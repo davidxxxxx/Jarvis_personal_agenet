@@ -1,0 +1,12 @@
+.superpowers/
+work/
+outputs/
+node_modules/
+dist/
+release/
+.env
+.env.*
+*.log
+userdata/
+recordings/
+
