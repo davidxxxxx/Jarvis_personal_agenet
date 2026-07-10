@@ -65,6 +65,8 @@ MiniMax 通过官方 OpenAI 兼容接口接入：
 - 增量分析默认模型：`MiniMax-M2.7-highspeed`
 - 会话最终总结默认模型：`MiniMax-M3`
 - 模型均可在设置中修改，以适配用户订阅权益
+- 所有请求设置 `reasoning_split=true`，只把 `message.content` 当作业务 JSON；M2.x 的推理内容不得进入 JSON 解析器
+- 最终总结使用 M3 时设置 `thinking: {"type":"disabled"}`，减少延迟并保持结构化输出稳定
 
 官方参考：[MiniMax OpenAI SDK 文档](https://platform.minimaxi.com/docs/api-reference/text-openai-api)
 
@@ -184,7 +186,7 @@ MicAudioSource ─┬─> AudioChunkStore ────────────�
 
 字段：`id`、`session_id`、`path`、`started_at`、`ended_at`、`duration_ms`、`sha256`、`expires_at`、`transcription_status`。
 
-音频以短片段写入，先写临时文件，再原子重命名；数据库只引用完整文件。
+音频默认按 60 秒分片；暂停或结束时允许产生不足 60 秒的尾片段。每片先写临时文件，再原子重命名；数据库只引用完整文件。若 OpenWhispr 上游录音器必须使用不同的内部帧长，持久化边界仍统一为不超过 60 秒。
 
 ### 6.3 TranscriptSegment
 
@@ -270,6 +272,8 @@ MicAudioSource ─┬─> AudioChunkStore ────────────�
 }
 ```
 
+`memories` 只接收 `fact`、`decision`、`commitment` 和 `opinion`；`todos` 与 `suggestions` 使用各自独立数组。校验通过后，本地把 `todos` 转换为 `Memory.type=todo`，把 `suggestions` 转换为 `Memory.type=suggestion`，避免同一条待办被模型重复返回两次。
+
 ### 7.3 校验
 
 - 响应必须是合法 JSON，并通过本地 JSON Schema。
@@ -280,8 +284,8 @@ MicAudioSource ─┬─> AudioChunkStore ────────────�
 
 ## 8. 记忆合并规则
 
-1. 同一人物、同一主题且语义高度相似的记忆合并，增加出现次数并更新时间。
-2. 语义接近但主体、主题或时间意义不同的条目保持独立。
+1. 使用 OpenWhispr 已有本地嵌入计算归一化余弦相似度。同一人物、同一主题且相似度不低于 0.86 的记忆自动合并，增加出现次数并更新时间。
+2. 相似度为 0.78–0.86 的候选只建立“可能重复”关联并等待确认；低于 0.78，或主体、主题、时间意义不同的条目保持独立。
 3. 新决定不覆盖旧决定；新条目通过 `supersedes_memory_id` 指向被替代条目。
 4. 相互矛盾的事实或承诺同时保留，并标记 `needs_confirmation=true`。
 5. 待办只有在用户明确表示完成或用户手动操作时关闭。
@@ -333,12 +337,12 @@ MicAudioSource ─┬─> AudioChunkStore ────────────�
 
 ### 11.4 磁盘不足
 
-- 低于安全阈值时先停止创建新音频，保留已完成片段和索引。
+- 可用空间低于 `max(5 GB, 卷容量的 5%)` 时先停止创建新音频，保留已完成片段和索引。
 - UI 和托盘显示明确错误，不静默丢弃音频。
 
 ### 11.5 程序崩溃
 
-- 音频短片段先写临时文件并定期落盘。
+- 音频按最多 60 秒的片段先写临时文件并落盘。
 - 启动时扫描未结束会话和完整孤立片段，恢复为 `recovered` 会话。
 - 不完整的最后一个临时片段隔离并报告，不阻塞其他数据恢复。
 
@@ -404,5 +408,4 @@ MicAudioSource ─┬─> AudioChunkStore ────────────�
 - **OpenWhispr 上游变化快。** 固定导入版本，建立 upstream 远端，只选择性同步必要修复。
 - **MiniMax 结构化输出可能不稳定。** 使用严格 JSON Schema、证据检查、一次修复和本地幂等合并。
 - **长期文本未做应用级加密。** 首版明确依赖 Windows 账户权限和磁盘加密；后续可评估 SQLCipher，但不阻塞当天 MVP。
-- **全天录音产生大量数据。** 采用短音频片段、7 天清理和磁盘安全阈值。
-
+- **全天录音产生大量数据。** 采用最多 60 秒音频片段、7 天清理和 `max(5 GB, 5%)` 磁盘安全阈值。
