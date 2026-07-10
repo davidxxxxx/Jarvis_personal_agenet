@@ -1,6 +1,12 @@
 export type JarvisSessionStatus =
   "recording" | "paused" | "finalizing" | "completed" | "recovered" | "failed";
 
+export interface JarvisControlEnvelope {
+  id: string;
+  action: JarvisControlAction;
+  expiresAt: number;
+}
+
 export interface JarvisSessionInput {
   id: string;
   startedAt: number;

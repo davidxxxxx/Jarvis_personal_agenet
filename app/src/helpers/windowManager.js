@@ -47,11 +47,16 @@ class WindowManager {
     this._panelStartPosition = "bottom-right";
     this._isDictatingToggle = false;
     this._pendingMeetingNoteNavigation = null;
+    this._onControlPanelUnavailable = null;
 
     app.on("before-quit", () => {
       this.isQuitting = true;
       this.hotkeyManager.unregisterAll();
     });
+  }
+
+  setControlPanelUnavailableHandler(handler) {
+    this._onControlPanelUnavailable = typeof handler === "function" ? handler : null;
   }
 
   async createMainWindow() {
@@ -671,6 +676,10 @@ class WindowManager {
       this.controlPanelWindow.setTitle(i18nMain.t("window.controlPanelTitle"));
     });
 
+    this.controlPanelWindow.webContents.on("did-start-loading", () => {
+      this._onControlPanelUnavailable?.("loading");
+    });
+
     this.controlPanelWindow.webContents.on(
       "did-fail-load",
       (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
@@ -689,6 +698,7 @@ class WindowManager {
     );
 
     this.controlPanelWindow.webContents.on("render-process-gone", (_event, details) => {
+      this._onControlPanelUnavailable?.(details.reason || "renderer_gone");
       if (details.reason === "crashed" || details.reason === "killed" || details.reason === "oom") {
         debugLogger.error(
           "Control panel renderer process gone",

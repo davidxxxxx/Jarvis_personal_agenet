@@ -6,6 +6,8 @@ const test = require("node:test");
 function loadPreloadApi() {
   const exposed = new Map();
   const invokes = [];
+  const sends = [];
+  const listeners = new Map();
   const electron = {
     contextBridge: {
       exposeInMainWorld(name, value) {
@@ -17,8 +19,15 @@ function loadPreloadApi() {
         invokes.push(args);
         return Promise.resolve("invoked");
       },
-      on() {},
-      removeListener() {},
+      send(...args) {
+        sends.push(args);
+      },
+      on(channel, listener) {
+        listeners.set(channel, listener);
+      },
+      removeListener(channel) {
+        listeners.delete(channel);
+      },
     },
     webUtils: {},
   };
@@ -35,7 +44,7 @@ function loadPreloadApi() {
     Module._load = originalLoad;
     delete require.cache[preloadPath];
   }
-  return { api: exposed.get("electronAPI").jarvis, invokes };
+  return { api: exposed.get("electronAPI").jarvis, invokes, sends, listeners };
 }
 
 function payload(windows) {
@@ -85,4 +94,24 @@ test("preload rejects oversized or malformed enrollment payloads before IPC clon
   ]);
   assert.equal(await api.completeVoiceEnrollment("session", valid), "invoked");
   assert.deepEqual(invokes[0], ["jarvis:voice-enrollment:complete", "session", valid]);
+});
+
+test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
+  const { api, sends, listeners } = loadPreloadApi();
+  const shutdownRequests = [];
+
+  api.controlReady("renderer-1");
+  api.acknowledgeControl("control-1", "ok");
+  const unsubscribe = api.onShutdownRequested((request) => shutdownRequests.push(request));
+  listeners.get("jarvis:shutdown-request")({}, { id: "shutdown-1" });
+  api.acknowledgeShutdown("shutdown-1", "ok");
+
+  assert.deepEqual(shutdownRequests, [{ id: "shutdown-1" }]);
+  assert.deepEqual(sends, [
+    ["jarvis:control:ready", "renderer-1"],
+    ["jarvis:control:ack", "control-1", "ok"],
+    ["jarvis:shutdown:ack", "shutdown-1", "ok"],
+  ]);
+  unsubscribe();
+  assert.equal(listeners.has("jarvis:shutdown-request"), false);
 });

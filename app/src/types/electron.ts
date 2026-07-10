@@ -2,6 +2,7 @@ import type {
   JarvisAudioChunk,
   JarvisCaptureInput,
   JarvisControlAction,
+  JarvisControlEnvelope,
   JarvisPerson,
   JarvisRenamePersonInput,
   JarvisRuntimeState,
@@ -556,7 +557,14 @@ declare global {
           payload: JarvisVoiceEnrollmentPayload
         ) => Promise<{ profileId: number }>;
         cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
-        onControl: (callback: (action: JarvisControlAction) => void) => () => void;
+        onControl: (callback: (envelope: JarvisControlEnvelope) => void) => () => void;
+        controlReady: (rendererId: string) => void;
+        acknowledgeControl: (
+          id: string,
+          outcome: "ok" | "duplicate" | "expired" | "error"
+        ) => void;
+        onShutdownRequested: (callback: (request: { id: string }) => void) => () => void;
+        acknowledgeShutdown: (id: string, outcome: "ok" | "error") => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;
       };
 

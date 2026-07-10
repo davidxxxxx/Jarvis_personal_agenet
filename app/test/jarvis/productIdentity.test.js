@@ -21,7 +21,7 @@ test("package exposes the Task 1 Jarvis contract", () => {
   );
   assert.equal(
     pkg.scripts["build:win:unsigned"],
-    "npm run prebuild:win && npm run build:renderer && electron-builder --win --config electron-builder.unsigned-win.json"
+    "npm run prebuild:win && npm run build:renderer && node scripts/build-windows.js"
   );
   assert.deepEqual(
     {

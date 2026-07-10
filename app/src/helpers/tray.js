@@ -10,6 +10,7 @@ class TrayManager {
     this.mainWindow = null;
     this.controlPanelWindow = null;
     this.windowManager = null;
+    this.jarvisControlQueue = null;
     this.attachedControlPanels = new WeakSet();
     this.jarvisState = { status: "idle", errorCode: null };
   }
@@ -34,6 +35,13 @@ class TrayManager {
 
   setWindowManager(windowManager) {
     this.windowManager = windowManager;
+  }
+
+  setJarvisControlQueue(queue) {
+    if (!queue || typeof queue.enqueue !== "function") {
+      throw new TypeError("Jarvis control queue with enqueue is required");
+    }
+    this.jarvisControlQueue = queue;
   }
 
   setCreateControlPanelCallback(callback) {
@@ -297,9 +305,7 @@ class TrayManager {
   async sendJarvisControl(action) {
     if (!["start", "pause", "resume", "finish"].includes(action)) return;
     await this.showControlPanelFromTray();
-    const window = this.windowManager?.controlPanelWindow || this.controlPanelWindow;
-    if (!window || window.isDestroyed()) return;
-    window.webContents.send("jarvis:control", action);
+    this.jarvisControlQueue?.enqueue(action);
   }
 
   getJarvisTooltip() {

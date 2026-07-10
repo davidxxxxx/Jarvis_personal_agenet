@@ -105,8 +105,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("jarvis:voice-enrollment:cancel", sessionId),
     onControl: registerListener(
       "jarvis:control",
-      (callback) => (_event, action) => callback(action)
+      (callback) => (_event, envelope) => callback(envelope)
     ),
+    controlReady: (rendererId) => ipcRenderer.send("jarvis:control:ready", rendererId),
+    acknowledgeControl: (id, outcome) =>
+      ipcRenderer.send("jarvis:control:ack", id, outcome),
+    onShutdownRequested: registerListener(
+      "jarvis:shutdown-request",
+      (callback) => (_event, request) => callback(request)
+    ),
+    acknowledgeShutdown: (id, outcome) =>
+      ipcRenderer.send("jarvis:shutdown:ack", id, outcome),
     onStateChanged: registerListener(
       "jarvis:state-changed",
       (callback) => (_event, state) => callback(state)

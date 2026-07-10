@@ -53,15 +53,10 @@ test("keeps metadata when deleting an expired audio file fails", () => {
   fs.mkdirSync(path.dirname(expiredPath), { recursive: true });
   fs.writeFileSync(expiredPath, "retry");
   insertChunk(repository, { id: "retry", filePath: expiredPath, expiresAt: 4_000 });
-  const fsImpl = Object.create(fs);
-  fsImpl.unlinkSync = () => {
-    const error = new Error("locked");
-    error.code = "EPERM";
-    throw error;
-  };
+  const deleteFile = () => ({ status: "retry", code: "sharing_violation" });
 
   try {
-    const result = new RetentionCleaner({ repository, recordingsRoot, fsImpl }).clean(5_000);
+    const result = new RetentionCleaner({ repository, recordingsRoot, deleteFile }).clean(5_000);
 
     assert.deepEqual(result, { deleted: 0, retry: 1, missing: 0 });
     assert.equal(fs.existsSync(expiredPath), true);
@@ -70,6 +65,77 @@ test("keeps metadata when deleting an expired audio file fails", () => {
     repository.close();
     fs.rmSync(recordingsRoot, { recursive: true, force: true });
   }
+});
+
+test("deletes metadata only after deleted or safe-missing result semantics", () => {
+  const deletedIds = [];
+  const repository = {
+    listExpiredAudioChunks: () => [
+      { id: "deleted", path: "deleted.wav" },
+      { id: "missing", path: "missing.wav" },
+      { id: "outside", path: "outside.wav" },
+      { id: "retry", path: "retry.wav" },
+      { id: "unsupported", path: "unsupported.wav" },
+    ],
+    deleteAudioChunk: (id) => deletedIds.push(id),
+  };
+  const resultByName = {
+    "deleted.wav": { status: "deleted", code: "deleted" },
+    "missing.wav": { status: "missing", code: "file_not_found" },
+    "outside.wav": { status: "outside", code: "handle_outside_root" },
+    "retry.wav": { status: "retry", code: "sharing_violation" },
+    "unsupported.wav": { status: "unsupported", code: "platform_unsupported" },
+  };
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteFile: (_root, filePath) => resultByName[filePath],
+  });
+
+  assert.deepEqual(cleaner.clean(5_000), { deleted: 1, retry: 3, missing: 1 });
+  assert.deepEqual(deletedIds, ["deleted", "missing"]);
+});
+
+test("timer start is idempotent, contains errors, stops, and ignores late callbacks", () => {
+  let intervalCallback;
+  const intervals = [];
+  const cleared = [];
+  const logs = [];
+  const repository = {
+    listExpiredAudioChunks: () => {
+      throw new Error("database unavailable");
+    },
+    deleteAudioChunk() {},
+  };
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteFile: () => ({ status: "deleted", code: "deleted" }),
+    setIntervalImpl: (callback, intervalMs) => {
+      intervalCallback = callback;
+      const timer = { intervalMs, unrefCalled: false, unref() { this.unrefCalled = true; } };
+      intervals.push(timer);
+      return timer;
+    },
+    clearIntervalImpl: (timer) => cleared.push(timer),
+    log: (result) => logs.push(result),
+  });
+
+  cleaner.start(123);
+  cleaner.start(456);
+  assert.equal(intervals.length, 1);
+  assert.equal(intervals[0].intervalMs, 123);
+  assert.equal(intervals[0].unrefCalled, true);
+  intervalCallback();
+  assert.deepEqual(logs.at(-1), { deleted: 0, retry: 1, missing: 0 });
+
+  cleaner.stop();
+  assert.deepEqual(cleared, intervals);
+  const logCount = logs.length;
+  intervalCallback();
+  assert.equal(logs.length, logCount);
+  cleaner.stop();
+  assert.equal(cleared.length, 1);
 });
 
 test("tolerates missing files but never deletes paths outside the recordings root", () => {

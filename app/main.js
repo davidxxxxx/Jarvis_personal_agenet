@@ -294,8 +294,14 @@ const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
 const JarvisService = require("./src/jarvis/main/JarvisService");
 const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
+const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
+const JarvisControlQueue = require("./src/jarvis/main/JarvisControlQueue");
+const {
+  GracefulShutdownCoordinator,
+  RendererShutdownHandshake,
+} = require("./src/jarvis/main/GracefulShutdownCoordinator");
 
 // Manager instances - initialized after app.whenReady()
 let debugLogger = null;
@@ -327,6 +333,9 @@ let jarvisRepository = null;
 let jarvisService = null;
 let retentionCleaner = null;
 let voiceEnrollmentService = null;
+let jarvisControlQueue = null;
+let rendererShutdownHandshake = null;
+let gracefulShutdownCoordinator = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -403,6 +412,11 @@ function initializeCoreManagers() {
   retentionCleaner = new RetentionCleaner({
     repository: jarvisRepository,
     recordingsRoot,
+    deleteFile: createSafeRecordingDelete({
+      helperDir: app.isPackaged
+        ? path.join(process.resourcesPath, "jarvis-native")
+        : path.join(__dirname, "src", "jarvis", "native", "windows"),
+    }),
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
   voiceEnrollmentService = new VoiceEnrollmentService({
@@ -428,6 +442,39 @@ function initializeCoreManagers() {
   debugLogger.refreshLogLevel();
 
   windowManager = new WindowManager();
+  jarvisControlQueue = new JarvisControlQueue({
+    send: (envelope) => windowManager.sendToControlPanel("jarvis:control", envelope),
+    log: (result) => debugLogger.info("Jarvis tray control delivery", result, "jarvis"),
+  });
+  rendererShutdownHandshake = new RendererShutdownHandshake({
+    send: (request) => windowManager.sendToControlPanel("jarvis:shutdown-request", request),
+    isAvailable: () =>
+      isLiveWindow(windowManager?.controlPanelWindow) &&
+      !windowManager.controlPanelWindow.webContents.isCrashed(),
+  });
+  windowManager.setControlPanelUnavailableHandler((reason) => {
+    jarvisControlQueue?.markNotReady(reason);
+    rendererShutdownHandshake?.markRendererGone();
+  });
+  const isControlPanelSender = (event) =>
+    windowManager?.controlPanelWindow?.webContents === event.sender;
+  ipcMain.on("jarvis:control:ready", (event, rendererId) => {
+    if (!isControlPanelSender(event)) return;
+    try {
+      jarvisControlQueue.markReady(rendererId);
+    } catch {
+      // Invalid renderer handshakes are ignored at the trust boundary.
+    }
+  });
+  ipcMain.on("jarvis:control:ack", (event, id, outcome) => {
+    if (!isControlPanelSender(event)) return;
+    jarvisControlQueue.acknowledge(id, outcome);
+  });
+  ipcMain.on("jarvis:shutdown:ack", (event, id, outcome) => {
+    if (!isControlPanelSender(event)) return;
+    if (outcome !== "ok" && outcome !== "error") return;
+    rendererShutdownHandshake.acknowledge(id, outcome);
+  });
   hotkeyManager = windowManager.hotkeyManager;
   clipboardManager = new ClipboardManager();
   whisperManager = new WhisperManager();
@@ -512,6 +559,7 @@ function initializeDeferredManagers() {
   });
   clipboardManager.preWarmAccessibility();
   trayManager = new TrayManager();
+  trayManager.setJarvisControlQueue(jarvisControlQueue);
   globeKeyManager = new GlobeKeyManager();
 
   if (process.platform === "darwin") {
@@ -1626,66 +1674,84 @@ if (gotSingleInstanceLock) {
   let isShuttingDown = false;
   app.on("before-quit", (event) => {
     if (isShuttingDown) return;
-    isShuttingDown = true;
-    if (updateManager && updateManager.isQuittingForUpdate) {
-      // Quit must proceed for the installer to run, so no preventDefault;
-      // sidecar shutdown is best-effort (the reaper cleans up orphans on relaunch).
-      performSyncTeardown();
-      sidecarRegistry.shutdownAll().catch(() => {});
-      return;
-    }
     event.preventDefault();
-    performSyncTeardown();
-    sidecarRegistry.shutdownAll().finally(() => app.exit(0));
+    isShuttingDown = true;
+    const quittingForUpdate = Boolean(updateManager?.isQuittingForUpdate);
+    performGracefulTeardown().finally(() => {
+      if (quittingForUpdate) app.quit();
+      else app.exit(0);
+    });
   });
 }
 
-function performSyncTeardown() {
-  if (wakeRewarmTimer) {
-    clearTimeout(wakeRewarmTimer);
-    wakeRewarmTimer = null;
-  }
-  if (authBridgeServer) {
-    authBridgeServer.close();
-    authBridgeServer = null;
-  }
-  if (cliBridge) {
-    cliBridge.stop().catch(() => {});
-    cliBridge = null;
-  }
-  if (windowManager && isLiveWindow(windowManager.agentWindow)) {
-    windowManager.agentWindow.destroy();
-  }
-  if (windowManager && isLiveWindow(windowManager.transcriptionPreviewWindow)) {
-    windowManager.transcriptionPreviewWindow.destroy();
-  }
-  if (hotkeyManager) {
-    hotkeyManager.unregisterAll();
-  } else {
-    globalShortcut.unregisterAll();
-  }
-  if (globeKeyManager) globeKeyManager.stop();
-  if (windowsKeyManager) windowsKeyManager.stop();
-  if (linuxKeyManager) linuxKeyManager.stop();
-  if (meetingDetectionEngine) meetingDetectionEngine.stop();
-  if (googleCalendarManager) googleCalendarManager.stop();
-  if (audioTapManager) audioTapManager.stop().catch(() => {});
-  if (linuxPortalAudioManager) linuxPortalAudioManager.stop().catch(() => {});
-  if (windowsLoopbackAudioManager) windowsLoopbackAudioManager.stop().catch(() => {});
-  if (meetingAecManager) meetingAecManager.stop().catch(() => {});
-  if (ipcHandlers) ipcHandlers._cleanupTextEditMonitor();
-  if (textEditMonitor) textEditMonitor.stopMonitoring();
-  if (updateManager) updateManager.cleanup();
-  if (retentionCleaner) {
-    retentionCleaner.stop();
-    retentionCleaner = null;
-  }
-  if (jarvisService) {
-    jarvisService.shutdown();
-    jarvisService = null;
-  }
-  if (jarvisRepository) {
-    jarvisRepository.close();
-    jarvisRepository = null;
-  }
+function performGracefulTeardown() {
+  if (gracefulShutdownCoordinator) return gracefulShutdownCoordinator.shutdown();
+
+  const closeAuthBridge = () =>
+    new Promise((resolve) => {
+      const server = authBridgeServer;
+      authBridgeServer = null;
+      if (!server) {
+        resolve();
+        return;
+      }
+      try {
+        server.close(resolve);
+      } catch {
+        resolve();
+      }
+    });
+
+  gracefulShutdownCoordinator = new GracefulShutdownCoordinator({
+    requestRendererFlush: () =>
+      rendererShutdownHandshake?.request(2_000) ?? Promise.resolve({ status: "unavailable" }),
+    beginClose: () => jarvisService?.beginShutdown(),
+    stopUpstream: [
+      () => cliBridge?.stop(),
+      () => audioTapManager?.stop(),
+      () => linuxPortalAudioManager?.stop(),
+      () => windowsLoopbackAudioManager?.stop(),
+      () => meetingAecManager?.stop(),
+      () => sidecarRegistry.shutdownAll(),
+    ],
+    stopRuntime: [
+      () => {
+        if (wakeRewarmTimer) clearTimeout(wakeRewarmTimer);
+        wakeRewarmTimer = null;
+      },
+      closeAuthBridge,
+      () => {
+        if (windowManager && isLiveWindow(windowManager.agentWindow)) {
+          windowManager.agentWindow.destroy();
+        }
+        if (windowManager && isLiveWindow(windowManager.transcriptionPreviewWindow)) {
+          windowManager.transcriptionPreviewWindow.destroy();
+        }
+      },
+      () => (hotkeyManager ? hotkeyManager.unregisterAll() : globalShortcut.unregisterAll()),
+      () => globeKeyManager?.stop(),
+      () => windowsKeyManager?.stop(),
+      () => linuxKeyManager?.stop(),
+      () => meetingDetectionEngine?.stop(),
+      () => googleCalendarManager?.stop(),
+      () => ipcHandlers?._cleanupTextEditMonitor(),
+      () => textEditMonitor?.stopMonitoring(),
+      () => updateManager?.cleanup(),
+      () => {
+        retentionCleaner?.stop();
+        retentionCleaner = null;
+      },
+    ],
+    closeWriter: () => {
+      const service = jarvisService;
+      jarvisService = null;
+      return service?.shutdown();
+    },
+    closeRepository: () => {
+      const repository = jarvisRepository;
+      jarvisRepository = null;
+      return repository?.close();
+    },
+  });
+  return gracefulShutdownCoordinator.shutdown();
 }

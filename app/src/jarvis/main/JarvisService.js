@@ -44,6 +44,8 @@ class JarvisService {
     this.now = now;
     this.fs = fsImpl;
     this.writer = null;
+    this.closing = false;
+    this.closed = false;
     this.state = {
       sessionId: null,
       status: "idle",
@@ -55,6 +57,7 @@ class JarvisService {
   }
 
   startCapture({ sessionId, startedAt, micDeviceId }) {
+    this._assertOpen();
     const id = assertId(sessionId, "sessionId");
     this._assertTime(startedAt, "startedAt");
     if (micDeviceId !== null && micDeviceId !== undefined && typeof micDeviceId !== "string") {
@@ -86,6 +89,7 @@ class JarvisService {
   }
 
   appendMicPcm(sessionId, pcmBuffer) {
+    if (this.closing || this.closed) return false;
     const id = assertId(sessionId, "sessionId");
     if (id !== this.state.sessionId) throw new Error("capture session mismatch");
     if (
@@ -108,6 +112,7 @@ class JarvisService {
   }
 
   pauseCapture(sessionId, at = this.now(), errorCode = null) {
+    this._assertOpen();
     this._assertActive(sessionId, "recording");
     this._assertTime(at, "at");
     if (errorCode !== null && (typeof errorCode !== "string" || errorCode.length === 0)) {
@@ -129,6 +134,7 @@ class JarvisService {
   }
 
   resumeCapture(sessionId, at = this.now()) {
+    this._assertOpen();
     this._assertActive(sessionId, "paused");
     this._assertTime(at, "at");
     let writer;
@@ -152,6 +158,7 @@ class JarvisService {
   }
 
   finishCapture(sessionId, at = this.now()) {
+    this._assertOpen();
     this._assertActive(sessionId, ["recording", "paused"]);
     this._assertTime(at, "at");
     if (this.state.status === "recording") {
@@ -171,6 +178,7 @@ class JarvisService {
   }
 
   failCapture(sessionId, code, at = this.now()) {
+    this._assertOpen();
     this._assertActive(sessionId, ["recording", "paused"]);
     this._assertTime(at, "at");
     if (typeof code !== "string" || code.length === 0) {
@@ -193,6 +201,7 @@ class JarvisService {
   }
 
   recoverOpenSessions(at = this.now()) {
+    this._assertOpen();
     this._assertTime(at, "at");
     return this.repository.recoverOpenSessions(at);
   }
@@ -201,34 +210,44 @@ class JarvisService {
     return this._publicState(this.now());
   }
 
+  beginShutdown() {
+    if (!this.closed) this.closing = true;
+  }
+
   shutdown() {
-    const at = this.now();
-    if (this.writer) {
-      try {
-        this.writer.close(at);
-      } catch (error) {
-        this.writer.abort?.();
-        if (["recording", "paused"].includes(this.state.status)) {
-          const code = error instanceof DiskSpaceError ? error.code : "AUDIO_WRITE_FAILED";
-          this.state.status = "failed";
-          this.state.errorCode = code;
-          this.state.activeSince = null;
-          this.repository.setSessionStatus(this.state.sessionId, "failed", at);
-          this._publish(at);
+    if (this.closed) return;
+    this.beginShutdown();
+    try {
+      const at = this.now();
+      if (this.writer) {
+        try {
+          this.writer.close(at);
+        } catch (error) {
+          this.writer.abort?.();
+          if (["recording", "paused"].includes(this.state.status)) {
+            const code = error instanceof DiskSpaceError ? error.code : "AUDIO_WRITE_FAILED";
+            this.state.status = "failed";
+            this.state.errorCode = code;
+            this.state.activeSince = null;
+            this.repository.setSessionStatus(this.state.sessionId, "failed", at);
+            this._publish(at);
+          }
+          this.writer = null;
+          return;
         }
         this.writer = null;
-        return;
       }
-      this.writer = null;
-    }
-    if (["recording", "paused"].includes(this.state.status)) {
-      if (this.state.status === "recording" && this.state.activeSince !== null) {
-        this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
+      if (["recording", "paused"].includes(this.state.status)) {
+        if (this.state.status === "recording" && this.state.activeSince !== null) {
+          this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
+        }
+        this.state.activeSince = null;
+        this.state.status = "recovered";
+        this.repository.setSessionStatus(this.state.sessionId, "recovered", at);
+        this._publish(at);
       }
-      this.state.activeSince = null;
-      this.state.status = "recovered";
-      this.repository.setSessionStatus(this.state.sessionId, "recovered", at);
-      this._publish(at);
+    } finally {
+      this.closed = true;
     }
   }
 
@@ -241,11 +260,13 @@ class JarvisService {
       now: this.now,
       startedAt,
       beforeChunk: () => this._assertSafeDiskSpace(),
-      onChunk: (chunk) =>
-        this.repository.insertAudioChunk({
+      onChunk: (chunk) => {
+        if (this.closed) return null;
+        return this.repository.insertAudioChunk({
           ...chunk,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
-        }),
+        });
+      },
     });
   }
 
@@ -292,6 +313,10 @@ class JarvisService {
     if (!expected.includes(this.state.status)) {
       throw new Error(`capture session must be ${expected.join(" or ")}`);
     }
+  }
+
+  _assertOpen() {
+    if (this.closing || this.closed) throw new Error("Jarvis capture is shutting down");
   }
 
   _assertTime(value, name) {

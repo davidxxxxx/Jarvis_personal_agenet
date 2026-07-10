@@ -244,6 +244,35 @@ test("shutdown flushes the last chunk and marks an active session recovered", ()
   }
 });
 
+test("shutdown is idempotent and rejects late capture callbacks into closed state", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_100,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.beginShutdown();
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(4_800, 1)), false);
+    assert.throws(
+      () => service.resumeCapture("s1", 1_100),
+      /shutting down/
+    );
+    service.shutdown();
+    service.shutdown();
+    assert.equal(repository.chunks.length, 0);
+    assert.equal(repository.sessions.get("s1").status, "recovered");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
 test("an error pause keeps completed audio and broadcasts the microphone error code", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();

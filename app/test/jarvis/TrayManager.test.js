@@ -22,6 +22,7 @@ test("recording and paused tray states expose truthful Chinese labels and toolti
   const manager = new TrayManager();
   const sent = [];
   manager.controlPanelWindow = makeControlPanel(sent);
+  manager.setJarvisControlQueue({ enqueue: (action) => sent.push(["queued", action]) });
 
   try {
     manager.setJarvisState({ status: "recording", errorCode: null });
@@ -35,8 +36,8 @@ test("recording and paused tray states expose truthful Chinese labels and toolti
     await pause.click();
     await finish.click();
     assert.deepEqual(sent, [
-      ["jarvis:control", "pause"],
-      ["jarvis:control", "finish"],
+      ["queued", "pause"],
+      ["queued", "finish"],
     ]);
 
     manager.setJarvisState({ status: "paused", errorCode: null });
@@ -47,7 +48,7 @@ test("recording and paused tray states expose truthful Chinese labels and toolti
     assert.ok(pausedMenu.find((item) => item.label === "结束并总结"));
 
     await resume.click();
-    assert.deepEqual(sent.at(-1), ["jarvis:control", "resume"]);
+    assert.deepEqual(sent.at(-1), ["queued", "resume"]);
 
     manager.setJarvisState({ status: "paused", errorCode: "MIC_DISCONNECTED" });
     assert.equal(
@@ -64,6 +65,7 @@ test("idle and terminal tray states offer start through the renderer control cha
   const manager = new TrayManager();
   const sent = [];
   manager.controlPanelWindow = makeControlPanel(sent);
+  manager.setJarvisControlQueue({ enqueue: (action) => sent.push(["queued", action]) });
 
   for (const status of ["idle", "completed", "failed", "recovered"]) {
     manager.setJarvisState({ status, errorCode: null });

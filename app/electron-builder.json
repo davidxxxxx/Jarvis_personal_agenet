@@ -94,7 +94,6 @@
     "src/workers/**/*"
   ],
   "extraResources": [
-    ".env",
     "src/assets/**/*",
     {
       "from": "resources/bin/",
@@ -167,6 +166,10 @@
       {
         "from": "resources/bin/nircmd.exe",
         "to": "bin/nircmd.exe"
+      },
+      {
+        "from": "src/jarvis/native/windows",
+        "to": "jarvis-native"
       }
     ]
   },
