@@ -199,9 +199,13 @@ function createHarness({
     setPeople(await jarvis.listPeople());
   });
   const onOperationChange = vi.fn();
+  const ensureTranscriptionReady = vi.fn(async () => {
+    calls.push("transcription:ready");
+  });
 
   const deps: RecordingDependencies = {
     jarvis,
+    ensureTranscriptionReady,
     startRecording,
     stopRecording,
     lockSpeaker: vi.fn(),
@@ -230,6 +234,7 @@ function createHarness({
     setSessions,
     createId,
     onOperationChange,
+    ensureTranscriptionReady,
     getSession: () => session,
     setMeeting: (next: Partial<typeof meeting>) => {
       meeting = { ...meeting, ...next };
@@ -277,7 +282,12 @@ describe("Jarvis recording controller", () => {
 
     await controller.start();
 
-    expect(harness.calls).toEqual(["jarvis:create", "jarvis:start", "upstream:start"]);
+    expect(harness.calls).toEqual([
+      "transcription:ready",
+      "jarvis:create",
+      "jarvis:start",
+      "upstream:start",
+    ]);
     expect(harness.jarvis.startCapture).toHaveBeenCalledWith({
       sessionId: "s1",
       startedAt: 1_000,
@@ -290,6 +300,7 @@ describe("Jarvis recording controller", () => {
       captureSystemAudio: false,
       jarvisSessionId: "s1",
       diarizationEnabled: true,
+      forceLocalTranscription: true,
     });
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
   });

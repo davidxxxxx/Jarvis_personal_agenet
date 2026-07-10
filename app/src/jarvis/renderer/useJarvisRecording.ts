@@ -93,6 +93,7 @@ export function createLatestRefresh<T>(
 
 export interface RecordingDependencies {
   jarvis: RecordingJarvisApi;
+  ensureTranscriptionReady: () => Promise<void>;
   startRecording: (args: StartRecordingArgs) => Promise<void>;
   stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
   lockSpeaker: (speakerId: string, displayName: string) => void;
@@ -184,6 +185,7 @@ function recordingArgs(id: string, seedSegments?: TranscriptSegment[]): StartRec
     captureSystemAudio: false,
     jarvisSessionId: id,
     diarizationEnabled: true,
+    forceLocalTranscription: true,
     ...(seedSegments ? { seedSegments } : {}),
   };
 }
@@ -326,6 +328,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     let captureStarted = false;
 
     try {
+      await deps.ensureTranscriptionReady();
       const micDeviceId = deps.getMicDeviceId();
       await deps.jarvis.createSession({
         id,
@@ -716,6 +719,26 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   if (controllerRef.current === null) {
     controllerRef.current = createRecordingController({
       jarvis: rendererJarvisApi,
+      ensureTranscriptionReady: async () => {
+        const settings = getSettings();
+        const model = settings.meetingWhisperModel || settings.whisperModel || "base";
+        const status = await window.electronAPI.checkModelStatus(model);
+        if (!status.success) {
+          throw new RecordingOperationError(
+            "local_model_setup_failed",
+            status.error || `could not check local Whisper model ${model}`
+          );
+        }
+        if (status.downloaded) return;
+
+        const downloaded = await window.electronAPI.downloadWhisperModel(model);
+        if (!downloaded.success || !downloaded.downloaded) {
+          throw new RecordingOperationError(
+            "local_model_setup_failed",
+            downloaded.error || `could not download local Whisper model ${model}`
+          );
+        }
+      },
       startRecording,
       stopRecording,
       lockSpeaker,

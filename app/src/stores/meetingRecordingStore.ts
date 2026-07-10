@@ -122,12 +122,12 @@ const isSegmentWithinIdentificationWindow = (
   );
 };
 
-const getMeetingTranscriptionOptions = () => {
+const getMeetingTranscriptionOptions = (forceLocalTranscription = false) => {
   const state = getSettings();
   const resolved = selectResolvedMeetingTranscription(state);
   const language = getBaseLanguageCode(state.preferredLanguage);
 
-  if (resolved.useLocalWhisper) {
+  if (forceLocalTranscription || resolved.useLocalWhisper) {
     return {
       provider: "local" as const,
       localProvider: resolved.localTranscriptionProvider,
@@ -806,6 +806,7 @@ export interface StartRecordingArgs {
   seedSegments?: TranscriptSegment[];
   diarizationEnabled?: boolean | null;
   expectedCount?: number | null;
+  forceLocalTranscription?: boolean;
 }
 
 export async function startRecording(args: StartRecordingArgs): Promise<void> {
@@ -904,7 +905,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
     const [startResult, micResult, initialSystemCaptureResult] = await Promise.all([
       window.electronAPI?.meetingTranscriptionStart?.({
-        ...getMeetingTranscriptionOptions(),
+        ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true),
         noteId: args.noteId ?? null,
         micOnly: args.captureSystemAudio === false,
         jarvisSessionId: args.jarvisSessionId ?? null,

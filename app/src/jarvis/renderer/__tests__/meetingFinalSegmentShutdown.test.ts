@@ -5,6 +5,7 @@ import {
   useMeetingRecordingStore,
   type TranscriptSegment,
 } from "../../../stores/meetingRecordingStore";
+import { useSettingsStore } from "../../../stores/settingsStore";
 import { createRecordingController, type RecordingDependencies } from "../useJarvisRecording";
 import type { SessionState } from "../sessionMachine";
 
@@ -117,6 +118,36 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     Reflect.deleteProperty(URL, "createObjectURL");
   });
 
+  it("uses local Whisper when a Jarvis recording forces local transcription", async () => {
+    useSettingsStore.setState({
+      meetingUseLocalWhisper: false,
+      meetingTranscriptionMode: "openwhispr",
+      meetingLocalTranscriptionProvider: "whisper",
+      meetingWhisperModel: "",
+      whisperModel: "base",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-local",
+      diarizationEnabled: true,
+      forceLocalTranscription: true,
+    });
+
+    expect(window.electronAPI.meetingTranscriptionStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "local",
+        localProvider: "whisper",
+        localModel: "base",
+        micOnly: true,
+        jarvisSessionId: "s-local",
+      })
+    );
+  });
+
   it("keeps listeners through source cleanup and syncs one returned final segment before ack", async () => {
     const finalSegment = {
       text: "Production final words",
@@ -163,6 +194,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     } as unknown as RecordingDependencies["jarvis"];
     const controller = createRecordingController({
       jarvis,
+      ensureTranscriptionReady: vi.fn(async () => {}),
       startRecording,
       stopRecording,
       lockSpeaker: vi.fn(),
