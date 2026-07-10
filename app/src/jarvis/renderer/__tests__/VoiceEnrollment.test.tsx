@@ -198,6 +198,21 @@ describe("VoiceEnrollment", () => {
     await waitFor(() => expect(getUserMedia).toHaveBeenCalledTimes(1));
   });
 
+  it("announces pending setup with aria-busy state", async () => {
+    const pending = deferred<typeof SESSION>();
+    const audio = createAudioHarness();
+    installMedia(audio.stream);
+    installElectronApi({ beginVoiceEnrollment: vi.fn(() => pending.promise) });
+    render(<VoiceEnrollment />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始校准" }));
+
+    expect(screen.getByRole("region", { name: "声纹校准" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status")).toHaveTextContent("正在准备声纹校准");
+    pending.resolve(SESSION);
+    await waitFor(() => expect(audio.context.audioWorklet.addModule).toHaveBeenCalled());
+  });
+
   it("resumes a suspended context before recording and cancels cleanly", async () => {
     const audio = createAudioHarness({ contextState: "suspended" });
     installMedia(audio.stream);
@@ -259,5 +274,48 @@ describe("VoiceEnrollment", () => {
     expect(audio.track.stop).toHaveBeenCalledTimes(1);
     expect(audio.context.close).toHaveBeenCalledTimes(1);
     expect(jarvis.cancelVoiceEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("zeroes failed save PCM, cancels the token, and permits a fresh start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const audio = createAudioHarness();
+    const getUserMedia = installMedia(audio.stream);
+    const jarvis = installElectronApi({
+      completeVoiceEnrollment: vi.fn().mockRejectedValue(new Error("embedding failed")),
+    });
+    render(<VoiceEnrollment />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开始校准" }));
+    await act(async () => Promise.resolve());
+    act(() => {
+      audio.port.onmessage?.({
+        data: new Float32Array(24_000 * 30).fill(0.2).buffer,
+      } as MessageEvent<ArrayBuffer>);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_100);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "保存声纹" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    const [, sentPayload] = jarvis.completeVoiceEnrollment.mock.calls[0];
+    expect(
+      sentPayload.windows.every((entry: { samples: Float32Array }) =>
+        entry.samples.every((sample) => sample === 0)
+      )
+    ).toBe(true);
+    expect(jarvis.cancelVoiceEnrollment).toHaveBeenCalledWith(SESSION.sessionId);
+    const restart = screen.getByRole("button", { name: "开始校准" });
+    expect(restart).toBeEnabled();
+
+    fireEvent.click(restart);
+    await act(async () => Promise.resolve());
+    expect(jarvis.beginVoiceEnrollment).toHaveBeenCalledTimes(2);
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
   });
 });

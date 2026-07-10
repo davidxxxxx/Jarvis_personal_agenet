@@ -9,6 +9,7 @@ const RECORDING_SECONDS = 30;
 const WINDOW_SECONDS = 8;
 const WORKLET_CHUNK_SIZE = 2_400;
 const MIN_READY_SECONDS = 29;
+const MAX_CAPTURE_SECONDS = 31;
 
 type EnrollmentState =
   "idle" | "setup" | "recording" | "stopping" | "ready" | "saving" | "saved" | "error";
@@ -71,10 +72,17 @@ export default function VoiceEnrollment() {
   const workletUrlRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const deadlineRef = useRef(0);
+  const capturedSampleCountRef = useRef(0);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
     timerRef.current = null;
+  }, []);
+
+  const dropChunks = useCallback(() => {
+    for (const chunk of chunksRef.current) chunk.fill(0);
+    chunksRef.current = [];
+    capturedSampleCountRef.current = 0;
   }, []);
 
   const cancelPendingSession = useCallback(async () => {
@@ -145,14 +153,14 @@ export default function VoiceEnrollment() {
     const totalSamples = chunksRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
     const sampleRate = sessionRef.current?.sampleRate ?? 24_000;
     if (totalSamples < sampleRate * MIN_READY_SECONDS) {
-      chunksRef.current = [];
+      dropChunks();
       await cancelPendingSession();
       if (mountedRef.current) setState("error");
     } else if (mountedRef.current) {
       setState("ready");
     }
     operationRef.current = false;
-  }, [cancelPendingSession, cleanupCapture]);
+  }, [cancelPendingSession, cleanupCapture, dropChunks]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -160,9 +168,9 @@ export default function VoiceEnrollment() {
       mountedRef.current = false;
       clearTimer();
       void cleanupCapture({ cancelSession: true, flush: false });
-      chunksRef.current = [];
+      dropChunks();
     };
-  }, [cleanupCapture, clearTimer]);
+  }, [cleanupCapture, clearTimer, dropChunks]);
 
   const start = async () => {
     if (operationRef.current) return;
@@ -170,7 +178,7 @@ export default function VoiceEnrollment() {
     setState("setup");
     setLevel(0);
     setSecondsLeft(RECORDING_SECONDS);
-    chunksRef.current = [];
+    dropChunks();
 
     try {
       const session = await window.electronAPI.jarvis.beginVoiceEnrollment();
@@ -212,10 +220,19 @@ export default function VoiceEnrollment() {
       processor.port.onmessage = (event) => {
         if (!(event.data instanceof ArrayBuffer)) return;
         const chunk = new Float32Array(event.data);
-        chunksRef.current.push(chunk);
+        const maxSamples = session.sampleRate * MAX_CAPTURE_SECONDS;
+        const remaining = maxSamples - capturedSampleCountRef.current;
+        if (remaining <= 0) {
+          chunk.fill(0);
+          return;
+        }
+        const retained = chunk.length > remaining ? chunk.slice(0, remaining) : chunk;
+        if (retained !== chunk) chunk.fill(0);
+        chunksRef.current.push(retained);
+        capturedSampleCountRef.current += retained.length;
         let energy = 0;
-        for (const sample of chunk) energy += sample * sample;
-        setLevelIfMounted(Math.min(1, Math.sqrt(energy / chunk.length) * 4));
+        for (const sample of retained) energy += sample * sample;
+        setLevelIfMounted(Math.min(1, Math.sqrt(energy / retained.length) * 4));
       };
       source.connect(processor);
       processor.connect(silentGain);
@@ -229,7 +246,7 @@ export default function VoiceEnrollment() {
       }, 250);
     } catch {
       await cleanupCapture({ cancelSession: true, flush: false });
-      chunksRef.current = [];
+      dropChunks();
       if (mountedRef.current) setState("error");
     } finally {
       operationRef.current = false;
@@ -240,7 +257,7 @@ export default function VoiceEnrollment() {
     if (operationRef.current) return;
     operationRef.current = true;
     await cleanupCapture({ cancelSession: true, flush: false });
-    chunksRef.current = [];
+    dropChunks();
     if (mountedRef.current) {
       setSecondsLeft(RECORDING_SECONDS);
       setState("idle");
@@ -275,11 +292,14 @@ export default function VoiceEnrollment() {
     try {
       await window.electronAPI.jarvis.completeVoiceEnrollment(session.sessionId, payload);
       sessionRef.current = null;
-      chunksRef.current = [];
       if (mountedRef.current) setState("saved");
     } catch {
+      await cleanupCapture({ cancelSession: true, flush: false });
       if (mountedRef.current) setState("error");
     } finally {
+      for (const entry of payload.windows) entry.samples.fill(0);
+      samples.fill(0);
+      dropChunks();
       operationRef.current = false;
     }
   };
@@ -287,11 +307,13 @@ export default function VoiceEnrollment() {
   const startEnabled = state === "idle" || state === "error" || state === "saved";
   const cancelEnabled = state === "recording" || state === "ready";
   const micLevel = Math.max(0, Math.min(1, level));
+  const pending = state === "setup" || state === "stopping" || state === "saving";
 
   return (
     <section
       className="rounded-xl border border-border/50 bg-card/70 p-4"
       aria-labelledby="voice-enrollment-title"
+      aria-busy={pending}
     >
       <div className="flex items-start gap-3">
         <div className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
@@ -329,6 +351,11 @@ export default function VoiceEnrollment() {
       {state === "saved" && (
         <p role="status" className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
           {t("jarvis.voiceEnrollmentSaved")}
+        </p>
+      )}
+      {pending && (
+        <p role="status" aria-live="polite" className="sr-only">
+          {t("jarvis.voiceEnrollmentPending")}
         </p>
       )}
       <div className="mt-4 flex flex-wrap gap-2">

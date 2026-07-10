@@ -12,6 +12,17 @@ interface SpeakerChipProps {
   confirmed?: boolean;
 }
 
+const MAX_SPEAKER_NAME_CODE_POINTS = 80;
+const MAX_SPEAKER_INPUT_CODE_POINTS = 160;
+
+function boundSpeakerInput(value: string): string {
+  return Array.from(value).slice(0, MAX_SPEAKER_INPUT_CODE_POINTS).join("");
+}
+
+function normalizeSpeakerName(value: string): string {
+  return Array.from(value.trim()).slice(0, MAX_SPEAKER_NAME_CODE_POINTS).join("");
+}
+
 export default function SpeakerChip({
   personId,
   displayName,
@@ -29,7 +40,8 @@ export default function SpeakerChip({
   useEffect(() => setName(displayName), [displayName]);
 
   const persist = async (input: { displayName?: string; isSelf?: boolean }) => {
-    const trimmed = input.displayName?.trim();
+    const trimmed =
+      input.displayName === undefined ? undefined : normalizeSpeakerName(input.displayName);
     if ((input.displayName !== undefined && !trimmed) || saving) return;
     setSaving(true);
     setError(false);
@@ -81,7 +93,8 @@ export default function SpeakerChip({
           <input
             id={`speaker-${personId}`}
             value={name}
-            onChange={(event) => setName(event.target.value)}
+            onChange={(event) => setName(boundSpeakerInput(event.target.value))}
+            maxLength={MAX_SPEAKER_INPUT_CODE_POINTS * 2}
             autoComplete="off"
             className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring/30"
           />
@@ -91,7 +104,7 @@ export default function SpeakerChip({
             </p>
           )}
           <div className="flex gap-2">
-            <Button type="submit" size="sm" disabled={!name.trim() || saving}>
+            <Button type="submit" size="sm" disabled={!normalizeSpeakerName(name) || saving}>
               <Check aria-hidden="true" />
               {t("jarvis.saveSpeakerName")}
             </Button>

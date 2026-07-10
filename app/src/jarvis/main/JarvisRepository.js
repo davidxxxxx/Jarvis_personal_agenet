@@ -3,6 +3,17 @@ const { assertId, assertSessionStatus } = require("../shared/contracts");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
+const MAX_SPEAKER_NAME_CODE_POINTS = 80;
+
+function normalizeSpeakerName(value) {
+  if (typeof value !== "string") throw new TypeError("displayName must be a string");
+  const trimmed = value.trim();
+  if (!trimmed) throw new TypeError("displayName must not be empty");
+  if (Array.from(trimmed).length > MAX_SPEAKER_NAME_CODE_POINTS) {
+    throw new RangeError("displayName must contain at most 80 Unicode code points");
+  }
+  return trimmed;
+}
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions (
@@ -302,12 +313,7 @@ class JarvisRepository {
     const hasIsSelf = Object.prototype.hasOwnProperty.call(input, "isSelf");
     const hasVoiceProfileId = Object.prototype.hasOwnProperty.call(input, "voiceProfileId");
 
-    if (
-      hasDisplayName &&
-      (typeof input.displayName !== "string" || input.displayName.trim().length === 0)
-    ) {
-      throw new TypeError("displayName must not be empty");
-    }
+    const displayName = hasDisplayName ? normalizeSpeakerName(input.displayName) : null;
     if (!hasDisplayName && !existing) {
       throw new TypeError("displayName is required when creating a person");
     }
@@ -324,7 +330,7 @@ class JarvisRepository {
 
     const update = {
       personId: safePersonId,
-      displayName: hasDisplayName ? input.displayName.trim() : existing.display_name,
+      displayName: hasDisplayName ? displayName : existing.display_name,
       isSelf: hasIsSelf ? (input.isSelf ? 1 : 0) : (existing?.is_self ?? 0),
       voiceProfileId: hasVoiceProfileId
         ? (input.voiceProfileId ?? null)

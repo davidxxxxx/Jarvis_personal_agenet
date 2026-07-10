@@ -62,4 +62,20 @@ describe("SpeakerChip", () => {
 
     expect(screen.getByRole("button", { name: "待确认" })).toBeInTheDocument();
   });
+
+  it("trims speaker edits to 80 Unicode code points before IPC", async () => {
+    render(<SpeakerChip personId="p2" displayName="说话人 2" confidence={0.9} />);
+    const longName = `  ${"😀".repeat(81)}  `;
+
+    fireEvent.click(screen.getByRole("button", { name: "说话人 2" }));
+    fireEvent.change(screen.getByLabelText("说话人姓名"), { target: { value: longName } });
+    fireEvent.click(screen.getByRole("button", { name: "保存姓名" }));
+
+    await waitFor(() => {
+      expect(window.electronAPI.jarvis.renamePerson).toHaveBeenCalledWith({
+        personId: "p2",
+        displayName: "😀".repeat(80),
+      });
+    });
+  });
 });

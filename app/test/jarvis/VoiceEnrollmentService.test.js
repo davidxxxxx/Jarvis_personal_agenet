@@ -9,6 +9,11 @@ const {
 
 const OWNER_ID = 41;
 const WINDOW_SAMPLES = CAPTURE_SAMPLE_RATE * 8;
+const EMBEDDING_DIMENSION = 512;
+
+function embedding(value = 1, dimension = EMBEDDING_DIMENSION) {
+  return new Float32Array(dimension).fill(value);
+}
 
 function speechWindow(index, length = WINDOW_SAMPLES) {
   const startSample = index * WINDOW_SAMPLES;
@@ -30,17 +35,21 @@ function validPayload(overrides = {}) {
   };
 }
 
-function createService({ embeddings, now = 1_000, profileId = SELF_VOICE_PROFILE_ID } = {}) {
+function createService({
+  embeddings,
+  centroid,
+  now = 1_000,
+  profileId = SELF_VOICE_PROFILE_ID,
+  sessionTtlMs,
+  maxActiveSessions,
+} = {}) {
   const savedProfiles = [];
   const renamedPeople = [];
   const extractedWindows = [];
   let currentTime = now;
   let nextEmbedding = 0;
-  const deterministicEmbeddings = embeddings ?? [
-    new Float32Array([1, 2, 3]),
-    new Float32Array([4, 5, 6]),
-    new Float32Array([7, 8, 9]),
-  ];
+  const deterministicEmbeddings = embeddings ?? [embedding(1), embedding(4), embedding(7)];
+  let nextId = 0;
   const service = new VoiceEnrollmentService({
     speakerEmbeddings: {
       extractEmbeddingFromSamples: async (samples) => {
@@ -48,12 +57,13 @@ function createService({ embeddings, now = 1_000, profileId = SELF_VOICE_PROFILE
         return deterministicEmbeddings[nextEmbedding++] ?? null;
       },
       computeCentroid(items) {
-        const centroid = new Float32Array(items[0].length);
+        if (centroid !== undefined) return centroid;
+        const computed = new Float32Array(items[0].length);
         for (const item of items) {
-          for (let index = 0; index < item.length; index += 1) centroid[index] += item[index];
+          for (let index = 0; index < item.length; index += 1) computed[index] += item[index];
         }
-        for (let index = 0; index < centroid.length; index += 1) centroid[index] /= items.length;
-        return centroid;
+        for (let index = 0; index < computed.length; index += 1) computed[index] /= items.length;
+        return computed;
       },
     },
     databaseManager: {
@@ -68,8 +78,13 @@ function createService({ embeddings, now = 1_000, profileId = SELF_VOICE_PROFILE
         return { id: input.personId };
       },
     },
-    createId: () => "opaque-enrollment-id",
+    createId: () => {
+      nextId += 1;
+      return nextId === 1 ? "opaque-enrollment-id" : `opaque-enrollment-id-${nextId}`;
+    },
     now: () => currentTime,
+    ...(sessionTtlMs === undefined ? {} : { sessionTtlMs }),
+    ...(maxActiveSessions === undefined ? {} : { maxActiveSessions }),
   });
   return {
     service,
@@ -82,8 +97,10 @@ function createService({ embeddings, now = 1_000, profileId = SELF_VOICE_PROFILE
   };
 }
 
-async function begin(service, ownerId = OWNER_ID) {
-  return service.begin({ ownerId });
+async function begin(harness, ownerId = OWNER_ID) {
+  const session = harness.service.begin({ ownerId });
+  harness.advance(30_000);
+  return session;
 }
 
 test("begins an opaque owner-bound 24 kHz mono Float32 enrollment session", () => {
@@ -102,8 +119,9 @@ test("begins an opaque owner-bound 24 kHz mono Float32 enrollment session", () =
 });
 
 test("saves three downsampled embeddings to the reserved self profile exactly once", async () => {
-  const { service, savedProfiles, renamedPeople, extractedWindows } = createService();
-  const session = await begin(service);
+  const harness = createService();
+  const { service, savedProfiles, renamedPeople, extractedWindows } = harness;
+  const session = await begin(harness);
 
   const result = await service.complete({
     ownerId: OWNER_ID,
@@ -128,7 +146,7 @@ test("saves three downsampled embeddings to the reserved self profile exactly on
         savedProfiles[0].embedding.byteLength / Float32Array.BYTES_PER_ELEMENT
       )
     ),
-    [4, 5, 6]
+    new Array(EMBEDDING_DIMENSION).fill(4)
   );
   assert.deepEqual(renamedPeople, [
     {
@@ -155,7 +173,7 @@ test("rejects unknown, foreign-owner, expired, and cancelled enrollment sessions
     /unknown enrollment session/
   );
 
-  const foreign = await begin(harness.service);
+  const foreign = await begin(harness);
   await assert.rejects(
     harness.service.complete({
       ownerId: OWNER_ID + 1,
@@ -175,7 +193,7 @@ test("rejects unknown, foreign-owner, expired, and cancelled enrollment sessions
     /unknown enrollment session/
   );
 
-  const expired = await begin(harness.service);
+  const expired = await begin(harness);
   harness.advance(120_001);
   await assert.rejects(
     harness.service.complete({
@@ -194,8 +212,9 @@ test("rejects wrong sample rate, channels, or sample format before embedding", a
     ["format", "int16"],
   ]) {
     await t.test(`${field}=${value}`, async () => {
-      const { service, extractedWindows } = createService();
-      const session = await begin(service);
+      const harness = createService();
+      const { service, extractedWindows } = harness;
+      const session = await begin(harness);
       await assert.rejects(
         service.complete({
           ownerId: OWNER_ID,
@@ -212,8 +231,9 @@ test("rejects wrong sample rate, channels, or sample format before embedding", a
 test("rejects NaN, Infinity, and out-of-range PCM before embedding", async (t) => {
   for (const value of [Number.NaN, Number.POSITIVE_INFINITY, 1.01, -1.01]) {
     await t.test(String(value), async () => {
-      const { service, extractedWindows } = createService();
-      const session = await begin(service);
+      const harness = createService();
+      const { service, extractedWindows } = harness;
+      const session = await begin(harness);
       const payload = validPayload();
       payload.windows[1].samples[10] = value;
       await assert.rejects(
@@ -269,8 +289,9 @@ test("rejects undersized, oversized, overlapping, and implausible-duration paylo
 
   for (const entry of cases) {
     await t.test(entry.name, async () => {
-      const { service, extractedWindows } = createService();
-      const session = await begin(service);
+      const harness = createService();
+      const { service, extractedWindows } = harness;
+      const session = await begin(harness);
       const payload = validPayload();
       entry.mutate(payload);
       await assert.rejects(
@@ -284,9 +305,9 @@ test("rejects undersized, oversized, overlapping, and implausible-duration paylo
 
 test("rejects fewer than three valid embeddings and a mismatched returned profile id", async () => {
   const missing = createService({
-    embeddings: [new Float32Array([1, 2]), null, new Float32Array([3, 4])],
+    embeddings: [embedding(1), null, embedding(3)],
   });
-  const missingSession = await begin(missing.service);
+  const missingSession = await begin(missing);
   await assert.rejects(
     missing.service.complete({
       ownerId: OWNER_ID,
@@ -298,7 +319,7 @@ test("rejects fewer than three valid embeddings and a mismatched returned profil
   assert.equal(missing.savedProfiles.length, 0);
 
   const mismatched = createService({ profileId: 12 });
-  const mismatchedSession = await begin(mismatched.service);
+  const mismatchedSession = await begin(mismatched);
   await assert.rejects(
     mismatched.service.complete({
       ownerId: OWNER_ID,
@@ -308,4 +329,134 @@ test("rejects fewer than three valid embeddings and a mismatched returned profil
     /reserved self profile/
   );
   assert.equal(mismatched.renamedPeople.length, 0);
+});
+
+test("attests minimum real elapsed capture time without sleeping", async () => {
+  const harness = createService();
+  const session = harness.service.begin({ ownerId: OWNER_ID });
+  harness.advance(28_999);
+
+  await assert.rejects(
+    harness.service.complete({
+      ownerId: OWNER_ID,
+      sessionId: session.sessionId,
+      payload: validPayload(),
+    }),
+    /minimum real capture duration/
+  );
+  assert.equal(harness.extractedWindows.length, 0);
+
+  harness.advance(1);
+  const result = await harness.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: session.sessionId,
+    payload: validPayload(),
+  });
+  assert.equal(result.profileId, SELF_VOICE_PROFILE_ID);
+});
+
+test("bounds active sessions per owner and globally while sweeping expiry", () => {
+  const harness = createService({ maxActiveSessions: 3, sessionTtlMs: 1_000 });
+  const first = harness.service.begin({ ownerId: 1 });
+  assert.throws(() => harness.service.begin({ ownerId: 1 }), /already active/);
+  harness.service.begin({ ownerId: 2 });
+  harness.service.begin({ ownerId: 3 });
+  assert.throws(() => harness.service.begin({ ownerId: 4 }), /capacity/);
+
+  harness.advance(1_001);
+  const replacement = harness.service.begin({ ownerId: 1 });
+  assert.notEqual(replacement.sessionId, first.sessionId);
+  assert.doesNotThrow(() => harness.service.begin({ ownerId: 4 }));
+});
+
+test("cancelOwner clears renderer-owned sessions and completion consumes invalid payloads", async () => {
+  const harness = createService();
+  const destroyed = harness.service.begin({ ownerId: OWNER_ID });
+  assert.equal(harness.service.cancelOwner(OWNER_ID), 1);
+  await assert.rejects(
+    harness.service.complete({
+      ownerId: OWNER_ID,
+      sessionId: destroyed.sessionId,
+      payload: validPayload(),
+    }),
+    /unknown enrollment session/
+  );
+
+  const invalid = await begin(harness);
+  const payload = validPayload();
+  payload.windows[0].samples[0] = Number.NaN;
+  await assert.rejects(
+    harness.service.complete({ ownerId: OWNER_ID, sessionId: invalid.sessionId, payload }),
+    /finite normalized PCM/
+  );
+  await assert.rejects(
+    harness.service.complete({
+      ownerId: OWNER_ID,
+      sessionId: invalid.sessionId,
+      payload: validPayload(),
+    }),
+    /unknown enrollment session/
+  );
+});
+
+test("zeroes main-owned PCM after a completion validation failure", async () => {
+  const harness = createService();
+  const session = await begin(harness);
+  const payload = validPayload();
+  payload.windows[1].samples[5] = Number.NaN;
+
+  await assert.rejects(
+    harness.service.complete({ ownerId: OWNER_ID, sessionId: session.sessionId, payload }),
+    /finite normalized PCM/
+  );
+
+  assert.equal(
+    payload.windows.every((entry) => entry.samples.every((sample) => sample === 0)),
+    true
+  );
+});
+
+test("rejects malformed 512-dimensional embeddings and centroids before persistence", async (t) => {
+  const malformedEmbeddings = [
+    ["short", embedding(1, 511)],
+    ["long", embedding(1, 513)],
+    ["NaN", Object.assign(embedding(1), { 8: Number.NaN })],
+    ["Infinity", Object.assign(embedding(1), { 8: Number.POSITIVE_INFINITY })],
+  ];
+  for (const [name, badEmbedding] of malformedEmbeddings) {
+    await t.test(name, async () => {
+      const harness = createService({ embeddings: [badEmbedding, embedding(2), embedding(3)] });
+      const session = await begin(harness);
+      await assert.rejects(
+        harness.service.complete({
+          ownerId: OWNER_ID,
+          sessionId: session.sessionId,
+          payload: validPayload(),
+        }),
+        /512 finite Float32 values/
+      );
+      assert.equal(harness.savedProfiles.length, 0);
+    });
+  }
+
+  for (const [name, badCentroid] of [
+    ["short centroid", embedding(1, 511)],
+    ["long centroid", embedding(1, 513)],
+    ["NaN centroid", Object.assign(embedding(1), { 3: Number.NaN })],
+    ["Infinity centroid", Object.assign(embedding(1), { 3: Number.POSITIVE_INFINITY })],
+  ]) {
+    await t.test(name, async () => {
+      const harness = createService({ centroid: badCentroid });
+      const session = await begin(harness);
+      await assert.rejects(
+        harness.service.complete({
+          ownerId: OWNER_ID,
+          sessionId: session.sessionId,
+          payload: validPayload(),
+        }),
+        /centroid must contain 512 finite Float32 values/
+      );
+      assert.equal(harness.savedProfiles.length, 0);
+    });
+  }
 });

@@ -11,7 +11,10 @@ const REQUIRED_WINDOWS = 3;
 const MIN_WINDOW_TOTAL_SECONDS = 24;
 const MAX_PAYLOAD_SECONDS = 25;
 const DEFAULT_SESSION_TTL_MS = 120_000;
-const SELF_VOICE_PROFILE_ID = 2_147_483_647;
+const DEFAULT_MAX_ACTIVE_SESSIONS = 8;
+const EXPECTED_EMBEDDING_DIMENSION = 512;
+const MIN_REAL_CAPTURE_MS = MIN_CAPTURE_SECONDS * 1_000;
+const SELF_VOICE_PROFILE_ID = -1;
 
 function requireOwnerId(ownerId) {
   if (!Number.isSafeInteger(ownerId) || ownerId < 0) {
@@ -102,6 +105,29 @@ function validatePayload(payload) {
   return windows;
 }
 
+function validateEmbedding(value, label) {
+  if (!(value instanceof Float32Array) || value.length !== EXPECTED_EMBEDDING_DIMENSION) {
+    throw new Error(
+      `voice enrollment ${label} must contain ${EXPECTED_EMBEDDING_DIMENSION} finite Float32 values`
+    );
+  }
+  for (const item of value) {
+    if (!Number.isFinite(item)) {
+      throw new Error(
+        `voice enrollment ${label} must contain ${EXPECTED_EMBEDDING_DIMENSION} finite Float32 values`
+      );
+    }
+  }
+  return value;
+}
+
+function zeroPayloadSamples(payload) {
+  if (!Array.isArray(payload?.windows)) return;
+  for (const entry of payload.windows) {
+    if (entry?.samples instanceof Float32Array) entry.samples.fill(0);
+  }
+}
+
 class VoiceEnrollmentService {
   constructor({
     speakerEmbeddings,
@@ -110,6 +136,7 @@ class VoiceEnrollmentService {
     createId = randomUUID,
     now = Date.now,
     sessionTtlMs = DEFAULT_SESSION_TTL_MS,
+    maxActiveSessions = DEFAULT_MAX_ACTIVE_SESSIONS,
   }) {
     if (
       !speakerEmbeddings ||
@@ -130,23 +157,44 @@ class VoiceEnrollmentService {
     if (!Number.isSafeInteger(sessionTtlMs) || sessionTtlMs < 1) {
       throw new TypeError("sessionTtlMs must be a positive safe integer");
     }
+    if (
+      !Number.isSafeInteger(maxActiveSessions) ||
+      maxActiveSessions < 1 ||
+      maxActiveSessions > 32
+    ) {
+      throw new TypeError("maxActiveSessions must be a safe integer between 1 and 32");
+    }
     this.speakerEmbeddings = speakerEmbeddings;
     this.databaseManager = databaseManager;
     this.repository = repository;
     this.createId = createId;
     this.now = now;
     this.sessionTtlMs = sessionTtlMs;
+    this.maxActiveSessions = maxActiveSessions;
     this.sessions = new Map();
+    this.ownerSessions = new Map();
   }
 
   begin({ ownerId }) {
     const safeOwnerId = requireOwnerId(ownerId);
+    const startedAt = this.now();
+    this._sweepExpired(startedAt);
+    if (this.ownerSessions.has(safeOwnerId)) {
+      throw new Error("renderer already active enrollment session");
+    }
+    if (this.sessions.size >= this.maxActiveSessions) {
+      throw new Error("voice enrollment session capacity reached");
+    }
     const sessionId = this.createId();
     if (typeof sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
       throw new TypeError("enrollment session id must be opaque and safe");
     }
-    const expiresAt = this.now() + this.sessionTtlMs;
-    this.sessions.set(sessionId, { ownerId: safeOwnerId, expiresAt });
+    if (this.sessions.has(sessionId)) {
+      throw new Error("enrollment session id collision");
+    }
+    const expiresAt = startedAt + this.sessionTtlMs;
+    this.sessions.set(sessionId, { ownerId: safeOwnerId, startedAt, expiresAt });
+    this.ownerSessions.set(safeOwnerId, sessionId);
     return {
       sessionId,
       expiresAt,
@@ -158,67 +206,106 @@ class VoiceEnrollmentService {
   }
 
   cancel({ ownerId, sessionId }) {
-    const session = this._getSession(ownerId, sessionId);
-    this.sessions.delete(sessionId);
+    const { session } = this._resolveSession(ownerId, sessionId);
+    this._deleteSession(sessionId, session);
     return { cancelled: true, expiresAt: session.expiresAt };
   }
 
-  async complete({ ownerId, sessionId, payload }) {
-    this._getSession(ownerId, sessionId);
-    const windows = validatePayload(payload);
-    this.sessions.delete(sessionId);
-
-    const embeddings = [];
-    for (const window of windows) {
-      const embedding = await this.speakerEmbeddings.extractEmbeddingFromSamples(
-        downsampleForEmbedding(window.samples)
-      );
-      if (embedding instanceof Float32Array && embedding.length > 0) embeddings.push(embedding);
-    }
-    if (embeddings.length !== REQUIRED_WINDOWS) {
-      throw new Error("voice enrollment requires three valid speech samples");
-    }
-
-    const centroid = this.speakerEmbeddings.computeCentroid(embeddings);
-    if (!(centroid instanceof Float32Array) || centroid.length === 0) {
-      throw new Error("voice enrollment could not create a speaker profile");
-    }
-    const profile = this.databaseManager.upsertSpeakerProfile(
-      "我",
-      null,
-      Buffer.from(centroid.buffer, centroid.byteOffset, centroid.byteLength),
-      SELF_VOICE_PROFILE_ID
-    );
-    if (!profile || profile.id !== SELF_VOICE_PROFILE_ID) {
-      throw new Error("database did not return the reserved self profile");
-    }
-    await this.repository.renamePerson({
-      personId: "self",
-      displayName: "我",
-      isSelf: true,
-      voiceProfileId: SELF_VOICE_PROFILE_ID,
-    });
-    return { profileId: SELF_VOICE_PROFILE_ID };
+  cancelOwner(ownerId) {
+    const safeOwnerId = requireOwnerId(ownerId);
+    this._sweepExpired(this.now());
+    const sessionId = this.ownerSessions.get(safeOwnerId);
+    if (!sessionId) return 0;
+    const session = this.sessions.get(sessionId);
+    if (session) this._deleteSession(sessionId, session);
+    else this.ownerSessions.delete(safeOwnerId);
+    return session ? 1 : 0;
   }
 
-  _getSession(ownerId, sessionId) {
+  async complete({ ownerId, sessionId, payload }) {
+    const { session, now } = this._resolveSession(ownerId, sessionId);
+    if (now - session.startedAt < MIN_REAL_CAPTURE_MS) {
+      throw new Error("voice enrollment has not reached the minimum real capture duration");
+    }
+    this._deleteSession(sessionId, session);
+    try {
+      const windows = validatePayload(payload);
+
+      const embeddings = [];
+      for (const window of windows) {
+        const embedding = await this.speakerEmbeddings.extractEmbeddingFromSamples(
+          downsampleForEmbedding(window.samples)
+        );
+        if (!(embedding instanceof Float32Array)) {
+          throw new Error("voice enrollment requires three valid speech samples");
+        }
+        embeddings.push(validateEmbedding(embedding, "embedding"));
+      }
+      if (embeddings.length !== REQUIRED_WINDOWS) {
+        throw new Error("voice enrollment requires three valid speech samples");
+      }
+
+      const centroid = validateEmbedding(
+        this.speakerEmbeddings.computeCentroid(embeddings),
+        "centroid"
+      );
+      const profile = this.databaseManager.upsertSpeakerProfile(
+        "我",
+        null,
+        Buffer.from(centroid.buffer, centroid.byteOffset, centroid.byteLength),
+        SELF_VOICE_PROFILE_ID
+      );
+      if (!profile || profile.id !== SELF_VOICE_PROFILE_ID) {
+        throw new Error("database did not return the reserved self profile");
+      }
+      await this.repository.renamePerson({
+        personId: "self",
+        displayName: "我",
+        isSelf: true,
+        voiceProfileId: SELF_VOICE_PROFILE_ID,
+      });
+      return { profileId: SELF_VOICE_PROFILE_ID };
+    } finally {
+      zeroPayloadSamples(payload);
+    }
+  }
+
+  _resolveSession(ownerId, sessionId) {
     const safeOwnerId = requireOwnerId(ownerId);
     if (typeof sessionId !== "string" || !sessionId) {
       throw new TypeError("enrollment session id is required");
     }
+    const now = this.now();
+    const expired = this._sweepExpired(now);
+    if (expired.has(sessionId)) throw new Error("enrollment session expired");
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error("unknown enrollment session");
     if (session.ownerId !== safeOwnerId) {
       throw new Error("enrollment session does not belong to this renderer");
     }
-    if (this.now() > session.expiresAt) {
-      this.sessions.delete(sessionId);
-      throw new Error("enrollment session expired");
+    return { session, now };
+  }
+
+  _deleteSession(sessionId, session) {
+    this.sessions.delete(sessionId);
+    if (this.ownerSessions.get(session.ownerId) === sessionId) {
+      this.ownerSessions.delete(session.ownerId);
     }
-    return session;
+  }
+
+  _sweepExpired(now) {
+    const expired = new Set();
+    for (const [sessionId, session] of this.sessions) {
+      if (now > session.expiresAt) {
+        expired.add(sessionId);
+        this._deleteSession(sessionId, session);
+      }
+    }
+    return expired;
   }
 }
 
 module.exports = VoiceEnrollmentService;
 module.exports.CAPTURE_SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
+module.exports.EXPECTED_EMBEDDING_DIMENSION = EXPECTED_EMBEDDING_DIMENSION;
 module.exports.SELF_VOICE_PROFILE_ID = SELF_VOICE_PROFILE_ID;

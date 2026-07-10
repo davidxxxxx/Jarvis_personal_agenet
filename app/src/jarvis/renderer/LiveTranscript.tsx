@@ -22,13 +22,25 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
       ),
     [segments]
   );
+  const lastSegment = orderedSegments.at(-1);
+  const tailSignature = lastSegment
+    ? [
+        lastSegment.id,
+        lastSegment.text,
+        lastSegment.speaker,
+        lastSegment.speakerName,
+        lastSegment.confidence,
+        lastSegment.speakerLocked,
+        lastSegment.timestamp,
+      ].join("\u0000")
+    : "";
 
   useEffect(() => {
     const tail = tailRef.current;
     if (tail && typeof tail.scrollIntoView === "function") {
       tail.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
-  }, [orderedSegments.length, partialText]);
+  }, [tailSignature, partialText]);
 
   return (
     <section className="min-h-0 flex-1 px-6 pb-6" aria-labelledby="live-transcript-title">

@@ -34,9 +34,15 @@ test("reserved self profile never blends with an unrelated profile named 我", (
   assert.equal(self.id, SELF_VOICE_PROFILE_ID);
   assert.notEqual(self.id, Number(unrelated.lastInsertRowid));
   assert.equal(
-    manager.db.prepare("SELECT sample_count FROM speaker_profiles WHERE id = ?").get(unrelated.lastInsertRowid)
-      .sample_count,
+    manager.db
+      .prepare("SELECT sample_count FROM speaker_profiles WHERE id = ?")
+      .get(unrelated.lastInsertRowid).sample_count,
     1
   );
+  assert.ok(SELF_VOICE_PROFILE_ID < 0);
+  const nextNormal = manager.db
+    .prepare("INSERT INTO speaker_profiles (display_name, embedding) VALUES (?, ?)")
+    .run("下一位", Buffer.from(new Float32Array([3, 4]).buffer));
+  assert.equal(Number(nextNormal.lastInsertRowid), 2);
   manager.db.close();
 });

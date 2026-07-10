@@ -35,11 +35,27 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
       throw new TypeError(`service.${method} must be a function`);
     }
   }
-  for (const method of ["begin", "complete", "cancel"]) {
+  for (const method of ["begin", "complete", "cancel", "cancelOwner"]) {
     if (!voiceEnrollmentService || typeof voiceEnrollmentService[method] !== "function") {
       throw new TypeError(`voiceEnrollmentService.${method} must be a function`);
     }
   }
+
+  const enrollmentOwnerListeners = new WeakSet();
+  const bindEnrollmentOwner = (event) => {
+    const sender = event?.sender;
+    if (!sender || typeof sender !== "object" || enrollmentOwnerListeners.has(sender)) return;
+    if (typeof sender.once !== "function") return;
+    const ownerId = sender.id;
+    enrollmentOwnerListeners.add(sender);
+    sender.once("destroyed", () => {
+      try {
+        voiceEnrollmentService.cancelOwner(ownerId);
+      } catch {
+        // Renderer destruction cleanup is best-effort and must not escape Electron's event loop.
+      }
+    });
+  };
 
   ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));
   ipcMain.handle(CHANNELS.setSessionStatus, (_event, id, status, at) =>
@@ -73,9 +89,10 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
   ipcMain.handle(CHANNELS.finishCapture, (_event, id, at) =>
     service.finishCapture(assertId(id, "sessionId"), at)
   );
-  ipcMain.handle(CHANNELS.beginVoiceEnrollment, (event) =>
-    voiceEnrollmentService.begin({ ownerId: event?.sender?.id })
-  );
+  ipcMain.handle(CHANNELS.beginVoiceEnrollment, (event) => {
+    bindEnrollmentOwner(event);
+    return voiceEnrollmentService.begin({ ownerId: event?.sender?.id });
+  });
   ipcMain.handle(CHANNELS.completeVoiceEnrollment, (event, sessionId, payload) =>
     voiceEnrollmentService.complete({ ownerId: event?.sender?.id, sessionId, payload })
   );

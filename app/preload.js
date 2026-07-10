@@ -1,5 +1,51 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+const ENROLLMENT_WINDOW_COUNT = 3;
+const ENROLLMENT_MAX_SAMPLES = 24_000 * 25;
+const ENROLLMENT_MAX_BYTES = ENROLLMENT_MAX_SAMPLES * Float32Array.BYTES_PER_ELEMENT;
+
+function assertVoiceEnrollmentPreflight(sessionId, payload) {
+  if (typeof sessionId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
+    throw new TypeError("enrollment session id must be opaque and safe");
+  }
+  if (!payload || typeof payload !== "object") {
+    throw new TypeError("voice enrollment payload is required");
+  }
+  if (
+    payload.sampleRate !== 24_000 ||
+    payload.channels !== 1 ||
+    payload.format !== "float32" ||
+    !Number.isSafeInteger(payload.recordedSampleCount)
+  ) {
+    throw new TypeError("voice enrollment preflight requires 24 kHz mono Float32 PCM");
+  }
+  if (!Array.isArray(payload.windows) || payload.windows.length !== ENROLLMENT_WINDOW_COUNT) {
+    throw new TypeError("voice enrollment preflight requires exactly three windows");
+  }
+  let totalSamples = 0;
+  let totalBytes = 0;
+  for (const entry of payload.windows) {
+    if (!entry || typeof entry !== "object" || !(entry.samples instanceof Float32Array)) {
+      throw new TypeError("voice enrollment preflight samples must be Float32Array values");
+    }
+    if (
+      !Number.isSafeInteger(entry.startSample) ||
+      !Number.isSafeInteger(entry.endSample) ||
+      entry.startSample < 0 ||
+      entry.endSample <= entry.startSample ||
+      entry.endSample - entry.startSample !== entry.samples.length ||
+      entry.endSample > payload.recordedSampleCount
+    ) {
+      throw new TypeError("voice enrollment preflight window boundaries are invalid");
+    }
+    totalSamples += entry.samples.length;
+    totalBytes += entry.samples.buffer.byteLength;
+    if (totalSamples > ENROLLMENT_MAX_SAMPLES || totalBytes > ENROLLMENT_MAX_BYTES) {
+      throw new RangeError("voice enrollment preflight exceeds the local PCM payload cap");
+    }
+  }
+}
+
 /**
  * Helper to register an IPC listener and return a cleanup function.
  * Ensures renderer code can easily remove listeners to avoid leaks.
@@ -50,8 +96,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     resumeCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:resume", id, at),
     finishCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:finish", id, at),
     beginVoiceEnrollment: () => ipcRenderer.invoke("jarvis:voice-enrollment:begin"),
-    completeVoiceEnrollment: (sessionId, payload) =>
-      ipcRenderer.invoke("jarvis:voice-enrollment:complete", sessionId, payload),
+    completeVoiceEnrollment: (sessionId, payload) => {
+      assertVoiceEnrollmentPreflight(sessionId, payload);
+      return ipcRenderer.invoke("jarvis:voice-enrollment:complete", sessionId, payload);
+    },
     cancelVoiceEnrollment: (sessionId) =>
       ipcRenderer.invoke("jarvis:voice-enrollment:cancel", sessionId),
     onControl: registerListener(

@@ -34,6 +34,7 @@ function createVoiceEnrollmentService(overrides = {}) {
     begin: () => "voice-begun",
     complete: () => "voice-enrolled",
     cancel: () => "voice-cancelled",
+    cancelOwner: () => 0,
     ...overrides,
   };
 }
@@ -156,11 +157,41 @@ test("IPC binds narrow voice enrollment sessions to the requesting renderer", as
     await handlers.get(CHANNELS.completeVoiceEnrollment)(event, "opaque-id", payload),
     "voice-enrolled"
   );
-  assert.equal(
-    handlers.get(CHANNELS.cancelVoiceEnrollment)(event, "opaque-id"),
-    "voice-cancelled"
-  );
+  assert.equal(handlers.get(CHANNELS.cancelVoiceEnrollment)(event, "opaque-id"), "voice-cancelled");
   assert.equal(typeof voiceEnrollmentService.complete, "function");
+});
+
+test("IPC cancels renderer-owned enrollment when the sender is destroyed", () => {
+  let destroyedListener;
+  const cancelOwnerCalls = [];
+  const voiceEnrollmentService = createVoiceEnrollmentService({
+    cancelOwner(ownerId) {
+      cancelOwnerCalls.push(ownerId);
+      return 1;
+    },
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService,
+  });
+  const event = {
+    sender: {
+      id: 42,
+      once(name, listener) {
+        assert.equal(name, "destroyed");
+        destroyedListener = listener;
+      },
+    },
+  };
+
+  handlers.get(CHANNELS.beginVoiceEnrollment)(event);
+  handlers.get(CHANNELS.beginVoiceEnrollment)(event);
+  assert.equal(typeof destroyedListener, "function");
+  destroyedListener();
+  assert.deepEqual(cancelOwnerCalls, [42]);
 });
 
 test("IPC registration rejects invalid IPC and missing handler capabilities", () => {
@@ -222,14 +253,18 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
     assert.deepEqual(registered, []);
   }
 
-  assert.throws(
-    () =>
-      registerJarvisIpc({
-        ipcMain: { handle() {} },
-        repository: createRepository(),
-        service: createService(),
-        voiceEnrollmentService: {},
-      }),
-    /voiceEnrollmentService\.begin must be a function/
-  );
+  for (const method of ["begin", "complete", "cancel", "cancelOwner"]) {
+    const voiceEnrollmentService = createVoiceEnrollmentService();
+    delete voiceEnrollmentService[method];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle() {} },
+          repository: createRepository(),
+          service: createService(),
+          voiceEnrollmentService,
+        }),
+      new RegExp(`voiceEnrollmentService\\.${method} must be a function`)
+    );
+  }
 });

@@ -248,6 +248,21 @@ test("ordinary rename preserves voice profile and mark-self preserves display na
   repo.close();
 });
 
+test("speaker names are trimmed and bounded to 80 Unicode code points", () => {
+  const repo = new JarvisRepository(":memory:");
+  const eightyEmoji = "😀".repeat(80);
+
+  const person = repo.renamePerson({ personId: "p2", displayName: `  ${eightyEmoji}  ` });
+
+  assert.equal(person.display_name, eightyEmoji);
+  assert.equal(Array.from(person.display_name).length, 80);
+  assert.throws(
+    () => repo.renamePerson({ personId: "p2", displayName: "😀".repeat(81) }),
+    /at most 80 Unicode code points/
+  );
+  repo.close();
+});
+
 test("person and segment writes roll back together when a segment violates the schema", () => {
   const repo = new JarvisRepository(":memory:");
   repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });

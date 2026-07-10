@@ -24,6 +24,7 @@
     "voiceEnrollmentPrivacy": "仅在本机处理和保存声纹，不保存或上传校准录音。",
     "voiceEnrollmentError": "声纹校准未完成，请录满时长后重试。",
     "voiceEnrollmentSaved": "你的本地声纹已保存。",
+    "voiceEnrollmentPending": "正在准备声纹校准",
     "audioLevel": "音频电平",
     "enableAfterAnalysis": "完成首次分析后启用",
     "todayDescription": "记录今天的对话，并随时查看实时转写。",

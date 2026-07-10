@@ -65,5 +65,9 @@ describe("JarvisShell", () => {
     expect(screen.getByTestId("jarvis-shell")).toHaveClass(
       "lg:grid-cols-[176px_minmax(420px,1fr)_320px]"
     );
+    expect(screen.getByRole("complementary", { name: "洞察" })).not.toHaveClass("hidden");
+    for (const explanation of screen.getAllByText("完成首次分析后启用")) {
+      expect(explanation).not.toHaveClass("hidden");
+    }
   });
 });

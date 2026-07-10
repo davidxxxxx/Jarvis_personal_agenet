@@ -2414,8 +2414,8 @@ class DatabaseManager {
   upsertSpeakerProfile(name, email, embeddingBuffer, profileId = null) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      if (profileId !== null && (!Number.isSafeInteger(profileId) || profileId < 1)) {
-        throw new TypeError("profileId must be a positive safe integer or null");
+      if (profileId !== null && (!Number.isSafeInteger(profileId) || profileId === 0)) {
+        throw new TypeError("profileId must be a non-zero safe integer or null");
       }
       const normalizedEmail = this._normalizeEmail(email);
       const hasReservedId = profileId !== null;

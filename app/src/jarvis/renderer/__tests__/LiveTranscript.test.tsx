@@ -89,4 +89,28 @@ describe("LiveTranscript", () => {
     });
     expect(screen.queryByRole("button", { name: "待确认" })).not.toBeInTheDocument();
   });
+
+  it("autoscrolls when the last stable row content is replaced in place", () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const { rerender } = render(
+      <LiveTranscript
+        segments={[{ id: "stable", text: "旧内容", source: "mic", timestamp: 1_000 }]}
+        partialText=""
+      />
+    );
+    const initialCalls = scrollIntoView.mock.calls.length;
+
+    rerender(
+      <LiveTranscript
+        segments={[{ id: "stable", text: "新内容", source: "mic", timestamp: 1_000 }]}
+        partialText=""
+      />
+    );
+
+    expect(scrollIntoView.mock.calls.length).toBe(initialCalls + 1);
+  });
 });
