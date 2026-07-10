@@ -22,6 +22,7 @@
     "localWindowDetails": "12 s stable windows · 2 s overlap",
     "cloudCorrectionOn": "Cloud correction on",
     "cloudCorrectionOff": "Cloud correction off",
+    "cloudAudioConsent": "Only suspicious audio clips are uploaded after you enable this switch.",
     "enableCloudCorrection": "Enable cloud correction",
     "monthlyHardLimit": "Monthly hard limit (USD)",
     "cloudUsageSummary": "Spent {{spent}} · Reserved {{reserved}} · Remaining {{remaining}}",

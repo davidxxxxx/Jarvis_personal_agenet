@@ -47,6 +47,9 @@ describe("TranscriptionQualityCard", () => {
     expect(screen.getByText("Turbo bilingual")).toBeInTheDocument();
     expect(screen.getByText("12 s stable windows · 2 s overlap")).toBeInTheDocument();
     expect(await screen.findByText("Cloud correction off")).toBeInTheDocument();
+    expect(
+      screen.getByText("Only suspicious audio clips are uploaded after you enable this switch.")
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Monthly hard limit (USD)")).toHaveValue(5);
     expect(screen.getByText("Spent $0.00 · Reserved $0.00 · Remaining $5.00")).toBeInTheDocument();
   });
@@ -81,5 +84,41 @@ describe("TranscriptionQualityCard", () => {
       })
     );
     expect(await screen.findByText("Cloud correction on")).toBeInTheDocument();
+  });
+
+  it("shows precise protected and unknown-usage fail-closed states", async () => {
+    installElectronApi({
+      getCloudBudget: vi.fn().mockResolvedValue({
+        ...DEFAULT_STATUS,
+        enabled: true,
+        keyConfigured: true,
+        spentMicrousd: 4_900_000,
+        remainingMicrousd: 100_000,
+        blockedReason: "budget_protected",
+      }),
+    });
+    const { unmount } = render(<TranscriptionQualityCard />);
+
+    expect(
+      await screen.findByText("Spent $4.90 · Reserved $0.00 · Remaining $0.10")
+    ).toBeInTheDocument();
+    expect(screen.getByText("The hard limit is protected. Cloud requests are paused.")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "98");
+
+    unmount();
+    installElectronApi({
+      getCloudBudget: vi.fn().mockResolvedValue({
+        ...DEFAULT_STATUS,
+        enabled: true,
+        keyConfigured: true,
+        blockedReason: "usage_unknown",
+      }),
+    });
+    render(<TranscriptionQualityCard />);
+    expect(
+      await screen.findByText(
+        "Usage could not be verified. Cloud requests are blocked for the rest of this month."
+      )
+    ).toBeInTheDocument();
   });
 });

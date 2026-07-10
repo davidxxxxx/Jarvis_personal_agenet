@@ -22,6 +22,7 @@
     "localWindowDetails": "12 秒稳定窗口 · 2 秒重叠上下文",
     "cloudCorrectionOn": "云端纠错已开启",
     "cloudCorrectionOff": "云端纠错已关闭",
+    "cloudAudioConsent": "只有在你开启此开关后，可疑的音频片段才会上传到云端。",
     "enableCloudCorrection": "启用云端纠错",
     "monthlyHardLimit": "每月硬预算上限（美元）",
     "cloudUsageSummary": "已花费 {{spent}} · 已预留 {{reserved}} · 剩余 {{remaining}}",

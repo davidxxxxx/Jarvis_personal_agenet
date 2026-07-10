@@ -79,6 +79,16 @@ export default function TranscriptionQualityCard() {
       : status?.blockedReason === "budget_protected"
         ? t("jarvis.cloudBudgetProtected")
         : null;
+  const usedPercent = status
+    ? Math.min(
+        100,
+        Math.round(
+          ((status.spentMicrousd + status.reservedMicrousd) /
+            status.monthlyLimitMicrousd) *
+            100
+        )
+      )
+    : 0;
 
   return (
     <section className="rounded-xl border border-border/50 bg-card/70 p-4">
@@ -113,6 +123,10 @@ export default function TranscriptionQualityCard() {
           </label>
         </div>
 
+        <p className="text-xs leading-5 text-muted-foreground">
+          {t("jarvis.cloudAudioConsent")}
+        </p>
+
         <label className="block text-xs text-muted-foreground">
           {t("jarvis.monthlyHardLimit")}
           <input
@@ -129,13 +143,27 @@ export default function TranscriptionQualityCard() {
         </label>
 
         {status && (
-          <p className="text-xs leading-5 text-muted-foreground">
-            {t("jarvis.cloudUsageSummary", {
-              spent: dollars(status.spentMicrousd),
-              reserved: dollars(status.reservedMicrousd),
-              remaining: dollars(status.remainingMicrousd),
-            })}
-          </p>
+          <div className="space-y-1.5">
+            <div
+              className="h-1.5 overflow-hidden rounded-full bg-muted"
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={usedPercent}
+            >
+              <div
+                className="h-full rounded-full bg-primary transition-[width]"
+                style={{ width: `${usedPercent}%` }}
+              />
+            </div>
+            <p className="text-xs leading-5 text-muted-foreground">
+              {t("jarvis.cloudUsageSummary", {
+                spent: dollars(status.spentMicrousd),
+                reserved: dollars(status.reservedMicrousd),
+                remaining: dollars(status.remainingMicrousd),
+              })}
+            </p>
+          </div>
         )}
         {blockedCopy && <p className="text-xs leading-5 text-amber-600">{blockedCopy}</p>}
 
