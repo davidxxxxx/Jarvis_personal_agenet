@@ -1,4 +1,5 @@
 .superpowers/
+.worktrees/
 work/
 outputs/
 node_modules/
@@ -9,4 +10,3 @@ release/
 *.log
 userdata/
 recordings/
-
