@@ -1673,6 +1673,8 @@ declare global {
         provider?: string;
         model?: string;
         language?: string;
+        micOnly?: boolean;
+        jarvisSessionId?: string | null;
       }) => Promise<{ success: boolean; alreadyPrepared?: boolean; error?: string }>;
       meetingTranscriptionStart?: (options: {
         provider?: string;

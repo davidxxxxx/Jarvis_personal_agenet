@@ -39,6 +39,8 @@ const {
   resolveMeetingCaptureMode,
   resolveMeetingCaptureModeWithPlan,
   routeMicOnlyPcm,
+  dispatchRealtimePcm,
+  settleMeetingPrepareBeforeStart,
 } = require("../jarvis/main/meetingCaptureMode");
 const postMigrationDetector = require("./postMigrationDetector");
 const {
@@ -3964,8 +3966,9 @@ class IPCHandlers {
     });
 
     let meetingTranscriptionStartInProgress = false;
-    let meetingTranscriptionPrepareInProgress = false;
-    let meetingTranscriptionPreparePromise = null;
+    let meetingTranscriptionPrepareState = null;
+    let meetingTranscriptionPrepareGeneration = 0;
+    let meetingPreparedCaptureMode = null;
 
     const DUPLICATE_TRANSCRIPT_WINDOW_MS = 6000;
     const DUPLICATE_TRANSCRIPT_MERGE_LIMIT = 3;
@@ -4514,15 +4517,25 @@ class IPCHandlers {
       !!this._meetingMicStreaming?.isConnected &&
       (systemAudioMode === "unsupported" || !!this._meetingSystemStreaming?.isConnected);
 
-    const connectRealtimeStreaming = async (event, options, resolvedCaptureMode = null) => {
-      if (this._meetingMicStreaming?.isConnected) {
-        await this._meetingMicStreaming.disconnect();
-      }
-      if (this._meetingSystemStreaming?.isConnected) {
-        await this._meetingSystemStreaming.disconnect();
-      }
+    const disconnectStreamingClients = async (...clients) => {
+      await Promise.all(
+        clients.filter(Boolean).map((client) => client.disconnect().catch(() => ({ text: "" })))
+      );
+    };
+
+    const connectRealtimeStreaming = async (
+      event,
+      options,
+      resolvedCaptureMode = null,
+      isCurrent = () => true
+    ) => {
+      const previousMicStreaming = this._meetingMicStreaming;
+      const previousSystemStreaming = this._meetingSystemStreaming;
       this._meetingMicStreaming = null;
       this._meetingSystemStreaming = null;
+      meetingPreparedCaptureMode = null;
+      await disconnectStreamingClients(previousMicStreaming, previousSystemStreaming);
+      if (!isCurrent()) return null;
       const win = BrowserWindow.fromWebContents(event.sender);
 
       const connectOpts = {
@@ -4554,19 +4567,34 @@ class IPCHandlers {
           },
         ];
       }
+      if (!isCurrent()) return null;
 
       const StreamingClass =
         STREAMING_CLIENT_BY_PROVIDER[options.provider] ?? OpenAIRealtimeStreaming;
+      const instances = {};
       for (const { ref, source } of pairs) {
-        this[ref] = new StreamingClass();
-        attachMeetingStreamingHandlers(this[ref], win, source);
+        instances[ref] = new StreamingClass();
+        attachMeetingStreamingHandlers(instances[ref], win, source);
       }
 
-      await Promise.all(
-        pairs.map(({ ref, secret }) =>
-          this[ref].connect({ apiKey: secret, token: secret, ...connectOpts })
-        )
-      );
+      try {
+        await Promise.all(
+          pairs.map(({ ref, secret }) =>
+            instances[ref].connect({ apiKey: secret, token: secret, ...connectOpts })
+          )
+        );
+      } catch (error) {
+        await disconnectStreamingClients(...Object.values(instances));
+        throw error;
+      }
+
+      if (!isCurrent()) {
+        await disconnectStreamingClients(...Object.values(instances));
+        return null;
+      }
+
+      this._meetingMicStreaming = instances._meetingMicStreaming || null;
+      this._meetingSystemStreaming = instances._meetingSystemStreaming || null;
 
       return win;
     };
@@ -4693,7 +4721,45 @@ class IPCHandlers {
       }
     };
 
-    const dispatchMeetingAudioBuffer = (buffer, source) => {
+    const transformMeetingMicBuffer = (buffer) => {
+      if (buffer.length < 2) return buffer;
+
+      const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length >> 1);
+      let sumSq = 0;
+      let peak = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const n = samples[i] / 0x7fff;
+        sumSq += n * n;
+        const abs = n < 0 ? -n : n;
+        if (abs > peak) peak = abs;
+      }
+      const rms = Math.sqrt(sumSq / samples.length);
+      const systemSpeaking = meetingEchoLeakDetector.isSystemSpeaking(
+        Date.now() - MEETING_MIC_BLEED_LOOKBACK_MS
+      );
+      let outbound = buffer;
+      if (rms < 0.0015 && peak < 0.05) {
+        outbound = Buffer.alloc(buffer.length);
+      } else if (
+        rms < MEETING_MIC_BLEED_RMS_CEILING &&
+        peak < MEETING_MIC_BLEED_PEAK_CEILING &&
+        systemSpeaking
+      ) {
+        outbound = Buffer.alloc(buffer.length);
+      }
+      if (meetingMicStatsLogCount < MEETING_MIC_STATS_LOG_LIMIT && (systemSpeaking || rms > 0.02)) {
+        meetingMicStatsLogCount += 1;
+        debugLogger.debug("Meeting mic audio stats", {
+          rms: rms.toFixed(4),
+          peak: peak.toFixed(4),
+          systemSpeaking,
+          zeroed: outbound !== buffer,
+        });
+      }
+      return outbound;
+    };
+
+    const dispatchMeetingAudioBuffer = (buffer, source, { preserveExactInput = false } = {}) => {
       if (meetingLocalMode) {
         meetingLocalBuffers[source].push(buffer);
         return;
@@ -4707,45 +4773,13 @@ class IPCHandlers {
         return;
       }
 
-      let outbound = buffer;
-      if (source === "mic" && buffer.length >= 2) {
-        const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length >> 1);
-        let sumSq = 0;
-        let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const n = samples[i] / 0x7fff;
-          sumSq += n * n;
-          const abs = n < 0 ? -n : n;
-          if (abs > peak) peak = abs;
-        }
-        const rms = Math.sqrt(sumSq / samples.length);
-        const systemSpeaking = meetingEchoLeakDetector.isSystemSpeaking(
-          Date.now() - MEETING_MIC_BLEED_LOOKBACK_MS
-        );
-        if (rms < 0.0015 && peak < 0.05) {
-          outbound = Buffer.alloc(buffer.length);
-        } else if (
-          rms < MEETING_MIC_BLEED_RMS_CEILING &&
-          peak < MEETING_MIC_BLEED_PEAK_CEILING &&
-          systemSpeaking
-        ) {
-          outbound = Buffer.alloc(buffer.length);
-        }
-        if (
-          meetingMicStatsLogCount < MEETING_MIC_STATS_LOG_LIMIT &&
-          (systemSpeaking || rms > 0.02)
-        ) {
-          meetingMicStatsLogCount += 1;
-          debugLogger.debug("Meeting mic audio stats", {
-            rms: rms.toFixed(4),
-            peak: peak.toFixed(4),
-            systemSpeaking,
-            zeroed: outbound !== buffer,
-          });
-        }
-      }
-
-      const sent = streaming.sendAudio(outbound);
+      const { sent } = dispatchRealtimePcm({
+        buffer,
+        source,
+        streaming,
+        preserveExactInput,
+        transformMicBuffer: transformMeetingMicBuffer,
+      });
       meetingSendCounts[source]++;
       if (meetingSendCounts[source] <= 5 || meetingSendCounts[source] % 100 === 0) {
         debugLogger.debug("Meeting audio send", {
@@ -5278,6 +5312,7 @@ class IPCHandlers {
     const resetMeetingStreamingState = () => {
       this._meetingMicStreaming = null;
       this._meetingSystemStreaming = null;
+      meetingPreparedCaptureMode = null;
       meetingSendCounts = { mic: 0, system: 0 };
       meetingLiveSpeakerStartedAt = null;
       meetingPendingMicChunks = [];
@@ -5418,11 +5453,30 @@ class IPCHandlers {
       }
     };
 
+    const cancelInFlightMeetingPrepare = () => {
+      const activePrepare = meetingTranscriptionPrepareState;
+      if (!activePrepare) return null;
+      activePrepare.cancelled = true;
+      meetingTranscriptionPrepareGeneration += 1;
+      meetingTranscriptionPrepareState = null;
+      void activePrepare.promise.catch(() => {});
+      return activePrepare;
+    };
+
     // Pre-warm: fetch tokens + connect WebSockets before user hits record
     ipcMain.handle("meeting-transcription-prepare", async (event, options = {}) => {
-      if (meetingTranscriptionPrepareInProgress || meetingTranscriptionStartInProgress) {
+      if (meetingTranscriptionStartInProgress) {
         debugLogger.debug("Meeting transcription prepare already in progress, ignoring");
         return { success: false, error: "Operation in progress" };
+      }
+
+      if (meetingTranscriptionPrepareState) {
+        if (options.micOnly === true && meetingTranscriptionPrepareState.micOnly !== true) {
+          cancelInFlightMeetingPrepare();
+        } else {
+          debugLogger.debug("Meeting transcription prepare already in progress, ignoring");
+          return { success: false, error: "Operation in progress" };
+        }
       }
 
       if (!ALLOWED_MEETING_PROVIDERS.has(options.provider)) {
@@ -5433,57 +5487,102 @@ class IPCHandlers {
         return { success: true };
       }
 
-      const captureMode = await resolveMeetingCaptureModeWithPlan(
-        options,
-        getMeetingSystemAudioPlan
-      );
-      const { systemAudioMode } = captureMode;
-
-      if (isMeetingStreamingConnected(systemAudioMode)) {
-        debugLogger.debug("Meeting transcription already prepared (warm connections)");
-        return { success: true, alreadyPrepared: true };
-      }
-
-      meetingTranscriptionPrepareInProgress = true;
-      meetingTranscriptionPreparePromise = (async () => {
+      const prepareGeneration = ++meetingTranscriptionPrepareGeneration;
+      const prepareState = {
+        cancelled: false,
+        generation: prepareGeneration,
+        micOnly: options.micOnly === true,
+        promise: null,
+      };
+      const preparePromise = (async () => {
         let timeoutHandle;
         try {
+          const captureMode = await resolveMeetingCaptureModeWithPlan(
+            options,
+            getMeetingSystemAudioPlan
+          );
+          if (
+            prepareState.cancelled ||
+            meetingTranscriptionPrepareState?.generation !== prepareGeneration
+          ) {
+            return { success: false, error: "Prepare superseded" };
+          }
+          const { systemAudioMode } = captureMode;
+          if (
+            isMeetingStreamingConnected(systemAudioMode) &&
+            (!captureMode.micOnly || meetingPreparedCaptureMode?.micOnly === true)
+          ) {
+            meetingPreparedCaptureMode = captureMode;
+            debugLogger.debug("Meeting transcription already prepared (warm connections)");
+            return { success: true, alreadyPrepared: true };
+          }
+
           await Promise.race([
-            connectRealtimeStreaming(event, options, captureMode),
+            connectRealtimeStreaming(
+              event,
+              options,
+              captureMode,
+              () =>
+                !prepareState.cancelled &&
+                meetingTranscriptionPrepareState?.generation === prepareGeneration
+            ),
             new Promise((_, reject) => {
               timeoutHandle = setTimeout(() => reject(new Error("Prepare timed out")), 15000);
             }),
           ]);
+          if (
+            prepareState.cancelled ||
+            meetingTranscriptionPrepareState?.generation !== prepareGeneration
+          ) {
+            return { success: false, error: "Prepare superseded" };
+          }
+          meetingPreparedCaptureMode = captureMode;
           debugLogger.debug("Meeting transcription prepared (meeting streams warm)");
           return { success: true };
         } catch (error) {
+          if (
+            prepareState.cancelled ||
+            meetingTranscriptionPrepareState?.generation !== prepareGeneration
+          ) {
+            return { success: false, error: "Prepare superseded" };
+          }
+          prepareState.cancelled = true;
           debugLogger.error("Meeting transcription prepare error", { error: error.message });
           return { success: false, error: error.message };
         } finally {
           if (timeoutHandle) clearTimeout(timeoutHandle);
-          meetingTranscriptionPrepareInProgress = false;
-          meetingTranscriptionPreparePromise = null;
+          if (meetingTranscriptionPrepareState?.generation === prepareGeneration) {
+            meetingTranscriptionPrepareState = null;
+          }
         }
       })();
+      prepareState.promise = preparePromise;
+      meetingTranscriptionPrepareState = prepareState;
 
-      return meetingTranscriptionPreparePromise;
+      return preparePromise;
     });
 
     ipcMain.handle("meeting-transcription-cancel", async () => {
+      if (meetingTranscriptionPrepareState) {
+        cancelInFlightMeetingPrepare();
+        return { success: true };
+      }
       if (isMeetingStreamingConnected() || meetingLocalTimer) {
         return { success: false, reason: "recording-active" };
       }
-      meetingTranscriptionPrepareInProgress = false;
       meetingTranscriptionStartInProgress = false;
-      meetingTranscriptionPreparePromise = null;
+      meetingTranscriptionPrepareState = null;
       return { success: true };
     });
 
     ipcMain.handle("meeting-transcription-start", async (event, options = {}) => {
-      // Wait for any in-flight prepare to finish before starting
-      if (meetingTranscriptionPreparePromise) {
-        debugLogger.debug("Meeting transcription start: waiting for in-flight prepare");
-        await meetingTranscriptionPreparePromise;
+      const prepareDisposition = await settleMeetingPrepareBeforeStart({
+        options,
+        activePrepare: meetingTranscriptionPrepareState,
+        cancelIncompatible: cancelInFlightMeetingPrepare,
+      });
+      if (prepareDisposition === "awaited") {
+        debugLogger.debug("Meeting transcription start: compatible prepare completed");
       }
 
       if (meetingTranscriptionStartInProgress) {
@@ -5507,6 +5606,13 @@ class IPCHandlers {
         if (captureMode.micOnly && !this.jarvisService) {
           throw new Error("Jarvis capture service is unavailable");
         }
+        if (
+          captureMode.micOnly &&
+          meetingPreparedCaptureMode?.micOnly !== true &&
+          (this._meetingMicStreaming || this._meetingSystemStreaming)
+        ) {
+          await disconnectMeetingStreaming();
+        }
         meetingEchoLeakDetector.reset();
         meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(options.noteId);
         meetingOneOnOneProfileBound = false;
@@ -5519,6 +5625,7 @@ class IPCHandlers {
 
         // If already prepared (warm connections from prepare), just re-attach handlers
         if (!meetingLocalMode && isMeetingStreamingConnected(systemAudioMode)) {
+          meetingPreparedCaptureMode = null;
           debugLogger.debug("Meeting transcription start: reusing warm connections");
           const win = BrowserWindow.fromWebContents(event.sender);
           attachMeetingStreamingHandlers(this._meetingMicStreaming, win, "mic");
@@ -5657,7 +5764,8 @@ class IPCHandlers {
               }
             },
             writeDiarization: (buffer) => writeMeetingDiarizationPcm(buffer, Date.now()),
-            dispatchTranscription: dispatchMeetingAudioBuffer,
+            dispatchTranscription: (buffer, micSource) =>
+              dispatchMeetingAudioBuffer(buffer, micSource, { preserveExactInput: true }),
           });
           return;
         }

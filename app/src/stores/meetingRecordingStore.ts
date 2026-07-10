@@ -21,6 +21,11 @@ import {
   type TranscriptSpeakerLockSource,
   type TranscriptSpeakerStatus,
 } from "../utils/transcriptSpeakerState";
+import {
+  buildMeetingPrepareOptions,
+  shouldAwaitRendererPrepare,
+  type MeetingPrepareCaptureOptions,
+} from "../jarvis/renderer/meetingPreparation";
 
 export interface TranscriptSegment {
   id: string;
@@ -408,8 +413,11 @@ let systemStream: MediaStream | null = null;
 let isRecordingFlag = false;
 let isStartingFlag = false;
 let isPrepared = false;
+let preparedMicOnly: boolean | null = null;
 let segmentsRefValue: TranscriptSegment[] = [];
 let preparePromise: Promise<void> | null = null;
+let prepareMicOnly: boolean | null = null;
+let prepareGeneration = 0;
 let ipcCleanups: Array<() => void> = [];
 let speakerIdentifications: SpeakerIdentification[] = [];
 let nextPlaceholderSpeakerIndex = 0;
@@ -641,24 +649,38 @@ async function cleanup(): Promise<void> {
   ipcCleanups.forEach((fn) => fn());
   ipcCleanups = [];
   isPrepared = false;
+  preparedMicOnly = null;
   isRecordingFlag = false;
   isStartingFlag = false;
 }
 
-export async function prepareTranscription(): Promise<void> {
-  if (isPrepared || isRecordingFlag || isStartingFlag) return;
-  if (preparePromise) return preparePromise;
+export async function prepareTranscription(
+  captureOptions: MeetingPrepareCaptureOptions = {}
+): Promise<void> {
+  const micOnly = captureOptions.captureSystemAudio === false;
+  if ((isPrepared && preparedMicOnly === micOnly) || isRecordingFlag || isStartingFlag) return;
+  if (preparePromise) {
+    if (prepareMicOnly === micOnly) return preparePromise;
+    prepareGeneration += 1;
+    preparePromise = null;
+    prepareMicOnly = null;
+    isPrepared = false;
+    preparedMicOnly = null;
+  }
 
   logger.info("Meeting transcription preparing (pre-warming WebSockets)...", {}, "meeting");
 
+  const generation = ++prepareGeneration;
   const promise = (async () => {
     try {
       const result = await window.electronAPI?.meetingTranscriptionPrepare?.(
-        getMeetingTranscriptionOptions()
+        buildMeetingPrepareOptions(getMeetingTranscriptionOptions(), captureOptions)
       );
 
+      if (generation !== prepareGeneration) return;
       if (result?.success) {
         isPrepared = true;
+        preparedMicOnly = micOnly;
         logger.info(
           "Meeting transcription prepared",
           { alreadyPrepared: result.alreadyPrepared },
@@ -668,17 +690,22 @@ export async function prepareTranscription(): Promise<void> {
         logger.error("Meeting transcription prepare failed", { error: result?.error }, "meeting");
       }
     } catch (err) {
+      if (generation !== prepareGeneration) return;
       logger.error(
         "Meeting transcription prepare error",
         { error: (err as Error).message },
         "meeting"
       );
     } finally {
-      preparePromise = null;
+      if (generation === prepareGeneration) {
+        preparePromise = null;
+        prepareMicOnly = null;
+      }
     }
   })();
 
   preparePromise = promise;
+  prepareMicOnly = micOnly;
   await promise;
 }
 
@@ -753,8 +780,24 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   isRecordingFlag = true;
 
   if (preparePromise) {
-    logger.debug("Waiting for in-flight prepare to finish...", {}, "meeting");
-    await preparePromise;
+    if (
+      shouldAwaitRendererPrepare({
+        startMicOnly: args.captureSystemAudio === false,
+        prepareMicOnly,
+      })
+    ) {
+      logger.debug("Waiting for compatible in-flight prepare to finish...", {}, "meeting");
+      await preparePromise;
+    } else {
+      prepareGeneration += 1;
+      preparePromise = null;
+      prepareMicOnly = null;
+      isPrepared = false;
+      preparedMicOnly = null;
+    }
+  }
+  if (args.captureSystemAudio === false && preparedMicOnly !== true) {
+    isPrepared = false;
   }
 
   try {
@@ -1273,6 +1316,11 @@ export function lockSpeaker(speakerId: string, displayName: string): void {
 }
 
 export function cancelPreparedTranscription(): void {
+  prepareGeneration += 1;
+  preparePromise = null;
+  prepareMicOnly = null;
+  isPrepared = false;
+  preparedMicOnly = null;
   window.electronAPI?.meetingTranscriptionCancel?.();
 }
 

@@ -4,6 +4,8 @@ const {
   resolveMeetingCaptureMode,
   resolveMeetingCaptureModeWithPlan,
   routeMicOnlyPcm,
+  dispatchRealtimePcm,
+  settleMeetingPrepareBeforeStart,
 } = require("../../src/jarvis/main/meetingCaptureMode");
 const {
   MIN_FREE_BYTES,
@@ -71,6 +73,108 @@ test("mic-only PCM reaches each named consumer once using the same buffer", () =
   assert.equal(calls[2][1], pcm);
   assert.equal(calls[3][1], "mic");
   assert.equal(calls[3][2], pcm);
+});
+
+test("quiet mic-only PCM reaches realtime streaming with identical Buffer identity and bytes", () => {
+  const pcm = Buffer.from([1, 0, 2, 0]);
+  const received = [];
+
+  routeMicOnlyPcm({
+    sessionId: "s1",
+    pcmBuffer: pcm,
+    appendMicPcm() {},
+    feedSpeaker() {},
+    writeDiarization() {},
+    dispatchTranscription: (buffer, source) =>
+      dispatchRealtimePcm({
+        buffer,
+        source,
+        preserveExactInput: true,
+        transformMicBuffer: () => Buffer.alloc(buffer.length),
+        streaming: {
+          sendAudio(outbound) {
+            received.push(outbound);
+            return true;
+          },
+        },
+      }),
+  });
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0], pcm);
+  assert.deepEqual([...received[0]], [1, 0, 2, 0]);
+});
+
+test("normal realtime mic dispatch retains upstream buffer transformation", () => {
+  const pcm = Buffer.from([1, 0, 2, 0]);
+  let received = null;
+
+  dispatchRealtimePcm({
+    buffer: pcm,
+    source: "mic",
+    preserveExactInput: false,
+    transformMicBuffer: (buffer) => Buffer.alloc(buffer.length),
+    streaming: {
+      sendAudio(outbound) {
+        received = outbound;
+        return true;
+      },
+    },
+  });
+
+  assert.notEqual(received, pcm);
+  assert.deepEqual([...received], [0, 0, 0, 0]);
+});
+
+test("mic-only start cancels an incompatible in-flight prepare without awaiting or planning system audio", async () => {
+  let cancelCalls = 0;
+  let systemPlanCalls = 0;
+  const neverSettles = new Promise(() => {});
+
+  const result = await Promise.race([
+    settleMeetingPrepareBeforeStart({
+      options: { micOnly: true },
+      activePrepare: { micOnly: false, promise: neverSettles },
+      cancelIncompatible: () => {
+        cancelCalls += 1;
+      },
+    }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("mic-only start awaited incompatible prepare")), 50)
+    ),
+  ]);
+  const mode = await resolveMeetingCaptureModeWithPlan({ micOnly: true }, async () => {
+    systemPlanCalls += 1;
+    return { mode: "native", strategy: "native" };
+  });
+
+  assert.equal(result, "cancelled");
+  assert.equal(cancelCalls, 1);
+  assert.equal(systemPlanCalls, 0);
+  assert.equal(mode.systemAudioMode, "unsupported");
+});
+
+test("normal start continues to await a compatible in-flight prepare", async () => {
+  let releasePrepare;
+  const preparePromise = new Promise((resolve) => {
+    releasePrepare = resolve;
+  });
+  let settled = false;
+  const waiting = settleMeetingPrepareBeforeStart({
+    options: { micOnly: false },
+    activePrepare: { micOnly: false, promise: preparePromise },
+    cancelIncompatible() {
+      throw new Error("compatible prepare must not be cancelled");
+    },
+  }).then((result) => {
+    settled = true;
+    return result;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releasePrepare();
+  assert.equal(await waiting, "awaited");
 });
 
 test("disk cutoff is the greater of 5 GB and five percent of the volume", () => {
