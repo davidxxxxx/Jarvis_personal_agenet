@@ -296,6 +296,7 @@ const JarvisService = require("./src/jarvis/main/JarvisService");
 const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
+const { resolveRecordingsRoot } = require("./src/jarvis/main/recordingStorage");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
@@ -403,11 +404,15 @@ function initializeCoreManagers() {
   databaseManager = new DatabaseManager();
 
   const jarvisUserDataDir = app.getPath("userData");
-  const recordingsRoot = path.join(jarvisUserDataDir, "recordings");
+  const recordingsRoot = resolveRecordingsRoot(
+    jarvisUserDataDir,
+    process.env.JARVIS_RECORDINGS_DIR
+  );
   jarvisRepository = new JarvisRepository(path.join(jarvisUserDataDir, "jarvis.db"));
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: jarvisUserDataDir,
+    recordingsDir: recordingsRoot,
     broadcast: (state) => {
       windowManager?.sendToControlPanel("jarvis:state-changed", state);
       trayManager?.setJarvisState(state);

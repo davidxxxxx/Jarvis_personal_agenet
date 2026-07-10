@@ -47,6 +47,41 @@ function createSafeFs() {
   return fsImpl;
 }
 
+test("an explicit recordings directory controls disk checks and audio paths", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-data-"));
+  const recordingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-audio-"));
+  const repository = createRepository();
+  const checkedPaths = [];
+  const fsImpl = createSafeFs();
+  fsImpl.statfsSync = (checkedPath) => {
+    checkedPaths.push(checkedPath);
+    return { bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 };
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    recordingsDir,
+    broadcast() {},
+    now: () => 1_100,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(4_800, 1));
+    service.finishCapture("s1", 1_100);
+
+    assert.equal(checkedPaths.length > 0, true);
+    assert.equal(checkedPaths.every((checkedPath) => checkedPath === recordingsDir), true);
+    assert.equal(repository.chunks.length, 1);
+    assert.equal(repository.chunks[0].path.startsWith(recordingsDir), true);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+    fs.rmSync(recordingsDir, { recursive: true, force: true });
+  }
+});
+
 test("pause closes audio, resume reuses the session, and finish stores seven-day metadata", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();

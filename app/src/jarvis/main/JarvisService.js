@@ -15,7 +15,7 @@ class DiskSpaceError extends Error {
 }
 
 class JarvisService {
-  constructor({ repository, userDataDir, broadcast, now = Date.now, fsImpl = fs }) {
+  constructor({ repository, userDataDir, recordingsDir, broadcast, now = Date.now, fsImpl = fs }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
     }
@@ -39,7 +39,10 @@ class JarvisService {
     }
 
     this.repository = repository;
-    this.recordingsDir = path.join(userDataDir, "recordings");
+    if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
+      throw new TypeError("recordingsDir must be an absolute path");
+    }
+    this.recordingsDir = recordingsDir ? path.resolve(recordingsDir) : path.join(userDataDir, "recordings");
     this.broadcast = broadcast;
     this.now = now;
     this.fs = fsImpl;
