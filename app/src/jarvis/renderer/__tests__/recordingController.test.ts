@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { TranscriptSegment } from "../../../stores/meetingRecordingStore";
+import { createMeetingStopCoordinator } from "../../../stores/meetingStopCoordinator";
+import type { StopRecordingResult, TranscriptSegment } from "../../../stores/meetingRecordingStore";
 import type { SessionState, SessionStatus } from "../sessionMachine";
 import { createRecordingController, type RecordingDependencies } from "../useJarvisRecording";
 
@@ -11,6 +12,14 @@ const stableSegment: TranscriptSegment = {
   speaker: "self",
   speakerName: "Me",
 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 function sessionFor(status: SessionStatus): SessionState {
   if (status === "idle") {
@@ -414,4 +423,42 @@ describe("Jarvis recording controller", () => {
     expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
     expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
   });
+
+  it.each(["pause", "finish"] as const)(
+    "does not %s main capture when a strict stop shares a default caller's failure",
+    async (action) => {
+      const harness = createHarness({ status: "recording", segments: [stableSegment] });
+      const previous = harness.getSession();
+      const gate = deferred<void>();
+      const teardown = vi.fn(async () => {
+        await gate.promise;
+        return {
+          diarizationSessionId: null,
+          success: false,
+          error: "shared stop failed",
+        };
+      });
+      const coordinator = createMeetingStopCoordinator<StopRecordingResult>((error) => ({
+        diarizationSessionId: null,
+        success: false,
+        error: error instanceof Error ? error.message : "shared stop failed",
+      }));
+      harness.stopRecording.mockImplementation((options) => coordinator.stop(teardown, options));
+      const normalStop = harness.stopRecording();
+      const controller = createRecordingController(harness.deps);
+      const controllerAction = controller[action]();
+      const controllerFailure = expect(controllerAction).rejects.toThrow("shared stop failed");
+
+      await Promise.resolve();
+      gate.resolve();
+      await expect(normalStop).resolves.toMatchObject({ success: false });
+      await controllerFailure;
+
+      expect(teardown).toHaveBeenCalledTimes(1);
+      expect(harness.getSession()).toEqual(previous);
+      expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
+      expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+      expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
+    }
+  );
 });

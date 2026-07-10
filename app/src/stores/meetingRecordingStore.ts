@@ -26,6 +26,7 @@ import {
   shouldAwaitRendererPrepare,
   type MeetingPrepareCaptureOptions,
 } from "../jarvis/renderer/meetingPreparation";
+import { createMeetingStopCoordinator, type SharedStopOptions } from "./meetingStopCoordinator";
 
 export interface TranscriptSegment {
   id: string;
@@ -413,7 +414,6 @@ let systemProcessor: AudioWorkletNode | null = null;
 let systemStream: MediaStream | null = null;
 let isRecordingFlag = false;
 let isStartingFlag = false;
-let isStopPendingFlag = false;
 let isPrepared = false;
 let preparedMicOnly: boolean | null = null;
 let segmentsRefValue: TranscriptSegment[] = [];
@@ -723,7 +723,7 @@ export interface StartRecordingArgs {
 }
 
 export async function startRecording(args: StartRecordingArgs): Promise<void> {
-  if (isRecordingFlag || isStartingFlag || isStopPendingFlag) return;
+  if (isRecordingFlag || isStartingFlag || meetingStopCoordinator.hasPendingStop()) return;
   isStartingFlag = true;
 
   const initialEnabled =
@@ -1254,29 +1254,48 @@ export interface StopRecordingResult {
   error?: string;
 }
 
-export interface StopRecordingOptions {
-  throwOnError?: boolean;
+export type StopRecordingOptions = SharedStopOptions;
+
+const meetingStopCoordinator = createMeetingStopCoordinator<StopRecordingResult>((error) => {
+  const stopError =
+    error instanceof Error ? error : new Error("Failed to stop meeting transcription");
+  return publishStopFailure(stopError);
+});
+
+function resetStoppedMeetingState(): void {
+  useMeetingRecordingStore.setState({
+    micPartial: "",
+    systemPartial: "",
+    systemPartialSpeakerId: null,
+    systemPartialSpeakerName: null,
+    currentMicLevel: 0,
+  });
 }
 
-export async function stopRecording(
-  options: StopRecordingOptions = {}
-): Promise<StopRecordingResult> {
-  if (!isRecordingFlag && !isStopPendingFlag) {
-    return { diarizationSessionId: null, success: true };
-  }
+function publishStopFailure(
+  stopError: Error,
+  diarizationSessionId: string | null = null
+): StopRecordingResult {
+  useMeetingRecordingStore.setState({ error: stopError.message });
+  logger.error(
+    "Meeting transcription stop failed",
+    { errorCode: "meeting_stop_failed" },
+    "meeting"
+  );
+  resetStoppedMeetingState();
+  return { diarizationSessionId, success: false, error: stopError.message };
+}
 
-  if (isRecordingFlag || isStartingFlag) {
-    isRecordingFlag = false;
-    isStartingFlag = false;
-    useMeetingRecordingStore.setState({ isRecording: false, isTranscribing: false });
-
-    await cleanup();
-  }
-
+async function performMeetingStop(): Promise<StopRecordingResult> {
   let diarizationSessionId: string | null = null;
-  let stopError: Error | null = null;
-  isStopPendingFlag = true;
   try {
+    if (isRecordingFlag || isStartingFlag) {
+      isRecordingFlag = false;
+      isStartingFlag = false;
+      useMeetingRecordingStore.setState({ isRecording: false, isTranscribing: false });
+      await cleanup();
+    }
+
     const result = await window.electronAPI?.meetingTranscriptionStop?.();
     if (result?.diarizationSessionId) {
       diarizationSessionId = result.diarizationSessionId;
@@ -1286,38 +1305,29 @@ export async function stopRecording(
       useMeetingRecordingStore.setState({ transcript: result.transcript });
     }
     if (result?.success === false || result?.error) {
-      stopError = new Error(result.error || "Failed to stop meeting transcription");
+      return publishStopFailure(
+        new Error(result.error || "Failed to stop meeting transcription"),
+        diarizationSessionId
+      );
     }
   } catch (err) {
-    stopError = err instanceof Error ? err : new Error("Failed to stop meeting transcription");
+    const stopError =
+      err instanceof Error ? err : new Error("Failed to stop meeting transcription");
+    return publishStopFailure(stopError, diarizationSessionId);
   }
 
-  if (stopError) {
-    useMeetingRecordingStore.setState({ error: stopError.message });
-    logger.error(
-      "Meeting transcription stop failed",
-      { errorCode: "meeting_stop_failed" },
-      "meeting"
-    );
-  } else {
-    isStopPendingFlag = false;
+  resetStoppedMeetingState();
+  logger.info("Meeting transcription stopped", {}, "meeting");
+  return { diarizationSessionId, success: true };
+}
+
+export async function stopRecording(
+  options: StopRecordingOptions = {}
+): Promise<StopRecordingResult> {
+  if (!isRecordingFlag && !meetingStopCoordinator.hasPendingStop()) {
+    return { diarizationSessionId: null, success: true };
   }
-
-  useMeetingRecordingStore.setState({
-    micPartial: "",
-    systemPartial: "",
-    systemPartialSpeakerId: null,
-    systemPartialSpeakerName: null,
-    currentMicLevel: 0,
-  });
-
-  if (!stopError) logger.info("Meeting transcription stopped", {}, "meeting");
-  if (stopError && options.throwOnError) throw stopError;
-  return {
-    diarizationSessionId,
-    success: stopError === null,
-    ...(stopError ? { error: stopError.message } : {}),
-  };
+  return meetingStopCoordinator.stop(performMeetingStop, options);
 }
 
 export function lockSpeaker(speakerId: string, displayName: string): void {
