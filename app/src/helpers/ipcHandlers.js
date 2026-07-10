@@ -42,6 +42,13 @@ const {
   dispatchRealtimePcm,
   settleMeetingPrepareBeforeStart,
 } = require("../jarvis/main/meetingCaptureMode");
+const {
+  JARVIS_OVERLAP_MS,
+  JARVIS_STABLE_WINDOW_MS,
+  buildBilingualPrompt,
+  classifyTranscriptQuality,
+  mergeOverlappingTranscript,
+} = require("../jarvis/main/transcriptionQuality");
 const postMigrationDetector = require("./postMigrationDetector");
 const {
   DEFAULT_EXPECTED_SPEAKER_COUNT,
@@ -4093,6 +4100,7 @@ class IPCHandlers {
       text,
       source,
       timestamp,
+      confidence = null,
       micSuppression = null,
       send = null,
       includeInLocalTranscript = false,
@@ -4109,6 +4117,7 @@ class IPCHandlers {
           source,
           type: "final",
           timestamp,
+          ...(confidence == null ? {} : { confidence }),
         });
       }
     };
@@ -5002,7 +5011,12 @@ class IPCHandlers {
       if (!chunks.length) return;
 
       const pcm24k = Buffer.concat(chunks);
-      meetingLocalBuffers[source] = [];
+      if (activeJarvisSessionId) {
+        const overlapBytes = Math.floor((24_000 * 2 * JARVIS_OVERLAP_MS) / 1_000);
+        meetingLocalBuffers[source] = [Buffer.from(pcm24k.subarray(-overlapBytes))];
+      } else {
+        meetingLocalBuffers[source] = [];
+      }
 
       const pcm16k = downsample24kTo16k(pcm24k);
 
@@ -5052,12 +5066,20 @@ class IPCHandlers {
           result = await this.whisperManager.transcribeLocalWhisper(wav, {
             model: meetingLocalModel,
             language: meetingLocalLanguage,
+            ...(activeJarvisSessionId
+              ? { initialPrompt: buildBilingualPrompt(meetingLocalTranscript) }
+              : {}),
             ...vadOptions,
           });
         }
 
         if (result?.success && result.text?.trim()) {
-          const text = result.text.trim();
+          let text = result.text.trim();
+          if (activeJarvisSessionId) {
+            text = mergeOverlappingTranscript(meetingLocalTranscript, text);
+          }
+          if (!text) return;
+          const quality = classifyTranscriptQuality(text);
           const segTimestamp = Date.now();
           let micSuppression = null;
           if (source === "mic") {
@@ -5147,6 +5169,7 @@ class IPCHandlers {
                   text,
                   source,
                   timestamp: segTimestamp,
+                  confidence: quality.suspicious ? 0.25 : 0.8,
                   micSuppression,
                   send: sendLocalSegment,
                   includeInLocalTranscript: true,
@@ -5159,6 +5182,7 @@ class IPCHandlers {
             text,
             source,
             timestamp: segTimestamp,
+            confidence: quality.suspicious ? 0.25 : 0.8,
             micSuppression,
             send: sendLocalSegment,
             includeInLocalTranscript: true,
@@ -5667,7 +5691,7 @@ class IPCHandlers {
 
           meetingLocalTimer = setInterval(() => {
             transcribeAllLocalBuffers();
-          }, 5000);
+          }, activeJarvisSessionId ? JARVIS_STABLE_WINDOW_MS : 5000);
 
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,

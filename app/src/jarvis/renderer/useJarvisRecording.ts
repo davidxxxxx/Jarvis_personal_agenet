@@ -30,6 +30,14 @@ const PERSIST_DEBOUNCE_MS = 500;
 const DEFAULT_CONFIDENCE = 0.5;
 const DEFAULT_NOTE_TITLE = "今日记录";
 
+export function resolveJarvisWhisperModel(settings: {
+  meetingWhisperModel?: string;
+  whisperModel?: string;
+}): string {
+  const meetingModel = settings.meetingWhisperModel?.trim();
+  return meetingModel || "turbo";
+}
+
 export interface RecordingJarvisApi {
   createSession: (input: JarvisSessionInput) => Promise<JarvisSession>;
   setSessionStatus: (id: string, status: "failed", at?: number) => Promise<JarvisSession | null>;
@@ -178,6 +186,7 @@ function errorCode(error: unknown, fallback: string): string {
 }
 
 function recordingArgs(id: string, seedSegments?: TranscriptSegment[]): StartRecordingArgs {
+  const settings = getSettings();
   return {
     noteId: null,
     noteTitle: DEFAULT_NOTE_TITLE,
@@ -186,6 +195,9 @@ function recordingArgs(id: string, seedSegments?: TranscriptSegment[]): StartRec
     jarvisSessionId: id,
     diarizationEnabled: true,
     forceLocalTranscription: true,
+    localModelOverride: resolveJarvisWhisperModel(settings),
+    localLanguageOverride: null,
+    localPromptMode: "bilingual-context",
     ...(seedSegments ? { seedSegments } : {}),
   };
 }
@@ -721,7 +733,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       jarvis: rendererJarvisApi,
       ensureTranscriptionReady: async () => {
         const settings = getSettings();
-        const model = settings.meetingWhisperModel || settings.whisperModel || "base";
+        const model = resolveJarvisWhisperModel(settings);
         const status = await window.electronAPI.checkModelStatus(model);
         if (!status.success) {
           throw new RecordingOperationError(

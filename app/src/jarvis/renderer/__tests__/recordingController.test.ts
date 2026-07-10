@@ -4,10 +4,25 @@ import type { StopRecordingResult, TranscriptSegment } from "../../../stores/mee
 import type { SessionState, SessionStatus } from "../sessionMachine";
 import {
   createRecordingController,
+  resolveJarvisWhisperModel,
   routeJarvisControl,
   type RecordingController,
   type RecordingDependencies,
 } from "../useJarvisRecording";
+
+describe("Jarvis local Whisper model", () => {
+  it("defaults Jarvis to turbo without inheriting the global base default", () => {
+    expect(resolveJarvisWhisperModel({ meetingWhisperModel: "", whisperModel: "base" })).toBe(
+      "turbo"
+    );
+  });
+
+  it("preserves an explicit meeting model selection", () => {
+    expect(resolveJarvisWhisperModel({ meetingWhisperModel: "small", whisperModel: "base" })).toBe(
+      "small"
+    );
+  });
+});
 
 const stableSegment: TranscriptSegment = {
   id: "seg-1",
@@ -301,6 +316,9 @@ describe("Jarvis recording controller", () => {
       jarvisSessionId: "s1",
       diarizationEnabled: true,
       forceLocalTranscription: true,
+      localModelOverride: "turbo",
+      localLanguageOverride: null,
+      localPromptMode: "bilingual-context",
     });
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
   });

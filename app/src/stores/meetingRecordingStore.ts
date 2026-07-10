@@ -122,7 +122,13 @@ const isSegmentWithinIdentificationWindow = (
   );
 };
 
-const getMeetingTranscriptionOptions = (forceLocalTranscription = false) => {
+const getMeetingTranscriptionOptions = (
+  forceLocalTranscription = false,
+  overrides: Pick<
+    StartRecordingArgs,
+    "localModelOverride" | "localLanguageOverride" | "localPromptMode"
+  > = {}
+) => {
   const state = getSettings();
   const resolved = selectResolvedMeetingTranscription(state);
   const language = getBaseLanguageCode(state.preferredLanguage);
@@ -134,8 +140,12 @@ const getMeetingTranscriptionOptions = (forceLocalTranscription = false) => {
       localModel:
         resolved.localTranscriptionProvider === "nvidia"
           ? resolved.parakeetModel || "parakeet-tdt-0.6b-v3"
-          : resolved.whisperModel || "base",
-      language,
+          : overrides.localModelOverride || resolved.whisperModel || "base",
+      language:
+        overrides.localLanguageOverride === null
+          ? null
+          : overrides.localLanguageOverride || language,
+      ...(overrides.localPromptMode ? { localPromptMode: overrides.localPromptMode } : {}),
     };
   }
 
@@ -807,6 +817,9 @@ export interface StartRecordingArgs {
   diarizationEnabled?: boolean | null;
   expectedCount?: number | null;
   forceLocalTranscription?: boolean;
+  localModelOverride?: string;
+  localLanguageOverride?: string | null;
+  localPromptMode?: "bilingual-context";
 }
 
 export async function startRecording(args: StartRecordingArgs): Promise<void> {
@@ -905,7 +918,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
     const [startResult, micResult, initialSystemCaptureResult] = await Promise.all([
       window.electronAPI?.meetingTranscriptionStart?.({
-        ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true),
+        ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true, args),
         noteId: args.noteId ?? null,
         micOnly: args.captureSystemAudio === false,
         jarvisSessionId: args.jarvisSessionId ?? null,

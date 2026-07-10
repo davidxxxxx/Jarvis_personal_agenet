@@ -59,6 +59,19 @@ test("main mic-only route uses the resolved mode and never finalizes Jarvis on m
   );
 });
 
+test("Jarvis local mode uses stable bilingual windows with PCM overlap and quality confidence", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+
+  assert.match(source, /buildBilingualPrompt/);
+  assert.match(source, /classifyTranscriptQuality/);
+  assert.match(source, /mergeOverlappingTranscript/);
+  assert.match(source, /JARVIS_STABLE_WINDOW_MS/);
+  assert.match(source, /JARVIS_OVERLAP_MS/);
+  assert.match(source, /initialPrompt:\s*buildBilingualPrompt\(meetingLocalTranscript\)/);
+  assert.match(source, /activeJarvisSessionId\s*\?\s*JARVIS_STABLE_WINDOW_MS\s*:\s*5000/);
+  assert.match(source, /confidence:\s*quality\.suspicious\s*\?\s*0\.25\s*:\s*0\.8/);
+});
+
 test("renderer reacts to authoritative capture failures and active mic loss", () => {
   const source = fs.readFileSync(
     path.join(appRoot, "src/jarvis/renderer/useJarvisRecording.ts"),
