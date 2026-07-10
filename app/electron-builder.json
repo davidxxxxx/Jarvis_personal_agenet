@@ -1,10 +1,10 @@
 {
-  "appId": "com.gizmolabs.openwhispr",
+  "appId": "com.local.jarvis-memory",
   "afterPack": "scripts/afterPack.js",
-  "productName": "OpenWhispr",
+  "productName": "Jarvis Memory",
   "protocols": {
-    "name": "OpenWhispr Protocol",
-    "schemes": ["openwhispr"]
+    "name": "Jarvis Memory Protocol",
+    "schemes": ["jarvis-memory"]
   },
   "directories": {
     "output": "dist"
@@ -250,11 +250,5 @@
       "height": 380
     }
   },
-  "publish": {
-    "provider": "github",
-    "owner": "OpenWhispr",
-    "repo": "openwhispr",
-    "private": false,
-    "releaseType": "draft"
-  }
+  "publish": null
 }
