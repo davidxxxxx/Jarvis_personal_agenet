@@ -3,6 +3,10 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import i18n from "../../../i18n";
 import JarvisShell from "../JarvisShell";
 
+vi.mock("../../../components/WindowControls", () => ({
+  default: () => <div data-testid="jarvis-window-controls">controls</div>,
+}));
+
 vi.mock("../useJarvisRecording", () => ({
   useJarvisRecording: () => ({
     session: {
@@ -41,6 +45,16 @@ beforeAll(async () => {
 });
 
 describe("JarvisShell", () => {
+  it("provides a draggable titlebar without making window controls draggable", () => {
+    render(<JarvisShell />);
+
+    expect(screen.getByTestId("jarvis-drag-region")).toHaveAttribute("data-app-region", "drag");
+    expect(screen.getByTestId("jarvis-window-controls").parentElement).toHaveAttribute(
+      "data-app-region",
+      "no-drag"
+    );
+  });
+
   it("shows the approved Today command-center hierarchy", () => {
     render(<JarvisShell />);
 

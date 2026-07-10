@@ -1086,3 +1086,11 @@ body:has(.agent-overlay-window) #root {
 .dark .rich-text-editor-content p.is-editor-empty:first-child::before {
   color: oklch(0.7 0 0 / 0.2);
 }
+/* Electron frameless-window hit regions. Keep interactive controls outside drag handling. */
+.jarvis-drag-region {
+  -webkit-app-region: drag;
+}
+
+.jarvis-no-drag-region {
+  -webkit-app-region: no-drag;
+}
