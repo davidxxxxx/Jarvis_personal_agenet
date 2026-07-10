@@ -80,12 +80,9 @@ const CREDENTIAL_PATTERNS = [
       /(?:AWS_ACCESS_KEY_ID|aws_access_key_id|accessKeyId)["'\s:=]{1,24}(?:AKIA|ASIA)[A-Z0-9]{16}\b/i,
   },
   { label: "google", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/ },
-  {
-    label: "private-key",
-    pattern:
-      /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\r?\n(?:[A-Za-z0-9+/=]{20,}\r?\n){2,}-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
-  },
 ];
+const PRIVATE_KEY_BLOCK_PATTERN =
+  /-----BEGIN[ \t]+(?:(RSA|EC|OPENSSH|ENCRYPTED)[ \t]+)?PRIVATE[ \t]+KEY[ \t]*-----([\s\S]*?)-----END[ \t]+(?:(RSA|EC|OPENSSH|ENCRYPTED)[ \t]+)?PRIVATE[ \t]+KEY[ \t]*-----/g;
 
 function isUnsafePackagePath(value) {
   if (typeof value !== "string" || value.startsWith("!")) return false;
@@ -123,7 +120,7 @@ function forbiddenProfilePath(value) {
     ) {
       return true;
     }
-    if (part === "default" && parts[index + 1] === "preferences") return true;
+    if (part === "default" && index < parts.length - 1) return true;
     if (part === "preferences" && ["default", "profile"].includes(parts[index - 1])) return true;
     if (PROFILE_STORAGE_PARTS.has(part) && (dependencyIndex < 0 || index < dependencyIndex)) {
       return true;
@@ -161,6 +158,22 @@ function assertSafeTextContent(buffer, relativePath) {
       throw new Error(`credential content (${label}) found [redacted]: ${relativePath}`);
     }
   }
+  if (containsPrivateKeyContent(text)) {
+    throw new Error(`credential content (private-key) found [redacted]: ${relativePath}`);
+  }
+}
+
+function containsPrivateKeyContent(text) {
+  const normalized = text.replace(/\\r\\n/g, "\n").replace(/\\[nr]/g, "\n");
+  PRIVATE_KEY_BLOCK_PATTERN.lastIndex = 0;
+  for (const match of normalized.matchAll(PRIVATE_KEY_BLOCK_PATTERN)) {
+    if ((match[1] ?? "") !== (match[3] ?? "")) continue;
+    const body = match[2].replace(/\s/g, "");
+    if (body.length >= 32 && body.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(body)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isProbablyBinary(buffer) {

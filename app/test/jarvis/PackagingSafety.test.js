@@ -193,6 +193,10 @@ test("package safety rejects Electron profile paths and aliases", async (t) => {
     "Guest Profile/Preferences",
     "System Profile/Preferences",
     "Default/Preferences",
+    "Default/Bookmarks",
+    "Default/Extensions/x",
+    "Default/Login Data",
+    "Default/Preferences.bak",
     "Cache/entry.bin",
     "Code Cache/entry.bin",
     "GPUCache/entry.bin",
@@ -218,6 +222,21 @@ test("package safety rejects Electron profile paths and aliases", async (t) => {
   }
 });
 
+test("package safety allows unrelated filenames containing default", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-default-name-"));
+  const files = ["assets/default-theme.json", "assets/mydefault.conf", "defaults/readme.txt"];
+  for (const relativePath of files) {
+    const filePath = path.join(root, ...relativePath.split("/"));
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, "safe text");
+  }
+  try {
+    assert.doesNotThrow(() => assertSafeArtifactTree(root));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("package safety scans common and extensionless text with redacted findings", async (t) => {
   for (const extension of [".ini", ".conf", ".toml", ".properties", "", ".custom"]) {
     await t.test(extension || "extensionless", () => {
@@ -233,6 +252,78 @@ test("package safety scans common and extensionless text with redacted findings"
             return true;
           }
         );
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+const PRIVATE_KEY_LABELS = [
+  "RSA PRIVATE KEY",
+  "EC PRIVATE KEY",
+  "OPENSSH PRIVATE KEY",
+  "PRIVATE KEY",
+  "ENCRYPTED PRIVATE KEY",
+];
+
+function createPrivateKeyFixture(label, { escaped = false, wrapped = false } = {}) {
+  const body = Buffer.from(`${label}:${"private-material-".repeat(12)}`).toString("base64");
+  const bodyText = wrapped ? `${body.slice(0, 37)} \r\n  ${body.slice(37)}` : body;
+  const pem = `-----BEGIN ${label}-----\n${bodyText}\n-----END ${label}-----`;
+  return escaped ? pem.replaceAll("\n", "\\n") : pem;
+}
+
+function assertRedactedPrivateKeyFailure(scan, secret) {
+  assert.throws(scan, (error) => {
+    assert.match(error.message, /credential content.*private-key/i);
+    assert.doesNotMatch(error.message, new RegExp(secret.slice(0, 24)));
+    assert.doesNotMatch(error.message, /BEGIN .*PRIVATE KEY/);
+    return true;
+  });
+}
+
+test("package safety detects one-line and escaped private keys in loose text", async (t) => {
+  const fileNames = ["key.conf", "key.custom", "key.json", "key", "key.properties"];
+  for (let index = 0; index < PRIVATE_KEY_LABELS.length; index += 1) {
+    const label = PRIVATE_KEY_LABELS[index];
+    await t.test(label, () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-private-key-"));
+      const escaped = index >= 2;
+      const secret = createPrivateKeyFixture(label, { escaped, wrapped: index === 1 });
+      const content = fileNames[index].endsWith(".json")
+        ? JSON.stringify({ privateKey: createPrivateKeyFixture(label) })
+        : `private_key = "${secret}"`;
+      fs.writeFileSync(path.join(root, fileNames[index]), content);
+      try {
+        assertRedactedPrivateKeyFailure(() => assertSafeArtifactTree(root), secret);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("package safety detects one-line and escaped private keys inside ASAR", async (t) => {
+  const asar = require("@electron/asar");
+  const fileNames = ["key.json", "key.ini", "key.custom", "key", "key.toml"];
+  for (let index = 0; index < PRIVATE_KEY_LABELS.length; index += 1) {
+    const label = PRIVATE_KEY_LABELS[index];
+    await t.test(label, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-private-key-"));
+      const source = path.join(root, "source");
+      const packagePath = path.join(root, "app.asar");
+      const escaped = index % 2 === 0;
+      const secret = createPrivateKeyFixture(label, { escaped, wrapped: index === 3 });
+      const content = fileNames[index].endsWith(".json")
+        ? JSON.stringify({ privateKey: createPrivateKeyFixture(label) })
+        : `private_key = "${secret}"`;
+      fs.mkdirSync(source);
+      fs.writeFileSync(path.join(source, fileNames[index]), content);
+      await asar.createPackage(source, packagePath);
+      fs.rmSync(source, { recursive: true, force: true });
+      try {
+        assertRedactedPrivateKeyFailure(() => assertSafeArtifactTree(root), secret);
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -279,6 +370,10 @@ test("package safety applies profile and unknown-text checks inside ASAR", async
   const asar = require("@electron/asar");
   for (const relativePath of [
     "Default/Preferences",
+    "Default/Bookmarks",
+    "Default/Extensions/x",
+    "Default/Login Data",
+    "Default/Preferences.bak",
     "settings.ini",
     "settings.conf",
     "settings.toml",
@@ -291,15 +386,16 @@ test("package safety applies profile and unknown-text checks inside ASAR", async
       const packagePath = path.join(root, "app.asar");
       const target = path.join(source, ...relativePath.split("/"));
       const secret = `sk-cp-${"V".repeat(48)}`;
+      const isProfilePath = relativePath.startsWith("Default/");
       fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.writeFileSync(target, `token = ${secret}\n`);
+      fs.writeFileSync(target, isProfilePath ? "runtime profile data" : `token = ${secret}\n`);
       await asar.createPackage(source, packagePath);
       fs.rmSync(source, { recursive: true, force: true });
       try {
         assert.throws(
           () => assertSafeArtifactTree(root),
           (error) => {
-            if (relativePath === "Default/Preferences") {
+            if (isProfilePath) {
               assert.match(error.message, /runtime profile resource/i);
             } else {
               assert.match(error.message, /credential content.*openai/i);
@@ -312,6 +408,23 @@ test("package safety applies profile and unknown-text checks inside ASAR", async
         fs.rmSync(root, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test("package safety allows unrelated default filenames inside ASAR", async () => {
+  const asar = require("@electron/asar");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-default-name-"));
+  const source = path.join(root, "source");
+  const packagePath = path.join(root, "app.asar");
+  const target = path.join(source, "assets", "default-theme.json");
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify({ theme: "safe" }));
+  await asar.createPackage(source, packagePath);
+  fs.rmSync(source, { recursive: true, force: true });
+  try {
+    assert.doesNotThrow(() => assertSafeArtifactTree(root));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
