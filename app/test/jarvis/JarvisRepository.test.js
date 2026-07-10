@@ -376,3 +376,121 @@ test("schema constraints reject unknown statuses and cascade session-owned rows"
   assert.deepEqual(repo.listTranscriptSegments("s1"), []);
   repo.close();
 });
+
+test("cloud budget settings and settled usage persist across restart", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-cloud-budget-"));
+  const dbPath = path.join(directory, "jarvis.db");
+  let first = null;
+  let second = null;
+
+  try {
+    first = new JarvisRepository(dbPath);
+    assert.deepEqual(first.getCloudBudgetSettings(), {
+      provider: "openai",
+      monthly_limit_microusd: 5_000_000,
+      enabled: 0,
+      updated_at: 0,
+    });
+    first.setCloudBudgetSettings({ enabled: true, monthlyLimitMicrousd: 5_000_000, at: 10 });
+    assert.equal(
+      first.reserveCloudUsage({
+        id: "usage_1",
+        monthUtc: "2026-07",
+        model: "gpt-4o-transcribe",
+        audioMs: 12_000,
+        reservedMicrousd: 100_000,
+        priceVersion: "openai-2026-07-11",
+        createdAt: 20,
+      }).ok,
+      true
+    );
+    first.settleCloudUsage({
+      id: "usage_1",
+      inputTokens: 120,
+      outputTokens: 18,
+      actualMicrousd: 480,
+      settledAt: 30,
+    });
+    first.close();
+    first = null;
+
+    second = new JarvisRepository(dbPath);
+    assert.equal(second.getCloudBudgetSettings().enabled, 1);
+    assert.deepEqual(second.getCloudBudgetStatus(Date.UTC(2026, 6, 20)), {
+      monthUtc: "2026-07",
+      enabled: true,
+      monthlyLimitMicrousd: 5_000_000,
+      spentMicrousd: 480,
+      reservedMicrousd: 0,
+      remainingMicrousd: 4_999_520,
+      blockedReason: null,
+    });
+    second.close();
+    second = null;
+  } finally {
+    first?.close();
+    second?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("cloud usage reservation atomically protects the monthly limit", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.setCloudBudgetSettings({ enabled: true, monthlyLimitMicrousd: 5_000_000, at: 1 });
+  repo.db.prepare(`
+    INSERT INTO cloud_usage (
+      id, month_utc, provider, model, audio_ms, input_tokens, output_tokens,
+      price_version, reserved_microusd, actual_microusd, status, created_at, settled_at
+    ) VALUES (?, ?, 'openai', 'gpt-4o-transcribe', 1000, 0, 0, ?, 0, ?, 'settled', 1, 2)
+  `).run("spent", "2026-07", "openai-2026-07-11", 4_950_001);
+
+  const result = repo.reserveCloudUsage({
+    id: "usage_2",
+    monthUtc: "2026-07",
+    model: "gpt-4o-transcribe",
+    audioMs: 12_000,
+    reservedMicrousd: 100_000,
+    priceVersion: "openai-2026-07-11",
+    createdAt: 3,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "budget_protected");
+  assert.equal(repo.db.prepare("SELECT count(*) AS count FROM cloud_usage").get().count, 1);
+  repo.close();
+});
+
+test("cloud budget validation rejects out-of-range limits and unknown usage fails closed", () => {
+  const repo = new JarvisRepository(":memory:");
+  assert.throws(
+    () => repo.setCloudBudgetSettings({ enabled: true, monthlyLimitMicrousd: 4_999_999 }),
+    /between 5000000 and 10000000/
+  );
+  repo.setCloudBudgetSettings({ enabled: true, monthlyLimitMicrousd: 10_000_000, at: 1 });
+  assert.equal(
+    repo.reserveCloudUsage({
+      id: "usage_unknown",
+      monthUtc: "2026-07",
+      model: "gpt-4o-transcribe",
+      audioMs: 1_000,
+      reservedMicrousd: 100_000,
+      priceVersion: "openai-2026-07-11",
+      createdAt: 2,
+    }).ok,
+    true
+  );
+  repo.markCloudUsageUnknown({ id: "usage_unknown", settledAt: 3 });
+
+  const blocked = repo.reserveCloudUsage({
+    id: "usage_after_unknown",
+    monthUtc: "2026-07",
+    model: "gpt-4o-transcribe",
+    audioMs: 1_000,
+    reservedMicrousd: 100_000,
+    priceVersion: "openai-2026-07-11",
+    createdAt: 4,
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, "usage_unknown");
+  repo.close();
+});

@@ -4,6 +4,10 @@ const { assertId, assertSessionStatus } = require("../shared/contracts");
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
 const MAX_SPEAKER_NAME_CODE_POINTS = 80;
+const DEFAULT_CLOUD_LIMIT_MICROUSD = 5_000_000;
+const MIN_CLOUD_LIMIT_MICROUSD = 5_000_000;
+const MAX_CLOUD_LIMIT_MICROUSD = 10_000_000;
+const CLOUD_RESERVATION_MICROUSD = 100_000;
 
 function normalizeSpeakerName(value) {
   if (typeof value !== "string") throw new TypeError("displayName must be a string");
@@ -57,9 +61,35 @@ const SCHEMA = `
     expires_at INTEGER NOT NULL,
     transcription_status TEXT NOT NULL DEFAULT 'pending'
   );
+  CREATE TABLE IF NOT EXISTS cloud_budget_settings (
+    provider TEXT PRIMARY KEY,
+    monthly_limit_microusd INTEGER NOT NULL
+      CHECK(monthly_limit_microusd BETWEEN 5000000 AND 10000000),
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    updated_at INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS cloud_usage (
+    id TEXT PRIMARY KEY,
+    month_utc TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    audio_ms INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    price_version TEXT NOT NULL,
+    reserved_microusd INTEGER NOT NULL,
+    actual_microusd INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK(status IN ('reserved','settled','released','unknown')),
+    created_at INTEGER NOT NULL,
+    settled_at INTEGER
+  );
+  INSERT OR IGNORE INTO cloud_budget_settings (
+    provider, monthly_limit_microusd, enabled, updated_at
+  ) VALUES ('openai', 5000000, 0, 0);
   CREATE INDEX IF NOT EXISTS idx_segments_session_time
     ON transcript_segments(session_id, started_at);
   CREATE INDEX IF NOT EXISTS idx_audio_expiry ON audio_chunks(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_cloud_usage_month ON cloud_usage(month_utc, provider, status);
 `;
 
 function assertInteger(value, name) {
@@ -67,6 +97,24 @@ function assertInteger(value, name) {
     throw new TypeError(`${name} must be a safe integer`);
   }
   return value;
+}
+
+function assertNonNegativeInteger(value, name) {
+  assertInteger(value, name);
+  if (value < 0) throw new RangeError(`${name} must not be negative`);
+  return value;
+}
+
+function assertMonthUtc(value) {
+  if (typeof value !== "string" || !/^\d{4}-(?:0[1-9]|1[0-2])$/.test(value)) {
+    throw new TypeError("monthUtc must use YYYY-MM");
+  }
+  return value;
+}
+
+function monthUtcFromTimestamp(at) {
+  assertInteger(at, "at");
+  return new Date(at).toISOString().slice(0, 7);
 }
 
 class JarvisRepository {
@@ -189,6 +237,54 @@ class JarvisRepository {
         SET status = 'recovered', ended_at = @at
         WHERE status IN ('recording', 'paused', 'finalizing')
       `),
+      getCloudBudgetSettings: this.db.prepare(
+        "SELECT provider, monthly_limit_microusd, enabled, updated_at FROM cloud_budget_settings WHERE provider = 'openai'"
+      ),
+      setCloudBudgetSettings: this.db.prepare(`
+        UPDATE cloud_budget_settings
+        SET monthly_limit_microusd = @monthlyLimitMicrousd,
+            enabled = @enabled,
+            updated_at = @at
+        WHERE provider = 'openai'
+      `),
+      getCloudUsageTotals: this.db.prepare(`
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'settled' THEN actual_microusd ELSE 0 END), 0) AS spent,
+          COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_microusd ELSE 0 END), 0) AS reserved,
+          COALESCE(SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_count
+        FROM cloud_usage
+        WHERE provider = 'openai' AND month_utc = ?
+      `),
+      insertCloudUsage: this.db.prepare(`
+        INSERT INTO cloud_usage (
+          id, month_utc, provider, model, audio_ms, input_tokens, output_tokens,
+          price_version, reserved_microusd, actual_microusd, status, created_at, settled_at
+        ) VALUES (
+          @id, @monthUtc, 'openai', @model, @audioMs, 0, 0,
+          @priceVersion, @reservedMicrousd, 0, 'reserved', @createdAt, NULL
+        )
+      `),
+      getCloudUsage: this.db.prepare("SELECT * FROM cloud_usage WHERE id = ?"),
+      settleCloudUsage: this.db.prepare(`
+        UPDATE cloud_usage
+        SET input_tokens = @inputTokens,
+            output_tokens = @outputTokens,
+            actual_microusd = @actualMicrousd,
+            reserved_microusd = 0,
+            status = 'settled',
+            settled_at = @settledAt
+        WHERE id = @id AND status = 'reserved'
+      `),
+      releaseCloudUsage: this.db.prepare(`
+        UPDATE cloud_usage
+        SET reserved_microusd = 0, status = 'released', settled_at = @settledAt
+        WHERE id = @id AND status = 'reserved'
+      `),
+      markCloudUsageUnknown: this.db.prepare(`
+        UPDATE cloud_usage
+        SET reserved_microusd = 0, status = 'unknown', settled_at = @settledAt
+        WHERE id = @id AND status = 'reserved'
+      `),
     };
 
     const writeTranscriptSegments = (sessionId, segments) => {
@@ -250,6 +346,22 @@ class JarvisRepository {
       const openSessions = this.statements.listOpenSessions.all();
       this.statements.recoverOpenSessions.run({ at });
       return openSessions.map((session) => this.statements.getSession.get(session.id));
+    });
+
+    this._reserveCloudUsage = this.db.transaction((input) => {
+      const settings = this.statements.getCloudBudgetSettings.get();
+      const totals = this.statements.getCloudUsageTotals.get(input.monthUtc);
+      if (totals.unknown_count > 0) {
+        return { ok: false, reason: "usage_unknown" };
+      }
+      if (!settings.enabled) {
+        return { ok: false, reason: "cloud_disabled" };
+      }
+      if (totals.spent + totals.reserved + input.reservedMicrousd > settings.monthly_limit_microusd) {
+        return { ok: false, reason: "budget_protected" };
+      }
+      this.statements.insertCloudUsage.run(input);
+      return { ok: true, reservationId: input.id };
     });
   }
 
@@ -354,6 +466,104 @@ class JarvisRepository {
 
   listPeople() {
     return this.statements.listPeople.all();
+  }
+
+  getCloudBudgetSettings() {
+    return this.statements.getCloudBudgetSettings.get();
+  }
+
+  setCloudBudgetSettings({ enabled, monthlyLimitMicrousd, at = Date.now() }) {
+    if (typeof enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+    assertInteger(monthlyLimitMicrousd, "monthlyLimitMicrousd");
+    if (
+      monthlyLimitMicrousd < MIN_CLOUD_LIMIT_MICROUSD ||
+      monthlyLimitMicrousd > MAX_CLOUD_LIMIT_MICROUSD
+    ) {
+      throw new RangeError("monthlyLimitMicrousd must be between 5000000 and 10000000");
+    }
+    assertInteger(at, "at");
+    this.statements.setCloudBudgetSettings.run({
+      enabled: enabled ? 1 : 0,
+      monthlyLimitMicrousd,
+      at,
+    });
+    return this.getCloudBudgetSettings();
+  }
+
+  getCloudBudgetStatus(at = Date.now()) {
+    const monthUtc = monthUtcFromTimestamp(at);
+    const settings = this.getCloudBudgetSettings();
+    const totals = this.statements.getCloudUsageTotals.get(monthUtc);
+    const remaining = Math.max(
+      0,
+      settings.monthly_limit_microusd - totals.spent - totals.reserved
+    );
+    let blockedReason = null;
+    if (totals.unknown_count > 0) blockedReason = "usage_unknown";
+    else if (!settings.enabled) blockedReason = "cloud_disabled";
+    else if (remaining < CLOUD_RESERVATION_MICROUSD) blockedReason = "budget_protected";
+    return {
+      monthUtc,
+      enabled: settings.enabled === 1,
+      monthlyLimitMicrousd: settings.monthly_limit_microusd,
+      spentMicrousd: totals.spent,
+      reservedMicrousd: totals.reserved,
+      remainingMicrousd: remaining,
+      blockedReason,
+    };
+  }
+
+  reserveCloudUsage(input) {
+    const safe = {
+      id: assertId(input.id, "cloudUsageId"),
+      monthUtc: assertMonthUtc(input.monthUtc),
+      model: input.model,
+      audioMs: assertNonNegativeInteger(input.audioMs, "audioMs"),
+      reservedMicrousd: assertNonNegativeInteger(
+        input.reservedMicrousd,
+        "reservedMicrousd"
+      ),
+      priceVersion: input.priceVersion,
+      createdAt: assertInteger(input.createdAt, "createdAt"),
+    };
+    if (typeof safe.model !== "string" || !safe.model) throw new TypeError("model is required");
+    if (typeof safe.priceVersion !== "string" || !safe.priceVersion) {
+      throw new TypeError("priceVersion is required");
+    }
+    return this._reserveCloudUsage(safe);
+  }
+
+  settleCloudUsage({ id, inputTokens, outputTokens, actualMicrousd, settledAt = Date.now() }) {
+    const safe = {
+      id: assertId(id, "cloudUsageId"),
+      inputTokens: assertNonNegativeInteger(inputTokens, "inputTokens"),
+      outputTokens: assertNonNegativeInteger(outputTokens, "outputTokens"),
+      actualMicrousd: assertNonNegativeInteger(actualMicrousd, "actualMicrousd"),
+      settledAt: assertInteger(settledAt, "settledAt"),
+    };
+    if (safe.actualMicrousd > CLOUD_RESERVATION_MICROUSD) {
+      throw new RangeError("actualMicrousd exceeds the reserved request maximum");
+    }
+    this.statements.settleCloudUsage.run(safe);
+    return this.statements.getCloudUsage.get(safe.id) ?? null;
+  }
+
+  releaseCloudUsage({ id, settledAt = Date.now() }) {
+    const safeId = assertId(id, "cloudUsageId");
+    this.statements.releaseCloudUsage.run({
+      id: safeId,
+      settledAt: assertInteger(settledAt, "settledAt"),
+    });
+    return this.statements.getCloudUsage.get(safeId) ?? null;
+  }
+
+  markCloudUsageUnknown({ id, settledAt = Date.now() }) {
+    const safeId = assertId(id, "cloudUsageId");
+    this.statements.markCloudUsageUnknown.run({
+      id: safeId,
+      settledAt: assertInteger(settledAt, "settledAt"),
+    });
+    return this.statements.getCloudUsage.get(safeId) ?? null;
   }
 
   insertAudioChunk(chunk) {
