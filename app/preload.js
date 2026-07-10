@@ -96,6 +96,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("jarvis:capture:pause", id, at, errorCode),
     resumeCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:resume", id, at),
     finishCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:finish", id, at),
+    failCapture: (id, errorCode, at) =>
+      ipcRenderer.invoke("jarvis:capture:fail", id, errorCode, at),
     beginVoiceEnrollment: () => ipcRenderer.invoke("jarvis:voice-enrollment:begin"),
     completeVoiceEnrollment: (sessionId, payload) => {
       assertVoiceEnrollmentPreflight(sessionId, payload);
@@ -108,8 +110,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
       (callback) => (_event, envelope) => callback(envelope)
     ),
     controlReady: (rendererId) => ipcRenderer.send("jarvis:control:ready", rendererId),
-    acknowledgeControl: (id, outcome) =>
-      ipcRenderer.send("jarvis:control:ack", id, outcome),
+    claimControl: (id, rendererId) =>
+      ipcRenderer.invoke("jarvis:control:claim", id, rendererId),
+    acknowledgeControl: (id, outcome, rendererId) =>
+      ipcRenderer.send("jarvis:control:ack", id, outcome, rendererId),
     onShutdownRequested: registerListener(
       "jarvis:shutdown-request",
       (callback) => (_event, request) => callback(request)

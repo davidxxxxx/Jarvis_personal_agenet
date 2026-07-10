@@ -13,6 +13,7 @@ const CHANNELS = Object.freeze({
   pauseCapture: "jarvis:capture:pause",
   resumeCapture: "jarvis:capture:resume",
   finishCapture: "jarvis:capture:finish",
+  failCapture: "jarvis:capture:fail",
   beginVoiceEnrollment: "jarvis:voice-enrollment:begin",
   completeVoiceEnrollment: "jarvis:voice-enrollment:complete",
   cancelVoiceEnrollment: "jarvis:voice-enrollment:cancel",
@@ -41,4 +42,17 @@ function assertSessionStatus(value) {
   return value;
 }
 
-module.exports = { CHANNELS, SESSION_STATUSES, assertId, assertSessionStatus };
+function assertMicErrorCode(value) {
+  if (value !== "MIC_PERMISSION" && value !== "MIC_DISCONNECTED") {
+    throw new TypeError("invalid microphone error code");
+  }
+  return value;
+}
+
+module.exports = {
+  CHANNELS,
+  SESSION_STATUSES,
+  assertId,
+  assertSessionStatus,
+  assertMicErrorCode,
+};

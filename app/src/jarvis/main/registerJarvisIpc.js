@@ -1,4 +1,9 @@
-const { CHANNELS, assertId, assertSessionStatus } = require("../shared/contracts");
+const {
+  CHANNELS,
+  assertId,
+  assertSessionStatus,
+  assertMicErrorCode,
+} = require("../shared/contracts");
 
 const REQUIRED_REPOSITORY_METHODS = [
   "createSession",
@@ -13,7 +18,13 @@ const REQUIRED_REPOSITORY_METHODS = [
   "listAudioChunks",
 ];
 
-const REQUIRED_SERVICE_METHODS = ["startCapture", "pauseCapture", "resumeCapture", "finishCapture"];
+const REQUIRED_SERVICE_METHODS = [
+  "startCapture",
+  "pauseCapture",
+  "resumeCapture",
+  "finishCapture",
+  "failCapture",
+];
 
 function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentService }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
@@ -88,6 +99,9 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
   );
   ipcMain.handle(CHANNELS.finishCapture, (_event, id, at) =>
     service.finishCapture(assertId(id, "sessionId"), at)
+  );
+  ipcMain.handle(CHANNELS.failCapture, (_event, id, errorCode, at) =>
+    service.failCapture(assertId(id, "sessionId"), assertMicErrorCode(errorCode), at)
   );
   ipcMain.handle(CHANNELS.beginVoiceEnrollment, (event) => {
     bindEnrollmentOwner(event);

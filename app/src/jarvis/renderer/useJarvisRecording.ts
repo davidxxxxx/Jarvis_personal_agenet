@@ -42,6 +42,11 @@ export interface RecordingJarvisApi {
   pauseCapture: (id: string, at?: number, errorCode?: string | null) => Promise<JarvisRuntimeState>;
   resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
   finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+  failCapture: (
+    id: string,
+    errorCode: "MIC_PERMISSION" | "MIC_DISCONNECTED",
+    at?: number
+  ) => Promise<JarvisRuntimeState>;
   upsertSegments: (
     sessionId: string,
     segments: JarvisTranscriptSegmentInput[]
@@ -193,6 +198,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     segments: TranscriptSegment[];
   } | null = null;
   let shutdownPromise: Promise<void> | null = null;
+  let segmentsFrozen = false;
   let disposed = false;
 
   const transition = (event: SessionEvent): SessionState => {
@@ -259,6 +265,18 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       await deps.jarvis.finishCapture(id, deps.now());
     } catch {
       // Best-effort cleanup for a partially started capture.
+    }
+  };
+
+  const failMainCapture = async (
+    id: string,
+    code: "MIC_PERMISSION" | "MIC_DISCONNECTED"
+  ): Promise<void> => {
+    try {
+      await deps.jarvis.failCapture(id, code, deps.now());
+    } catch {
+      await finishMainCapture(id);
+      await markPersistedSessionFailed(id);
     }
   };
 
@@ -343,8 +361,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         try {
           await deps.jarvis.pauseCapture(id, deps.now(), code);
         } catch {
-          await finishMainCapture(id);
-          await markPersistedSessionFailed(id);
+          await failMainCapture(id, code as "MIC_PERMISSION" | "MIC_DISCONNECTED");
         }
       } else {
         if (captureStarted) await finishMainCapture(id);
@@ -390,8 +407,12 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         throw error;
       }
       if (state.id) {
-        await finishMainCapture(state.id);
-        await markPersistedSessionFailed(state.id);
+        if (reportedError === "MIC_PERMISSION" || reportedError === "MIC_DISCONNECTED") {
+          await failMainCapture(state.id, reportedError);
+        } else {
+          await finishMainCapture(state.id);
+          await markPersistedSessionFailed(state.id);
+        }
       }
       failCurrentSession(code);
       throw error;
@@ -456,8 +477,12 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
           await deps.jarvis.pauseCapture(state.id, deps.now(), isMicError ? code : null);
           if (isMicError) failCurrentSession(code);
         } catch {
-          await finishMainCapture(state.id);
-          await markPersistedSessionFailed(state.id);
+          if (isMicError) {
+            await failMainCapture(state.id, code as "MIC_PERMISSION" | "MIC_DISCONNECTED");
+          } else {
+            await finishMainCapture(state.id);
+            await markPersistedSessionFailed(state.id);
+          }
           failCurrentSession(code);
         }
       }
@@ -521,7 +546,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   };
 
   const handleSegmentsChanged = (segments: TranscriptSegment[]): void => {
-    if (disposed || shutdownPromise) return;
+    if (disposed || segmentsFrozen) return;
     clearPersistTimer();
     const state = deps.getSessionState();
     if (!state.id || state.startedAt === null || !["recording", "paused"].includes(state.status)) {
@@ -559,11 +584,36 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   const shutdown = (): Promise<void> => {
     if (!shutdownPromise) {
       shutdownPromise = (async () => {
-        await flushPendingPersistence();
+        let stopError: unknown = null;
         if (deps.getMeetingSnapshot().isRecording) {
-          await deps.stopRecording({ throwOnError: false });
+          try {
+            await deps.stopRecording({ throwOnError: false });
+          } catch (error) {
+            stopError = error;
+          }
         }
-        disposed = true;
+        segmentsFrozen = true;
+        clearPersistTimer();
+        pendingPersistence = null;
+        const state = deps.getSessionState();
+        try {
+          if (
+            state.id &&
+            state.startedAt !== null &&
+            ["recording", "paused"].includes(state.status)
+          ) {
+            await persistSnapshot(
+              state.id,
+              state.startedAt,
+              deps.getMeetingSnapshot().segments.slice()
+            );
+          } else {
+            await persistenceTail;
+          }
+        } finally {
+          disposed = true;
+        }
+        if (stopError) throw stopError;
       })();
     }
     return shutdownPromise;
@@ -610,6 +660,7 @@ const rendererJarvisApi: RecordingJarvisApi = {
   pauseCapture: (id, at, errorCode) => window.electronAPI.jarvis.pauseCapture(id, at, errorCode),
   resumeCapture: (id, at) => window.electronAPI.jarvis.resumeCapture(id, at),
   finishCapture: (id, at) => window.electronAPI.jarvis.finishCapture(id, at),
+  failCapture: (id, errorCode, at) => window.electronAPI.jarvis.failCapture(id, errorCode, at),
   upsertSegments: (sessionId, segments) =>
     window.electronAPI.jarvis.upsertSegments(sessionId, segments),
   syncSegments: (sessionId, segments) =>
@@ -711,14 +762,17 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   );
 
   useEffect(() => {
+    const rendererId = crypto.randomUUID();
     const receiver = createJarvisControlReceiver({
+      claim: (id) => window.electronAPI.jarvis.claimControl(id, rendererId),
       route: (action) => routeJarvisControl(controller, action),
-      acknowledge: (id, outcome) => window.electronAPI.jarvis.acknowledgeControl(id, outcome),
+      acknowledge: (id, outcome) =>
+        window.electronAPI.jarvis.acknowledgeControl(id, outcome, rendererId),
     });
     const unsubscribe = window.electronAPI.jarvis.onControl((envelope) => {
       void receiver.handle(envelope);
     });
-    window.electronAPI.jarvis.controlReady(crypto.randomUUID());
+    window.electronAPI.jarvis.controlReady(rendererId);
     return unsubscribe;
   }, [controller]);
 

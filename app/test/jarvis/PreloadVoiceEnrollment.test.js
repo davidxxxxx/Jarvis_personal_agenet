@@ -97,21 +97,32 @@ test("preload rejects oversized or malformed enrollment payloads before IPC clon
 });
 
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
-  const { api, sends, listeners } = loadPreloadApi();
+  const { api, sends, invokes, listeners } = loadPreloadApi();
   const shutdownRequests = [];
 
   api.controlReady("renderer-1");
-  api.acknowledgeControl("control-1", "ok");
+  api.claimControl("control-1", "renderer-1");
+  api.acknowledgeControl("control-1", "ok", "renderer-1");
   const unsubscribe = api.onShutdownRequested((request) => shutdownRequests.push(request));
   listeners.get("jarvis:shutdown-request")({}, { id: "shutdown-1" });
   api.acknowledgeShutdown("shutdown-1", "ok");
 
   assert.deepEqual(shutdownRequests, [{ id: "shutdown-1" }]);
+  assert.deepEqual(invokes, [["jarvis:control:claim", "control-1", "renderer-1"]]);
   assert.deepEqual(sends, [
     ["jarvis:control:ready", "renderer-1"],
-    ["jarvis:control:ack", "control-1", "ok"],
+    ["jarvis:control:ack", "control-1", "ok", "renderer-1"],
     ["jarvis:shutdown:ack", "shutdown-1", "ok"],
   ]);
   unsubscribe();
   assert.equal(listeners.has("jarvis:shutdown-request"), false);
+});
+
+test("preload exposes narrow authoritative capture failure IPC", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  assert.equal(await api.failCapture("s1", "MIC_DISCONNECTED", 1_100), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:capture:fail", "s1", "MIC_DISCONNECTED", 1_100],
+  ]);
 });

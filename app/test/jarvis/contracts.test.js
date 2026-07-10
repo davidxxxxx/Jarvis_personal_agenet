@@ -25,6 +25,7 @@ function createService(overrides = {}) {
     pauseCapture: () => "capture-paused",
     resumeCapture: () => "capture-resumed",
     finishCapture: () => "capture-finished",
+    failCapture: () => "capture-failed",
     ...overrides,
   };
 }
@@ -66,6 +67,7 @@ test("contract exposes only the named Jarvis channels", () => {
     "completeVoiceEnrollment",
     "control",
     "createSession",
+    "failCapture",
     "finishCapture",
     "getSession",
     "listAudioChunks",
@@ -104,6 +106,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.pauseCapture,
       CHANNELS.resumeCapture,
       CHANNELS.finishCapture,
+      CHANNELS.failCapture,
       CHANNELS.beginVoiceEnrollment,
       CHANNELS.completeVoiceEnrollment,
       CHANNELS.cancelVoiceEnrollment,
@@ -236,7 +239,13 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
     assert.deepEqual(registered, []);
   }
 
-  for (const method of ["startCapture", "pauseCapture", "resumeCapture", "finishCapture"]) {
+  for (const method of [
+    "startCapture",
+    "pauseCapture",
+    "resumeCapture",
+    "finishCapture",
+    "failCapture",
+  ]) {
     const service = createService();
     delete service[method];
     const registered = [];
@@ -266,5 +275,57 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
         }),
       new RegExp(`voiceEnrollmentService\\.${method} must be a function`)
     );
+  }
+});
+
+test("failCapture IPC validates MIC codes and preserves authoritative failed broadcast", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const JarvisService = require("../../src/jarvis/main/JarvisService");
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-fail-ipc-"));
+  const session = { id: "s1", status: "recording" };
+  const broadcasts = [];
+  const repository = {
+    getSession: () => session,
+    setSessionStatus: (_id, status) => {
+      session.status = status;
+    },
+    insertAudioChunk: () => {},
+    recoverOpenSessions: () => [],
+  };
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    now: () => 1_100,
+    fsImpl,
+    broadcast: (state) => broadcasts.push(state),
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service,
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.throws(
+      () => handlers.get(CHANNELS.failCapture)(null, "s1", "upstream_stop_failed", 1_100),
+      /microphone error code/
+    );
+    handlers.get(CHANNELS.failCapture)(null, "s1", "MIC_DISCONNECTED", 1_100);
+
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "MIC_DISCONNECTED");
+    assert.equal(session.status, "failed");
+    assert.equal(broadcasts.at(-1).status, "failed");
+    assert.equal(broadcasts.at(-1).errorCode, "MIC_DISCONNECTED");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

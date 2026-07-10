@@ -412,7 +412,7 @@ function initializeCoreManagers() {
   retentionCleaner = new RetentionCleaner({
     repository: jarvisRepository,
     recordingsRoot,
-    deleteFile: createSafeRecordingDelete({
+    deleteBatch: createSafeRecordingDelete({
       helperDir: app.isPackaged
         ? path.join(process.resourcesPath, "jarvis-native")
         : path.join(__dirname, "src", "jarvis", "native", "windows"),
@@ -426,8 +426,6 @@ function initializeCoreManagers() {
   });
   const recovered = jarvisService.recoverOpenSessions(Date.now());
   debugLogger.info("Jarvis interrupted-session recovery", { recovered: recovered.length }, "jarvis");
-  retentionCleaner.clean(Date.now());
-  retentionCleaner.start();
   registerJarvisIpc({
     ipcMain,
     repository: jarvisRepository,
@@ -466,9 +464,13 @@ function initializeCoreManagers() {
       // Invalid renderer handshakes are ignored at the trust boundary.
     }
   });
-  ipcMain.on("jarvis:control:ack", (event, id, outcome) => {
+  ipcMain.handle("jarvis:control:claim", (event, id, rendererId) => {
+    if (!isControlPanelSender(event)) return { status: "not_ready" };
+    return jarvisControlQueue.claim(id, rendererId);
+  });
+  ipcMain.on("jarvis:control:ack", (event, id, outcome, rendererId) => {
     if (!isControlPanelSender(event)) return;
-    jarvisControlQueue.acknowledge(id, outcome);
+    jarvisControlQueue.acknowledge(id, outcome, rendererId);
   });
   ipcMain.on("jarvis:shutdown:ack", (event, id, outcome) => {
     if (!isControlPanelSender(event)) return;
@@ -941,6 +943,16 @@ async function startApp() {
   if (!startMinimized) {
     await windowManager.createControlPanelWindow();
   }
+
+  // Retention can touch hundreds of files; begin only after the first user-visible windows exist.
+  retentionCleaner.start();
+  void retentionCleaner.clean(Date.now()).catch(() => {
+    debugLogger.info(
+      "Jarvis audio retention cleanup",
+      { deleted: 0, retry: 1, missing: 0 },
+      "jarvis"
+    );
+  });
 
   // Create agent window (hidden) and set up agent hotkey
   await windowManager.createAgentWindow();
@@ -1738,8 +1750,9 @@ function performGracefulTeardown() {
       () => textEditMonitor?.stopMonitoring(),
       () => updateManager?.cleanup(),
       () => {
-        retentionCleaner?.stop();
+        const stopping = retentionCleaner?.stop();
         retentionCleaner = null;
+        return stopping;
       },
     ],
     closeWriter: () => {

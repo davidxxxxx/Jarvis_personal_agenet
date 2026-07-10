@@ -131,6 +131,13 @@ function createHarness({
         errorCode: null,
       };
     }),
+    failCapture: vi.fn(async (id, code, at = 1_000) => ({
+      sessionId: id,
+      status: "failed" as const,
+      startedAt: 1_000,
+      elapsedMs: at - 1_000,
+      errorCode: code,
+    })),
     upsertSegments: vi.fn(async (_id, mapped) => {
       calls.push("jarvis:persist");
       return mapped.map((segment) => ({
@@ -367,25 +374,40 @@ describe("Jarvis recording controller", () => {
     expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(1);
   });
 
-  it("shutdown awaits the persistence tail before stopping upstream capture", async () => {
-    vi.useFakeTimers();
-    const gate = deferred<void>();
+  it("shutdown stops the producer, accepts its final segment, then persists the frozen snapshot", async () => {
+    const stopGate = deferred<void>();
     const harness = createHarness({ status: "recording", segments: [stableSegment] });
-    vi.mocked(harness.jarvis.syncSegments).mockImplementationOnce(async () => {
-      await gate.promise;
-      return [];
+    harness.stopRecording.mockImplementationOnce(async () => {
+      harness.calls.push("upstream:stop");
+      await stopGate.promise;
+      harness.setMeeting({ isRecording: false });
+      return { diarizationSessionId: null, success: true };
     });
     const controller = createRecordingController(harness.deps);
     controller.handleSegmentsChanged([stableSegment]);
-    await vi.advanceTimersByTimeAsync(500);
 
-    const shutdown = controller.shutdown();
-    await Promise.resolve();
-    expect(harness.stopRecording).not.toHaveBeenCalled();
-    gate.resolve();
-    await shutdown;
+    const firstShutdown = controller.shutdown();
+    const secondShutdown = controller.shutdown();
+    expect(firstShutdown).toBe(secondShutdown);
+    await vi.waitFor(() => expect(harness.stopRecording).toHaveBeenCalledTimes(1));
+    expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
+
+    const finalSegment = { ...stableSegment, id: "seg-2", text: "Last words" };
+    harness.setMeeting({ segments: [stableSegment, finalSegment] });
+    controller.handleSegmentsChanged([stableSegment, finalSegment]);
+    stopGate.resolve();
+    await firstShutdown;
 
     expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: false });
+    expect(harness.calls).toEqual(["upstream:stop", "jarvis:sync"]);
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(1);
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledWith(
+      "s1",
+      expect.arrayContaining([
+        expect.objectContaining({ id: "s1__seg-1" }),
+        expect.objectContaining({ id: "s1__seg-2", text: "Last words" }),
+      ])
+    );
   });
 
   it("rejects re-entry without issuing duplicate commands", async () => {
@@ -578,26 +600,49 @@ describe("Jarvis recording controller", () => {
   it("preserves the microphone error when both error-pause teardown steps fail", async () => {
     const harness = createHarness({ status: "recording" });
     harness.stopRecording.mockRejectedValueOnce(new Error("device disappeared during stop"));
-    vi.mocked(harness.jarvis.pauseCapture).mockRejectedValueOnce(
-      new Error("main pause failed")
-    );
+    vi.mocked(harness.jarvis.pauseCapture).mockRejectedValueOnce(new Error("main pause failed"));
     const controller = createRecordingController(harness.deps);
 
-    await expect(controller.pauseForError("MIC_DISCONNECTED")).rejects.toThrow(
-      "main pause failed"
-    );
+    await expect(controller.pauseForError("MIC_DISCONNECTED")).rejects.toThrow("main pause failed");
 
-    expect(harness.jarvis.pauseCapture).toHaveBeenCalledWith(
-      "s1",
-      1_000,
-      "MIC_DISCONNECTED"
-    );
-    expect(harness.jarvis.finishCapture).toHaveBeenCalledWith("s1", 1_000);
+    expect(harness.jarvis.pauseCapture).toHaveBeenCalledWith("s1", 1_000, "MIC_DISCONNECTED");
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith("s1", "MIC_DISCONNECTED", 1_000);
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
     expect(harness.getSession()).toMatchObject({
       status: "failed",
       errorCode: "MIC_DISCONNECTED",
     });
     expect(harness.deps.onError).toHaveBeenLastCalledWith("MIC_DISCONNECTED");
+  });
+
+  it("authoritatively fails main capture when resume MIC pause cannot be persisted", async () => {
+    const harness = createHarness({ status: "paused" });
+    harness.startRecording.mockImplementationOnce(async () => {
+      harness.setMeeting({ isRecording: false, error: "MIC_PERMISSION" });
+    });
+    vi.mocked(harness.jarvis.pauseCapture).mockRejectedValueOnce(new Error("pause failed"));
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.resume()).rejects.toThrow("microphone capture failed");
+
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith("s1", "MIC_PERMISSION", 1_000);
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+    expect(harness.getSession()).toMatchObject({ status: "failed", errorCode: "MIC_PERMISSION" });
+  });
+
+  it("authoritatively fails main capture when initial MIC pause cannot be persisted", async () => {
+    const harness = createHarness();
+    harness.startRecording.mockImplementationOnce(async () => {
+      harness.setMeeting({ isRecording: false, error: "MIC_PERMISSION" });
+    });
+    vi.mocked(harness.jarvis.pauseCapture).mockRejectedValueOnce(new Error("pause failed"));
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.start()).rejects.toThrow("microphone capture failed");
+
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith("s1", "MIC_PERMISSION", 1_000);
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+    expect(harness.getSession()).toMatchObject({ status: "failed", errorCode: "MIC_PERMISSION" });
   });
 
   it("classifies a microphone resume failure like a microphone start failure", async () => {

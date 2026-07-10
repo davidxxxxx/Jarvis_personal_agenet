@@ -551,6 +551,11 @@ declare global {
         ) => Promise<JarvisRuntimeState>;
         resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+        failCapture: (
+          id: string,
+          errorCode: "MIC_PERMISSION" | "MIC_DISCONNECTED",
+          at?: number
+        ) => Promise<JarvisRuntimeState>;
         beginVoiceEnrollment: () => Promise<JarvisVoiceEnrollmentSession>;
         completeVoiceEnrollment: (
           sessionId: string,
@@ -559,10 +564,14 @@ declare global {
         cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
         onControl: (callback: (envelope: JarvisControlEnvelope) => void) => () => void;
         controlReady: (rendererId: string) => void;
-        acknowledgeControl: (
+        claimControl: (
           id: string,
-          outcome: "ok" | "duplicate" | "expired" | "error"
-        ) => void;
+          rendererId: string
+        ) => Promise<{
+          status:
+            "claimed" | "not_ready" | "duplicate" | "expired" | "failed" | "in_flight" | "unknown";
+        }>;
+        acknowledgeControl: (id: string, outcome: "ok" | "error", rendererId: string) => void;
         onShutdownRequested: (callback: (request: { id: string }) => void) => () => void;
         acknowledgeShutdown: (id: string, outcome: "ok" | "error") => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;

@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const JarvisControlQueue = require("../../src/jarvis/main/JarvisControlQueue");
 
-test("queues through load, crash, reload, and renderer-ready handshakes", () => {
+test("claimed controls fail on renderer crash and are never replayed", () => {
   const sent = [];
   let sequence = 0;
   const queue = new JarvisControlQueue({
@@ -12,19 +12,41 @@ test("queues through load, crash, reload, and renderer-ready handshakes", () => 
   });
 
   const first = queue.enqueue("start");
-  assert.deepEqual(sent, []);
-
   queue.markReady("renderer-1");
-  assert.deepEqual(sent.map((entry) => entry.id), [first.id]);
+  assert.deepEqual(queue.claim(first.id, "renderer-1"), { status: "claimed" });
 
   queue.markNotReady("crashed");
-  const second = queue.enqueue("pause");
   queue.markReady("renderer-2");
-  assert.deepEqual(sent.map((entry) => entry.id), [first.id, first.id, second.id]);
+  assert.deepEqual(sent.map((entry) => entry.id), [first.id]);
+  assert.deepEqual(queue.acknowledge(first.id, "ok", "renderer-1"), { status: "failed" });
+  assert.deepEqual(queue.getSnapshot().claimedIds, []);
+  assert.equal(queue.getSnapshot().failed, 1);
 
-  assert.deepEqual(queue.acknowledge(first.id, "ok"), { status: "acknowledged" });
-  assert.deepEqual(queue.acknowledge(first.id, "ok"), { status: "duplicate" });
-  assert.deepEqual(queue.getSnapshot().pendingIds, [second.id]);
+  const retry = queue.enqueue("start");
+  assert.notEqual(retry.id, first.id);
+  assert.deepEqual(sent.map((entry) => entry.id), [first.id, retry.id]);
+  assert.deepEqual(queue.claim(retry.id, "renderer-2"), { status: "claimed" });
+  assert.deepEqual(queue.acknowledge(retry.id, "ok", "renderer-2"), {
+    status: "acknowledged",
+  });
+});
+
+test("only the ready renderer can atomically claim an unexpired pending control", () => {
+  let now = 1_000;
+  const queue = new JarvisControlQueue({
+    send: () => {},
+    createId: () => "control-1",
+    now: () => now,
+    ttlMs: 100,
+  });
+  const envelope = queue.enqueue("pause");
+
+  assert.deepEqual(queue.claim(envelope.id, "renderer-1"), { status: "not_ready" });
+  queue.markReady("renderer-1");
+  assert.deepEqual(queue.claim(envelope.id, "renderer-2"), { status: "not_ready" });
+  assert.deepEqual(queue.claim("unknown", "renderer-1"), { status: "unknown" });
+  now = 1_101;
+  assert.deepEqual(queue.claim(envelope.id, "renderer-1"), { status: "expired" });
 });
 
 test("expires stale controls and bounds pending and acknowledgement dedupe", () => {
@@ -43,17 +65,19 @@ test("expires stale controls and bounds pending and acknowledgement dedupe", () 
   now = 1_101;
   queue.markReady("renderer");
   assert.equal(queue.getSnapshot().expired, 1);
-  assert.deepEqual(queue.acknowledge(expired.id, "ok"), { status: "expired" });
+  assert.deepEqual(queue.claim(expired.id, "renderer"), { status: "expired" });
 
   const first = queue.enqueue("start");
   const second = queue.enqueue("pause");
   const third = queue.enqueue("finish");
   assert.deepEqual(queue.getSnapshot().pendingIds, [second.id, third.id]);
   assert.equal(queue.getSnapshot().dropped, 1);
-  queue.acknowledge(second.id, "ok");
-  queue.acknowledge(third.id, "ok");
-  assert.deepEqual(queue.acknowledge(second.id, "ok"), { status: "unknown" });
-  assert.deepEqual(queue.acknowledge(third.id, "ok"), { status: "duplicate" });
+  queue.claim(second.id, "renderer");
+  queue.acknowledge(second.id, "ok", "renderer");
+  queue.claim(third.id, "renderer");
+  queue.acknowledge(third.id, "ok", "renderer");
+  assert.deepEqual(queue.acknowledge(second.id, "ok", "renderer"), { status: "unknown" });
+  assert.deepEqual(queue.acknowledge(third.id, "ok", "renderer"), { status: "duplicate" });
   assert.notEqual(first.id, second.id);
 });
 
@@ -72,6 +96,10 @@ test("send and renderer errors are contained with explicit result semantics", ()
 
   assert.deepEqual(queue.getSnapshot().pendingIds, [envelope.id]);
   assert.equal(errors.at(-1).status, "send_failed");
-  assert.deepEqual(queue.acknowledge(envelope.id, "error"), { status: "failed" });
+  assert.deepEqual(queue.acknowledge(envelope.id, "error", "renderer"), {
+    status: "unclaimed",
+  });
+  assert.deepEqual(queue.claim(envelope.id, "renderer"), { status: "claimed" });
+  assert.deepEqual(queue.acknowledge(envelope.id, "error", "renderer"), { status: "failed" });
   assert.deepEqual(queue.getSnapshot().pendingIds, []);
 });
