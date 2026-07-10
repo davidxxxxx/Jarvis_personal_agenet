@@ -31,6 +31,28 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onStartDictation: registerListener("start-dictation", (callback) => () => callback()),
   onStopDictation: registerListener("stop-dictation", (callback) => () => callback()),
 
+  jarvis: {
+    createSession: (input) => ipcRenderer.invoke("jarvis:session:create", input),
+    setSessionStatus: (id, status, at) =>
+      ipcRenderer.invoke("jarvis:session:set-status", id, status, at),
+    getSession: (id) => ipcRenderer.invoke("jarvis:session:get", id),
+    listSessions: (query) => ipcRenderer.invoke("jarvis:session:list", query),
+    upsertSegments: (sessionId, segments) =>
+      ipcRenderer.invoke("jarvis:segments:upsert", sessionId, segments),
+    listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
+    renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
+    listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
+    listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
+    onControl: registerListener(
+      "jarvis:control",
+      (callback) => (_event, action) => callback(action)
+    ),
+    onStateChanged: registerListener(
+      "jarvis:state-changed",
+      (callback) => (_event, state) => callback(state)
+    ),
+  },
+
   // Database functions
   saveTranscription: (text, rawText, options) =>
     ipcRenderer.invoke("db-save-transcription", text, rawText, options),

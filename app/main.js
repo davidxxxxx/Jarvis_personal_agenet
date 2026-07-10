@@ -291,6 +291,8 @@ const { i18nMain, changeLanguage } = require("./src/helpers/i18nMain");
 const { ensureYdotool } = require("./src/helpers/ensureYdotool");
 const sidecarRegistry = require("./src/helpers/sidecarRegistry");
 const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
+const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
+const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 
 // Manager instances - initialized after app.whenReady()
 let debugLogger = null;
@@ -318,6 +320,7 @@ let meetingAecManager = null;
 let qdrantManager = null;
 let ipcHandlers = null;
 let cliBridge = null;
+let jarvisRepository = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -377,6 +380,9 @@ function initializeCoreManagers() {
 
   debugLogger = require("./src/helpers/debugLogger");
   debugLogger.ensureFileLogging();
+
+  jarvisRepository = new JarvisRepository(path.join(app.getPath("userData"), "jarvis.db"));
+  registerJarvisIpc({ ipcMain, repository: jarvisRepository });
 
   environmentManager = new EnvironmentManager();
   const uiLanguage = environmentManager.getUiLanguage();
@@ -1632,4 +1638,8 @@ function performSyncTeardown() {
   if (ipcHandlers) ipcHandlers._cleanupTextEditMonitor();
   if (textEditMonitor) textEditMonitor.stopMonitoring();
   if (updateManager) updateManager.cleanup();
+  if (jarvisRepository) {
+    jarvisRepository.close();
+    jarvisRepository = null;
+  }
 }

@@ -1,0 +1,32 @@
+const { CHANNELS, assertId, assertSessionStatus } = require("../shared/contracts");
+
+function registerJarvisIpc({ ipcMain, repository }) {
+  if (!ipcMain || typeof ipcMain.handle !== "function") {
+    throw new TypeError("ipcMain with a handle method is required");
+  }
+  if (!repository || typeof repository !== "object") {
+    throw new TypeError("repository is required");
+  }
+
+  ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));
+  ipcMain.handle(CHANNELS.setSessionStatus, (_event, id, status, at) =>
+    repository.setSessionStatus(assertId(id, "sessionId"), assertSessionStatus(status), at)
+  );
+  ipcMain.handle(CHANNELS.getSession, (_event, id) =>
+    repository.getSession(assertId(id, "sessionId"))
+  );
+  ipcMain.handle(CHANNELS.listSessions, (_event, query) => repository.listSessions(query));
+  ipcMain.handle(CHANNELS.upsertSegments, (_event, sessionId, segments) =>
+    repository.upsertTranscriptSegments(assertId(sessionId, "sessionId"), segments)
+  );
+  ipcMain.handle(CHANNELS.listSegments, (_event, sessionId) =>
+    repository.listTranscriptSegments(assertId(sessionId, "sessionId"))
+  );
+  ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
+  ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
+  ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
+    repository.listAudioChunks(assertId(sessionId, "sessionId"))
+  );
+}
+
+module.exports = registerJarvisIpc;

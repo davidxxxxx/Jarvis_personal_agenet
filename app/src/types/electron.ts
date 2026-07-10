@@ -1,3 +1,17 @@
+import type {
+  JarvisAudioChunk,
+  JarvisControlAction,
+  JarvisPerson,
+  JarvisRenamePersonInput,
+  JarvisRuntimeState,
+  JarvisSession,
+  JarvisSessionInput,
+  JarvisSessionQuery,
+  JarvisSessionStatus,
+  JarvisTranscriptSegment,
+  JarvisTranscriptSegmentInput,
+} from "../jarvis/types";
+
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
 
 export type InferenceMode = "openwhispr" | "providers" | "local" | "self-hosted" | "enterprise";
@@ -503,6 +517,27 @@ declare global {
       onToggleVoiceAgent?: (callback: () => void) => () => void;
       onStartDictation?: (callback: () => void) => () => void;
       onStopDictation?: (callback: () => void) => () => void;
+
+      jarvis: {
+        createSession: (input: JarvisSessionInput) => Promise<JarvisSession>;
+        setSessionStatus: (
+          id: string,
+          status: JarvisSessionStatus,
+          at?: number
+        ) => Promise<JarvisSession | null>;
+        getSession: (id: string) => Promise<JarvisSession | null>;
+        listSessions: (query?: JarvisSessionQuery) => Promise<JarvisSession[]>;
+        upsertSegments: (
+          sessionId: string,
+          segments: JarvisTranscriptSegmentInput[]
+        ) => Promise<JarvisTranscriptSegment[]>;
+        listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
+        renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
+        listPeople: () => Promise<JarvisPerson[]>;
+        listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
+        onControl: (callback: (action: JarvisControlAction) => void) => () => void;
+        onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;
+      };
 
       // STT config
       getSttConfig?: () => Promise<{
