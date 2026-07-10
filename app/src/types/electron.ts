@@ -1,5 +1,6 @@
 import type {
   JarvisAudioChunk,
+  JarvisCaptureInput,
   JarvisControlAction,
   JarvisPerson,
   JarvisRenamePersonInput,
@@ -535,6 +536,10 @@ declare global {
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
+        startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
+        pauseCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+        resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+        finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         onControl: (callback: (action: JarvisControlAction) => void) => () => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;
       };
@@ -1674,6 +1679,8 @@ declare global {
         model?: string;
         language?: string;
         noteId?: number | null;
+        micOnly?: boolean;
+        jarvisSessionId?: string | null;
       }) => Promise<{
         success: boolean;
         error?: string;

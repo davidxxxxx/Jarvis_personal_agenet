@@ -12,7 +12,9 @@ const REQUIRED_REPOSITORY_METHODS = [
   "listAudioChunks",
 ];
 
-function registerJarvisIpc({ ipcMain, repository }) {
+const REQUIRED_SERVICE_METHODS = ["startCapture", "pauseCapture", "resumeCapture", "finishCapture"];
+
+function registerJarvisIpc({ ipcMain, repository, service }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
   }
@@ -22,6 +24,14 @@ function registerJarvisIpc({ ipcMain, repository }) {
   for (const method of REQUIRED_REPOSITORY_METHODS) {
     if (typeof repository[method] !== "function") {
       throw new TypeError(`repository.${method} must be a function`);
+    }
+  }
+  if (!service || typeof service !== "object") {
+    throw new TypeError("service is required");
+  }
+  for (const method of REQUIRED_SERVICE_METHODS) {
+    if (typeof service[method] !== "function") {
+      throw new TypeError(`service.${method} must be a function`);
     }
   }
 
@@ -43,6 +53,16 @@ function registerJarvisIpc({ ipcMain, repository }) {
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
     repository.listAudioChunks(assertId(sessionId, "sessionId"))
+  );
+  ipcMain.handle(CHANNELS.startCapture, (_event, input) => service.startCapture(input));
+  ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at) =>
+    service.pauseCapture(assertId(id, "sessionId"), at)
+  );
+  ipcMain.handle(CHANNELS.resumeCapture, (_event, id, at) =>
+    service.resumeCapture(assertId(id, "sessionId"), at)
+  );
+  ipcMain.handle(CHANNELS.finishCapture, (_event, id, at) =>
+    service.finishCapture(assertId(id, "sessionId"), at)
   );
 }
 

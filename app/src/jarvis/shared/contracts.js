@@ -8,6 +8,10 @@ const CHANNELS = Object.freeze({
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
   listAudioChunks: "jarvis:audio:list",
+  startCapture: "jarvis:capture:start",
+  pauseCapture: "jarvis:capture:pause",
+  resumeCapture: "jarvis:capture:resume",
+  finishCapture: "jarvis:capture:finish",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",
 });

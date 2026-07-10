@@ -686,6 +686,8 @@ export interface StartRecordingArgs {
   noteId: number | null;
   noteTitle: string | null;
   folderId: number | null;
+  captureSystemAudio?: boolean;
+  jarvisSessionId?: string | null;
   seedSegments?: TranscriptSegment[];
   diarizationEnabled?: boolean | null;
   expectedCount?: number | null;
@@ -705,7 +707,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   );
 
   const systemAudioAccessPromise =
-    window.electronAPI?.checkSystemAudioAccess?.() ?? Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS);
+    args.captureSystemAudio === false
+      ? Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS)
+      : (window.electronAPI?.checkSystemAudioAccess?.() ??
+        Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS));
 
   logger.info("Meeting transcription starting...", {}, "meeting");
   const seed = args.seedSegments ?? [];
@@ -757,12 +762,20 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     const initialSystemAudioAccess =
       (await systemAudioAccessPromise) ?? getFallbackSystemAudioAccess();
     const { initialSystemAudioStrategy, initialDisplayCaptureStrategy, systemCapturePromise } =
-      prepareMeetingSystemAudioCapture(initialSystemAudioAccess);
+      args.captureSystemAudio === false
+        ? {
+            initialSystemAudioStrategy: "unsupported" as const,
+            initialDisplayCaptureStrategy: null,
+            systemCapturePromise: Promise.resolve({ stream: null, error: null }),
+          }
+        : prepareMeetingSystemAudioCapture(initialSystemAudioAccess);
 
     const [startResult, micResult, initialSystemCaptureResult] = await Promise.all([
       window.electronAPI?.meetingTranscriptionStart?.({
         ...getMeetingTranscriptionOptions(),
         noteId: args.noteId ?? null,
+        micOnly: args.captureSystemAudio === false,
+        jarvisSessionId: args.jarvisSessionId ?? null,
       }),
       getMeetingMicConstraints().then(async (constraints) => {
         try {
@@ -772,6 +785,14 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             typeof constraints.audio === "object" &&
             constraints.audio !== null &&
             "deviceId" in constraints.audio;
+          if (hasExactDevice && args.captureSystemAudio === false) {
+            logger.error(
+              "Selected microphone is unavailable for mic-only capture",
+              { error: (err as Error).message },
+              "meeting"
+            );
+            return null;
+          }
           if (hasExactDevice) {
             try {
               const fallbackStream = await navigator.mediaDevices.getUserMedia({

@@ -18,6 +18,16 @@ function createRepository(overrides = {}) {
   };
 }
 
+function createService(overrides = {}) {
+  return {
+    startCapture: () => "capture-started",
+    pauseCapture: () => "capture-paused",
+    resumeCapture: () => "capture-resumed",
+    finishCapture: () => "capture-finished",
+    ...overrides,
+  };
+}
+
 function createIpcHarness(overrides = {}) {
   const handlers = new Map();
   const ipcMain = {
@@ -26,8 +36,9 @@ function createIpcHarness(overrides = {}) {
     },
   };
   const repository = createRepository(overrides);
-  registerJarvisIpc({ ipcMain, repository });
-  return { handlers, repository };
+  const service = createService();
+  registerJarvisIpc({ ipcMain, repository, service });
+  return { handlers, repository, service };
 }
 
 test("contract rejects path traversal and unknown states", () => {
@@ -40,13 +51,17 @@ test("contract exposes only the named Jarvis channels", () => {
   assert.deepEqual(Object.keys(CHANNELS).sort(), [
     "control",
     "createSession",
+    "finishCapture",
     "getSession",
     "listAudioChunks",
     "listPeople",
     "listSegments",
     "listSessions",
+    "pauseCapture",
     "renamePerson",
+    "resumeCapture",
     "setSessionStatus",
+    "startCapture",
     "stateChanged",
     "upsertSegments",
   ]);
@@ -56,17 +71,24 @@ test("contract exposes only the named Jarvis channels", () => {
 test("IPC registers only request-response repository channels", () => {
   const { handlers } = createIpcHarness();
 
-  assert.deepEqual([...handlers.keys()].sort(), [
-    CHANNELS.createSession,
-    CHANNELS.getSession,
-    CHANNELS.listAudioChunks,
-    CHANNELS.listPeople,
-    CHANNELS.listSegments,
-    CHANNELS.listSessions,
-    CHANNELS.renamePerson,
-    CHANNELS.setSessionStatus,
-    CHANNELS.upsertSegments,
-  ].sort());
+  assert.deepEqual(
+    [...handlers.keys()].sort(),
+    [
+      CHANNELS.createSession,
+      CHANNELS.getSession,
+      CHANNELS.listAudioChunks,
+      CHANNELS.listPeople,
+      CHANNELS.listSegments,
+      CHANNELS.listSessions,
+      CHANNELS.renamePerson,
+      CHANNELS.setSessionStatus,
+      CHANNELS.upsertSegments,
+      CHANNELS.startCapture,
+      CHANNELS.pauseCapture,
+      CHANNELS.resumeCapture,
+      CHANNELS.finishCapture,
+    ].sort()
+  );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
 });
@@ -90,10 +112,7 @@ test("IPC validates identifiers and statuses before calling the repository", () 
     () => handlers.get(CHANNELS.setSessionStatus)(null, "s1", "hidden-recording", 1000),
     /invalid session status/
   );
-  assert.throws(
-    () => handlers.get(CHANNELS.listSegments)(null, "../s1"),
-    /safe identifier/
-  );
+  assert.throws(() => handlers.get(CHANNELS.listSegments)(null, "../s1"), /safe identifier/);
   assert.equal(calls, 0);
 });
 
@@ -108,9 +127,12 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
   assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
 });
 
-test("IPC registration rejects invalid IPC and missing repository handler capabilities", () => {
-  assert.throws(() => registerJarvisIpc({ ipcMain: null, repository: {} }), /ipcMain/);
-  assert.throws(() => registerJarvisIpc({ ipcMain: { handle() {} }, repository: null }), /repository/);
+test("IPC registration rejects invalid IPC and missing handler capabilities", () => {
+  assert.throws(() => registerJarvisIpc({ ipcMain: null, repository: {}, service: {} }), /ipcMain/);
+  assert.throws(
+    () => registerJarvisIpc({ ipcMain: { handle() {} }, repository: null, service: {} }),
+    /repository/
+  );
 
   const requiredMethods = [
     "createSession",
@@ -132,8 +154,25 @@ test("IPC registration rejects invalid IPC and missing repository handler capabi
         registerJarvisIpc({
           ipcMain: { handle: (channel) => registered.push(channel) },
           repository,
+          service: createService(),
         }),
       new RegExp(`repository\\.${method} must be a function`)
+    );
+    assert.deepEqual(registered, []);
+  }
+
+  for (const method of ["startCapture", "pauseCapture", "resumeCapture", "finishCapture"]) {
+    const service = createService();
+    delete service[method];
+    const registered = [];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle: (channel) => registered.push(channel) },
+          repository: createRepository(),
+          service,
+        }),
+      new RegExp(`service\\.${method} must be a function`)
     );
     assert.deepEqual(registered, []);
   }

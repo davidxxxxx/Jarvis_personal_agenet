@@ -43,6 +43,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
+    startCapture: (input) => ipcRenderer.invoke("jarvis:capture:start", input),
+    pauseCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:pause", id, at),
+    resumeCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:resume", id, at),
+    finishCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:finish", id, at),
     onControl: registerListener(
       "jarvis:control",
       (callback) => (_event, action) => callback(action)

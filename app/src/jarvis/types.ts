@@ -1,16 +1,17 @@
 export type JarvisSessionStatus =
-  | "recording"
-  | "paused"
-  | "finalizing"
-  | "completed"
-  | "recovered"
-  | "failed";
+  "recording" | "paused" | "finalizing" | "completed" | "recovered" | "failed";
 
 export interface JarvisSessionInput {
   id: string;
   startedAt: number;
   micDeviceId: string | null;
   language?: string;
+}
+
+export interface JarvisCaptureInput {
+  sessionId: string;
+  startedAt: number;
+  micDeviceId: string | null;
 }
 
 export interface JarvisSession {
@@ -85,10 +86,9 @@ export interface JarvisAudioChunk {
 export type JarvisControlAction = "start" | "pause" | "resume" | "finish";
 
 export interface JarvisRuntimeState {
-  id: string | null;
-  status: "idle" | "starting" | JarvisSessionStatus;
+  sessionId: string | null;
+  status: "idle" | JarvisSessionStatus;
   startedAt: number | null;
-  activeSince: number | null;
-  accumulatedMs: number;
+  elapsedMs: number;
   errorCode: string | null;
 }

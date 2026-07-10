@@ -34,6 +34,12 @@ const {
   isSpeakerLocked,
 } = require("./speakerAssignmentPolicy");
 const { downsample24kTo16k, pcm16ToWav } = require("../utils/audioUtils");
+const { assertId } = require("../jarvis/shared/contracts");
+const {
+  resolveMeetingCaptureMode,
+  resolveMeetingCaptureModeWithPlan,
+  routeMicOnlyPcm,
+} = require("../jarvis/main/meetingCaptureMode");
 const postMigrationDetector = require("./postMigrationDetector");
 const {
   DEFAULT_EXPECTED_SPEAKER_COUNT,
@@ -332,6 +338,7 @@ class IPCHandlers {
     this.linuxPortalAudioManager = managers.linuxPortalAudioManager;
     this.windowsLoopbackAudioManager = managers.windowsLoopbackAudioManager;
     this.meetingAecManager = managers.meetingAecManager;
+    this.jarvisService = managers.jarvisService;
     this.oauthProtocolRegistered = managers.oauthProtocolRegistered === true;
     this.oauthProtocol = managers.oauthProtocol || "openwhispr";
     this.sessionId = crypto.randomUUID();
@@ -4128,7 +4135,6 @@ class IPCHandlers {
           debugLogger.debug(
             "Dropping buffered mic segment after system context confirmed duplicate",
             {
-              text: pending.text.slice(0, 80),
               averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
               averageResidual: pending.micSuppression?.averageResidual?.toFixed(3),
             }
@@ -4145,7 +4151,6 @@ class IPCHandlers {
       for (const pending of ready) {
         if (pending.micSuppression?.hasBleedEvidence) {
           debugLogger.debug("Dropping flagged-bleed mic segment after holdback", {
-            text: pending.text.slice(0, 80),
             holdbackMs: pending.holdbackMs,
             averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
             averageResidual: pending.micSuppression?.averageResidual?.toFixed(3),
@@ -4153,7 +4158,6 @@ class IPCHandlers {
           continue;
         }
         debugLogger.debug("Releasing buffered mic segment after duplicate holdback", {
-          text: pending.text.slice(0, 80),
           holdbackMs: pending.holdbackMs,
           averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
           averageResidual: pending.micSuppression?.averageResidual?.toFixed(3),
@@ -4271,7 +4275,6 @@ class IPCHandlers {
               reason: micSuppression.reason,
               averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
               averageResidual: micSuppression.averageResidual?.toFixed(3),
-              text: latestSegment.slice(0, 80),
             });
             send("meeting-transcription-segment", { text: "", source, type: "partial" });
             return;
@@ -4279,7 +4282,6 @@ class IPCHandlers {
 
           if (shouldSkipDuplicateMicSegment(latestSegment, timestamp, micSuppression)) {
             debugLogger.debug("Skipping duplicate mic segment that matches recent system audio", {
-              text: latestSegment.slice(0, 80),
               averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
               averageResidual: micSuppression.averageResidual?.toFixed(3),
             });
@@ -4293,7 +4295,6 @@ class IPCHandlers {
           if (pending.length > 0) {
             debugLogger.debug("Dropping buffered mic segments after system transcript arrived", {
               count: pending.length,
-              text: latestSegment.slice(0, 80),
             });
           }
 
@@ -4310,7 +4311,6 @@ class IPCHandlers {
 
         debugLogger.debug("Meeting segment sending to renderer", {
           source,
-          text: latestSegment.slice(0, 80),
           segmentCount: segments.length,
           micCorrelation: micSuppression?.averageCorrelation?.toFixed(3),
           micSuppressionReason: micSuppression?.reason,
@@ -4320,7 +4320,6 @@ class IPCHandlers {
         });
         if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
           debugLogger.debug("Buffering risky mic segment before renderer commit", {
-            text: latestSegment.slice(0, 80),
             holdbackMs: STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS,
             reason: micSuppression?.reason,
             hasBleedEvidence: micSuppression?.hasBleedEvidence,
@@ -4515,7 +4514,7 @@ class IPCHandlers {
       !!this._meetingMicStreaming?.isConnected &&
       (systemAudioMode === "unsupported" || !!this._meetingSystemStreaming?.isConnected);
 
-    const connectRealtimeStreaming = async (event, options) => {
+    const connectRealtimeStreaming = async (event, options, resolvedCaptureMode = null) => {
       if (this._meetingMicStreaming?.isConnected) {
         await this._meetingMicStreaming.disconnect();
       }
@@ -4535,7 +4534,10 @@ class IPCHandlers {
         keyterms: options.keyterms,
         sampleRate: MEETING_STREAM_SAMPLE_RATE,
       };
-      const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
+      const captureMode =
+        resolvedCaptureMode ||
+        (await resolveMeetingCaptureModeWithPlan(options, getMeetingSystemAudioPlan));
+      const { systemAudioMode } = captureMode;
       let pairs;
       if (systemAudioMode !== "unsupported") {
         const secrets = await fetchRealtimeToken(event, options, { streams: 2 });
@@ -4621,6 +4623,13 @@ class IPCHandlers {
     let meetingOneOnOneAttendee = null;
     let meetingOneOnOneProfileBound = false;
     let meetingNoteId = null;
+    let activeMeetingCaptureMode = resolveMeetingCaptureMode();
+    let activeJarvisSessionId = null;
+
+    const resetActiveMeetingCapture = () => {
+      activeMeetingCaptureMode = resolveMeetingCaptureMode();
+      activeJarvisSessionId = null;
+    };
 
     const getLiveSpeakerProfiles = () => {
       const attendees = this._getNoteNonSelfParticipants(meetingNoteId);
@@ -4852,10 +4861,10 @@ class IPCHandlers {
       return meetingLiveSpeakerState;
     };
 
-    const startLiveSpeakerIdentification = async (win, systemAudioMode) => {
+    const startLiveSpeakerIdentification = async (win, systemAudioMode, micOnly = false) => {
       await stopLiveSpeakerIdentification();
 
-      if (systemAudioMode !== "native" || !liveSpeakerIdentifier.isAvailable()) {
+      if ((!micOnly && systemAudioMode !== "native") || !liveSpeakerIdentifier.isAvailable()) {
         return false;
       }
 
@@ -4900,7 +4909,7 @@ class IPCHandlers {
 
           for (const seg of meetingDiarizationSegments) {
             if (
-              seg.source === "system" &&
+              seg.source === (micOnly ? "mic" : "system") &&
               seg.timestamp != null &&
               seg.timestamp >= startTime &&
               seg.timestamp <= endTime &&
@@ -5025,7 +5034,6 @@ class IPCHandlers {
             );
             debugLogger.debug("Local meeting transcription candidate", {
               source,
-              text: text.slice(0, 80),
               suppress: micSuppression.suppress,
               reason: micSuppression.reason,
               hasBleedEvidence: micSuppression.hasBleedEvidence,
@@ -5038,14 +5046,12 @@ class IPCHandlers {
                 reason: micSuppression.reason,
                 averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
                 averageResidual: micSuppression.averageResidual?.toFixed(3),
-                text: text.slice(0, 80),
               });
               return;
             }
 
             if (shouldSkipDuplicateMicSegment(text, segTimestamp, micSuppression)) {
               debugLogger.debug("Skipping duplicate local mic segment that matches system audio", {
-                text: text.slice(0, 80),
                 averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
                 averageResidual: micSuppression.averageResidual?.toFixed(3),
               });
@@ -5054,7 +5060,6 @@ class IPCHandlers {
           } else {
             debugLogger.debug("Local meeting transcription candidate", {
               source,
-              text: text.slice(0, 80),
             });
           }
 
@@ -5065,7 +5070,6 @@ class IPCHandlers {
                 "Dropping buffered local mic segments after system transcript arrived",
                 {
                   count: pending.length,
-                  text: text.slice(0, 80),
                 }
               );
             }
@@ -5095,7 +5099,6 @@ class IPCHandlers {
 
           if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
             debugLogger.debug("Buffering risky local mic segment before renderer commit", {
-              text: text.slice(0, 80),
               holdbackMs: LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS,
               reason: micSuppression?.reason,
               hasBleedEvidence: micSuppression?.hasBleedEvidence,
@@ -5315,6 +5318,7 @@ class IPCHandlers {
       await stopLiveSpeakerIdentification().catch(() => {});
       resetMeetingLocalState();
       await disconnectMeetingStreaming().catch(() => {});
+      resetActiveMeetingCapture();
     };
 
     const setupDictationCallbacks = (streaming, event) => {
@@ -5429,7 +5433,11 @@ class IPCHandlers {
         return { success: true };
       }
 
-      const { mode: systemAudioMode } = await getMeetingSystemAudioPlan();
+      const captureMode = await resolveMeetingCaptureModeWithPlan(
+        options,
+        getMeetingSystemAudioPlan
+      );
+      const { systemAudioMode } = captureMode;
 
       if (isMeetingStreamingConnected(systemAudioMode)) {
         debugLogger.debug("Meeting transcription already prepared (warm connections)");
@@ -5441,7 +5449,7 @@ class IPCHandlers {
         let timeoutHandle;
         try {
           await Promise.race([
-            connectRealtimeStreaming(event, options),
+            connectRealtimeStreaming(event, options, captureMode),
             new Promise((_, reject) => {
               timeoutHandle = setTimeout(() => reject(new Error("Prepare timed out")), 15000);
             }),
@@ -5487,8 +5495,18 @@ class IPCHandlers {
       meetingStartedAt = Date.now();
       this.meetingDetectionEngine?.setUserRecording(true);
       try {
-        const systemAudioPlan = await getMeetingSystemAudioPlan();
-        let { mode: systemAudioMode, strategy: systemAudioStrategy } = systemAudioPlan;
+        const captureMode = await resolveMeetingCaptureModeWithPlan(
+          options,
+          getMeetingSystemAudioPlan
+        );
+        let { systemAudioMode, systemAudioStrategy } = captureMode;
+        activeMeetingCaptureMode = captureMode;
+        activeJarvisSessionId = captureMode.micOnly
+          ? assertId(options.jarvisSessionId, "jarvisSessionId")
+          : null;
+        if (captureMode.micOnly && !this.jarvisService) {
+          throw new Error("Jarvis capture service is unavailable");
+        }
         meetingEchoLeakDetector.reset();
         meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(options.noteId);
         meetingOneOnOneProfileBound = false;
@@ -5508,11 +5526,12 @@ class IPCHandlers {
             attachMeetingStreamingHandlers(this._meetingSystemStreaming, win, "system");
           }
           await startMeetingAec(systemAudioMode);
-          await startLiveSpeakerIdentification(win, systemAudioMode);
+          await startLiveSpeakerIdentification(win, systemAudioMode, captureMode.micOnly);
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,
             systemAudioMode,
             systemAudioStrategy,
+            captureMode,
             "during warm-start reuse"
           ));
           return {
@@ -5532,7 +5551,11 @@ class IPCHandlers {
           meetingLocalBuffers = { mic: [], system: [] };
           meetingLocalTranscript = "";
 
-          await startLiveSpeakerIdentification(meetingLocalWin, systemAudioMode);
+          await startLiveSpeakerIdentification(
+            meetingLocalWin,
+            systemAudioMode,
+            captureMode.micOnly
+          );
           await startMeetingAec(systemAudioMode);
 
           meetingLocalTimer = setInterval(() => {
@@ -5543,6 +5566,7 @@ class IPCHandlers {
             event,
             systemAudioMode,
             systemAudioStrategy,
+            captureMode,
             "in local meeting mode"
           ));
 
@@ -5564,14 +5588,15 @@ class IPCHandlers {
           return { success: false, error: `Unsupported provider: ${options.provider}` };
         }
 
-        await connectRealtimeStreaming(event, options);
+        await connectRealtimeStreaming(event, options, captureMode);
         const realtimeWin = BrowserWindow.fromWebContents(event.sender);
-        await startLiveSpeakerIdentification(realtimeWin, systemAudioMode);
+        await startLiveSpeakerIdentification(realtimeWin, systemAudioMode, captureMode.micOnly);
         await startMeetingAec(systemAudioMode);
         ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
           event,
           systemAudioMode,
           systemAudioStrategy,
+          captureMode,
           "in realtime mode"
         ));
         return {
@@ -5590,10 +5615,20 @@ class IPCHandlers {
       }
     });
 
+    const writeMeetingDiarizationPcm = (buffer, receivedAt) => {
+      if (!meetingDiarizationStream) {
+        meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
+        meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
+        meetingDiarizationStartedAt = receivedAt;
+      }
+      meetingDiarizationStream.write(buffer);
+    };
+
     const sendMeetingAudio = (audioBuffer, source) => {
       const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
 
       if (source === "system") {
+        if (activeMeetingCaptureMode.micOnly) return;
         const receivedAt = Date.now();
         meetingEchoLeakDetector.recordSystemChunk(outboundBuffer, receivedAt);
         if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(outboundBuffer)) {
@@ -5605,18 +5640,28 @@ class IPCHandlers {
           void liveSpeakerIdentifier.feedAudio(outboundBuffer);
         }
 
-        if (!meetingDiarizationStream) {
-          const os = require("os");
-          meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
-          meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
-          meetingDiarizationStartedAt = receivedAt;
-        }
-        meetingDiarizationStream.write(outboundBuffer);
+        writeMeetingDiarizationPcm(outboundBuffer, receivedAt);
         dispatchMeetingAudioBuffer(outboundBuffer, "system");
         return;
       }
 
       if (source === "mic") {
+        if (activeMeetingCaptureMode.micOnly) {
+          routeMicOnlyPcm({
+            sessionId: activeJarvisSessionId,
+            pcmBuffer: outboundBuffer,
+            appendMicPcm: (sessionId, buffer) => this.jarvisService.appendMicPcm(sessionId, buffer),
+            feedSpeaker: (buffer) => {
+              if (meetingLiveSpeakerActive) {
+                void liveSpeakerIdentifier.feedAudio(buffer);
+              }
+            },
+            writeDiarization: (buffer) => writeMeetingDiarizationPcm(buffer, Date.now()),
+            dispatchTranscription: dispatchMeetingAudioBuffer,
+          });
+          return;
+        }
+
         if (processMeetingMicWithAec(outboundBuffer)) {
           return;
         }
@@ -5682,8 +5727,13 @@ class IPCHandlers {
       event,
       systemAudioMode,
       systemAudioStrategy,
+      captureMode,
       context
     ) => {
+      if (captureMode.micOnly) {
+        return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
+      }
+
       if (systemAudioMode === "native") {
         try {
           await startManagedMeetingSystemAudio(
@@ -5837,6 +5887,8 @@ class IPCHandlers {
       } catch (error) {
         debugLogger.error("Meeting transcription stop error", { error: error.message });
         return { success: false, error: error.message };
+      } finally {
+        resetActiveMeetingCapture();
       }
     });
 

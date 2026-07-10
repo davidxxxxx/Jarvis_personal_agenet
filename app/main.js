@@ -292,6 +292,7 @@ const { ensureYdotool } = require("./src/helpers/ensureYdotool");
 const sidecarRegistry = require("./src/helpers/sidecarRegistry");
 const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
+const JarvisService = require("./src/jarvis/main/JarvisService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 
 // Manager instances - initialized after app.whenReady()
@@ -321,6 +322,7 @@ let qdrantManager = null;
 let ipcHandlers = null;
 let cliBridge = null;
 let jarvisRepository = null;
+let jarvisService = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -382,7 +384,13 @@ function initializeCoreManagers() {
   debugLogger.ensureFileLogging();
 
   jarvisRepository = new JarvisRepository(path.join(app.getPath("userData"), "jarvis.db"));
-  registerJarvisIpc({ ipcMain, repository: jarvisRepository });
+  jarvisService = new JarvisService({
+    repository: jarvisRepository,
+    userDataDir: app.getPath("userData"),
+    broadcast: (state) => windowManager?.sendToControlPanel("jarvis:state-changed", state),
+  });
+  jarvisService.recoverOpenSessions(Date.now());
+  registerJarvisIpc({ ipcMain, repository: jarvisRepository, service: jarvisService });
 
   environmentManager = new EnvironmentManager();
   const uiLanguage = environmentManager.getUiLanguage();
@@ -446,6 +454,7 @@ function initializeCoreManagers() {
     linuxPortalAudioManager,
     windowsLoopbackAudioManager,
     meetingAecManager,
+    jarvisService,
     getTrayManager: () => trayManager,
     oauthProtocolRegistered: protocolRegistered,
     oauthProtocol: OAUTH_PROTOCOL,
@@ -1638,6 +1647,10 @@ function performSyncTeardown() {
   if (ipcHandlers) ipcHandlers._cleanupTextEditMonitor();
   if (textEditMonitor) textEditMonitor.stopMonitoring();
   if (updateManager) updateManager.cleanup();
+  if (jarvisService) {
+    jarvisService.shutdown();
+    jarvisService = null;
+  }
   if (jarvisRepository) {
     jarvisRepository.close();
     jarvisRepository = null;
