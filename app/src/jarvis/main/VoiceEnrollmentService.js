@@ -145,7 +145,11 @@ class VoiceEnrollmentService {
     ) {
       throw new TypeError("speakerEmbeddings is required");
     }
-    if (!databaseManager || typeof databaseManager.upsertSpeakerProfile !== "function") {
+    if (
+      !databaseManager ||
+      typeof databaseManager.upsertSpeakerProfile !== "function" ||
+      typeof databaseManager.getSpeakerProfiles !== "function"
+    ) {
       throw new TypeError("databaseManager is required");
     }
     if (!repository || typeof repository.renamePerson !== "function") {
@@ -173,6 +177,21 @@ class VoiceEnrollmentService {
     this.maxActiveSessions = maxActiveSessions;
     this.sessions = new Map();
     this.ownerSessions = new Map();
+  }
+
+  getStatus() {
+    const profile = this.databaseManager
+      .getSpeakerProfiles(false)
+      .find((candidate) => candidate.id === SELF_VOICE_PROFILE_ID);
+    if (!profile) {
+      return { enrolled: false, profileId: null, sampleCount: 0, updatedAt: null };
+    }
+    return {
+      enrolled: true,
+      profileId: profile.id,
+      sampleCount: profile.sample_count,
+      updatedAt: profile.updated_at,
+    };
   }
 
   begin({ ownerId }) {

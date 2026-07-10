@@ -42,6 +42,7 @@ function createService({
   profileId = SELF_VOICE_PROFILE_ID,
   sessionTtlMs,
   maxActiveSessions,
+  profiles = [],
 } = {}) {
   const savedProfiles = [];
   const renamedPeople = [];
@@ -67,6 +68,10 @@ function createService({
       },
     },
     databaseManager: {
+      getSpeakerProfiles(includeEmbedding) {
+        assert.equal(includeEmbedding, false);
+        return profiles;
+      },
       upsertSpeakerProfile(name, email, embedding, requestedProfileId) {
         savedProfiles.push({ name, email, embedding, requestedProfileId });
         return { id: profileId };
@@ -96,6 +101,39 @@ function createService({
     },
   };
 }
+
+test("reports reserved self-profile metadata without exposing the embedding", () => {
+  const { service } = createService({
+    profiles: [
+      {
+        id: SELF_VOICE_PROFILE_ID,
+        display_name: "我",
+        sample_count: 3,
+        updated_at: "2026-07-11 03:00:00",
+        embedding: Buffer.alloc(2_048),
+      },
+    ],
+  });
+
+  assert.deepEqual(service.getStatus(), {
+    enrolled: true,
+    profileId: SELF_VOICE_PROFILE_ID,
+    sampleCount: 3,
+    updatedAt: "2026-07-11 03:00:00",
+  });
+  assert.equal("embedding" in service.getStatus(), false);
+});
+
+test("reports an explicit unbound self-profile state", () => {
+  const { service } = createService();
+
+  assert.deepEqual(service.getStatus(), {
+    enrolled: false,
+    profileId: null,
+    sampleCount: 0,
+    updatedAt: null,
+  });
+});
 
 async function begin(harness, ownerId = OWNER_ID) {
   const session = harness.service.begin({ ownerId });

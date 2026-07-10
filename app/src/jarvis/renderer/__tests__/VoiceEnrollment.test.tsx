@@ -110,6 +110,12 @@ afterEach(() => {
 
 function installElectronApi(overrides = {}) {
   const jarvis = {
+    getVoiceEnrollmentStatus: vi.fn().mockResolvedValue({
+      enrolled: false,
+      profileId: null,
+      sampleCount: 0,
+      updatedAt: null,
+    }),
     beginVoiceEnrollment: vi.fn().mockResolvedValue(SESSION),
     completeVoiceEnrollment: vi.fn().mockResolvedValue({ profileId: 2_147_483_647 }),
     cancelVoiceEnrollment: vi.fn().mockResolvedValue({ cancelled: true }),
@@ -132,6 +138,23 @@ function installMedia(stream: MediaStream) {
 }
 
 describe("VoiceEnrollment", () => {
+  it("loads and displays a persistent enrolled self-voice status", async () => {
+    installElectronApi({
+      getVoiceEnrollmentStatus: vi.fn().mockResolvedValue({
+        enrolled: true,
+        profileId: -1,
+        sampleCount: 3,
+        updatedAt: "2026-07-11 03:00:00",
+      }),
+    });
+
+    render(<VoiceEnrollment />);
+
+    expect(await screen.findByText("已绑定")).toBeInTheDocument();
+    expect(screen.getByText(/2026-07-11 03:00:00/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新校准" })).toBeEnabled();
+  });
+
   it("shows an explicit local 30-second calibration flow with meter values", () => {
     render(<VoiceEnrollment />);
 

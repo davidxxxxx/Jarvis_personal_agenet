@@ -96,6 +96,13 @@ test("preload rejects oversized or malformed enrollment payloads before IPC clon
   assert.deepEqual(invokes[0], ["jarvis:voice-enrollment:complete", "session", valid]);
 });
 
+test("preload exposes metadata-only self voice enrollment status", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  assert.equal(await api.getVoiceEnrollmentStatus(), "invoked");
+  assert.deepEqual(invokes, [["jarvis:voice-enrollment:status"]]);
+});
+
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
   const { api, sends, invokes, listeners } = loadPreloadApi();
   const shutdownRequests = [];

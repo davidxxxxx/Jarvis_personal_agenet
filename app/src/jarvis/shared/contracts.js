@@ -15,6 +15,7 @@ const CHANNELS = Object.freeze({
   finishCapture: "jarvis:capture:finish",
   failCapture: "jarvis:capture:fail",
   beginVoiceEnrollment: "jarvis:voice-enrollment:begin",
+  getVoiceEnrollmentStatus: "jarvis:voice-enrollment:status",
   completeVoiceEnrollment: "jarvis:voice-enrollment:complete",
   cancelVoiceEnrollment: "jarvis:voice-enrollment:cancel",
   control: "jarvis:control",

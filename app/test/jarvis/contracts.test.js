@@ -32,6 +32,7 @@ function createService(overrides = {}) {
 
 function createVoiceEnrollmentService(overrides = {}) {
   return {
+    getStatus: () => "voice-status",
     begin: () => "voice-begun",
     complete: () => "voice-enrolled",
     cancel: () => "voice-cancelled",
@@ -70,6 +71,7 @@ test("contract exposes only the named Jarvis channels", () => {
     "failCapture",
     "finishCapture",
     "getSession",
+    "getVoiceEnrollmentStatus",
     "listAudioChunks",
     "listPeople",
     "listSegments",
@@ -108,12 +110,19 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.finishCapture,
       CHANNELS.failCapture,
       CHANNELS.beginVoiceEnrollment,
+      CHANNELS.getVoiceEnrollmentStatus,
       CHANNELS.completeVoiceEnrollment,
       CHANNELS.cancelVoiceEnrollment,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
+});
+
+test("IPC returns metadata-only self voice enrollment status", async () => {
+  const { handlers } = createIpcHarness();
+
+  assert.equal(await handlers.get(CHANNELS.getVoiceEnrollmentStatus)({ sender: { id: 7 } }), "voice-status");
 });
 
 test("IPC validates identifiers and statuses before calling the repository", () => {

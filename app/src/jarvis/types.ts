@@ -98,6 +98,13 @@ export interface JarvisVoiceEnrollmentSession {
   targetDurationSeconds: 30;
 }
 
+export interface JarvisVoiceEnrollmentStatus {
+  enrolled: boolean;
+  profileId: number | null;
+  sampleCount: number;
+  updatedAt: string | null;
+}
+
 export interface JarvisVoiceEnrollmentWindow {
   startSample: number;
   endSample: number;

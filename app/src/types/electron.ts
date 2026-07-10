@@ -14,6 +14,7 @@ import type {
   JarvisTranscriptSegmentInput,
   JarvisVoiceEnrollmentPayload,
   JarvisVoiceEnrollmentSession,
+  JarvisVoiceEnrollmentStatus,
 } from "../jarvis/types";
 
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
@@ -557,6 +558,7 @@ declare global {
           at?: number
         ) => Promise<JarvisRuntimeState>;
         beginVoiceEnrollment: () => Promise<JarvisVoiceEnrollmentSession>;
+        getVoiceEnrollmentStatus: () => Promise<JarvisVoiceEnrollmentStatus>;
         completeVoiceEnrollment: (
           sessionId: string,
           payload: JarvisVoiceEnrollmentPayload

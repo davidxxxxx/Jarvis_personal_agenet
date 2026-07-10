@@ -3,7 +3,11 @@ import { useTranslation } from "react-i18next";
 import { Mic2, Save, Square, X } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
-import type { JarvisVoiceEnrollmentPayload, JarvisVoiceEnrollmentSession } from "../types";
+import type {
+  JarvisVoiceEnrollmentPayload,
+  JarvisVoiceEnrollmentSession,
+  JarvisVoiceEnrollmentStatus,
+} from "../types";
 
 const RECORDING_SECONDS = 30;
 const WINDOW_SECONDS = 8;
@@ -61,6 +65,7 @@ export default function VoiceEnrollment() {
   const [state, setState] = useState<EnrollmentState>("idle");
   const [secondsLeft, setSecondsLeft] = useState(RECORDING_SECONDS);
   const [level, setLevel] = useState(0);
+  const [profileStatus, setProfileStatus] = useState<JarvisVoiceEnrollmentStatus | null>(null);
   const mountedRef = useRef(true);
   const operationRef = useRef(false);
   const chunksRef = useRef<Float32Array[]>([]);
@@ -77,6 +82,15 @@ export default function VoiceEnrollment() {
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
     timerRef.current = null;
+  }, []);
+
+  const refreshProfileStatus = useCallback(async () => {
+    try {
+      const status = await window.electronAPI.jarvis.getVoiceEnrollmentStatus();
+      if (mountedRef.current) setProfileStatus(status);
+    } catch {
+      if (mountedRef.current) setProfileStatus(null);
+    }
   }, []);
 
   const dropChunks = useCallback(() => {
@@ -171,6 +185,10 @@ export default function VoiceEnrollment() {
       dropChunks();
     };
   }, [cleanupCapture, clearTimer, dropChunks]);
+
+  useEffect(() => {
+    void refreshProfileStatus();
+  }, [refreshProfileStatus]);
 
   const start = async () => {
     if (operationRef.current) return;
@@ -292,7 +310,10 @@ export default function VoiceEnrollment() {
     try {
       await window.electronAPI.jarvis.completeVoiceEnrollment(session.sessionId, payload);
       sessionRef.current = null;
-      if (mountedRef.current) setState("saved");
+      if (mountedRef.current) {
+        setState("saved");
+        await refreshProfileStatus();
+      }
     } catch {
       await cleanupCapture({ cancelSession: true, flush: false });
       if (mountedRef.current) setState("error");
@@ -343,6 +364,18 @@ export default function VoiceEnrollment() {
           className="h-2 min-w-0 flex-1"
         />
       </div>
+      {profileStatus && (
+        <p className="mt-2 text-xs text-muted-foreground" role="status">
+          <span className="font-medium text-foreground">
+            {profileStatus.enrolled
+              ? t("jarvis.voiceEnrollmentEnrolled")
+              : t("jarvis.voiceEnrollmentNotEnrolled")}
+          </span>
+          {profileStatus.enrolled && profileStatus.updatedAt
+            ? ` · ${t("jarvis.voiceEnrollmentUpdatedAt", { value: profileStatus.updatedAt })}`
+            : null}
+        </p>
+      )}
       {state === "error" && (
         <p role="alert" className="mt-2 text-xs text-destructive">
           {t("jarvis.voiceEnrollmentError")}
@@ -361,7 +394,9 @@ export default function VoiceEnrollment() {
       <div className="mt-4 flex flex-wrap gap-2">
         <Button type="button" size="sm" disabled={!startEnabled} onClick={() => void start()}>
           <Mic2 aria-hidden="true" />
-          {t("jarvis.voiceEnrollmentStart")}
+          {profileStatus?.enrolled
+            ? t("jarvis.voiceEnrollmentRestart")
+            : t("jarvis.voiceEnrollmentStart")}
         </Button>
         <Button
           type="button"

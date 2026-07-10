@@ -99,6 +99,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     failCapture: (id, errorCode, at) =>
       ipcRenderer.invoke("jarvis:capture:fail", id, errorCode, at),
     beginVoiceEnrollment: () => ipcRenderer.invoke("jarvis:voice-enrollment:begin"),
+    getVoiceEnrollmentStatus: () => ipcRenderer.invoke("jarvis:voice-enrollment:status"),
     completeVoiceEnrollment: (sessionId, payload) => {
       assertVoiceEnrollmentPreflight(sessionId, payload);
       return ipcRenderer.invoke("jarvis:voice-enrollment:complete", sessionId, payload);

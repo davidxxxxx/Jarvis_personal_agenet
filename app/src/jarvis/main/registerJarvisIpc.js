@@ -46,7 +46,7 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
       throw new TypeError(`service.${method} must be a function`);
     }
   }
-  for (const method of ["begin", "complete", "cancel", "cancelOwner"]) {
+  for (const method of ["getStatus", "begin", "complete", "cancel", "cancelOwner"]) {
     if (!voiceEnrollmentService || typeof voiceEnrollmentService[method] !== "function") {
       throw new TypeError(`voiceEnrollmentService.${method} must be a function`);
     }
@@ -107,6 +107,7 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
     bindEnrollmentOwner(event);
     return voiceEnrollmentService.begin({ ownerId: event?.sender?.id });
   });
+  ipcMain.handle(CHANNELS.getVoiceEnrollmentStatus, () => voiceEnrollmentService.getStatus());
   ipcMain.handle(CHANNELS.completeVoiceEnrollment, (event, sessionId, payload) =>
     voiceEnrollmentService.complete({ ownerId: event?.sender?.id, sessionId, payload })
   );
