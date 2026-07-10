@@ -1729,6 +1729,12 @@ declare global {
         transcript?: string;
         diarizationSessionId?: string;
         error?: string;
+        finalSegments?: Array<{
+          text: string;
+          source: "mic" | "system";
+          timestamp?: number;
+          confidence?: number;
+        }>;
       }>;
       meetingTranscriptionCancel?: () => Promise<{
         success: boolean;

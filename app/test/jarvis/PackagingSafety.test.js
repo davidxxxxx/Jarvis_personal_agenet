@@ -182,3 +182,242 @@ test("package safety scans ordinary JavaScript inside ASAR without exposing secr
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("package safety rejects Electron profile paths and aliases", async (t) => {
+  const profilePaths = [
+    "user-data/Cookies",
+    "userdata/History",
+    "user data/Network/Cookies",
+    "profile/Preferences",
+    "Profile 1/Preferences",
+    "Guest Profile/Preferences",
+    "System Profile/Preferences",
+    "Default/Preferences",
+    "Cache/entry.bin",
+    "Code Cache/entry.bin",
+    "GPUCache/entry.bin",
+    "Local Storage/entry.bin",
+    "Session Storage/entry.bin",
+    "IndexedDB/entry.bin",
+    "Network/Cookies",
+    "Crashpad/report.dmp",
+  ];
+
+  for (const profilePath of profilePaths) {
+    await t.test(profilePath, () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-profile-"));
+      const filePath = path.join(root, "resources", ...profilePath.split("/"));
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, "runtime profile data");
+      try {
+        assert.throws(() => assertSafeArtifactTree(root), /runtime profile resource/i);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("package safety scans common and extensionless text with redacted findings", async (t) => {
+  for (const extension of [".ini", ".conf", ".toml", ".properties", "", ".custom"]) {
+    await t.test(extension || "extensionless", () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-unknown-text-"));
+      const secret = `sk-cp-${"U".repeat(48)}`;
+      fs.writeFileSync(path.join(root, `settings${extension}`), `token = ${secret}\n`);
+      try {
+        assert.throws(
+          () => assertSafeArtifactTree(root),
+          (error) => {
+            assert.match(error.message, /credential content.*openai/i);
+            assert.doesNotMatch(error.message, new RegExp(secret));
+            return true;
+          }
+        );
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("package safety rejects oversized unknown files before reading them", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-oversized-"));
+  const filePath = path.join(root, "settings.custom");
+  const fd = fs.openSync(filePath, "w");
+  fs.ftruncateSync(fd, 32 * 1024 * 1024 + 1);
+  fs.closeSync(fd);
+  try {
+    assert.throws(() => assertSafeArtifactTree(root), /exceeds safety limit/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("package safety rejects loose junction indirections", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-link-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-link-target-"));
+  fs.writeFileSync(path.join(outside, "settings.ini"), "safe text");
+  const junctionPath = path.join(root, "linked");
+  try {
+    fs.symlinkSync(outside, junctionPath, "junction");
+  } catch (error) {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+    t.skip(`junction unavailable: ${error.code}`);
+    return;
+  }
+  try {
+    assert.throws(() => assertSafeArtifactTree(root), /unsupported loose entry.*linked/i);
+  } finally {
+    fs.rmSync(junctionPath, { force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("package safety applies profile and unknown-text checks inside ASAR", async (t) => {
+  const asar = require("@electron/asar");
+  for (const relativePath of [
+    "Default/Preferences",
+    "settings.ini",
+    "settings.conf",
+    "settings.toml",
+    "settings.properties",
+    "settings",
+  ]) {
+    await t.test(relativePath, async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-policy-"));
+      const source = path.join(root, "source");
+      const packagePath = path.join(root, "app.asar");
+      const target = path.join(source, ...relativePath.split("/"));
+      const secret = `sk-cp-${"V".repeat(48)}`;
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, `token = ${secret}\n`);
+      await asar.createPackage(source, packagePath);
+      fs.rmSync(source, { recursive: true, force: true });
+      try {
+        assert.throws(
+          () => assertSafeArtifactTree(root),
+          (error) => {
+            if (relativePath === "Default/Preferences") {
+              assert.match(error.message, /runtime profile resource/i);
+            } else {
+              assert.match(error.message, /credential content.*openai/i);
+              assert.doesNotMatch(error.message, new RegExp(secret));
+            }
+            return true;
+          }
+        );
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("package safety rejects ASAR link metadata without following it", async () => {
+  const asar = require("@electron/asar");
+  const { Readable } = require("node:stream");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-link-"));
+  const packagePath = path.join(root, "app.asar");
+  const statPath = path.join(root, "stat-source.txt");
+  fs.writeFileSync(statPath, "safe");
+  const stat = fs.statSync(statPath);
+  await asar.createPackageFromStreams(packagePath, [
+    {
+      type: "file",
+      path: "target.txt",
+      unpacked: false,
+      stat,
+      streamGenerator: () => Readable.from([Buffer.from("safe")]),
+    },
+    {
+      type: "link",
+      path: "linked.txt",
+      symlink: "target.txt",
+      unpacked: false,
+      stat,
+      streamGenerator: () => Readable.from([Buffer.alloc(0)]),
+    },
+  ]);
+  try {
+    assert.throws(() => assertSafeArtifactTree(root), /unsupported ASAR link.*linked\.txt/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("package safety scans supported ASAR unpacked indirections", async () => {
+  const asar = require("@electron/asar");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-unpacked-"));
+  const source = path.join(root, "source");
+  const packagePath = path.join(root, "app.asar");
+  const secret = `sk-cp-${"W".repeat(48)}`;
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, "settings.ini"), `token = ${secret}\n`);
+  await asar.createPackageWithOptions(source, packagePath, { unpack: "*.ini" });
+  fs.rmSync(source, { recursive: true, force: true });
+  try {
+    assert.throws(
+      () => assertSafeArtifactTree(root),
+      (error) => {
+        assert.match(error.message, /credential content.*openai/i);
+        assert.doesNotMatch(error.message, new RegExp(secret));
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(`${packagePath}.unpacked`, { recursive: true, force: true });
+  }
+});
+
+test("package safety rejects malformed missing ONNX unpacked aliases", async () => {
+  const asar = require("@electron/asar");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-missing-"));
+  const source = path.join(root, "source");
+  const packagePath = path.join(root, "app.asar");
+  const relativePath = path.join(
+    "node_modules",
+    "onnxruntime-node",
+    "bin",
+    "napi-v6",
+    "malformed.txt"
+  );
+  const target = path.join(source, relativePath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, "safe");
+  await asar.createPackageWithOptions(source, packagePath, { unpack: "**/*.txt" });
+  fs.rmSync(source, { recursive: true, force: true });
+  fs.rmSync(`${packagePath}.unpacked`, { recursive: true, force: true });
+  try {
+    assert.throws(
+      () => assertSafeArtifactTree(root),
+      /unsupported ASAR unpacked indirection.*malformed\.txt/i
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("package safety rejects a reparse artifact root", (t) => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-root-link-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-root-target-"));
+  fs.writeFileSync(path.join(outside, "safe.txt"), "safe");
+  const root = path.join(parent, "dist");
+  try {
+    fs.symlinkSync(outside, root, "junction");
+  } catch (error) {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+    t.skip(`junction unavailable: ${error.code}`);
+    return;
+  }
+  try {
+    assert.throws(() => assertSafeArtifactTree(root), /unsupported package root/i);
+  } finally {
+    fs.rmSync(root, { force: true });
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});

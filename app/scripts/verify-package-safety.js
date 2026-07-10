@@ -6,22 +6,69 @@ const PACKAGE_PATH_KEYS = new Set(["files", "extraFiles", "extraResources", "asa
 const SECRET_BASENAME = /^(?:\.env(?:\..*)?|.*\.(?:pem|pfx|p12|key)|id_rsa|credentials\.json)$/i;
 const RUNTIME_BASENAME = /^(?:jarvis\.db(?:-(?:wal|shm))?|.*\.(?:db|sqlite|sqlite3|log|wav|part|pcm))$/i;
 const RUNTIME_DIRECTORY = /^(?:logs?|recordings?|audio-captures?)$/i;
-const TEXT_EXTENSIONS = new Set([
-  ".cjs",
-  ".css",
-  ".html",
-  ".js",
-  ".json",
-  ".jsx",
-  ".md",
-  ".mjs",
-  ".text",
-  ".ts",
-  ".tsx",
-  ".txt",
-  ".xml",
-  ".yaml",
-  ".yml",
+const STRONG_PROFILE_PARTS = new Set(["user-data", "userdata", "user data", "profile"]);
+const PROFILE_STORAGE_PARTS = new Set([
+  "cache",
+  "code cache",
+  "gpucache",
+  "local storage",
+  "session storage",
+  "indexeddb",
+  "network",
+  "cookies",
+  "history",
+  "crashpad",
+]);
+const BINARY_EXTENSIONS = new Set([
+  ".7z",
+  ".a",
+  ".aac",
+  ".asar",
+  ".avi",
+  ".bin",
+  ".blob",
+  ".blockmap",
+  ".br",
+  ".bz2",
+  ".dat",
+  ".dll",
+  ".dmp",
+  ".dylib",
+  ".exe",
+  ".flac",
+  ".gif",
+  ".gz",
+  ".icns",
+  ".ico",
+  ".jpeg",
+  ".jpg",
+  ".lib",
+  ".m4a",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".node",
+  ".ogg",
+  ".onnx",
+  ".opus",
+  ".otf",
+  ".pak",
+  ".pdb",
+  ".pdf",
+  ".png",
+  ".raw",
+  ".so",
+  ".snapshot",
+  ".tar",
+  ".ttf",
+  ".wasm",
+  ".wav",
+  ".webm",
+  ".webp",
+  ".woff",
+  ".woff2",
+  ".xz",
+  ".zip",
 ]);
 const MAX_TEXT_BYTES = 32 * 1024 * 1024;
 const CREDENTIAL_PATTERNS = [
@@ -55,6 +102,36 @@ function forbiddenRuntimePath(value) {
     (parts.length > 0 && RUNTIME_BASENAME.test(parts.at(-1)));
 }
 
+function splitPathParts(value) {
+  return value
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter(Boolean)
+    .map((part) => part.toLowerCase());
+}
+
+function forbiddenProfilePath(value) {
+  const parts = splitPathParts(value);
+  const dependencyIndex = parts.indexOf("node_modules");
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (
+      STRONG_PROFILE_PARTS.has(part) ||
+      /^profile \d+$/.test(part) ||
+      part === "guest profile" ||
+      part === "system profile"
+    ) {
+      return true;
+    }
+    if (part === "default" && parts[index + 1] === "preferences") return true;
+    if (part === "preferences" && ["default", "profile"].includes(parts[index - 1])) return true;
+    if (PROFILE_STORAGE_PARTS.has(part) && (dependencyIndex < 0 || index < dependencyIndex)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function assertSafeArtifactPath(relativePath) {
   if (isUnsafePackagePath(relativePath)) {
     throw new Error(`unsafe packaged resource configured or found: ${relativePath}`);
@@ -62,10 +139,9 @@ function assertSafeArtifactPath(relativePath) {
   if (forbiddenRuntimePath(relativePath)) {
     throw new Error(`forbidden runtime resource found: ${relativePath}`);
   }
-}
-
-function isTextResource(resourcePath) {
-  return TEXT_EXTENSIONS.has(path.extname(resourcePath).toLowerCase());
+  if (forbiddenProfilePath(relativePath)) {
+    throw new Error(`runtime profile resource found: ${relativePath}`);
+  }
 }
 
 function assertScannableTextSize(size, relativePath) {
@@ -76,7 +152,7 @@ function assertScannableTextSize(size, relativePath) {
 
 function assertSafeTextContent(buffer, relativePath) {
   assertScannableTextSize(buffer.length, relativePath);
-  if (buffer.includes(0)) {
+  if (isProbablyBinary(buffer)) {
     throw new Error(`unscannable binary content in text resource: ${relativePath}`);
   }
   const text = buffer.toString("utf8");
@@ -84,6 +160,103 @@ function assertSafeTextContent(buffer, relativePath) {
     if (pattern.test(text)) {
       throw new Error(`credential content (${label}) found [redacted]: ${relativePath}`);
     }
+  }
+}
+
+function isProbablyBinary(buffer) {
+  if (buffer.includes(0)) return true;
+  const sampleLength = Math.min(buffer.length, 8 * 1024);
+  if (sampleLength === 0) return false;
+  let controls = 0;
+  for (let index = 0; index < sampleLength; index += 1) {
+    const byte = buffer[index];
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) controls += 1;
+  }
+  return controls / sampleLength > 0.01;
+}
+
+function isKnownBinaryResource(resourcePath) {
+  return BINARY_EXTENSIONS.has(path.extname(resourcePath).toLowerCase());
+}
+
+function scanContentBuffer(buffer, relativePath) {
+  if (isKnownBinaryResource(relativePath)) return;
+  assertSafeTextContent(buffer, relativePath);
+}
+
+function scanLooseFile(fullPath, relativePath) {
+  if (isKnownBinaryResource(relativePath)) return;
+  const stat = fs.lstatSync(fullPath);
+  if (!stat.isFile()) throw new Error(`unsupported loose entry found: ${relativePath}`);
+  assertScannableTextSize(stat.size, relativePath);
+  scanContentBuffer(fs.readFileSync(fullPath), relativePath);
+}
+
+function assertContainedPath(root, candidate, label) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  if (
+    resolvedCandidate !== resolvedRoot &&
+    !resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`)
+  ) {
+    throw new Error(`unsupported ASAR indirection found: ${label}`);
+  }
+}
+
+function isKnownStrippedUnpackedEntry(innerPath) {
+  const parts = splitPathParts(innerPath);
+  const marker = ["node_modules", "onnxruntime-node", "bin", "napi-v6"];
+  const markerIndex = parts.findIndex((part, index) =>
+    marker.every((expected, offset) => parts[index + offset] === expected)
+  );
+  if (markerIndex < 0) return false;
+  const platform = parts[markerIndex + marker.length];
+  const architecture = parts[markerIndex + marker.length + 1];
+  if (!["darwin", "linux", "win32"].includes(platform)) return false;
+  if (!["arm64", "ia32", "x64"].includes(architecture)) return false;
+  return platform !== process.platform || architecture !== process.arch;
+}
+
+function scanAsarFile(archivePath, archiveRelativePath, innerPath, info) {
+  const label = `${archiveRelativePath}:${innerPath}`;
+  if (Object.prototype.hasOwnProperty.call(info, "link")) {
+    throw new Error(`unsupported ASAR link found: ${label}`);
+  }
+  if (info.unpacked) {
+    const unpackedRoot = `${archivePath}.unpacked`;
+    const externalPath = path.join(unpackedRoot, innerPath);
+    assertContainedPath(unpackedRoot, externalPath, label);
+    let stat;
+    try {
+      stat = fs.lstatSync(externalPath);
+    } catch {
+      if (isKnownStrippedUnpackedEntry(innerPath)) return;
+      throw new Error(`unsupported ASAR unpacked indirection found: ${label}`);
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new Error(`unsupported ASAR unpacked indirection found: ${label}`);
+    }
+    scanLooseFile(externalPath, label);
+    return;
+  }
+  if (!Number.isSafeInteger(info.size) || info.size < 0) {
+    throw new Error(`unsupported ASAR entry metadata found: ${label}`);
+  }
+  if (isKnownBinaryResource(innerPath)) return;
+  assertScannableTextSize(info.size, label);
+  scanContentBuffer(asar.extractFile(archivePath, innerPath, false), label);
+}
+
+function scanAsarArchive(archivePath, archiveRelativePath) {
+  for (const packagedPath of asar.listPackage(archivePath)) {
+    assertSafeArtifactPath(packagedPath);
+    const innerPath = packagedPath.replace(/^[\\/]+/, "");
+    const info = asar.statFile(archivePath, innerPath, false);
+    if (info?.files) continue;
+    if (!info || typeof info !== "object") {
+      throw new Error(`unsupported ASAR entry metadata found: ${archiveRelativePath}:${innerPath}`);
+    }
+    scanAsarFile(archivePath, archiveRelativePath, innerPath, info);
   }
 }
 
@@ -111,7 +284,13 @@ function loadConfigChain(configPath, seen = new Set()) {
 
 function findUnsafeConfigPaths(value, activePackagePath = false, found = []) {
   if (typeof value === "string") {
-    if (activePackagePath && isUnsafePackagePath(value)) found.push(value);
+    if (
+      activePackagePath &&
+      !value.startsWith("!") &&
+      (isUnsafePackagePath(value) || forbiddenRuntimePath(value) || forbiddenProfilePath(value))
+    ) {
+      found.push(value);
+    }
     return found;
   }
   if (Array.isArray(value)) {
@@ -136,31 +315,30 @@ function assertSafeBuilderConfig(configPath) {
 
 function assertSafeArtifactTree(root) {
   if (!fs.existsSync(root)) throw new Error(`package output does not exist: ${root}`);
-  const pending = [path.resolve(root)];
+  const resolvedRoot = path.resolve(root);
+  const rootStat = fs.lstatSync(resolvedRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`unsupported package root: ${resolvedRoot}`);
+  }
+  const pending = [resolvedRoot];
   while (pending.length > 0) {
     const current = pending.pop();
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const fullPath = path.join(current, entry.name);
-      const relativePath = path.relative(root, fullPath);
+      const relativePath = path.relative(resolvedRoot, fullPath);
       assertSafeArtifactPath(relativePath);
-      if (entry.isDirectory()) {
+      const stat = fs.lstatSync(fullPath);
+      if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
+        throw new Error(`unsupported loose entry found: ${relativePath}`);
+      }
+      if (entry.isDirectory() && stat.isDirectory()) {
         pending.push(fullPath);
-      } else if (entry.isFile() && entry.name.endsWith(".asar")) {
-        for (const packagedPath of asar.listPackage(fullPath)) {
-          assertSafeArtifactPath(packagedPath);
-          const innerPath = packagedPath.replace(/^[\\/]+/, "");
-          const info = asar.statFile(fullPath, innerPath);
-          if (!info?.files && isTextResource(innerPath)) {
-            assertScannableTextSize(info.size, `${relativePath}:${innerPath}`);
-            assertSafeTextContent(
-              asar.extractFile(fullPath, innerPath),
-              `${relativePath}:${innerPath}`
-            );
-          }
-        }
-      } else if (entry.isFile() && isTextResource(relativePath)) {
-        assertScannableTextSize(fs.statSync(fullPath).size, relativePath);
-        assertSafeTextContent(fs.readFileSync(fullPath), relativePath);
+      } else if (entry.isFile() && stat.isFile() && entry.name.endsWith(".asar")) {
+        scanAsarArchive(fullPath, relativePath);
+      } else if (entry.isFile() && stat.isFile()) {
+        scanLooseFile(fullPath, relativePath);
+      } else {
+        throw new Error(`unsupported loose entry found: ${relativePath}`);
       }
     }
   }
@@ -179,5 +357,6 @@ module.exports = {
   assertScannableTextSize,
   assertSafeTextContent,
   forbiddenRuntimePath,
+  forbiddenProfilePath,
   isUnsafePackagePath,
 };

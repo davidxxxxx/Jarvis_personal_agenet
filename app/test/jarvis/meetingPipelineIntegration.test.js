@@ -42,6 +42,11 @@ test("main mic-only route uses the resolved mode and never finalizes Jarvis on m
     source,
     /ipcMain\.handle\("meeting-transcription-stop"[\s\S]*?jarvisService\.finishCapture/
   );
+  assert.match(
+    source,
+    /diarizationSegments\.map\([\s\S]*?return \{ success: true, transcript, diarizationSessionId, finalSegments \}/,
+    "main stop must return structured final segments after stream flush"
+  );
 
   const meetingSection = source.slice(
     source.indexOf("let meetingTranscriptionStartInProgress"),

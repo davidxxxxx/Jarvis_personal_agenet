@@ -5963,7 +5963,15 @@ class IPCHandlers {
             noteIdSnapshot
           );
 
-          return { success: true, transcript, diarizationSessionId };
+          const finalSegments = diarizationSegments.map(
+            ({ text, source, timestamp, confidence }) => ({
+              text,
+              source,
+              timestamp,
+              ...(confidence == null ? {} : { confidence }),
+            })
+          );
+          return { success: true, transcript, diarizationSessionId, finalSegments };
         }
 
         const results = await disconnectMeetingStreaming({ flushPending: true });
@@ -5991,7 +5999,15 @@ class IPCHandlers {
           noteIdSnapshot
         );
 
-        return { success: true, transcript, diarizationSessionId };
+        const finalSegments = diarizationSegments.map(
+          ({ text, source, timestamp, confidence }) => ({
+            text,
+            source,
+            timestamp,
+            ...(confidence == null ? {} : { confidence }),
+          })
+        );
+        return { success: true, transcript, diarizationSessionId, finalSegments };
       } catch (error) {
         debugLogger.error("Meeting transcription stop error", { error: error.message });
         return { success: false, error: error.message };

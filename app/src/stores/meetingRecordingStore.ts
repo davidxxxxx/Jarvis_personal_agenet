@@ -45,6 +45,13 @@ export interface TranscriptSegment {
   speakerLockSource?: TranscriptSpeakerLockSource;
 }
 
+export interface MeetingFinalSegment {
+  text: string;
+  source: "mic" | "system";
+  timestamp?: number;
+  confidence?: number;
+}
+
 export const SIDE_PANEL_BREAKPOINT_PX = 1024;
 
 interface SpeakerIdentification {
@@ -615,7 +622,77 @@ function assignProvisionalSpeaker(segment: TranscriptSegment): TranscriptSegment
   });
 }
 
-async function cleanup(): Promise<void> {
+function commitFinalSegment(data: MeetingFinalSegment): void {
+  if (!data.text || (data.source !== "mic" && data.source !== "system")) return;
+  const prev = useMeetingRecordingStore.getState().segments;
+  if (
+    prev.some(
+      (segment) =>
+        segment.source === data.source &&
+        segment.timestamp === data.timestamp &&
+        segment.text === data.text
+    )
+  ) {
+    return;
+  }
+
+  let rawSegment: TranscriptSegment = normalizeTranscriptSegment({
+    id: `seg-${++segmentCounter}`,
+    text: data.text,
+    source: data.source,
+    timestamp: data.timestamp,
+    confidence: data.confidence,
+  });
+
+  for (let index = speakerIdentifications.length - 1; index >= 0; index -= 1) {
+    rawSegment = applySpeakerIdentification(rawSegment, speakerIdentifications[index]);
+  }
+
+  const provisional = assignProvisionalSpeaker(rawSegment);
+  reserveSpeakerIndex(provisional.speaker);
+  const lockedName = provisional.speaker ? speakerLocks.get(provisional.speaker) : undefined;
+  const segment = lockedName
+    ? lockTranscriptSpeaker(provisional, {
+        speakerName: lockedName,
+        speakerIsPlaceholder: false,
+        suggestedName: undefined,
+        suggestedProfileId: undefined,
+      })
+    : provisional;
+
+  const timestamp = segment.timestamp ?? Infinity;
+  let insertionIndex = prev.length;
+  while (insertionIndex > 0 && (prev[insertionIndex - 1].timestamp ?? 0) > timestamp) {
+    insertionIndex -= 1;
+  }
+  const next =
+    insertionIndex === prev.length
+      ? [...prev, segment]
+      : [...prev.slice(0, insertionIndex), segment, ...prev.slice(insertionIndex)];
+  segmentsRefValue = next;
+  const partialPatch = data.source === "mic" ? { micPartial: "" } : { systemPartial: "" };
+  useMeetingRecordingStore.setState({
+    segments: next,
+    transcript: buildTranscriptText(next),
+    ...partialPatch,
+  });
+  if (data.source === "system" && segment.speaker) {
+    rememberSystemSpeaker(
+      segment.speaker,
+      segment.speakerName ?? null,
+      !!segment.speakerIsPlaceholder,
+      segment.timestamp ?? Date.now()
+    );
+  }
+  if (data.source === "system") setSystemPartialSpeakerIdentity(null, null);
+}
+
+function mergeFinalSegments(finalSegments: MeetingFinalSegment[] | undefined): void {
+  if (!Array.isArray(finalSegments)) return;
+  for (const segment of finalSegments) commitFinalSegment(segment);
+}
+
+async function cleanupCaptureSources(): Promise<void> {
   await flushAndDisconnectProcessor(micProcessor);
   micProcessor = null;
 
@@ -649,12 +726,20 @@ async function cleanup(): Promise<void> {
   } catch {}
   systemContext = null;
 
-  ipcCleanups.forEach((fn) => fn());
-  ipcCleanups = [];
   isPrepared = false;
   preparedMicOnly = null;
   isRecordingFlag = false;
   isStartingFlag = false;
+}
+
+function detachMeetingListeners(): void {
+  ipcCleanups.forEach((fn) => fn());
+  ipcCleanups = [];
+}
+
+async function cleanup(): Promise<void> {
+  await cleanupCaptureSources();
+  detachMeetingListeners();
 }
 
 export async function prepareTranscription(
@@ -847,9 +932,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             constraints.audio !== null &&
             "deviceId" in constraints.audio;
           if (hasExactDevice && args.captureSystemAudio === false) {
-            micFailureCode = ["NotAllowedError", "SecurityError"].includes(
-              (err as Error).name
-            )
+            micFailureCode = ["NotAllowedError", "SecurityError"].includes((err as Error).name)
               ? "MIC_PERMISSION"
               : "MIC_DISCONNECTED";
             logger.error(
@@ -885,9 +968,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             "meeting"
           );
           if (args.captureSystemAudio === false) {
-            micFailureCode = ["NotAllowedError", "SecurityError"].includes(
-              (err as Error).name
-            )
+            micFailureCode = ["NotAllowedError", "SecurityError"].includes((err as Error).name)
               ? "MIC_PERMISSION"
               : "MIC_DISCONNECTED";
           }
@@ -1009,55 +1090,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
           return;
         }
 
-        let rawSegment: TranscriptSegment = normalizeTranscriptSegment({
-          id: `seg-${++segmentCounter}`,
-          text: data.text,
-          source: data.source,
-          timestamp: data.timestamp,
-          confidence: data.confidence,
-        });
-
-        for (let i = speakerIdentifications.length - 1; i >= 0; i -= 1) {
-          rawSegment = applySpeakerIdentification(rawSegment, speakerIdentifications[i]);
-        }
-
-        const provisional = assignProvisionalSpeaker(rawSegment);
-        reserveSpeakerIndex(provisional.speaker);
-        const lockedName = provisional.speaker ? speakerLocks.get(provisional.speaker) : undefined;
-        const seg = lockedName
-          ? lockTranscriptSpeaker(provisional, {
-              speakerName: lockedName,
-              speakerIsPlaceholder: false,
-              suggestedName: undefined,
-              suggestedProfileId: undefined,
-            })
-          : provisional;
-
-        const prev = useMeetingRecordingStore.getState().segments;
-        const ts = seg.timestamp ?? Infinity;
-        let i = prev.length;
-        while (i > 0 && (prev[i - 1].timestamp ?? 0) > ts) i--;
-        const next =
-          i === prev.length ? [...prev, seg] : [...prev.slice(0, i), seg, ...prev.slice(i)];
-        segmentsRefValue = next;
-
-        const partialPatch = data.source === "mic" ? { micPartial: "" } : { systemPartial: "" };
-        useMeetingRecordingStore.setState({
-          segments: next,
-          transcript: buildTranscriptText(next),
-          ...partialPatch,
-        });
-        if (data.source === "system" && seg.speaker) {
-          rememberSystemSpeaker(
-            seg.speaker,
-            seg.speakerName ?? null,
-            !!seg.speakerIsPlaceholder,
-            seg.timestamp ?? Date.now()
-          );
-        }
-        if (data.source === "system") {
-          setSystemPartialSpeakerIdentity(null, null);
-        }
+        commitFinalSegment(data);
       }
     );
     if (segmentCleanup) ipcCleanups.push(segmentCleanup);
@@ -1291,6 +1324,7 @@ export interface StopRecordingResult {
   diarizationSessionId: string | null;
   success: boolean;
   error?: string;
+  finalSegments?: MeetingFinalSegment[];
 }
 
 export type StopRecordingOptions = SharedStopOptions;
@@ -1329,10 +1363,8 @@ async function performMeetingStop(): Promise<StopRecordingResult> {
   let diarizationSessionId: string | null = null;
   try {
     if (isRecordingFlag || isStartingFlag) {
-      isRecordingFlag = false;
-      isStartingFlag = false;
       useMeetingRecordingStore.setState({ isRecording: false, isTranscribing: false });
-      await cleanup();
+      await cleanupCaptureSources();
     }
 
     const result = await window.electronAPI?.meetingTranscriptionStop?.();
@@ -1343,6 +1375,7 @@ async function performMeetingStop(): Promise<StopRecordingResult> {
     if (result?.success && result.transcript) {
       useMeetingRecordingStore.setState({ transcript: result.transcript });
     }
+    if (result?.success) mergeFinalSegments(result.finalSegments);
     if (result?.success === false || result?.error) {
       return publishStopFailure(
         new Error(result.error || "Failed to stop meeting transcription"),
@@ -1353,11 +1386,17 @@ async function performMeetingStop(): Promise<StopRecordingResult> {
     const stopError =
       err instanceof Error ? err : new Error("Failed to stop meeting transcription");
     return publishStopFailure(stopError, diarizationSessionId);
+  } finally {
+    detachMeetingListeners();
   }
 
   resetStoppedMeetingState();
   logger.info("Meeting transcription stopped", {}, "meeting");
-  return { diarizationSessionId, success: true };
+  return {
+    diarizationSessionId,
+    success: true,
+    finalSegments: useMeetingRecordingStore.getState().segments.slice(),
+  };
 }
 
 export async function stopRecording(
