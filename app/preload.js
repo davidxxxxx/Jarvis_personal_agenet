@@ -106,6 +106,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     },
     cancelVoiceEnrollment: (sessionId) =>
       ipcRenderer.invoke("jarvis:voice-enrollment:cancel", sessionId),
+    getCloudBudget: () => ipcRenderer.invoke("jarvis:cloud-budget:get"),
+    setCloudBudget: (input) => ipcRenderer.invoke("jarvis:cloud-budget:set", input),
     onControl: registerListener(
       "jarvis:control",
       (callback) => (_event, envelope) => callback(envelope)

@@ -18,6 +18,8 @@ const CHANNELS = Object.freeze({
   getVoiceEnrollmentStatus: "jarvis:voice-enrollment:status",
   completeVoiceEnrollment: "jarvis:voice-enrollment:complete",
   cancelVoiceEnrollment: "jarvis:voice-enrollment:cancel",
+  getCloudBudget: "jarvis:cloud-budget:get",
+  setCloudBudget: "jarvis:cloud-budget:set",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",
 });

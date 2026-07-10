@@ -105,6 +105,28 @@ export interface JarvisVoiceEnrollmentStatus {
   updatedAt: string | null;
 }
 
+export type JarvisCloudBudgetBlockedReason =
+  | "cloud_disabled"
+  | "budget_protected"
+  | "usage_unknown"
+  | null;
+
+export interface JarvisCloudBudgetStatus {
+  monthUtc: string;
+  enabled: boolean;
+  keyConfigured: boolean;
+  monthlyLimitMicrousd: number;
+  spentMicrousd: number;
+  reservedMicrousd: number;
+  remainingMicrousd: number;
+  blockedReason: JarvisCloudBudgetBlockedReason;
+}
+
+export interface JarvisCloudBudgetInput {
+  enabled: boolean;
+  monthlyLimitMicrousd: number;
+}
+
 export interface JarvisVoiceEnrollmentWindow {
   startSample: number;
   endSample: number;

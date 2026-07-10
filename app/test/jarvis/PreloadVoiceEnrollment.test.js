@@ -103,6 +103,18 @@ test("preload exposes metadata-only self voice enrollment status", async () => {
   assert.deepEqual(invokes, [["jarvis:voice-enrollment:status"]]);
 });
 
+test("preload exposes narrow cloud budget controls", async () => {
+  const { api, invokes } = loadPreloadApi();
+  const input = { enabled: true, monthlyLimitMicrousd: 5_000_000 };
+
+  assert.equal(await api.getCloudBudget(), "invoked");
+  assert.equal(await api.setCloudBudget(input), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:cloud-budget:get"],
+    ["jarvis:cloud-budget:set", input],
+  ]);
+});
+
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
   const { api, sends, invokes, listeners } = loadPreloadApi();
   const shutdownRequests = [];

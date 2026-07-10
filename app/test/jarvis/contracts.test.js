@@ -15,6 +15,16 @@ function createRepository(overrides = {}) {
     renamePerson: () => "renamed",
     listPeople: () => [],
     listAudioChunks: () => [],
+    getCloudBudgetStatus: () => ({
+      monthUtc: "2026-07",
+      enabled: false,
+      monthlyLimitMicrousd: 5_000_000,
+      spentMicrousd: 0,
+      reservedMicrousd: 0,
+      remainingMicrousd: 5_000_000,
+      blockedReason: "cloud_disabled",
+    }),
+    setCloudBudgetSettings: () => ({ enabled: 0 }),
     ...overrides,
   };
 }
@@ -51,8 +61,15 @@ function createIpcHarness(overrides = {}) {
   const repository = createRepository(overrides);
   const service = createService();
   const voiceEnrollmentService = createVoiceEnrollmentService();
-  registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentService });
-  return { handlers, repository, service, voiceEnrollmentService };
+  const environmentManager = { getOpenAIKey: () => "sk-project-test" };
+  registerJarvisIpc({
+    ipcMain,
+    repository,
+    service,
+    voiceEnrollmentService,
+    environmentManager,
+  });
+  return { handlers, repository, service, voiceEnrollmentService, environmentManager };
 }
 
 test("contract rejects path traversal and unknown states", () => {
@@ -70,6 +87,7 @@ test("contract exposes only the named Jarvis channels", () => {
     "createSession",
     "failCapture",
     "finishCapture",
+    "getCloudBudget",
     "getSession",
     "getVoiceEnrollmentStatus",
     "listAudioChunks",
@@ -79,6 +97,7 @@ test("contract exposes only the named Jarvis channels", () => {
     "pauseCapture",
     "renamePerson",
     "resumeCapture",
+    "setCloudBudget",
     "setSessionStatus",
     "startCapture",
     "stateChanged",
@@ -113,6 +132,8 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.getVoiceEnrollmentStatus,
       CHANNELS.completeVoiceEnrollment,
       CHANNELS.cancelVoiceEnrollment,
+      CHANNELS.getCloudBudget,
+      CHANNELS.setCloudBudget,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
@@ -123,6 +144,41 @@ test("IPC returns metadata-only self voice enrollment status", async () => {
   const { handlers } = createIpcHarness();
 
   assert.equal(await handlers.get(CHANNELS.getVoiceEnrollmentStatus)({ sender: { id: 7 } }), "voice-status");
+});
+
+test("IPC returns cloud budget status without exposing the project key", async () => {
+  let savedSettings = null;
+  const { handlers } = createIpcHarness({
+    setCloudBudgetSettings(input) {
+      savedSettings = input;
+    },
+    getCloudBudgetStatus() {
+      return {
+        monthUtc: "2026-07",
+        enabled: true,
+        monthlyLimitMicrousd: 10_000_000,
+        spentMicrousd: 1200,
+        reservedMicrousd: 100_000,
+        remainingMicrousd: 9_898_800,
+        blockedReason: null,
+      };
+    },
+  });
+
+  const initial = await handlers.get(CHANNELS.getCloudBudget)();
+  assert.equal(initial.keyConfigured, true);
+  assert.equal(JSON.stringify(initial).includes("sk-project-test"), false);
+
+  const updated = await handlers.get(CHANNELS.setCloudBudget)(null, {
+    enabled: true,
+    monthlyLimitMicrousd: 10_000_000,
+  });
+  assert.deepEqual(savedSettings, {
+    enabled: true,
+    monthlyLimitMicrousd: 10_000_000,
+  });
+  assert.equal(updated.keyConfigured, true);
+  assert.equal(updated.monthlyLimitMicrousd, 10_000_000);
 });
 
 test("IPC validates identifiers and statuses before calling the repository", () => {
@@ -188,6 +244,7 @@ test("IPC cancels renderer-owned enrollment when the sender is destroyed", () =>
     repository: createRepository(),
     service: createService(),
     voiceEnrollmentService,
+    environmentManager: { getOpenAIKey: () => null },
   });
   const event = {
     sender: {
@@ -230,6 +287,8 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
     "renamePerson",
     "listPeople",
     "listAudioChunks",
+    "getCloudBudgetStatus",
+    "setCloudBudgetSettings",
   ];
   for (const method of requiredMethods) {
     const repository = createRepository();
@@ -242,6 +301,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
           repository,
           service: createService(),
           voiceEnrollmentService: createVoiceEnrollmentService(),
+          environmentManager: { getOpenAIKey: () => null },
         }),
       new RegExp(`repository\\.${method} must be a function`)
     );
@@ -265,6 +325,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
           repository: createRepository(),
           service,
           voiceEnrollmentService: createVoiceEnrollmentService(),
+          environmentManager: { getOpenAIKey: () => null },
         }),
       new RegExp(`service\\.${method} must be a function`)
     );
@@ -281,6 +342,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
           repository: createRepository(),
           service: createService(),
           voiceEnrollmentService,
+          environmentManager: { getOpenAIKey: () => null },
         }),
       new RegExp(`voiceEnrollmentService\\.${method} must be a function`)
     );
@@ -318,6 +380,7 @@ test("failCapture IPC validates MIC codes and preserves authoritative failed bro
     repository: createRepository(),
     service,
     voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
   });
 
   try {

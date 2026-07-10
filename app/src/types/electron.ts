@@ -15,6 +15,8 @@ import type {
   JarvisVoiceEnrollmentPayload,
   JarvisVoiceEnrollmentSession,
   JarvisVoiceEnrollmentStatus,
+  JarvisCloudBudgetInput,
+  JarvisCloudBudgetStatus,
 } from "../jarvis/types";
 
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
@@ -564,6 +566,8 @@ declare global {
           payload: JarvisVoiceEnrollmentPayload
         ) => Promise<{ profileId: number }>;
         cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
+        getCloudBudget: () => Promise<JarvisCloudBudgetStatus>;
+        setCloudBudget: (input: JarvisCloudBudgetInput) => Promise<JarvisCloudBudgetStatus>;
         onControl: (callback: (envelope: JarvisControlEnvelope) => void) => () => void;
         controlReady: (rendererId: string) => void;
         claimControl: (

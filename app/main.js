@@ -446,6 +446,7 @@ function initializeCoreManagers() {
     repository: jarvisRepository,
     service: jarvisService,
     voiceEnrollmentService,
+    environmentManager,
   });
 
   const uiLanguage = environmentManager.getUiLanguage();

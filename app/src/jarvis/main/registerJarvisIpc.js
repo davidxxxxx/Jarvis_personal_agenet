@@ -16,6 +16,8 @@ const REQUIRED_REPOSITORY_METHODS = [
   "renamePerson",
   "listPeople",
   "listAudioChunks",
+  "getCloudBudgetStatus",
+  "setCloudBudgetSettings",
 ];
 
 const REQUIRED_SERVICE_METHODS = [
@@ -26,7 +28,13 @@ const REQUIRED_SERVICE_METHODS = [
   "failCapture",
 ];
 
-function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentService }) {
+function registerJarvisIpc({
+  ipcMain,
+  repository,
+  service,
+  voiceEnrollmentService,
+  environmentManager,
+}) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
   }
@@ -51,6 +59,14 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
       throw new TypeError(`voiceEnrollmentService.${method} must be a function`);
     }
   }
+  if (!environmentManager || typeof environmentManager.getOpenAIKey !== "function") {
+    throw new TypeError("environmentManager.getOpenAIKey must be a function");
+  }
+
+  const cloudBudgetStatus = () => ({
+    ...repository.getCloudBudgetStatus(),
+    keyConfigured: Boolean(environmentManager.getOpenAIKey()),
+  });
 
   const enrollmentOwnerListeners = new WeakSet();
   const bindEnrollmentOwner = (event) => {
@@ -114,6 +130,23 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
   ipcMain.handle(CHANNELS.cancelVoiceEnrollment, (event, sessionId) =>
     voiceEnrollmentService.cancel({ ownerId: event?.sender?.id, sessionId })
   );
+  ipcMain.handle(CHANNELS.getCloudBudget, cloudBudgetStatus);
+  ipcMain.handle(CHANNELS.setCloudBudget, (_event, input) => {
+    if (!input || typeof input !== "object") throw new TypeError("cloud budget input is required");
+    if (typeof input.enabled !== "boolean") throw new TypeError("enabled must be a boolean");
+    if (
+      !Number.isSafeInteger(input.monthlyLimitMicrousd) ||
+      input.monthlyLimitMicrousd < 5_000_000 ||
+      input.monthlyLimitMicrousd > 10_000_000
+    ) {
+      throw new RangeError("monthlyLimitMicrousd must be between 5000000 and 10000000");
+    }
+    repository.setCloudBudgetSettings({
+      enabled: input.enabled,
+      monthlyLimitMicrousd: input.monthlyLimitMicrousd,
+    });
+    return cloudBudgetStatus();
+  });
 }
 
 module.exports = registerJarvisIpc;

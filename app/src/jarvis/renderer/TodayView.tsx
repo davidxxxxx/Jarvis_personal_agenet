@@ -4,6 +4,7 @@ import type { UseJarvisRecordingResult } from "./useJarvisRecording";
 import LiveTranscript from "./LiveTranscript";
 import RecordingControls from "./RecordingControls";
 import VoiceEnrollment from "./VoiceEnrollment";
+import TranscriptionQualityCard from "./TranscriptionQualityCard";
 
 interface TodayViewProps {
   recording: UseJarvisRecordingResult;
@@ -46,6 +47,7 @@ export default function TodayView({ recording }: TodayViewProps) {
           <InsightCard title={t("jarvis.currentTopic")} />
           <InsightCard title={t("jarvis.newTodos")} />
           <InsightCard title={t("jarvis.aiAdvice")} />
+          <TranscriptionQualityCard />
           <VoiceEnrollment />
         </div>
       </aside>
