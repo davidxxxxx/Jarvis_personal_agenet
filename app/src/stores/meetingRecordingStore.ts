@@ -32,6 +32,7 @@ export interface TranscriptSegment {
   text: string;
   source: "mic" | "system";
   timestamp?: number;
+  confidence?: number;
   speaker?: string;
   speakerName?: string;
   speakerIsPlaceholder?: boolean;
@@ -939,6 +940,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         source: "mic" | "system";
         type: "partial" | "final" | "retract";
         timestamp?: number;
+        confidence?: number;
       }) => {
         if (data.type === "retract") {
           const next = useMeetingRecordingStore
@@ -982,6 +984,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
           text: data.text,
           source: data.source,
           timestamp: data.timestamp,
+          confidence: data.confidence,
         });
 
         for (let i = speakerIdentifications.length - 1; i >= 0; i -= 1) {
