@@ -54,7 +54,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     | ((data: {
         text: string;
         source: "mic" | "system";
-        type: "partial" | "final" | "retract";
+        type: "partial" | "final" | "retract" | "correction";
+        originalText?: string;
         timestamp?: number;
       }) => void)
     | null;
@@ -146,6 +147,40 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         jarvisSessionId: "s-local",
       })
     );
+  });
+
+  it("applies a cloud correction to only the matching local segment", async () => {
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-correction",
+      diarizationEnabled: true,
+    });
+
+    segmentListener?.({
+      type: "final",
+      text: "und der die das",
+      source: "mic",
+      timestamp: 1_900,
+    });
+    const original = useMeetingRecordingStore.getState().segments[0];
+    segmentListener?.({
+      type: "correction",
+      text: "我们 review 一下 API budget",
+      originalText: "und der die das",
+      source: "mic",
+      timestamp: 1_900,
+    });
+
+    expect(useMeetingRecordingStore.getState().segments[0]).toMatchObject({
+      id: original.id,
+      text: "我们 review 一下 API budget",
+      source: "mic",
+      timestamp: 1_900,
+      revisionSource: "openai_correction",
+    });
   });
 
   it("keeps listeners through source cleanup and syncs one returned final segment before ack", async () => {

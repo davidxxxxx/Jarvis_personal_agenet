@@ -83,6 +83,20 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     settled_at INTEGER
   );
+  CREATE TABLE IF NOT EXISTS transcript_revisions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL,
+    audio_source TEXT NOT NULL CHECK(audio_source IN ('mic','system')),
+    person_id TEXT,
+    speaker_label TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    current_text TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source = 'openai_correction'),
+    confidence REAL NOT NULL,
+    reason TEXT NOT NULL,
+    corrected_at INTEGER NOT NULL
+  );
   INSERT OR IGNORE INTO cloud_budget_settings (
     provider, monthly_limit_microusd, enabled, updated_at
   ) VALUES ('openai', 5000000, 0, 0);
@@ -285,6 +299,23 @@ class JarvisRepository {
         SET reserved_microusd = 0, status = 'unknown', settled_at = @settledAt
         WHERE id = @id AND status = 'reserved'
       `),
+      findSegmentForRevision: this.db.prepare(`
+        SELECT person_id, speaker_label
+        FROM transcript_segments
+        WHERE session_id = @sessionId AND started_at = @startedAt AND text = @originalText
+        ORDER BY id ASC
+        LIMIT 1
+      `),
+      insertTranscriptRevision: this.db.prepare(`
+        INSERT INTO transcript_revisions (
+          id, session_id, started_at, audio_source, person_id, speaker_label,
+          original_text, current_text, source, confidence, reason, corrected_at
+        ) VALUES (
+          @id, @sessionId, @startedAt, @audioSource, @personId, @speakerLabel,
+          @originalText, @currentText, 'openai_correction', @confidence, @reason, @correctedAt
+        )
+      `),
+      getTranscriptRevision: this.db.prepare("SELECT * FROM transcript_revisions WHERE id = ?"),
     };
 
     const writeTranscriptSegments = (sessionId, segments) => {
@@ -564,6 +595,46 @@ class JarvisRepository {
       settledAt: assertInteger(settledAt, "settledAt"),
     });
     return this.statements.getCloudUsage.get(safeId) ?? null;
+  }
+
+  addTranscriptRevision(input) {
+    const safe = {
+      id: assertId(input.id, "revisionId"),
+      sessionId: assertId(input.sessionId, "sessionId"),
+      startedAt: assertInteger(input.startedAt, "startedAt"),
+      audioSource: input.source,
+      originalText: input.originalText,
+      currentText: input.currentText,
+      confidence: input.confidence,
+      reason: input.reason,
+      correctedAt: assertInteger(input.correctedAt, "correctedAt"),
+    };
+    if (safe.audioSource !== "mic" && safe.audioSource !== "system") {
+      throw new TypeError("source must be mic or system");
+    }
+    for (const [name, value] of [
+      ["originalText", safe.originalText],
+      ["currentText", safe.currentText],
+      ["reason", safe.reason],
+    ]) {
+      if (typeof value !== "string" || !value) throw new TypeError(`${name} is required`);
+    }
+    if (
+      typeof safe.confidence !== "number" ||
+      !Number.isFinite(safe.confidence) ||
+      safe.confidence < 0 ||
+      safe.confidence > 1
+    ) {
+      throw new RangeError("confidence must be between 0 and 1");
+    }
+    const segment = this.statements.findSegmentForRevision.get(safe);
+    if (!segment) return null;
+    this.statements.insertTranscriptRevision.run({
+      ...safe,
+      personId: segment.person_id,
+      speakerLabel: segment.speaker_label,
+    });
+    return this.statements.getTranscriptRevision.get(safe.id);
   }
 
   insertAudioChunk(chunk) {

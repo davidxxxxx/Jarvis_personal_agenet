@@ -494,3 +494,53 @@ test("cloud budget validation rejects out-of-range limits and unknown usage fail
   assert.equal(blocked.reason, "usage_unknown");
   repo.close();
 });
+
+test("transcript revisions preserve the original speaker and timestamp identity", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.createSession({ id: "s_revision", startedAt: 1_000, micDeviceId: null });
+  repo.upsertTranscriptSegments("s_revision", [
+    {
+      id: "seg_revision",
+      startedAt: 1_900,
+      endedAt: 1_900,
+      personId: "self",
+      speakerLabel: "我",
+      text: "und der die das",
+      confidence: 0.25,
+      isStable: true,
+    },
+  ]);
+
+  const revision = repo.addTranscriptRevision({
+    id: "revision_1",
+    sessionId: "s_revision",
+    source: "mic",
+    startedAt: 1_900,
+    originalText: "und der die das",
+    currentText: "我们 review 一下 API budget",
+    confidence: 0.9,
+    reason: "unexpected_language",
+    correctedAt: 2_500,
+  });
+
+  assert.equal(revision.source, "openai_correction");
+  assert.equal(revision.person_id, "self");
+  assert.equal(revision.speaker_label, "我");
+  assert.equal(revision.started_at, 1_900);
+  assert.equal(repo.listTranscriptSegments("s_revision")[0].text, "und der die das");
+  assert.equal(
+    repo.addTranscriptRevision({
+      id: "revision_wrong",
+      sessionId: "missing",
+      source: "mic",
+      startedAt: 1_900,
+      originalText: "und der die das",
+      currentText: "wrong",
+      confidence: 0.9,
+      reason: "test",
+      correctedAt: 2_500,
+    }),
+    null
+  );
+  repo.close();
+});

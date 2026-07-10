@@ -43,6 +43,8 @@ export interface TranscriptSegment {
   speakerStatus?: TranscriptSpeakerStatus;
   speakerLocked?: boolean;
   speakerLockSource?: TranscriptSpeakerLockSource;
+  revisionSource?: "openai_correction";
+  originalText?: string;
 }
 
 export interface MeetingFinalSegment {
@@ -1063,10 +1065,41 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       (data: {
         text: string;
         source: "mic" | "system";
-        type: "partial" | "final" | "retract";
+        type: "partial" | "final" | "retract" | "correction";
+        originalText?: string;
         timestamp?: number;
         confidence?: number;
       }) => {
+        if (data.type === "correction") {
+          const current = useMeetingRecordingStore.getState().segments;
+          let changed = false;
+          const next = current.map((segment) => {
+            if (
+              segment.source !== data.source ||
+              segment.timestamp !== data.timestamp ||
+              segment.text !== data.originalText
+            ) {
+              return segment;
+            }
+            changed = true;
+            return normalizeTranscriptSegment({
+              ...segment,
+              originalText: segment.text,
+              text: data.text,
+              confidence: data.confidence ?? segment.confidence,
+              revisionSource: "openai_correction",
+            });
+          });
+          if (changed) {
+            segmentsRefValue = next;
+            useMeetingRecordingStore.setState({
+              segments: next,
+              transcript: buildTranscriptText(next),
+            });
+          }
+          return;
+        }
+
         if (data.type === "retract") {
           const next = useMeetingRecordingStore
             .getState()

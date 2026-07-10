@@ -296,6 +296,8 @@ const JarvisService = require("./src/jarvis/main/JarvisService");
 const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
+const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
+const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 const JarvisControlQueue = require("./src/jarvis/main/JarvisControlQueue");
 const {
@@ -333,6 +335,8 @@ let jarvisRepository = null;
 let jarvisService = null;
 let retentionCleaner = null;
 let voiceEnrollmentService = null;
+let cloudBudgetGuard = null;
+let openAiCorrectionService = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
 let gracefulShutdownCoordinator = null;
@@ -424,6 +428,17 @@ function initializeCoreManagers() {
     databaseManager,
     repository: jarvisRepository,
   });
+  environmentManager = new EnvironmentManager();
+  cloudBudgetGuard = new CloudBudgetGuard({
+    repository: jarvisRepository,
+    createId: () => `cloud_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
+  });
+  openAiCorrectionService = new OpenAiCorrectionService({
+    budgetGuard: cloudBudgetGuard,
+    getApiKey: () => environmentManager.getOpenAIKey(),
+    fetchImpl: (url, options) => net.fetch(url, options),
+    log: (entry) => debugLogger.info("Jarvis cloud correction", entry, "jarvis"),
+  });
   const recovered = jarvisService.recoverOpenSessions(Date.now());
   debugLogger.info("Jarvis interrupted-session recovery", { recovered: recovered.length }, "jarvis");
   registerJarvisIpc({
@@ -433,7 +448,6 @@ function initializeCoreManagers() {
     voiceEnrollmentService,
   });
 
-  environmentManager = new EnvironmentManager();
   const uiLanguage = environmentManager.getUiLanguage();
   process.env.UI_LANGUAGE = uiLanguage;
   changeLanguage(uiLanguage);
@@ -532,6 +546,8 @@ function initializeCoreManagers() {
     windowsLoopbackAudioManager,
     meetingAecManager,
     jarvisService,
+    jarvisRepository,
+    openAiCorrectionService,
     getTrayManager: () => trayManager,
     oauthProtocolRegistered: protocolRegistered,
     oauthProtocol: OAUTH_PROTOCOL,

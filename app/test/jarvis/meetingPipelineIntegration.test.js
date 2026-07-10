@@ -72,6 +72,16 @@ test("Jarvis local mode uses stable bilingual windows with PCM overlap and quali
   assert.match(source, /confidence:\s*quality\.suspicious\s*\?\s*0\.25\s*:\s*0\.8/);
 });
 
+test("suspicious Jarvis audio is corrected asynchronously without replacing local identity", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+
+  assert.match(source, /openAiCorrectionService\s*\.maybeCorrect/);
+  assert.match(source, /type:\s*"correction"/);
+  assert.match(source, /originalText/);
+  assert.match(source, /addTranscriptRevision/);
+  assert.match(source, /correctionSessionId\s*!==\s*activeJarvisSessionId/);
+});
+
 test("renderer reacts to authoritative capture failures and active mic loss", () => {
   const source = fs.readFileSync(
     path.join(appRoot, "src/jarvis/renderer/useJarvisRecording.ts"),

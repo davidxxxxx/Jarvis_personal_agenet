@@ -1746,8 +1746,10 @@ declare global {
         callback: (data: {
           text: string;
           source: "mic" | "system";
-          type: "partial" | "final" | "retract";
+          type: "partial" | "final" | "retract" | "correction";
+          originalText?: string;
           timestamp?: number;
+          confidence?: number;
         }) => void
       ) => () => void;
       onMeetingSpeakerIdentified?: (

@@ -348,6 +348,8 @@ class IPCHandlers {
     this.windowsLoopbackAudioManager = managers.windowsLoopbackAudioManager;
     this.meetingAecManager = managers.meetingAecManager;
     this.jarvisService = managers.jarvisService;
+    this.jarvisRepository = managers.jarvisRepository;
+    this.openAiCorrectionService = managers.openAiCorrectionService;
     this.oauthProtocolRegistered = managers.oauthProtocolRegistered === true;
     this.oauthProtocol = managers.oauthProtocol || "openwhispr";
     this.sessionId = crypto.randomUUID();
@@ -5081,6 +5083,9 @@ class IPCHandlers {
           if (!text) return;
           const quality = classifyTranscriptQuality(text);
           const segTimestamp = Date.now();
+          const correctionSessionId = activeJarvisSessionId;
+          const correctionContext = meetingLocalTranscript;
+          const correctionAudioMs = Math.round((pcm24k.length / 2 / 24_000) * 1_000);
           let micSuppression = null;
           if (source === "mic") {
             const chunkDurationMs = (pcm24k.length / 2 / 24000) * 1000;
@@ -5153,6 +5158,80 @@ class IPCHandlers {
             }
           };
 
+          const requestCloudCorrection = () => {
+            if (
+              !quality.suspicious ||
+              !correctionSessionId ||
+              !this.openAiCorrectionService?.maybeCorrect
+            ) {
+              return;
+            }
+            void this.openAiCorrectionService
+              .maybeCorrect({
+                audioWav: wav,
+                audioMs: correctionAudioMs,
+                localText: text,
+                contextText: correctionContext,
+              })
+              .then((corrected) => {
+                if (
+                  corrected?.status !== "corrected" ||
+                  correctionSessionId !== activeJarvisSessionId ||
+                  !meetingLocalWin ||
+                  meetingLocalWin.isDestroyed()
+                ) {
+                  return;
+                }
+                try {
+                  this.jarvisRepository?.addTranscriptRevision?.({
+                    id: `revision_${crypto.randomUUID().replaceAll("-", "")}`,
+                    sessionId: correctionSessionId,
+                    source,
+                    startedAt: segTimestamp,
+                    originalText: text,
+                    currentText: corrected.text,
+                    confidence: corrected.confidence ?? 0.9,
+                    reason: quality.reasons.join(",") || "low_confidence",
+                    correctedAt: Date.now(),
+                  });
+                } catch (error) {
+                  debugLogger.warn(
+                    "Jarvis transcript revision metadata could not be stored",
+                    { error: error.message },
+                    "jarvis"
+                  );
+                }
+                meetingLocalWin.webContents.send("meeting-transcription-segment", {
+                  type: "correction",
+                  text: corrected.text,
+                  originalText: text,
+                  source,
+                  timestamp: segTimestamp,
+                  confidence: corrected.confidence ?? 0.9,
+                });
+              })
+              .catch((error) => {
+                debugLogger.warn(
+                  "Jarvis cloud correction failed closed",
+                  { error: error.message },
+                  "jarvis"
+                );
+              });
+          };
+
+          const emitLocalFinal = () => {
+            sendMeetingFinalSegment({
+              text,
+              source,
+              timestamp: segTimestamp,
+              confidence: quality.suspicious ? 0.25 : 0.8,
+              micSuppression,
+              send: sendLocalSegment,
+              includeInLocalTranscript: true,
+            });
+            requestCloudCorrection();
+          };
+
           if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {
             debugLogger.debug("Buffering risky local mic segment before renderer commit", {
               holdbackMs: LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS,
@@ -5164,29 +5243,12 @@ class IPCHandlers {
               timestamp: segTimestamp,
               micSuppression,
               holdbackMs: LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS,
-              emit: () =>
-                sendMeetingFinalSegment({
-                  text,
-                  source,
-                  timestamp: segTimestamp,
-                  confidence: quality.suspicious ? 0.25 : 0.8,
-                  micSuppression,
-                  send: sendLocalSegment,
-                  includeInLocalTranscript: true,
-                }),
+              emit: emitLocalFinal,
             });
             return;
           }
 
-          sendMeetingFinalSegment({
-            text,
-            source,
-            timestamp: segTimestamp,
-            confidence: quality.suspicious ? 0.25 : 0.8,
-            micSuppression,
-            send: sendLocalSegment,
-            includeInLocalTranscript: true,
-          });
+          emitLocalFinal();
         }
       } catch (error) {
         debugLogger.error("Local meeting transcription chunk failed", {
