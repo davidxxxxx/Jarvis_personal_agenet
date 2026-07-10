@@ -13,6 +13,7 @@ const CHANNELS = Object.freeze({
   pauseCapture: "jarvis:capture:pause",
   resumeCapture: "jarvis:capture:resume",
   finishCapture: "jarvis:capture:finish",
+  enrollVoice: "jarvis:voice:enroll",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",
 });

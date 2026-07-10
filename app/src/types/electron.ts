@@ -544,6 +544,13 @@ declare global {
         pauseCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+        enrollVoice: (
+          sampleWindows: Array<{
+            startSample: number;
+            endSample: number;
+            samples: Float32Array;
+          }>
+        ) => Promise<{ profileId: number }>;
         onControl: (callback: (action: JarvisControlAction) => void) => () => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;
       };

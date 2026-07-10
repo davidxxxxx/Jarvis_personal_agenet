@@ -13,6 +13,7 @@ import { useTheme } from "./hooks/useTheme";
 const ControlPanel = React.lazy(() => import("./components/ControlPanel.tsx"));
 const OnboardingFlow = React.lazy(() => import("./components/OnboardingFlow.tsx"));
 const AgentOverlay = React.lazy(() => import("./components/AgentOverlay.tsx"));
+const JarvisShell = React.lazy(() => import("./jarvis/renderer/JarvisShell.tsx"));
 
 export default function AppRouter() {
   useTheme();
@@ -28,6 +29,19 @@ export default function AppRouter() {
 
   if (params.includes("transcription-preview=true")) {
     return <TranscriptionPreviewOverlay />;
+  }
+
+  const isAgentPanel = params.includes("agent=true");
+  const isControlPanel =
+    !isAgentPanel &&
+    (window.location.pathname.includes("control") || params.includes("panel=true"));
+
+  if (isControlPanel) {
+    return (
+      <Suspense fallback={<LoadingFallback message="正在启动 Jarvis…" />}>
+        <JarvisShell />
+      </Suspense>
+    );
   }
 
   return <MainApp />;

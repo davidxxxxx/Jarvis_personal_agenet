@@ -1,0 +1,59 @@
+import { render, screen } from "@testing-library/react";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import i18n from "../../../i18n";
+import JarvisShell from "../JarvisShell";
+
+vi.mock("../useJarvisRecording", () => ({
+  useJarvisRecording: () => ({
+    session: {
+      status: "recording",
+      id: "s1",
+      startedAt: 0,
+      activeSince: 0,
+      accumulatedMs: 42_000,
+      errorCode: null,
+    },
+    segments: [
+      {
+        id: "seg1",
+        text: "下一版先把支付流程跑通",
+        source: "mic",
+        speaker: "self",
+        speakerName: "我",
+        timestamp: 1_000,
+        confidence: 0.98,
+      },
+    ],
+    partialText: "",
+    micLevel: 0.4,
+    error: null,
+    start: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    finish: vi.fn(),
+    renameSpeaker: vi.fn(),
+  }),
+}));
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh-CN");
+});
+
+describe("JarvisShell", () => {
+  it("shows the approved Today command-center hierarchy", () => {
+    render(<JarvisShell />);
+
+    expect(screen.getByRole("heading", { name: "今天" })).toBeInTheDocument();
+    expect(screen.getByText("实时对话")).toBeInTheDocument();
+    expect(screen.getByText("正在监听")).toBeInTheDocument();
+    expect(screen.getByText("当前主题")).toBeInTheDocument();
+    expect(screen.getByText("AI 建议")).toBeInTheDocument();
+  });
+
+  it("keeps future navigation disabled until the first analysis", () => {
+    render(<JarvisShell />);
+
+    expect(screen.getByRole("button", { name: /人物/ })).toBeDisabled();
+    expect(screen.getAllByText("完成首次分析后启用")).toHaveLength(4);
+  });
+});

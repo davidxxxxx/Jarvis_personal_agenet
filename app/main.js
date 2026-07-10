@@ -293,6 +293,7 @@ const sidecarRegistry = require("./src/helpers/sidecarRegistry");
 const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
 const JarvisService = require("./src/jarvis/main/JarvisService");
+const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 
 // Manager instances - initialized after app.whenReady()
@@ -323,6 +324,7 @@ let ipcHandlers = null;
 let cliBridge = null;
 let jarvisRepository = null;
 let jarvisService = null;
+let voiceEnrollmentService = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -383,14 +385,26 @@ function initializeCoreManagers() {
   debugLogger = require("./src/helpers/debugLogger");
   debugLogger.ensureFileLogging();
 
+  databaseManager = new DatabaseManager();
+
   jarvisRepository = new JarvisRepository(path.join(app.getPath("userData"), "jarvis.db"));
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: app.getPath("userData"),
     broadcast: (state) => windowManager?.sendToControlPanel("jarvis:state-changed", state),
   });
+  voiceEnrollmentService = new VoiceEnrollmentService({
+    speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
+    databaseManager,
+    repository: jarvisRepository,
+  });
   jarvisService.recoverOpenSessions(Date.now());
-  registerJarvisIpc({ ipcMain, repository: jarvisRepository, service: jarvisService });
+  registerJarvisIpc({
+    ipcMain,
+    repository: jarvisRepository,
+    service: jarvisService,
+    voiceEnrollmentService,
+  });
 
   environmentManager = new EnvironmentManager();
   const uiLanguage = environmentManager.getUiLanguage();
@@ -400,7 +414,6 @@ function initializeCoreManagers() {
 
   windowManager = new WindowManager();
   hotkeyManager = windowManager.hotkeyManager;
-  databaseManager = new DatabaseManager();
   clipboardManager = new ClipboardManager();
   whisperManager = new WhisperManager();
   if (process.platform !== "darwin") {

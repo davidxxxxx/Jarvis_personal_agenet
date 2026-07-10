@@ -15,7 +15,7 @@ const REQUIRED_REPOSITORY_METHODS = [
 
 const REQUIRED_SERVICE_METHODS = ["startCapture", "pauseCapture", "resumeCapture", "finishCapture"];
 
-function registerJarvisIpc({ ipcMain, repository, service }) {
+function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentService }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
   }
@@ -34,6 +34,9 @@ function registerJarvisIpc({ ipcMain, repository, service }) {
     if (typeof service[method] !== "function") {
       throw new TypeError(`service.${method} must be a function`);
     }
+  }
+  if (!voiceEnrollmentService || typeof voiceEnrollmentService.enroll !== "function") {
+    throw new TypeError("voiceEnrollmentService.enroll must be a function");
   }
 
   ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));
@@ -67,6 +70,9 @@ function registerJarvisIpc({ ipcMain, repository, service }) {
   );
   ipcMain.handle(CHANNELS.finishCapture, (_event, id, at) =>
     service.finishCapture(assertId(id, "sessionId"), at)
+  );
+  ipcMain.handle(CHANNELS.enrollVoice, (_event, sampleWindows) =>
+    voiceEnrollmentService.enroll(sampleWindows)
   );
 }
 

@@ -29,6 +29,13 @@ function createService(overrides = {}) {
   };
 }
 
+function createVoiceEnrollmentService(overrides = {}) {
+  return {
+    enroll: () => "voice-enrolled",
+    ...overrides,
+  };
+}
+
 function createIpcHarness(overrides = {}) {
   const handlers = new Map();
   const ipcMain = {
@@ -38,8 +45,9 @@ function createIpcHarness(overrides = {}) {
   };
   const repository = createRepository(overrides);
   const service = createService();
-  registerJarvisIpc({ ipcMain, repository, service });
-  return { handlers, repository, service };
+  const voiceEnrollmentService = createVoiceEnrollmentService();
+  registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentService });
+  return { handlers, repository, service, voiceEnrollmentService };
 }
 
 test("contract rejects path traversal and unknown states", () => {
@@ -52,6 +60,7 @@ test("contract exposes only the named Jarvis channels", () => {
   assert.deepEqual(Object.keys(CHANNELS).sort(), [
     "control",
     "createSession",
+    "enrollVoice",
     "finishCapture",
     "getSession",
     "listAudioChunks",
@@ -90,6 +99,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.pauseCapture,
       CHANNELS.resumeCapture,
       CHANNELS.finishCapture,
+      CHANNELS.enrollVoice,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
@@ -130,10 +140,24 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
   assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
 });
 
+test("IPC sends voice enrollment windows only to the local enrollment service", async () => {
+  const { handlers, voiceEnrollmentService } = createIpcHarness();
+  const windows = [{ startSample: 0, endSample: 1, samples: new Float32Array([0.1]) }];
+
+  assert.equal(await handlers.get(CHANNELS.enrollVoice)(null, windows), "voice-enrolled");
+  assert.equal(typeof voiceEnrollmentService.enroll, "function");
+});
+
 test("IPC registration rejects invalid IPC and missing handler capabilities", () => {
   assert.throws(() => registerJarvisIpc({ ipcMain: null, repository: {}, service: {} }), /ipcMain/);
   assert.throws(
-    () => registerJarvisIpc({ ipcMain: { handle() {} }, repository: null, service: {} }),
+    () =>
+      registerJarvisIpc({
+        ipcMain: { handle() {} },
+        repository: null,
+        service: {},
+        voiceEnrollmentService: {},
+      }),
     /repository/
   );
 
@@ -159,6 +183,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
           ipcMain: { handle: (channel) => registered.push(channel) },
           repository,
           service: createService(),
+          voiceEnrollmentService: createVoiceEnrollmentService(),
         }),
       new RegExp(`repository\\.${method} must be a function`)
     );
@@ -175,9 +200,21 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
           ipcMain: { handle: (channel) => registered.push(channel) },
           repository: createRepository(),
           service,
+          voiceEnrollmentService: createVoiceEnrollmentService(),
         }),
       new RegExp(`service\\.${method} must be a function`)
     );
     assert.deepEqual(registered, []);
   }
+
+  assert.throws(
+    () =>
+      registerJarvisIpc({
+        ipcMain: { handle() {} },
+        repository: createRepository(),
+        service: createService(),
+        voiceEnrollmentService: {},
+      }),
+    /voiceEnrollmentService\.enroll must be a function/
+  );
 });
