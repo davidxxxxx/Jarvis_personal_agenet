@@ -1,6 +1,12 @@
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { assertSafeArtifactTree, assertSafeBuilderConfig } = require("./verify-package-safety");
+const { verifyNativeAbi } = require("./verify-native-abi");
+
+const ELECTRON_VERSION = "41.10.0";
+const ELECTRON_ABI = "145";
+const TARGET_ARCH = "x64";
+const TARGET_PLATFORM = "win32";
 
 const SIGNING_ENVIRONMENT = [
   /^(?:WIN(?:DOWS)?_)?CSC_/i,
@@ -21,7 +27,10 @@ function sanitizeUnsignedEnvironment(environment) {
   return sanitized;
 }
 
-function createUnsignedBuilderInvocation({ appRoot = path.resolve(__dirname, ".."), env = process.env } = {}) {
+function createUnsignedBuilderInvocation({
+  appRoot = path.resolve(__dirname, ".."),
+  env = process.env,
+} = {}) {
   const configPath = path.join(appRoot, "electron-builder.unsigned-win.json");
   return {
     command: process.execPath,
@@ -33,6 +42,103 @@ function createUnsignedBuilderInvocation({ appRoot = path.resolve(__dirname, "..
       stdio: "inherit",
       windowsHide: true,
     },
+  };
+}
+
+function createElectronNativeRebuildInvocation({
+  appRoot = path.resolve(__dirname, ".."),
+  env = process.env,
+} = {}) {
+  const rebuildMainPath = require.resolve("@electron/rebuild");
+  const rebuildCliPath = path.join(path.dirname(rebuildMainPath), "cli.js");
+  return {
+    command: process.execPath,
+    args: [
+      rebuildCliPath,
+      "--version",
+      ELECTRON_VERSION,
+      "--arch",
+      TARGET_ARCH,
+      "--platform",
+      TARGET_PLATFORM,
+      "--force",
+      "--only",
+      "better-sqlite3",
+      "--module-dir",
+      appRoot,
+    ],
+    env: sanitizeUnsignedEnvironment(env),
+    options: {
+      cwd: appRoot,
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  };
+}
+
+function createNodeNativeRestoreInvocation({
+  appRoot = path.resolve(__dirname, ".."),
+  env = process.env,
+} = {}) {
+  const npmCliPath = path.join(
+    path.dirname(process.execPath),
+    "node_modules",
+    "npm",
+    "bin",
+    "npm-cli.js"
+  );
+  const restoreEnvironment = { ...env };
+  for (const name of Object.keys(restoreEnvironment)) {
+    if (/^(?:npm_config_)?(?:runtime|target|disturl|target_arch)$/i.test(name)) {
+      delete restoreEnvironment[name];
+    }
+  }
+  delete restoreEnvironment.ELECTRON_RUN_AS_NODE;
+  return {
+    command: process.execPath,
+    args: [npmCliPath, "rebuild", "better-sqlite3"],
+    env: restoreEnvironment,
+    options: {
+      cwd: appRoot,
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  };
+}
+
+function runRequiredInvocation(invocation, label, spawnSyncImpl) {
+  const result = spawnSyncImpl(invocation.command, invocation.args, {
+    ...invocation.options,
+    env: invocation.env,
+  });
+  if (result.error || result.status !== 0) throw new Error(`${label} failed`);
+  return result;
+}
+
+function getSourceNativePaths(appRoot) {
+  const modulePath = path.join(appRoot, "node_modules", "better-sqlite3");
+  return {
+    runtimePath: path.join(appRoot, "node_modules", "electron", "dist", "electron.exe"),
+    modulePath,
+    binaryPath: path.join(modulePath, "build", "Release", "better_sqlite3.node"),
+  };
+}
+
+function getPackagedNativePaths(appRoot) {
+  const unpackedRoot = path.join(appRoot, "dist", "win-unpacked");
+  const modulePath = path.join(
+    unpackedRoot,
+    "resources",
+    "app.asar.unpacked",
+    "node_modules",
+    "better-sqlite3"
+  );
+  return {
+    runtimePath: path.join(unpackedRoot, "Jarvis Memory.exe"),
+    modulePath,
+    binaryPath: path.join(modulePath, "build", "Release", "better_sqlite3.node"),
   };
 }
 
@@ -49,7 +155,9 @@ function assertUnsignedWindowsArtifacts({
   if (typeof systemRoot !== "string" || !path.win32.isAbsolute(systemRoot)) {
     throw new Error("trusted Windows SystemRoot is unavailable");
   }
-  const pkg = JSON.parse(require("node:fs").readFileSync(path.join(appRoot, "package.json"), "utf8"));
+  const pkg = JSON.parse(
+    require("node:fs").readFileSync(path.join(appRoot, "package.json"), "utf8")
+  );
   const expectedNames = [
     `${pkg.productName} Setup ${pkg.version}.exe`,
     `${pkg.productName} ${pkg.version}.exe`,
@@ -96,26 +204,79 @@ function assertUnsignedWindowsArtifacts({
 function buildUnsignedWindows(options = {}) {
   const appRoot = options.appRoot ?? path.resolve(__dirname, "..");
   const invocation = createUnsignedBuilderInvocation({ ...options, appRoot });
+  const electronRebuildInvocation = createElectronNativeRebuildInvocation({ ...options, appRoot });
+  const nodeRestoreInvocation = createNodeNativeRestoreInvocation({ ...options, appRoot });
   const configPath = path.join(appRoot, "electron-builder.unsigned-win.json");
-  assertSafeBuilderConfig(configPath);
   const spawnSyncImpl = options.spawnSyncImpl ?? spawnSync;
-  const result = spawnSyncImpl(invocation.command, invocation.args, {
-    ...invocation.options,
-    env: invocation.env,
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) process.exitCode = result.status ?? 1;
-  else {
+  const assertSafeBuilderConfigImpl =
+    options.assertSafeBuilderConfigImpl ?? assertSafeBuilderConfig;
+  const verifyNativeAbiImpl = options.verifyNativeAbiImpl ?? verifyNativeAbi;
+  const assertSafeArtifactTreeImpl = options.assertSafeArtifactTreeImpl ?? assertSafeArtifactTree;
+  const assertUnsignedWindowsArtifactsImpl =
+    options.assertUnsignedWindowsArtifactsImpl ?? assertUnsignedWindowsArtifacts;
+  const sourceNativePaths = getSourceNativePaths(appRoot);
+  const packagedNativePaths = getPackagedNativePaths(appRoot);
+  let result;
+  let primaryError;
+  let restoreError;
+
+  try {
+    assertSafeBuilderConfigImpl(configPath);
+    runRequiredInvocation(
+      electronRebuildInvocation,
+      "Electron native dependency rebuild",
+      spawnSyncImpl
+    );
+    verifyNativeAbiImpl({
+      ...sourceNativePaths,
+      expectedAbi: ELECTRON_ABI,
+      label: "source-electron",
+      environment: invocation.env,
+    });
+    result = spawnSyncImpl(invocation.command, invocation.args, {
+      ...invocation.options,
+      env: invocation.env,
+    });
+    if (result.error || result.status !== 0) throw new Error("Windows package build failed");
+    verifyNativeAbiImpl({
+      ...packagedNativePaths,
+      expectedAbi: ELECTRON_ABI,
+      label: "packaged-electron",
+      environment: invocation.env,
+    });
     const artifactRoot = path.join(appRoot, "dist");
-    assertSafeArtifactTree(artifactRoot);
-    assertUnsignedWindowsArtifacts({
+    assertSafeArtifactTreeImpl(artifactRoot);
+    assertUnsignedWindowsArtifactsImpl({
       appRoot,
       artifactRoot,
       platform: options.platform,
       systemRoot: options.systemRoot,
       spawnSyncImpl,
     });
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    try {
+      runRequiredInvocation(nodeRestoreInvocation, "Node native dependency restore", spawnSyncImpl);
+      verifyNativeAbiImpl({
+        ...sourceNativePaths,
+        runtimePath: process.execPath,
+        expectedAbi: String(process.versions.modules),
+        label: "source-node",
+        environment: nodeRestoreInvocation.env,
+      });
+    } catch (error) {
+      restoreError = error;
+    }
   }
+  if (restoreError) {
+    throw new Error(
+      primaryError
+        ? `${primaryError.message}; Node native dependency restore failed`
+        : "Node native dependency restore failed"
+    );
+  }
+  if (primaryError) throw primaryError;
   return result;
 }
 
@@ -124,6 +285,9 @@ if (require.main === module) buildUnsignedWindows();
 module.exports = {
   assertUnsignedWindowsArtifacts,
   buildUnsignedWindows,
+  createElectronNativeRebuildInvocation,
+  createNodeNativeRestoreInvocation,
   createUnsignedBuilderInvocation,
   sanitizeUnsignedEnvironment,
+  verifyNativeAbi,
 };
