@@ -49,7 +49,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     pauseCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:pause", id, at),
     resumeCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:resume", id, at),
     finishCapture: (id, at) => ipcRenderer.invoke("jarvis:capture:finish", id, at),
-    enrollVoice: (sampleWindows) => ipcRenderer.invoke("jarvis:voice:enroll", sampleWindows),
+    beginVoiceEnrollment: () => ipcRenderer.invoke("jarvis:voice-enrollment:begin"),
+    completeVoiceEnrollment: (sessionId, payload) =>
+      ipcRenderer.invoke("jarvis:voice-enrollment:complete", sessionId, payload),
+    cancelVoiceEnrollment: (sessionId) =>
+      ipcRenderer.invoke("jarvis:voice-enrollment:cancel", sessionId),
     onControl: registerListener(
       "jarvis:control",
       (callback) => (_event, action) => callback(action)

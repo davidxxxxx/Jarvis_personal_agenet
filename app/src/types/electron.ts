@@ -11,6 +11,8 @@ import type {
   JarvisSessionStatus,
   JarvisTranscriptSegment,
   JarvisTranscriptSegmentInput,
+  JarvisVoiceEnrollmentPayload,
+  JarvisVoiceEnrollmentSession,
 } from "../jarvis/types";
 
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
@@ -544,13 +546,12 @@ declare global {
         pauseCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
-        enrollVoice: (
-          sampleWindows: Array<{
-            startSample: number;
-            endSample: number;
-            samples: Float32Array;
-          }>
+        beginVoiceEnrollment: () => Promise<JarvisVoiceEnrollmentSession>;
+        completeVoiceEnrollment: (
+          sessionId: string,
+          payload: JarvisVoiceEnrollmentPayload
         ) => Promise<{ profileId: number }>;
+        cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
         onControl: (callback: (action: JarvisControlAction) => void) => () => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;
       };

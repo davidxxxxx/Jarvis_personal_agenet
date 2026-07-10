@@ -2414,14 +2414,18 @@ class DatabaseManager {
   upsertSpeakerProfile(name, email, embeddingBuffer, profileId = null) {
     try {
       if (!this.db) throw new Error("Database not initialized");
+      if (profileId !== null && (!Number.isSafeInteger(profileId) || profileId < 1)) {
+        throw new TypeError("profileId must be a positive safe integer or null");
+      }
       const normalizedEmail = this._normalizeEmail(email);
-      let existing = profileId
+      const hasReservedId = profileId !== null;
+      let existing = hasReservedId
         ? this.db.prepare("SELECT * FROM speaker_profiles WHERE id = ?").get(profileId)
         : null;
-      if (!existing && normalizedEmail) {
+      if (!hasReservedId && !existing && normalizedEmail) {
         existing = this._findProfileByEmail(normalizedEmail);
       }
-      if (!existing) {
+      if (!hasReservedId && !existing) {
         existing = this.db
           .prepare("SELECT * FROM speaker_profiles WHERE display_name = ?")
           .get(name);
@@ -2461,9 +2465,17 @@ class DatabaseManager {
         }
         return resolved;
       }
-      const result = this.db
-        .prepare("INSERT INTO speaker_profiles (display_name, email, embedding) VALUES (?, ?, ?)")
-        .run(name, normalizedEmail, embeddingBuffer);
+      const result = hasReservedId
+        ? this.db
+            .prepare(
+              "INSERT INTO speaker_profiles (id, display_name, email, embedding) VALUES (?, ?, ?, ?)"
+            )
+            .run(profileId, name, normalizedEmail, embeddingBuffer)
+        : this.db
+            .prepare(
+              "INSERT INTO speaker_profiles (display_name, email, embedding) VALUES (?, ?, ?)"
+            )
+            .run(name, normalizedEmail, embeddingBuffer);
       return this.db
         .prepare("SELECT * FROM speaker_profiles WHERE id = ?")
         .get(result.lastInsertRowid);

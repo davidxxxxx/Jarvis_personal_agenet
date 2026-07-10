@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Check, UserRound, UserRoundCheck } from "lucide-react";
 import { lockSpeaker } from "../../stores/meetingRecordingStore";
@@ -9,32 +9,38 @@ interface SpeakerChipProps {
   personId: string;
   displayName: string;
   confidence?: number;
+  confirmed?: boolean;
 }
 
-export default function SpeakerChip({ personId, displayName, confidence }: SpeakerChipProps) {
+export default function SpeakerChip({
+  personId,
+  displayName,
+  confidence,
+  confirmed = false,
+}: SpeakerChipProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState(displayName);
-  const [visibleName, setVisibleName] = useState(displayName);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(false);
-  const needsConfirmation = typeof confidence === "number" && confidence < 0.65;
-  const chipLabel = needsConfirmation ? t("jarvis.needsConfirmation") : visibleName;
+  const needsConfirmation = !confirmed && typeof confidence === "number" && confidence < 0.65;
+  const chipLabel = needsConfirmation ? t("jarvis.needsConfirmation") : displayName;
 
-  const persist = async (nextName: string, isSelf: boolean) => {
-    const trimmed = nextName.trim();
-    if (!trimmed || saving) return;
+  useEffect(() => setName(displayName), [displayName]);
+
+  const persist = async (input: { displayName?: string; isSelf?: boolean }) => {
+    const trimmed = input.displayName?.trim();
+    if ((input.displayName !== undefined && !trimmed) || saving) return;
     setSaving(true);
     setError(false);
     try {
-      await window.electronAPI.jarvis.renamePerson({
+      const person = await window.electronAPI.jarvis.renamePerson({
         personId,
-        displayName: trimmed,
-        isSelf,
+        ...(trimmed ? { displayName: trimmed } : {}),
+        ...(input.isSelf === undefined ? {} : { isSelf: input.isSelf }),
       });
-      lockSpeaker(personId, trimmed);
-      setVisibleName(trimmed);
-      setName(trimmed);
+      const resolvedName = person.display_name || trimmed || displayName;
+      lockSpeaker(personId, resolvedName);
       setOpen(false);
     } catch {
       setError(true);
@@ -63,7 +69,7 @@ export default function SpeakerChip({ personId, displayName, confidence }: Speak
           className="space-y-2"
           onSubmit={(event) => {
             event.preventDefault();
-            void persist(name, false);
+            void persist({ displayName: name });
           }}
         >
           <label
@@ -94,7 +100,7 @@ export default function SpeakerChip({ personId, displayName, confidence }: Speak
               size="sm"
               variant="outline"
               disabled={saving}
-              onClick={() => void persist(t("jarvis.selfName"), true)}
+              onClick={() => void persist({ isSelf: true })}
             >
               <UserRoundCheck aria-hidden="true" />
               {t("jarvis.markAsSelf")}

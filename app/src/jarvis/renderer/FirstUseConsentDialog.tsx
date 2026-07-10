@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "../../components/ui/dialog";
+import { grantRecordingConsent } from "./recordingConsent";
 
 interface FirstUseConsentDialogProps {
   open: boolean;
@@ -30,7 +31,7 @@ export default function FirstUseConsentDialog({
 
   const confirm = async () => {
     if (!confirmed) return;
-    localStorage.setItem("jarvisRecordingConsentVersion", "1");
+    grantRecordingConsent();
     onOpenChange(false);
     await onConsent();
   };
@@ -53,6 +54,11 @@ export default function FirstUseConsentDialog({
           />
           <span>{t("jarvis.consentConfirmation")}</span>
         </label>
+        <ul className="list-disc space-y-1 pl-5 text-xs leading-5 text-muted-foreground">
+          <li>{t("jarvis.consentAudioRetention")}</li>
+          <li>{t("jarvis.consentDerivedRetention")}</li>
+          <li>{t("jarvis.consentResponsibility")}</li>
+        </ul>
         <p className="text-xs leading-5 text-muted-foreground">
           {t("jarvis.visibleIndicatorNote")}
         </p>

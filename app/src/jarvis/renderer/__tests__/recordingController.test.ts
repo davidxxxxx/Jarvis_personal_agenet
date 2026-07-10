@@ -45,9 +45,11 @@ function sessionFor(status: SessionStatus): SessionState {
 function createHarness({
   status = "idle",
   segments = [] as TranscriptSegment[],
+  hasConsent = true,
 }: {
   status?: SessionStatus;
   segments?: TranscriptSegment[];
+  hasConsent?: boolean;
 } = {}) {
   const calls: string[] = [];
   let session = sessionFor(status);
@@ -184,6 +186,7 @@ function createHarness({
   const refreshPeople = vi.fn(async () => {
     setPeople(await jarvis.listPeople());
   });
+  const onOperationChange = vi.fn();
 
   const deps: RecordingDependencies = {
     jarvis,
@@ -201,7 +204,9 @@ function createHarness({
     now: () => 1_000,
     getMicDeviceId: () => null,
     getLanguage: () => "zh",
+    hasRecordingConsent: () => hasConsent,
     onError: vi.fn(),
+    onOperationChange,
   };
 
   return {
@@ -212,6 +217,7 @@ function createHarness({
     stopRecording,
     setSessions,
     createId,
+    onOperationChange,
     getSession: () => session,
     setMeeting: (next: Partial<typeof meeting>) => {
       meeting = { ...meeting, ...next };
@@ -224,6 +230,35 @@ afterEach(() => {
 });
 
 describe("Jarvis recording controller", () => {
+  it("publishes pending operation truth until the command settles", async () => {
+    const gate = deferred<void>();
+    const harness = createHarness();
+    harness.startRecording.mockImplementationOnce(async () => {
+      await gate.promise;
+      harness.setMeeting({ isRecording: true });
+    });
+    const controller = createRecordingController(harness.deps);
+
+    const pending = controller.start();
+    await vi.waitFor(() => expect(harness.startRecording).toHaveBeenCalledTimes(1));
+    expect(harness.onOperationChange).toHaveBeenLastCalledWith("start");
+
+    gate.resolve();
+    await pending;
+    expect(harness.onOperationChange).toHaveBeenLastCalledWith(null);
+  });
+  it("rejects a direct start without consent before allocating or persisting a session", async () => {
+    const harness = createHarness({ hasConsent: false });
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.start()).rejects.toThrow("recording consent is required");
+
+    expect(harness.createId).not.toHaveBeenCalled();
+    expect(harness.jarvis.createSession).not.toHaveBeenCalled();
+    expect(harness.jarvis.startCapture).not.toHaveBeenCalled();
+    expect(harness.startRecording).not.toHaveBeenCalled();
+    expect(harness.getSession()).toEqual(sessionFor("idle"));
+  });
   it("starts one UUID session through the mic-only Jarvis path", async () => {
     const harness = createHarness();
     const controller = createRecordingController(harness.deps);

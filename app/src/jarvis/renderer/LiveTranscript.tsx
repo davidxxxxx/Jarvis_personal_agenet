@@ -63,6 +63,7 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
                       personId={segment.speaker}
                       displayName={segment.speakerName || segment.speaker}
                       confidence={segment.confidence}
+                      confirmed={segment.speakerLocked === true}
                     />
                   )}
                   {segment.timestamp != null && (

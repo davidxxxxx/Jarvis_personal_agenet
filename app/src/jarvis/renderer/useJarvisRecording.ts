@@ -11,6 +11,7 @@ import {
 } from "../../stores/meetingRecordingStore";
 import { getSettings } from "../../stores/settingsStore";
 import type {
+  JarvisControlAction,
   JarvisPerson,
   JarvisRenamePersonInput,
   JarvisRuntimeState,
@@ -21,6 +22,7 @@ import type {
 } from "../types";
 import { createStableSegmentId } from "../shared/segmentIds";
 import { useJarvisStore } from "./jarvisStore";
+import { hasRecordingConsent } from "./recordingConsent";
 import { reduceSession, type SessionEvent, type SessionState } from "./sessionMachine";
 
 const PERSIST_DEBOUNCE_MS = 500;
@@ -97,6 +99,8 @@ export interface RecordingDependencies {
   now: () => number;
   getMicDeviceId: () => string | null;
   getLanguage: () => string;
+  hasRecordingConsent: () => boolean;
+  onOperationChange: (operation: JarvisControlAction | null) => void;
   onError: (code: string | null) => void;
 }
 
@@ -169,7 +173,7 @@ function recordingArgs(id: string, seedSegments?: TranscriptSegment[]): StartRec
 }
 
 export function createRecordingController(deps: RecordingDependencies): RecordingController {
-  let activeOperation: "start" | "pause" | "resume" | "finish" | null = null;
+  let activeOperation: JarvisControlAction | null = null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let persistenceTail: Promise<void> = Promise.resolve();
 
@@ -184,11 +188,13 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       throw new Error(`cannot ${operation} while ${activeOperation} is in progress`);
     }
     activeOperation = operation;
+    deps.onOperationChange(operation);
     deps.onError(null);
   };
 
   const end = (): void => {
     activeOperation = null;
+    deps.onOperationChange(null);
   };
 
   const clearPersistTimer = (): void => {
@@ -260,6 +266,14 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     const state = deps.getSessionState();
     if (!["idle", "completed", "failed"].includes(state.status)) {
       throw new Error(`cannot start from ${state.status}`);
+    }
+    if (!deps.hasRecordingConsent()) {
+      const error = new RecordingOperationError(
+        "recording_consent_required",
+        "recording consent is required"
+      );
+      deps.onError(error.code);
+      throw error;
     }
     if (deps.getMeetingSnapshot().isRecording) {
       throw new RecordingOperationError(
@@ -454,9 +468,13 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   const renameSpeaker = async (
     personId: string,
     displayName: string,
-    isSelf = false
+    isSelf?: boolean
   ): Promise<JarvisPerson> => {
-    const person = await deps.jarvis.renamePerson({ personId, displayName, isSelf });
+    const person = await deps.jarvis.renamePerson({
+      personId,
+      displayName,
+      ...(isSelf === undefined ? {} : { isSelf }),
+    });
     deps.lockSpeaker(personId, displayName);
     await deps.refreshPeople();
     return person;
@@ -494,6 +512,7 @@ export interface UseJarvisRecordingResult {
   segments: TranscriptSegment[];
   partialText: string;
   micLevel: number;
+  operation: JarvisControlAction | null;
   error: string | null;
   start: () => Promise<void>;
   pause: () => Promise<void>;
@@ -505,6 +524,7 @@ export interface UseJarvisRecordingResult {
 export function useJarvisRecording(): UseJarvisRecordingResult {
   const session = useJarvisStore((state) => state.session);
   const controllerError = useJarvisStore((state) => state.error);
+  const operation = useJarvisStore((state) => state.operation);
   const segments = useMeetingRecordingStore((state) => state.segments);
   const micPartial = useMeetingRecordingStore((state) => state.micPartial);
   const systemPartial = useMeetingRecordingStore((state) => state.systemPartial);
@@ -548,6 +568,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       now: Date.now,
       getMicDeviceId: () => getSettings().selectedMicDeviceId || null,
       getLanguage: () => getSettings().preferredLanguage || "zh",
+      hasRecordingConsent,
+      onOperationChange: (operation) => useJarvisStore.getState().setOperation(operation),
       onError: (code) => useJarvisStore.getState().setError(code),
     });
   }
@@ -579,7 +601,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const resume = useCallback(() => controller.resume(), [controller]);
   const finish = useCallback(() => controller.finish(), [controller]);
   const renameSpeaker = useCallback(
-    (personId: string, displayName: string, isSelf = false) =>
+    (personId: string, displayName: string, isSelf?: boolean) =>
       controller.renameSpeaker(personId, displayName, isSelf),
     [controller]
   );
@@ -589,6 +611,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     segments,
     partialText: [micPartial, systemPartial].filter(Boolean).join(" "),
     micLevel,
+    operation,
     error: upstreamError ?? controllerError,
     start,
     pause,

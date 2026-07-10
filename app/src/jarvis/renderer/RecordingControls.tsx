@@ -1,12 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CircleStop, Mic, Pause, Play, RotateCcw } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
 import type { UseJarvisRecordingResult } from "./useJarvisRecording";
 import FirstUseConsentDialog from "./FirstUseConsentDialog";
-
-const CONSENT_KEY = "jarvisRecordingConsentVersion";
+import { hasRecordingConsent } from "./recordingConsent";
 
 interface RecordingControlsProps {
   recording: UseJarvisRecordingResult;
@@ -32,7 +31,7 @@ function activeElapsedMs(recording: UseJarvisRecordingResult, now: number): numb
   return session.accumulatedMs + Math.max(0, now - session.activeSince);
 }
 
-function useMicrophoneName(): string | null {
+function useMicrophoneName(refreshKey: string): string | null {
   const [name, setName] = useState<string | null>(null);
 
   useEffect(() => {
@@ -54,10 +53,12 @@ function useMicrophoneName(): string | null {
       }
     };
     void load();
+    navigator.mediaDevices?.addEventListener?.("devicechange", load);
     return () => {
       active = false;
+      navigator.mediaDevices?.removeEventListener?.("devicechange", load);
     };
-  }, []);
+  }, [refreshKey]);
 
   return name;
 }
@@ -66,11 +67,15 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
   const { t } = useTranslation();
   const [now, setNow] = useState(Date.now());
   const [consentOpen, setConsentOpen] = useState(false);
-  const microphoneName = useMicrophoneName();
+  const [invoking, setInvoking] = useState(false);
+  const [actionError, setActionError] = useState(false);
+  const invocationRef = useRef(false);
   const { session } = recording;
+  const microphoneName = useMicrophoneName(session.status);
   const isRecording = session.status === "recording";
   const isPaused = session.status === "paused";
   const isBusy = session.status === "starting" || session.status === "finalizing";
+  const commandPending = recording.operation !== null || invoking;
 
   useEffect(() => {
     if (!isRecording) return;
@@ -87,9 +92,24 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
       ? t("jarvis.paused")
       : t(`jarvis.status.${session.status}`);
 
+  const run = async (action: () => Promise<void>): Promise<void> => {
+    if (invocationRef.current || recording.operation !== null) return;
+    invocationRef.current = true;
+    setInvoking(true);
+    setActionError(false);
+    try {
+      await action();
+    } catch {
+      setActionError(true);
+    } finally {
+      invocationRef.current = false;
+      setInvoking(false);
+    }
+  };
+
   const requestStart = () => {
-    if (localStorage.getItem(CONSENT_KEY) === "1") {
-      void recording.start();
+    if (hasRecordingConsent()) {
+      void run(recording.start);
       return;
     }
     setConsentOpen(true);
@@ -138,7 +158,14 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="w-24" aria-label={t("jarvis.micLevel")}>
+            <div
+              role="meter"
+              aria-label={t("jarvis.micLevel")}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={micPercent}
+              className="w-24"
+            >
               <div className="h-1.5 overflow-hidden rounded-full bg-muted">
                 <div
                   className={`h-full rounded-full transition-[width] duration-100 ${
@@ -155,43 +182,61 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
 
           {isRecording ? (
             <div className="flex gap-2">
-              <Button type="button" onClick={() => void recording.pause()}>
+              <Button
+                type="button"
+                disabled={commandPending}
+                onClick={() => void run(recording.pause)}
+              >
                 <Pause aria-hidden="true" />
                 {t("jarvis.pause")}
               </Button>
-              <Button type="button" variant="outline" onClick={() => void recording.finish()}>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={commandPending}
+                onClick={() => void run(recording.finish)}
+              >
                 <CircleStop aria-hidden="true" />
                 {t("jarvis.finish")}
               </Button>
             </div>
           ) : isPaused ? (
             <div className="flex gap-2">
-              <Button type="button" onClick={() => void recording.resume()}>
+              <Button
+                type="button"
+                disabled={commandPending}
+                onClick={() => void run(recording.resume)}
+              >
                 <RotateCcw aria-hidden="true" />
                 {t("jarvis.resume")}
               </Button>
-              <Button type="button" variant="outline" onClick={() => void recording.finish()}>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={commandPending}
+                onClick={() => void run(recording.finish)}
+              >
                 <CircleStop aria-hidden="true" />
                 {t("jarvis.finish")}
               </Button>
             </div>
           ) : (
-            <Button type="button" disabled={isBusy} onClick={requestStart}>
+            <Button type="button" disabled={isBusy || commandPending} onClick={requestStart}>
               <Play aria-hidden="true" />
               {t("jarvis.start")}
             </Button>
           )}
         </div>
-        {recording.error && (
+        {(recording.error || actionError) && (
           <p role="alert" className="mt-3 text-xs text-destructive">
-            {t("jarvis.recordingError")}
+            {t(actionError ? "jarvis.operationError" : "jarvis.recordingError")}
           </p>
         )}
       </div>
       <FirstUseConsentDialog
         open={consentOpen}
         onOpenChange={setConsentOpen}
-        onConsent={recording.start}
+        onConsent={() => run(recording.start)}
       />
     </header>
   );

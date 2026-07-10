@@ -34,12 +34,15 @@ export default function JarvisShell() {
   }, [selectedView, setSelectedView]);
 
   return (
-    <div className="grid h-screen grid-cols-[176px_minmax(420px,1fr)_320px] overflow-hidden bg-background text-foreground">
+    <div
+      data-testid="jarvis-shell"
+      className="grid h-screen grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-background text-foreground lg:grid-cols-[176px_minmax(420px,1fr)_320px] lg:grid-rows-1"
+    >
       <nav
-        className="flex min-h-0 flex-col border-r border-border/40 bg-card/40 px-3 py-4"
+        className="flex min-h-0 flex-row border-b border-border/40 bg-card/40 px-3 py-3 lg:flex-col lg:border-b-0 lg:border-r lg:py-4"
         aria-label={t("jarvis.navigation")}
       >
-        <div className="mb-6 flex items-center gap-2 px-2">
+        <div className="mr-4 flex shrink-0 items-center gap-2 px-2 lg:mb-6 lg:mr-0">
           <div className="grid size-8 place-items-center rounded-lg bg-primary text-primary-foreground">
             <BrainCircuit className="size-4" aria-hidden="true" />
           </div>
@@ -51,7 +54,7 @@ export default function JarvisShell() {
             </p>
           </div>
         </div>
-        <ul className="space-y-1">
+        <ul className="flex min-w-0 gap-1 overflow-x-auto lg:block lg:space-y-1">
           {NAV_ITEMS.map(({ id, icon: Icon }) => {
             const disabled = id !== "today";
             return (
@@ -72,7 +75,7 @@ export default function JarvisShell() {
                     {t(`jarvis.${id}`)}
                   </span>
                   {disabled && (
-                    <span className="mt-1 block pl-6 text-[10px] leading-3 text-muted-foreground">
+                    <span className="mt-1 hidden pl-6 text-[10px] leading-3 text-muted-foreground lg:block">
                       {t("jarvis.enableAfterAnalysis")}
                     </span>
                   )}

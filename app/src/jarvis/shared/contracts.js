@@ -13,7 +13,9 @@ const CHANNELS = Object.freeze({
   pauseCapture: "jarvis:capture:pause",
   resumeCapture: "jarvis:capture:resume",
   finishCapture: "jarvis:capture:finish",
-  enrollVoice: "jarvis:voice:enroll",
+  beginVoiceEnrollment: "jarvis:voice-enrollment:begin",
+  completeVoiceEnrollment: "jarvis:voice-enrollment:complete",
+  cancelVoiceEnrollment: "jarvis:voice-enrollment:cancel",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",
 });

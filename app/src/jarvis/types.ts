@@ -56,7 +56,7 @@ export interface JarvisTranscriptSegment {
 
 export interface JarvisRenamePersonInput {
   personId: string;
-  displayName: string;
+  displayName?: string;
   isSelf?: boolean;
   voiceProfileId?: number | null;
 }
@@ -81,6 +81,29 @@ export interface JarvisAudioChunk {
   sha256: string;
   expires_at: number;
   transcription_status: string;
+}
+
+export interface JarvisVoiceEnrollmentSession {
+  sessionId: string;
+  expiresAt: number;
+  sampleRate: 24000;
+  channels: 1;
+  format: "float32";
+  targetDurationSeconds: 30;
+}
+
+export interface JarvisVoiceEnrollmentWindow {
+  startSample: number;
+  endSample: number;
+  samples: Float32Array;
+}
+
+export interface JarvisVoiceEnrollmentPayload {
+  sampleRate: 24000;
+  channels: 1;
+  format: "float32";
+  recordedSampleCount: number;
+  windows: JarvisVoiceEnrollmentWindow[];
 }
 
 export type JarvisControlAction = "start" | "pause" | "resume" | "finish";

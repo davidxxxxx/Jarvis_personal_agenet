@@ -35,8 +35,10 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
       throw new TypeError(`service.${method} must be a function`);
     }
   }
-  if (!voiceEnrollmentService || typeof voiceEnrollmentService.enroll !== "function") {
-    throw new TypeError("voiceEnrollmentService.enroll must be a function");
+  for (const method of ["begin", "complete", "cancel"]) {
+    if (!voiceEnrollmentService || typeof voiceEnrollmentService[method] !== "function") {
+      throw new TypeError(`voiceEnrollmentService.${method} must be a function`);
+    }
   }
 
   ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));
@@ -71,8 +73,14 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
   ipcMain.handle(CHANNELS.finishCapture, (_event, id, at) =>
     service.finishCapture(assertId(id, "sessionId"), at)
   );
-  ipcMain.handle(CHANNELS.enrollVoice, (_event, sampleWindows) =>
-    voiceEnrollmentService.enroll(sampleWindows)
+  ipcMain.handle(CHANNELS.beginVoiceEnrollment, (event) =>
+    voiceEnrollmentService.begin({ ownerId: event?.sender?.id })
+  );
+  ipcMain.handle(CHANNELS.completeVoiceEnrollment, (event, sessionId, payload) =>
+    voiceEnrollmentService.complete({ ownerId: event?.sender?.id, sessionId, payload })
+  );
+  ipcMain.handle(CHANNELS.cancelVoiceEnrollment, (event, sessionId) =>
+    voiceEnrollmentService.cancel({ ownerId: event?.sender?.id, sessionId })
   );
 }
 

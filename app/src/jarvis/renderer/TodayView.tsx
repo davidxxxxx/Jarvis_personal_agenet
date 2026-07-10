@@ -39,7 +39,7 @@ export default function TodayView({ recording }: TodayViewProps) {
         <LiveTranscript segments={recording.segments} partialText={recording.partialText} />
       </main>
       <aside
-        className="overflow-y-auto border-l border-border/40 bg-muted/10 p-4"
+        className="hidden overflow-y-auto border-l border-border/40 bg-muted/10 p-4 lg:block"
         aria-label={t("jarvis.insights")}
       >
         <div className="space-y-3">

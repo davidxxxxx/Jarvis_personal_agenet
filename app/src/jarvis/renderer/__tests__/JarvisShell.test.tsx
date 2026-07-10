@@ -27,6 +27,7 @@ vi.mock("../useJarvisRecording", () => ({
     partialText: "",
     micLevel: 0.4,
     error: null,
+    operation: null,
     start: vi.fn(),
     pause: vi.fn(),
     resume: vi.fn(),
@@ -55,5 +56,14 @@ describe("JarvisShell", () => {
 
     expect(screen.getByRole("button", { name: /人物/ })).toBeDisabled();
     expect(screen.getAllByText("完成首次分析后启用")).toHaveLength(4);
+  });
+
+  it("has a single-column fallback below the desktop layout breakpoint", () => {
+    render(<JarvisShell />);
+
+    expect(screen.getByTestId("jarvis-shell")).toHaveClass("grid-cols-1");
+    expect(screen.getByTestId("jarvis-shell")).toHaveClass(
+      "lg:grid-cols-[176px_minmax(420px,1fr)_320px]"
+    );
   });
 });

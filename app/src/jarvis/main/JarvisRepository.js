@@ -294,24 +294,44 @@ class JarvisRepository {
     return this.statements.listSegments.all(assertId(sessionId, "sessionId"));
   }
 
-  renamePerson({ personId, displayName, isSelf = false, voiceProfileId = null }) {
-    const safePersonId = assertId(personId, "personId");
-    if (typeof displayName !== "string" || displayName.trim().length === 0) {
+  renamePerson(input) {
+    if (!input || typeof input !== "object") throw new TypeError("person update is required");
+    const safePersonId = assertId(input.personId, "personId");
+    const existing = this.statements.getPerson.get(safePersonId) ?? null;
+    const hasDisplayName = Object.prototype.hasOwnProperty.call(input, "displayName");
+    const hasIsSelf = Object.prototype.hasOwnProperty.call(input, "isSelf");
+    const hasVoiceProfileId = Object.prototype.hasOwnProperty.call(input, "voiceProfileId");
+
+    if (
+      hasDisplayName &&
+      (typeof input.displayName !== "string" || input.displayName.trim().length === 0)
+    ) {
       throw new TypeError("displayName must not be empty");
     }
-    if (typeof isSelf !== "boolean") throw new TypeError("isSelf must be a boolean");
-    if (voiceProfileId !== null && !Number.isSafeInteger(voiceProfileId)) {
+    if (!hasDisplayName && !existing) {
+      throw new TypeError("displayName is required when creating a person");
+    }
+    if (hasIsSelf && typeof input.isSelf !== "boolean") {
+      throw new TypeError("isSelf must be a boolean");
+    }
+    if (
+      hasVoiceProfileId &&
+      input.voiceProfileId !== null &&
+      !Number.isSafeInteger(input.voiceProfileId)
+    ) {
       throw new TypeError("voiceProfileId must be a safe integer or null");
     }
 
-    const input = {
+    const update = {
       personId: safePersonId,
-      displayName: displayName.trim(),
-      isSelf: isSelf ? 1 : 0,
-      voiceProfileId,
+      displayName: hasDisplayName ? input.displayName.trim() : existing.display_name,
+      isSelf: hasIsSelf ? (input.isSelf ? 1 : 0) : (existing?.is_self ?? 0),
+      voiceProfileId: hasVoiceProfileId
+        ? (input.voiceProfileId ?? null)
+        : (existing?.voice_profile_id ?? null),
       now: Date.now(),
     };
-    this._renamePerson(input);
+    this._renamePerson(update);
     return this.statements.getPerson.get(safePersonId);
   }
 

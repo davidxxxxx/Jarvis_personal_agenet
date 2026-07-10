@@ -1,17 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Mic2, Save, Square, X } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
+import type { JarvisVoiceEnrollmentPayload, JarvisVoiceEnrollmentSession } from "../types";
 
-const SAMPLE_RATE = 16_000;
 const RECORDING_SECONDS = 30;
 const WINDOW_SECONDS = 8;
-const WORKLET_CHUNK_SIZE = 1_600;
+const WORKLET_CHUNK_SIZE = 2_400;
+const MIN_READY_SECONDS = 29;
 
-type EnrollmentState = "idle" | "recording" | "ready" | "saving" | "saved" | "error";
+type EnrollmentState =
+  "idle" | "setup" | "recording" | "stopping" | "ready" | "saving" | "saved" | "error";
 
-function getEnrollmentWorkletUrl(): string {
+function createEnrollmentWorkletUrl(): string {
   const code = `
 const CHUNK_SIZE = ${WORKLET_CHUNK_SIZE};
 class JarvisEnrollmentProcessor extends AudioWorkletProcessor {
@@ -58,55 +60,125 @@ export default function VoiceEnrollment() {
   const [state, setState] = useState<EnrollmentState>("idle");
   const [secondsLeft, setSecondsLeft] = useState(RECORDING_SECONDS);
   const [level, setLevel] = useState(0);
+  const mountedRef = useRef(true);
+  const operationRef = useRef(false);
   const chunksRef = useRef<Float32Array[]>([]);
+  const sessionRef = useRef<JarvisVoiceEnrollmentSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<AudioWorkletNode | null>(null);
+  const workletUrlRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const deadlineRef = useRef(0);
 
-  const clearTimer = () => {
+  const clearTimer = useCallback(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
     timerRef.current = null;
-  };
+  }, []);
 
-  const stopCapture = async (nextState: EnrollmentState) => {
-    clearTimer();
-    processorRef.current?.port.postMessage("stop");
-    await new Promise((resolve) => window.setTimeout(resolve, 50));
-    processorRef.current?.disconnect();
-    sourceRef.current?.disconnect();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    if (contextRef.current && contextRef.current.state !== "closed") {
-      await contextRef.current.close();
+  const cancelPendingSession = useCallback(async () => {
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    if (!session) return;
+    try {
+      await window.electronAPI.jarvis.cancelVoiceEnrollment(session.sessionId);
+    } catch {
+      // The main process may already have consumed or expired this one-time session.
     }
-    processorRef.current = null;
-    sourceRef.current = null;
-    streamRef.current = null;
-    contextRef.current = null;
-    setLevel(0);
-    setState(nextState);
-  };
+  }, []);
 
-  useEffect(
-    () => () => {
+  const cleanupCapture = useCallback(
+    async ({ cancelSession, flush }: { cancelSession: boolean; flush: boolean }) => {
       clearTimer();
-      processorRef.current?.port.postMessage("stop");
-      processorRef.current?.disconnect();
-      sourceRef.current?.disconnect();
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-      void contextRef.current?.close();
-      chunksRef.current = [];
+      const processor = processorRef.current;
+      const source = sourceRef.current;
+      const stream = streamRef.current;
+      const context = contextRef.current;
+      processorRef.current = null;
+      sourceRef.current = null;
+      streamRef.current = null;
+      contextRef.current = null;
+
+      if (flush && processor) {
+        try {
+          processor.port.postMessage("stop");
+          await new Promise((resolve) => window.setTimeout(resolve, 50));
+        } catch {}
+      }
+      if (processor) {
+        processor.port.onmessage = null;
+        try {
+          processor.disconnect();
+        } catch {}
+      }
+      if (source) {
+        try {
+          source.disconnect();
+        } catch {}
+      }
+      stream?.getTracks().forEach((track) => track.stop());
+      if (context && context.state !== "closed") {
+        try {
+          await context.close();
+        } catch {}
+      }
+      if (workletUrlRef.current) {
+        URL.revokeObjectURL(workletUrlRef.current);
+        workletUrlRef.current = null;
+      }
+      setLevelIfMounted(0);
+      if (cancelSession) await cancelPendingSession();
     },
-    []
+    [cancelPendingSession, clearTimer]
   );
 
+  const setLevelIfMounted = (nextLevel: number) => {
+    if (mountedRef.current) setLevel(nextLevel);
+  };
+
+  const stopForReview = useCallback(async () => {
+    if (operationRef.current) return;
+    operationRef.current = true;
+    if (mountedRef.current) setState("stopping");
+    await cleanupCapture({ cancelSession: false, flush: true });
+    const totalSamples = chunksRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
+    const sampleRate = sessionRef.current?.sampleRate ?? 24_000;
+    if (totalSamples < sampleRate * MIN_READY_SECONDS) {
+      chunksRef.current = [];
+      await cancelPendingSession();
+      if (mountedRef.current) setState("error");
+    } else if (mountedRef.current) {
+      setState("ready");
+    }
+    operationRef.current = false;
+  }, [cancelPendingSession, cleanupCapture]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearTimer();
+      void cleanupCapture({ cancelSession: true, flush: false });
+      chunksRef.current = [];
+    };
+  }, [cleanupCapture, clearTimer]);
+
   const start = async () => {
-    setState("idle");
-    chunksRef.current = [];
+    if (operationRef.current) return;
+    operationRef.current = true;
+    setState("setup");
+    setLevel(0);
     setSecondsLeft(RECORDING_SECONDS);
+    chunksRef.current = [];
+
     try {
+      const session = await window.electronAPI.jarvis.beginVoiceEnrollment();
+      sessionRef.current = session;
+      if (!mountedRef.current) {
+        await cancelPendingSession();
+        return;
+      }
       const selectedId = getSettings().selectedMicDeviceId;
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -114,13 +186,27 @@ export default function VoiceEnrollment() {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-          channelCount: 1,
+          channelCount: session.channels,
         },
       });
-      const context = new AudioContext({ sampleRate: SAMPLE_RATE });
-      await context.audioWorklet.addModule(getEnrollmentWorkletUrl());
+      streamRef.current = stream;
+      if (!mountedRef.current) throw new Error("enrollment view closed");
+
+      const context = new AudioContext({ sampleRate: session.sampleRate });
+      contextRef.current = context;
+      if (context.state === "suspended") await context.resume();
+      if (!mountedRef.current) throw new Error("enrollment view closed");
+
+      const workletUrl = createEnrollmentWorkletUrl();
+      workletUrlRef.current = workletUrl;
+      await context.audioWorklet.addModule(workletUrl);
+      URL.revokeObjectURL(workletUrl);
+      workletUrlRef.current = null;
+
       const source = context.createMediaStreamSource(stream);
+      sourceRef.current = source;
       const processor = new AudioWorkletNode(context, "jarvis-enrollment-processor");
+      processorRef.current = processor;
       const silentGain = context.createGain();
       silentGain.gain.value = 0;
       processor.port.onmessage = (event) => {
@@ -129,36 +215,43 @@ export default function VoiceEnrollment() {
         chunksRef.current.push(chunk);
         let energy = 0;
         for (const sample of chunk) energy += sample * sample;
-        setLevel(Math.min(1, Math.sqrt(energy / chunk.length) * 4));
+        setLevelIfMounted(Math.min(1, Math.sqrt(energy / chunk.length) * 4));
       };
       source.connect(processor);
       processor.connect(silentGain);
       silentGain.connect(context.destination);
-      streamRef.current = stream;
-      contextRef.current = context;
-      sourceRef.current = source;
-      processorRef.current = processor;
-      deadlineRef.current = Date.now() + RECORDING_SECONDS * 1_000;
-      setState("recording");
+      deadlineRef.current = Date.now() + session.targetDurationSeconds * 1_000;
+      if (mountedRef.current) setState("recording");
       timerRef.current = window.setInterval(() => {
         const remaining = Math.max(0, Math.ceil((deadlineRef.current - Date.now()) / 1_000));
-        setSecondsLeft(remaining);
-        if (remaining === 0) void stopCapture("ready");
+        if (mountedRef.current) setSecondsLeft(remaining);
+        if (remaining === 0) void stopForReview();
       }, 250);
     } catch {
-      setState("error");
-      void stopCapture("error");
+      await cleanupCapture({ cancelSession: true, flush: false });
+      chunksRef.current = [];
+      if (mountedRef.current) setState("error");
+    } finally {
+      operationRef.current = false;
     }
   };
 
   const cancel = async () => {
-    await stopCapture("idle");
+    if (operationRef.current) return;
+    operationRef.current = true;
+    await cleanupCapture({ cancelSession: true, flush: false });
     chunksRef.current = [];
-    setSecondsLeft(RECORDING_SECONDS);
+    if (mountedRef.current) {
+      setSecondsLeft(RECORDING_SECONDS);
+      setState("idle");
+    }
+    operationRef.current = false;
   };
 
   const save = async () => {
-    if (state !== "ready") return;
+    const session = sessionRef.current;
+    if (state !== "ready" || operationRef.current || !session) return;
+    operationRef.current = true;
     setState("saving");
     const totalLength = chunksRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
     const samples = new Float32Array(totalLength);
@@ -167,24 +260,33 @@ export default function VoiceEnrollment() {
       samples.set(chunk, offset);
       offset += chunk.length;
     }
-    const windowSamples = SAMPLE_RATE * WINDOW_SECONDS;
-    if (samples.length < windowSamples * 3) {
-      setState("error");
-      return;
-    }
-    const windows = [0, 1, 2].map((index) => {
-      const startSample = index * windowSamples;
-      const endSample = startSample + windowSamples;
-      return { startSample, endSample, samples: samples.slice(startSample, endSample) };
-    });
+    const windowSamples = session.sampleRate * WINDOW_SECONDS;
+    const payload: JarvisVoiceEnrollmentPayload = {
+      sampleRate: session.sampleRate,
+      channels: session.channels,
+      format: session.format,
+      recordedSampleCount: samples.length,
+      windows: [0, 1, 2].map((index) => {
+        const startSample = index * windowSamples;
+        const endSample = startSample + windowSamples;
+        return { startSample, endSample, samples: samples.slice(startSample, endSample) };
+      }),
+    };
     try {
-      await window.electronAPI.jarvis.enrollVoice(windows);
+      await window.electronAPI.jarvis.completeVoiceEnrollment(session.sessionId, payload);
+      sessionRef.current = null;
       chunksRef.current = [];
-      setState("saved");
+      if (mountedRef.current) setState("saved");
     } catch {
-      setState("error");
+      if (mountedRef.current) setState("error");
+    } finally {
+      operationRef.current = false;
     }
   };
+
+  const startEnabled = state === "idle" || state === "error" || state === "saved";
+  const cancelEnabled = state === "recording" || state === "ready";
+  const micLevel = Math.max(0, Math.min(1, level));
 
   return (
     <section
@@ -215,7 +317,7 @@ export default function VoiceEnrollment() {
           aria-label={t("jarvis.audioLevel")}
           min={0}
           max={1}
-          value={level}
+          value={micLevel}
           className="h-2 min-w-0 flex-1"
         />
       </div>
@@ -230,12 +332,7 @@ export default function VoiceEnrollment() {
         </p>
       )}
       <div className="mt-4 flex flex-wrap gap-2">
-        <Button
-          type="button"
-          size="sm"
-          disabled={state === "recording" || state === "saving"}
-          onClick={() => void start()}
-        >
+        <Button type="button" size="sm" disabled={!startEnabled} onClick={() => void start()}>
           <Mic2 aria-hidden="true" />
           {t("jarvis.voiceEnrollmentStart")}
         </Button>
@@ -243,7 +340,7 @@ export default function VoiceEnrollment() {
           type="button"
           size="sm"
           variant="outline"
-          disabled={state !== "recording"}
+          disabled={!cancelEnabled}
           onClick={() => void cancel()}
         >
           {state === "recording" ? <Square aria-hidden="true" /> : <X aria-hidden="true" />}

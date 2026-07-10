@@ -31,7 +31,9 @@ function createService(overrides = {}) {
 
 function createVoiceEnrollmentService(overrides = {}) {
   return {
-    enroll: () => "voice-enrolled",
+    begin: () => "voice-begun",
+    complete: () => "voice-enrolled",
+    cancel: () => "voice-cancelled",
     ...overrides,
   };
 }
@@ -58,9 +60,11 @@ test("contract rejects path traversal and unknown states", () => {
 
 test("contract exposes only the named Jarvis channels", () => {
   assert.deepEqual(Object.keys(CHANNELS).sort(), [
+    "beginVoiceEnrollment",
+    "cancelVoiceEnrollment",
+    "completeVoiceEnrollment",
     "control",
     "createSession",
-    "enrollVoice",
     "finishCapture",
     "getSession",
     "listAudioChunks",
@@ -99,7 +103,9 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.pauseCapture,
       CHANNELS.resumeCapture,
       CHANNELS.finishCapture,
-      CHANNELS.enrollVoice,
+      CHANNELS.beginVoiceEnrollment,
+      CHANNELS.completeVoiceEnrollment,
+      CHANNELS.cancelVoiceEnrollment,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
@@ -140,12 +146,21 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
   assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
 });
 
-test("IPC sends voice enrollment windows only to the local enrollment service", async () => {
+test("IPC binds narrow voice enrollment sessions to the requesting renderer", async () => {
   const { handlers, voiceEnrollmentService } = createIpcHarness();
-  const windows = [{ startSample: 0, endSample: 1, samples: new Float32Array([0.1]) }];
+  const event = { sender: { id: 42 } };
+  const payload = { sampleRate: 24_000, channels: 1, format: "float32", windows: [] };
 
-  assert.equal(await handlers.get(CHANNELS.enrollVoice)(null, windows), "voice-enrolled");
-  assert.equal(typeof voiceEnrollmentService.enroll, "function");
+  assert.equal(await handlers.get(CHANNELS.beginVoiceEnrollment)(event), "voice-begun");
+  assert.equal(
+    await handlers.get(CHANNELS.completeVoiceEnrollment)(event, "opaque-id", payload),
+    "voice-enrolled"
+  );
+  assert.equal(
+    handlers.get(CHANNELS.cancelVoiceEnrollment)(event, "opaque-id"),
+    "voice-cancelled"
+  );
+  assert.equal(typeof voiceEnrollmentService.complete, "function");
 });
 
 test("IPC registration rejects invalid IPC and missing handler capabilities", () => {
@@ -215,6 +230,6 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
         service: createService(),
         voiceEnrollmentService: {},
       }),
-    /voiceEnrollmentService\.enroll must be a function/
+    /voiceEnrollmentService\.begin must be a function/
   );
 });

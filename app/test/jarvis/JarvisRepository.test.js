@@ -211,6 +211,43 @@ test("renaming a person changes display metadata without rewriting transcript te
   repo.close();
 });
 
+test("renaming a profiled self preserves self and voice-profile identity", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.renamePerson({
+    personId: "self",
+    displayName: "Original",
+    isSelf: true,
+    voiceProfileId: 77,
+  });
+
+  const renamed = repo.renamePerson({ personId: "self", displayName: "Renamed" });
+
+  assert.equal(renamed.display_name, "Renamed");
+  assert.equal(renamed.is_self, 1);
+  assert.equal(renamed.voice_profile_id, 77);
+  repo.close();
+});
+
+test("ordinary rename preserves voice profile and mark-self preserves display name", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.renamePerson({
+    personId: "p2",
+    displayName: "张三",
+    isSelf: false,
+    voiceProfileId: 88,
+  });
+
+  const renamed = repo.renamePerson({ personId: "p2", displayName: "张先生" });
+  const markedSelf = repo.renamePerson({ personId: "p2", isSelf: true });
+
+  assert.equal(renamed.voice_profile_id, 88);
+  assert.equal(renamed.is_self, 0);
+  assert.equal(markedSelf.display_name, "张先生");
+  assert.equal(markedSelf.voice_profile_id, 88);
+  assert.equal(markedSelf.is_self, 1);
+  repo.close();
+});
+
 test("person and segment writes roll back together when a segment violates the schema", () => {
   const repo = new JarvisRepository(":memory:");
   repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });

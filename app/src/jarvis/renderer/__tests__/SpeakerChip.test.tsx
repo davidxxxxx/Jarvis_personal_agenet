@@ -37,7 +37,21 @@ describe("SpeakerChip", () => {
       expect(window.electronAPI.jarvis.renamePerson).toHaveBeenCalledWith({
         personId: "p2",
         displayName: "张三",
-        isSelf: false,
+      });
+    });
+    expect(lockSpeaker).toHaveBeenCalledWith("p2", "张三");
+  });
+
+  it("marks a speaker as self without overwriting their existing profile name", async () => {
+    render(<SpeakerChip personId="p2" displayName="张三" confidence={0.9} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "张三" }));
+    fireEvent.click(screen.getByRole("button", { name: "标记为我" }));
+
+    await waitFor(() => {
+      expect(window.electronAPI.jarvis.renamePerson).toHaveBeenCalledWith({
+        personId: "p2",
+        isSelf: true,
       });
     });
     expect(lockSpeaker).toHaveBeenCalledWith("p2", "张三");
