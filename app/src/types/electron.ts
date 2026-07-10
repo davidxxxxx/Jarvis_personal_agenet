@@ -543,7 +543,11 @@ declare global {
         listPeople: () => Promise<JarvisPerson[]>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
-        pauseCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+        pauseCapture: (
+          id: string,
+          at?: number,
+          errorCode?: string | null
+        ) => Promise<JarvisRuntimeState>;
         resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         beginVoiceEnrollment: () => Promise<JarvisVoiceEnrollmentSession>;

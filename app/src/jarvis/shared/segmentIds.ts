@@ -1,6 +1,6 @@
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-function hashPart(value, seed) {
+function hashPart(value: string, seed: number): string {
   let hash = seed >>> 0;
   for (let index = 0; index < value.length; index += 1) {
     hash ^= value.charCodeAt(index);
@@ -8,14 +8,13 @@ function hashPart(value, seed) {
   }
   return hash.toString(16).padStart(8, "0");
 }
-
-function hashIdentifier(value) {
+function hashIdentifier(value: string): string {
   return [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35]
     .map((seed) => hashPart(value, seed))
     .join("");
 }
 
-function createStableSegmentId(sessionId, rawSegmentId) {
+export function createStableSegmentId(sessionId: string, rawSegmentId: string): string {
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     throw new TypeError("sessionId must not be empty");
   }
@@ -28,5 +27,3 @@ function createStableSegmentId(sessionId, rawSegmentId) {
     ? namespaced
     : `seg_${hashIdentifier(`${sessionId}\0${rawSegmentId}`)}`;
 }
-
-module.exports = { createStableSegmentId };

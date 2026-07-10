@@ -20,6 +20,11 @@ test("renderer mic-only start bypasses system access and forwards Jarvis identit
     source,
     /hasExactDevice[\s\S]*?args\.captureSystemAudio === false[\s\S]*?return null/
   );
+  assert.match(source, /import \{ reacquireIfDead \} from "\.\.\/helpers\/micTrackHealth"/);
+  assert.match(source, /await reacquireIfDead\(/);
+  assert.match(source, /addEventListener\("ended"/);
+  assert.match(source, /MIC_PERMISSION/);
+  assert.match(source, /MIC_DISCONNECTED/);
 });
 
 test("main mic-only route uses the resolved mode and never finalizes Jarvis on meeting stop", () => {
@@ -47,4 +52,24 @@ test("main mic-only route uses the resolved mode and never finalizes Jarvis on m
     /text:\s*(?:pending\.text|latestSegment|text)\.slice/,
     "meeting recording must not log transcript bodies"
   );
+});
+
+test("renderer reacts to authoritative capture failures and active mic loss", () => {
+  const source = fs.readFileSync(
+    path.join(appRoot, "src/jarvis/renderer/useJarvisRecording.ts"),
+    "utf8"
+  );
+
+  assert.match(source, /jarvis\.onStateChanged/);
+  assert.match(source, /state\.status === "failed"/);
+  assert.match(source, /stopRecording\(\{ throwOnError: false \}\)/);
+  assert.match(source, /pauseForError\(upstreamError\)/);
+});
+
+test("renderer shared segment-id module is browser-native ESM for Vite development", () => {
+  const sourcePath = path.join(appRoot, "src/jarvis/shared/segmentIds.ts");
+  assert.equal(fs.existsSync(sourcePath), true);
+  const source = fs.readFileSync(sourcePath, "utf8");
+  assert.match(source, /export function createStableSegmentId/);
+  assert.doesNotMatch(source, /module\.exports/);
 });

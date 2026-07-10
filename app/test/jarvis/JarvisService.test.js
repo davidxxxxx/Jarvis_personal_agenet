@@ -41,6 +41,12 @@ function createRepository() {
   };
 }
 
+function createSafeFs() {
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
+  return fsImpl;
+}
+
 test("pause closes audio, resume reuses the session, and finish stores seven-day metadata", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();
@@ -51,6 +57,7 @@ test("pause closes audio, resume reuses the session, and finish stores seven-day
     userDataDir,
     broadcast: (state) => broadcasts.push(state),
     now: () => clock,
+    fsImpl: createSafeFs(),
   });
 
   try {
@@ -94,7 +101,13 @@ test("pause closes audio, resume reuses the session, and finish stores seven-day
 test("append rejects a session mismatch without writing audio", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();
-  const service = new JarvisService({ repository, userDataDir, broadcast() {}, now: () => 1000 });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1000,
+    fsImpl: createSafeFs(),
+  });
 
   try {
     service.startCapture({ sessionId: "s1", startedAt: 1000, micDeviceId: null });
@@ -116,6 +129,7 @@ test("audio metadata starts at the explicit session start rather than IPC handli
     userDataDir,
     broadcast() {},
     now: () => clock,
+    fsImpl: createSafeFs(),
   });
 
   try {
@@ -126,6 +140,133 @@ test("audio metadata starts at the explicit session start rather than IPC handli
 
     assert.equal(repository.chunks[0].startedAt, 1000);
     assert.equal(repository.chunks[0].durationMs, 100);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("fails visibly before opening a writer when free disk is below the safety cutoff", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
+  const repository = createRepository();
+  const broadcasts = [];
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 1024 ** 3 });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast: (state) => broadcasts.push(state),
+    now: () => 1_000,
+    fsImpl,
+  });
+
+  try {
+    assert.throws(
+      () => service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null }),
+      /disk space/i
+    );
+    assert.equal(repository.sessions.get("s1").status, "failed");
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "DISK_SPACE_LOW");
+    assert.equal(broadcasts.at(-1).errorCode, "DISK_SPACE_LOW");
+    assert.deepEqual(repository.chunks, []);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("checks disk again at each rotation and fails without a corrupt partial chunk", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
+  const repository = createRepository();
+  let diskChecks = 0;
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => {
+    diskChecks += 1;
+    const safe = diskChecks < 3;
+    return {
+      bsize: 1,
+      blocks: 200 * 1024 ** 3,
+      bavail: safe ? 20 * 1024 ** 3 : 1024 ** 3,
+    };
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    const accepted = service.appendMicPcm("s1", Buffer.alloc(24000 * 2 * 60 * 2, 1));
+
+    assert.equal(accepted, false);
+    assert.equal(diskChecks, 3);
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "DISK_SPACE_LOW");
+    assert.equal(repository.chunks.length, 1);
+    const sessionDir = path.join(userDataDir, "recordings", "s1");
+    assert.equal(fs.readdirSync(sessionDir).some((name) => name.endsWith(".part")), false);
+    assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 1);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown flushes the last chunk and marks an active session recovered", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
+  const repository = createRepository();
+  let clock = 1_000;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => clock,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(4_800, 1));
+    clock = 1_100;
+
+    service.shutdown();
+
+    assert.equal(repository.chunks.length, 1);
+    assert.equal(repository.sessions.get("s1").status, "recovered");
+    assert.equal(service.getState().status, "recovered");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("an error pause keeps completed audio and broadcasts the microphone error code", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
+  const repository = createRepository();
+  const broadcasts = [];
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast: (state) => broadcasts.push(state),
+    now: () => 1_100,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(4_800, 1));
+
+    service.pauseCapture("s1", 1_100, "MIC_DISCONNECTED");
+
+    assert.equal(repository.chunks.length, 1);
+    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(service.getState().status, "paused");
+    assert.equal(service.getState().errorCode, "MIC_DISCONNECTED");
+    assert.equal(broadcasts.at(-1).errorCode, "MIC_DISCONNECTED");
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });

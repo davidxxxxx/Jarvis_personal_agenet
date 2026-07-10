@@ -293,6 +293,7 @@ const sidecarRegistry = require("./src/helpers/sidecarRegistry");
 const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
 const JarvisService = require("./src/jarvis/main/JarvisService");
+const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 
@@ -324,6 +325,7 @@ let ipcHandlers = null;
 let cliBridge = null;
 let jarvisRepository = null;
 let jarvisService = null;
+let retentionCleaner = null;
 let voiceEnrollmentService = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
@@ -387,18 +389,31 @@ function initializeCoreManagers() {
 
   databaseManager = new DatabaseManager();
 
-  jarvisRepository = new JarvisRepository(path.join(app.getPath("userData"), "jarvis.db"));
+  const jarvisUserDataDir = app.getPath("userData");
+  const recordingsRoot = path.join(jarvisUserDataDir, "recordings");
+  jarvisRepository = new JarvisRepository(path.join(jarvisUserDataDir, "jarvis.db"));
   jarvisService = new JarvisService({
     repository: jarvisRepository,
-    userDataDir: app.getPath("userData"),
-    broadcast: (state) => windowManager?.sendToControlPanel("jarvis:state-changed", state),
+    userDataDir: jarvisUserDataDir,
+    broadcast: (state) => {
+      windowManager?.sendToControlPanel("jarvis:state-changed", state);
+      trayManager?.setJarvisState(state);
+    },
+  });
+  retentionCleaner = new RetentionCleaner({
+    repository: jarvisRepository,
+    recordingsRoot,
+    log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
   voiceEnrollmentService = new VoiceEnrollmentService({
     speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
     databaseManager,
     repository: jarvisRepository,
   });
-  jarvisService.recoverOpenSessions(Date.now());
+  const recovered = jarvisService.recoverOpenSessions(Date.now());
+  debugLogger.info("Jarvis interrupted-session recovery", { recovered: recovered.length }, "jarvis");
+  retentionCleaner.clean(Date.now());
+  retentionCleaner.start();
   registerJarvisIpc({
     ipcMain,
     repository: jarvisRepository,
@@ -1067,6 +1082,7 @@ async function startApp() {
   trayManager.setWindows(windowManager.mainWindow, windowManager.controlPanelWindow);
   trayManager.setWindowManager(windowManager);
   trayManager.setCreateControlPanelCallback(() => windowManager.createControlPanelWindow());
+  trayManager.setJarvisState(jarvisService.getState());
   await trayManager.createTray();
 
   updateManager.setWindows(windowManager.mainWindow, windowManager.controlPanelWindow);
@@ -1660,6 +1676,10 @@ function performSyncTeardown() {
   if (ipcHandlers) ipcHandlers._cleanupTextEditMonitor();
   if (textEditMonitor) textEditMonitor.stopMonitoring();
   if (updateManager) updateManager.cleanup();
+  if (retentionCleaner) {
+    retentionCleaner.stop();
+    retentionCleaner = null;
+  }
   if (jarvisService) {
     jarvisService.shutdown();
     jarvisService = null;

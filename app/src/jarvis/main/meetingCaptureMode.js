@@ -32,10 +32,11 @@ function routeMicOnlyPcm({
   writeDiarization,
   dispatchTranscription,
 }) {
-  appendMicPcm(sessionId, pcmBuffer);
+  if (appendMicPcm(sessionId, pcmBuffer) === false) return false;
   feedSpeaker(pcmBuffer);
   writeDiarization(pcmBuffer);
   dispatchTranscription(pcmBuffer, "mic");
+  return true;
 }
 
 function dispatchRealtimePcm({

@@ -105,6 +105,25 @@ test("quiet mic-only PCM reaches realtime streaming with identical Buffer identi
   assert.deepEqual([...received[0]], [1, 0, 2, 0]);
 });
 
+test("mic-only PCM stops downstream processing when the disk writer safe-stops", () => {
+  const calls = [];
+
+  const routed = routeMicOnlyPcm({
+    sessionId: "s1",
+    pcmBuffer: Buffer.from([1, 0]),
+    appendMicPcm: () => {
+      calls.push("persist");
+      return false;
+    },
+    feedSpeaker: () => calls.push("speaker"),
+    writeDiarization: () => calls.push("diarization"),
+    dispatchTranscription: () => calls.push("transcription"),
+  });
+
+  assert.equal(routed, false);
+  assert.deepEqual(calls, ["persist"]);
+});
+
 test("normal realtime mic dispatch retains upstream buffer transformation", () => {
   const pcm = Buffer.from([1, 0, 2, 0]);
   let received = null;

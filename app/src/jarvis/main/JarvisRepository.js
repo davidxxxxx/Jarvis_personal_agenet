@@ -179,6 +179,11 @@ class JarvisRepository {
         ORDER BY expires_at ASC, id ASC
       `),
       deleteAudioChunk: this.db.prepare("DELETE FROM audio_chunks WHERE id = ?"),
+      listOpenSessions: this.db.prepare(`
+        SELECT * FROM sessions
+        WHERE status IN ('recording', 'paused', 'finalizing')
+        ORDER BY started_at ASC, id ASC
+      `),
       recoverOpenSessions: this.db.prepare(`
         UPDATE sessions
         SET status = 'recovered', ended_at = @at
@@ -239,6 +244,12 @@ class JarvisRepository {
     this._renamePerson = this.db.transaction((input) => {
       if (input.isSelf) this.statements.clearSelf.run();
       this.statements.renamePerson.run(input);
+    });
+
+    this._recoverOpenSessions = this.db.transaction((at) => {
+      const openSessions = this.statements.listOpenSessions.all();
+      this.statements.recoverOpenSessions.run({ at });
+      return openSessions.map((session) => this.statements.getSession.get(session.id));
     });
   }
 
@@ -374,7 +385,7 @@ class JarvisRepository {
   }
 
   recoverOpenSessions(at = Date.now()) {
-    return this.statements.recoverOpenSessions.run({ at: assertInteger(at, "at") }).changes;
+    return this._recoverOpenSessions(assertInteger(at, "at"));
   }
 
   close() {

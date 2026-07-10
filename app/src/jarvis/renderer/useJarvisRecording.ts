@@ -38,7 +38,7 @@ export interface RecordingJarvisApi {
     startedAt: number;
     micDeviceId: string | null;
   }) => Promise<JarvisRuntimeState>;
-  pauseCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
+  pauseCapture: (id: string, at?: number, errorCode?: string | null) => Promise<JarvisRuntimeState>;
   resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
   finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
   upsertSegments: (
@@ -107,11 +107,19 @@ export interface RecordingDependencies {
 export interface RecordingController {
   start: () => Promise<void>;
   pause: () => Promise<void>;
+  pauseForError: (code: "MIC_PERMISSION" | "MIC_DISCONNECTED") => Promise<void>;
   resume: () => Promise<void>;
   finish: () => Promise<void>;
   renameSpeaker: (personId: string, displayName: string, isSelf?: boolean) => Promise<JarvisPerson>;
   handleSegmentsChanged: (segments: TranscriptSegment[]) => void;
   dispose: () => void;
+}
+
+export function routeJarvisControl(
+  controller: RecordingController,
+  action: JarvisControlAction
+): Promise<void> {
+  return controller[action]();
 }
 
 class RecordingOperationError extends Error {
@@ -301,18 +309,41 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       await deps.jarvis.startCapture({ sessionId: id, startedAt, micDeviceId });
       captureStarted = true;
       await deps.startRecording(recordingArgs(id));
-      if (!deps.getMeetingSnapshot().isRecording) {
+      const meetingSnapshot = deps.getMeetingSnapshot();
+      if (!meetingSnapshot.isRecording) {
+        const code = ["MIC_PERMISSION", "MIC_DISCONNECTED"].includes(
+          meetingSnapshot.error ?? ""
+        )
+          ? (meetingSnapshot.error as string)
+          : "upstream_start_failed";
         throw new RecordingOperationError(
-          "upstream_start_failed",
-          "upstream recording did not start"
+          code,
+          code.startsWith("MIC_")
+            ? "microphone capture failed"
+            : "upstream recording did not start"
         );
       }
       transition({ type: "STARTED", id, at: startedAt });
       await refreshSessions();
     } catch (error) {
       const code = errorCode(error, "capture_start_failed");
-      if (captureStarted) await finishMainCapture(id);
-      if (sessionCreated) await markPersistedSessionFailed(id);
+      const isMicError = code === "MIC_PERMISSION" || code === "MIC_DISCONNECTED";
+      if (captureStarted && isMicError) {
+        try {
+          await stopUpstream();
+        } catch {
+          // Main capture still pauses even if the already-failing upstream cannot stop cleanly.
+        }
+        try {
+          await deps.jarvis.pauseCapture(id, deps.now(), code);
+        } catch {
+          await finishMainCapture(id);
+          await markPersistedSessionFailed(id);
+        }
+      } else {
+        if (captureStarted) await finishMainCapture(id);
+        if (sessionCreated) await markPersistedSessionFailed(id);
+      }
       failCurrentSession(code);
       throw error;
     } finally {
@@ -320,7 +351,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     }
   };
 
-  const pause = async (): Promise<void> => {
+  const pauseCapture = async (reportedError: string | null): Promise<void> => {
     const state = deps.getSessionState();
     const at = deps.now();
     const paused = reduceSession(state, { type: "PAUSED", at });
@@ -330,9 +361,10 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     try {
       await stopUpstream();
       upstreamStopped = true;
-      await deps.jarvis.pauseCapture(state.id as string, at);
+      await deps.jarvis.pauseCapture(state.id as string, at, reportedError);
       deps.setSessionState(paused);
       await refreshSessions();
+      if (reportedError) deps.onError(reportedError);
     } catch (error) {
       const code = errorCode(
         error,
@@ -352,6 +384,15 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     } finally {
       end();
     }
+  };
+
+  const pause = (): Promise<void> => pauseCapture(null);
+
+  const pauseForError = (code: "MIC_PERMISSION" | "MIC_DISCONNECTED"): Promise<void> => {
+    if (code !== "MIC_PERMISSION" && code !== "MIC_DISCONNECTED") {
+      throw new TypeError("unsupported microphone error code");
+    }
+    return pauseCapture(code);
   };
 
   const resume = async (): Promise<void> => {
@@ -483,6 +524,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   return {
     start,
     pause,
+    pauseForError,
     resume,
     finish,
     renameSpeaker,
@@ -496,7 +538,7 @@ const rendererJarvisApi: RecordingJarvisApi = {
   setSessionStatus: (id, status, at) => window.electronAPI.jarvis.setSessionStatus(id, status, at),
   listSessions: () => window.electronAPI.jarvis.listSessions(),
   startCapture: (input) => window.electronAPI.jarvis.startCapture(input),
-  pauseCapture: (id, at) => window.electronAPI.jarvis.pauseCapture(id, at),
+  pauseCapture: (id, at, errorCode) => window.electronAPI.jarvis.pauseCapture(id, at, errorCode),
   resumeCapture: (id, at) => window.electronAPI.jarvis.resumeCapture(id, at),
   finishCapture: (id, at) => window.electronAPI.jarvis.finishCapture(id, at),
   upsertSegments: (sessionId, segments) =>
@@ -533,6 +575,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
   const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
   const controllerRef = useRef<RecordingController | null>(null);
+  const handledMicErrorRef = useRef<string | null>(null);
 
   if (sessionsRefreshRef.current === null) {
     sessionsRefreshRef.current = createLatestRefresh(
@@ -586,6 +629,51 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       controller.dispose();
     };
   }, [controller]);
+
+  useEffect(
+    () =>
+      window.electronAPI.jarvis.onControl((action) => {
+        void routeJarvisControl(controller, action).catch(() => undefined);
+      }),
+    [controller]
+  );
+
+  useEffect(
+    () =>
+      window.electronAPI.jarvis.onStateChanged((state) => {
+        if (state.errorCode) useJarvisStore.getState().setError(state.errorCode);
+        if (state.status === "failed") {
+          const current = useJarvisStore.getState().session;
+          if (
+            current.id === state.sessionId &&
+            ["starting", "recording", "paused", "finalizing"].includes(current.status)
+          ) {
+            useJarvisStore.getState().setSession(
+              reduceSession(current, {
+                type: "FAILED",
+                code: state.errorCode || "capture_failed",
+              })
+            );
+          }
+          void stopRecording({ throwOnError: false });
+        }
+      }),
+    []
+  );
+
+  useEffect(() => {
+    const isMicError =
+      upstreamError === "MIC_PERMISSION" || upstreamError === "MIC_DISCONNECTED";
+    if (!isMicError) {
+      handledMicErrorRef.current = null;
+      return;
+    }
+    if (session.status !== "recording" || handledMicErrorRef.current === upstreamError) return;
+    handledMicErrorRef.current = upstreamError;
+    void controller.pauseForError(upstreamError).catch(() => {
+      useJarvisStore.getState().setError(upstreamError);
+    });
+  }, [controller, session.status, upstreamError]);
 
   useEffect(() => {
     void sessionsRefresh.run(() => rendererJarvisApi.listSessions());

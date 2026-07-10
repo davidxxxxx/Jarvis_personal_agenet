@@ -11,6 +11,7 @@ class TrayManager {
     this.controlPanelWindow = null;
     this.windowManager = null;
     this.attachedControlPanels = new WeakSet();
+    this.jarvisState = { status: "idle", errorCode: null };
   }
 
   setWindows(mainWindow, controlPanelWindow) {
@@ -37,6 +38,14 @@ class TrayManager {
 
   setCreateControlPanelCallback(callback) {
     this.createControlPanelCallback = callback;
+  }
+
+  setJarvisState(state) {
+    this.jarvisState = {
+      status: typeof state?.status === "string" ? state.status : "idle",
+      errorCode: typeof state?.errorCode === "string" ? state.errorCode : null,
+    };
+    this.updateTrayMenu();
   }
 
   attachControlPanelListeners(window) {
@@ -229,6 +238,7 @@ class TrayManager {
 
   buildContextMenuTemplate() {
     const dictationVisible = this.windowManager?.isDictationPanelVisible?.() ?? false;
+    const jarvisControls = this.buildJarvisControls();
 
     return [
       {
@@ -252,6 +262,8 @@ class TrayManager {
         },
       },
       { type: "separator" },
+      ...jarvisControls,
+      ...(jarvisControls.length > 0 ? [{ type: "separator" }] : []),
       {
         label: i18nMain.t("tray.quit"),
         click: () => {
@@ -262,11 +274,51 @@ class TrayManager {
     ];
   }
 
+  buildJarvisControls() {
+    const send = (action) => async () => this.sendJarvisControl(action);
+    if (this.jarvisState.status === "recording") {
+      return [
+        { label: i18nMain.t("jarvis.pause"), click: send("pause") },
+        { label: i18nMain.t("jarvis.finish"), click: send("finish") },
+      ];
+    }
+    if (this.jarvisState.status === "paused") {
+      return [
+        { label: i18nMain.t("jarvis.resume"), click: send("resume") },
+        { label: i18nMain.t("jarvis.finish"), click: send("finish") },
+      ];
+    }
+    if (["idle", "completed", "failed", "recovered"].includes(this.jarvisState.status)) {
+      return [{ label: i18nMain.t("jarvis.start"), click: send("start") }];
+    }
+    return [];
+  }
+
+  async sendJarvisControl(action) {
+    if (!["start", "pause", "resume", "finish"].includes(action)) return;
+    await this.showControlPanelFromTray();
+    const window = this.windowManager?.controlPanelWindow || this.controlPanelWindow;
+    if (!window || window.isDestroyed()) return;
+    window.webContents.send("jarvis:control", action);
+  }
+
+  getJarvisTooltip() {
+    const statusKey = ["recording", "paused", "finalizing", "completed", "failed"].includes(
+      this.jarvisState.status
+    )
+      ? this.jarvisState.status
+      : "idle";
+    const status = `Jarvis Memory · ${i18nMain.t(`jarvis.status.${statusKey}`)}`;
+    return this.jarvisState.errorCode
+      ? `${status} · ${i18nMain.t("jarvis.recordingError")}`
+      : status;
+  }
+
   updateTrayMenu() {
     if (!this.tray) return;
 
     const contextMenu = Menu.buildFromTemplate(this.buildContextMenuTemplate());
-    this.tray.setToolTip(i18nMain.t("tray.tooltip"));
+    this.tray.setToolTip(this.getJarvisTooltip());
     this.tray.setContextMenu(contextMenu);
   }
 

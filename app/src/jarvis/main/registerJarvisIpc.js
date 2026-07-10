@@ -80,8 +80,8 @@ function registerJarvisIpc({ ipcMain, repository, service, voiceEnrollmentServic
     repository.listAudioChunks(assertId(sessionId, "sessionId"))
   );
   ipcMain.handle(CHANNELS.startCapture, (_event, input) => service.startCapture(input));
-  ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at) =>
-    service.pauseCapture(assertId(id, "sessionId"), at)
+  ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at, errorCode) =>
+    service.pauseCapture(assertId(id, "sessionId"), at, errorCode)
   );
   ipcMain.handle(CHANNELS.resumeCapture, (_event, id, at) =>
     service.resumeCapture(assertId(id, "sessionId"), at)

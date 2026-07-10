@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
-const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds");
+const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds.ts");
 
 test("session-namespaced segment ids avoid restart-local raw id collisions", () => {
   const repo = new JarvisRepository(":memory:");
@@ -307,7 +307,10 @@ test("audio metadata retention and interrupted session recovery stay in jarvis.d
   assert.equal(repo.listSessions({ from: 1500, to: 2500 })[0].id, "s2");
   assert.equal(repo.listExpiredAudioChunks(3999).length, 0);
   assert.equal(repo.listExpiredAudioChunks(4000)[0].id, "chunk-1");
-  assert.equal(repo.recoverOpenSessions(5000), 1);
+  assert.deepEqual(
+    repo.recoverOpenSessions(5000).map((session) => session.id),
+    ["s1"]
+  );
   assert.equal(repo.getSession("s1").status, "recovered");
   assert.equal(repo.getSession("s1").ended_at, 5000);
   assert.equal(repo.deleteAudioChunk("chunk-1"), 1);

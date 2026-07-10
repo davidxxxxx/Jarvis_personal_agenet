@@ -31,6 +31,7 @@ class AudioChunkWriter {
     chunkSeconds = MAX_CHUNK_SECONDS,
     now = Date.now,
     startedAt = now(),
+    beforeChunk = () => {},
     onChunk,
   }) {
     if (typeof sessionId !== "string" || sessionId.length === 0) {
@@ -50,6 +51,7 @@ class AudioChunkWriter {
       throw new TypeError("startedAt must be a safe integer");
     }
     if (typeof onChunk !== "function") throw new TypeError("onChunk must be a function");
+    if (typeof beforeChunk !== "function") throw new TypeError("beforeChunk must be a function");
 
     const chunkBytes = sampleRate * BYTES_PER_SAMPLE * chunkSeconds;
     if (!Number.isSafeInteger(chunkBytes) || chunkBytes % BYTES_PER_SAMPLE !== 0) {
@@ -62,6 +64,7 @@ class AudioChunkWriter {
     this.chunkBytes = chunkBytes;
     this.now = now;
     this.onChunk = onChunk;
+    this.beforeChunk = beforeChunk;
     this.pending = [];
     this.pendingBytes = 0;
     this.startedAt = startedAt;
@@ -80,6 +83,7 @@ class AudioChunkWriter {
     this.pending.push(Buffer.from(buffer));
     this.pendingBytes += buffer.length;
     while (this.pendingBytes >= this.chunkBytes) {
+      this.beforeChunk();
       this._emit(this._take(this.chunkBytes), this.now());
     }
   }
@@ -88,7 +92,15 @@ class AudioChunkWriter {
     if (this.closed) return;
     this.closed = true;
     if (this.pendingBytes === 0) return;
+    this.beforeChunk();
     this._emit(this._take(this.pendingBytes), at);
+  }
+
+  abort() {
+    if (this.closed) return;
+    this.closed = true;
+    this.pending = [];
+    this.pendingBytes = 0;
   }
 
   _take(byteLength) {

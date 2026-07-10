@@ -27,6 +27,7 @@ import {
   type MeetingPrepareCaptureOptions,
 } from "../jarvis/renderer/meetingPreparation";
 import { createMeetingStopCoordinator, type SharedStopOptions } from "./meetingStopCoordinator";
+import { reacquireIfDead } from "../helpers/micTrackHealth";
 
 export interface TranscriptSegment {
   id: string;
@@ -814,6 +815,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             systemCapturePromise: Promise.resolve({ stream: null, error: null }),
           }
         : prepareMeetingSystemAudioCapture(initialSystemAudioAccess);
+    let micFailureCode: "MIC_PERMISSION" | "MIC_DISCONNECTED" | null = null;
 
     const [startResult, micResult, initialSystemCaptureResult] = await Promise.all([
       window.electronAPI?.meetingTranscriptionStart?.({
@@ -824,16 +826,35 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       }),
       getMeetingMicConstraints().then(async (constraints) => {
         try {
-          return await navigator.mediaDevices.getUserMedia(constraints);
+          const initialMicStream = await navigator.mediaDevices.getUserMedia(constraints);
+          if (args.captureSystemAudio !== false) return initialMicStream;
+
+          const recoveredMicStream = await reacquireIfDead(
+            initialMicStream,
+            () => Promise.resolve(constraints),
+            logger
+          );
+          const recoveredTrack = recoveredMicStream.getAudioTracks()[0];
+          if (!recoveredTrack || recoveredTrack.readyState === "ended" || recoveredTrack.muted) {
+            micFailureCode = "MIC_DISCONNECTED";
+            stopMediaStream(recoveredMicStream);
+            return null;
+          }
+          return recoveredMicStream;
         } catch (err) {
           const hasExactDevice =
             typeof constraints.audio === "object" &&
             constraints.audio !== null &&
             "deviceId" in constraints.audio;
           if (hasExactDevice && args.captureSystemAudio === false) {
+            micFailureCode = ["NotAllowedError", "SecurityError"].includes(
+              (err as Error).name
+            )
+              ? "MIC_PERMISSION"
+              : "MIC_DISCONNECTED";
             logger.error(
               "Selected microphone is unavailable for mic-only capture",
-              { error: (err as Error).message },
+              { errorCode: micFailureCode },
               "meeting"
             );
             return null;
@@ -863,6 +884,13 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             { error: (err as Error).message, constraints },
             "meeting"
           );
+          if (args.captureSystemAudio === false) {
+            micFailureCode = ["NotAllowedError", "SecurityError"].includes(
+              (err as Error).name
+            )
+              ? "MIC_PERMISSION"
+              : "MIC_DISCONNECTED";
+          }
           return null;
         }
       }),
@@ -922,10 +950,11 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       logger.error("Meeting transcription has no available audio source", {}, "meeting");
       useMeetingRecordingStore.setState({
         error:
-          systemAudioMode === "unsupported"
+          micFailureCode ??
+          (systemAudioMode === "unsupported"
             ? "No microphone is available and system audio capture is unsupported on this device."
             : systemCaptureError?.message ||
-              "No microphone is available and system audio capture could not be started.",
+              "No microphone is available and system audio capture could not be started."),
         isRecording: false,
         isTranscribing: false,
       });
@@ -1111,6 +1140,16 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     let micPipelinePromise: Promise<void> | null = null;
     if (micResult) {
       micStream = micResult;
+      const activeMicTrack = micResult.getAudioTracks()[0];
+      if (args.captureSystemAudio === false && activeMicTrack) {
+        const onJarvisMicEnded = () => {
+          if (!isRecordingFlag) return;
+          useMeetingRecordingStore.setState({ error: "MIC_DISCONNECTED" });
+          void stopRecording();
+        };
+        activeMicTrack.addEventListener("ended", onJarvisMicEnded);
+        ipcCleanups.push(() => activeMicTrack.removeEventListener("ended", onJarvisMicEnded));
+      }
       const ctx = new AudioContext({ sampleRate: 24000 });
       await detachFromOutputDevice(ctx);
       micContext = ctx;
