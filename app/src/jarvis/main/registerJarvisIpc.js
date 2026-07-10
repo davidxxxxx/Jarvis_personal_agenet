@@ -1,11 +1,28 @@
 const { CHANNELS, assertId, assertSessionStatus } = require("../shared/contracts");
 
+const REQUIRED_REPOSITORY_METHODS = [
+  "createSession",
+  "setSessionStatus",
+  "getSession",
+  "listSessions",
+  "upsertTranscriptSegments",
+  "listTranscriptSegments",
+  "renamePerson",
+  "listPeople",
+  "listAudioChunks",
+];
+
 function registerJarvisIpc({ ipcMain, repository }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
   }
   if (!repository || typeof repository !== "object") {
     throw new TypeError("repository is required");
+  }
+  for (const method of REQUIRED_REPOSITORY_METHODS) {
+    if (typeof repository[method] !== "function") {
+      throw new TypeError(`repository.${method} must be a function`);
+    }
   }
 
   ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));

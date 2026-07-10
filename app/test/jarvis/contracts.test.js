@@ -3,14 +3,8 @@ const assert = require("node:assert/strict");
 const { CHANNELS, assertId, assertSessionStatus } = require("../../src/jarvis/shared/contracts");
 const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
 
-function createIpcHarness(overrides = {}) {
-  const handlers = new Map();
-  const ipcMain = {
-    handle(channel, handler) {
-      handlers.set(channel, handler);
-    },
-  };
-  const repository = {
+function createRepository(overrides = {}) {
+  return {
     createSession: () => "created",
     setSessionStatus: () => "status-set",
     getSession: () => "session",
@@ -22,6 +16,16 @@ function createIpcHarness(overrides = {}) {
     listAudioChunks: () => [],
     ...overrides,
   };
+}
+
+function createIpcHarness(overrides = {}) {
+  const handlers = new Map();
+  const ipcMain = {
+    handle(channel, handler) {
+      handlers.set(channel, handler);
+    },
+  };
+  const repository = createRepository(overrides);
   registerJarvisIpc({ ipcMain, repository });
   return { handlers, repository };
 }
@@ -104,7 +108,33 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
   assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
 });
 
-test("IPC registration rejects incomplete dependencies", () => {
+test("IPC registration rejects invalid IPC and missing repository handler capabilities", () => {
   assert.throws(() => registerJarvisIpc({ ipcMain: null, repository: {} }), /ipcMain/);
   assert.throws(() => registerJarvisIpc({ ipcMain: { handle() {} }, repository: null }), /repository/);
+
+  const requiredMethods = [
+    "createSession",
+    "setSessionStatus",
+    "getSession",
+    "listSessions",
+    "upsertTranscriptSegments",
+    "listTranscriptSegments",
+    "renamePerson",
+    "listPeople",
+    "listAudioChunks",
+  ];
+  for (const method of requiredMethods) {
+    const repository = createRepository();
+    delete repository[method];
+    const registered = [];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle: (channel) => registered.push(channel) },
+          repository,
+        }),
+      new RegExp(`repository\\.${method} must be a function`)
+    );
+    assert.deepEqual(registered, []);
+  }
 });

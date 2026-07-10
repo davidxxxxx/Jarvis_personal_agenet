@@ -28,6 +28,55 @@ test("session lifecycle and stable transcript upsert are idempotent", () => {
   repo.close();
 });
 
+test("cross-session segment collisions reject and roll back the whole batch", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });
+  repo.createSession({ id: "s2", startedAt: 2000, micDeviceId: null });
+  const original = {
+    id: "seg-shared",
+    startedAt: 1100,
+    endedAt: 1200,
+    personId: "p-original",
+    speakerLabel: "Speaker 1",
+    text: "Original session text",
+    confidence: 0.9,
+    isStable: true,
+  };
+  repo.upsertTranscriptSegments("s1", [original]);
+
+  assert.throws(
+    () =>
+      repo.upsertTranscriptSegments("s2", [
+        {
+          id: "seg-new",
+          startedAt: 2100,
+          endedAt: 2200,
+          personId: "p-new",
+          speakerLabel: "Speaker 2",
+          text: "Must roll back",
+          confidence: 0.8,
+          isStable: true,
+        },
+        {
+          ...original,
+          personId: "p-collision",
+          speakerLabel: "Wrong speaker",
+          text: "Must not overwrite session one",
+        },
+      ]),
+    /segment belongs to a different session/
+  );
+
+  assert.deepEqual(repo.listTranscriptSegments("s2"), []);
+  assert.equal(repo.listPeople().some((person) => person.id === "p-new"), false);
+  assert.equal(repo.listPeople().some((person) => person.id === "p-collision"), false);
+  assert.equal(repo.listTranscriptSegments("s1")[0].text, original.text);
+
+  repo.upsertTranscriptSegments("s1", [{ ...original, text: "Updated in session one" }]);
+  assert.equal(repo.listTranscriptSegments("s1")[0].text, "Updated in session one");
+  repo.close();
+});
+
 test("renaming a person changes display metadata without rewriting transcript text", () => {
   const repo = new JarvisRepository(":memory:");
   repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });

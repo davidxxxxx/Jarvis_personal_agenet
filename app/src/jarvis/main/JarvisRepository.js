@@ -2,6 +2,7 @@ const Database = require("better-sqlite3");
 const { assertId, assertSessionStatus } = require("../shared/contracts");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
+const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions (
@@ -105,6 +106,9 @@ class JarvisRepository {
           @id, @displayName, 0, @createdAt, @lastSeenAt
         )
       `),
+      getSegmentSession: this.db.prepare(
+        "SELECT session_id FROM transcript_segments WHERE id = ?"
+      ),
       upsertSegment: this.db.prepare(`
         INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, person_id, speaker_label,
@@ -175,6 +179,12 @@ class JarvisRepository {
 
     this._upsertTranscriptSegments = this.db.transaction((sessionId, segments) => {
       for (const segment of segments) {
+        const segmentId = assertId(segment.id, "segmentId");
+        const existing = this.statements.getSegmentSession.get(segmentId);
+        if (existing && existing.session_id !== sessionId) {
+          throw new Error(SEGMENT_SESSION_MISMATCH_MESSAGE);
+        }
+
         if (segment.personId !== null && segment.personId !== undefined) {
           const personId = assertId(segment.personId, "personId");
           this.statements.insertPerson.run({
@@ -186,7 +196,7 @@ class JarvisRepository {
         }
 
         this.statements.upsertSegment.run({
-          id: assertId(segment.id, "segmentId"),
+          id: segmentId,
           sessionId,
           startedAt: segment.startedAt,
           endedAt: segment.endedAt,
