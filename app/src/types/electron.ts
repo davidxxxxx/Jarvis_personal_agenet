@@ -532,6 +532,10 @@ declare global {
           sessionId: string,
           segments: JarvisTranscriptSegmentInput[]
         ) => Promise<JarvisTranscriptSegment[]>;
+        syncSegments: (
+          sessionId: string,
+          segments: JarvisTranscriptSegmentInput[]
+        ) => Promise<JarvisTranscriptSegment[]>;
         listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;

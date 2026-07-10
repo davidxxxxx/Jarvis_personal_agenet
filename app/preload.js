@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     listSessions: (query) => ipcRenderer.invoke("jarvis:session:list", query),
     upsertSegments: (sessionId, segments) =>
       ipcRenderer.invoke("jarvis:segments:upsert", sessionId, segments),
+    syncSegments: (sessionId, segments) =>
+      ipcRenderer.invoke("jarvis:segments:sync", sessionId, segments),
     listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),

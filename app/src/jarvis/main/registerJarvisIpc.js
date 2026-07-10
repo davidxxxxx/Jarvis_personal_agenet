@@ -6,6 +6,7 @@ const REQUIRED_REPOSITORY_METHODS = [
   "getSession",
   "listSessions",
   "upsertTranscriptSegments",
+  "syncTranscriptSegments",
   "listTranscriptSegments",
   "renamePerson",
   "listPeople",
@@ -45,6 +46,9 @@ function registerJarvisIpc({ ipcMain, repository, service }) {
   ipcMain.handle(CHANNELS.listSessions, (_event, query) => repository.listSessions(query));
   ipcMain.handle(CHANNELS.upsertSegments, (_event, sessionId, segments) =>
     repository.upsertTranscriptSegments(assertId(sessionId, "sessionId"), segments)
+  );
+  ipcMain.handle(CHANNELS.syncSegments, (_event, sessionId, segments) =>
+    repository.syncTranscriptSegments(assertId(sessionId, "sessionId"), segments)
   );
   ipcMain.handle(CHANNELS.listSegments, (_event, sessionId) =>
     repository.listTranscriptSegments(assertId(sessionId, "sessionId"))

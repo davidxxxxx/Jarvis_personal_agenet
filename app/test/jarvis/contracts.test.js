@@ -10,6 +10,7 @@ function createRepository(overrides = {}) {
     getSession: () => "session",
     listSessions: () => [],
     upsertTranscriptSegments: () => "segments-upserted",
+    syncTranscriptSegments: () => "segments-synced",
     listTranscriptSegments: () => [],
     renamePerson: () => "renamed",
     listPeople: () => [],
@@ -63,6 +64,7 @@ test("contract exposes only the named Jarvis channels", () => {
     "setSessionStatus",
     "startCapture",
     "stateChanged",
+    "syncSegments",
     "upsertSegments",
   ]);
   assert.equal(Object.isFrozen(CHANNELS), true);
@@ -82,6 +84,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.listSessions,
       CHANNELS.renamePerson,
       CHANNELS.setSessionStatus,
+      CHANNELS.syncSegments,
       CHANNELS.upsertSegments,
       CHANNELS.startCapture,
       CHANNELS.pauseCapture,
@@ -140,6 +143,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
     "getSession",
     "listSessions",
     "upsertTranscriptSegments",
+    "syncTranscriptSegments",
     "listTranscriptSegments",
     "renamePerson",
     "listPeople",

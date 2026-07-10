@@ -4,6 +4,43 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds");
+
+test("session-namespaced segment ids avoid restart-local raw id collisions", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });
+  repo.createSession({ id: "s2", startedAt: 2000, micDeviceId: null });
+  const firstId = createStableSegmentId("s1", "seg-1");
+  const secondId = createStableSegmentId("s2", "seg-1");
+  const segment = {
+    id: firstId,
+    startedAt: 1100,
+    endedAt: 1200,
+    personId: null,
+    speakerLabel: "mic",
+    text: "First session",
+    confidence: 0.5,
+    isStable: true,
+  };
+
+  assert.notEqual(firstId, secondId);
+  assert.match(firstId, /^[A-Za-z0-9_-]{1,128}$/);
+  assert.match(secondId, /^[A-Za-z0-9_-]{1,128}$/);
+  const longId = createStableSegmentId("s".repeat(128), "raw".repeat(50));
+  assert.match(longId, /^[A-Za-z0-9_-]{1,128}$/);
+  assert.equal(longId, createStableSegmentId("s".repeat(128), "raw".repeat(50)));
+  assert.notEqual(longId, createStableSegmentId("t".repeat(128), "raw".repeat(50)));
+  repo.upsertTranscriptSegments("s1", [segment]);
+  repo.upsertTranscriptSegments("s2", [
+    { ...segment, id: secondId, startedAt: 2100, endedAt: 2200, text: "Second session" },
+  ]);
+  repo.upsertTranscriptSegments("s1", [{ ...segment, text: "Updated first session" }]);
+
+  assert.equal(repo.listTranscriptSegments("s1")[0].id, firstId);
+  assert.equal(repo.listTranscriptSegments("s1")[0].text, "Updated first session");
+  assert.equal(repo.listTranscriptSegments("s2")[0].id, secondId);
+  repo.close();
+});
 
 test("session lifecycle and stable transcript upsert are idempotent", () => {
   const repo = new JarvisRepository(":memory:");
@@ -68,12 +105,87 @@ test("cross-session segment collisions reject and roll back the whole batch", ()
   );
 
   assert.deepEqual(repo.listTranscriptSegments("s2"), []);
-  assert.equal(repo.listPeople().some((person) => person.id === "p-new"), false);
-  assert.equal(repo.listPeople().some((person) => person.id === "p-collision"), false);
+  assert.equal(
+    repo.listPeople().some((person) => person.id === "p-new"),
+    false
+  );
+  assert.equal(
+    repo.listPeople().some((person) => person.id === "p-collision"),
+    false
+  );
   assert.equal(repo.listTranscriptSegments("s1")[0].text, original.text);
 
   repo.upsertTranscriptSegments("s1", [{ ...original, text: "Updated in session one" }]);
   assert.equal(repo.listTranscriptSegments("s1")[0].text, "Updated in session one");
+  repo.close();
+});
+
+test("stable transcript snapshot sync deletes retractions transactionally and only within its session", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });
+  repo.createSession({ id: "s2", startedAt: 2000, micDeviceId: null });
+  const keep = {
+    id: createStableSegmentId("s1", "seg-1"),
+    startedAt: 1100,
+    endedAt: 1200,
+    personId: "p1",
+    speakerLabel: "Speaker 1",
+    text: "Keep me",
+    confidence: 0.8,
+    isStable: true,
+  };
+  const retract = {
+    ...keep,
+    id: createStableSegmentId("s1", "seg-2"),
+    startedAt: 1300,
+    endedAt: 1400,
+    text: "Retract me",
+  };
+  const other = {
+    ...keep,
+    id: createStableSegmentId("s2", "seg-1"),
+    startedAt: 2100,
+    endedAt: 2200,
+    personId: "p2",
+    speakerLabel: "Speaker 2",
+    text: "Other session",
+  };
+  repo.upsertTranscriptSegments("s1", [keep, retract]);
+  repo.upsertTranscriptSegments("s2", [other]);
+  repo.db
+    .prepare("UPDATE transcript_segments SET analysis_state = 'ready' WHERE id = ?")
+    .run(keep.id);
+
+  repo.syncTranscriptSegments("s1", [{ ...keep, text: "Updated keep" }]);
+  assert.deepEqual(
+    repo.listTranscriptSegments("s1").map((segment) => segment.id),
+    [keep.id]
+  );
+  assert.equal(repo.listTranscriptSegments("s1")[0].text, "Updated keep");
+  assert.equal(repo.listTranscriptSegments("s1")[0].analysis_state, "ready");
+  assert.equal(repo.listTranscriptSegments("s2")[0].id, other.id);
+
+  assert.throws(
+    () =>
+      repo.syncTranscriptSegments("s1", [
+        retract,
+        { ...other, personId: "p-rollback", text: "Cross-session collision" },
+      ]),
+    /segment belongs to a different session/
+  );
+  assert.deepEqual(
+    repo.listTranscriptSegments("s1").map((segment) => segment.id),
+    [keep.id]
+  );
+  assert.equal(
+    repo.listPeople().some((person) => person.id === "p-rollback"),
+    false
+  );
+  assert.equal(repo.listTranscriptSegments("s2")[0].text, "Other session");
+
+  repo.syncTranscriptSegments("s1", []);
+  assert.deepEqual(repo.listTranscriptSegments("s1"), []);
+  assert.equal(repo.listTranscriptSegments("s2")[0].id, other.id);
   repo.close();
 });
 
@@ -188,16 +300,19 @@ test("schema constraints reject unknown statuses and cascade session-owned rows"
 
   assert.throws(() => repo.setSessionStatus("s1", "hidden-recording"), /invalid session status/);
   assert.throws(
-    () => repo.upsertTranscriptSegments("missing", [{
-      id: "seg-2",
-      startedAt: 1000,
-      endedAt: 1200,
-      personId: null,
-      speakerLabel: "Speaker 1",
-      text: "Hello",
-      confidence: 0.8,
-      isStable: true,
-    }]),
+    () =>
+      repo.upsertTranscriptSegments("missing", [
+        {
+          id: "seg-2",
+          startedAt: 1000,
+          endedAt: 1200,
+          personId: null,
+          speakerLabel: "Speaker 1",
+          text: "Hello",
+          confidence: 0.8,
+          isStable: true,
+        },
+      ]),
     /FOREIGN KEY/
   );
   repo.db.prepare("DELETE FROM people WHERE id = ?").run("p1");

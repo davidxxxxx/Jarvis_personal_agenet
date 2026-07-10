@@ -130,6 +130,21 @@ function createHarness({
         analysis_state: "pending",
       }));
     }),
+    syncSegments: vi.fn(async (_id, mapped) => {
+      calls.push("jarvis:sync");
+      return mapped.map((segment) => ({
+        id: segment.id,
+        session_id: "s1",
+        started_at: segment.startedAt,
+        ended_at: segment.endedAt,
+        person_id: segment.personId,
+        speaker_label: segment.speakerLabel,
+        text: segment.text,
+        confidence: segment.confidence,
+        is_stable: segment.isStable ? 1 : 0,
+        analysis_state: "pending",
+      }));
+    }),
     renamePerson: vi.fn(async (input) => ({
       id: input.personId,
       display_name: input.displayName,
@@ -149,30 +164,36 @@ function createHarness({
   const stopRecording = vi.fn<RecordingDependencies["stopRecording"]>(async () => {
     calls.push("upstream:stop");
     meeting = { ...meeting, isRecording: false };
-    return { diarizationSessionId: null };
+    return { diarizationSessionId: null, success: true };
   });
   const setSessions = vi.fn();
+  const createId = vi.fn(() => "s1");
+  const setPeople = vi.fn();
+  const refreshSessions = vi.fn(async () => {
+    setSessions(await jarvis.listSessions());
+  });
+  const refreshPeople = vi.fn(async () => {
+    setPeople(await jarvis.listPeople());
+  });
 
-  const deps: RecordingDependencies & { setSessions: typeof setSessions } = Object.assign(
-    {
-      jarvis,
-      startRecording,
-      stopRecording,
-      lockSpeaker: vi.fn(),
-      getMeetingSnapshot: () => meeting,
-      getSessionState: () => session,
-      setSessionState: (next: SessionState) => {
-        session = next;
-      },
-      setPeople: vi.fn(),
-      createId: () => "s1",
-      now: () => 1_000,
-      getMicDeviceId: () => null,
-      getLanguage: () => "zh",
-      onError: vi.fn(),
+  const deps: RecordingDependencies = {
+    jarvis,
+    startRecording,
+    stopRecording,
+    lockSpeaker: vi.fn(),
+    getMeetingSnapshot: () => meeting,
+    getSessionState: () => session,
+    setSessionState: (next: SessionState) => {
+      session = next;
     },
-    { setSessions }
-  );
+    refreshSessions,
+    refreshPeople,
+    createId,
+    now: () => 1_000,
+    getMicDeviceId: () => null,
+    getLanguage: () => "zh",
+    onError: vi.fn(),
+  };
 
   return {
     calls,
@@ -181,6 +202,7 @@ function createHarness({
     startRecording,
     stopRecording,
     setSessions,
+    createId,
     getSession: () => session,
     setMeeting: (next: Partial<typeof meeting>) => {
       meeting = { ...meeting, ...next };
@@ -250,10 +272,10 @@ describe("Jarvis recording controller", () => {
 
     await controller.finish();
 
-    expect(harness.calls).toEqual(["upstream:stop", "jarvis:persist", "jarvis:finish"]);
-    expect(harness.jarvis.upsertSegments).toHaveBeenCalledWith("s1", [
+    expect(harness.calls).toEqual(["upstream:stop", "jarvis:sync", "jarvis:finish"]);
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledWith("s1", [
       {
-        id: "seg-1",
+        id: "s1__seg-1",
         startedAt: 1_250,
         endedAt: 1_250,
         personId: "self",
@@ -273,10 +295,14 @@ describe("Jarvis recording controller", () => {
 
     controller.handleSegmentsChanged([stableSegment]);
     await vi.advanceTimersByTimeAsync(499);
-    expect(harness.jarvis.upsertSegments).not.toHaveBeenCalled();
+    expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(1);
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(1);
+
+    controller.handleSegmentsChanged([]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(harness.jarvis.syncSegments).toHaveBeenLastCalledWith("s1", []);
     controller.dispose();
   });
 
@@ -296,7 +322,7 @@ describe("Jarvis recording controller", () => {
 
     const firstStart = controller.start();
     await vi.waitFor(() => expect(harness.startRecording).toHaveBeenCalledTimes(1));
-    await expect(controller.start()).rejects.toThrow("cannot start while start is in progress");
+    await expect(controller.start()).rejects.toThrow("cannot start from starting");
     releaseStart();
     await firstStart;
 
@@ -325,5 +351,67 @@ describe("Jarvis recording controller", () => {
     expect(harness.setSessions).toHaveBeenCalledWith([
       expect.objectContaining({ id: "s1", status: "recording" }),
     ]);
+  });
+
+  it.each(["starting", "recording", "paused", "finalizing"] as const)(
+    "rejects start from %s without changing the existing session or resources",
+    async (status) => {
+      const harness = createHarness({ status });
+      const previous = harness.getSession();
+      const controller = createRecordingController(harness.deps);
+
+      await expect(controller.start()).rejects.toThrow();
+
+      expect(harness.getSession()).toEqual(previous);
+      expect(harness.createId).not.toHaveBeenCalled();
+      expect(harness.jarvis.createSession).not.toHaveBeenCalled();
+      expect(harness.jarvis.startCapture).not.toHaveBeenCalled();
+      expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+      expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
+    }
+  );
+
+  it("rejects an upstream-active start before allocating a session id", async () => {
+    const harness = createHarness();
+    harness.setMeeting({ isRecording: true });
+    const previous = harness.getSession();
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.start()).rejects.toThrow("another recording is active");
+
+    expect(harness.getSession()).toEqual(previous);
+    expect(harness.createId).not.toHaveBeenCalled();
+    expect(harness.jarvis.createSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps a recording recoverable when upstream stop fails during pause", async () => {
+    const harness = createHarness({ status: "recording", segments: [stableSegment] });
+    const previous = harness.getSession();
+    harness.stopRecording.mockRejectedValueOnce(new Error("upstream stop failed"));
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.pause()).rejects.toThrow("upstream stop failed");
+
+    expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: true });
+    expect(harness.getSession()).toEqual(previous);
+    expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
+  });
+
+  it("keeps a recording recoverable when upstream stop fails during finish", async () => {
+    const harness = createHarness({ status: "recording", segments: [stableSegment] });
+    const previous = harness.getSession();
+    harness.stopRecording.mockRejectedValueOnce(new Error("upstream stop failed"));
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.finish()).rejects.toThrow("upstream stop failed");
+
+    expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: true });
+    expect(harness.getSession()).toEqual(previous);
+    expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
+    expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
   });
 });

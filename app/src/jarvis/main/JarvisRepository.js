@@ -106,9 +106,7 @@ class JarvisRepository {
           @id, @displayName, 0, @createdAt, @lastSeenAt
         )
       `),
-      getSegmentSession: this.db.prepare(
-        "SELECT session_id FROM transcript_segments WHERE id = ?"
-      ),
+      getSegmentSession: this.db.prepare("SELECT session_id FROM transcript_segments WHERE id = ?"),
       upsertSegment: this.db.prepare(`
         INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, person_id, speaker_label,
@@ -177,7 +175,7 @@ class JarvisRepository {
       `),
     };
 
-    this._upsertTranscriptSegments = this.db.transaction((sessionId, segments) => {
+    const writeTranscriptSegments = (sessionId, segments) => {
       for (const segment of segments) {
         const segmentId = assertId(segment.id, "segmentId");
         const existing = this.statements.getSegmentSession.get(segmentId);
@@ -207,6 +205,24 @@ class JarvisRepository {
           isStable: segment.isStable ? 1 : 0,
         });
       }
+    };
+
+    this._upsertTranscriptSegments = this.db.transaction((sessionId, segments) => {
+      writeTranscriptSegments(sessionId, segments);
+    });
+
+    this._syncTranscriptSegments = this.db.transaction((sessionId, segments) => {
+      writeTranscriptSegments(sessionId, segments);
+      if (segments.length === 0) {
+        this.db.prepare("DELETE FROM transcript_segments WHERE session_id = ?").run(sessionId);
+        return;
+      }
+      const placeholders = segments.map(() => "?").join(",");
+      this.db
+        .prepare(
+          `DELETE FROM transcript_segments WHERE session_id = ? AND id NOT IN (${placeholders})`
+        )
+        .run(sessionId, ...segments.map((segment) => segment.id));
     });
 
     this._renamePerson = this.db.transaction((input) => {
@@ -264,6 +280,13 @@ class JarvisRepository {
     const safeSessionId = assertId(sessionId, "sessionId");
     if (!Array.isArray(segments)) throw new TypeError("segments must be an array");
     this._upsertTranscriptSegments(safeSessionId, segments);
+    return this.listTranscriptSegments(safeSessionId);
+  }
+
+  syncTranscriptSegments(sessionId, segments) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (!Array.isArray(segments)) throw new TypeError("segments must be an array");
+    this._syncTranscriptSegments(safeSessionId, segments);
     return this.listTranscriptSegments(safeSessionId);
   }
 

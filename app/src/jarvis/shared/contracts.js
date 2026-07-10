@@ -4,6 +4,7 @@ const CHANNELS = Object.freeze({
   getSession: "jarvis:session:get",
   listSessions: "jarvis:session:list",
   upsertSegments: "jarvis:segments:upsert",
+  syncSegments: "jarvis:segments:sync",
   listSegments: "jarvis:segments:list",
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",

@@ -5,6 +5,7 @@ import {
   stopRecording,
   useMeetingRecordingStore,
   type StartRecordingArgs,
+  type StopRecordingOptions,
   type StopRecordingResult,
   type TranscriptSegment,
 } from "../../stores/meetingRecordingStore";
@@ -18,6 +19,7 @@ import type {
   JarvisTranscriptSegment,
   JarvisTranscriptSegmentInput,
 } from "../types";
+import { createStableSegmentId } from "../shared/segmentIds";
 import { useJarvisStore } from "./jarvisStore";
 import { reduceSession, type SessionEvent, type SessionState } from "./sessionMachine";
 
@@ -41,6 +43,10 @@ export interface RecordingJarvisApi {
     sessionId: string,
     segments: JarvisTranscriptSegmentInput[]
   ) => Promise<JarvisTranscriptSegment[]>;
+  syncSegments: (
+    sessionId: string,
+    segments: JarvisTranscriptSegmentInput[]
+  ) => Promise<JarvisTranscriptSegment[]>;
   renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
   listPeople: () => Promise<JarvisPerson[]>;
 }
@@ -51,16 +57,42 @@ export interface RecordingMeetingSnapshot {
   error: string | null;
 }
 
+export interface LatestRefresh<T> {
+  run: (load: () => Promise<T>) => Promise<void>;
+  invalidate: () => void;
+}
+
+export function createLatestRefresh<T>(
+  commit: (value: T) => void,
+  onError: () => void
+): LatestRefresh<T> {
+  let generation = 0;
+  return {
+    run: async (load) => {
+      const requestGeneration = ++generation;
+      try {
+        const value = await load();
+        if (requestGeneration === generation) commit(value);
+      } catch {
+        if (requestGeneration === generation) onError();
+      }
+    },
+    invalidate: () => {
+      generation += 1;
+    },
+  };
+}
+
 export interface RecordingDependencies {
   jarvis: RecordingJarvisApi;
   startRecording: (args: StartRecordingArgs) => Promise<void>;
-  stopRecording: () => Promise<StopRecordingResult>;
+  stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
   lockSpeaker: (speakerId: string, displayName: string) => void;
   getMeetingSnapshot: () => RecordingMeetingSnapshot;
   getSessionState: () => SessionState;
   setSessionState: (state: SessionState) => void;
-  setSessions: (sessions: JarvisSession[]) => void;
-  setPeople: (people: JarvisPerson[]) => void;
+  refreshSessions: () => Promise<void>;
+  refreshPeople: () => Promise<void>;
   createId: () => string;
   now: () => number;
   getMicDeviceId: () => string | null;
@@ -97,6 +129,7 @@ function safePersonId(value: string | undefined): string | null {
 }
 
 export function mapStableSegments(
+  sessionId: string,
   segments: TranscriptSegment[],
   fallbackTimestamp: number
 ): JarvisTranscriptSegmentInput[] {
@@ -104,7 +137,7 @@ export function mapStableSegments(
     const timestamp = safeTimestamp(segment.timestamp, fallbackTimestamp);
     const personId = safePersonId(segment.speaker);
     return {
-      id: segment.id,
+      id: createStableSegmentId(sessionId, segment.id),
       startedAt: timestamp,
       endedAt: timestamp,
       personId,
@@ -171,7 +204,10 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     segments: TranscriptSegment[]
   ): Promise<void> => {
     const persist = async () => {
-      await deps.jarvis.upsertSegments(sessionId, mapStableSegments(segments, sessionStartedAt));
+      await deps.jarvis.syncSegments(
+        sessionId,
+        mapStableSegments(sessionId, segments, sessionStartedAt)
+      );
     };
     const result = persistenceTail.then(persist, persist);
     persistenceTail = result.catch(() => undefined);
@@ -204,27 +240,42 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
 
   const refreshSessions = async (): Promise<void> => {
     try {
-      deps.setSessions(await deps.jarvis.listSessions());
+      await deps.refreshSessions();
     } catch {
       deps.onError("jarvis_query_failed");
     }
   };
 
+  const stopUpstream = async (): Promise<void> => {
+    const result = await deps.stopRecording({ throwOnError: true });
+    if (result.success === false) {
+      throw new RecordingOperationError(
+        "upstream_stop_failed",
+        result.error || "upstream recording did not stop"
+      );
+    }
+  };
+
   const start = async (): Promise<void> => {
-    begin("start");
+    const state = deps.getSessionState();
+    if (!["idle", "completed", "failed"].includes(state.status)) {
+      throw new Error(`cannot start from ${state.status}`);
+    }
+    if (deps.getMeetingSnapshot().isRecording) {
+      throw new RecordingOperationError(
+        "upstream_recording_active",
+        "cannot start Jarvis while another recording is active"
+      );
+    }
     const id = deps.createId();
     const startedAt = deps.now();
+    const starting = reduceSession(state, { type: "STARTING", id, at: startedAt });
+    begin("start");
+    deps.setSessionState(starting);
     let sessionCreated = false;
     let captureStarted = false;
 
     try {
-      if (deps.getMeetingSnapshot().isRecording) {
-        throw new RecordingOperationError(
-          "upstream_recording_active",
-          "cannot start Jarvis while another recording is active"
-        );
-      }
-      transition({ type: "STARTING", id, at: startedAt });
       const micDeviceId = deps.getMicDeviceId();
       await deps.jarvis.createSession({
         id,
@@ -260,14 +311,24 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     const at = deps.now();
     const paused = reduceSession(state, { type: "PAUSED", at });
     begin("pause");
+    let upstreamStopped = false;
 
     try {
-      await deps.stopRecording();
+      await stopUpstream();
+      upstreamStopped = true;
       await deps.jarvis.pauseCapture(state.id as string, at);
       deps.setSessionState(paused);
       await refreshSessions();
     } catch (error) {
-      const code = errorCode(error, "capture_pause_failed");
+      const code = errorCode(
+        error,
+        upstreamStopped ? "capture_pause_failed" : "upstream_stop_failed"
+      );
+      if (!upstreamStopped) {
+        deps.setSessionState(state);
+        deps.onError(code);
+        throw error;
+      }
       if (state.id) {
         await finishMainCapture(state.id);
         await markPersistedSessionFailed(state.id);
@@ -328,12 +389,16 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     const at = deps.now();
     const finalizing = reduceSession(state, { type: "FINISHED", at });
     begin("finish");
-    clearPersistTimer();
-    deps.setSessionState(finalizing);
+    let upstreamStopped = state.status === "paused";
     let mainFinished = false;
 
     try {
-      if (state.status === "recording") await deps.stopRecording();
+      if (state.status === "recording") {
+        await stopUpstream();
+        upstreamStopped = true;
+      }
+      clearPersistTimer();
+      deps.setSessionState(finalizing);
       const stableSegments = deps.getMeetingSnapshot().segments;
       await persistSnapshot(state.id as string, state.startedAt ?? at, stableSegments);
       await deps.jarvis.finishCapture(state.id as string, deps.now());
@@ -341,7 +406,15 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       transition({ type: "COMPLETED" });
       await refreshSessions();
     } catch (error) {
-      const code = errorCode(error, "capture_finish_failed");
+      const code = errorCode(
+        error,
+        upstreamStopped ? "capture_finish_failed" : "upstream_stop_failed"
+      );
+      if (!upstreamStopped) {
+        deps.setSessionState(state);
+        deps.onError(code);
+        throw error;
+      }
       if (!mainFinished && state.id) {
         try {
           if (state.status === "recording") {
@@ -385,7 +458,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   ): Promise<JarvisPerson> => {
     const person = await deps.jarvis.renamePerson({ personId, displayName, isSelf });
     deps.lockSpeaker(personId, displayName);
-    deps.setPeople(await deps.jarvis.listPeople());
+    await deps.refreshPeople();
     return person;
   };
 
@@ -410,6 +483,8 @@ const rendererJarvisApi: RecordingJarvisApi = {
   finishCapture: (id, at) => window.electronAPI.jarvis.finishCapture(id, at),
   upsertSegments: (sessionId, segments) =>
     window.electronAPI.jarvis.upsertSegments(sessionId, segments),
+  syncSegments: (sessionId, segments) =>
+    window.electronAPI.jarvis.syncSegments(sessionId, segments),
   renamePerson: (input) => window.electronAPI.jarvis.renamePerson(input),
   listPeople: () => window.electronAPI.jarvis.listPeople(),
 };
@@ -435,7 +510,25 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const systemPartial = useMeetingRecordingStore((state) => state.systemPartial);
   const micLevel = useMeetingRecordingStore((state) => state.currentMicLevel);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
+  const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
+  const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
   const controllerRef = useRef<RecordingController | null>(null);
+
+  if (sessionsRefreshRef.current === null) {
+    sessionsRefreshRef.current = createLatestRefresh(
+      (sessions) => useJarvisStore.getState().setSessions(sessions),
+      () => useJarvisStore.getState().setError("jarvis_query_failed")
+    );
+  }
+  if (peopleRefreshRef.current === null) {
+    peopleRefreshRef.current = createLatestRefresh(
+      (people) => useJarvisStore.getState().setPeople(people),
+      () => useJarvisStore.getState().setError("jarvis_query_failed")
+    );
+  }
+
+  const sessionsRefresh = sessionsRefreshRef.current;
+  const peopleRefresh = peopleRefreshRef.current;
 
   if (controllerRef.current === null) {
     controllerRef.current = createRecordingController({
@@ -449,8 +542,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       },
       getSessionState: () => useJarvisStore.getState().session,
       setSessionState: (next) => useJarvisStore.getState().setSession(next),
-      setSessions: (sessions) => useJarvisStore.getState().setSessions(sessions),
-      setPeople: (people) => useJarvisStore.getState().setPeople(people),
+      refreshSessions: () => sessionsRefresh.run(() => rendererJarvisApi.listSessions()),
+      refreshPeople: () => peopleRefresh.run(() => rendererJarvisApi.listPeople()),
       createId: () => crypto.randomUUID(),
       now: Date.now,
       getMicDeviceId: () => getSettings().selectedMicDeviceId || null,
@@ -473,20 +566,13 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   }, [controller]);
 
   useEffect(() => {
-    let cancelled = false;
-    void Promise.all([rendererJarvisApi.listSessions(), rendererJarvisApi.listPeople()])
-      .then(([persistedSessions, people]) => {
-        if (cancelled) return;
-        useJarvisStore.getState().setSessions(persistedSessions);
-        useJarvisStore.getState().setPeople(people);
-      })
-      .catch(() => {
-        if (!cancelled) useJarvisStore.getState().setError("jarvis_query_failed");
-      });
+    void sessionsRefresh.run(() => rendererJarvisApi.listSessions());
+    void peopleRefresh.run(() => rendererJarvisApi.listPeople());
     return () => {
-      cancelled = true;
+      sessionsRefresh.invalidate();
+      peopleRefresh.invalidate();
     };
-  }, []);
+  }, [peopleRefresh, sessionsRefresh]);
 
   const start = useCallback(() => controller.start(), [controller]);
   const pause = useCallback(() => controller.pause(), [controller]);
