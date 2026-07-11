@@ -57,6 +57,11 @@ test("Windows packaging exposes the Task 1 Jarvis contract", () => {
     false,
     "the guarded build script rebuilds only better-sqlite3; electron-builder must not rebuild unrelated native modules"
   );
+  assert.equal(
+    builder.electronDist,
+    "node_modules/electron/dist",
+    "Windows packaging must reuse the exact npm-installed Electron runtime instead of downloading it again"
+  );
   assert.equal(builder.publish, null);
   assert.equal(unsignedBuilder.win.azureSignOptions, null);
 });

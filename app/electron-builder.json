@@ -10,6 +10,7 @@
     "output": "dist"
   },
   "npmRebuild": false,
+  "electronDist": "node_modules/electron/dist",
   "buildDependenciesFromSource": false,
   "files": [
     "main.js",
