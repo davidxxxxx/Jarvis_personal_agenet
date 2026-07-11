@@ -1,4 +1,5 @@
 const Database = require("better-sqlite3");
+const crypto = require("node:crypto");
 const { assertId, assertSessionStatus } = require("../shared/contracts");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
@@ -97,6 +98,83 @@ const SCHEMA = `
     reason TEXT NOT NULL,
     corrected_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS analysis_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('incremental','final')),
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    input_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','running','completed','retry','failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
+    response_json TEXT,
+    error_code TEXT,
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    UNIQUE(session_id, kind, input_hash)
+  );
+  CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    decisions_json TEXT NOT NULL DEFAULT '[]',
+    suggestions_json TEXT NOT NULL DEFAULT '[]',
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    updated_at INTEGER NOT NULL,
+    is_final INTEGER NOT NULL DEFAULT 0 CHECK(is_final IN (0,1))
+  );
+  CREATE TABLE IF NOT EXISTS topics (
+    id TEXT PRIMARY KEY,
+    canonical_title TEXT NOT NULL,
+    normalized_title TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS session_topics (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    PRIMARY KEY(session_id, topic_id)
+  );
+  CREATE TABLE IF NOT EXISTS todos (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    normalized_content TEXT NOT NULL,
+    owner_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    topic_id TEXT REFERENCES topics(id) ON DELETE SET NULL,
+    due_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','completed')),
+    confidence REAL NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK(type IN ('fact','decision','commitment','opinion')),
+    content TEXT NOT NULL,
+    normalized_content TEXT NOT NULL,
+    person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    topic_id TEXT REFERENCES topics(id) ON DELETE SET NULL,
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    needs_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(needs_confirmation IN (0,1))
+  );
+  CREATE TABLE IF NOT EXISTS memory_evidence (
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    PRIMARY KEY(memory_id, segment_id)
+  );
   INSERT OR IGNORE INTO cloud_budget_settings (
     provider, monthly_limit_microusd, enabled, updated_at
   ) VALUES ('openai', 5000000, 0, 0);
@@ -104,6 +182,9 @@ const SCHEMA = `
     ON transcript_segments(session_id, started_at);
   CREATE INDEX IF NOT EXISTS idx_audio_expiry ON audio_chunks(expires_at);
   CREATE INDEX IF NOT EXISTS idx_cloud_usage_month ON cloud_usage(month_utc, provider, status);
+  CREATE INDEX IF NOT EXISTS idx_analysis_session ON analysis_runs(session_id, window_end);
+  CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status, updated_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_memory_last_seen ON memories(last_seen_at DESC);
 `;
 
 function assertInteger(value, name) {
@@ -129,6 +210,23 @@ function assertMonthUtc(value) {
 function monthUtcFromTimestamp(at) {
   assertInteger(at, "at");
   return new Date(at).toISOString().slice(0, 7);
+}
+
+function normalizeDerivedText(value, name) {
+  if (typeof value !== "string") throw new TypeError(`${name} must be a string`);
+  const trimmed = value.trim();
+  if (!trimmed) throw new TypeError(`${name} must not be empty`);
+  if (Array.from(trimmed).length > 2_000) throw new RangeError(`${name} is too long`);
+  return trimmed.replace(/\s+/g, " ");
+}
+
+function normalizedKey(value) {
+  return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
+}
+
+function derivedId(prefix, ...parts) {
+  const digest = crypto.createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
+  return `${prefix}_${digest}`;
 }
 
 class JarvisRepository {
@@ -497,6 +595,357 @@ class JarvisRepository {
 
   listPeople() {
     return this.statements.listPeople.all();
+  }
+
+  applyAnalysisResult(input) {
+    if (!input || typeof input !== "object") throw new TypeError("analysis input is required");
+    const safe = {
+      runId: assertId(input.runId, "analysisRunId"),
+      sessionId: assertId(input.sessionId, "sessionId"),
+      kind: input.kind,
+      inputHash: normalizeDerivedText(input.inputHash, "inputHash"),
+      model: normalizeDerivedText(input.model, "model"),
+      windowStart: assertInteger(input.windowStart, "windowStart"),
+      windowEnd: assertInteger(input.windowEnd, "windowEnd"),
+      completedAt: assertInteger(input.completedAt, "completedAt"),
+      result: input.result,
+    };
+    if (safe.kind !== "incremental" && safe.kind !== "final") {
+      throw new TypeError("analysis kind must be incremental or final");
+    }
+    if (!safe.result || typeof safe.result !== "object" || Array.isArray(safe.result)) {
+      throw new TypeError("analysis result is required");
+    }
+    const summary = normalizeDerivedText(safe.result.summary, "summary");
+    const arrays = {};
+    for (const key of ["topics", "todos", "memories", "decisions", "suggestions"]) {
+      if (!Array.isArray(safe.result[key])) throw new TypeError(`${key} must be an array`);
+      if (safe.result[key].length > 100) throw new RangeError(`${key} has too many items`);
+      arrays[key] = safe.result[key];
+    }
+
+    const transaction = this.db.transaction(() => {
+      if (!this.getSession(safe.sessionId)) throw new Error("analysis session does not exist");
+      const existingRun = this.db
+        .prepare("SELECT * FROM analysis_runs WHERE session_id = ? AND kind = ? AND input_hash = ?")
+        .get(safe.sessionId, safe.kind, safe.inputHash);
+      if (existingRun?.status === "completed") return this.getSessionDetail(safe.sessionId);
+
+      const allowedSegments = new Set(
+        this.listTranscriptSegments(safe.sessionId).map((segment) => segment.id)
+      );
+      const evidenceFor = (item) => {
+        if (!Array.isArray(item.evidenceSegmentIds) || item.evidenceSegmentIds.length === 0) {
+          throw new TypeError("analysis item requires evidence segment ids");
+        }
+        const ids = item.evidenceSegmentIds.map((id) => assertId(id, "evidenceSegmentId"));
+        for (const id of ids) {
+          if (!allowedSegments.has(id)) throw new Error(`evidence segment ${id} is not in session`);
+        }
+        return [...new Set(ids)];
+      };
+
+      for (const topic of arrays.topics) {
+        normalizeDerivedText(topic.title, "topic title");
+        normalizeDerivedText(topic.description, "topic description");
+        evidenceFor(topic);
+      }
+      for (const todo of arrays.todos) {
+        normalizeDerivedText(todo.content, "todo content");
+        evidenceFor(todo);
+      }
+      for (const memory of arrays.memories) {
+        if (!["fact", "decision", "commitment", "opinion"].includes(memory.type)) {
+          throw new TypeError("unsupported memory type");
+        }
+        normalizeDerivedText(memory.content, "memory content");
+        if (
+          typeof memory.confidence !== "number" ||
+          !Number.isFinite(memory.confidence) ||
+          memory.confidence < 0 ||
+          memory.confidence > 1
+        ) {
+          throw new RangeError("memory confidence must be between 0 and 1");
+        }
+        evidenceFor(memory);
+      }
+
+      this.db.prepare(`
+        INSERT INTO analysis_runs (
+          id, session_id, kind, window_start, window_end, input_hash, model,
+          status, attempt_count, response_json, created_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', 1, ?, ?, ?)
+        ON CONFLICT(session_id, kind, input_hash) DO UPDATE SET
+          status = 'completed', response_json = excluded.response_json,
+          completed_at = excluded.completed_at, error_code = NULL
+      `).run(
+        safe.runId,
+        safe.sessionId,
+        safe.kind,
+        safe.windowStart,
+        safe.windowEnd,
+        safe.inputHash,
+        safe.model,
+        JSON.stringify(safe.result),
+        safe.completedAt,
+        safe.completedAt
+      );
+
+      const persistedRun = this.db
+        .prepare("SELECT id FROM analysis_runs WHERE session_id = ? AND kind = ? AND input_hash = ?")
+        .get(safe.sessionId, safe.kind, safe.inputHash);
+      const runId = persistedRun.id;
+
+      this.db.prepare(`
+        INSERT INTO session_summaries (
+          session_id, summary, decisions_json, suggestions_json,
+          analysis_run_id, updated_at, is_final
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          summary = excluded.summary,
+          decisions_json = excluded.decisions_json,
+          suggestions_json = excluded.suggestions_json,
+          analysis_run_id = excluded.analysis_run_id,
+          updated_at = excluded.updated_at,
+          is_final = MAX(session_summaries.is_final, excluded.is_final)
+      `).run(
+        safe.sessionId,
+        summary,
+        JSON.stringify(arrays.decisions),
+        JSON.stringify(arrays.suggestions),
+        runId,
+        safe.completedAt,
+        safe.kind === "final" ? 1 : 0
+      );
+
+      const topicIds = new Map();
+      for (const topic of arrays.topics) {
+        const title = normalizeDerivedText(topic.title, "topic title");
+        const key = normalizedKey(title);
+        const id = derivedId("topic", key);
+        this.db.prepare(`
+          INSERT INTO topics (
+            id, canonical_title, normalized_title, description, created_at, last_seen_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(normalized_title) DO UPDATE SET
+            description = excluded.description, last_seen_at = excluded.last_seen_at
+        `).run(id, title, key, normalizeDerivedText(topic.description, "topic description"), safe.completedAt, safe.completedAt);
+        const persistedTopic = this.db.prepare("SELECT id FROM topics WHERE normalized_title = ?").get(key);
+        topicIds.set(key, persistedTopic.id);
+        this.db.prepare(`
+          INSERT INTO session_topics (session_id, topic_id, analysis_run_id)
+          VALUES (?, ?, ?)
+          ON CONFLICT(session_id, topic_id) DO UPDATE SET analysis_run_id = excluded.analysis_run_id
+        `).run(safe.sessionId, persistedTopic.id, runId);
+      }
+
+      const resolveTopicId = (title) => {
+        if (typeof title !== "string" || !title.trim()) return null;
+        const key = normalizedKey(title);
+        if (topicIds.has(key)) return topicIds.get(key);
+        return this.db.prepare("SELECT id FROM topics WHERE normalized_title = ?").get(key)?.id ?? null;
+      };
+      const resolvePersonId = (personRef) => {
+        if (typeof personRef !== "string" || !personRef) return null;
+        return this.statements.getPerson.get(personRef)?.id ?? null;
+      };
+
+      for (const todo of arrays.todos) {
+        const content = normalizeDerivedText(todo.content, "todo content");
+        const ownerId = resolvePersonId(todo.ownerRef);
+        const topicId = resolveTopicId(todo.topicRef);
+        const evidence = evidenceFor(todo);
+        let dueAt = null;
+        if (todo.dueDate !== null && todo.dueDate !== undefined && todo.dueDate !== "") {
+          if (typeof todo.dueDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(todo.dueDate)) {
+            throw new TypeError("todo dueDate must be YYYY-MM-DD or null");
+          }
+          dueAt = Date.parse(`${todo.dueDate}T00:00:00.000Z`);
+          if (!Number.isSafeInteger(dueAt)) throw new TypeError("todo dueDate is invalid");
+        }
+        const key = normalizedKey(content);
+        const id = derivedId("todo", safe.sessionId, key, ownerId ?? "", topicId ?? "");
+        this.db.prepare(`
+          INSERT INTO todos (
+            id, content, normalized_content, owner_person_id, topic_id, due_at,
+            created_at, updated_at, source_session_id, source_segment_id, analysis_run_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            content = excluded.content, due_at = COALESCE(excluded.due_at, todos.due_at),
+            updated_at = excluded.updated_at, analysis_run_id = excluded.analysis_run_id
+        `).run(id, content, key, ownerId, topicId, dueAt, safe.completedAt, safe.completedAt, safe.sessionId, evidence[0], runId);
+      }
+
+      for (const memory of arrays.memories) {
+        const content = normalizeDerivedText(memory.content, "memory content");
+        const personId = resolvePersonId(memory.personRef);
+        const topicId = resolveTopicId(memory.topicRef);
+        const key = normalizedKey(content);
+        const id = derivedId("memory", memory.type, key, personId ?? "", topicId ?? "");
+        this.db.prepare(`
+          INSERT INTO memories (
+            id, type, content, normalized_content, person_id, topic_id, confidence,
+            first_seen_at, last_seen_at, needs_confirmation
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            confidence = MAX(memories.confidence, excluded.confidence),
+            last_seen_at = excluded.last_seen_at,
+            occurrence_count = memories.occurrence_count + 1,
+            needs_confirmation = MIN(memories.needs_confirmation, excluded.needs_confirmation)
+        `).run(id, memory.type, content, key, personId, topicId, memory.confidence, safe.completedAt, safe.completedAt, memory.confidence < 0.7 ? 1 : 0);
+        for (const segmentId of evidenceFor(memory)) {
+          this.db.prepare(`
+            INSERT OR IGNORE INTO memory_evidence (memory_id, segment_id, analysis_run_id)
+            VALUES (?, ?, ?)
+          `).run(id, segmentId, runId);
+        }
+      }
+      return this.getSessionDetail(safe.sessionId);
+    });
+    return transaction();
+  }
+
+  getSessionDetail(id) {
+    const sessionId = assertId(id, "sessionId");
+    const session = this.getSession(sessionId);
+    if (!session) return null;
+    const summary = this.db.prepare("SELECT * FROM session_summaries WHERE session_id = ?").get(sessionId) ?? null;
+    return {
+      session,
+      summary,
+      segments: this.listTranscriptSegments(sessionId),
+      audioChunks: this.listAudioChunks(sessionId),
+      topics: this.db.prepare(`
+        SELECT t.* FROM topics t JOIN session_topics st ON st.topic_id = t.id
+        WHERE st.session_id = ? ORDER BY t.last_seen_at DESC, t.canonical_title
+      `).all(sessionId),
+      todos: this.db.prepare(`
+        SELECT td.*, p.display_name AS owner_name, t.canonical_title AS topic_title
+        FROM todos td LEFT JOIN people p ON p.id = td.owner_person_id
+        LEFT JOIN topics t ON t.id = td.topic_id
+        WHERE td.source_session_id = ? ORDER BY td.updated_at DESC
+      `).all(sessionId),
+      memories: this.db.prepare(`
+        SELECT DISTINCT m.*, p.display_name AS person_name, t.canonical_title AS topic_title
+        FROM memories m JOIN memory_evidence me ON me.memory_id = m.id
+        JOIN transcript_segments ts ON ts.id = me.segment_id
+        LEFT JOIN people p ON p.id = m.person_id LEFT JOIN topics t ON t.id = m.topic_id
+        WHERE ts.session_id = ? ORDER BY m.last_seen_at DESC
+      `).all(sessionId),
+    };
+  }
+
+  listPeopleOverview() {
+    return this.db.prepare(`
+      SELECT p.*,
+        COUNT(DISTINCT ts.session_id) AS session_count,
+        COUNT(DISTINCT CASE WHEN td.status = 'open' THEN td.id END) AS open_todo_count,
+        MAX(ts.ended_at) AS last_interaction_at
+      FROM people p
+      LEFT JOIN transcript_segments ts ON ts.person_id = p.id
+      LEFT JOIN todos td ON td.owner_person_id = p.id
+      GROUP BY p.id
+      ORDER BY p.is_self DESC, COALESCE(last_interaction_at, p.last_seen_at) DESC, p.display_name
+    `).all();
+  }
+
+  getPersonDetail(id) {
+    const personId = assertId(id, "personId");
+    const person = this.db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
+    if (!person) return null;
+    return {
+      person,
+      sessions: this.db.prepare(`
+        SELECT DISTINCT s.* FROM sessions s JOIN transcript_segments ts ON ts.session_id = s.id
+        WHERE ts.person_id = ? ORDER BY s.started_at DESC
+      `).all(personId),
+      todos: this.db.prepare("SELECT * FROM todos WHERE owner_person_id = ? ORDER BY updated_at DESC").all(personId),
+      memories: this.db.prepare("SELECT * FROM memories WHERE person_id = ? ORDER BY last_seen_at DESC").all(personId),
+      topics: this.db.prepare(`
+        SELECT DISTINCT t.* FROM topics t JOIN session_topics st ON st.topic_id = t.id
+        JOIN transcript_segments ts ON ts.session_id = st.session_id
+        WHERE ts.person_id = ? ORDER BY t.last_seen_at DESC
+      `).all(personId),
+    };
+  }
+
+  listTopics() {
+    return this.db.prepare(`
+      SELECT t.*, COUNT(DISTINCT st.session_id) AS session_count,
+        COUNT(DISTINCT CASE WHEN td.status = 'open' THEN td.id END) AS open_todo_count
+      FROM topics t LEFT JOIN session_topics st ON st.topic_id = t.id
+      LEFT JOIN todos td ON td.topic_id = t.id
+      GROUP BY t.id ORDER BY t.last_seen_at DESC, t.canonical_title
+    `).all();
+  }
+
+  getTopicDetail(id) {
+    const topicId = assertId(id, "topicId");
+    const topic = this.db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId);
+    if (!topic) return null;
+    return {
+      topic,
+      sessions: this.db.prepare(`SELECT s.* FROM sessions s JOIN session_topics st ON st.session_id=s.id WHERE st.topic_id=? ORDER BY s.started_at DESC`).all(topicId),
+      todos: this.db.prepare("SELECT * FROM todos WHERE topic_id = ? ORDER BY updated_at DESC").all(topicId),
+      memories: this.db.prepare("SELECT * FROM memories WHERE topic_id = ? ORDER BY last_seen_at DESC").all(topicId),
+    };
+  }
+
+  renameTopic(id, title, at = Date.now()) {
+    const topicId = assertId(id, "topicId");
+    const canonical = normalizeDerivedText(title, "topic title");
+    this.db.prepare(`UPDATE topics SET canonical_title=?, normalized_title=?, last_seen_at=? WHERE id=?`).run(canonical, normalizedKey(canonical), assertInteger(at, "at"), topicId);
+    return this.db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId) ?? null;
+  }
+
+  listTodos(status = null) {
+    if (status !== null && status !== "open" && status !== "completed") throw new TypeError("invalid todo status");
+    return this.db.prepare(`
+      SELECT td.*, p.display_name AS owner_name, t.canonical_title AS topic_title
+      FROM todos td LEFT JOIN people p ON p.id=td.owner_person_id
+      LEFT JOIN topics t ON t.id=td.topic_id
+      WHERE (? IS NULL OR td.status = ?)
+      ORDER BY CASE td.status WHEN 'open' THEN 0 ELSE 1 END, COALESCE(td.due_at, 9223372036854775807), td.updated_at DESC
+    `).all(status, status);
+  }
+
+  setTodoStatus(id, status, at = Date.now()) {
+    const todoId = assertId(id, "todoId");
+    if (status !== "open" && status !== "completed") throw new TypeError("invalid todo status");
+    const when = assertInteger(at, "at");
+    this.db.prepare(`UPDATE todos SET status=?, updated_at=?, completed_at=? WHERE id=?`).run(status, when, status === "completed" ? when : null, todoId);
+    return this.db.prepare("SELECT * FROM todos WHERE id = ?").get(todoId) ?? null;
+  }
+
+  listMemories(limit = 200) {
+    assertInteger(limit, "limit");
+    return this.db.prepare(`
+      SELECT m.*, p.display_name AS person_name, t.canonical_title AS topic_title
+      FROM memories m LEFT JOIN people p ON p.id=m.person_id LEFT JOIN topics t ON t.id=m.topic_id
+      ORDER BY m.last_seen_at DESC LIMIT ?
+    `).all(limit);
+  }
+
+  searchMemory(query, limit = 100) {
+    const term = normalizeDerivedText(query, "query");
+    assertInteger(limit, "limit");
+    if (limit < 1 || limit > 1000) throw new RangeError("limit must be between 1 and 1000");
+    const like = `%${term.replace(/[\\%_]/g, "\\$&")}%`;
+    return this.db.prepare(`
+      SELECT DISTINCT s.* FROM sessions s
+      LEFT JOIN session_summaries ss ON ss.session_id=s.id
+      WHERE ss.summary LIKE ? ESCAPE '\\'
+        OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.session_id=s.id AND ts.text LIKE ? ESCAPE '\\')
+        OR EXISTS (SELECT 1 FROM session_topics st JOIN topics t ON t.id=st.topic_id WHERE st.session_id=s.id AND (t.canonical_title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\'))
+        OR EXISTS (SELECT 1 FROM transcript_segments ts JOIN people p ON p.id=ts.person_id WHERE ts.session_id=s.id AND p.display_name LIKE ? ESCAPE '\\')
+      ORDER BY s.started_at DESC LIMIT ?
+    `).all(like, like, like, like, like, limit);
+  }
+
+  getTodayInsights(sessionId) {
+    const detail = this.getSessionDetail(sessionId);
+    if (!detail) return null;
+    return { summary: detail.summary, topics: detail.topics, todos: detail.todos, memories: detail.memories };
   }
 
   getCloudBudgetSettings() {
