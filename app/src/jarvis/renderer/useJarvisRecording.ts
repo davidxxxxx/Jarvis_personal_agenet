@@ -691,6 +691,8 @@ export interface UseJarvisRecordingResult {
   micLevel: number;
   activeMicLabel?: string | null;
   micFallbackActive?: boolean;
+  micRecoveryStatus?: "idle" | "reconnecting" | "restored";
+  micRecoveryAttempt?: number;
   operation: JarvisControlAction | null;
   error: string | null;
   start: () => Promise<void>;
@@ -710,6 +712,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micLevel = useMeetingRecordingStore((state) => state.currentMicLevel);
   const activeMicLabel = useMeetingRecordingStore((state) => state.activeMicLabel);
   const micFallbackActive = useMeetingRecordingStore((state) => state.micFallbackActive);
+  const micRecoveryStatus = useMeetingRecordingStore((state) => state.micRecoveryStatus);
+  const micRecoveryAttempt = useMeetingRecordingStore((state) => state.micRecoveryAttempt);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
   const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
@@ -920,6 +924,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     micLevel,
     activeMicLabel,
     micFallbackActive,
+    micRecoveryStatus,
+    micRecoveryAttempt,
     operation,
     error: upstreamError ?? controllerError,
     start,

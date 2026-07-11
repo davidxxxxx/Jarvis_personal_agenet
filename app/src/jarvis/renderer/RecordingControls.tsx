@@ -233,11 +233,27 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             {t(actionError ? "jarvis.operationError" : "jarvis.recordingError")}
           </p>
         )}
-        {recording.micFallbackActive && (
-          <p className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-            首选麦克风已断开，正在使用{recording.activeMicLabel || "系统默认麦克风"}继续录音。
+        {recording.micRecoveryStatus === "reconnecting" ? (
+          <p
+            aria-live="polite"
+            className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          >
+            {t("jarvis.micReconnecting", { count: recording.micRecoveryAttempt ?? 1 })}
           </p>
-        )}
+        ) : recording.micRecoveryStatus === "restored" && recording.activeMicLabel ? (
+          <p
+            aria-live="polite"
+            className="mt-3 rounded-md bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300"
+          >
+            {t("jarvis.micRestored", { device: recording.activeMicLabel })}
+          </p>
+        ) : recording.micFallbackActive ? (
+          <p className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            {t("jarvis.micFallback", {
+              device: recording.activeMicLabel || t("jarvis.defaultMicrophone"),
+            })}
+          </p>
+        ) : null}
         <JarvisMicrophoneSelector disabled={isRecording || isBusy || commandPending} />
       </div>
       <FirstUseConsentDialog
