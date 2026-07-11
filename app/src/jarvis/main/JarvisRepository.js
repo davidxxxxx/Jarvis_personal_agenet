@@ -1,6 +1,7 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const { assertId, assertSessionStatus } = require("../shared/contracts");
+const CaptureEvidenceStore = require("./CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("./JarvisMigrations");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
@@ -227,6 +228,9 @@ class JarvisRepository {
         this.db.exec(SCHEMA);
       })();
       this._prepareStatements();
+      this.captureEvidenceStore = new CaptureEvidenceStore(this.db, {
+        createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
+      });
     } catch (error) {
       this.db.close();
       throw error;
@@ -1193,6 +1197,34 @@ class JarvisRepository {
       speakerLabel: segment.speaker_label,
     });
     return this.statements.getTranscriptRevision.get(safe.id);
+  }
+
+  createTrack(track) {
+    return this.captureEvidenceStore.createTrack(track);
+  }
+
+  setTrackState(id, state, endedAt) {
+    return this.captureEvidenceStore.setTrackState(id, state, endedAt);
+  }
+
+  openGap(gap) {
+    return this.captureEvidenceStore.openGap(gap);
+  }
+
+  closeGap(id, endedAt, recoveryAttempts) {
+    return this.captureEvidenceStore.closeGap(id, endedAt, recoveryAttempts);
+  }
+
+  commitChunk(chunk) {
+    return this.captureEvidenceStore.commitChunk(chunk);
+  }
+
+  tombstoneChunk(id, deletedAt) {
+    return this.captureEvidenceStore.tombstoneChunk(id, deletedAt);
+  }
+
+  enqueueChunkTranscription(chunk) {
+    return this.captureEvidenceStore.enqueueChunkTranscription(chunk);
   }
 
   insertAudioChunk(chunk) {
