@@ -63,26 +63,7 @@ class MiniMaxAnalysisClient {
     this.timeoutMs = timeoutMs;
   }
 
-  async analyze({ kind, segments, previousSummary = null }) {
-    if (kind !== "incremental" && kind !== "final") throw new TypeError("invalid analysis kind");
-    if (!Array.isArray(segments) || segments.length === 0)
-      throw new TypeError("segments are required");
-    const apiKey = this.getApiKey();
-    if (typeof apiKey !== "string" || !apiKey)
-      throw failure("MINIMAX_KEY_MISSING", "MiniMax key is not configured");
-    const allowedIds = new Set();
-    const transcript = segments.map((segment) => {
-      if (typeof segment.id !== "string" || !segment.id)
-        throw new TypeError("segment id is required");
-      allowedIds.add(segment.id);
-      return {
-        id: segment.id,
-        startedAt: segment.startedAt ?? null,
-        endedAt: segment.endedAt ?? null,
-        speaker: segment.speakerRef || "unknown",
-        text: segment.text,
-      };
-    });
+  async _requestTool({ apiKey, messages }) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     let response;
@@ -93,17 +74,7 @@ class MiniMaxAnalysisClient {
         signal: controller.signal,
         body: JSON.stringify({
           model: this.model,
-          messages: [
-            {
-              role: "system",
-              content:
-                "Analyze only the supplied transcript. Do not invent facts. Every topic, memory, and todo must cite supplied segment ids. Keep Chinese and English terms in their original language. Call the required tool exactly once. The topics, memories, todos, decisions, and suggestions fields MUST be JSON arrays; use [] when a collection has no items and never wrap arrays in an object.",
-            },
-            {
-              role: "user",
-              content: JSON.stringify({ kind, previousSummary, segments: transcript }),
-            },
-          ],
+          messages,
           tools: [ANALYSIS_TOOL],
           tool_choice: { type: "function", function: { name: "submit_jarvis_analysis" } },
           temperature: 0.1,
@@ -145,25 +116,90 @@ class MiniMaxAnalysisClient {
     try {
       parsed = JSON.parse(toolCall.function.arguments);
     } catch {
-      throw failure("MINIMAX_INVALID_ANALYSIS", "MiniMax analysis arguments are invalid");
-    }
-    let result;
-    try {
-      result = validateAnalysisPayload(normalizeToolArguments(parsed), allowedIds);
-    } catch {
-      throw failure(
-        "MINIMAX_INVALID_ANALYSIS",
-        "MiniMax returned analysis with an invalid structure",
-        true
-      );
+      throw failure("MINIMAX_INVALID_ANALYSIS", "MiniMax analysis arguments are invalid", true);
     }
     return {
-      result,
+      parsed,
       usage: {
         inputTokens: body?.usage?.prompt_tokens ?? body?.usage?.input_tokens ?? 0,
         outputTokens: body?.usage?.completion_tokens ?? body?.usage?.output_tokens ?? 0,
       },
       model: body?.model || this.model,
+    };
+  }
+
+  async analyze({ kind, segments, previousSummary = null }) {
+    if (kind !== "incremental" && kind !== "final") throw new TypeError("invalid analysis kind");
+    if (!Array.isArray(segments) || segments.length === 0)
+      throw new TypeError("segments are required");
+    const apiKey = this.getApiKey();
+    if (typeof apiKey !== "string" || !apiKey)
+      throw failure("MINIMAX_KEY_MISSING", "MiniMax key is not configured");
+    const allowedIds = new Set();
+    const transcript = segments.map((segment) => {
+      if (typeof segment.id !== "string" || !segment.id)
+        throw new TypeError("segment id is required");
+      allowedIds.add(segment.id);
+      return {
+        id: segment.id,
+        startedAt: segment.startedAt ?? null,
+        endedAt: segment.endedAt ?? null,
+        speaker: segment.speakerRef || "unknown",
+        text: segment.text,
+      };
+    });
+    const requestInput = { kind, previousSummary, segments: transcript };
+    const first = await this._requestTool({
+      apiKey,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Analyze only the supplied transcript. Do not invent facts. Every topic, memory, and todo must cite supplied segment ids. Keep Chinese and English terms in their original language. Call the required tool exactly once. The topics, memories, todos, decisions, and suggestions fields MUST be JSON arrays; use [] when a collection has no items and never wrap arrays in an object.",
+        },
+        { role: "user", content: JSON.stringify(requestInput) },
+      ],
+    });
+    let result;
+    try {
+      result = validateAnalysisPayload(normalizeToolArguments(first.parsed), allowedIds);
+    } catch {
+      const repaired = await this._requestTool({
+        apiKey,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Repair the supplied analysis so it exactly matches the submit_jarvis_analysis tool schema. Re-check the transcript for grounding. All collection fields MUST be JSON arrays. Use only supplied segment ids as evidence, use null for unknown optional values, omit no required fields, and call the tool exactly once.",
+          },
+          {
+            role: "user",
+            content: JSON.stringify({ ...requestInput, invalidAnalysis: first.parsed }),
+          },
+        ],
+      });
+      try {
+        result = validateAnalysisPayload(normalizeToolArguments(repaired.parsed), allowedIds);
+      } catch {
+        throw failure(
+          "MINIMAX_INVALID_ANALYSIS",
+          "MiniMax returned analysis with an invalid structure",
+          true
+        );
+      }
+      return {
+        result,
+        usage: {
+          inputTokens: first.usage.inputTokens + repaired.usage.inputTokens,
+          outputTokens: first.usage.outputTokens + repaired.usage.outputTokens,
+        },
+        model: repaired.model,
+      };
+    }
+    return {
+      result,
+      usage: first.usage,
+      model: first.model,
     };
   }
 }

@@ -124,6 +124,67 @@ test("normalizes common MiniMax tool argument wrappers before strict validation"
   assert.match(requestBody.messages[0].content, /MUST be JSON arrays/);
 });
 
+test("repairs a deeper MiniMax schema mismatch once and validates the repaired tool call", async () => {
+  const requests = [];
+  const invalid = {
+    ...result,
+    todos: [{ task: "完成验收", evidenceSegmentIds: "seg-1" }],
+  };
+  const repaired = {
+    ...result,
+    todos: [
+      {
+        content: "完成验收",
+        ownerRef: "self",
+        dueDate: null,
+        topicRef: null,
+        evidenceSegmentIds: ["seg-1"],
+      },
+    ],
+  };
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      requests.push(request);
+      const argumentsValue = requests.length === 1 ? invalid : repaired;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    function: {
+                      name: "submit_jarvis_analysis",
+                      arguments: JSON.stringify(argumentsValue),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 11, completion_tokens: 13 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    },
+    getApiKey: () => "secret-token-plan-key",
+  });
+
+  const response = await client.analyze({
+    kind: "final",
+    segments: [{ id: "seg-1", speakerRef: "person_2", text: "完成验收" }],
+  });
+
+  assert.equal(requests.length, 2);
+  assert.match(requests[1].messages[0].content, /repair/i);
+  assert.match(requests[1].messages[1].content, /invalidAnalysis/);
+  assert.match(requests[1].messages[1].content, /完成验收/);
+  assert.doesNotMatch(JSON.stringify(requests[1]), /audio|张三/i);
+  assert.deepEqual(response.result, repaired);
+  assert.deepEqual(response.usage, { inputTokens: 22, outputTokens: 26 });
+});
+
 test("redacts unrepairable MiniMax analysis shape errors", async () => {
   const client = new MiniMaxAnalysisClient({
     fetchImpl: async () =>
