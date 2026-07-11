@@ -1,6 +1,7 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const { assertId, assertSessionStatus } = require("../shared/contracts");
+const { applyJarvisMigrations } = require("./JarvisMigrations");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -21,15 +22,6 @@ function normalizeSpeakerName(value) {
 }
 
 const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER,
-    status TEXT NOT NULL CHECK(status IN ('recording','paused','finalizing','completed','recovered','failed')),
-    mic_device_id TEXT,
-    language TEXT NOT NULL DEFAULT 'zh',
-    created_at INTEGER NOT NULL
-  );
   CREATE TABLE IF NOT EXISTS people (
     id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
@@ -50,17 +42,6 @@ const SCHEMA = `
     confidence REAL NOT NULL,
     is_stable INTEGER NOT NULL,
     analysis_state TEXT NOT NULL DEFAULT 'pending'
-  );
-  CREATE TABLE IF NOT EXISTS audio_chunks (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    path TEXT NOT NULL UNIQUE,
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    sha256 TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    transcription_status TEXT NOT NULL DEFAULT 'pending'
   );
   CREATE TABLE IF NOT EXISTS cloud_budget_settings (
     provider TEXT PRIMARY KEY,
@@ -241,7 +222,10 @@ class JarvisRepository {
       if (dbPath !== ":memory:") {
         this.db.pragma("journal_mode = WAL");
       }
-      this.db.transaction(() => this.db.exec(SCHEMA))();
+      this.db.transaction(() => {
+        applyJarvisMigrations(this.db);
+        this.db.exec(SCHEMA);
+      })();
       this._prepareStatements();
     } catch (error) {
       this.db.close();
