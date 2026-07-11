@@ -34,6 +34,7 @@ function registerJarvisIpc({
   service,
   voiceEnrollmentService,
   environmentManager,
+  analysisScheduler,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -106,6 +107,58 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
     repository.listAudioChunks(assertId(sessionId, "sessionId"))
   );
+  ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
+    repository.getSessionDetail(assertId(sessionId, "sessionId"))
+  );
+  ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
+    if (typeof query !== "string") throw new TypeError("query must be a string");
+    return query.trim() ? repository.searchMemory(query, limit) : repository.listSessions({ limit: limit ?? 100 });
+  });
+  ipcMain.handle(CHANNELS.listPeopleOverview, () => repository.listPeopleOverview());
+  ipcMain.handle(CHANNELS.getPersonDetail, (_event, personId) =>
+    repository.getPersonDetail(assertId(personId, "personId"))
+  );
+  ipcMain.handle(CHANNELS.listTopics, () => repository.listTopics());
+  ipcMain.handle(CHANNELS.getTopicDetail, (_event, topicId) =>
+    repository.getTopicDetail(assertId(topicId, "topicId"))
+  );
+  ipcMain.handle(CHANNELS.renameTopic, (_event, topicId, title) =>
+    repository.renameTopic(assertId(topicId, "topicId"), title)
+  );
+  ipcMain.handle(CHANNELS.listTodos, (_event, status) => repository.listTodos(status ?? null));
+  ipcMain.handle(CHANNELS.setTodoStatus, (_event, todoId, status) => {
+    if (status !== "open" && status !== "completed") throw new TypeError("invalid todo status");
+    return repository.setTodoStatus(assertId(todoId, "todoId"), status);
+  });
+  ipcMain.handle(CHANNELS.listMemories, (_event, limit) => repository.listMemories(limit ?? 200));
+  ipcMain.handle(CHANNELS.getTodayInsights, (_event, sessionId) =>
+    repository.getTodayInsights(assertId(sessionId, "sessionId"))
+  );
+  if (analysisScheduler) {
+    ipcMain.handle(CHANNELS.analyzeSession, (_event, sessionId, kind) =>
+      analysisScheduler.analyzeSession(assertId(sessionId, "sessionId"), kind ?? "incremental")
+    );
+    ipcMain.handle(CHANNELS.getAnalysisStatus, (_event, sessionId) =>
+      analysisScheduler.getStatus(assertId(sessionId, "sessionId"))
+    );
+  }
+  if (
+    typeof environmentManager.getMiniMaxKey === "function" &&
+    typeof environmentManager.saveMiniMaxKey === "function"
+  ) {
+    const miniMaxConfig = () => ({
+      keyConfigured: Boolean(environmentManager.getMiniMaxKey()),
+      model: process.env.MINIMAX_MODEL || "MiniMax-M2.7",
+    });
+    ipcMain.handle(CHANNELS.getMiniMaxConfig, miniMaxConfig);
+    ipcMain.handle(CHANNELS.setMiniMaxKey, (_event, key) => {
+      if (typeof key !== "string" || !key.trim() || key.length > 512) {
+        throw new TypeError("MiniMax key must be a non-empty string");
+      }
+      environmentManager.saveMiniMaxKey(key.trim());
+      return miniMaxConfig();
+    });
+  }
   ipcMain.handle(CHANNELS.startCapture, (_event, input) => service.startCapture(input));
   ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at, errorCode) =>
     service.pauseCapture(assertId(id, "sessionId"), at, errorCode)

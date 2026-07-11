@@ -7,6 +7,7 @@ const { normalizeUiLanguage } = require("./i18nMain");
 const secretCrypto = require("./secretCrypto");
 
 const SECRET_KEYS = [
+  "MINIMAX_API_KEY",
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
   "GEMINI_API_KEY",
@@ -273,6 +274,14 @@ class EnvironmentManager {
 
   saveOpenAIKey(key) {
     return this._saveKey("OPENAI_API_KEY", key);
+  }
+
+  getMiniMaxKey() {
+    return this._getKey("MINIMAX_API_KEY");
+  }
+
+  saveMiniMaxKey(key) {
+    return this._saveKey("MINIMAX_API_KEY", key);
   }
 
   getAnthropicKey() {

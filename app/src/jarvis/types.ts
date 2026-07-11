@@ -89,6 +89,106 @@ export interface JarvisAudioChunk {
   transcription_status: string;
 }
 
+export interface JarvisSessionSummary {
+  session_id: string;
+  summary: string;
+  decisions_json: string;
+  suggestions_json: string;
+  updated_at: number;
+  is_final: number;
+}
+
+export interface JarvisTopic {
+  id: string;
+  canonical_title: string;
+  normalized_title: string;
+  description: string;
+  status: "active" | "archived";
+  created_at: number;
+  last_seen_at: number;
+  session_count?: number;
+  open_todo_count?: number;
+}
+
+export interface JarvisTodo {
+  id: string;
+  content: string;
+  owner_person_id: string | null;
+  owner_name?: string | null;
+  topic_id: string | null;
+  topic_title?: string | null;
+  due_at: number | null;
+  status: "open" | "completed";
+  updated_at: number;
+  completed_at: number | null;
+  source_session_id: string;
+  source_segment_id: string | null;
+}
+
+export interface JarvisMemoryItem {
+  id: string;
+  type: "fact" | "decision" | "commitment" | "opinion";
+  content: string;
+  person_id: string | null;
+  person_name?: string | null;
+  topic_id: string | null;
+  topic_title?: string | null;
+  confidence: number;
+  last_seen_at: number;
+  occurrence_count: number;
+  needs_confirmation: number;
+}
+
+export interface JarvisSessionDetail {
+  session: JarvisSession;
+  summary: JarvisSessionSummary | null;
+  segments: JarvisTranscriptSegment[];
+  audioChunks: JarvisAudioChunk[];
+  topics: JarvisTopic[];
+  todos: JarvisTodo[];
+  memories: JarvisMemoryItem[];
+}
+
+export interface JarvisPersonOverview extends JarvisPerson {
+  session_count: number;
+  open_todo_count: number;
+  last_interaction_at: number | null;
+}
+
+export interface JarvisPersonDetail {
+  person: JarvisPerson;
+  sessions: JarvisSession[];
+  todos: JarvisTodo[];
+  memories: JarvisMemoryItem[];
+  topics: JarvisTopic[];
+}
+
+export interface JarvisTopicDetail {
+  topic: JarvisTopic;
+  sessions: JarvisSession[];
+  todos: JarvisTodo[];
+  memories: JarvisMemoryItem[];
+}
+
+export interface JarvisTodayInsights {
+  summary: JarvisSessionSummary | null;
+  topics: JarvisTopic[];
+  todos: JarvisTodo[];
+  memories: JarvisMemoryItem[];
+}
+
+export interface JarvisAnalysisStatus {
+  sessionId: string;
+  state: "waiting" | "analyzing" | "ready" | "quota_limited" | "retry_needed";
+  errorCode: string | null;
+  updatedAt: number | null;
+}
+
+export interface JarvisMiniMaxConfig {
+  keyConfigured: boolean;
+  model: string;
+}
+
 export interface JarvisVoiceEnrollmentSession {
   sessionId: string;
   expiresAt: number;

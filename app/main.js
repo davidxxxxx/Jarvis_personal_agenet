@@ -299,6 +299,8 @@ const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService
 const { resolveRecordingsRoot } = require("./src/jarvis/main/recordingStorage");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
+const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
+const AnalysisScheduler = require("./src/jarvis/main/AnalysisScheduler");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 const JarvisControlQueue = require("./src/jarvis/main/JarvisControlQueue");
 const {
@@ -338,6 +340,7 @@ let retentionCleaner = null;
 let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
 let openAiCorrectionService = null;
+let jarvisAnalysisScheduler = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
 let gracefulShutdownCoordinator = null;
@@ -434,6 +437,16 @@ function initializeCoreManagers() {
     repository: jarvisRepository,
   });
   environmentManager = new EnvironmentManager();
+  const miniMaxAnalysisClient = new MiniMaxAnalysisClient({
+    getApiKey: () => environmentManager.getMiniMaxKey(),
+    fetchImpl: (url, options) => net.fetch(url, options),
+    baseUrl: process.env.MINIMAX_BASE_URL || "https://api.minimaxi.com/v1",
+    model: process.env.MINIMAX_MODEL || "MiniMax-M2.7",
+  });
+  jarvisAnalysisScheduler = new AnalysisScheduler({
+    repository: jarvisRepository,
+    client: miniMaxAnalysisClient,
+  });
   cloudBudgetGuard = new CloudBudgetGuard({
     repository: jarvisRepository,
     createId: () => `cloud_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
@@ -452,6 +465,7 @@ function initializeCoreManagers() {
     service: jarvisService,
     voiceEnrollmentService,
     environmentManager,
+    analysisScheduler: jarvisAnalysisScheduler,
   });
 
   const uiLanguage = environmentManager.getUiLanguage();

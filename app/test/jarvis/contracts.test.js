@@ -15,6 +15,17 @@ function createRepository(overrides = {}) {
     renamePerson: () => "renamed",
     listPeople: () => [],
     listAudioChunks: () => [],
+    getSessionDetail: () => ({ session: { id: "s1" } }),
+    searchMemory: () => [],
+    listPeopleOverview: () => [],
+    getPersonDetail: () => null,
+    listTopics: () => [],
+    getTopicDetail: () => null,
+    renameTopic: () => null,
+    listTodos: () => [],
+    setTodoStatus: () => null,
+    listMemories: () => [],
+    getTodayInsights: () => null,
     getCloudBudgetStatus: () => ({
       monthUtc: "2026-07",
       enabled: false,
@@ -61,15 +72,24 @@ function createIpcHarness(overrides = {}) {
   const repository = createRepository(overrides);
   const service = createService();
   const voiceEnrollmentService = createVoiceEnrollmentService();
-  const environmentManager = { getOpenAIKey: () => "sk-project-test" };
+  const environmentManager = {
+    getOpenAIKey: () => "sk-project-test",
+    getMiniMaxKey: () => "sk-cp-test",
+    saveMiniMaxKey: () => ({ success: true }),
+  };
+  const analysisScheduler = {
+    analyzeSession: () => Promise.resolve({ state: "ready" }),
+    getStatus: () => ({ state: "waiting" }),
+  };
   registerJarvisIpc({
     ipcMain,
     repository,
     service,
     voiceEnrollmentService,
     environmentManager,
+    analysisScheduler,
   });
-  return { handlers, repository, service, voiceEnrollmentService, environmentManager };
+  return { handlers, repository, service, voiceEnrollmentService, environmentManager, analysisScheduler };
 }
 
 test("contract rejects path traversal and unknown states", () => {
@@ -87,23 +107,38 @@ test("contract exposes only the named Jarvis channels", () => {
     "createSession",
     "failCapture",
     "finishCapture",
+    "getAnalysisStatus",
     "getCloudBudget",
+    "getMiniMaxConfig",
+    "getPersonDetail",
     "getSession",
+    "getSessionDetail",
+    "getTodayInsights",
+    "getTopicDetail",
     "getVoiceEnrollmentStatus",
+    "analyzeSession",
     "listAudioChunks",
+    "listMemories",
     "listPeople",
+    "listPeopleOverview",
     "listSegments",
     "listSessions",
+    "listTodos",
+    "listTopics",
     "pauseCapture",
     "renamePerson",
     "resumeCapture",
     "setCloudBudget",
+    "setMiniMaxKey",
     "setSessionStatus",
+    "setTodoStatus",
     "startCapture",
     "stateChanged",
     "syncSegments",
+    "searchMemory",
+    "renameTopic",
     "upsertSegments",
-  ]);
+  ].sort());
   assert.equal(Object.isFrozen(CHANNELS), true);
 });
 
@@ -134,10 +169,35 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.cancelVoiceEnrollment,
       CHANNELS.getCloudBudget,
       CHANNELS.setCloudBudget,
+      CHANNELS.getSessionDetail,
+      CHANNELS.searchMemory,
+      CHANNELS.listPeopleOverview,
+      CHANNELS.getPersonDetail,
+      CHANNELS.listTopics,
+      CHANNELS.getTopicDetail,
+      CHANNELS.renameTopic,
+      CHANNELS.listTodos,
+      CHANNELS.setTodoStatus,
+      CHANNELS.listMemories,
+      CHANNELS.getTodayInsights,
+      CHANNELS.analyzeSession,
+      CHANNELS.getAnalysisStatus,
+      CHANNELS.getMiniMaxConfig,
+      CHANNELS.setMiniMaxKey,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
+});
+
+test("IPC exposes MiniMax configured state without returning the secret", async () => {
+  const { handlers } = createIpcHarness();
+  const config = await handlers.get(CHANNELS.getMiniMaxConfig)();
+  const expectedModel = process.env.MINIMAX_MODEL || "MiniMax-M2.7";
+  assert.deepEqual(config, { keyConfigured: true, model: expectedModel });
+  assert.doesNotMatch(JSON.stringify(config), /sk-cp/);
+  const saved = await handlers.get(CHANNELS.setMiniMaxKey)(null, "new-token-plan-key");
+  assert.deepEqual(saved, { keyConfigured: true, model: expectedModel });
 });
 
 test("IPC returns metadata-only self voice enrollment status", async () => {

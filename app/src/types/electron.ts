@@ -17,6 +17,16 @@ import type {
   JarvisVoiceEnrollmentStatus,
   JarvisCloudBudgetInput,
   JarvisCloudBudgetStatus,
+  JarvisAnalysisStatus,
+  JarvisMemoryItem,
+  JarvisMiniMaxConfig,
+  JarvisPersonDetail,
+  JarvisPersonOverview,
+  JarvisSessionDetail,
+  JarvisTodayInsights,
+  JarvisTodo,
+  JarvisTopic,
+  JarvisTopicDetail,
 } from "../jarvis/types";
 
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
@@ -546,6 +556,21 @@ declare global {
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
+        getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
+        searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
+        listPeopleOverview: () => Promise<JarvisPersonOverview[]>;
+        getPersonDetail: (personId: string) => Promise<JarvisPersonDetail | null>;
+        listTopics: () => Promise<JarvisTopic[]>;
+        getTopicDetail: (topicId: string) => Promise<JarvisTopicDetail | null>;
+        renameTopic: (topicId: string, title: string) => Promise<JarvisTopic | null>;
+        listTodos: (status?: "open" | "completed" | null) => Promise<JarvisTodo[]>;
+        setTodoStatus: (todoId: string, status: "open" | "completed") => Promise<JarvisTodo | null>;
+        listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
+        getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
+        analyzeSession: (sessionId: string, kind: "incremental" | "final") => Promise<JarvisAnalysisStatus>;
+        getAnalysisStatus: (sessionId: string) => Promise<JarvisAnalysisStatus>;
+        getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
+        setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
         pauseCapture: (
           id: string,
