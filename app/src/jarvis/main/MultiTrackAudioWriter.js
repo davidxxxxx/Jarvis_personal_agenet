@@ -31,7 +31,19 @@ class MultiTrackAudioWriter {
   }
 
   closeAll(at) {
-    for (const writer of this.writers.values()) writer.close(at);
+    const errors = [];
+    const failedSources = [];
+    for (const [sourceType, writer] of this.writers) {
+      try {
+        writer.close(at);
+      } catch (error) {
+        failedSources.push(sourceType);
+        errors.push(new Error(`failed to close audio source: ${sourceType}`, { cause: error }));
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, `failed to close audio sources: ${failedSources.join(", ")}`);
+    }
   }
 
   abortAll() {

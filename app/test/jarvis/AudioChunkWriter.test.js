@@ -136,6 +136,46 @@ test("fsyncs before hashing PCM, renaming, and advertising the chunk", (t) => {
   });
 });
 
+test("advances durable coordinates when the post-rename callback throws", () => {
+  withTempDir((dir) => {
+    const attempts = [];
+    let failFirstCallback = true;
+    const writer = new AudioChunkWriter({
+      sessionId: "s1",
+      trackId: "tm",
+      sourceType: "mic",
+      baseDir: dir,
+      chunkSeconds: 0.002,
+      startedAt: 100,
+      onChunk(chunk) {
+        attempts.push(chunk);
+        if (failFirstCallback) {
+          failFirstCallback = false;
+          throw new Error("commit failed");
+        }
+      },
+    });
+
+    assert.throws(() => writer.append(Buffer.alloc(96, 1)), /commit failed/);
+    writer.append(Buffer.alloc(48, 2));
+    writer.close(500);
+
+    assert.deepEqual(
+      attempts.map(({ sequenceNumber, startedAt, endedAt }) => ({
+        sequenceNumber,
+        startedAt,
+        endedAt,
+      })),
+      [
+        { sequenceNumber: 0, startedAt: 100, endedAt: 102 },
+        { sequenceNumber: 1, startedAt: 102, endedAt: 103 },
+      ]
+    );
+    assert.equal(new Set(attempts.map((chunk) => chunk.path)).size, 2);
+    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".wav")).length, 2);
+  });
+});
+
 test("close never emits an empty chunk", () => {
   withTempDir((dir) => {
     const completed = [];

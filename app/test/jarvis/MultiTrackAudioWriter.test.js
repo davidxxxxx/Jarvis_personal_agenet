@@ -86,3 +86,67 @@ test("rejects appends for inactive sources", () => {
     writer.abortAll();
   });
 });
+
+test("closeAll flushes every source and aggregates source-aware failures", () => {
+  withTempDir((baseDir) => {
+    const completed = [];
+    const writer = new MultiTrackAudioWriter({
+      sessionId: "s1",
+      baseDir,
+      tracks: {
+        mic: { id: "tm", startedAt: 10 },
+        system: { id: "ts", startedAt: 20 },
+      },
+      onChunk(chunk) {
+        if (chunk.sourceType === "mic") throw new Error("mic commit failed");
+        completed.push(chunk);
+      },
+    });
+    writer.append("mic", Buffer.alloc(48, 1));
+    writer.append("system", Buffer.alloc(48, 2));
+
+    assert.throws(
+      () => writer.closeAll(1000),
+      (error) => {
+        assert.equal(error instanceof AggregateError, true);
+        assert.match(error.message, /mic/);
+        assert.equal(error.errors.length, 1);
+        assert.match(error.errors[0].message, /mic/);
+        assert.match(error.errors[0].cause.message, /mic commit failed/);
+        return true;
+      }
+    );
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].sourceType, "system");
+    assert.equal(fs.readFileSync(completed[0].path).subarray(44).equals(Buffer.alloc(48, 2)), true);
+
+    writer.closeAll(1001);
+    assert.equal(completed.length, 1);
+  });
+});
+
+test("closeSource failure does not close another source", () => {
+  withTempDir((baseDir) => {
+    const completed = [];
+    const writer = new MultiTrackAudioWriter({
+      sessionId: "s1",
+      baseDir,
+      tracks: {
+        mic: { id: "tm", startedAt: 10 },
+        system: { id: "ts", startedAt: 20 },
+      },
+      onChunk(chunk) {
+        if (chunk.sourceType === "mic") throw new Error("mic commit failed");
+        completed.push(chunk);
+      },
+    });
+    writer.append("mic", Buffer.alloc(48, 1));
+
+    assert.throws(() => writer.closeSource("mic", 1000), /mic commit failed/);
+    writer.append("system", Buffer.alloc(48, 2));
+    writer.closeSource("system", 1001);
+
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].sourceType, "system");
+  });
+});

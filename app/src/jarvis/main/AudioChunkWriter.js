@@ -164,20 +164,21 @@ class AudioChunkWriter {
       throw error;
     }
 
+    const sequenceNumber = this.sequenceNumber;
+    this.startedAt = endedAt;
+    this.sequenceNumber += 1;
     this.onChunk({
       id,
       sessionId: this.sessionId,
       trackId: this.trackId,
       sourceType: this.sourceType,
-      sequenceNumber: this.sequenceNumber,
+      sequenceNumber,
       path: finalPath,
       startedAt,
       endedAt,
       durationMs,
       sha256,
     });
-    this.startedAt = endedAt;
-    this.sequenceNumber += 1;
   }
 }
 
