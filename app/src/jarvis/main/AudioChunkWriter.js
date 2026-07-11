@@ -73,11 +73,13 @@ class AudioChunkWriter {
     this.pendingBytes = 0;
     this.startedAt = startedAt;
     this.sequenceNumber = 0;
+    this.fault = null;
     this.closed = false;
     fs.mkdirSync(baseDir, { recursive: true });
   }
 
   append(pcmBuffer) {
+    if (this.fault) throw this.fault;
     if (this.closed) throw new Error("audio chunk writer is closed");
     const buffer = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer);
     if (buffer.length % BYTES_PER_SAMPLE !== 0) {
@@ -94,6 +96,7 @@ class AudioChunkWriter {
   }
 
   close(at = this.now()) {
+    if (this.fault) throw this.fault;
     if (this.closed) return;
     this.closed = true;
     if (this.pendingBytes === 0) return;
@@ -134,6 +137,8 @@ class AudioChunkWriter {
     const id = `chunk-${crypto.randomUUID()}`;
     const partPath = path.join(this.baseDir, `${id}.wav.tmp`);
     const finalPath = path.join(this.baseDir, `${id}.wav`);
+    const recoveryPath = `${finalPath}.recovery.json`;
+    const recoveryPartPath = `${recoveryPath}.tmp`;
     const wav = Buffer.concat([wavHeader(pcmBuffer.length, this.sampleRate), pcmBuffer]);
     const durationMs = Math.max(
       1,
@@ -141,8 +146,13 @@ class AudioChunkWriter {
     );
     const startedAt = this.startedAt;
     const endedAt = startedAt + durationMs;
+    const sequenceNumber = this.sequenceNumber;
+    let chunk;
     let sha256;
     let fd = null;
+    let recoveryFd = null;
+    let recoveryCommitted = false;
+    let wavCommitted = false;
 
     try {
       fd = fs.openSync(partPath, "wx");
@@ -151,34 +161,67 @@ class AudioChunkWriter {
       fs.closeSync(fd);
       fd = null;
       sha256 = crypto.createHash("sha256").update(pcmBuffer).digest("hex");
+      chunk = {
+        id,
+        sessionId: this.sessionId,
+        trackId: this.trackId,
+        sourceType: this.sourceType,
+        sequenceNumber,
+        path: finalPath,
+        startedAt,
+        endedAt,
+        durationMs,
+        sha256,
+      };
+      recoveryFd = fs.openSync(recoveryPartPath, "wx");
+      fs.writeFileSync(recoveryFd, JSON.stringify(chunk));
+      fs.fsyncSync(recoveryFd);
+      fs.closeSync(recoveryFd);
+      recoveryFd = null;
+      fs.renameSync(recoveryPartPath, recoveryPath);
+      recoveryCommitted = true;
       fs.renameSync(partPath, finalPath);
+      wavCommitted = true;
     } catch (error) {
       if (fd !== null) {
         try {
           fs.closeSync(fd);
         } catch {}
       }
+      if (recoveryFd !== null) {
+        try {
+          fs.closeSync(recoveryFd);
+        } catch {}
+      }
       try {
         fs.unlinkSync(partPath);
       } catch {}
+      try {
+        fs.unlinkSync(recoveryPartPath);
+      } catch {}
+      if (recoveryCommitted && !wavCommitted) {
+        try {
+          fs.unlinkSync(recoveryPath);
+        } catch {}
+      }
       throw error;
     }
 
-    const sequenceNumber = this.sequenceNumber;
     this.startedAt = endedAt;
     this.sequenceNumber += 1;
-    this.onChunk({
-      id,
-      sessionId: this.sessionId,
-      trackId: this.trackId,
-      sourceType: this.sourceType,
-      sequenceNumber,
-      path: finalPath,
-      startedAt,
-      endedAt,
-      durationMs,
-      sha256,
-    });
+    try {
+      this.onChunk(chunk);
+    } catch (error) {
+      this.fault = new Error(`audio chunk metadata commit failed for ${id}`, { cause: error });
+      throw this.fault;
+    }
+
+    try {
+      fs.unlinkSync(recoveryPath);
+    } catch (error) {
+      this.fault = new Error(`audio chunk recovery cleanup failed for ${id}`, { cause: error });
+      throw this.fault;
+    }
   }
 }
 

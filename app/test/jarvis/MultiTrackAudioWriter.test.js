@@ -112,7 +112,8 @@ test("closeAll flushes every source and aggregates source-aware failures", () =>
         assert.match(error.message, /mic/);
         assert.equal(error.errors.length, 1);
         assert.match(error.errors[0].message, /mic/);
-        assert.match(error.errors[0].cause.message, /mic commit failed/);
+        assert.match(error.errors[0].cause.message, /audio chunk metadata commit failed/);
+        assert.match(error.errors[0].cause.cause.message, /mic commit failed/);
         return true;
       }
     );
@@ -120,8 +121,28 @@ test("closeAll flushes every source and aggregates source-aware failures", () =>
     assert.equal(completed[0].sourceType, "system");
     assert.equal(fs.readFileSync(completed[0].path).subarray(44).equals(Buffer.alloc(48, 2)), true);
 
-    writer.closeAll(1001);
+    assert.throws(
+      () => writer.closeAll(1001),
+      (error) => {
+        assert.equal(error instanceof AggregateError, true);
+        assert.match(error.message, /mic/);
+        assert.equal(error.errors.length, 1);
+        assert.match(error.errors[0].cause.cause.message, /mic commit failed/);
+        return true;
+      }
+    );
     assert.equal(completed.length, 1);
+    assert.equal(
+      fs.readdirSync(path.join(baseDir, "mic")).filter((name) => name.endsWith(".recovery.json"))
+        .length,
+      1
+    );
+    assert.equal(
+      fs
+        .readdirSync(path.join(baseDir, "system"))
+        .filter((name) => name.endsWith(".recovery.json")).length,
+      0
+    );
   });
 });
 
@@ -142,9 +163,19 @@ test("closeSource failure does not close another source", () => {
     });
     writer.append("mic", Buffer.alloc(48, 1));
 
-    assert.throws(() => writer.closeSource("mic", 1000), /mic commit failed/);
+    let fault;
+    assert.throws(
+      () => writer.closeSource("mic", 1000),
+      (error) => {
+        fault = error;
+        assert.match(error.message, /audio chunk metadata commit failed/);
+        return true;
+      }
+    );
+    assert.match(fault.cause.message, /mic commit failed/);
     writer.append("system", Buffer.alloc(48, 2));
     writer.closeSource("system", 1001);
+    assert.throws(() => writer.closeSource("mic", 1002), (error) => error === fault);
 
     assert.equal(completed.length, 1);
     assert.equal(completed[0].sourceType, "system");
