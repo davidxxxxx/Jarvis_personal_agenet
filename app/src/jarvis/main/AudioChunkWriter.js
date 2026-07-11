@@ -26,6 +26,8 @@ function wavHeader(dataBytes, sampleRate) {
 class AudioChunkWriter {
   constructor({
     sessionId,
+    trackId,
+    sourceType,
     baseDir,
     sampleRate = REQUIRED_SAMPLE_RATE,
     chunkSeconds = MAX_CHUNK_SECONDS,
@@ -59,6 +61,8 @@ class AudioChunkWriter {
     }
 
     this.sessionId = sessionId;
+    this.trackId = trackId;
+    this.sourceType = sourceType;
     this.baseDir = baseDir;
     this.sampleRate = sampleRate;
     this.chunkBytes = chunkBytes;
@@ -68,6 +72,7 @@ class AudioChunkWriter {
     this.pending = [];
     this.pendingBytes = 0;
     this.startedAt = startedAt;
+    this.sequenceNumber = 0;
     this.closed = false;
     fs.mkdirSync(baseDir, { recursive: true });
   }
@@ -127,13 +132,16 @@ class AudioChunkWriter {
     if (pcmBuffer.length === 0) return;
 
     const id = `chunk-${crypto.randomUUID()}`;
-    const partPath = path.join(this.baseDir, `${id}.wav.part`);
+    const partPath = path.join(this.baseDir, `${id}.wav.tmp`);
     const finalPath = path.join(this.baseDir, `${id}.wav`);
     const wav = Buffer.concat([wavHeader(pcmBuffer.length, this.sampleRate), pcmBuffer]);
-    const durationMs = Math.round((pcmBuffer.length * 1000) / (this.sampleRate * BYTES_PER_SAMPLE));
+    const durationMs = Math.max(
+      1,
+      Math.round((pcmBuffer.length * 1000) / (this.sampleRate * BYTES_PER_SAMPLE))
+    );
     const startedAt = this.startedAt;
-    const candidateEnd = Number.isSafeInteger(at) ? at : this.now();
-    const endedAt = Math.max(startedAt + durationMs, candidateEnd);
+    const endedAt = startedAt + durationMs;
+    let sha256;
     let fd = null;
 
     try {
@@ -142,6 +150,7 @@ class AudioChunkWriter {
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = null;
+      sha256 = crypto.createHash("sha256").update(pcmBuffer).digest("hex");
       fs.renameSync(partPath, finalPath);
     } catch (error) {
       if (fd !== null) {
@@ -155,16 +164,20 @@ class AudioChunkWriter {
       throw error;
     }
 
-    this.startedAt = endedAt;
     this.onChunk({
       id,
       sessionId: this.sessionId,
+      trackId: this.trackId,
+      sourceType: this.sourceType,
+      sequenceNumber: this.sequenceNumber,
       path: finalPath,
       startedAt,
       endedAt,
       durationMs,
-      sha256: crypto.createHash("sha256").update(wav).digest("hex"),
+      sha256,
     });
+    this.startedAt = endedAt;
+    this.sequenceNumber += 1;
   }
 }
 
