@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
+const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 
 function createRepository() {
   const sessions = new Map([
@@ -19,9 +20,13 @@ function createRepository() {
     ],
   ]);
   const chunks = [];
+  const tracks = [];
+  const gaps = [];
   return {
     sessions,
     chunks,
+    tracks,
+    gaps,
     getSession(id) {
       return sessions.get(id) ?? null;
     },
@@ -32,6 +37,28 @@ function createRepository() {
       return session;
     },
     insertAudioChunk(chunk) {
+      chunks.push(chunk);
+      return chunk;
+    },
+    createTrack(track) {
+      tracks.push({ ...track });
+      return track;
+    },
+    setTrackState(id, state, endedAt = null) {
+      const track = tracks.find((entry) => entry.id === id);
+      if (track) Object.assign(track, { state, endedAt });
+      return track;
+    },
+    openGap(gap) {
+      gaps.push({ ...gap, endedAt: null });
+      return gap;
+    },
+    closeGap(id, endedAt, recoveryAttempts = null) {
+      const gap = gaps.find((entry) => entry.id === id);
+      if (gap) Object.assign(gap, { endedAt, recoveryAttempts });
+      return gap;
+    },
+    commitChunk(chunk) {
       chunks.push(chunk);
       return chunk;
     },
@@ -121,9 +148,11 @@ test("pause closes audio, resume reuses the session, and finish stores seven-day
       true
     );
     assert.deepEqual(Object.keys(broadcasts.at(-1)).sort(), [
+      "captureMode",
       "elapsedMs",
       "errorCode",
       "sessionId",
+      "sources",
       "startedAt",
       "status",
     ]);
@@ -242,7 +271,7 @@ test("checks disk again at each rotation and fails without a corrupt partial chu
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "DISK_SPACE_LOW");
     assert.equal(repository.chunks.length, 1);
-    const sessionDir = path.join(userDataDir, "recordings", "s1");
+    const sessionDir = path.join(userDataDir, "recordings", "s1", "mic");
     assert.equal(fs.readdirSync(sessionDir).some((name) => name.endsWith(".part")), false);
     assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 1);
   } finally {
@@ -333,6 +362,223 @@ test("an error pause keeps completed audio and broadcasts the microphone error c
     assert.equal(broadcasts.at(-1).errorCode, "MIC_DISCONNECTED");
   } finally {
     service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("system loss degrades dual capture without closing mic", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-dual-"));
+  const repository = createRepository();
+  let clock = 10;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => clock,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: [
+        {
+          sourceType: "mic",
+          deviceId: "mv7",
+          deviceLabel: "Shure MV7",
+          strategy: "web-audio",
+        },
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: "Windows output",
+          strategy: "wasapi-loopback",
+        },
+      ],
+    });
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(4_800, 1)), true);
+    clock = 20;
+    const degraded = service.sourceInterrupted("s1", "system", {
+      at: 20,
+      reason: "track-ended",
+    });
+
+    assert.equal(degraded.status, "degraded");
+    assert.equal(degraded.captureMode, "dual");
+    assert.equal(degraded.sources.mic.state, "active");
+    assert.equal(degraded.sources.system.state, "reconnecting");
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(4_800, 2)), true);
+    assert.equal(service.appendPcm("s1", "system", Buffer.alloc(4_800, 3)), false);
+    assert.equal(repository.gaps.length, 1);
+    assert.equal(repository.gaps[0].reason, "track-ended");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("restoring one source reopens only that writer and continues its sequence", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-restore-"));
+  const repository = createRepository();
+  let clock = 10;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => clock,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: [
+        { sourceType: "mic", deviceId: "mv7", deviceLabel: "MV7", strategy: "web-audio" },
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: "Output",
+          strategy: "wasapi-loopback",
+        },
+      ],
+    });
+    service.appendPcm("s1", "system", Buffer.alloc(48, 1));
+    clock = 20;
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    const restored = service.sourceRestored("s1", "system", {
+      at: 30,
+      deviceId: "output-2",
+      deviceLabel: "New output",
+      strategy: "wasapi-loopback",
+    });
+    service.appendPcm("s1", "system", Buffer.alloc(48, 2));
+    service.appendPcm("s1", "mic", Buffer.alloc(48, 3));
+    clock = 40;
+    service.finishCapture("s1", 40);
+
+    assert.equal(restored.status, "recording");
+    assert.equal(restored.sources.system.state, "active");
+    assert.equal(restored.sources.system.deviceId, "output-2");
+    assert.equal(repository.gaps[0].endedAt, 30);
+    assert.deepEqual(
+      repository.chunks
+        .filter((chunk) => chunk.sourceType === "system")
+        .map((chunk) => chunk.sequenceNumber),
+      [0, 1]
+    );
+    assert.equal(repository.chunks.filter((chunk) => chunk.sourceType === "mic").length, 1);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("a sticky writer failure isolates only its source", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-fault-"));
+  const repository = createRepository();
+  const commitChunk = repository.commitChunk;
+  repository.commitChunk = (chunk) => {
+    if (chunk.sourceType === "system") throw new Error("system metadata unavailable");
+    return commitChunk.call(repository, chunk);
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: [
+        { sourceType: "mic", deviceId: "mv7", deviceLabel: "MV7", strategy: "web-audio" },
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: "Output",
+          strategy: "wasapi-loopback",
+        },
+      ],
+    });
+    service.appendPcm("s1", "system", Buffer.alloc(48, 1));
+    const state = service.sourceInterrupted("s1", "system", {
+      at: 20,
+      reason: "track-ended",
+    });
+
+    assert.equal(state.status, "degraded");
+    assert.equal(state.sources.system.errorCode, "AUDIO_WRITE_FAILED");
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 2)), true);
+    assert.doesNotThrow(() => service.finishCapture("s1", 30));
+    assert.equal(repository.chunks.filter((chunk) => chunk.sourceType === "mic").length, 1);
+    assert.equal(repository.gaps.length, 1);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("degraded public state keeps the durable session open with real evidence storage", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-real-store-"));
+  const repository = new JarvisRepository(":memory:");
+  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: [
+        { sourceType: "mic", deviceId: "mv7", deviceLabel: "MV7", strategy: "web-audio" },
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: "Output",
+          strategy: "wasapi-loopback",
+        },
+      ],
+    });
+    const state = service.sourceInterrupted("s1", "system", {
+      at: 20,
+      reason: "track-ended",
+    });
+
+    assert.equal(state.status, "degraded");
+    assert.equal(repository.getSession("s1").status, "recording");
+    assert.equal(
+      repository.db.prepare("SELECT count(*) count FROM audio_gaps").get().count,
+      1
+    );
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 1)), true);
+    service.finishCapture("s1", 30);
+    assert.deepEqual(
+      repository.db
+        .prepare("SELECT source_type, sequence_number FROM audio_chunks")
+        .all(),
+      [{ source_type: "mic", sequence_number: 0 }]
+    );
+    assert.equal(
+      repository.db.prepare("SELECT count(*) count FROM processing_jobs").get().count,
+      1
+    );
+  } finally {
+    service.shutdown();
+    repository.close();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

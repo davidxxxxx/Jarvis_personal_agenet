@@ -1,10 +1,17 @@
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const AudioChunkWriter = require("./AudioChunkWriter");
+const MultiTrackAudioWriter = require("./MultiTrackAudioWriter");
 const { hasSafeDiskSpace } = require("./retentionPolicy");
 const { assertId } = require("../shared/contracts");
+const {
+  assertSourceType,
+  normalizeCaptureStartInput,
+  normalizeSource,
+} = require("../shared/captureModes");
 
 const AUDIO_RETENTION_MS = 7 * 86400000;
+const ACTIVE_SESSION_STATUSES = new Set(["recording", "degraded"]);
 
 class DiskSpaceError extends Error {
   constructor(code) {
@@ -22,8 +29,12 @@ class JarvisService {
     for (const method of [
       "getSession",
       "setSessionStatus",
-      "insertAudioChunk",
       "recoverOpenSessions",
+      "createTrack",
+      "setTrackState",
+      "openGap",
+      "closeGap",
+      "commitChunk",
     ]) {
       if (typeof repository[method] !== "function") {
         throw new TypeError(`repository.${method} must be a function`);
@@ -42,58 +53,82 @@ class JarvisService {
     if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
       throw new TypeError("recordingsDir must be an absolute path");
     }
-    this.recordingsDir = recordingsDir ? path.resolve(recordingsDir) : path.join(userDataDir, "recordings");
+    this.recordingsDir = recordingsDir
+      ? path.resolve(recordingsDir)
+      : path.join(userDataDir, "recordings");
     this.broadcast = broadcast;
     this.now = now;
     this.fs = fsImpl;
     this.writer = null;
     this.closing = false;
     this.closed = false;
-    this.state = {
-      sessionId: null,
-      status: "idle",
-      startedAt: null,
-      activeSince: null,
-      accumulatedMs: 0,
-      errorCode: null,
-    };
+    this.state = this._idleState();
   }
 
-  startCapture({ sessionId, startedAt, micDeviceId }) {
+  startCapture(input) {
     this._assertOpen();
-    const id = assertId(sessionId, "sessionId");
-    this._assertTime(startedAt, "startedAt");
-    if (micDeviceId !== null && micDeviceId !== undefined && typeof micDeviceId !== "string") {
-      throw new TypeError("micDeviceId must be a string or null");
-    }
-    if (this.writer || this.state.status === "recording" || this.state.status === "paused") {
+    const normalized = normalizeCaptureStartInput(input);
+    const id = assertId(normalized.sessionId, "sessionId");
+    this._assertTime(normalized.startedAt, "startedAt");
+    if (this.writer || ACTIVE_SESSION_STATUSES.has(this.state.status) || this.state.status === "paused") {
       throw new Error("a capture session is already active");
     }
     const session = this.repository.getSession(id);
     if (!session) throw new Error("capture session does not exist");
 
     this.fs.mkdirSync(this.recordingsDir, { recursive: true });
+    const sources = {};
+    for (const source of normalized.sources) {
+      sources[source.sourceType] = {
+        ...source,
+        trackId: `track-${crypto.randomUUID()}`,
+        state: "active",
+        gapId: null,
+        interruptedAt: null,
+        reason: null,
+        errorCode: null,
+      };
+    }
     this.state = {
       sessionId: id,
       status: "recording",
-      startedAt,
-      activeSince: startedAt,
+      startedAt: normalized.startedAt,
+      activeSince: normalized.startedAt,
       accumulatedMs: 0,
       errorCode: null,
+      captureMode: normalized.captureMode,
+      sources,
     };
+
     try {
       this._assertSafeDiskSpace();
-      this.writer = this._createWriter(id, path.join(this.recordingsDir, id), startedAt);
+      for (const source of Object.values(sources)) {
+        this.repository.createTrack({
+          id: source.trackId,
+          sessionId: id,
+          sourceType: source.sourceType,
+          deviceId: source.deviceId,
+          deviceLabel: source.deviceLabel,
+          strategy: source.strategy,
+          sampleRate: 24_000,
+          channels: 1,
+          startedAt: normalized.startedAt,
+          state: "active",
+        });
+      }
+      this.writer = this._createWriter(id, path.join(this.recordingsDir, id));
     } catch (error) {
-      if (error instanceof DiskSpaceError) this._failForDisk(error.code, startedAt);
+      const diskError = this._findDiskSpaceError(error);
+      if (diskError) this._failForDisk(diskError.code, normalized.startedAt);
       throw error;
     }
-    return this._publish(startedAt);
+    return this._publish(normalized.startedAt);
   }
 
-  appendMicPcm(sessionId, pcmBuffer) {
+  appendPcm(sessionId, sourceType, pcmBuffer) {
     if (this.closing || this.closed) return false;
     const id = assertId(sessionId, "sessionId");
+    const type = assertSourceType(sourceType);
     if (id !== this.state.sessionId) throw new Error("capture session mismatch");
     if (
       this.state.status === "failed" &&
@@ -101,38 +136,93 @@ class JarvisService {
     ) {
       return false;
     }
-    if (this.state.status !== "recording" || !this.writer) {
+    const source = this.state.sources[type];
+    if (!source) throw new Error(`capture source was not requested: ${type}`);
+    if (source.state !== "active") return false;
+    if (!ACTIVE_SESSION_STATUSES.has(this.state.status) || !this.writer) {
       throw new Error("capture session is not recording");
     }
     try {
-      this.writer.append(pcmBuffer);
+      this.writer.append(type, pcmBuffer);
       return true;
     } catch (error) {
-      if (!(error instanceof DiskSpaceError)) throw error;
-      this._failForDisk(error.code, this.now());
+      const diskError = this._findDiskSpaceError(error);
+      if (diskError) {
+        this._failForDisk(diskError.code, this.now());
+        return false;
+      }
+      if (error instanceof TypeError || error instanceof RangeError) throw error;
+      this._interruptSource(id, type, { at: this.now(), reason: "audio-write-failed" }, error);
       return false;
     }
   }
 
+  appendMicPcm(sessionId, pcmBuffer) {
+    return this.appendPcm(sessionId, "mic", pcmBuffer);
+  }
+
+  sourceInterrupted(sessionId, sourceType, interruption) {
+    this._assertOpen();
+    if (!interruption || typeof interruption !== "object") {
+      throw new TypeError("interruption is required");
+    }
+    return this._interruptSource(sessionId, sourceType, interruption);
+  }
+
+  sourceRestored(sessionId, sourceType, restoration) {
+    this._assertOpen();
+    const source = this._assertSourceSession(sessionId, sourceType, ["degraded", "paused"]);
+    if (!restoration || typeof restoration !== "object") {
+      throw new TypeError("restoration is required");
+    }
+    this._assertTime(restoration.at, "at");
+    if (source.state !== "reconnecting") {
+      throw new Error(`capture source is not reconnecting: ${source.sourceType}`);
+    }
+    const restored = normalizeSource({ sourceType: source.sourceType, ...restoration });
+
+    this._assertSafeDiskSpace();
+    this.writer.reopenSource(source.sourceType, {
+      id: source.trackId,
+      startedAt: restoration.at,
+    });
+    if (source.gapId) this.repository.closeGap(source.gapId, restoration.at, 1);
+    this.repository.setTrackState(source.trackId, "active", null);
+    Object.assign(source, restored, {
+      state: "active",
+      gapId: null,
+      interruptedAt: null,
+      reason: null,
+      errorCode: null,
+    });
+    const status = this._deriveSessionStatus();
+    this._transitionSessionStatus(status, restoration.at);
+    this._persistSessionStatus(status, restoration.at);
+    return this._publish(restoration.at);
+  }
+
   pauseCapture(sessionId, at = this.now(), errorCode = null) {
     this._assertOpen();
-    this._assertActive(sessionId, "recording");
+    this._assertActive(sessionId, ["recording", "degraded"]);
     this._assertTime(at, "at");
     if (errorCode !== null && (typeof errorCode !== "string" || errorCode.length === 0)) {
       throw new TypeError("errorCode must be a non-empty string or null");
     }
     try {
-      this.writer.close(at);
-      this.writer = null;
+      this.writer.closeAll(at);
     } catch (error) {
-      if (!(error instanceof DiskSpaceError)) throw error;
-      return this._failForDisk(error.code, at);
+      const diskError = this._findDiskSpaceError(error);
+      if (!diskError) throw error;
+      return this._failForDisk(diskError.code, at);
     }
-    this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
-    this.state.activeSince = null;
-    this.state.status = "paused";
+    for (const source of Object.values(this.state.sources)) {
+      if (source.state !== "active") continue;
+      source.state = "paused";
+      this.repository.setTrackState(source.trackId, "paused", at);
+    }
+    this._transitionSessionStatus("paused", at);
     this.state.errorCode = errorCode;
-    this.repository.setSessionStatus(this.state.sessionId, "paused", at);
+    this._persistSessionStatus("paused", at);
     return this._publish(at);
   }
 
@@ -140,66 +230,65 @@ class JarvisService {
     this._assertOpen();
     this._assertActive(sessionId, "paused");
     this._assertTime(at, "at");
-    let writer;
     try {
       this._assertSafeDiskSpace();
-      writer = this._createWriter(
-        this.state.sessionId,
-        path.join(this.recordingsDir, this.state.sessionId),
-        at
-      );
+      for (const source of Object.values(this.state.sources)) {
+        if (source.state !== "paused") continue;
+        this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
+        source.state = "active";
+        this.repository.setTrackState(source.trackId, "active", null);
+      }
     } catch (error) {
-      if (error instanceof DiskSpaceError) this._failForDisk(error.code, at);
+      const diskError = this._findDiskSpaceError(error);
+      if (diskError) this._failForDisk(diskError.code, at);
       throw error;
     }
-    this.repository.setSessionStatus(this.state.sessionId, "recording", at);
-    this.writer = writer;
-    this.state.activeSince = at;
-    this.state.status = "recording";
+    const status = this._deriveSessionStatus();
+    this._transitionSessionStatus(status, at);
     this.state.errorCode = null;
+    this._persistSessionStatus(status, at);
     return this._publish(at);
   }
 
   finishCapture(sessionId, at = this.now()) {
     this._assertOpen();
-    this._assertActive(sessionId, ["recording", "paused"]);
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(at, "at");
-    if (this.state.status === "recording") {
+    if (ACTIVE_SESSION_STATUSES.has(this.state.status)) {
       try {
-        this.writer.close(at);
-        this.writer = null;
+        this.writer.closeAll(at);
       } catch (error) {
-        if (!(error instanceof DiskSpaceError)) throw error;
-        return this._failForDisk(error.code, at);
+        const diskError = this._findDiskSpaceError(error);
+        if (!diskError) throw error;
+        return this._failForDisk(diskError.code, at);
       }
-      this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
     }
-    this.state.activeSince = null;
-    this.repository.setSessionStatus(this.state.sessionId, "completed", at);
-    this.state.status = "completed";
+    this.writer = null;
+    this._finishSources(at, "ended");
+    this._transitionSessionStatus("completed", at);
+    this._persistSessionStatus("completed", at);
     return this._publish(at);
   }
 
   failCapture(sessionId, code, at = this.now()) {
     this._assertOpen();
-    this._assertActive(sessionId, ["recording", "paused"]);
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(at, "at");
     if (typeof code !== "string" || code.length === 0) {
       throw new TypeError("code must be a non-empty string");
     }
-    if (this.state.status === "recording") {
+    if (ACTIVE_SESSION_STATUSES.has(this.state.status)) {
       try {
-        this.writer.close(at);
+        this.writer.closeAll(at);
       } catch {
-        this.writer.abort?.();
+        this.writer.abortAll?.();
       }
-      this.writer = null;
-      this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
     }
-    this.state.activeSince = null;
-    this.state.status = "failed";
+    this.writer = null;
+    this._finishSources(at, "failed");
+    this._transitionSessionStatus("failed", at);
     this.state.errorCode = code;
-    this.repository.setSessionStatus(this.state.sessionId, "failed", at);
+    this._persistSessionStatus("failed", at);
     return this._publish(at);
   }
 
@@ -224,15 +313,15 @@ class JarvisService {
       const at = this.now();
       if (this.writer) {
         try {
-          this.writer.close(at);
+          this.writer.closeAll(at);
         } catch (error) {
-          this.writer.abort?.();
-          if (["recording", "paused"].includes(this.state.status)) {
-            const code = error instanceof DiskSpaceError ? error.code : "AUDIO_WRITE_FAILED";
-            this.state.status = "failed";
-            this.state.errorCode = code;
-            this.state.activeSince = null;
-            this.repository.setSessionStatus(this.state.sessionId, "failed", at);
+          this.writer.abortAll?.();
+          if (["recording", "degraded", "paused"].includes(this.state.status)) {
+            const diskError = this._findDiskSpaceError(error);
+            this._finishSources(at, "failed");
+            this._transitionSessionStatus("failed", at);
+            this.state.errorCode = diskError?.code ?? "AUDIO_WRITE_FAILED";
+            this._persistSessionStatus("failed", at);
             this._publish(at);
           }
           this.writer = null;
@@ -240,13 +329,10 @@ class JarvisService {
         }
         this.writer = null;
       }
-      if (["recording", "paused"].includes(this.state.status)) {
-        if (this.state.status === "recording" && this.state.activeSince !== null) {
-          this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
-        }
-        this.state.activeSince = null;
-        this.state.status = "recovered";
-        this.repository.setSessionStatus(this.state.sessionId, "recovered", at);
+      if (["recording", "degraded", "paused"].includes(this.state.status)) {
+        this._finishSources(at, "recovered");
+        this._transitionSessionStatus("recovered", at);
+        this._persistSessionStatus("recovered", at);
         this._publish(at);
       }
     } finally {
@@ -254,23 +340,118 @@ class JarvisService {
     }
   }
 
-  _createWriter(sessionId, baseDir, startedAt) {
-    return new AudioChunkWriter({
+  _idleState() {
+    return {
+      sessionId: null,
+      status: "idle",
+      startedAt: null,
+      activeSince: null,
+      accumulatedMs: 0,
+      errorCode: null,
+      captureMode: null,
+      sources: {},
+    };
+  }
+
+  _createWriter(sessionId, baseDir) {
+    const tracks = Object.fromEntries(
+      Object.values(this.state.sources).map((source) => [
+        source.sourceType,
+        { id: source.trackId, startedAt: this.state.startedAt },
+      ])
+    );
+    return new MultiTrackAudioWriter({
       sessionId,
+      tracks,
       baseDir,
-      sampleRate: 24000,
-      chunkSeconds: 60,
       now: this.now,
-      startedAt,
       beforeChunk: () => this._assertSafeDiskSpace(),
       onChunk: (chunk) => {
         if (this.closed) return null;
-        return this.repository.insertAudioChunk({
+        return this.repository.commitChunk({
           ...chunk,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
         });
       },
     });
+  }
+
+  _interruptSource(sessionId, sourceType, { at, reason }, writerError = null) {
+    const source = this._assertSourceSession(sessionId, sourceType, ["recording", "degraded"]);
+    this._assertTime(at, "at");
+    if (typeof reason !== "string" || reason.length === 0) {
+      throw new TypeError("reason must be a non-empty string");
+    }
+    if (source.state === "reconnecting") return this._publicState(at);
+    if (source.state !== "active") throw new Error(`capture source is not active: ${source.sourceType}`);
+
+    let closeError = writerError;
+    try {
+      this.writer.closeSource(source.sourceType, at);
+    } catch (error) {
+      closeError ??= error;
+      const diskError = this._findDiskSpaceError(error);
+      if (diskError) return this._failForDisk(diskError.code, at);
+    }
+    const gapId = `gap-${crypto.randomUUID()}`;
+    this.repository.setTrackState(source.trackId, "recovering", at);
+    this.repository.openGap({
+      id: gapId,
+      trackId: source.trackId,
+      startedAt: at,
+      reason,
+      recoveryAttempts: 0,
+    });
+    Object.assign(source, {
+      state: "reconnecting",
+      gapId,
+      interruptedAt: at,
+      reason,
+      errorCode: closeError ? "AUDIO_WRITE_FAILED" : null,
+    });
+    const status = this._deriveSessionStatus();
+    this._transitionSessionStatus(status, at);
+    this._persistSessionStatus(status, at);
+    return this._publish(at);
+  }
+
+  _finishSources(at, state) {
+    for (const source of Object.values(this.state.sources)) {
+      if (source.gapId) {
+        this.repository.closeGap(source.gapId, at, null);
+        source.gapId = null;
+      }
+      source.state = state;
+      this.repository.setTrackState(source.trackId, state, at);
+    }
+  }
+
+  _deriveSessionStatus() {
+    const sources = Object.values(this.state.sources);
+    const activeCount = sources.filter((source) => source.state === "active").length;
+    if (activeCount === sources.length) return "recording";
+    if (activeCount > 0) return "degraded";
+    return "paused";
+  }
+
+  _transitionSessionStatus(status, at) {
+    const wasActive = ACTIVE_SESSION_STATUSES.has(this.state.status);
+    const willBeActive = ACTIVE_SESSION_STATUSES.has(status);
+    if (wasActive && !willBeActive && this.state.activeSince !== null) {
+      this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
+      this.state.activeSince = null;
+    } else if (!wasActive && willBeActive) {
+      this.state.activeSince = at;
+    }
+    this.state.status = status;
+  }
+
+  _persistSessionStatus(status, at) {
+    return this.repository.setSessionStatus(
+      this.state.sessionId,
+      status === "degraded" ? "recording" : status,
+      at
+    );
   }
 
   _assertSafeDiskSpace() {
@@ -296,17 +477,33 @@ class JarvisService {
     }
   }
 
-  _failForDisk(code, at) {
-    this.writer?.abort?.();
-    this.writer = null;
-    if (this.state.status === "recording" && this.state.activeSince !== null) {
-      this.state.accumulatedMs += Math.max(0, at - this.state.activeSince);
+  _findDiskSpaceError(error) {
+    if (error instanceof DiskSpaceError) return error;
+    if (error instanceof AggregateError) {
+      for (const nested of error.errors) {
+        const found = this._findDiskSpaceError(nested);
+        if (found) return found;
+      }
     }
-    this.state.activeSince = null;
-    this.state.status = "failed";
+    return error?.cause ? this._findDiskSpaceError(error.cause) : null;
+  }
+
+  _failForDisk(code, at) {
+    this.writer?.abortAll?.();
+    this.writer = null;
+    this._finishSources(at, "failed");
+    this._transitionSessionStatus("failed", at);
     this.state.errorCode = code;
-    this.repository.setSessionStatus(this.state.sessionId, "failed", at);
+    this._persistSessionStatus("failed", at);
     return this._publish(at);
+  }
+
+  _assertSourceSession(sessionId, sourceType, expectedStatuses) {
+    this._assertActive(sessionId, expectedStatuses);
+    const type = assertSourceType(sourceType);
+    const source = this.state.sources[type];
+    if (!source) throw new Error(`capture source was not requested: ${type}`);
+    return source;
   }
 
   _assertActive(sessionId, expectedStatuses) {
@@ -328,7 +525,7 @@ class JarvisService {
 
   _publicState(at) {
     const activeMs =
-      this.state.status === "recording" && this.state.activeSince !== null
+      ACTIVE_SESSION_STATUSES.has(this.state.status) && this.state.activeSince !== null
         ? Math.max(0, at - this.state.activeSince)
         : 0;
     return {
@@ -337,6 +534,10 @@ class JarvisService {
       startedAt: this.state.startedAt,
       elapsedMs: this.state.accumulatedMs + activeMs,
       errorCode: this.state.errorCode,
+      captureMode: this.state.captureMode,
+      sources: Object.fromEntries(
+        Object.entries(this.state.sources).map(([sourceType, source]) => [sourceType, { ...source }])
+      ),
     };
   }
 

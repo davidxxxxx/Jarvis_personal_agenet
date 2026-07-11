@@ -33,6 +33,7 @@ class AudioChunkWriter {
     chunkSeconds = MAX_CHUNK_SECONDS,
     now = Date.now,
     startedAt = now(),
+    sequenceNumber = 0,
     beforeChunk = () => {},
     onChunk,
   }) {
@@ -51,6 +52,9 @@ class AudioChunkWriter {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     if (!Number.isSafeInteger(startedAt)) {
       throw new TypeError("startedAt must be a safe integer");
+    }
+    if (!Number.isSafeInteger(sequenceNumber) || sequenceNumber < 0) {
+      throw new TypeError("sequenceNumber must be a non-negative safe integer");
     }
     if (typeof onChunk !== "function") throw new TypeError("onChunk must be a function");
     if (typeof beforeChunk !== "function") throw new TypeError("beforeChunk must be a function");
@@ -72,7 +76,7 @@ class AudioChunkWriter {
     this.pending = [];
     this.pendingBytes = 0;
     this.startedAt = startedAt;
-    this.sequenceNumber = 0;
+    this.sequenceNumber = sequenceNumber;
     this.fault = null;
     this.closed = false;
     fs.mkdirSync(baseDir, { recursive: true });
@@ -131,7 +135,7 @@ class AudioChunkWriter {
     return output;
   }
 
-  _emit(pcmBuffer, at) {
+  _emit(pcmBuffer, _at) {
     if (pcmBuffer.length === 0) return;
 
     const id = `chunk-${crypto.randomUUID()}`;

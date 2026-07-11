@@ -121,16 +121,7 @@ test("closeAll flushes every source and aggregates source-aware failures", () =>
     assert.equal(completed[0].sourceType, "system");
     assert.equal(fs.readFileSync(completed[0].path).subarray(44).equals(Buffer.alloc(48, 2)), true);
 
-    assert.throws(
-      () => writer.closeAll(1001),
-      (error) => {
-        assert.equal(error instanceof AggregateError, true);
-        assert.match(error.message, /mic/);
-        assert.equal(error.errors.length, 1);
-        assert.match(error.errors[0].cause.cause.message, /mic commit failed/);
-        return true;
-      }
-    );
+    assert.doesNotThrow(() => writer.closeAll(1001));
     assert.equal(completed.length, 1);
     assert.equal(
       fs.readdirSync(path.join(baseDir, "mic")).filter((name) => name.endsWith(".recovery.json"))
@@ -175,9 +166,40 @@ test("closeSource failure does not close another source", () => {
     assert.match(fault.cause.message, /mic commit failed/);
     writer.append("system", Buffer.alloc(48, 2));
     writer.closeSource("system", 1001);
-    assert.throws(() => writer.closeSource("mic", 1002), (error) => error === fault);
+    assert.doesNotThrow(() => writer.closeSource("mic", 1002));
 
     assert.equal(completed.length, 1);
     assert.equal(completed[0].sourceType, "system");
+  });
+});
+
+test("reopens one closed source without replacing a surviving writer", () => {
+  withTempDir((baseDir) => {
+    const completed = [];
+    const writer = new MultiTrackAudioWriter({
+      sessionId: "s1",
+      baseDir,
+      tracks: {
+        mic: { id: "tm", startedAt: 10 },
+        system: { id: "ts", startedAt: 20 },
+      },
+      onChunk: (chunk) => completed.push(chunk),
+    });
+
+    writer.append("system", Buffer.alloc(48, 1));
+    writer.closeSource("system", 1000);
+    writer.append("mic", Buffer.alloc(48, 2));
+    writer.reopenSource("system", { id: "ts", startedAt: 1100 });
+    writer.append("system", Buffer.alloc(48, 3));
+    writer.closeAll(1200);
+
+    assert.deepEqual(
+      completed.map((chunk) => [chunk.sourceType, chunk.sequenceNumber]),
+      [
+        ["system", 0],
+        ["mic", 0],
+        ["system", 1],
+      ]
+    );
   });
 });

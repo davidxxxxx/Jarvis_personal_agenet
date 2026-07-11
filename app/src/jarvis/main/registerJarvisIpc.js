@@ -4,6 +4,7 @@ const {
   assertSessionStatus,
   assertMicErrorCode,
 } = require("../shared/contracts");
+const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const fs = require("node:fs/promises");
 
 const REQUIRED_REPOSITORY_METHODS = [
@@ -172,7 +173,9 @@ function registerJarvisIpc({
       return miniMaxConfig();
     });
   }
-  ipcMain.handle(CHANNELS.startCapture, (_event, input) => service.startCapture(input));
+  ipcMain.handle(CHANNELS.startCapture, (_event, input) =>
+    service.startCapture(normalizeCaptureStartInput(input))
+  );
   ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at, errorCode) =>
     service.pauseCapture(assertId(id, "sessionId"), at, errorCode)
   );

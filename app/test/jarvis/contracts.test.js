@@ -1,6 +1,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { CHANNELS, assertId, assertSessionStatus } = require("../../src/jarvis/shared/contracts");
+const {
+  CHANNELS,
+  assertId,
+  assertSessionStatus,
+  assertCaptureMode,
+  assertSourceType,
+} = require("../../src/jarvis/shared/contracts");
 const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
 
 function createRepository(overrides = {}) {
@@ -104,6 +110,49 @@ test("contract rejects path traversal and unknown states", () => {
   assert.throws(() => assertId("../secret", "sessionId"), /safe identifier/);
   assert.throws(() => assertSessionStatus("hidden-recording"), /invalid session status/);
   assert.equal(assertSessionStatus("recording"), "recording");
+  assert.throws(() => assertSessionStatus("degraded"), /invalid session status/);
+  assert.equal(assertCaptureMode("dual"), "dual");
+  assert.equal(assertSourceType("system"), "system");
+  assert.throws(() => assertCaptureMode("auto"), /invalid capture mode/);
+  assert.throws(() => assertSourceType("mixed"), /invalid source type/);
+});
+
+test("start capture IPC rejects invalid source selections before calling the service", () => {
+  let calls = 0;
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService({
+      startCapture() {
+        calls += 1;
+      },
+    }),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  assert.throws(
+    () =>
+      handlers.get(CHANNELS.startCapture)(null, {
+        sessionId: "s1",
+        startedAt: 10,
+        captureMode: "dual",
+        sources: [{ sourceType: "mic" }],
+      }),
+    /sources must exactly match capture mode dual/
+  );
+  assert.throws(
+    () =>
+      handlers.get(CHANNELS.startCapture)(null, {
+        sessionId: "s1",
+        startedAt: 10,
+        captureMode: "auto",
+        sources: [],
+      }),
+    /invalid capture mode/
+  );
+  assert.equal(calls, 0);
 });
 
 test("contract exposes only the named Jarvis channels", () => {
@@ -439,6 +488,11 @@ test("failCapture IPC validates MIC codes and preserves authoritative failed bro
       session.status = status;
     },
     insertAudioChunk: () => {},
+    createTrack: () => {},
+    setTrackState: () => {},
+    openGap: () => {},
+    closeGap: () => {},
+    commitChunk: () => {},
     recoverOpenSessions: () => [],
   };
   const fsImpl = Object.create(fs);

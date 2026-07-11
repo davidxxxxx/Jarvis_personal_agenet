@@ -40,6 +40,8 @@ const CHANNELS = Object.freeze({
   stateChanged: "jarvis:state-changed",
 });
 
+const { assertCaptureMode, assertSourceType } = require("./captureModes");
+
 const SESSION_STATUSES = new Set([
   "recording",
   "paused",
@@ -74,4 +76,6 @@ module.exports = {
   assertId,
   assertSessionStatus,
   assertMicErrorCode,
+  assertCaptureMode,
+  assertSourceType,
 };
