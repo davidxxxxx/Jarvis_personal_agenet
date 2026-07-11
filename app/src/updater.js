@@ -1,4 +1,11 @@
-const { autoUpdater } = require("electron-updater");
+let autoUpdater = null;
+let autoUpdaterLoadError = null;
+
+try {
+  ({ autoUpdater } = require("electron-updater"));
+} catch (error) {
+  autoUpdaterLoadError = error;
+}
 
 class UpdateManager {
   constructor() {
@@ -15,6 +22,7 @@ class UpdateManager {
     this.updateCheckInterval = null;
     this.windowManager = null;
     this._suppressNotification = false;
+    this.updaterUnavailableError = autoUpdaterLoadError;
 
     this.setupAutoUpdater();
   }
@@ -30,6 +38,14 @@ class UpdateManager {
 
   setupAutoUpdater() {
     if (process.env.NODE_ENV === "development") {
+      return;
+    }
+
+    if (!autoUpdater) {
+      console.error(
+        "Automatic updates are unavailable; continuing without updater support:",
+        this.updaterUnavailableError
+      );
       return;
     }
 
@@ -179,6 +195,13 @@ class UpdateManager {
         };
       }
 
+      if (!autoUpdater) {
+        return {
+          updateAvailable: false,
+          message: "Automatic updates are unavailable in this build",
+        };
+      }
+
       console.log("🔍 Checking for updates...");
       this._suppressNotification = true;
       const result = await autoUpdater.checkForUpdates();
@@ -211,6 +234,13 @@ class UpdateManager {
         return {
           success: false,
           message: "Update downloads are disabled in development mode",
+        };
+      }
+
+      if (!autoUpdater) {
+        return {
+          success: false,
+          message: "Automatic updates are unavailable in this build",
         };
       }
 
@@ -247,6 +277,13 @@ class UpdateManager {
         return {
           success: false,
           message: "Update installation is disabled in development mode",
+        };
+      }
+
+      if (!autoUpdater) {
+        return {
+          success: false,
+          message: "Automatic updates are unavailable in this build",
         };
       }
 
@@ -311,7 +348,7 @@ class UpdateManager {
   }
 
   checkForUpdatesOnStartup() {
-    if (process.env.NODE_ENV !== "development") {
+    if (process.env.NODE_ENV !== "development" && autoUpdater) {
       setTimeout(() => {
         console.log("🔄 Checking for updates on startup...");
         autoUpdater.checkForUpdates().catch((err) => {
@@ -334,9 +371,11 @@ class UpdateManager {
       clearInterval(this.updateCheckInterval);
       this.updateCheckInterval = null;
     }
-    this.eventListeners.forEach(({ event, handler }) => {
-      autoUpdater.removeListener(event, handler);
-    });
+    if (autoUpdater) {
+      this.eventListeners.forEach(({ event, handler }) => {
+        autoUpdater.removeListener(event, handler);
+      });
+    }
     this.eventListeners = [];
     if (this.handleBeforeQuitForUpdate) {
       require("electron").autoUpdater.removeListener(
