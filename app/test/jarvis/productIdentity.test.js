@@ -52,6 +52,11 @@ test("Windows packaging exposes the Task 1 Jarvis contract", () => {
     schemes: ["jarvis-memory"],
   });
   assert.deepEqual(builder.win.target, ["nsis", "portable"]);
+  assert.equal(
+    builder.npmRebuild,
+    false,
+    "the guarded build script rebuilds only better-sqlite3; electron-builder must not rebuild unrelated native modules"
+  );
   assert.equal(builder.publish, null);
   assert.equal(unsignedBuilder.win.azureSignOptions, null);
 });
