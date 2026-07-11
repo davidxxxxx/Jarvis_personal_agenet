@@ -161,31 +161,29 @@ test("rejects duplicate track sequence without a partial chunk or job", (t) => {
   assert.equal(db.prepare("SELECT id FROM audio_chunks").get().id, "c1");
 });
 
-test("rolls back a new chunk when its transcription input already has a job", (t) => {
+test("creates distinct jobs for time-positioned chunks with identical PCM hashes", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
-  createTrack(store, {
-    id: "t2",
-    sourceType: "mic",
-    deviceId: "device-2",
-    deviceLabel: "Microphone",
-    strategy: "media-recorder",
-  });
   store.commitChunk(chunk());
 
-  assert.throws(() =>
-    store.commitChunk(
-      chunk({
-        id: "c2",
-        trackId: "t2",
-        sourceType: "mic",
-        path: "c2.wav",
-      })
-    )
+  store.commitChunk(
+    chunk({
+      id: "c2",
+      sequenceNumber: 1,
+      path: "c2.wav",
+      startedAt: 20,
+      endedAt: 30,
+    })
   );
 
-  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 1);
-  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 2);
+  assert.deepEqual(
+    db
+      .prepare("SELECT chunk_id FROM processing_jobs ORDER BY chunk_id")
+      .all()
+      .map((row) => row.chunk_id),
+    ["c1", "c2"]
+  );
 });
 
 test("rolls back transcription creation when the chunk insert fails", (t) => {
@@ -231,19 +229,82 @@ test("enqueueChunkTranscription is idempotent by transcription input", (t) => {
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
 });
 
-test("tombstones chunk bytes once while retaining evidence metadata", (t) => {
+test("rejects chunks whose track session or source does not match", (t) => {
+  const { store, db } = fixture(t);
+  db.prepare(
+    "INSERT INTO sessions (id, started_at, status, created_at) VALUES ('s2', 10, 'recording', 10)"
+  ).run();
+  createTrack(store);
+
+  assert.throws(() => store.commitChunk(chunk({ sessionId: "s2" })), /session/i);
+  assert.throws(() => store.commitChunk(chunk({ sourceType: "mic" })), /source/i);
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
+test("rejects enqueue metadata that does not match the persisted chunk", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
   store.commitChunk(chunk());
 
+  assert.throws(() => store.enqueueChunkTranscription(chunk({ sessionId: "other" })), /session/i);
+  assert.throws(() => store.enqueueChunkTranscription(chunk({ trackId: "other" })), /track/i);
+  assert.throws(() => store.enqueueChunkTranscription(chunk({ sourceType: "mic" })), /source/i);
+  assert.throws(() => store.enqueueChunkTranscription(chunk({ sha256: "other" })), /hash/i);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
+});
+
+test("accepts only 24 kHz mono evidence tracks", (t) => {
+  const { store, db } = fixture(t);
+
+  assert.throws(() => createTrack(store, { sampleRate: 16_000 }), /24 kHz/i);
+  assert.throws(() => createTrack(store, { channels: 2 }), /mono/i);
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_tracks").get().count, 0);
+});
+
+test("rejects invalid chunk duration and retention deadlines", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+  assert.throws(
+    () => store.commitChunk(chunk({ endedAt: 10, durationMs: 0 })),
+    /positive/i
+  );
+  assert.throws(
+    () =>
+      store.commitChunk(
+        chunk({ endedAt: 60_011, durationMs: 60_001, expiresAt: 60_011 + sevenDaysMs })
+      ),
+    /60000/i
+  );
+  assert.throws(
+    () => store.commitChunk(chunk({ expiresAt: 20 + sevenDaysMs + 1 })),
+    /seven days/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
+test("tombstones multiple chunks once while retaining evidence metadata", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk());
+  store.commitChunk(
+    chunk({ id: "c2", sequenceNumber: 1, path: "c2.wav", sha256: "def" })
+  );
+
   assert.equal(store.tombstoneChunk("c1", 200).changes, 1);
+  assert.equal(store.tombstoneChunk("c2", 201).changes, 1);
   assert.equal(store.tombstoneChunk("c1", 300).changes, 0);
 
-  const row = db.prepare("SELECT * FROM audio_chunks WHERE id = 'c1'").get();
-  assert.equal(row.path, "");
-  assert.equal(row.deleted_at, 200);
-  assert.equal(row.sha256, "abc");
-  assert.equal(row.started_at, 10);
+  const rows = db.prepare("SELECT * FROM audio_chunks ORDER BY id").all();
+  assert.equal(rows[0].path, "tombstone:c1");
+  assert.equal(rows[0].deleted_at, 200);
+  assert.equal(rows[0].sha256, "abc");
+  assert.equal(rows[0].started_at, 10);
+  assert.equal(rows[1].path, "tombstone:c2");
+  assert.equal(rows[1].deleted_at, 201);
 });
 
 test("JarvisRepository delegates the complete capture evidence interface", () => {

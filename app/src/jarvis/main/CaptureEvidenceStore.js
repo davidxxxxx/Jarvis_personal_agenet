@@ -1,3 +1,6 @@
+const MAX_CHUNK_DURATION_MS = 60_000;
+const MAX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 class CaptureEvidenceStore {
   constructor(db, { createId, now = Date.now }) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
@@ -38,6 +41,7 @@ class CaptureEvidenceStore {
             recovery_attempts = COALESCE(@recoveryAttempts, recovery_attempts)
         WHERE id = @id AND ended_at IS NULL
       `),
+      getTrack: db.prepare("SELECT * FROM audio_tracks WHERE id = ?"),
       findChunkSequence: db.prepare(`
         SELECT id FROM audio_chunks
         WHERE track_id = ? AND sequence_number = ?
@@ -53,26 +57,33 @@ class CaptureEvidenceStore {
           'pending', 'committed'
         )
       `),
+      getChunk: db.prepare("SELECT * FROM audio_chunks WHERE id = ?"),
       insertTranscriptionJob: db.prepare(`
         INSERT INTO processing_jobs (
-          id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
         ) VALUES (
           @id, @sessionId, @trackId, @chunkId,
-          'transcribe_chunk', 'pending', @inputHash, @createdAt
+          'transcribe_chunk', 'pending', @inputHash, @inputVersion, @modelVersion, @createdAt
         )
       `),
       getTranscriptionJobByInput: db.prepare(`
         SELECT * FROM processing_jobs
-        WHERE job_type = 'transcribe_chunk' AND input_hash = ?
+        WHERE job_type = 'transcribe_chunk'
+          AND chunk_id = @chunkId
+          AND input_hash = @inputHash
+          AND input_version = @inputVersion
+          AND model_version = @modelVersion
       `),
       tombstoneChunk: db.prepare(`
         UPDATE audio_chunks
-        SET path = '', deleted_at = ?
+        SET path = 'tombstone:' || id, deleted_at = ?
         WHERE id = ? AND deleted_at IS NULL
       `),
     };
 
     this.commitChunkTransaction = db.transaction((chunk) => {
+      this._assertChunk(chunk);
       if (this.statements.findChunkSequence.get(chunk.trackId, chunk.sequenceNumber)) {
         throw new Error(
           `chunk sequence ${chunk.sequenceNumber} already exists for track ${chunk.trackId}`
@@ -84,6 +95,12 @@ class CaptureEvidenceStore {
   }
 
   createTrack(track) {
+    if (track.sampleRate !== 24_000) {
+      throw new RangeError("capture evidence tracks must use 24 kHz sample rate");
+    }
+    if (track.channels !== 1) {
+      throw new RangeError("capture evidence tracks must be mono");
+    }
     return this.statements.createTrack.run({
       ...track,
       deviceId: track.deviceId ?? null,
@@ -117,20 +134,62 @@ class CaptureEvidenceStore {
   }
 
   enqueueChunkTranscription(chunk) {
-    const existing = this.statements.getTranscriptionJobByInput.get(chunk.sha256);
+    const persisted = this.statements.getChunk.get(chunk.id);
+    if (!persisted) throw new Error(`chunk ${chunk.id} does not exist`);
+    if (persisted.session_id !== chunk.sessionId) throw new Error("chunk session does not match");
+    if (persisted.track_id !== chunk.trackId) throw new Error("chunk track does not match");
+    if (persisted.source_type !== chunk.sourceType) throw new Error("chunk source does not match");
+    if (persisted.sha256 !== chunk.sha256) throw new Error("chunk input hash does not match");
+
+    const input = this._transcriptionInput(chunk);
+    const existing = this.statements.getTranscriptionJobByInput.get(input);
     return existing ?? this._insertChunkTranscription(chunk);
   }
 
   _insertChunkTranscription(chunk) {
+    const input = this._transcriptionInput(chunk);
     this.statements.insertTranscriptionJob.run({
       id: this.createId("job"),
       sessionId: chunk.sessionId,
       trackId: chunk.trackId,
-      chunkId: chunk.id,
-      inputHash: chunk.sha256,
+      ...input,
       createdAt: this.now(),
     });
-    return this.statements.getTranscriptionJobByInput.get(chunk.sha256);
+    return this.statements.getTranscriptionJobByInput.get(input);
+  }
+
+  _transcriptionInput(chunk) {
+    return {
+      chunkId: chunk.id,
+      inputHash: chunk.sha256,
+      inputVersion: chunk.inputVersion ?? 1,
+      modelVersion: chunk.modelVersion ?? "",
+    };
+  }
+
+  _assertChunk(chunk) {
+    const track = this.statements.getTrack.get(chunk.trackId);
+    if (!track) throw new Error(`track ${chunk.trackId} does not exist`);
+    if (track.session_id !== chunk.sessionId) throw new Error("chunk session does not match track");
+    if (track.source_type !== chunk.sourceType) throw new Error("chunk source does not match track");
+    if (!Number.isSafeInteger(chunk.durationMs) || chunk.durationMs <= 0) {
+      throw new RangeError("chunk duration must be a positive integer");
+    }
+    if (chunk.durationMs > MAX_CHUNK_DURATION_MS) {
+      throw new RangeError("chunk duration must not exceed 60000 ms");
+    }
+    if (!Number.isSafeInteger(chunk.startedAt) || !Number.isSafeInteger(chunk.endedAt)) {
+      throw new TypeError("chunk timestamps must be safe integers");
+    }
+    if (chunk.endedAt <= chunk.startedAt) {
+      throw new RangeError("chunk endedAt must be after startedAt");
+    }
+    if (!Number.isSafeInteger(chunk.expiresAt)) {
+      throw new TypeError("chunk expiresAt must be a safe integer");
+    }
+    if (chunk.expiresAt < chunk.endedAt || chunk.expiresAt > chunk.endedAt + MAX_RETENTION_MS) {
+      throw new RangeError("chunk expiry must be no later than seven days after endedAt");
+    }
   }
 }
 

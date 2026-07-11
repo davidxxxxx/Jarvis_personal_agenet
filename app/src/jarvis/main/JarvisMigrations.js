@@ -1,4 +1,27 @@
-const TARGET_VERSION = 1;
+const TARGET_VERSION = 2;
+
+const PROCESSING_JOBS_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    job_type TEXT NOT NULL,
+    state TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    input_hash TEXT NOT NULL,
+    input_version INTEGER NOT NULL DEFAULT 1,
+    model_version TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    error_code TEXT,
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    UNIQUE(job_type, chunk_id, input_hash, input_version, model_version)
+  );
+`;
 
 const MIGRATION_BASE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions (
@@ -44,6 +67,29 @@ function addColumn(db, table, definition) {
   }
 }
 
+function rebuildLegacyProcessingJobs(db) {
+  const sql = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs'")
+    .get()?.sql;
+  if (!sql?.replace(/\s+/g, "").includes("UNIQUE(job_type,input_hash)")) return;
+
+  db.exec(`
+    ALTER TABLE processing_jobs RENAME TO processing_jobs_v1;
+    ${PROCESSING_JOBS_SCHEMA}
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, next_retry_at,
+      lease_owner, lease_expires_at, error_code, created_at, completed_at
+    )
+    SELECT
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, COALESCE(model_version, ''), attempt_count, next_retry_at,
+      lease_owner, lease_expires_at, error_code, created_at, completed_at
+    FROM processing_jobs_v1;
+    DROP TABLE processing_jobs_v1;
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -87,26 +133,12 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         reason TEXT NOT NULL,
         recovery_attempts INTEGER NOT NULL DEFAULT 0
       );
-      CREATE TABLE IF NOT EXISTS processing_jobs (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
-        chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
-        job_type TEXT NOT NULL,
-        state TEXT NOT NULL,
-        priority INTEGER NOT NULL DEFAULT 0,
-        input_hash TEXT NOT NULL,
-        input_version INTEGER NOT NULL DEFAULT 1,
-        model_version TEXT,
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        next_retry_at INTEGER,
-        lease_owner TEXT,
-        lease_expires_at INTEGER,
-        error_code TEXT,
-        created_at INTEGER NOT NULL,
-        completed_at INTEGER,
-        UNIQUE(job_type, input_hash)
-      );
+    `);
+    db.exec(PROCESSING_JOBS_SCHEMA);
+    rebuildLegacyProcessingJobs(db);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence
+      ON audio_chunks(track_id, sequence_number);
     `);
 
     db.pragma(`user_version = ${TARGET_VERSION}`);
