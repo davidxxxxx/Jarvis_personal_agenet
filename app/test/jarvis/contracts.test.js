@@ -1,0 +1,403 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { CHANNELS, assertId, assertSessionStatus } = require("../../src/jarvis/shared/contracts");
+const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
+
+function createRepository(overrides = {}) {
+  return {
+    createSession: () => "created",
+    setSessionStatus: () => "status-set",
+    getSession: () => "session",
+    listSessions: () => [],
+    upsertTranscriptSegments: () => "segments-upserted",
+    syncTranscriptSegments: () => "segments-synced",
+    listTranscriptSegments: () => [],
+    renamePerson: () => "renamed",
+    listPeople: () => [],
+    listAudioChunks: () => [],
+    getCloudBudgetStatus: () => ({
+      monthUtc: "2026-07",
+      enabled: false,
+      monthlyLimitMicrousd: 5_000_000,
+      spentMicrousd: 0,
+      reservedMicrousd: 0,
+      remainingMicrousd: 5_000_000,
+      blockedReason: "cloud_disabled",
+    }),
+    setCloudBudgetSettings: () => ({ enabled: 0 }),
+    ...overrides,
+  };
+}
+
+function createService(overrides = {}) {
+  return {
+    startCapture: () => "capture-started",
+    pauseCapture: () => "capture-paused",
+    resumeCapture: () => "capture-resumed",
+    finishCapture: () => "capture-finished",
+    failCapture: () => "capture-failed",
+    ...overrides,
+  };
+}
+
+function createVoiceEnrollmentService(overrides = {}) {
+  return {
+    getStatus: () => "voice-status",
+    begin: () => "voice-begun",
+    complete: () => "voice-enrolled",
+    cancel: () => "voice-cancelled",
+    cancelOwner: () => 0,
+    ...overrides,
+  };
+}
+
+function createIpcHarness(overrides = {}) {
+  const handlers = new Map();
+  const ipcMain = {
+    handle(channel, handler) {
+      handlers.set(channel, handler);
+    },
+  };
+  const repository = createRepository(overrides);
+  const service = createService();
+  const voiceEnrollmentService = createVoiceEnrollmentService();
+  const environmentManager = { getOpenAIKey: () => "sk-project-test" };
+  registerJarvisIpc({
+    ipcMain,
+    repository,
+    service,
+    voiceEnrollmentService,
+    environmentManager,
+  });
+  return { handlers, repository, service, voiceEnrollmentService, environmentManager };
+}
+
+test("contract rejects path traversal and unknown states", () => {
+  assert.throws(() => assertId("../secret", "sessionId"), /safe identifier/);
+  assert.throws(() => assertSessionStatus("hidden-recording"), /invalid session status/);
+  assert.equal(assertSessionStatus("recording"), "recording");
+});
+
+test("contract exposes only the named Jarvis channels", () => {
+  assert.deepEqual(Object.keys(CHANNELS).sort(), [
+    "beginVoiceEnrollment",
+    "cancelVoiceEnrollment",
+    "completeVoiceEnrollment",
+    "control",
+    "createSession",
+    "failCapture",
+    "finishCapture",
+    "getCloudBudget",
+    "getSession",
+    "getVoiceEnrollmentStatus",
+    "listAudioChunks",
+    "listPeople",
+    "listSegments",
+    "listSessions",
+    "pauseCapture",
+    "renamePerson",
+    "resumeCapture",
+    "setCloudBudget",
+    "setSessionStatus",
+    "startCapture",
+    "stateChanged",
+    "syncSegments",
+    "upsertSegments",
+  ]);
+  assert.equal(Object.isFrozen(CHANNELS), true);
+});
+
+test("IPC registers only request-response repository channels", () => {
+  const { handlers } = createIpcHarness();
+
+  assert.deepEqual(
+    [...handlers.keys()].sort(),
+    [
+      CHANNELS.createSession,
+      CHANNELS.getSession,
+      CHANNELS.listAudioChunks,
+      CHANNELS.listPeople,
+      CHANNELS.listSegments,
+      CHANNELS.listSessions,
+      CHANNELS.renamePerson,
+      CHANNELS.setSessionStatus,
+      CHANNELS.syncSegments,
+      CHANNELS.upsertSegments,
+      CHANNELS.startCapture,
+      CHANNELS.pauseCapture,
+      CHANNELS.resumeCapture,
+      CHANNELS.finishCapture,
+      CHANNELS.failCapture,
+      CHANNELS.beginVoiceEnrollment,
+      CHANNELS.getVoiceEnrollmentStatus,
+      CHANNELS.completeVoiceEnrollment,
+      CHANNELS.cancelVoiceEnrollment,
+      CHANNELS.getCloudBudget,
+      CHANNELS.setCloudBudget,
+    ].sort()
+  );
+  assert.equal(handlers.has(CHANNELS.control), false);
+  assert.equal(handlers.has(CHANNELS.stateChanged), false);
+});
+
+test("IPC returns metadata-only self voice enrollment status", async () => {
+  const { handlers } = createIpcHarness();
+
+  assert.equal(await handlers.get(CHANNELS.getVoiceEnrollmentStatus)({ sender: { id: 7 } }), "voice-status");
+});
+
+test("IPC returns cloud budget status without exposing the project key", async () => {
+  let savedSettings = null;
+  const { handlers } = createIpcHarness({
+    setCloudBudgetSettings(input) {
+      savedSettings = input;
+    },
+    getCloudBudgetStatus() {
+      return {
+        monthUtc: "2026-07",
+        enabled: true,
+        monthlyLimitMicrousd: 10_000_000,
+        spentMicrousd: 1200,
+        reservedMicrousd: 100_000,
+        remainingMicrousd: 9_898_800,
+        blockedReason: null,
+      };
+    },
+  });
+
+  const initial = await handlers.get(CHANNELS.getCloudBudget)();
+  assert.equal(initial.keyConfigured, true);
+  assert.equal(JSON.stringify(initial).includes("sk-project-test"), false);
+
+  const updated = await handlers.get(CHANNELS.setCloudBudget)(null, {
+    enabled: true,
+    monthlyLimitMicrousd: 10_000_000,
+  });
+  assert.deepEqual(savedSettings, {
+    enabled: true,
+    monthlyLimitMicrousd: 10_000_000,
+  });
+  assert.equal(updated.keyConfigured, true);
+  assert.equal(updated.monthlyLimitMicrousd, 10_000_000);
+});
+
+test("IPC validates identifiers and statuses before calling the repository", () => {
+  let calls = 0;
+  const { handlers } = createIpcHarness({
+    setSessionStatus() {
+      calls += 1;
+    },
+    listTranscriptSegments() {
+      calls += 1;
+    },
+  });
+
+  assert.throws(
+    () => handlers.get(CHANNELS.setSessionStatus)(null, "../s1", "recording", 1000),
+    /safe identifier/
+  );
+  assert.throws(
+    () => handlers.get(CHANNELS.setSessionStatus)(null, "s1", "hidden-recording", 1000),
+    /invalid session status/
+  );
+  assert.throws(() => handlers.get(CHANNELS.listSegments)(null, "../s1"), /safe identifier/);
+  assert.equal(calls, 0);
+});
+
+test("IPC preserves repository errors for Electron invoke rejection", () => {
+  const expected = new Error("database closed");
+  const { handlers } = createIpcHarness({
+    getSession() {
+      throw expected;
+    },
+  });
+
+  assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
+});
+
+test("IPC binds narrow voice enrollment sessions to the requesting renderer", async () => {
+  const { handlers, voiceEnrollmentService } = createIpcHarness();
+  const event = { sender: { id: 42 } };
+  const payload = { sampleRate: 24_000, channels: 1, format: "float32", windows: [] };
+
+  assert.equal(await handlers.get(CHANNELS.beginVoiceEnrollment)(event), "voice-begun");
+  assert.equal(
+    await handlers.get(CHANNELS.completeVoiceEnrollment)(event, "opaque-id", payload),
+    "voice-enrolled"
+  );
+  assert.equal(handlers.get(CHANNELS.cancelVoiceEnrollment)(event, "opaque-id"), "voice-cancelled");
+  assert.equal(typeof voiceEnrollmentService.complete, "function");
+});
+
+test("IPC cancels renderer-owned enrollment when the sender is destroyed", () => {
+  let destroyedListener;
+  const cancelOwnerCalls = [];
+  const voiceEnrollmentService = createVoiceEnrollmentService({
+    cancelOwner(ownerId) {
+      cancelOwnerCalls.push(ownerId);
+      return 1;
+    },
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService,
+    environmentManager: { getOpenAIKey: () => null },
+  });
+  const event = {
+    sender: {
+      id: 42,
+      once(name, listener) {
+        assert.equal(name, "destroyed");
+        destroyedListener = listener;
+      },
+    },
+  };
+
+  handlers.get(CHANNELS.beginVoiceEnrollment)(event);
+  handlers.get(CHANNELS.beginVoiceEnrollment)(event);
+  assert.equal(typeof destroyedListener, "function");
+  destroyedListener();
+  assert.deepEqual(cancelOwnerCalls, [42]);
+});
+
+test("IPC registration rejects invalid IPC and missing handler capabilities", () => {
+  assert.throws(() => registerJarvisIpc({ ipcMain: null, repository: {}, service: {} }), /ipcMain/);
+  assert.throws(
+    () =>
+      registerJarvisIpc({
+        ipcMain: { handle() {} },
+        repository: null,
+        service: {},
+        voiceEnrollmentService: {},
+      }),
+    /repository/
+  );
+
+  const requiredMethods = [
+    "createSession",
+    "setSessionStatus",
+    "getSession",
+    "listSessions",
+    "upsertTranscriptSegments",
+    "syncTranscriptSegments",
+    "listTranscriptSegments",
+    "renamePerson",
+    "listPeople",
+    "listAudioChunks",
+    "getCloudBudgetStatus",
+    "setCloudBudgetSettings",
+  ];
+  for (const method of requiredMethods) {
+    const repository = createRepository();
+    delete repository[method];
+    const registered = [];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle: (channel) => registered.push(channel) },
+          repository,
+          service: createService(),
+          voiceEnrollmentService: createVoiceEnrollmentService(),
+          environmentManager: { getOpenAIKey: () => null },
+        }),
+      new RegExp(`repository\\.${method} must be a function`)
+    );
+    assert.deepEqual(registered, []);
+  }
+
+  for (const method of [
+    "startCapture",
+    "pauseCapture",
+    "resumeCapture",
+    "finishCapture",
+    "failCapture",
+  ]) {
+    const service = createService();
+    delete service[method];
+    const registered = [];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle: (channel) => registered.push(channel) },
+          repository: createRepository(),
+          service,
+          voiceEnrollmentService: createVoiceEnrollmentService(),
+          environmentManager: { getOpenAIKey: () => null },
+        }),
+      new RegExp(`service\\.${method} must be a function`)
+    );
+    assert.deepEqual(registered, []);
+  }
+
+  for (const method of ["begin", "complete", "cancel", "cancelOwner"]) {
+    const voiceEnrollmentService = createVoiceEnrollmentService();
+    delete voiceEnrollmentService[method];
+    assert.throws(
+      () =>
+        registerJarvisIpc({
+          ipcMain: { handle() {} },
+          repository: createRepository(),
+          service: createService(),
+          voiceEnrollmentService,
+          environmentManager: { getOpenAIKey: () => null },
+        }),
+      new RegExp(`voiceEnrollmentService\\.${method} must be a function`)
+    );
+  }
+});
+
+test("failCapture IPC validates MIC codes and preserves authoritative failed broadcast", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const JarvisService = require("../../src/jarvis/main/JarvisService");
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-fail-ipc-"));
+  const session = { id: "s1", status: "recording" };
+  const broadcasts = [];
+  const repository = {
+    getSession: () => session,
+    setSessionStatus: (_id, status) => {
+      session.status = status;
+    },
+    insertAudioChunk: () => {},
+    recoverOpenSessions: () => [],
+  };
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    now: () => 1_100,
+    fsImpl,
+    broadcast: (state) => broadcasts.push(state),
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service,
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.throws(
+      () => handlers.get(CHANNELS.failCapture)(null, "s1", "upstream_stop_failed", 1_100),
+      /microphone error code/
+    );
+    handlers.get(CHANNELS.failCapture)(null, "s1", "MIC_DISCONNECTED", 1_100);
+
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "MIC_DISCONNECTED");
+    assert.equal(session.status, "failed");
+    assert.equal(broadcasts.at(-1).status, "failed");
+    assert.equal(broadcasts.at(-1).errorCode, "MIC_DISCONNECTED");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});

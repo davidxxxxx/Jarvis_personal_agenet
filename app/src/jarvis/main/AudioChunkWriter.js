@@ -1,0 +1,171 @@
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const REQUIRED_SAMPLE_RATE = 24000;
+const BYTES_PER_SAMPLE = 2;
+const MAX_CHUNK_SECONDS = 60;
+
+function wavHeader(dataBytes, sampleRate) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataBytes, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataBytes, 40);
+  return header;
+}
+
+class AudioChunkWriter {
+  constructor({
+    sessionId,
+    baseDir,
+    sampleRate = REQUIRED_SAMPLE_RATE,
+    chunkSeconds = MAX_CHUNK_SECONDS,
+    now = Date.now,
+    startedAt = now(),
+    beforeChunk = () => {},
+    onChunk,
+  }) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      throw new TypeError("sessionId is required");
+    }
+    if (typeof baseDir !== "string" || baseDir.length === 0) {
+      throw new TypeError("baseDir is required");
+    }
+    if (sampleRate !== REQUIRED_SAMPLE_RATE) {
+      throw new RangeError("sampleRate must be exactly 24000 Hz");
+    }
+    if (!(chunkSeconds > 0 && chunkSeconds <= MAX_CHUNK_SECONDS)) {
+      throw new RangeError("chunkSeconds must be greater than 0 and at most 60");
+    }
+    if (typeof now !== "function") throw new TypeError("now must be a function");
+    if (!Number.isSafeInteger(startedAt)) {
+      throw new TypeError("startedAt must be a safe integer");
+    }
+    if (typeof onChunk !== "function") throw new TypeError("onChunk must be a function");
+    if (typeof beforeChunk !== "function") throw new TypeError("beforeChunk must be a function");
+
+    const chunkBytes = sampleRate * BYTES_PER_SAMPLE * chunkSeconds;
+    if (!Number.isSafeInteger(chunkBytes) || chunkBytes % BYTES_PER_SAMPLE !== 0) {
+      throw new RangeError("chunkSeconds must produce a whole number of 16-bit samples");
+    }
+
+    this.sessionId = sessionId;
+    this.baseDir = baseDir;
+    this.sampleRate = sampleRate;
+    this.chunkBytes = chunkBytes;
+    this.now = now;
+    this.onChunk = onChunk;
+    this.beforeChunk = beforeChunk;
+    this.pending = [];
+    this.pendingBytes = 0;
+    this.startedAt = startedAt;
+    this.closed = false;
+    fs.mkdirSync(baseDir, { recursive: true });
+  }
+
+  append(pcmBuffer) {
+    if (this.closed) throw new Error("audio chunk writer is closed");
+    const buffer = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer);
+    if (buffer.length % BYTES_PER_SAMPLE !== 0) {
+      throw new RangeError("PCM must contain complete signed 16-bit little-endian samples");
+    }
+    if (buffer.length === 0) return;
+
+    this.pending.push(Buffer.from(buffer));
+    this.pendingBytes += buffer.length;
+    while (this.pendingBytes >= this.chunkBytes) {
+      this.beforeChunk();
+      this._emit(this._take(this.chunkBytes), this.now());
+    }
+  }
+
+  close(at = this.now()) {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.pendingBytes === 0) return;
+    this.beforeChunk();
+    this._emit(this._take(this.pendingBytes), at);
+  }
+
+  abort() {
+    if (this.closed) return;
+    this.closed = true;
+    this.pending = [];
+    this.pendingBytes = 0;
+  }
+
+  _take(byteLength) {
+    const output = Buffer.allocUnsafe(byteLength);
+    let offset = 0;
+
+    while (offset < byteLength) {
+      const head = this.pending[0];
+      const take = Math.min(head.length, byteLength - offset);
+      head.copy(output, offset, 0, take);
+      offset += take;
+      this.pendingBytes -= take;
+      if (take === head.length) {
+        this.pending.shift();
+      } else {
+        this.pending[0] = head.subarray(take);
+      }
+    }
+
+    return output;
+  }
+
+  _emit(pcmBuffer, at) {
+    if (pcmBuffer.length === 0) return;
+
+    const id = `chunk-${crypto.randomUUID()}`;
+    const partPath = path.join(this.baseDir, `${id}.wav.part`);
+    const finalPath = path.join(this.baseDir, `${id}.wav`);
+    const wav = Buffer.concat([wavHeader(pcmBuffer.length, this.sampleRate), pcmBuffer]);
+    const durationMs = Math.round((pcmBuffer.length * 1000) / (this.sampleRate * BYTES_PER_SAMPLE));
+    const startedAt = this.startedAt;
+    const candidateEnd = Number.isSafeInteger(at) ? at : this.now();
+    const endedAt = Math.max(startedAt + durationMs, candidateEnd);
+    let fd = null;
+
+    try {
+      fd = fs.openSync(partPath, "wx");
+      fs.writeFileSync(fd, wav);
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      fs.renameSync(partPath, finalPath);
+    } catch (error) {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {}
+      }
+      try {
+        fs.unlinkSync(partPath);
+      } catch {}
+      throw error;
+    }
+
+    this.startedAt = endedAt;
+    this.onChunk({
+      id,
+      sessionId: this.sessionId,
+      path: finalPath,
+      startedAt,
+      endedAt,
+      durationMs,
+      sha256: crypto.createHash("sha256").update(wav).digest("hex"),
+    });
+  }
+}
+
+module.exports = AudioChunkWriter;
