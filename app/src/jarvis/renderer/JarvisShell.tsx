@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import {
   BrainCircuit,
@@ -12,6 +11,10 @@ import { useJarvisStore, type JarvisView } from "./jarvisStore";
 import { useJarvisRecording } from "./useJarvisRecording";
 import JarvisTitleBar from "./JarvisTitleBar";
 import TodayView from "./TodayView";
+import MemoryView from "./MemoryView";
+import PeopleView from "./PeopleView";
+import TopicsView from "./TopicsView";
+import TodosView from "./TodosView";
 
 const NAV_ITEMS: Array<{
   id: JarvisView;
@@ -30,9 +33,18 @@ export default function JarvisShell() {
   const selectedView = useJarvisStore((state) => state.selectedView);
   const setSelectedView = useJarvisStore((state) => state.setSelectedView);
 
-  useEffect(() => {
-    if (selectedView !== "today") setSelectedView("today");
-  }, [selectedView, setSelectedView]);
+  const content =
+    selectedView === "people" ? (
+      <PeopleView />
+    ) : selectedView === "topics" ? (
+      <TopicsView />
+    ) : selectedView === "todos" ? (
+      <TodosView />
+    ) : selectedView === "memory" ? (
+      <MemoryView />
+    ) : (
+      <TodayView recording={recording} />
+    );
 
   return (
     <div className="grid h-screen grid-rows-[40px_minmax(0,1fr)] overflow-hidden bg-background text-foreground">
@@ -59,36 +71,29 @@ export default function JarvisShell() {
           </div>
           <ul className="flex min-w-0 gap-1 overflow-x-auto lg:block lg:space-y-1">
             {NAV_ITEMS.map(({ id, icon: Icon }) => {
-              const disabled = id !== "today";
               return (
                 <li key={id}>
                   <button
                     type="button"
-                    disabled={disabled}
-                    aria-current={id === "today" ? "page" : undefined}
+                    aria-current={id === selectedView ? "page" : undefined}
                     onClick={() => setSelectedView(id)}
                     className={`w-full rounded-lg px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 ${
-                      id === "today"
+                      id === selectedView
                         ? "bg-primary/10 text-primary"
-                        : "text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                     }`}
                   >
                     <span className="flex items-center gap-2 text-sm font-medium">
                       <Icon className="size-4" aria-hidden="true" />
                       {t(`jarvis.${id}`)}
                     </span>
-                    {disabled && (
-                      <span className="mt-1 block pl-6 text-[10px] leading-3 text-muted-foreground">
-                        {t("jarvis.enableAfterAnalysis")}
-                      </span>
-                    )}
                   </button>
                 </li>
               );
             })}
           </ul>
         </nav>
-        <TodayView recording={recording} />
+        {content}
       </div>
     </div>
   );

@@ -91,15 +91,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
+    readAudioChunk: (audioChunkId) => ipcRenderer.invoke("jarvis:audio:read", audioChunkId),
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),
     searchMemory: (query, limit) => ipcRenderer.invoke("jarvis:memory:search", query, limit),
     listPeopleOverview: () => ipcRenderer.invoke("jarvis:memory:people"),
     getPersonDetail: (personId) => ipcRenderer.invoke("jarvis:memory:person-detail", personId),
     listTopics: () => ipcRenderer.invoke("jarvis:memory:topics"),
     getTopicDetail: (topicId) => ipcRenderer.invoke("jarvis:memory:topic-detail", topicId),
-    renameTopic: (topicId, title) => ipcRenderer.invoke("jarvis:memory:topic-rename", topicId, title),
+    renameTopic: (topicId, title) =>
+      ipcRenderer.invoke("jarvis:memory:topic-rename", topicId, title),
     listTodos: (status) => ipcRenderer.invoke("jarvis:memory:todos", status),
-    setTodoStatus: (todoId, status) => ipcRenderer.invoke("jarvis:memory:todo-status", todoId, status),
+    setTodoStatus: (todoId, status) =>
+      ipcRenderer.invoke("jarvis:memory:todo-status", todoId, status),
     listMemories: (limit) => ipcRenderer.invoke("jarvis:memory:list", limit),
     getTodayInsights: (sessionId) => ipcRenderer.invoke("jarvis:memory:today-insights", sessionId),
     analyzeSession: (sessionId, kind) => ipcRenderer.invoke("jarvis:analysis:run", sessionId, kind),
@@ -128,16 +131,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
       (callback) => (_event, envelope) => callback(envelope)
     ),
     controlReady: (rendererId) => ipcRenderer.send("jarvis:control:ready", rendererId),
-    claimControl: (id, rendererId) =>
-      ipcRenderer.invoke("jarvis:control:claim", id, rendererId),
+    claimControl: (id, rendererId) => ipcRenderer.invoke("jarvis:control:claim", id, rendererId),
     acknowledgeControl: (id, outcome, rendererId) =>
       ipcRenderer.send("jarvis:control:ack", id, outcome, rendererId),
     onShutdownRequested: registerListener(
       "jarvis:shutdown-request",
       (callback) => (_event, request) => callback(request)
     ),
-    acknowledgeShutdown: (id, outcome) =>
-      ipcRenderer.send("jarvis:shutdown:ack", id, outcome),
+    acknowledgeShutdown: (id, outcome) => ipcRenderer.send("jarvis:shutdown:ack", id, outcome),
     onStateChanged: registerListener(
       "jarvis:state-changed",
       (callback) => (_event, state) => callback(state)

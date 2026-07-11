@@ -486,7 +486,10 @@ class JarvisRepository {
       if (!settings.enabled) {
         return { ok: false, reason: "cloud_disabled" };
       }
-      if (totals.spent + totals.reserved + input.reservedMicrousd > settings.monthly_limit_microusd) {
+      if (
+        totals.spent + totals.reserved + input.reservedMicrousd >
+        settings.monthly_limit_microusd
+      ) {
         return { ok: false, reason: "budget_protected" };
       }
       this.statements.insertCloudUsage.run(input);
@@ -670,7 +673,9 @@ class JarvisRepository {
         evidenceFor(memory);
       }
 
-      this.db.prepare(`
+      this.db
+        .prepare(
+          `
         INSERT INTO analysis_runs (
           id, session_id, kind, window_start, window_end, input_hash, model,
           status, attempt_count, response_json, created_at, completed_at
@@ -678,25 +683,31 @@ class JarvisRepository {
         ON CONFLICT(session_id, kind, input_hash) DO UPDATE SET
           status = 'completed', response_json = excluded.response_json,
           completed_at = excluded.completed_at, error_code = NULL
-      `).run(
-        safe.runId,
-        safe.sessionId,
-        safe.kind,
-        safe.windowStart,
-        safe.windowEnd,
-        safe.inputHash,
-        safe.model,
-        JSON.stringify(safe.result),
-        safe.completedAt,
-        safe.completedAt
-      );
+      `
+        )
+        .run(
+          safe.runId,
+          safe.sessionId,
+          safe.kind,
+          safe.windowStart,
+          safe.windowEnd,
+          safe.inputHash,
+          safe.model,
+          JSON.stringify(safe.result),
+          safe.completedAt,
+          safe.completedAt
+        );
 
       const persistedRun = this.db
-        .prepare("SELECT id FROM analysis_runs WHERE session_id = ? AND kind = ? AND input_hash = ?")
+        .prepare(
+          "SELECT id FROM analysis_runs WHERE session_id = ? AND kind = ? AND input_hash = ?"
+        )
         .get(safe.sessionId, safe.kind, safe.inputHash);
       const runId = persistedRun.id;
 
-      this.db.prepare(`
+      this.db
+        .prepare(
+          `
         INSERT INTO session_summaries (
           session_id, summary, decisions_json, suggestions_json,
           analysis_run_id, updated_at, is_final
@@ -708,42 +719,63 @@ class JarvisRepository {
           analysis_run_id = excluded.analysis_run_id,
           updated_at = excluded.updated_at,
           is_final = MAX(session_summaries.is_final, excluded.is_final)
-      `).run(
-        safe.sessionId,
-        summary,
-        JSON.stringify(arrays.decisions),
-        JSON.stringify(arrays.suggestions),
-        runId,
-        safe.completedAt,
-        safe.kind === "final" ? 1 : 0
-      );
+      `
+        )
+        .run(
+          safe.sessionId,
+          summary,
+          JSON.stringify(arrays.decisions),
+          JSON.stringify(arrays.suggestions),
+          runId,
+          safe.completedAt,
+          safe.kind === "final" ? 1 : 0
+        );
 
       const topicIds = new Map();
       for (const topic of arrays.topics) {
         const title = normalizeDerivedText(topic.title, "topic title");
         const key = normalizedKey(title);
         const id = derivedId("topic", key);
-        this.db.prepare(`
+        this.db
+          .prepare(
+            `
           INSERT INTO topics (
             id, canonical_title, normalized_title, description, created_at, last_seen_at
           ) VALUES (?, ?, ?, ?, ?, ?)
           ON CONFLICT(normalized_title) DO UPDATE SET
             description = excluded.description, last_seen_at = excluded.last_seen_at
-        `).run(id, title, key, normalizeDerivedText(topic.description, "topic description"), safe.completedAt, safe.completedAt);
-        const persistedTopic = this.db.prepare("SELECT id FROM topics WHERE normalized_title = ?").get(key);
+        `
+          )
+          .run(
+            id,
+            title,
+            key,
+            normalizeDerivedText(topic.description, "topic description"),
+            safe.completedAt,
+            safe.completedAt
+          );
+        const persistedTopic = this.db
+          .prepare("SELECT id FROM topics WHERE normalized_title = ?")
+          .get(key);
         topicIds.set(key, persistedTopic.id);
-        this.db.prepare(`
+        this.db
+          .prepare(
+            `
           INSERT INTO session_topics (session_id, topic_id, analysis_run_id)
           VALUES (?, ?, ?)
           ON CONFLICT(session_id, topic_id) DO UPDATE SET analysis_run_id = excluded.analysis_run_id
-        `).run(safe.sessionId, persistedTopic.id, runId);
+        `
+          )
+          .run(safe.sessionId, persistedTopic.id, runId);
       }
 
       const resolveTopicId = (title) => {
         if (typeof title !== "string" || !title.trim()) return null;
         const key = normalizedKey(title);
         if (topicIds.has(key)) return topicIds.get(key);
-        return this.db.prepare("SELECT id FROM topics WHERE normalized_title = ?").get(key)?.id ?? null;
+        return (
+          this.db.prepare("SELECT id FROM topics WHERE normalized_title = ?").get(key)?.id ?? null
+        );
       };
       const resolvePersonId = (personRef) => {
         if (typeof personRef !== "string" || !personRef) return null;
@@ -765,7 +797,9 @@ class JarvisRepository {
         }
         const key = normalizedKey(content);
         const id = derivedId("todo", safe.sessionId, key, ownerId ?? "", topicId ?? "");
-        this.db.prepare(`
+        this.db
+          .prepare(
+            `
           INSERT INTO todos (
             id, content, normalized_content, owner_person_id, topic_id, due_at,
             created_at, updated_at, source_session_id, source_segment_id, analysis_run_id
@@ -773,7 +807,21 @@ class JarvisRepository {
           ON CONFLICT(id) DO UPDATE SET
             content = excluded.content, due_at = COALESCE(excluded.due_at, todos.due_at),
             updated_at = excluded.updated_at, analysis_run_id = excluded.analysis_run_id
-        `).run(id, content, key, ownerId, topicId, dueAt, safe.completedAt, safe.completedAt, safe.sessionId, evidence[0], runId);
+        `
+          )
+          .run(
+            id,
+            content,
+            key,
+            ownerId,
+            topicId,
+            dueAt,
+            safe.completedAt,
+            safe.completedAt,
+            safe.sessionId,
+            evidence[0],
+            runId
+          );
       }
 
       for (const memory of arrays.memories) {
@@ -782,7 +830,9 @@ class JarvisRepository {
         const topicId = resolveTopicId(memory.topicRef);
         const key = normalizedKey(content);
         const id = derivedId("memory", memory.type, key, personId ?? "", topicId ?? "");
-        this.db.prepare(`
+        this.db
+          .prepare(
+            `
           INSERT INTO memories (
             id, type, content, normalized_content, person_id, topic_id, confidence,
             first_seen_at, last_seen_at, needs_confirmation
@@ -792,12 +842,29 @@ class JarvisRepository {
             last_seen_at = excluded.last_seen_at,
             occurrence_count = memories.occurrence_count + 1,
             needs_confirmation = MIN(memories.needs_confirmation, excluded.needs_confirmation)
-        `).run(id, memory.type, content, key, personId, topicId, memory.confidence, safe.completedAt, safe.completedAt, memory.confidence < 0.7 ? 1 : 0);
+        `
+          )
+          .run(
+            id,
+            memory.type,
+            content,
+            key,
+            personId,
+            topicId,
+            memory.confidence,
+            safe.completedAt,
+            safe.completedAt,
+            memory.confidence < 0.7 ? 1 : 0
+          );
         for (const segmentId of evidenceFor(memory)) {
-          this.db.prepare(`
+          this.db
+            .prepare(
+              `
             INSERT OR IGNORE INTO memory_evidence (memory_id, segment_id, analysis_run_id)
             VALUES (?, ?, ?)
-          `).run(id, segmentId, runId);
+          `
+            )
+            .run(id, segmentId, runId);
         }
       }
       return this.getSessionDetail(safe.sessionId);
@@ -809,34 +876,50 @@ class JarvisRepository {
     const sessionId = assertId(id, "sessionId");
     const session = this.getSession(sessionId);
     if (!session) return null;
-    const summary = this.db.prepare("SELECT * FROM session_summaries WHERE session_id = ?").get(sessionId) ?? null;
+    const summary =
+      this.db.prepare("SELECT * FROM session_summaries WHERE session_id = ?").get(sessionId) ??
+      null;
     return {
       session,
       summary,
       segments: this.listTranscriptSegments(sessionId),
       audioChunks: this.listAudioChunks(sessionId),
-      topics: this.db.prepare(`
+      topics: this.db
+        .prepare(
+          `
         SELECT t.* FROM topics t JOIN session_topics st ON st.topic_id = t.id
         WHERE st.session_id = ? ORDER BY t.last_seen_at DESC, t.canonical_title
-      `).all(sessionId),
-      todos: this.db.prepare(`
+      `
+        )
+        .all(sessionId),
+      todos: this.db
+        .prepare(
+          `
         SELECT td.*, p.display_name AS owner_name, t.canonical_title AS topic_title
         FROM todos td LEFT JOIN people p ON p.id = td.owner_person_id
         LEFT JOIN topics t ON t.id = td.topic_id
         WHERE td.source_session_id = ? ORDER BY td.updated_at DESC
-      `).all(sessionId),
-      memories: this.db.prepare(`
+      `
+        )
+        .all(sessionId),
+      memories: this.db
+        .prepare(
+          `
         SELECT DISTINCT m.*, p.display_name AS person_name, t.canonical_title AS topic_title
         FROM memories m JOIN memory_evidence me ON me.memory_id = m.id
         JOIN transcript_segments ts ON ts.id = me.segment_id
         LEFT JOIN people p ON p.id = m.person_id LEFT JOIN topics t ON t.id = m.topic_id
         WHERE ts.session_id = ? ORDER BY m.last_seen_at DESC
-      `).all(sessionId),
+      `
+        )
+        .all(sessionId),
     };
   }
 
   listPeopleOverview() {
-    return this.db.prepare(`
+    return this.db
+      .prepare(
+        `
       SELECT p.*,
         COUNT(DISTINCT ts.session_id) AS session_count,
         COUNT(DISTINCT CASE WHEN td.status = 'open' THEN td.id END) AS open_todo_count,
@@ -846,7 +929,9 @@ class JarvisRepository {
       LEFT JOIN todos td ON td.owner_person_id = p.id
       GROUP BY p.id
       ORDER BY p.is_self DESC, COALESCE(last_interaction_at, p.last_seen_at) DESC, p.display_name
-    `).all();
+    `
+      )
+      .all();
   }
 
   getPersonDetail(id) {
@@ -855,28 +940,44 @@ class JarvisRepository {
     if (!person) return null;
     return {
       person,
-      sessions: this.db.prepare(`
+      sessions: this.db
+        .prepare(
+          `
         SELECT DISTINCT s.* FROM sessions s JOIN transcript_segments ts ON ts.session_id = s.id
         WHERE ts.person_id = ? ORDER BY s.started_at DESC
-      `).all(personId),
-      todos: this.db.prepare("SELECT * FROM todos WHERE owner_person_id = ? ORDER BY updated_at DESC").all(personId),
-      memories: this.db.prepare("SELECT * FROM memories WHERE person_id = ? ORDER BY last_seen_at DESC").all(personId),
-      topics: this.db.prepare(`
+      `
+        )
+        .all(personId),
+      todos: this.db
+        .prepare("SELECT * FROM todos WHERE owner_person_id = ? ORDER BY updated_at DESC")
+        .all(personId),
+      memories: this.db
+        .prepare("SELECT * FROM memories WHERE person_id = ? ORDER BY last_seen_at DESC")
+        .all(personId),
+      topics: this.db
+        .prepare(
+          `
         SELECT DISTINCT t.* FROM topics t JOIN session_topics st ON st.topic_id = t.id
         JOIN transcript_segments ts ON ts.session_id = st.session_id
         WHERE ts.person_id = ? ORDER BY t.last_seen_at DESC
-      `).all(personId),
+      `
+        )
+        .all(personId),
     };
   }
 
   listTopics() {
-    return this.db.prepare(`
+    return this.db
+      .prepare(
+        `
       SELECT t.*, COUNT(DISTINCT st.session_id) AS session_count,
         COUNT(DISTINCT CASE WHEN td.status = 'open' THEN td.id END) AS open_todo_count
       FROM topics t LEFT JOIN session_topics st ON st.topic_id = t.id
       LEFT JOIN todos td ON td.topic_id = t.id
       GROUP BY t.id ORDER BY t.last_seen_at DESC, t.canonical_title
-    `).all();
+    `
+      )
+      .all();
   }
 
   getTopicDetail(id) {
@@ -885,45 +986,66 @@ class JarvisRepository {
     if (!topic) return null;
     return {
       topic,
-      sessions: this.db.prepare(`SELECT s.* FROM sessions s JOIN session_topics st ON st.session_id=s.id WHERE st.topic_id=? ORDER BY s.started_at DESC`).all(topicId),
-      todos: this.db.prepare("SELECT * FROM todos WHERE topic_id = ? ORDER BY updated_at DESC").all(topicId),
-      memories: this.db.prepare("SELECT * FROM memories WHERE topic_id = ? ORDER BY last_seen_at DESC").all(topicId),
+      sessions: this.db
+        .prepare(
+          `SELECT s.* FROM sessions s JOIN session_topics st ON st.session_id=s.id WHERE st.topic_id=? ORDER BY s.started_at DESC`
+        )
+        .all(topicId),
+      todos: this.db
+        .prepare("SELECT * FROM todos WHERE topic_id = ? ORDER BY updated_at DESC")
+        .all(topicId),
+      memories: this.db
+        .prepare("SELECT * FROM memories WHERE topic_id = ? ORDER BY last_seen_at DESC")
+        .all(topicId),
     };
   }
 
   renameTopic(id, title, at = Date.now()) {
     const topicId = assertId(id, "topicId");
     const canonical = normalizeDerivedText(title, "topic title");
-    this.db.prepare(`UPDATE topics SET canonical_title=?, normalized_title=?, last_seen_at=? WHERE id=?`).run(canonical, normalizedKey(canonical), assertInteger(at, "at"), topicId);
+    this.db
+      .prepare(`UPDATE topics SET canonical_title=?, normalized_title=?, last_seen_at=? WHERE id=?`)
+      .run(canonical, normalizedKey(canonical), assertInteger(at, "at"), topicId);
     return this.db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId) ?? null;
   }
 
   listTodos(status = null) {
-    if (status !== null && status !== "open" && status !== "completed") throw new TypeError("invalid todo status");
-    return this.db.prepare(`
+    if (status !== null && status !== "open" && status !== "completed")
+      throw new TypeError("invalid todo status");
+    return this.db
+      .prepare(
+        `
       SELECT td.*, p.display_name AS owner_name, t.canonical_title AS topic_title
       FROM todos td LEFT JOIN people p ON p.id=td.owner_person_id
       LEFT JOIN topics t ON t.id=td.topic_id
       WHERE (? IS NULL OR td.status = ?)
       ORDER BY CASE td.status WHEN 'open' THEN 0 ELSE 1 END, COALESCE(td.due_at, 9223372036854775807), td.updated_at DESC
-    `).all(status, status);
+    `
+      )
+      .all(status, status);
   }
 
   setTodoStatus(id, status, at = Date.now()) {
     const todoId = assertId(id, "todoId");
     if (status !== "open" && status !== "completed") throw new TypeError("invalid todo status");
     const when = assertInteger(at, "at");
-    this.db.prepare(`UPDATE todos SET status=?, updated_at=?, completed_at=? WHERE id=?`).run(status, when, status === "completed" ? when : null, todoId);
+    this.db
+      .prepare(`UPDATE todos SET status=?, updated_at=?, completed_at=? WHERE id=?`)
+      .run(status, when, status === "completed" ? when : null, todoId);
     return this.db.prepare("SELECT * FROM todos WHERE id = ?").get(todoId) ?? null;
   }
 
   listMemories(limit = 200) {
     assertInteger(limit, "limit");
-    return this.db.prepare(`
+    return this.db
+      .prepare(
+        `
       SELECT m.*, p.display_name AS person_name, t.canonical_title AS topic_title
       FROM memories m LEFT JOIN people p ON p.id=m.person_id LEFT JOIN topics t ON t.id=m.topic_id
       ORDER BY m.last_seen_at DESC LIMIT ?
-    `).all(limit);
+    `
+      )
+      .all(limit);
   }
 
   searchMemory(query, limit = 100) {
@@ -931,7 +1053,9 @@ class JarvisRepository {
     assertInteger(limit, "limit");
     if (limit < 1 || limit > 1000) throw new RangeError("limit must be between 1 and 1000");
     const like = `%${term.replace(/[\\%_]/g, "\\$&")}%`;
-    return this.db.prepare(`
+    return this.db
+      .prepare(
+        `
       SELECT DISTINCT s.* FROM sessions s
       LEFT JOIN session_summaries ss ON ss.session_id=s.id
       WHERE ss.summary LIKE ? ESCAPE '\\'
@@ -939,13 +1063,20 @@ class JarvisRepository {
         OR EXISTS (SELECT 1 FROM session_topics st JOIN topics t ON t.id=st.topic_id WHERE st.session_id=s.id AND (t.canonical_title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\'))
         OR EXISTS (SELECT 1 FROM transcript_segments ts JOIN people p ON p.id=ts.person_id WHERE ts.session_id=s.id AND p.display_name LIKE ? ESCAPE '\\')
       ORDER BY s.started_at DESC LIMIT ?
-    `).all(like, like, like, like, like, limit);
+    `
+      )
+      .all(like, like, like, like, like, limit);
   }
 
   getTodayInsights(sessionId) {
     const detail = this.getSessionDetail(sessionId);
     if (!detail) return null;
-    return { summary: detail.summary, topics: detail.topics, todos: detail.todos, memories: detail.memories };
+    return {
+      summary: detail.summary,
+      topics: detail.topics,
+      todos: detail.todos,
+      memories: detail.memories,
+    };
   }
 
   getCloudBudgetSettings() {
@@ -974,10 +1105,7 @@ class JarvisRepository {
     const monthUtc = monthUtcFromTimestamp(at);
     const settings = this.getCloudBudgetSettings();
     const totals = this.statements.getCloudUsageTotals.get(monthUtc);
-    const remaining = Math.max(
-      0,
-      settings.monthly_limit_microusd - totals.spent - totals.reserved
-    );
+    const remaining = Math.max(0, settings.monthly_limit_microusd - totals.spent - totals.reserved);
     let blockedReason = null;
     if (totals.unknown_count > 0) blockedReason = "usage_unknown";
     else if (!settings.enabled) blockedReason = "cloud_disabled";
@@ -999,10 +1127,7 @@ class JarvisRepository {
       monthUtc: assertMonthUtc(input.monthUtc),
       model: input.model,
       audioMs: assertNonNegativeInteger(input.audioMs, "audioMs"),
-      reservedMicrousd: assertNonNegativeInteger(
-        input.reservedMicrousd,
-        "reservedMicrousd"
-      ),
+      reservedMicrousd: assertNonNegativeInteger(input.reservedMicrousd, "reservedMicrousd"),
       priceVersion: input.priceVersion,
       createdAt: assertInteger(input.createdAt, "createdAt"),
     };
@@ -1104,6 +1229,10 @@ class JarvisRepository {
 
   listAudioChunks(sessionId) {
     return this.statements.listAudioChunks.all(assertId(sessionId, "sessionId"));
+  }
+
+  getAudioChunk(id) {
+    return this.statements.getAudioChunk.get(assertId(id, "audioChunkId")) ?? null;
   }
 
   listExpiredAudioChunks(now = Date.now()) {

@@ -4,6 +4,7 @@ const {
   assertSessionStatus,
   assertMicErrorCode,
 } = require("../shared/contracts");
+const fs = require("node:fs/promises");
 
 const REQUIRED_REPOSITORY_METHODS = [
   "createSession",
@@ -107,12 +108,24 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
     repository.listAudioChunks(assertId(sessionId, "sessionId"))
   );
+  ipcMain.handle(CHANNELS.readAudioChunk, async (_event, audioChunkId) => {
+    const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
+    if (!chunk) return null;
+    try {
+      return await fs.readFile(chunk.path);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+  });
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
     repository.getSessionDetail(assertId(sessionId, "sessionId"))
   );
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
     if (typeof query !== "string") throw new TypeError("query must be a string");
-    return query.trim() ? repository.searchMemory(query, limit) : repository.listSessions({ limit: limit ?? 100 });
+    return query.trim()
+      ? repository.searchMemory(query, limit)
+      : repository.listSessions({ limit: limit ?? 100 });
   });
   ipcMain.handle(CHANNELS.listPeopleOverview, () => repository.listPeopleOverview());
   ipcMain.handle(CHANNELS.getPersonDetail, (_event, personId) =>

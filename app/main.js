@@ -458,7 +458,11 @@ function initializeCoreManagers() {
     log: (entry) => debugLogger.info("Jarvis cloud correction", entry, "jarvis"),
   });
   const recovered = jarvisService.recoverOpenSessions(Date.now());
-  debugLogger.info("Jarvis interrupted-session recovery", { recovered: recovered.length }, "jarvis");
+  debugLogger.info(
+    "Jarvis interrupted-session recovery",
+    { recovered: recovered.length },
+    "jarvis"
+  );
   registerJarvisIpc({
     ipcMain,
     repository: jarvisRepository,

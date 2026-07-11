@@ -9,6 +9,7 @@ const CHANNELS = Object.freeze({
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
   listAudioChunks: "jarvis:audio:list",
+  readAudioChunk: "jarvis:audio:read",
   getSessionDetail: "jarvis:memory:session-detail",
   searchMemory: "jarvis:memory:search",
   listPeopleOverview: "jarvis:memory:people",

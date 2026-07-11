@@ -149,6 +149,72 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     );
   });
 
+  it("falls back to the system default when the pinned microphone cannot open", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "physical-mic", preferBuiltInMic: false });
+    const fallbackTrack = new FakeTrack();
+    fallbackTrack.label = "System default microphone";
+    const fallbackStream = {
+      getAudioTracks: () => [fallbackTrack],
+      getTracks: () => [fallbackTrack],
+    } as unknown as MediaStream;
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockRejectedValueOnce(Object.assign(new Error("missing"), { name: "NotFoundError" }))
+      .mockResolvedValueOnce(fallbackStream);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-fallback-start",
+      diarizationEnabled: true,
+    });
+
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      activeMicLabel: "System default microphone",
+      micFallbackActive: true,
+      error: null,
+    });
+  });
+
+  it("hot-swaps to the default microphone without ending the Jarvis session", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "physical-mic", preferBuiltInMic: false });
+    const fallbackTrack = new FakeTrack();
+    fallbackTrack.label = "System default microphone";
+    const fallbackStream = {
+      getAudioTracks: () => [fallbackTrack],
+      getTracks: () => [fallbackTrack],
+    } as unknown as MediaStream;
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce({
+        getAudioTracks: () => [track],
+        getTracks: () => [track],
+      } as unknown as MediaStream)
+      .mockResolvedValueOnce(fallbackStream);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-hot-swap",
+      diarizationEnabled: true,
+    });
+    track.readyState = "ended";
+    track.dispatchEvent(new Event("ended"));
+
+    await vi.waitFor(() => {
+      expect(useMeetingRecordingStore.getState()).toMatchObject({
+        isRecording: true,
+        activeMicLabel: "System default microphone",
+        micFallbackActive: true,
+        error: null,
+      });
+    });
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
   it("applies a cloud correction to only the matching local segment", async () => {
     await startRecording({
       noteId: null,

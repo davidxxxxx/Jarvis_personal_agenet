@@ -206,10 +206,7 @@ export interface JarvisVoiceEnrollmentStatus {
 }
 
 export type JarvisCloudBudgetBlockedReason =
-  | "cloud_disabled"
-  | "budget_protected"
-  | "usage_unknown"
-  | null;
+  "cloud_disabled" | "budget_protected" | "usage_unknown" | null;
 
 export interface JarvisCloudBudgetStatus {
   monthUtc: string;

@@ -65,9 +65,18 @@ function validateAnalysisPayload(payload, allowedSegmentIds) {
     }),
     memories: array(input.memories, "memories").map((raw) => {
       const item = object(raw, "memory");
-      exactFields(item, new Set(["type", "content", "personRef", "topicRef", "confidence", "evidenceSegmentIds"]), "memory");
+      exactFields(
+        item,
+        new Set(["type", "content", "personRef", "topicRef", "confidence", "evidenceSegmentIds"]),
+        "memory"
+      );
       if (!MEMORY_TYPES.has(item.type)) throw new TypeError("unsupported memory type");
-      if (typeof item.confidence !== "number" || !Number.isFinite(item.confidence) || item.confidence < 0 || item.confidence > 1) {
+      if (
+        typeof item.confidence !== "number" ||
+        !Number.isFinite(item.confidence) ||
+        item.confidence < 0 ||
+        item.confidence > 1
+      ) {
         throw new RangeError("memory confidence must be between 0 and 1");
       }
       return {
@@ -81,9 +90,14 @@ function validateAnalysisPayload(payload, allowedSegmentIds) {
     }),
     todos: array(input.todos, "todos").map((raw) => {
       const item = object(raw, "todo");
-      exactFields(item, new Set(["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"]), "todo");
+      exactFields(
+        item,
+        new Set(["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"]),
+        "todo"
+      );
       const dueDate = nullableString(item.dueDate, "dueDate");
-      if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) throw new TypeError("dueDate must use YYYY-MM-DD");
+      if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate))
+        throw new TypeError("dueDate must use YYYY-MM-DD");
       return {
         content: string(item.content, "todo content"),
         ownerRef: nullableString(item.ownerRef, "ownerRef"),
@@ -96,7 +110,10 @@ function validateAnalysisPayload(payload, allowedSegmentIds) {
     suggestions: array(input.suggestions, "suggestions").map((raw) => {
       const item = object(raw, "suggestion");
       exactFields(item, new Set(["content", "reason"]), "suggestion");
-      return { content: string(item.content, "suggestion content"), reason: string(item.reason, "suggestion reason") };
+      return {
+        content: string(item.content, "suggestion content"),
+        reason: string(item.reason, "suggestion reason"),
+      };
     }),
   };
   return result;
@@ -113,11 +130,67 @@ const ANALYSIS_TOOL = {
       required: ["summary", "topics", "memories", "todos", "decisions", "suggestions"],
       properties: {
         summary: { type: "string" },
-        topics: { type: "array", items: { type: "object", additionalProperties: false, required: ["title", "description", "evidenceSegmentIds"], properties: { title: { type: "string" }, description: { type: "string" }, evidenceSegmentIds: { type: "array", items: { type: "string" } } } } },
-        memories: { type: "array", items: { type: "object", additionalProperties: false, required: ["type", "content", "personRef", "topicRef", "confidence", "evidenceSegmentIds"], properties: { type: { type: "string", enum: [...MEMORY_TYPES] }, content: { type: "string" }, personRef: { type: ["string", "null"] }, topicRef: { type: ["string", "null"] }, confidence: { type: "number", minimum: 0, maximum: 1 }, evidenceSegmentIds: { type: "array", items: { type: "string" } } } } },
-        todos: { type: "array", items: { type: "object", additionalProperties: false, required: ["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"], properties: { content: { type: "string" }, ownerRef: { type: ["string", "null"] }, dueDate: { type: ["string", "null"] }, topicRef: { type: ["string", "null"] }, evidenceSegmentIds: { type: "array", items: { type: "string" } } } } },
+        topics: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["title", "description", "evidenceSegmentIds"],
+            properties: {
+              title: { type: "string" },
+              description: { type: "string" },
+              evidenceSegmentIds: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+        memories: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: [
+              "type",
+              "content",
+              "personRef",
+              "topicRef",
+              "confidence",
+              "evidenceSegmentIds",
+            ],
+            properties: {
+              type: { type: "string", enum: [...MEMORY_TYPES] },
+              content: { type: "string" },
+              personRef: { type: ["string", "null"] },
+              topicRef: { type: ["string", "null"] },
+              confidence: { type: "number", minimum: 0, maximum: 1 },
+              evidenceSegmentIds: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+        todos: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"],
+            properties: {
+              content: { type: "string" },
+              ownerRef: { type: ["string", "null"] },
+              dueDate: { type: ["string", "null"] },
+              topicRef: { type: ["string", "null"] },
+              evidenceSegmentIds: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
         decisions: { type: "array", items: { type: "string" } },
-        suggestions: { type: "array", items: { type: "object", additionalProperties: false, required: ["content", "reason"], properties: { content: { type: "string" }, reason: { type: "string" } } } },
+        suggestions: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["content", "reason"],
+            properties: { content: { type: "string" }, reason: { type: "string" } },
+          },
+        },
       },
     },
   },

@@ -5,6 +5,7 @@ import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
 import type { UseJarvisRecordingResult } from "./useJarvisRecording";
 import FirstUseConsentDialog from "./FirstUseConsentDialog";
+import JarvisMicrophoneSelector from "./JarvisMicrophoneSelector";
 import { hasRecordingConsent } from "./recordingConsent";
 
 interface RecordingControlsProps {
@@ -152,7 +153,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
                 </p>
               </div>
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                {microphoneName || t("jarvis.defaultMicrophone")}
+                {recording.activeMicLabel || microphoneName || t("jarvis.defaultMicrophone")}
               </p>
             </div>
           </div>
@@ -232,6 +233,12 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             {t(actionError ? "jarvis.operationError" : "jarvis.recordingError")}
           </p>
         )}
+        {recording.micFallbackActive && (
+          <p className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+            首选麦克风已断开，正在使用{recording.activeMicLabel || "系统默认麦克风"}继续录音。
+          </p>
+        )}
+        <JarvisMicrophoneSelector disabled={isRecording || isBusy || commandPending} />
       </div>
       <FirstUseConsentDialog
         open={consentOpen}

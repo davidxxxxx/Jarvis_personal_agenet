@@ -689,6 +689,8 @@ export interface UseJarvisRecordingResult {
   segments: TranscriptSegment[];
   partialText: string;
   micLevel: number;
+  activeMicLabel?: string | null;
+  micFallbackActive?: boolean;
   operation: JarvisControlAction | null;
   error: string | null;
   start: () => Promise<void>;
@@ -706,11 +708,18 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micPartial = useMeetingRecordingStore((state) => state.micPartial);
   const systemPartial = useMeetingRecordingStore((state) => state.systemPartial);
   const micLevel = useMeetingRecordingStore((state) => state.currentMicLevel);
+  const activeMicLabel = useMeetingRecordingStore((state) => state.activeMicLabel);
+  const micFallbackActive = useMeetingRecordingStore((state) => state.micFallbackActive);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
   const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
   const controllerRef = useRef<RecordingController | null>(null);
   const handledMicErrorRef = useRef<string | null>(null);
+  const analysisProgressRef = useRef<{ sessionId: string | null; bucket: number; final: boolean }>({
+    sessionId: null,
+    bucket: 0,
+    final: false,
+  });
 
   if (sessionsRefreshRef.current === null) {
     sessionsRefreshRef.current = createLatestRefresh(
@@ -856,6 +865,44 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     };
   }, [peopleRefresh, sessionsRefresh]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (typeof window.electronAPI?.jarvis?.analyzeSession !== "function") return;
+      const current = useJarvisStore.getState().session;
+      if (!current.id || current.status !== "recording") return;
+      if (analysisProgressRef.current.sessionId !== current.id) {
+        analysisProgressRef.current = { sessionId: current.id, bucket: 0, final: false };
+      }
+      const elapsed =
+        current.accumulatedMs +
+        (current.activeSince ? Math.max(0, Date.now() - current.activeSince) : 0);
+      const bucket = Math.floor(elapsed / 600_000);
+      if (bucket < 1 || bucket <= analysisProgressRef.current.bucket) return;
+      analysisProgressRef.current.bucket = bucket;
+      void window.electronAPI.jarvis.analyzeSession(current.id, "incremental").catch(() => {
+        // Cloud analysis never interrupts local recording.
+      });
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (
+      !session.id ||
+      session.status !== "completed" ||
+      typeof window.electronAPI?.jarvis?.analyzeSession !== "function"
+    )
+      return;
+    if (analysisProgressRef.current.sessionId !== session.id) {
+      analysisProgressRef.current = { sessionId: session.id, bucket: 0, final: false };
+    }
+    if (analysisProgressRef.current.final) return;
+    analysisProgressRef.current.final = true;
+    void window.electronAPI.jarvis.analyzeSession(session.id, "final").catch(() => {
+      // The completed recording remains available for manual retry from Memory.
+    });
+  }, [session.id, session.status]);
+
   const start = useCallback(() => controller.start(), [controller]);
   const pause = useCallback(() => controller.pause(), [controller]);
   const resume = useCallback(() => controller.resume(), [controller]);
@@ -871,6 +918,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     segments,
     partialText: [micPartial, systemPartial].filter(Boolean).join(" "),
     micLevel,
+    activeMicLabel,
+    micFallbackActive,
     operation,
     error: upstreamError ?? controllerError,
     start,

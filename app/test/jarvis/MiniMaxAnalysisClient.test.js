@@ -16,10 +16,23 @@ test("sends transcript text through a forced MiniMax tool without audio or real 
   const client = new MiniMaxAnalysisClient({
     fetchImpl: async (url, options) => {
       request = { url, options, body: JSON.parse(options.body) };
-      return new Response(JSON.stringify({
-        choices: [{ message: { tool_calls: [{ function: { name: "submit_jarvis_analysis", arguments: JSON.stringify(result) } }] } }],
-        usage: { prompt_tokens: 10, completion_tokens: 20 },
-      }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                tool_calls: [
+                  {
+                    function: { name: "submit_jarvis_analysis", arguments: JSON.stringify(result) },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 20 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
     },
     getApiKey: () => "secret-token-plan-key",
     baseUrl: "https://api.minimaxi.com/v1",
@@ -45,9 +58,15 @@ test("fails with redacted stable error codes", async () => {
     fetchImpl: async () => new Response("body containing secret transcript", { status: 429 }),
     getApiKey: () => "secret-token-plan-key",
   });
-  await assert.rejects(client.analyze({ kind: "final", segments: [{ id: "seg-1", speakerRef: "self", text: "secret transcript" }] }), (error) => {
-    assert.equal(error.code, "MINIMAX_RATE_LIMITED");
-    assert.doesNotMatch(error.message, /secret|transcript/i);
-    return true;
-  });
+  await assert.rejects(
+    client.analyze({
+      kind: "final",
+      segments: [{ id: "seg-1", speakerRef: "self", text: "secret transcript" }],
+    }),
+    (error) => {
+      assert.equal(error.code, "MINIMAX_RATE_LIMITED");
+      assert.doesNotMatch(error.message, /secret|transcript/i);
+      return true;
+    }
+  );
 });

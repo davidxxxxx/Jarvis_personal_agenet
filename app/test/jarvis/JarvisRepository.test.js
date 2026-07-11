@@ -437,12 +437,16 @@ test("cloud budget settings and settled usage persist across restart", () => {
 test("cloud usage reservation atomically protects the monthly limit", () => {
   const repo = new JarvisRepository(":memory:");
   repo.setCloudBudgetSettings({ enabled: true, monthlyLimitMicrousd: 5_000_000, at: 1 });
-  repo.db.prepare(`
+  repo.db
+    .prepare(
+      `
     INSERT INTO cloud_usage (
       id, month_utc, provider, model, audio_ms, input_tokens, output_tokens,
       price_version, reserved_microusd, actual_microusd, status, created_at, settled_at
     ) VALUES (?, ?, 'openai', 'gpt-4o-transcribe', 1000, 0, 0, ?, 0, ?, 'settled', 1, 2)
-  `).run("spent", "2026-07", "openai-2026-07-11", 4_950_001);
+  `
+    )
+    .run("spent", "2026-07", "openai-2026-07-11", 4_950_001);
 
   const result = repo.reserveCloudUsage({
     id: "usage_2",
@@ -550,17 +554,56 @@ test("derived memory analysis is idempotent and queryable from every Jarvis view
   repo.createSession({ id: "history-1", startedAt: 1_000, micDeviceId: "mv7", language: "auto" });
   repo.setSessionStatus("history-1", "completed", 61_000);
   repo.upsertTranscriptSegments("history-1", [
-    { id: "seg-history-1", startedAt: 2_000, endedAt: 3_000, personId: "person-2", speakerLabel: "说话人 2", text: "周五前完成戒指 SDK 对接。", confidence: 0.94, isStable: true },
+    {
+      id: "seg-history-1",
+      startedAt: 2_000,
+      endedAt: 3_000,
+      personId: "person-2",
+      speakerLabel: "说话人 2",
+      text: "周五前完成戒指 SDK 对接。",
+      confidence: 0.94,
+      isStable: true,
+    },
   ]);
   const input = {
-    runId: "run-history-1", sessionId: "history-1", kind: "final", inputHash: "hash-history-1", model: "MiniMax-M2.7", windowStart: 1_000, windowEnd: 61_000, completedAt: 62_000,
+    runId: "run-history-1",
+    sessionId: "history-1",
+    kind: "final",
+    inputHash: "hash-history-1",
+    model: "MiniMax-M2.7",
+    windowStart: 1_000,
+    windowEnd: 61_000,
+    completedAt: 62_000,
     result: {
       summary: "讨论了智能戒指 SDK 的交付安排。",
       decisions: ["采用厂商提供的 SDK"],
       suggestions: [{ content: "先确认 BLE 协议文档", reason: "减少逆向开发风险" }],
-      topics: [{ title: "智能戒指 SDK", description: "SDK、BLE 协议和交付计划", evidenceSegmentIds: ["seg-history-1"] }],
-      todos: [{ content: "完成戒指 SDK 对接", ownerRef: "person-2", dueDate: "2026-07-17", topicRef: "智能戒指 SDK", evidenceSegmentIds: ["seg-history-1"] }],
-      memories: [{ type: "decision", content: "采用厂商提供的 SDK", personRef: "person-2", topicRef: "智能戒指 SDK", confidence: 0.93, evidenceSegmentIds: ["seg-history-1"] }],
+      topics: [
+        {
+          title: "智能戒指 SDK",
+          description: "SDK、BLE 协议和交付计划",
+          evidenceSegmentIds: ["seg-history-1"],
+        },
+      ],
+      todos: [
+        {
+          content: "完成戒指 SDK 对接",
+          ownerRef: "person-2",
+          dueDate: "2026-07-17",
+          topicRef: "智能戒指 SDK",
+          evidenceSegmentIds: ["seg-history-1"],
+        },
+      ],
+      memories: [
+        {
+          type: "decision",
+          content: "采用厂商提供的 SDK",
+          personRef: "person-2",
+          topicRef: "智能戒指 SDK",
+          confidence: 0.93,
+          evidenceSegmentIds: ["seg-history-1"],
+        },
+      ],
     },
   };
   repo.applyAnalysisResult(input);
@@ -577,7 +620,10 @@ test("derived memory analysis is idempotent and queryable from every Jarvis view
   assert.equal(people[0].id, "person-2");
   assert.equal(people[0].session_count, 1);
   assert.equal(people[0].open_todo_count, 1);
-  assert.deepEqual(repo.searchMemory("戒指", 20).map((row) => row.id), ["history-1"]);
+  assert.deepEqual(
+    repo.searchMemory("戒指", 20).map((row) => row.id),
+    ["history-1"]
+  );
   const todo = repo.listTodos()[0];
   assert.equal(repo.setTodoStatus(todo.id, "completed", 70_000).status, "completed");
   assert.equal(repo.setTodoStatus(todo.id, "open", 80_000).completed_at, null);
@@ -588,12 +634,48 @@ test("analysis evidence must belong to the target session and rolls back as a un
   const repo = new JarvisRepository(":memory:");
   repo.createSession({ id: "s-analysis", startedAt: 1, micDeviceId: null });
   repo.upsertTranscriptSegments("s-analysis", [
-    { id: "seg-allowed", startedAt: 1, endedAt: 2, personId: null, speakerLabel: "mic", text: "有效证据", confidence: 1, isStable: true },
+    {
+      id: "seg-allowed",
+      startedAt: 1,
+      endedAt: 2,
+      personId: null,
+      speakerLabel: "mic",
+      text: "有效证据",
+      confidence: 1,
+      isStable: true,
+    },
   ]);
-  assert.throws(() => repo.applyAnalysisResult({
-    runId: "run-invalid", sessionId: "s-analysis", kind: "incremental", inputHash: "hash-invalid", model: "MiniMax-M2.7", windowStart: 1, windowEnd: 2, completedAt: 3,
-    result: { summary: "不应保存", decisions: [], suggestions: [], topics: [], todos: [], memories: [{ type: "fact", content: "无证据事实", personRef: null, topicRef: null, confidence: 0.9, evidenceSegmentIds: ["seg-other-session"] }] },
-  }), /evidence segment/);
+  assert.throws(
+    () =>
+      repo.applyAnalysisResult({
+        runId: "run-invalid",
+        sessionId: "s-analysis",
+        kind: "incremental",
+        inputHash: "hash-invalid",
+        model: "MiniMax-M2.7",
+        windowStart: 1,
+        windowEnd: 2,
+        completedAt: 3,
+        result: {
+          summary: "不应保存",
+          decisions: [],
+          suggestions: [],
+          topics: [],
+          todos: [],
+          memories: [
+            {
+              type: "fact",
+              content: "无证据事实",
+              personRef: null,
+              topicRef: null,
+              confidence: 0.9,
+              evidenceSegmentIds: ["seg-other-session"],
+            },
+          ],
+        },
+      }),
+    /evidence segment/
+  );
   assert.equal(repo.getSessionDetail("s-analysis").summary, null);
   assert.equal(repo.listMemories().length, 0);
   repo.close();

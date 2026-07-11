@@ -556,6 +556,7 @@ declare global {
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
+        readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
         searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
         listPeopleOverview: () => Promise<JarvisPersonOverview[]>;
@@ -567,7 +568,10 @@ declare global {
         setTodoStatus: (todoId: string, status: "open" | "completed") => Promise<JarvisTodo | null>;
         listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
         getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
-        analyzeSession: (sessionId: string, kind: "incremental" | "final") => Promise<JarvisAnalysisStatus>;
+        analyzeSession: (
+          sessionId: string,
+          kind: "incremental" | "final"
+        ) => Promise<JarvisAnalysisStatus>;
         getAnalysisStatus: (sessionId: string) => Promise<JarvisAnalysisStatus>;
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;

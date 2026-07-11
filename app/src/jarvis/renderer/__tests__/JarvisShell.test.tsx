@@ -65,11 +65,13 @@ describe("JarvisShell", () => {
     expect(screen.getByText("AI 建议")).toBeInTheDocument();
   });
 
-  it("keeps future navigation disabled until the first analysis", () => {
+  it("enables every memory navigation destination", () => {
     render(<JarvisShell />);
 
-    expect(screen.getByRole("button", { name: /人物/ })).toBeDisabled();
-    expect(screen.getAllByText("完成首次分析后启用")).toHaveLength(4);
+    for (const name of [/人物/, /主题/, /待办/, /记忆/]) {
+      expect(screen.getByRole("button", { name })).toBeEnabled();
+    }
+    expect(screen.queryByText("完成首次分析后启用")).not.toBeInTheDocument();
   });
 
   it("has a single-column fallback below the desktop layout breakpoint", () => {
@@ -80,8 +82,5 @@ describe("JarvisShell", () => {
       "lg:grid-cols-[176px_minmax(420px,1fr)_320px]"
     );
     expect(screen.getByRole("complementary", { name: "洞察" })).not.toHaveClass("hidden");
-    for (const explanation of screen.getAllByText("完成首次分析后启用")) {
-      expect(explanation).not.toHaveClass("hidden");
-    }
   });
 });

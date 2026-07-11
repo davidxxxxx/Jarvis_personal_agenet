@@ -15,6 +15,7 @@ function createRepository(overrides = {}) {
     renamePerson: () => "renamed",
     listPeople: () => [],
     listAudioChunks: () => [],
+    getAudioChunk: () => null,
     getSessionDetail: () => ({ session: { id: "s1" } }),
     searchMemory: () => [],
     listPeopleOverview: () => [],
@@ -89,7 +90,14 @@ function createIpcHarness(overrides = {}) {
     environmentManager,
     analysisScheduler,
   });
-  return { handlers, repository, service, voiceEnrollmentService, environmentManager, analysisScheduler };
+  return {
+    handlers,
+    repository,
+    service,
+    voiceEnrollmentService,
+    environmentManager,
+    analysisScheduler,
+  };
 }
 
 test("contract rejects path traversal and unknown states", () => {
@@ -99,46 +107,50 @@ test("contract rejects path traversal and unknown states", () => {
 });
 
 test("contract exposes only the named Jarvis channels", () => {
-  assert.deepEqual(Object.keys(CHANNELS).sort(), [
-    "beginVoiceEnrollment",
-    "cancelVoiceEnrollment",
-    "completeVoiceEnrollment",
-    "control",
-    "createSession",
-    "failCapture",
-    "finishCapture",
-    "getAnalysisStatus",
-    "getCloudBudget",
-    "getMiniMaxConfig",
-    "getPersonDetail",
-    "getSession",
-    "getSessionDetail",
-    "getTodayInsights",
-    "getTopicDetail",
-    "getVoiceEnrollmentStatus",
-    "analyzeSession",
-    "listAudioChunks",
-    "listMemories",
-    "listPeople",
-    "listPeopleOverview",
-    "listSegments",
-    "listSessions",
-    "listTodos",
-    "listTopics",
-    "pauseCapture",
-    "renamePerson",
-    "resumeCapture",
-    "setCloudBudget",
-    "setMiniMaxKey",
-    "setSessionStatus",
-    "setTodoStatus",
-    "startCapture",
-    "stateChanged",
-    "syncSegments",
-    "searchMemory",
-    "renameTopic",
-    "upsertSegments",
-  ].sort());
+  assert.deepEqual(
+    Object.keys(CHANNELS).sort(),
+    [
+      "beginVoiceEnrollment",
+      "cancelVoiceEnrollment",
+      "completeVoiceEnrollment",
+      "control",
+      "createSession",
+      "failCapture",
+      "finishCapture",
+      "getAnalysisStatus",
+      "getCloudBudget",
+      "getMiniMaxConfig",
+      "getPersonDetail",
+      "getSession",
+      "getSessionDetail",
+      "getTodayInsights",
+      "getTopicDetail",
+      "getVoiceEnrollmentStatus",
+      "analyzeSession",
+      "listAudioChunks",
+      "readAudioChunk",
+      "listMemories",
+      "listPeople",
+      "listPeopleOverview",
+      "listSegments",
+      "listSessions",
+      "listTodos",
+      "listTopics",
+      "pauseCapture",
+      "renamePerson",
+      "resumeCapture",
+      "setCloudBudget",
+      "setMiniMaxKey",
+      "setSessionStatus",
+      "setTodoStatus",
+      "startCapture",
+      "stateChanged",
+      "syncSegments",
+      "searchMemory",
+      "renameTopic",
+      "upsertSegments",
+    ].sort()
+  );
   assert.equal(Object.isFrozen(CHANNELS), true);
 });
 
@@ -151,6 +163,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.createSession,
       CHANNELS.getSession,
       CHANNELS.listAudioChunks,
+      CHANNELS.readAudioChunk,
       CHANNELS.listPeople,
       CHANNELS.listSegments,
       CHANNELS.listSessions,
@@ -203,7 +216,10 @@ test("IPC exposes MiniMax configured state without returning the secret", async 
 test("IPC returns metadata-only self voice enrollment status", async () => {
   const { handlers } = createIpcHarness();
 
-  assert.equal(await handlers.get(CHANNELS.getVoiceEnrollmentStatus)({ sender: { id: 7 } }), "voice-status");
+  assert.equal(
+    await handlers.get(CHANNELS.getVoiceEnrollmentStatus)({ sender: { id: 7 } }),
+    "voice-status"
+  );
 });
 
 test("IPC returns cloud budget status without exposing the project key", async () => {
