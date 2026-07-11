@@ -53,6 +53,8 @@ class FakeAudioWorkletNode extends FakeAudioNode {
   };
 }
 
+const audioContexts: FakeAudioContext[] = [];
+
 class FakeAudioContext {
   state: AudioContextState = "running";
   destination = new FakeAudioNode();
@@ -68,6 +70,10 @@ class FakeAudioContext {
   close = vi.fn(async () => {});
   resume = vi.fn(async () => {});
   setSinkId = vi.fn(async () => {});
+
+  constructor() {
+    audioContexts.push(this);
+  }
 }
 
 describe("Jarvis shutdown final meeting segment integration", () => {
@@ -84,6 +90,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   let segmentListenerDetached: boolean;
 
   beforeEach(() => {
+    audioContexts.length = 0;
     track = new FakeTrack();
     segmentListener = null;
     segmentListenerDetached = false;
@@ -465,6 +472,31 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       micRecoveryStatus: "idle",
       micRecoveryAttempt: 0,
     });
+  });
+
+  it("releases the stream and AudioContext when microphone pipeline setup fails", async () => {
+    vi.stubGlobal(
+      "AudioWorkletNode",
+      class {
+        constructor() {
+          throw new Error("worklet setup failed");
+        }
+      }
+    );
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-pipeline-failure-cleanup",
+      diarizationEnabled: true,
+    });
+
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(audioContexts).toHaveLength(1);
+    expect(audioContexts[0].close).toHaveBeenCalledOnce();
+    expect(useMeetingRecordingStore.getState().isRecording).toBe(false);
   });
 
   it("applies a cloud correction to only the matching local segment", async () => {

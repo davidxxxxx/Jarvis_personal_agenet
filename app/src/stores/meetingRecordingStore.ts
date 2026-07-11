@@ -1470,21 +1470,40 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     };
 
     attachMicPipeline = async (stream, fallbackActive) => {
+      const track = stream.getAudioTracks()[0];
+      if (!track || track.readyState === "ended" || track.muted) {
+        stopMediaStream(stream);
+        throw new Error("MIC_DISCONNECTED");
+      }
+
       const ctx = new AudioContext({ sampleRate: 24000 });
-      await detachFromOutputDevice(ctx);
-      const { source, processor } = await createAudioPipeline({
-        stream,
-        context: ctx,
-        onChunk: onMicChunk,
-      });
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.4;
-      const analyserSink = ctx.createGain();
-      analyserSink.gain.value = 0;
-      source.connect(analyser);
-      analyser.connect(analyserSink);
-      analyserSink.connect(ctx.destination);
+      let pipeline: {
+        source: MediaStreamAudioSourceNode;
+        processor: AudioWorkletNode;
+        analyser: AnalyserNode;
+      };
+      try {
+        await detachFromOutputDevice(ctx);
+        const { source, processor } = await createAudioPipeline({
+          stream,
+          context: ctx,
+          onChunk: onMicChunk,
+        });
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.4;
+        const analyserSink = ctx.createGain();
+        analyserSink.gain.value = 0;
+        source.connect(analyser);
+        analyser.connect(analyserSink);
+        analyserSink.connect(ctx.destination);
+        pipeline = { source, processor, analyser };
+      } catch (error) {
+        stopMediaStream(stream);
+        await ctx.close().catch(() => undefined);
+        throw error;
+      }
+      const { source, processor, analyser } = pipeline;
 
       if (!isRecordingFlag) {
         await flushAndDisconnectProcessor(processor);
@@ -1507,15 +1526,6 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       micStream = stream;
       micContext = ctx;
 
-      const track = stream.getAudioTracks()[0];
-      if (!track || track.readyState === "ended" || track.muted) {
-        await flushAndDisconnectProcessor(processor);
-        source.disconnect();
-        analyser.disconnect();
-        stopMediaStream(stream);
-        await ctx.close().catch(() => undefined);
-        throw new Error("MIC_DISCONNECTED");
-      }
       useMeetingRecordingStore.setState({
         activeMicLabel: track?.label || null,
         micFallbackActive: fallbackActive,
