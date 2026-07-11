@@ -18,9 +18,17 @@ const PROCESSING_JOBS_SCHEMA = `
     lease_expires_at INTEGER,
     error_code TEXT,
     created_at INTEGER NOT NULL,
-    completed_at INTEGER,
-    UNIQUE(job_type, chunk_id, input_hash, input_version, model_version)
+    completed_at INTEGER
   );
+`;
+
+const PROCESSING_JOBS_INDEXES = `
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_chunk_input
+  ON processing_jobs(job_type, chunk_id, input_hash, input_version, model_version)
+  WHERE chunk_id IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_global_input
+  ON processing_jobs(job_type, input_hash, input_version, model_version)
+  WHERE chunk_id IS NULL;
 `;
 
 const MIGRATION_BASE_SCHEMA = `
@@ -136,6 +144,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     `);
     db.exec(PROCESSING_JOBS_SCHEMA);
     rebuildLegacyProcessingJobs(db);
+    db.exec(PROCESSING_JOBS_INDEXES);
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence
       ON audio_chunks(track_id, sequence_number);

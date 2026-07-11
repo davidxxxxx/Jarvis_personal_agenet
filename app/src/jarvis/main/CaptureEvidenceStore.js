@@ -172,17 +172,24 @@ class CaptureEvidenceStore {
     if (!track) throw new Error(`track ${chunk.trackId} does not exist`);
     if (track.session_id !== chunk.sessionId) throw new Error("chunk session does not match track");
     if (track.source_type !== chunk.sourceType) throw new Error("chunk source does not match track");
+    if (!Number.isSafeInteger(chunk.startedAt) || !Number.isSafeInteger(chunk.endedAt)) {
+      throw new TypeError("chunk timestamps must be safe integers");
+    }
+    const captureSpanMs = chunk.endedAt - chunk.startedAt;
+    if (captureSpanMs <= 0) {
+      throw new RangeError("chunk capture span must be positive");
+    }
+    if (captureSpanMs > MAX_CHUNK_DURATION_MS) {
+      throw new RangeError("chunk capture span must not exceed 60000 ms");
+    }
     if (!Number.isSafeInteger(chunk.durationMs) || chunk.durationMs <= 0) {
       throw new RangeError("chunk duration must be a positive integer");
     }
     if (chunk.durationMs > MAX_CHUNK_DURATION_MS) {
       throw new RangeError("chunk duration must not exceed 60000 ms");
     }
-    if (!Number.isSafeInteger(chunk.startedAt) || !Number.isSafeInteger(chunk.endedAt)) {
-      throw new TypeError("chunk timestamps must be safe integers");
-    }
-    if (chunk.endedAt <= chunk.startedAt) {
-      throw new RangeError("chunk endedAt must be after startedAt");
+    if (chunk.durationMs !== captureSpanMs) {
+      throw new RangeError("chunk durationMs must equal the integer capture span");
     }
     if (!Number.isSafeInteger(chunk.expiresAt)) {
       throw new TypeError("chunk expiresAt must be a safe integer");

@@ -5,7 +5,7 @@ const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 
-function fixture(t) {
+function fixture(t, { createId } = {}) {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
   applyJarvisMigrations(db);
@@ -14,7 +14,7 @@ function fixture(t) {
   ).run();
   let nextId = 0;
   const store = new CaptureEvidenceStore(db, {
-    createId: (prefix) => `${prefix}-${++nextId}`,
+    createId: createId ?? ((prefix) => `${prefix}-${++nextId}`),
     now: () => 100,
   });
   t.after(() => db.close());
@@ -206,6 +206,24 @@ test("rolls back transcription creation when the chunk insert fails", (t) => {
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
 });
 
+test("rolls back the inserted chunk when job creation fails", (t) => {
+  const { store, db } = fixture(t, { createId: () => "job-fixed" });
+  createTrack(store);
+  db.prepare(
+    `INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'job-fixed', 's1', 't1', NULL, 'seed_job', 'pending', 'seed', 1, '', 1
+    )`
+  ).run();
+
+  assert.throws(() => store.commitChunk(chunk()), /processing_jobs\.id/i);
+
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
+});
+
 test("enqueueChunkTranscription is idempotent by transcription input", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -281,6 +299,33 @@ test("rejects invalid chunk duration and retention deadlines", (t) => {
   assert.throws(
     () => store.commitChunk(chunk({ expiresAt: 20 + sevenDaysMs + 1 })),
     /seven days/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
+test("rejects an actual capture span over 60000 ms", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+
+  assert.throws(
+    () =>
+      store.commitChunk(
+        chunk({ startedAt: 10, endedAt: 120_010, durationMs: 60_000, expiresAt: 120_020 })
+      ),
+    /capture span.*60000/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
+test("requires durationMs to equal the integer capture span", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+
+  assert.throws(
+    () => store.commitChunk(chunk({ endedAt: 30, durationMs: 19, expiresAt: 40 })),
+    /durationMs.*capture span/i
   );
   assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);

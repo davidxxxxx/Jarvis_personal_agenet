@@ -62,6 +62,49 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
       ),
       ["track_id", "source_type", "sequence_number", "write_state", "deleted_at"]
     );
+
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 10, 'recording', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'system', 24000, 1, 10, 'active');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at
+      ) VALUES
+        ('c1', 's1', 't1', 'system', 0, 'c1.wav', 10, 20, 10, 'same', 30),
+        ('c2', 's1', 't1', 'system', 1, 'c2.wav', 20, 30, 10, 'same', 40);
+      INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, created_at
+      ) VALUES
+        ('j1', 's1', 't1', 'c1', 'transcribe_chunk', 'pending', 'same', 1, '', 20),
+        ('j2', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 30),
+        ('g1', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40);
+    `);
+    assert.throws(() =>
+      db.prepare(
+        `INSERT INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
+        ) VALUES ('j3', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 50)`
+      ).run()
+    );
+    assert.throws(() =>
+      db.prepare(
+        `INSERT INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
+        ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 50)`
+      ).run()
+    );
+    db.prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, created_at
+      ) VALUES ('g3', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, 'model-2', 60)`
+    ).run();
   } finally {
     db.close();
   }
@@ -214,7 +257,9 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
         ('c2', 's1', 't1', 'system', 1, 'c2.wav', 20, 30, 10, 'same', 40);
       INSERT INTO processing_jobs (
         id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at
-      ) VALUES ('j1', 's1', 't1', 'c1', 'transcribe_chunk', 'pending', 'same', 20);
+      ) VALUES
+        ('j1', 's1', 't1', 'c1', 'transcribe_chunk', 'pending', 'same', 20),
+        ('g1', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 20);
       PRAGMA user_version = 1;
     `);
 
@@ -236,6 +281,20 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
         ) VALUES ('j3', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 40)`
       ).run()
     );
+    assert.throws(() =>
+      db.prepare(
+        `INSERT INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
+        ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40)`
+      ).run()
+    );
+    db.prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, created_at
+      ) VALUES ('g3', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, 'model-2', 50)`
+    ).run();
     assert.throws(
       () =>
         db.prepare(
