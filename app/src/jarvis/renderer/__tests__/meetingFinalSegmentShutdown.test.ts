@@ -17,12 +17,34 @@ class FakeAudioNode {
 class FakeTrack extends EventTarget {
   readyState: MediaStreamTrackState = "live";
   muted = false;
-  label = "Test microphone";
+  label: string;
+  private readonly deviceId: string;
+
+  constructor(label = "Test microphone", deviceId = "test-mic") {
+    super();
+    this.label = label;
+    this.deviceId = deviceId;
+  }
+
   stop = vi.fn(() => {
     this.readyState = "ended";
   });
-  getSettings = vi.fn(() => ({ deviceId: "test-mic", sampleRate: 24_000 }));
+  getSettings = vi.fn(() => ({ deviceId: this.deviceId, sampleRate: 24_000 }));
+
+  end(): void {
+    this.readyState = "ended";
+    this.dispatchEvent(new Event("ended"));
+  }
 }
+
+const streamFor = (streamTrack: FakeTrack) =>
+  ({
+    getAudioTracks: () => [streamTrack],
+    getTracks: () => [streamTrack],
+  }) as unknown as MediaStream;
+
+const inputDevice = (deviceId: string, label: string) =>
+  ({ kind: "audioinput", deviceId, label }) as MediaDeviceInfo;
 
 class FakeAudioWorkletNode extends FakeAudioNode {
   port = {
@@ -72,10 +94,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       value: vi.fn(() => "blob:meeting-worklet"),
     });
 
-    const stream = {
-      getAudioTracks: () => [track],
-      getTracks: () => [track],
-    } as unknown as MediaStream;
+    const stream = streamFor(track);
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
       value: {
@@ -101,6 +120,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       onMeetingSpeakerIdentified: vi.fn(() => () => {}),
       onMeetingSpeakersMerged: vi.fn(() => () => {}),
       onMeetingTranscriptionError: vi.fn(() => () => {}),
+      meetingTranscriptionStop: vi.fn(async () => ({ success: true })),
     } as unknown as Window["electronAPI"];
 
     useMeetingRecordingStore.setState({
@@ -113,6 +133,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await stopRecording();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -213,6 +234,237 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       });
     });
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps retrying after failed recovery cycles without stopping the session", async () => {
+    vi.useFakeTimers();
+    useSettingsStore.setState({ selectedMicDeviceId: "physical-mic", preferBuiltInMic: false });
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockRejectedValue(Object.assign(new Error("missing"), { name: "NotFoundError" }));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-unlimited-recovery",
+      diarizationEnabled: true,
+    });
+    track.end();
+    await vi.advanceTimersByTimeAsync(12_000);
+
+    expect(navigator.mediaDevices.enumerateDevices).toHaveBeenCalledTimes(5);
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      error: null,
+      micRecoveryStatus: "reconnecting",
+      micRecoveryAttempt: 6,
+    });
+    expect(window.electronAPI.meetingTranscriptionStop).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Sonar default stream and later attaches a physical microphone", async () => {
+    vi.useFakeTimers();
+    useSettingsStore.setState({ selectedMicDeviceId: "missing-physical", preferBuiltInMic: false });
+    const sonarTrack = new FakeTrack("SteelSeries Sonar - Microphone", "sonar");
+    const shureTrack = new FakeTrack("Microphone (5- Shure MV7)", "shure");
+    vi.mocked(navigator.mediaDevices.enumerateDevices)
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([inputDevice("shure", shureTrack.label)]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockResolvedValueOnce(streamFor(sonarTrack))
+      .mockResolvedValueOnce(streamFor(shureTrack));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-filter-virtual",
+      diarizationEnabled: true,
+    });
+    track.end();
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(sonarTrack.stop).toHaveBeenCalledOnce();
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      activeMicLabel: shureTrack.label,
+      micRecoveryStatus: "restored",
+      micRecoveryAttempt: 0,
+    });
+  });
+
+  it("re-enumerates and opens a physical microphone before default on initial fallback", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "missing-physical", preferBuiltInMic: false });
+    const shureTrack = new FakeTrack("Microphone (5- Shure MV7)", "shure");
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([
+      inputDevice("shure", shureTrack.label),
+      inputDevice("sonar", "SteelSeries Sonar - Microphone"),
+    ]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockRejectedValueOnce(Object.assign(new Error("missing"), { name: "NotFoundError" }))
+      .mockResolvedValueOnce(streamFor(shureTrack));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-safe-initial-fallback",
+      diarizationEnabled: true,
+    });
+
+    expect(navigator.mediaDevices.enumerateDevices).toHaveBeenCalledOnce();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenNthCalledWith(2, {
+      audio: expect.objectContaining({ deviceId: { exact: "shure" } }),
+    });
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      activeMicLabel: shureTrack.label,
+      micFallbackActive: true,
+      error: null,
+    });
+  });
+
+  it("recovers again when a replacement track later ends", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "first", preferBuiltInMic: false });
+    const firstReplacement = new FakeTrack("Microphone (5- Shure MV7)", "first");
+    const secondReplacement = new FakeTrack("Microphone (6- Arctis Nova Pro)", "second");
+    vi.mocked(navigator.mediaDevices.enumerateDevices)
+      .mockResolvedValueOnce([inputDevice("first", firstReplacement.label)])
+      .mockResolvedValueOnce([inputDevice("second", secondReplacement.label)]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockResolvedValueOnce(streamFor(firstReplacement))
+      .mockResolvedValueOnce(streamFor(secondReplacement));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-repeat-recovery",
+      diarizationEnabled: true,
+    });
+    track.end();
+    await vi.waitFor(() =>
+      expect(useMeetingRecordingStore.getState()).toMatchObject({
+        activeMicLabel: firstReplacement.label,
+        micRecoveryStatus: "restored",
+      })
+    );
+    firstReplacement.end();
+    await vi.waitFor(() =>
+      expect(useMeetingRecordingStore.getState()).toMatchObject({
+        activeMicLabel: secondReplacement.label,
+        micRecoveryStatus: "restored",
+      })
+    );
+
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      error: null,
+      micRecoveryStatus: "restored",
+    });
+    expect(window.electronAPI.meetingTranscriptionStop).not.toHaveBeenCalled();
+  });
+
+  it("coalesces duplicate ended events into one recovery cycle", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "shure", preferBuiltInMic: false });
+    const shureTrack = new FakeTrack("Microphone (5- Shure MV7)", "shure");
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([
+      inputDevice("shure", shureTrack.label),
+    ]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockResolvedValueOnce(streamFor(shureTrack));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-coalesce-ended",
+      diarizationEnabled: true,
+    });
+    track.end();
+    track.dispatchEvent(new Event("ended"));
+
+    await vi.waitFor(() =>
+      expect(useMeetingRecordingStore.getState().micRecoveryStatus).toBe("restored")
+    );
+    expect(navigator.mediaDevices.enumerateDevices).toHaveBeenCalledOnce();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops a replacement stream that resolves after recording is stopped", async () => {
+    useSettingsStore.setState({ selectedMicDeviceId: "physical-mic", preferBuiltInMic: false });
+    const lateTrack = new FakeTrack("Microphone (5- Shure MV7)", "shure");
+    let resolveLateStream: ((stream: MediaStream) => void) | null = null;
+    const lateStream = new Promise<MediaStream>((resolve) => {
+      resolveLateStream = resolve;
+    });
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockImplementationOnce(() => lateStream);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-late-replacement",
+      diarizationEnabled: true,
+    });
+    track.end();
+    await vi.waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2));
+    await stopRecording();
+    resolveLateStream?.(streamFor(lateTrack));
+    await vi.waitFor(() => expect(lateTrack.stop).toHaveBeenCalledOnce());
+
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: false,
+      activeMicLabel: null,
+      micRecoveryStatus: "idle",
+    });
+  });
+
+  it("cancels a delayed retry when recording stops", async () => {
+    vi.useFakeTimers();
+    useSettingsStore.setState({ selectedMicDeviceId: "physical-mic", preferBuiltInMic: false });
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([]);
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockRejectedValue(Object.assign(new Error("missing"), { name: "NotFoundError" }));
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-cancel-delay",
+      diarizationEnabled: true,
+    });
+    track.end();
+    await vi.advanceTimersByTimeAsync(500);
+    const callsBeforeStop = vi.mocked(navigator.mediaDevices.getUserMedia).mock.calls.length;
+    const stopPromise = stopRecording();
+    await vi.runAllTimersAsync();
+    await stopPromise;
+    await vi.runAllTimersAsync();
+
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(callsBeforeStop);
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: false,
+      micRecoveryStatus: "idle",
+      micRecoveryAttempt: 0,
+    });
   });
 
   it("applies a cloud correction to only the matching local segment", async () => {
