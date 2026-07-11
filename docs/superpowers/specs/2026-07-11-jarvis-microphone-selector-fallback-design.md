@@ -1,143 +1,173 @@
-# Jarvis Microphone Selector and Runtime Fallback Design
+# Jarvis Microphone Selector and Continuous Recovery Design
 
 ## Problem
 
-Jarvis currently records from the application-wide microphone setting, but the Jarvis control panel does not expose a device selector. The default Windows capture endpoint on this machine is `SteelSeries Sonar - Microphone`. That virtual endpoint has intermittently ended its `MediaStreamTrack` shortly after capture starts, producing the generic `MIC_DISCONNECTED` message even though physical microphones remain available.
+Jarvis exposes a microphone selector and can hot-swap once from a pinned input to the Windows default input. The default input on this machine is `SteelSeries Sonar - Microphone`. If the selected track ends, Jarvis can therefore move onto the same unstable virtual-audio path; if that replacement track ends, the current one-shot recovery guard emits `MIC_DISCONNECTED` and stops the recording.
 
-The user needs to pin Jarvis to a physical microphone while retaining an automatic system-default fallback when the pinned device is unavailable or disconnects during a recording.
+Jarvis must keep an already-started recording session alive through any number of microphone interruptions. Automatic recovery must re-enumerate devices, avoid known virtual inputs, retry indefinitely, and resume the existing audio/transcription pipeline when a physical input becomes available.
 
 ## Goals
 
-- Show every currently available audio-input device in a compact selector on the Jarvis recording card.
-- Persist an explicitly selected device through the existing `selectedMicDeviceId` setting.
-- Disable `preferBuiltInMic` when the user makes an explicit Jarvis selection so it cannot override the pinned device.
-- Use an exact device constraint for the selected microphone on start and resume.
-- Fall back to the system-default microphone if the selected device cannot be opened.
-- If the selected track ends during capture, replace the microphone pipeline with a system-default stream without ending the Jarvis session.
-- Display the actual active microphone and a visible fallback notice.
-- Preserve the current `MIC_DISCONNECTED` failure behavior only when both the selected device and system default are unavailable.
+- Preserve the existing explicit microphone selector and persisted `selectedMicDeviceId` setting.
+- Respect the user's explicit selection when a recording starts.
+- When an active Jarvis microphone track ends, keep the recording session and timer running.
+- Re-enumerate audio inputs before every recovery cycle instead of reusing a stale device list.
+- Prefer the saved physical microphone, then other physical microphones, then a non-virtual system-default input.
+- Exclude known virtual inputs from automatic recovery, including SteelSeries Sonar, VoiceMeeter, Steam, and YY inputs.
+- Retry without a maximum attempt count while the recording remains active.
+- Resume PCM delivery, WAV writing, transcription, diarization, and analysis in the same Jarvis session after recovery.
+- Cancel pending retry timers and discard late streams when the user pauses, stops, finalizes, or exits.
+- Show a non-fatal reconnecting state while no microphone is available.
 
 ## Non-goals
 
 - Capturing computer/system audio.
-- Automatically switching back to the preferred microphone during an active recording after fallback succeeds.
-- Changing the global Windows default audio device.
-- Uploading audio or changing cloud-correction behavior.
-- Classifying devices as physical or virtual with an unreliable label heuristic.
+- Changing the Windows default audio device.
+- Preventing the user from explicitly selecting a virtual microphone for the initial recording.
+- Perfect hardware classification. Automatic recovery uses a conservative, test-covered label denylist because Web media-device APIs do not expose a reliable physical/virtual flag.
+- Filling a microphone outage with generated silence. The session clock continues, but no synthetic PCM is written during the gap.
+- Changing cloud-correction, MiniMax analysis, speaker identity, retention, or budget behavior.
 
 ## User experience
 
-The recording card gains a `Microphone` select control. It is enabled while Jarvis is idle, finished, failed, or paused, and disabled while starting, recording, or finalizing.
+The existing `Microphone` selector remains enabled only while changing devices is safe. An explicitly selected device remains persisted across restarts.
 
-The selector contains `System default` followed by every `audioinput` device returned by `enumerateDevices()`. If labels are unavailable, Jarvis requests microphone access once, stops the temporary permission stream immediately, and enumerates again.
+During normal recording, the card displays the label from the active `MediaStreamTrack`. When the track ends, Jarvis clears the active label and displays a non-blocking status such as `Microphone disconnected. Reconnecting…`. The recording timer and session remain active.
 
-Selecting a named device stores its exact `deviceId` and sets `preferBuiltInMic=false`. Selecting `System default` stores an empty device id and also sets `preferBuiltInMic=false`.
+Recovery starts immediately. If it does not succeed, Jarvis retries after progressively longer delays and then settles at one attempt every 10 seconds. There is no final `MIC_DISCONNECTED` transition solely because recovery attempts have failed. The status remains reconnecting until a suitable microphone is acquired or the user ends the operation.
 
-During capture, the card displays the label from the active `MediaStreamTrack`, not merely the saved selection. If fallback is active, a non-blocking notice says: `Selected microphone disconnected. Continuing with <device>.`
+After recovery, the card displays the new active device and a notice such as `Microphone restored with <device>.` If that replacement later ends, Jarvis returns to the same reconnecting flow.
 
-If fallback also fails, Jarvis stops the capture pipeline and shows the existing recording error. The saved preferred device is not erased, so the next session can try it again.
+The user can always pause or stop. Either action immediately cancels future retries and cleans up any replacement stream that resolves after cancellation.
 
 ## Architecture
 
-### Device selector
+### Recovery policy module
 
-Create `app/src/jarvis/renderer/JarvisMicrophoneSelector.tsx`. It owns device enumeration and device-change refresh, and consumes the existing Zustand settings store:
+Create a focused renderer module beside the recording store. It contains pure, independently tested policy functions for:
 
-- `selectedMicDeviceId`
-- `setSelectedMicDeviceId(deviceId)`
-- `setPreferBuiltInMic(false)`
+- normalizing device labels;
+- detecting denied virtual-device labels;
+- ordering recovery candidates;
+- returning the retry delay for an attempt.
 
-It receives `disabled: boolean` from `RecordingControls` and exposes no recording lifecycle methods.
+The denylist is case-insensitive and includes tokens for `sonar`, `voicemeeter`, `steam`, and `yy`. A device with an empty label is not automatically accepted during recovery because its physical/virtual status cannot be verified. The system-default entry is accepted only when its resolved track label is non-empty and does not match the denylist.
 
-`RecordingControls` renders the selector inside the recording card and uses the active microphone metadata from `UseJarvisRecordingResult` for its status label.
+Candidate order for each cycle is:
 
-### Capture selection and initial fallback
+1. the persisted selected device, if it is present and its current label is not denied;
+2. remaining labeled, non-denied `audioinput` devices in enumeration order;
+3. a default-device request, retained only if the returned track label is non-empty and not denied.
 
-Refactor microphone constraint resolution in `meetingRecordingStore.ts` into an independently testable unit. The resolver returns both the preferred exact constraint and the default fallback constraint.
+Duplicate device ids and duplicate resolved labels are attempted once per cycle.
 
-For Jarvis mic-only capture:
+Retry delays are `0 ms`, `500 ms`, `1 s`, `2 s`, `5 s`, then `10 s` for every subsequent failed cycle. The delay counter resets after a stream is successfully attached. A new disconnect starts again with an immediate attempt.
 
-1. If `selectedMicDeviceId` is set, call `getUserMedia` with `deviceId: { exact: selectedMicDeviceId }`.
-2. If that request fails for any reason other than permission denial, retry once with the default constraints.
-3. Permission denial remains `MIC_PERMISSION`; it must not trigger a second permission request.
-4. If no explicit device is stored, open the system default directly.
+### Continuous recovery controller
 
-Non-Jarvis meeting capture retains its existing fallback behavior.
+Replace the capture-local one-shot flags with one recovery controller scoped to the active `startRecording` invocation. It owns:
 
-### Mid-recording hot swap
+- a generation token that invalidates work after pause/stop/finalize;
+- a single in-flight recovery promise;
+- one cancellable retry timer;
+- the current attempt number;
+- the last active device id and label for ordering and diagnostics.
 
-Extract microphone pipeline attachment into a capture-local helper that can be invoked for both the initial stream and a replacement stream. The helper owns:
+Every Jarvis mic-only track receives the same ended handler, including replacement tracks. The handler is idempotent: duplicate `ended` events join the existing recovery operation rather than starting parallel `getUserMedia` calls.
 
-- the `MediaStream` and active audio track;
-- a 24 kHz `AudioContext` detached from an output device;
-- the worklet source and processor;
-- the microphone analyser;
-- the track-ended listener.
+For each recovery cycle the controller:
 
-When the selected track fires `ended` during Jarvis mic-only capture:
+1. verifies that the recording generation is still active;
+2. publishes the reconnecting state without setting the fatal recording error;
+3. calls `enumerateDevices()`;
+4. constructs the ordered physical-device candidates;
+5. requests each exact candidate until one returns a live, unmuted audio track;
+6. if needed, requests the default device and rejects/stops it when its resolved label is denied;
+7. attaches the first accepted stream to the existing microphone pipeline;
+8. resets the retry counter and publishes the restored active-device state.
 
-1. Guard recovery with a single in-flight promise so duplicate events cannot create parallel pipelines.
-2. Acquire the system-default stream once.
-3. Build the replacement pipeline using the existing `onChunk` callback, so main-process WAV writing and local transcription continue in the same Jarvis session.
-4. Atomically publish the new stream/context/source/processor/analyser references.
-5. Flush and close the old pipeline after the replacement is ready.
-6. Publish active-device metadata with `fallbackActive=true`.
+If enumeration, acquisition, or pipeline attachment fails, all partial streams and audio nodes are closed before the next scheduled cycle. The same session remains recording.
 
-If default acquisition or replacement-pipeline creation fails, preserve the current `MIC_DISCONNECTED` path and stop recording.
+### Pipeline handoff
 
-The fallback stream is not automatically switched back to the selected microphone during the same recording. The preferred id remains persisted for the next start or manual pause/resume.
+The existing pipeline attachment helper remains responsible for creating the 24 kHz audio context, worklet processor, analyser, and track-ended listener. A replacement is built before the previous pipeline references are discarded. Publication of the new references happens atomically, and only the currently published processor may dispatch PCM chunks.
+
+Recovery reuses the existing `onMicChunk` callback. Therefore recovered audio continues through the same main-process WAV writer and local transcription socket with the same Jarvis session id. Recovery does not reset transcript segment ids, speaker identities, cloud budget state, the recording timer, or scheduled analysis.
 
 ### State propagation
 
-Extend the meeting recording state and `UseJarvisRecordingResult` with:
+Extend the meeting recording state with a small recovery status rather than representing a temporary outage as a fatal error:
 
-- `activeMicLabel: string | null`
-- `micFallbackActive: boolean`
+- `micRecoveryStatus: "idle" | "reconnecting" | "restored"`
+- `micRecoveryAttempt: number`
+- existing `activeMicLabel: string | null`
+- existing `micFallbackActive: boolean`
 
-Reset both fields during final cleanup. The user-visible recording state continues to come from the existing Jarvis session machine; no new database columns are required.
+`activeMicLabel` becomes `null` while reconnecting. `micFallbackActive` remains true when the active stream is not the saved selection. Cleanup resets all fields. No database migration is required.
+
+## Initial acquisition
+
+An explicitly selected device is still attempted first on start and resume. If it cannot open for a non-permission reason, Jarvis applies the same candidate filtering to choose another physical device. An explicit permission denial remains `MIC_PERMISSION` and does not enter a background retry loop.
+
+An initial recording cannot transition to the active recording state without at least one accepted live microphone stream. Infinite recovery applies after a Jarvis recording has successfully started; this prevents creating a new session that contains no audio from its first moment.
 
 ## Error handling and concurrency
 
-- Device enumeration failure shows a local selector error without changing the saved device.
-- A missing saved device remains visible as `Previously selected microphone unavailable` until the user chooses another device.
-- A selection cannot be changed during an active start/finalize/recording operation.
-- Only one default-device recovery attempt may run for a track-ended event.
-- Stop/finalize invalidates an in-flight recovery; a late replacement stream is stopped and never attached.
-- Old and replacement pipelines must never dispatch the same PCM buffer concurrently.
-- Recovery does not reset the Jarvis timer, session id, transcript segment ids, speaker identities, or cloud budget state.
+- `MIC_PERMISSION` remains fatal because retrying cannot fix denied operating-system permission.
+- Runtime device absence, `NotFoundError`, `NotReadableError`, an ended track, or a denied automatic fallback is recoverable and must not stop the session.
+- Only one recovery cycle and one retry timer may exist at a time.
+- A late stream resolving after cancellation is stopped and never attached.
+- A track that ends during pipeline construction is rejected and closed.
+- A replacement that ends later starts a fresh unlimited recovery sequence.
+- Pause, stop, finalize, and app shutdown invalidate the controller before closing media resources.
+- Recovery logs contain attempt number, candidate label, and browser error name, but never transcript text or audio contents.
 
 ## Testing
 
-### Renderer component tests
+### Policy unit tests
 
-- Enumerates labeled microphones and renders the system-default choice.
-- Requests permission only when labels are absent and immediately stops the temporary stream.
-- Selecting a device persists its id and disables built-in preference.
-- The selector is disabled while recording and enabled while paused.
-- Device removal preserves the saved id and displays the unavailable label.
+- Denies Sonar, VoiceMeeter, Steam, and YY labels case-insensitively.
+- Does not deny Shure MV7 or Arctis Nova Pro labels.
+- Orders the saved physical device before other physical inputs.
+- Excludes empty labels, denied labels, and duplicate candidates.
+- Produces `0`, `500`, `1000`, `2000`, `5000`, then repeated `10000` millisecond delays.
 
 ### Capture pipeline tests
 
-- An available exact device is used without requesting default fallback.
-- An unavailable exact device falls back to default for Jarvis mic-only capture.
-- Permission denial reports `MIC_PERMISSION` without fallback.
-- A selected track ending attaches one default replacement and continues PCM dispatch in the same session.
-- Duplicate ended events share one recovery.
-- Stop during recovery discards the late replacement.
-- Default recovery failure produces `MIC_DISCONNECTED` and stops capture.
+- A selected track ending begins recovery without ending the Jarvis session.
+- Recovery re-enumerates devices before each failed cycle.
+- A Sonar default stream is stopped and not attached.
+- A physical candidate is selected before a virtual default stream.
+- Failed cycles continue beyond the previous one-attempt limit.
+- A recovered track ending starts another recovery sequence.
+- Duplicate ended events do not create parallel acquisition calls.
+- Stop during a delay cancels the timer.
+- Stop during `getUserMedia` discards the late stream.
+- Recovery preserves the Jarvis session id and continues PCM delivery.
+- Permission denial on initial start still produces `MIC_PERMISSION`.
+
+### Renderer tests
+
+- The recording card displays reconnecting state and attempt count without a fatal error.
+- The restored active-device label replaces the reconnecting message.
+- Pause and stop remain available while reconnecting.
 
 ### Hardware acceptance
 
-- Select the active Shure MV7 or Arctis Nova Pro endpoint in Jarvis.
-- Restart the app and confirm the selection persists.
-- Start, pause, resume, and finish while verifying the active-device label and microphone meter.
-- Confirm WAV files under `G:\JarvisData\recordings` contain non-silent audio.
-- Confirm cloud correction remains off and no usage is recorded.
+- Pin Jarvis to Shure MV7 or Arctis Nova Pro.
+- Start a recording and disconnect or disable the selected endpoint.
+- Confirm the timer and session remain active while the UI reports reconnecting.
+- Confirm Sonar is never shown as the automatically recovered active device.
+- Reconnect the physical microphone and confirm audio/transcription resume in the same session.
+- Repeat the disconnect/reconnect cycle at least twice.
+- Stop during reconnecting and confirm no later microphone activation occurs.
 
 ## Success criteria
 
-- Jarvis can be pinned to a physical microphone from its own control panel.
-- Sonar is not used while the pinned device is available.
-- A preferred-device disconnect does not end the Jarvis session when the system default can be opened.
-- The UI always states the device actually supplying audio.
-- Existing Jarvis, packaging, lint, type-check, and localization suites pass.
+- A runtime microphone interruption never stops an already-started Jarvis session unless the user stops it or microphone permission is revoked.
+- Automatic recovery never attaches a known virtual input.
+- Recovery can survive any number of sequential track endings.
+- Device candidates are refreshed on every cycle.
+- Failed recovery settles at a 10-second interval and continues indefinitely without parallel retries.
+- Recovered audio continues in the same WAV/transcription/session pipeline.
+- Existing Jarvis, renderer, localization, type-check, build, and packaging checks pass.
