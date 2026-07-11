@@ -3,12 +3,47 @@ const { validateAnalysisPayload, ANALYSIS_TOOL } = require("./JarvisAnalysisSche
 const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const COLLECTION_FIELDS = ["topics", "memories", "todos", "decisions", "suggestions"];
 
 function failure(code, message, retryable = false) {
   const error = new Error(message);
   error.code = code;
   error.retryable = retryable;
   return error;
+}
+
+function normalizeCollection(value, field) {
+  if (Array.isArray(value)) return value;
+  if (value === null || value === undefined) return [];
+  if (value && typeof value === "object") {
+    for (const key of [field, "items", "results"]) {
+      if (Array.isArray(value[key])) return value[key];
+    }
+    if (Object.keys(value).length === 0) return [];
+    return [value];
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed || /^(?:none|null|n\/a)$/i.test(trimmed)) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed !== value) return normalizeCollection(parsed, field);
+    } catch {
+      // A plain decision string is a valid single decision. Structured collections
+      // remain unchanged so the strict validator can reject ungrounded prose.
+    }
+    if (field === "decisions") return [trimmed];
+  }
+  return value;
+}
+
+function normalizeToolArguments(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const normalized = { ...value };
+  for (const field of COLLECTION_FIELDS) {
+    normalized[field] = normalizeCollection(value[field], field);
+  }
+  return normalized;
 }
 
 class MiniMaxAnalysisClient {
@@ -62,7 +97,7 @@ class MiniMaxAnalysisClient {
             {
               role: "system",
               content:
-                "Analyze only the supplied transcript. Do not invent facts. Every topic, memory, and todo must cite supplied segment ids. Keep Chinese and English terms in their original language. Call the required tool exactly once.",
+                "Analyze only the supplied transcript. Do not invent facts. Every topic, memory, and todo must cite supplied segment ids. Keep Chinese and English terms in their original language. Call the required tool exactly once. The topics, memories, todos, decisions, and suggestions fields MUST be JSON arrays; use [] when a collection has no items and never wrap arrays in an object.",
             },
             {
               role: "user",
@@ -112,8 +147,18 @@ class MiniMaxAnalysisClient {
     } catch {
       throw failure("MINIMAX_INVALID_ANALYSIS", "MiniMax analysis arguments are invalid");
     }
+    let result;
+    try {
+      result = validateAnalysisPayload(normalizeToolArguments(parsed), allowedIds);
+    } catch {
+      throw failure(
+        "MINIMAX_INVALID_ANALYSIS",
+        "MiniMax returned analysis with an invalid structure",
+        true
+      );
+    }
     return {
-      result: validateAnalysisPayload(parsed, allowedIds),
+      result,
       usage: {
         inputTokens: body?.usage?.prompt_tokens ?? body?.usage?.input_tokens ?? 0,
         outputTokens: body?.usage?.completion_tokens ?? body?.usage?.output_tokens ?? 0,
