@@ -4,7 +4,7 @@
 
 **Goal:** Turn complete transcripts and confirmed speaker context into durable, evidence-linked memories, topics, commitments, todos, daily reviews, and forward-looking suggestions without inventing facts or silently overwriting history.
 
-**Architecture:** Durable analysis jobs consume immutable transcript and identity revisions. MiniMax receives pseudonymized text only and returns a strictly validated candidate analysis. A deterministic local merger owns persistence, versioning, deduplication, conflicts, and evidence links. Daily digests are versioned views over stored evidence; planning outputs remain suggestions until the user explicitly accepts them.
+**Architecture:** Durable, lowest-priority analysis jobs consume immutable final transcript and identity revisions. MiniMax receives pseudonymized text only and returns a strictly validated candidate analysis. A deterministic local merger owns persistence, versioning, deduplication, conflicts, and evidence links. Daily digests are versioned views over stored evidence and explicitly expose processing completeness; planning outputs remain suggestions until the user accepts them.
 
 **Tech Stack:** Electron, Node.js, better-sqlite3, MiniMax text API, existing Jarvis repository and analysis client, React, Zustand, Node test runner, Vitest, Testing Library.
 
@@ -15,9 +15,25 @@
 - Every factual output must point to persisted evidence.
 - AI output is untrusted input and must pass structural and semantic validation.
 - Cloud failure must not block capture, transcript viewing, playback, or manual memory access.
+- Provisional transcripts and temporary speaker labels are never analysis inputs.
+- Analysis and digest work is lower priority than capture, preview, final transcription, speaker processing, and evidence compression.
+- Analysis backpressure must remain durable and bounded; it may not reserve the GPU or delay higher-priority local work.
+- A daily review may be generated while upstream work is pending only when it is labeled partial and records the exact input watermark; completion creates a new revision.
 - Existing summaries, memories, topics, and todos must be preserved and imported idempotently.
 
 ---
+
+## File Structure
+
+- Create `app/src/jarvis/main/MemoryRepository.js`: analysis revisions, evidence links, memories, conflicts, digests, and suggestions.
+- Create `app/src/jarvis/main/AnalysisInputBuilder.js` and modify `JarvisAnalysisSchema.js`/`MiniMaxAnalysisClient.js`: pseudonymization, strict request/response schema, and privacy validation.
+- Create `app/src/jarvis/main/JarvisAnalysisWorker.js`: idempotent final-revision analysis.
+- Create `app/src/jarvis/main/MemoryMerger.js`: deterministic local merge, deduplication, and conflict handling.
+- Create `app/src/jarvis/main/DailyDigestService.js` and `DailyDigestScheduler.js`: local-day, watermark-aware digest revisions.
+- Create `app/src/jarvis/main/AgentWorkloadPolicy.js`: final-input eligibility, priority, and bounded deferral.
+- Modify `app/src/jarvis/main/JarvisProcessingRuntime.js`: register analysis as lower-priority non-capture work.
+- Modify `app/src/jarvis/main/registerJarvisIpc.js`: expose evidence, revisions, partial/final state, retry, and acceptance actions.
+- Modify Jarvis renderer People, Topics, Todos, Memory, and Daily Review views: persisted data, evidence navigation, completeness, and deferred status.
 
 ### Task 1: Add revisioned analysis and memory lineage storage
 
@@ -557,12 +573,95 @@ git commit -m "test: gate jarvis privacy budget and migration"
 
 ---
 
+### Task 8: Make Agent Analysis Final-Only, Lowest-Priority, and Backlog-Aware
+
+**Files:**
+- Create: `app/src/jarvis/main/AgentWorkloadPolicy.js`
+- Modify: `app/src/jarvis/main/JarvisAnalysisWorker.js`
+- Modify: `app/src/jarvis/main/DailyDigestService.js`
+- Modify: `app/src/jarvis/main/JarvisProcessingRuntime.js`
+- Modify: `app/src/jarvis/renderer/DailyReviewView.tsx`
+- Modify: `app/src/jarvis/renderer/ProcessingStatus.tsx`
+- Test: `app/test/jarvis/AgentWorkloadPolicy.test.js`
+- Test: `app/test/jarvis/AnalysisFinalInputOnly.test.js`
+
+**Interfaces:**
+- Consumes: final transcript revision IDs, resolved identity revision IDs, `ResourceGovernor` snapshots, durable processing jobs, and the validated MiniMax boundary from Tasks 2–3.
+- Produces: `AgentWorkloadPolicy.evaluate(input): { eligible, reason, priority }`, exact analysis input watermarks, and `partial | final` daily-review completeness.
+
+- [ ] **Step 1: Write failing final-input and priority tests**
+
+```js
+test('rejects provisional transcript and temporary identity revisions', () => {
+  assert.deepEqual(policy.evaluate({ transcriptState: 'provisional', identityState: 'temporary' }), {
+    eligible: false, reason: 'final_inputs_pending', priority: 50,
+  })
+})
+
+test('analysis waits behind every local evidence job', () => {
+  const order = scheduler.order(['analysis', 'speaker', 'final_transcription', 'preview', 'storage_recovery_compress', 'retention_urgent'])
+  assert.deepEqual(order, ['retention_urgent', 'storage_recovery_compress', 'preview', 'final_transcription', 'speaker', 'analysis'])
+})
+```
+
+- [ ] **Step 2: Run focused tests and verify failure**
+
+Run: `cd app && node --test test/jarvis/AgentWorkloadPolicy.test.js test/jarvis/AnalysisFinalInputOnly.test.js`
+
+Expected: FAIL because final-only admission and the explicit priority are missing.
+
+- [ ] **Step 3: Implement immutable input admission**
+
+```js
+export class AgentWorkloadPolicy {
+  evaluate(input) {
+    const final = input.transcriptState === 'final' && input.identityState !== 'temporary'
+    return final
+      ? { eligible: true, reason: null, priority: 50 }
+      : { eligible: false, reason: 'final_inputs_pending', priority: 50 }
+  }
+}
+```
+
+The job key must include transcript, identity, prompt-schema, and pseudonym-map revision IDs. `JarvisAnalysisWorker` must reload and compare those revisions immediately before sending MiniMax data; a changed input supersedes the stale job instead of mixing revisions.
+
+- [ ] **Step 4: Enforce bounded low-priority execution**
+
+Allow at most one active MiniMax analysis request and a bounded local candidate-validation queue. When higher-priority local jobs are pending or the system is `constrained`, release the analysis lease with `analysis_deferred_for_local_work`; do not hold `HeavyJobGate`, open audio files, or affect session readiness.
+
+- [ ] **Step 5: Version partial and final daily reviews**
+
+Store a watermark `{ localDate, latestTranscriptRevisionId, latestIdentityRevisionId, pendingUpstreamJobs }`. If pending work exists, label the digest `partial` and list the missing stages. When the watermark advances and pending count reaches zero, create a new `final` revision that supersedes but does not delete the partial review.
+
+- [ ] **Step 6: Render honest backlog/completeness state**
+
+Show `今日回顾仍在补齐`, missing stage names, oldest analysis job, next retry, and the evidence watermark. Keep previously persisted memories, topics, todos, and reviews readable while analysis is deferred or MiniMax is offline.
+
+- [ ] **Step 7: Run focused and end-to-end tests**
+
+Run: `cd app && node --test test/jarvis/AgentWorkloadPolicy.test.js test/jarvis/AnalysisFinalInputOnly.test.js test/jarvis/JarvisAnalysisWorker.test.js test/jarvis/DailyDigestService.test.js && npm run test:jarvis`
+
+Expected: all tests pass; no MiniMax request contains provisional text or temporary identity, analysis never blocks a higher-priority job, and a partial review becomes a distinct final revision after backlog drain.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add app/src/jarvis/main/AgentWorkloadPolicy.js app/src/jarvis/main/JarvisAnalysisWorker.js app/src/jarvis/main/DailyDigestService.js app/src/jarvis/main/JarvisProcessingRuntime.js app/src/jarvis/renderer/DailyReviewView.tsx app/src/jarvis/renderer/ProcessingStatus.tsx app/test/jarvis/AgentWorkloadPolicy.test.js app/test/jarvis/AnalysisFinalInputOnly.test.js
+git commit -m "feat(jarvis): defer final only agent analysis"
+```
+
+---
+
 ## Phase Acceptance Checklist
 
 - [ ] Every factual memory, topic, decision, commitment, todo, and summary line has stored evidence.
 - [ ] MiniMax receives pseudonymized transcript text only; raw audio, embeddings, paths, device names, real names, and secrets stay local.
 - [ ] Invalid or unexpected MiniMax structures cannot reach the database.
 - [ ] Analysis jobs survive restart, retry safely, and never block recording or playback.
+- [ ] MiniMax and memory generation consume only immutable final transcript and non-temporary identity revisions.
+- [ ] Analysis remains below capture, preview, final transcription, speaker, and compression priority and never reserves the GPU-heavy gate.
+- [ ] Deferred/offline analysis leaves all existing memories and evidence readable and exposes its backlog reason.
+- [ ] Partial daily reviews record an exact watermark and are superseded by a distinct final revision after upstream backlog completes.
 - [ ] Repeated analysis is idempotent; changed inputs create revisions and lineage.
 - [ ] Similar memories are suggested for merging; conflicting facts are not silently overwritten.
 - [ ] Daily reviews respect local-day boundaries, processing completeness, and revision history.

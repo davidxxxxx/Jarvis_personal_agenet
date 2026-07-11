@@ -1,7 +1,7 @@
 # Jarvis 全天运行与资源治理补充设计
 
 日期：2026-07-12
-状态：设计已批准，待书面审阅
+状态：规格已批准，已合并进四阶段实施计划
 基础规格：`2026-07-12-jarvis-trusted-personal-agent-foundation-design.md`
 
 ## 1. 目的
@@ -548,9 +548,9 @@ Today页面分别展示：
 
 本设计是基础规格的横切补充，不替代四个实施阶段：
 
-1. 双轨采集与证据层负责引入Capture Lane、VAD时间线、WAV提交、FLAC和磁盘保护。
-2. 完整转写与连续会话负责Preview Lane、Final Processing Lane、CUDA Worker、资源治理和背压。
-3. 说话人与长期身份负责把实时高频声纹改为后台稳定语音段处理。
-4. 证据化记忆与Agent输出遵守最终结果依赖和低优先级调度。
+1. `2026-07-12-jarvis-evidence-dual-track-capture.md` Tasks 9–12 引入Capture Lane、VAD时间线、语音触发/连续保留、WAV提交、无损FLAC、磁盘保护和全天采集门槛。
+2. `2026-07-12-jarvis-complete-transcription-session-playback.md` Tasks 8–13 引入Preview Lane、Final Processing Lane、固定CUDA Worker、真实GPU验证、资源治理、背压、系统生命周期和24小时性能门槛。
+3. `2026-07-12-jarvis-speaker-long-term-identity.md` Task 7 移除实时高频声纹，把说话人工作限制为最终证据后的后台稳定语音段处理，并与Whisper串行。
+4. `2026-07-12-jarvis-evidence-memory-agent-output.md` Task 8 强制最终结果依赖、最低优先级调度、部分/最终每日回顾和可见积压状态。
 
 详细实施计划必须把本设计的任务合并进相应阶段，并保留阶段间依赖顺序。

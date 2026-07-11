@@ -4,7 +4,7 @@
 
 **Goal:** Reliably distinguish the owner from other speakers, keep session-local speaker clusters separate from confirmed long-term identities, and let the user correct, name, merge, or undo identity decisions with complete provenance.
 
-**Architecture:** A durable diarization job creates session-scoped speaker clusters from finalized audio and transcript timing. A conservative identity resolver compares quality-gated cluster embeddings with versioned voice profiles, but only high-confidence matches are linked automatically. Confirmed user corrections update durable identity links transactionally; the original cluster, score, model version, and correction history remain queryable.
+**Architecture:** A durable, resource-governed diarization job creates session-scoped speaker clusters only from finalized audio and transcript timing. A conservative identity resolver compares quality-gated cluster embeddings with versioned voice profiles, but only high-confidence matches are linked automatically. Confirmed user corrections update durable identity links transactionally; the original cluster, score, model version, and correction history remain queryable.
 
 **Tech Stack:** Electron, Node.js, better-sqlite3, existing Whisper/diarization and speaker-embedding helpers, React, Zustand, Node test runner, Vitest, Testing Library.
 
@@ -15,9 +15,26 @@
 - Never identify a person solely from a display name supplied by the model.
 - Do not update a voice centroid from an automatic match.
 - Preserve unknown speakers as unknown.
+- Do not compute speaker embeddings per second during live capture.
+- Preview may show temporary session labels only; persistent identity work begins after final audio and final transcript are available.
+- Speaker diarization/embedding is GPU-heavy work and must use the phase-two `HeavyJobGate`; it may not overlap Whisper inference.
+- When resources are `busy`, `constrained`, or `unavailable`, speaker jobs remain durable and deferred without affecting capture or final transcript visibility.
 - All schema changes must be idempotent and preserve existing sessions, chunks, transcripts, people, and the reserved self profile.
 
 ---
+
+## File Structure
+
+- Create `app/src/jarvis/main/SpeakerIdentityRepository.js`: durable profiles, samples, session clusters, links, and revisions.
+- Create `app/src/jarvis/main/VoiceProfileStore.js` and modify `app/src/jarvis/main/VoiceEnrollmentService.js`: consented, quality-gated self enrollment.
+- Create `app/src/jarvis/main/SessionDiarizationWorker.js`: final-evidence-only session clustering.
+- Create `app/src/jarvis/main/SpeakerIdentityResolver.js`: conservative identity matching and suggestions.
+- Create `app/src/jarvis/main/SpeakerCorrectionService.js`: rename, link, merge, reject, and undo transactions.
+- Create `app/src/jarvis/main/SpeakerProcessingPolicy.js`: resource admission and final-evidence eligibility.
+- Modify `app/src/helpers/liveSpeakerIdentifier.js`: remove it from Jarvis all-day capture and retain only explicitly scoped legacy use.
+- Modify `app/src/jarvis/main/JarvisProcessingRuntime.js`: register deferred speaker jobs behind `HeavyJobGate`.
+- Modify `app/src/jarvis/main/JarvisRepository.js` and `app/src/jarvis/main/JarvisMigrations.js`: identity persistence and job eligibility.
+- Modify Jarvis renderer people/session views: temporary labels, identity suggestions, corrections, provenance, and deferred status.
 
 ### Task 1: Add durable cluster, profile-sample, and identity-link storage
 
@@ -479,6 +496,82 @@ git commit -m "test: gate long term speaker identity quality"
 
 ---
 
+### Task 7: Defer Speaker Work and Remove Per-Second Live Embeddings
+
+**Files:**
+- Create: `app/src/jarvis/main/SpeakerProcessingPolicy.js`
+- Modify: `app/src/jarvis/main/SessionDiarizationWorker.js`
+- Modify: `app/src/jarvis/main/JarvisProcessingRuntime.js`
+- Modify: `app/src/helpers/liveSpeakerIdentifier.js`
+- Modify: `app/src/jarvis/renderer/ProcessingStatus.tsx`
+- Test: `app/test/jarvis/SpeakerProcessingPolicy.test.js`
+- Test: `app/test/jarvis/NoLiveSpeakerEmbedding.test.js`
+
+**Interfaces:**
+- Consumes: `ResourceGovernor.admit('speaker')`, `HeavyJobGate.run('speaker', fn)`, final transcript revision IDs, and `AudioEvidenceReader.readVerifiedPcm(chunk)` from phases 1–2.
+- Produces: `SpeakerProcessingPolicy.evaluate(session): { eligible, reason }` and durable speaker-job deferral reasons.
+
+- [ ] **Step 1: Write failing eligibility and no-live-embedding tests**
+
+```js
+test('requires final transcript and committed final audio', () => {
+  assert.deepEqual(policy.evaluate(session({ transcriptState: 'provisional' })), {
+    eligible: false, reason: 'final_transcript_pending',
+  })
+  assert.deepEqual(policy.evaluate(session({ transcriptState: 'final', audioState: 'committed' })), {
+    eligible: true, reason: null,
+  })
+})
+
+test('accepting live PCM never invokes the embedding extractor', async () => {
+  await jarvis.acceptPcm('mic', oneHourOfFrames())
+  assert.equal(embeddingExtractor.calls.length, 0)
+})
+```
+
+- [ ] **Step 2: Run focused tests and verify failure**
+
+Run: `cd app && node --test test/jarvis/SpeakerProcessingPolicy.test.js test/jarvis/NoLiveSpeakerEmbedding.test.js`
+
+Expected: FAIL because no final-evidence policy exists and the legacy live path can still invoke embeddings.
+
+- [ ] **Step 3: Implement explicit final-evidence admission**
+
+```js
+export class SpeakerProcessingPolicy {
+  evaluate(session) {
+    if (session.audioState !== 'committed') return { eligible: false, reason: 'final_audio_pending' }
+    if (session.transcriptState !== 'final') return { eligible: false, reason: 'final_transcript_pending' }
+    return { eligible: true, reason: null }
+  }
+}
+```
+
+Require immutable input revision IDs in the speaker job key. Never read renderer preview buffers or provisional segments in `SessionDiarizationWorker`.
+
+- [ ] **Step 4: Route all speaker inference through the heavy-job gate**
+
+Call `ResourceGovernor.admit('speaker')`; on `defer` or `pause_preview`, release the durable lease with a retry time and visible reason. On admission, run diarization and embedding inside `HeavyJobGate.run('speaker', ...)`. Remove Jarvis capture subscriptions from `liveSpeakerIdentifier`; keep any non-Jarvis legacy export inert unless called explicitly.
+
+- [ ] **Step 5: Expose deferred state without inventing identity**
+
+While speaker work waits, render session-local labels such as `说话人 1（待确认）` and `声纹分析等待 GPU`; never substitute `我` or a persisted person name before the identity resolver creates an evidence-backed link.
+
+- [ ] **Step 6: Run focused, integration, and evaluation tests**
+
+Run: `cd app && node --test test/jarvis/SpeakerProcessingPolicy.test.js test/jarvis/NoLiveSpeakerEmbedding.test.js test/jarvis/SessionDiarizationWorker.test.js test/jarvis/SpeakerProfileIdentity.test.js`
+
+Expected: all tests pass; live PCM produces zero embedding calls, speaker/Whisper maximum heavy concurrency is 1, and deferred work later completes against the same immutable revisions.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add app/src/jarvis/main/SpeakerProcessingPolicy.js app/src/jarvis/main/SessionDiarizationWorker.js app/src/jarvis/main/JarvisProcessingRuntime.js app/src/helpers/liveSpeakerIdentifier.js app/src/jarvis/renderer/ProcessingStatus.tsx app/test/jarvis/SpeakerProcessingPolicy.test.js app/test/jarvis/NoLiveSpeakerEmbedding.test.js
+git commit -m "perf(jarvis): defer speaker identity processing"
+```
+
+---
+
 ## Phase Acceptance Checklist
 
 - [ ] Self enrollment survives restart and records its embedding model version.
@@ -489,4 +582,8 @@ git commit -m "test: gate long term speaker identity quality"
 - [ ] Persistent identity learning occurs only after explicit confirmation and a quality pass.
 - [ ] Every identity decision retains score, margin, model version, evidence cluster, and correction history.
 - [ ] Raw audio and embeddings never leave the local identity pipeline.
+- [ ] Live capture performs no per-second speaker embedding or persistent identity assignment.
+- [ ] Speaker processing consumes only committed final audio and final transcript revisions.
+- [ ] Whisper and speaker inference never overlap; resource pressure defers speaker jobs durably without blocking capture or transcript viewing.
+- [ ] Deferred sessions show temporary, explicitly unconfirmed labels until evidence-backed identity resolution completes.
 - [ ] Full Jarvis tests, typecheck, lint, and consented evaluation gates pass.

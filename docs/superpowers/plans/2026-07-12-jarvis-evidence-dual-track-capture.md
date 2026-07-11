@@ -2,22 +2,32 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a crash-recoverable evidence layer that records microphone and Windows system audio as independent tracks in one Jarvis session.
+**Goal:** Build a crash-recoverable, all-day evidence layer that records microphone and Windows system audio as independent tracks while minimizing retained silence and disk growth.
 
-**Architecture:** Keep the existing OpenWhispr capture implementations, but make `JarvisService` the authoritative multi-track session coordinator. Every committed WAV chunk is registered in SQLite with a source, sequence, hash, gap history, and durable processing job; renderer state only reflects this authority.
+**Architecture:** Keep the existing OpenWhispr capture implementations, but make `JarvisService` the authoritative multi-track session coordinator. A capture lane always commits source-aware WAV evidence first; a speech gate with bounded pre/post-roll decides what is retained in normal all-day mode, while important-meeting mode retains continuous audio. Background FLAC conversion may replace a WAV only after lossless verification and an atomic database switch.
 
-**Tech Stack:** Electron 41, Node.js 24, React 19, TypeScript 6, Zustand, better-sqlite3 12, Node test runner, Vitest, Windows WASAPI Loopback with Chromium Loopback fallback.
+**Tech Stack:** Electron 41, Node.js 24, React 19, TypeScript 6, Zustand, better-sqlite3 12, Node test runner, Vitest, Windows WASAPI Loopback with Chromium Loopback fallback, local VAD, bundled FLAC encoder.
 
 ## Global Constraints
 
 - Windows 10/11 x64 is the release platform.
 - Capture modes are exactly `mic`, `system`, and `dual`.
+- Retention modes are exactly `speech_triggered` and `continuous`; they are independent of capture source mode.
+- Normal all-day capture defaults to `speech_triggered` with 2 seconds of pre-roll, 3 seconds of post-roll, and speech gaps of at most 3 seconds merged into one retained region.
+- Important-meeting capture uses `continuous` retention until the user ends or changes the session.
 - System audio is off until the user explicitly selects it for a recording.
 - Microphone and system audio remain separate 24 kHz mono PCM tracks and separate WAV chunks.
 - Each WAV chunk is at most 60 seconds and is atomically committed with SHA-256 metadata.
+- WAV is the crash-safe first commit; FLAC may become authoritative only after decode, duration, sample-rate, channel-count, and decoded-PCM SHA-256 verification.
+- VAD failure fails open to continuous retention and exposes a visible degraded state.
+- Whisper, speaker embeddings, MiniMax, FLAC/FFmpeg conversion, and analytical database work never run synchronously in an audio callback.
+- Low disk must stop new evidence safely before SQLite or the current committed chunk is corrupted.
 - Runtime loss of one source cannot stop the other source.
 - Automatic microphone recovery excludes Sonar, VoiceMeeter, Steam, and YY devices.
 - Raw audio remains local and expires after 7 days; metadata tombstones remain.
+- Audio age is measured from capture end time; backlog never extends the user-approved seven-day deadline.
+- Expiring unprocessed audio is promoted for final transcription, but if it still cannot finish by expiry its bytes are deleted and its job becomes `audio_expired_before_processing`.
+- The user may choose a data directory on a local fixed volume; migration must be resumable and checksum verified.
 - Do not change MiniMax analysis, speaker identity, or memory merging in this plan.
 
 ---
@@ -27,6 +37,12 @@
 - Create `app/src/jarvis/main/JarvisMigrations.js`: idempotent schema/version migrations.
 - Create `app/src/jarvis/main/CaptureEvidenceStore.js`: focused CRUD for tracks, gaps, chunks, and processing jobs.
 - Create `app/src/jarvis/main/MultiTrackAudioWriter.js`: owns one `AudioChunkWriter` per source.
+- Create `app/src/jarvis/main/PcmRingBuffer.js`: bounded per-source PCM pre-roll buffer.
+- Create `app/src/jarvis/main/SpeechTriggeredCaptureGate.js`: VAD state machine and retained-region decisions.
+- Create `app/src/jarvis/main/AudioEvidenceReader.js`: format-independent verified PCM reader for downstream workers.
+- Create `app/src/jarvis/main/FlacCompressionWorker.js`: lossless WAV-to-FLAC conversion and atomic evidence replacement.
+- Create `app/src/jarvis/main/StorageGovernor.js`: free-space thresholds, safe-stop policy, and storage status.
+- Create `app/src/jarvis/main/DataDirectoryMigrator.js`: resumable checksum-verified data-root migration.
 - Create `app/src/jarvis/shared/captureModes.js`: capture-mode and source validation shared by main tests and IPC.
 - Create `app/src/jarvis/renderer/JarvisCaptureModeSelector.tsx`: explicit three-mode selector.
 - Modify `app/src/jarvis/main/AudioChunkWriter.js`: include track/source/sequence metadata.
@@ -39,6 +55,8 @@
 - Modify `app/src/stores/meetingRecordingStore.ts`: start the requested mode without silent initial downgrade.
 - Modify `app/src/jarvis/renderer/useJarvisRecording.ts`: pass capture mode and consume authoritative source state.
 - Modify `app/src/jarvis/renderer/RecordingControls.tsx`: show MIC and PC independently.
+- Create `app/src/jarvis/renderer/JarvisStorageSettings.tsx`: choose retention mode and data directory and show disk protection state.
+- Modify `app/src/jarvis/renderer/JarvisShell.tsx`: mount storage and retention settings.
 - Modify `app/src/jarvis/renderer/jarvisStore.ts`: persist capture-mode choice and source states.
 - Modify `app/src/jarvis/types.ts` and `app/src/types/electron.ts`: add public contracts.
 - Modify `app/main.js`: wire migration backup and evidence store dependencies.
@@ -300,7 +318,7 @@ class MultiTrackAudioWriter {
 }
 ```
 
-Update `AudioChunkWriter._emit` to include `trackId`, `sourceType`, and a monotonically increasing `sequenceNumber` initialized to zero.
+Update `AudioChunkWriter._emit` to include `trackId`, `sourceType`, and a monotonically increasing `sequenceNumber` initialized to zero. Each writer must write `chunk.wav.tmp`, complete the header, flush and fsync, compute the PCM SHA-256, rename to `chunk.wav`, and only then invoke `onChunk` for the SQLite transaction.
 
 - [ ] **Step 4: Run writer tests**
 
@@ -539,6 +557,12 @@ test("retention removes bytes but keeps timeline metadata", async () => {
   assert.equal(row.deleted_at, now);
   assert.equal(row.started_at, 10);
 });
+
+test("expiry does not extend retention for unfinished transcription", async () => {
+  await cleaner.run(now);
+  assert.equal(repository.getJob("j1").state, "audio_expired_before_processing");
+  assert.equal(fs.existsSync(wavPath), false);
+});
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -563,7 +587,7 @@ function backfillLegacyRecordings({ repository, recordingsRoot }) {
 }
 ```
 
-Do not delete or auto-link orphan folders whose directory name is not an existing session ID.
+Do not delete or auto-link orphan folders whose directory name is not an existing session ID. Before expiry, promote unfinished final-transcription jobs to `retention_urgent`; at expiry, delete WAV or FLAC bytes regardless of backlog, tombstone the chunk, and terminate unfinished audio-dependent jobs as `audio_expired_before_processing`.
 
 - [ ] **Step 4: Run retention, repository, and recovery tests**
 
@@ -646,6 +670,274 @@ git commit -m "test(jarvis): verify dual-track capture foundation"
 
 ---
 
+### Task 9: Add Speech-Triggered Retention with Bounded Context
+
+**Files:**
+- Create: `app/src/jarvis/main/PcmRingBuffer.js`
+- Create: `app/src/jarvis/main/SpeechTriggeredCaptureGate.js`
+- Modify: `app/src/jarvis/main/JarvisMigrations.js`
+- Modify: `app/src/jarvis/main/CaptureEvidenceStore.js`
+- Modify: `app/src/jarvis/main/JarvisService.js`
+- Modify: `app/src/jarvis/shared/captureModes.js`
+- Modify: `app/src/jarvis/renderer/RecordingControls.tsx`
+- Modify: `app/main.js`
+- Test: `app/test/jarvis/SpeechTriggeredCaptureGate.test.js`
+- Test: `app/test/jarvis/SpeechTriggeredCaptureIntegration.test.js`
+
+**Interfaces:**
+- Consumes: `JarvisService.acceptPcm(sourceType, pcm, capturedAt)` and the source-aware writer from Tasks 3–5.
+- Produces: `PcmRingBuffer({ capacityFrames, bytesPerFrame })`, `SpeechTriggeredCaptureGate.accept({ sourceType, pcm, capturedAt, speechProbability })`, and durable gaps containing `reason = 'silence_suppressed' | 'vad_degraded'`, `average_level`, and `peak_level`.
+
+- [ ] **Step 1: Write failing ring-buffer and gate tests**
+
+```js
+test('retains two seconds before speech and three seconds after it', () => {
+  const gate = makeGate({ sampleRate: 24_000, preRollMs: 2_000, postRollMs: 3_000, mergeGapMs: 3_000 })
+  feed(gate, { silenceMs: 5_000, speechMs: 1_000, silenceMsAfter: 4_000 })
+  assert.deepEqual(gate.retainedRanges(), [{ startMs: 3_000, endMs: 9_000 }])
+})
+
+test('fails open when VAD becomes unavailable', () => {
+  const gate = makeGate()
+  gate.reportVadFailure(new Error('model unavailable'))
+  assert.equal(gate.mode, 'continuous_fallback')
+  assert.equal(gate.accept(frame()).retain, true)
+  assert.equal(gate.status().degradedReason, 'vad_unavailable')
+})
+```
+
+- [ ] **Step 2: Run the focused tests and verify failure**
+
+Run: `cd app && node --test test/jarvis/SpeechTriggeredCaptureGate.test.js test/jarvis/SpeechTriggeredCaptureIntegration.test.js`
+
+Expected: FAIL because `PcmRingBuffer` and `SpeechTriggeredCaptureGate` do not exist.
+
+- [ ] **Step 3: Implement the bounded state machine and durable gap contract**
+
+```js
+export const RETENTION_MODES = Object.freeze(['speech_triggered', 'continuous'])
+export const DEFAULT_SPEECH_POLICY = Object.freeze({
+  preRollMs: 2_000,
+  postRollMs: 3_000,
+  mergeGapMs: 3_000,
+})
+
+export class SpeechTriggeredCaptureGate {
+  accept({ sourceType, pcm, capturedAt, speechProbability }) {
+    // Return only bounded write/gap decisions; JarvisService performs persistence.
+    return { sourceType, pcmToWrite: Buffer.alloc(0), gapsToCommit: [], state: 'armed' }
+  }
+  reportVadFailure(error) {
+    this.mode = 'continuous_fallback'
+    this.degradedReason = 'vad_unavailable'
+  }
+}
+```
+
+Implement the real method so the pre-roll buffer never exceeds `sampleRate * 2` seconds per source, gaps of `<= 3_000 ms` merge, and longer suppressed spans create timeline gap rows with average/peak level without writing silence. VAD runs single-threaded and never shares the speaker-embedding model.
+
+- [ ] **Step 4: Integrate capture policy without changing source selection**
+
+Persist `sessions.retention_mode`, `sessions.capture_policy_json`, and the gap fields. `JarvisService.start({ captureMode, retentionMode })` must default `retentionMode` to `speech_triggered`; switching to `continuous` flushes buffered PCM in timestamp order and never merges MIC with PC. After a VAD failure, reload it in the background; on a successful health test return from visible `continuous_fallback` to `speech_triggered`. Keep VAD indexing active but non-cropping in important-meeting mode, and show different main-window/taskbar states for `正在监听` versus `重要会议`.
+
+- [ ] **Step 5: Run focused and regression tests**
+
+Run: `cd app && node --test test/jarvis/SpeechTriggeredCaptureGate.test.js test/jarvis/SpeechTriggeredCaptureIntegration.test.js && npm run test:jarvis`
+
+Expected: all tests pass; fixtures prove bounded memory, the exact 2/3/3-second policy, continuous meeting retention, and fail-open VAD behavior.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/src/jarvis/main/PcmRingBuffer.js app/src/jarvis/main/SpeechTriggeredCaptureGate.js app/src/jarvis/main/JarvisMigrations.js app/src/jarvis/main/CaptureEvidenceStore.js app/src/jarvis/main/JarvisService.js app/src/jarvis/shared/captureModes.js app/src/jarvis/renderer/RecordingControls.tsx app/main.js app/test/jarvis/SpeechTriggeredCaptureGate.test.js app/test/jarvis/SpeechTriggeredCaptureIntegration.test.js
+git commit -m "feat(jarvis): add speech triggered evidence retention"
+```
+
+### Task 10: Convert Committed WAV Evidence to Verified FLAC
+
+**Files:**
+- Create: `app/src/jarvis/main/AudioEvidenceReader.js`
+- Create: `app/src/jarvis/main/FlacCompressionWorker.js`
+- Modify: `app/src/jarvis/main/JarvisMigrations.js`
+- Modify: `app/src/jarvis/main/CaptureEvidenceStore.js`
+- Modify: `app/src/jarvis/main/JarvisService.js`
+- Test: `app/test/jarvis/FlacCompressionWorker.test.js`
+
+**Interfaces:**
+- Consumes: committed chunk `{ id, path, format, pcm_sha256, duration_ms, sample_rate, channels }` and durable `processing_jobs`.
+- Produces: `AudioEvidenceReader.readVerifiedPcm(chunk)`, `AudioEvidenceReader.withVerifiedWav(chunk, fn)`, `AudioEvidenceReader.readPlayableWav(chunk)`, job type `compress_chunk`, and `FlacCompressionWorker.run(job)` with atomic `wav -> flac` replacement.
+
+- [ ] **Step 1: Write failing lossless-conversion tests**
+
+```js
+test('switches authority only after decoded PCM verification', async () => {
+  const result = await worker.run(jobFor('speech.wav'))
+  assert.equal(result.chunk.format, 'flac')
+  assert.equal(result.chunk.pcm_sha256, fixturePcmSha256)
+  assert.equal(await exists('speech.wav'), false)
+})
+
+test('keeps WAV authoritative when FLAC verification fails', async () => {
+  encoder.decodeHash = 'different'
+  await assert.rejects(worker.run(jobFor('speech.wav')), /pcm_hash_mismatch/)
+  assert.equal(store.getChunk('c1').format, 'wav')
+  assert.equal(await exists('speech.wav'), true)
+})
+```
+
+- [ ] **Step 2: Run the test and verify failure**
+
+Run: `cd app && node --test test/jarvis/FlacCompressionWorker.test.js`
+
+Expected: FAIL because the reader and worker do not exist.
+
+- [ ] **Step 3: Implement format-independent reading and the verification transaction**
+
+```js
+export class AudioEvidenceReader {
+  async readVerifiedPcm(chunk) {
+    const pcm = await this.decoder.decode(chunk.path, chunk.format)
+    if (sha256(pcm.bytes) !== chunk.pcm_sha256) throw new Error('pcm_hash_mismatch')
+    return pcm
+  }
+  async withVerifiedWav(chunk, consume) {
+    const pcm = await this.readVerifiedPcm(chunk)
+    const temporaryWav = await this.temporaryWav.write(pcm)
+    try { return await consume(temporaryWav.path) }
+    finally { await temporaryWav.remove() }
+  }
+}
+```
+
+Write FLAC to `<final>.partial`, decode it, compare duration within one sample plus exact rate/channels/PCM hash, rename it atomically, update `audio_chunks.path/format/file_sha256` in one transaction, then delete the WAV. On any failure, remove only the partial FLAC and leave the WAV row unchanged.
+
+- [ ] **Step 4: Register idempotent compression jobs**
+
+After a WAV commit, enqueue one `compress_chunk` job keyed by `chunk_id + encoder_version`. A completed job is a no-op on replay; a running transcription lease may keep reading the old path through `AudioEvidenceReader` until the atomic transaction finishes. Startup recovery removes invalid `.tmp/.partial` files, completes or rolls back a valid WAV/FLAC double-file state using hashes and the authoritative row, and never guesses from the extension alone.
+
+- [ ] **Step 5: Run focused and regression tests**
+
+Run: `cd app && node --test test/jarvis/FlacCompressionWorker.test.js && npm run test:jarvis`
+
+Expected: all tests pass, including crash points before rename, after rename, and before WAV deletion.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/src/jarvis/main/AudioEvidenceReader.js app/src/jarvis/main/FlacCompressionWorker.js app/src/jarvis/main/JarvisMigrations.js app/src/jarvis/main/CaptureEvidenceStore.js app/src/jarvis/main/JarvisService.js app/test/jarvis/FlacCompressionWorker.test.js
+git commit -m "feat(jarvis): compress evidence to verified flac"
+```
+
+### Task 11: Protect Disk Space and Support Safe Data-Directory Migration
+
+**Files:**
+- Create: `app/src/jarvis/main/StorageGovernor.js`
+- Create: `app/src/jarvis/main/DataDirectoryMigrator.js`
+- Modify: `app/src/jarvis/main/registerJarvisIpc.js`
+- Create: `app/src/jarvis/renderer/JarvisStorageSettings.tsx`
+- Modify: `app/src/jarvis/renderer/JarvisShell.tsx`
+- Modify: `app/src/jarvis/types.ts`
+- Modify: `app/src/types/electron.ts`
+- Test: `app/test/jarvis/StorageGovernor.test.js`
+- Test: `app/test/jarvis/DataDirectoryMigrator.test.js`
+
+**Interfaces:**
+- Produces: `StorageGovernor.evaluate({ freeBytes, pendingWriteBytes }): 'ok' | 'warning' | 'stop'`, `DataDirectoryMigrator.migrate({ from, to, signal })`, IPC `jarvis:storage:status` and `jarvis:storage:migrate`.
+
+- [ ] **Step 1: Write failing disk and migration tests**
+
+```js
+test('warns at 20 GiB and stops at 5 GiB on a large volume', () => {
+  const GIB = 1024 ** 3
+  assert.equal(governor.evaluate({ volumeBytes: 200 * GIB, freeBytes: 19 * GIB }), 'warning')
+  assert.equal(governor.evaluate({ volumeBytes: 200 * GIB, freeBytes: 4 * GIB }), 'stop')
+})
+
+test('resumes a copied-file migration and switches root only after verification', async () => {
+  await assert.rejects(migrator.migrate({ from, to, failAfterFiles: 2 }))
+  const result = await migrator.migrate({ from, to })
+  assert.equal(result.switched, true)
+  assert.deepEqual(await hashTree(to), await hashTree(from))
+})
+```
+
+- [ ] **Step 2: Run the tests and verify failure**
+
+Run: `cd app && node --test test/jarvis/StorageGovernor.test.js test/jarvis/DataDirectoryMigrator.test.js`
+
+Expected: FAIL because both services are missing.
+
+- [ ] **Step 3: Implement explicit thresholds and safe-stop semantics**
+
+Use `warning = max(20 GiB, 10% of volume)` and `stop = max(5 GiB, 3% of volume)`. Maintain a preallocated 512 MiB emergency reserve; at `stop`, release that reserve, close and commit the current writable chunk if possible, persist `capture_stopped_low_disk`, stop accepting PCM, and leave the session recoverable. Never acknowledge a save when SQLite commit failed; move the completed file into the recovery directory for startup reconciliation.
+
+- [ ] **Step 4: Implement resumable migration and status IPC**
+
+Default to `<Electron userData>/jarvis`. Move recordings, CUDA components, Whisper models, and temporary files as one configured data root. Copy into a migration staging directory, persist a manifest of relative path/size/SHA-256, fsync and verify every file, close the database, atomically update the configured root, reopen it, then offer deletion of the old root only after a successful reopen. Reject network/removable targets in this phase.
+
+- [ ] **Step 5: Add the settings UI contract**
+
+Render free space, actual bytes written/compressed in the latest 24 hours, projected daily growth, remaining recordable days, `ok/warning/stopped` state, current data root, migration progress, and the exact recovery action. Never start migration while capture is active and never promise a fixed FLAC compression ratio.
+
+- [ ] **Step 6: Run verification and commit**
+
+Run: `cd app && node --test test/jarvis/StorageGovernor.test.js test/jarvis/DataDirectoryMigrator.test.js && npm run typecheck && npm run build:renderer`
+
+Expected: all commands exit 0.
+
+```bash
+git add app/src/jarvis/main/StorageGovernor.js app/src/jarvis/main/DataDirectoryMigrator.js app/src/jarvis/main/registerJarvisIpc.js app/src/jarvis/renderer/JarvisStorageSettings.tsx app/src/jarvis/renderer/JarvisShell.tsx app/src/jarvis/types.ts app/src/types/electron.ts app/test/jarvis/StorageGovernor.test.js app/test/jarvis/DataDirectoryMigrator.test.js
+git commit -m "feat(jarvis): govern evidence storage safely"
+```
+
+### Task 12: Gate the All-Day Capture Lane
+
+**Files:**
+- Create: `app/test/jarvis/AllDayCaptureSoak.test.js`
+- Modify: `docs/testing/jarvis-dual-track-hardware-acceptance.md`
+- Modify: `app/package.json`
+
+**Interfaces:**
+- Consumes: all phase-one capture, speech-gate, compression, retention, and storage services.
+- Produces: `npm run test:jarvis:capture-soak` and recorded Windows hardware evidence.
+
+- [ ] **Step 1: Add a deterministic 24-hour simulated soak**
+
+```js
+test('24 hour capture keeps queues and handles bounded', async () => {
+  const result = await simulateCapture({ hours: 24, speechDutyCycle: 0.18, sourceFailures: 12 })
+  assert.ok(result.maxRingBufferBytes <= result.expectedRingBufferBytes)
+  assert.equal(result.orphanedChunks, 0)
+  assert.equal(result.unboundedQueue, false)
+  assert.equal(result.corruptChunks, 0)
+})
+```
+
+- [ ] **Step 2: Run it before wiring the script**
+
+Run: `cd app && node --test test/jarvis/AllDayCaptureSoak.test.js`
+
+Expected: PASS only when the capture lane remains bounded and every retained region is durable.
+
+- [ ] **Step 3: Add the phase command and manual scenarios**
+
+Add `"test:jarvis:capture-soak": "node --test test/jarvis/AllDayCaptureSoak.test.js"`. Extend hardware acceptance with speech-triggered quiet periods, important-meeting continuous mode, VAD fail-open, low-disk safe stop, interrupted FLAC conversion, migration restart, and seven-day tombstoning.
+
+- [ ] **Step 4: Run the full phase gate**
+
+Run: `cd app && npm run test:jarvis && npm run test:jarvis:capture-soak && npm run typecheck && npm run lint && npm run i18n:check && npm run build:renderer`
+
+Expected: every command exits 0; the simulated soak reports bounded buffers/queues/handles, and the manual document contains observed Windows results.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/test/jarvis/AllDayCaptureSoak.test.js docs/testing/jarvis-dual-track-hardware-acceptance.md app/package.json
+git commit -m "test(jarvis): gate all day capture durability"
+```
+
+---
+
 ## Phase Acceptance Checklist
 
 - [ ] The user can explicitly select microphone-only, system-only, or dual capture.
@@ -655,5 +947,11 @@ git commit -m "test(jarvis): verify dual-track capture foundation"
 - [ ] Microphone recovery retries indefinitely, re-enumerates devices, excludes virtual devices, and falls back safely.
 - [ ] Force-close and restart recover the session without orphaning committed audio.
 - [ ] Seven-day cleanup tombstones audio while preserving durable metadata.
+- [ ] Processing backlog never extends seven-day audio retention; expired unfinished work becomes visibly `audio_expired_before_processing`.
 - [ ] Existing recordings migrate to microphone tracks without data loss.
+- [ ] Speech-triggered retention keeps exactly 2 seconds of pre-roll and 3 seconds of post-roll and merges gaps of at most 3 seconds.
+- [ ] Important-meeting mode records continuously, and VAD failure visibly fails open to continuous capture.
+- [ ] WAV remains authoritative until FLAC passes lossless verification and an atomic database switch.
+- [ ] Low disk stops capture safely; a chosen local data directory migrates resumably with checksums.
+- [ ] A deterministic 24-hour capture soak shows bounded buffers, queues, handles, and logs with no corrupt or orphaned evidence.
 - [ ] Automated checks and the Windows hardware acceptance document pass.
