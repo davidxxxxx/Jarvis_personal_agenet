@@ -736,6 +736,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     "meeting-transcription-input-rejected",
     (callback) => (_event, data) => callback(data)
   ),
+  onMeetingTranscriptionSourceState: registerListener(
+    "meeting-transcription-source-state",
+    (callback) => (_event, data) => callback(data)
+  ),
 
   // Dictation realtime streaming
   dictationRealtimeWarmup: (options) => ipcRenderer.invoke("dictation-realtime-warmup", options),

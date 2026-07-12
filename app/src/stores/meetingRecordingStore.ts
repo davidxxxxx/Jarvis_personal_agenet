@@ -1198,17 +1198,6 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         isRecording: false,
         isTranscribing: false,
       });
-      try {
-        await window.electronAPI?.meetingTranscriptionStop?.();
-      } catch (stopError) {
-        logger.error(
-          "Meeting transcription main cleanup failed after required source rejection",
-          { error: stopError instanceof Error ? stopError.message : "UnknownError" },
-          "meeting"
-        );
-      } finally {
-        isStartingFlag = false;
-      }
       throw new CaptureSourcesUnavailableError(sourceStates);
     }
 
@@ -1398,6 +1387,28 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       }
     );
     if (inputRejectedCleanup) ipcCleanups.push(inputRejectedCleanup);
+
+    const sourceStateCleanup = window.electronAPI?.onMeetingTranscriptionSourceState?.(
+      ({ source, state, inputGeneration: sourceGeneration }) => {
+        if (
+          source !== "system" ||
+          state !== "unavailable" ||
+          !isRecordingFlag ||
+          activeMeetingInputGeneration !== inputGeneration ||
+          sourceGeneration !== inputGeneration
+        ) {
+          return;
+        }
+        useMeetingRecordingStore.setState({
+          error: "System audio capture stopped.",
+          captureSourceStates: {
+            ...useMeetingRecordingStore.getState().captureSourceStates,
+            system: "unavailable",
+          },
+        });
+      }
+    );
+    if (sourceStateCleanup) ipcCleanups.push(sourceStateCleanup);
 
     if (startResult.oneOnOneAttendee) {
       const synthetic: SpeakerIdentification = {
@@ -1676,30 +1687,100 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       );
     };
 
-    if (micResult) await attachMicPipeline(micResult, usedDefaultMicFallback);
+    const throwPipelineFailure = (source: "mic" | "system", error: unknown): never => {
+      const failedStates: JarvisCaptureSourceStates = {
+        ...useMeetingRecordingStore.getState().captureSourceStates,
+        [source]: "unavailable",
+      };
+      useMeetingRecordingStore.setState({ captureSourceStates: failedStates });
+      if (args.requireAllSources) {
+        useMeetingRecordingStore.setState({
+          error: "capture_source_unavailable",
+          isRecording: false,
+          isTranscribing: false,
+        });
+        throw new CaptureSourcesUnavailableError(failedStates);
+      }
+      throw error;
+    };
+
+    if (micResult) {
+      try {
+        await attachMicPipeline(micResult, usedDefaultMicFallback);
+      } catch (error) {
+        throwPipelineFailure("mic", error);
+      }
+      useMeetingRecordingStore.setState({
+        captureSourceStates: {
+          ...useMeetingRecordingStore.getState().captureSourceStates,
+          mic: "recording",
+        },
+      });
+    }
+
+    if (captureSystemAudio && systemAudioHandledInMain) {
+      useMeetingRecordingStore.setState({
+        captureSourceStates: {
+          ...useMeetingRecordingStore.getState().captureSourceStates,
+          system: "recording",
+        },
+      });
+    }
 
     if (systemCaptureResult.stream) {
       const stream = systemCaptureResult.stream;
       systemStream = stream;
+      try {
+        const ctx = new AudioContext({ sampleRate: 24000 });
+        systemContext = ctx;
+        await detachFromOutputDevice(ctx);
 
-      const ctx = new AudioContext({ sampleRate: 24000 });
-      await detachFromOutputDevice(ctx);
-      systemContext = ctx;
-
-      await createAudioPipeline({
-        stream,
-        context: ctx,
-        onChunk: (chunk) => {
-          if (!isRecordingFlag || meetingInputRejected) return;
-          if (socketReady) {
-            sendMeetingChunk(chunk, "system");
-            return;
-          }
-          pendingSystemChunks.push(chunk.slice(0));
-        },
-      }).then(({ source, processor }) => {
+        const { source, processor } = await createAudioPipeline({
+          stream,
+          context: ctx,
+          onChunk: (chunk) => {
+            if (!isRecordingFlag || meetingInputRejected) return;
+            if (socketReady) {
+              sendMeetingChunk(chunk, "system");
+              return;
+            }
+            pendingSystemChunks.push(chunk.slice(0));
+          },
+        });
         systemSource = source;
         systemProcessor = processor;
+
+        const systemTrack = stream.getAudioTracks()[0];
+        const markRendererSystemUnavailable = () => {
+          if (
+            !isRecordingFlag ||
+            activeMeetingInputGeneration !== inputGeneration ||
+            systemStream !== stream
+          ) {
+            return;
+          }
+          useMeetingRecordingStore.setState({
+            error: "System audio capture stopped.",
+            captureSourceStates: {
+              ...useMeetingRecordingStore.getState().captureSourceStates,
+              system: "unavailable",
+            },
+          });
+        };
+        systemTrack?.addEventListener("ended", markRendererSystemUnavailable);
+        stream.addEventListener("inactive", markRendererSystemUnavailable);
+        ipcCleanups.push(() => {
+          systemTrack?.removeEventListener("ended", markRendererSystemUnavailable);
+          stream.removeEventListener("inactive", markRendererSystemUnavailable);
+        });
+      } catch (error) {
+        throwPipelineFailure("system", error);
+      }
+      useMeetingRecordingStore.setState({
+        captureSourceStates: {
+          ...useMeetingRecordingStore.getState().captureSourceStates,
+          system: "recording",
+        },
       });
     } else if (systemCaptureError) {
       if (systemAudioStrategy === "loopback") {
@@ -1729,12 +1810,6 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
     isStartingFlag = false;
     socketReady = true;
-    useMeetingRecordingStore.setState({
-      captureSourceStates: {
-        mic: captureMicrophone ? "recording" : "idle",
-        system: captureSystemAudio ? "recording" : "idle",
-      },
-    });
 
     for (const chunk of pendingMicChunks) {
       if (!sendMeetingChunk(chunk, "mic")) break;
@@ -1759,12 +1834,25 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     );
   } catch (err) {
     if (err instanceof CaptureSourcesUnavailableError) {
+      const shouldAbortAcceptedMainStart = acceptedMainInputGeneration !== null;
       activeMeetingInputGeneration = null;
       isRecordingFlag = false;
       try {
-        await cleanup({ preserveStarting: true });
+        if (shouldAbortAcceptedMainStart) {
+          await window.electronAPI?.meetingTranscriptionStop?.();
+        }
+      } catch (stopError) {
+        logger.error(
+          "Meeting transcription main cleanup failed after required source rejection",
+          { error: stopError instanceof Error ? stopError.message : "UnknownError" },
+          "meeting"
+        );
       } finally {
-        isStartingFlag = false;
+        try {
+          await cleanup({ preserveStarting: true });
+        } finally {
+          isStartingFlag = false;
+        }
       }
       throw err;
     }

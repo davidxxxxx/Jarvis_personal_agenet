@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CircleStop, Mic, Pause, Play, RotateCcw } from "lucide-react";
+import { CircleStop, Mic, MonitorSpeaker, Pause, Play, RotateCcw } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
 import type { UseJarvisRecordingResult } from "./useJarvisRecording";
@@ -35,10 +35,14 @@ function activeElapsedMs(recording: UseJarvisRecordingResult, now: number): numb
   return session.accumulatedMs + Math.max(0, now - session.activeSince);
 }
 
-function useMicrophoneName(refreshKey: string): string | null {
+function useMicrophoneName(refreshKey: string, enabled: boolean): string | null {
   const [name, setName] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!enabled) {
+      setName(null);
+      return;
+    }
     let active = true;
     const load = async () => {
       if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -62,7 +66,7 @@ function useMicrophoneName(refreshKey: string): string | null {
       active = false;
       navigator.mediaDevices?.removeEventListener?.("devicechange", load);
     };
-  }, [refreshKey]);
+  }, [enabled, refreshKey]);
 
   return name;
 }
@@ -78,7 +82,8 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
   const captureMode = useJarvisStore((state) => state.captureMode);
   const setCaptureMode = useJarvisStore((state) => state.setCaptureMode);
   const sourceStates = useJarvisStore((state) => state.sourceStates);
-  const microphoneName = useMicrophoneName(session.status);
+  const isSystemOnly = captureMode === "system";
+  const microphoneName = useMicrophoneName(session.status, !isSystemOnly);
   const isRecording = session.status === "recording";
   const isPaused = session.status === "paused";
   const isBusy = session.status === "starting" || session.status === "finalizing";
@@ -149,8 +154,13 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
     setConsentOpen(true);
   };
 
+  const retryCaptureSources = () => {
+    if (sourceSemanticsLocked) return;
+    void run(recording.start);
+  };
+
   const continueWithAvailableSource = () => {
-    if (!availableCaptureMode) return;
+    if (sourceSemanticsLocked || !availableCaptureMode) return;
     setCaptureMode(availableCaptureMode);
     void run(recording.start);
   };
@@ -169,11 +179,17 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <div
+              role={isSystemOnly ? "img" : undefined}
+              aria-label={isSystemOnly ? "电脑声音" : undefined}
               className={`grid size-11 shrink-0 place-items-center rounded-xl ${
                 isRecording ? "bg-red-500 text-white" : "bg-muted text-muted-foreground"
               }`}
             >
-              <Mic aria-hidden="true" />
+              {isSystemOnly ? (
+                <MonitorSpeaker aria-hidden="true" />
+              ) : (
+                <Mic aria-hidden="true" />
+              )}
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
@@ -192,29 +208,33 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
                 </p>
               </div>
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
-                {recording.activeMicLabel || microphoneName || t("jarvis.defaultMicrophone")}
+                {isSystemOnly
+                  ? "电脑声音"
+                  : recording.activeMicLabel || microphoneName || t("jarvis.defaultMicrophone")}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            <div
-              role="meter"
-              aria-label={t("jarvis.micLevel")}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={micPercent}
-              className="w-24"
-            >
-              <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                <div
-                  className={`h-full rounded-full transition-[width] duration-100 ${
-                    isRecording ? "bg-red-500" : "bg-primary"
-                  }`}
-                  style={{ width: `${micPercent}%` }}
-                />
+            {!isSystemOnly && (
+              <div
+                role="meter"
+                aria-label={t("jarvis.micLevel")}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={micPercent}
+                className="w-24"
+              >
+                <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                  <div
+                    className={`h-full rounded-full transition-[width] duration-100 ${
+                      isRecording ? "bg-red-500" : "bg-primary"
+                    }`}
+                    style={{ width: `${micPercent}%` }}
+                  />
+                </div>
               </div>
-            </div>
+            )}
             <time className="w-14 text-right font-mono text-sm tabular-nums text-foreground">
               {elapsed}
             </time>
@@ -281,29 +301,31 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             <Button
               type="button"
               variant="outline"
-              disabled={commandPending}
-              onClick={() => void run(recording.start)}
+              disabled={sourceSemanticsLocked}
+              onClick={retryCaptureSources}
             >
               重试
             </Button>
             <Button
               type="button"
               variant="outline"
-              disabled={commandPending || availableCaptureMode === null}
+              disabled={sourceSemanticsLocked || availableCaptureMode === null}
               onClick={continueWithAvailableSource}
             >
               使用可用音源继续
             </Button>
           </div>
         )}
-        {recording.micRecoveryStatus === "reconnecting" ? (
+        {!isSystemOnly && recording.micRecoveryStatus === "reconnecting" ? (
           <p
             aria-live="polite"
             className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
           >
             {t("jarvis.micReconnecting", { count: recording.micRecoveryAttempt ?? 1 })}
           </p>
-        ) : recording.micRecoveryStatus === "restored" && recording.activeMicLabel ? (
+        ) : !isSystemOnly &&
+          recording.micRecoveryStatus === "restored" &&
+          recording.activeMicLabel ? (
           <p
             aria-live="polite"
             className="mt-3 rounded-md bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300"

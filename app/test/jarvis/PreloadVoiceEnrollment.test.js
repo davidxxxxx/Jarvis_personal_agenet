@@ -178,3 +178,32 @@ test("preload exposes metadata-only meeting input rejection events", () => {
   unsubscribe();
   assert.equal(listeners.has("meeting-transcription-input-rejected"), false);
 });
+
+test("preload exposes generation-bound meeting source state events", () => {
+  const { rootApi, listeners } = loadPreloadApi();
+  const states = [];
+
+  const unsubscribe = rootApi.onMeetingTranscriptionSourceState((payload) =>
+    states.push(payload)
+  );
+  listeners.get("meeting-transcription-source-state")(
+    {},
+    {
+      source: "system",
+      state: "unavailable",
+      reason: "system-capture-error",
+      inputGeneration: "input-generation-2",
+    }
+  );
+
+  assert.deepEqual(states, [
+    {
+      source: "system",
+      state: "unavailable",
+      reason: "system-capture-error",
+      inputGeneration: "input-generation-2",
+    },
+  ]);
+  unsubscribe();
+  assert.equal(listeners.has("meeting-transcription-source-state"), false);
+});

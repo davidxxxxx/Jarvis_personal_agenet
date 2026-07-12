@@ -1816,6 +1816,14 @@ declare global {
           inputGeneration: string;
         }) => void
       ) => () => void;
+      onMeetingTranscriptionSourceState?: (
+        callback: (payload: {
+          source: "system";
+          state: "unavailable";
+          reason: "system-capture-error";
+          inputGeneration: string;
+        }) => void
+      ) => () => void;
 
       // Speaker diarization
       downloadDiarizationModels?: () => Promise<{ success: boolean; error?: string }>;

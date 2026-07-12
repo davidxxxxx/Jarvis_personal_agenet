@@ -488,7 +488,7 @@ test("a stale managed system callback cannot touch a newer mic-only generation",
     persisted.map(([sessionId, source]) => [sessionId, source]),
     [["jarvis-current", "mic"]]
   );
-  assert.equal(fixture.managerStops.length, 2);
+  assert.equal(fixture.managerStops.length, 1);
   assert.deepEqual(
     fixture.sent.filter(([channel]) => channel === "meeting-transcription-input-rejected"),
     []
@@ -527,7 +527,55 @@ test("a stale managed system callback is gated before a newer dual-track session
   assert.equal(staleAccepted, false);
   assert.equal(currentAccepted, true);
   assert.deepEqual(persisted, [["jarvis-current-dual", "system"]]);
+  assert.equal(fixture.managerStops.length, 1);
+});
+
+test("managed system errors publish only for their current input generation", async (t) => {
+  const fixture = createFixture({ systemAvailable: true });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-source-state-old" }
+  );
+  const oldProducer = fixture.managedStarts[0];
+  await stop({ sender: fixture.sender });
+
+  const second = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-source-state-current" }
+  );
+  const currentProducer = fixture.managedStarts[1];
+  const stopsBeforeStaleError = fixture.managerStops.length;
+  oldProducer.onError(new Error("stale producer"));
+  const stopsAfterStaleError = fixture.managerStops.length;
+  currentProducer.onError(new Error("current producer"));
+
+  assert.deepEqual(
+    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state"),
+    [
+      [
+        "meeting-transcription-source-state",
+        {
+          source: "system",
+          state: "unavailable",
+          reason: "system-capture-error",
+          inputGeneration: second.inputGeneration,
+        },
+      ],
+    ]
+  );
+  assert.equal(stopsBeforeStaleError, 1);
+  assert.equal(stopsAfterStaleError, stopsBeforeStaleError);
   assert.equal(fixture.managerStops.length, 2);
+  assert.equal(
+    fixture.sent.some(([, payload]) =>
+      JSON.stringify(payload).includes("private device details")
+    ),
+    false
+  );
 });
 
 test("cancel keeps the start gate until the cancelled attempt finishes rolling back", async (t) => {

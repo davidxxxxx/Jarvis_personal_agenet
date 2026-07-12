@@ -200,4 +200,46 @@ describe("RecordingControls microphone recovery", () => {
     expect(screen.getByRole("radio", { name: "仅电脑声音" })).toBeDisabled();
     expect(screen.getByRole("radio", { name: "麦克风和电脑声音" })).toBeDisabled();
   });
+
+  it("uses computer-audio visuals without a microphone identity or meter in system-only mode", () => {
+    useJarvisStore.setState({
+      captureMode: "system",
+      sourceStates: { mic: "idle", system: "recording" },
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          activeMicLabel: "Private microphone name",
+          micLevel: 0.75,
+        })}
+      />
+    );
+
+    expect(screen.getByRole("img", { name: "电脑声音" })).toBeInTheDocument();
+    expect(screen.getByText("电脑声音", { selector: "p" })).toBeInTheDocument();
+    expect(screen.queryByText("Private microphone name")).not.toBeInTheDocument();
+    expect(screen.queryByRole("meter")).not.toBeInTheDocument();
+  });
+
+  it("does not let runtime source loss change an active session capture mode", () => {
+    const start = vi.fn().mockResolvedValue(undefined);
+    useJarvisStore.setState({
+      captureMode: "dual",
+      sourceStates: { mic: "recording", system: "unavailable" },
+    });
+
+    render(<RecordingControls recording={fakeRecording({ start })} />);
+
+    const retry = screen.getByRole("button", { name: "重试" });
+    const continueButton = screen.getByRole("button", { name: "使用可用音源继续" });
+    expect(retry).toBeDisabled();
+    expect(continueButton).toBeDisabled();
+
+    fireEvent.click(retry);
+    fireEvent.click(continueButton);
+
+    expect(start).not.toHaveBeenCalled();
+    expect(useJarvisStore.getState().captureMode).toBe("dual");
+  });
 });

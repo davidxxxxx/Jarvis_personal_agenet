@@ -6065,10 +6065,12 @@ class IPCHandlers {
       });
     };
 
-    const rejectManagedMeetingSystemProducer = (producer) => {
+    const rejectManagedMeetingSystemProducer = (producer, { stopManager = true } = {}) => {
       if (producer.inputRejected) return;
       producer.inputRejected = true;
-      void producer.manager.stop().catch(() => {});
+      if (stopManager) {
+        void producer.manager.stop().catch(() => {});
+      }
     };
 
     const deliverManagedMeetingSystemChunk = (producer, chunk) => {
@@ -6084,7 +6086,7 @@ class IPCHandlers {
       const pending = inputBinding.pendingManagedSystemChunks.splice(0);
       for (const { producer, chunk } of pending) {
         if (activeMeetingInputBinding !== inputBinding || inputBinding.active !== true) {
-          rejectManagedMeetingSystemProducer(producer);
+          rejectManagedMeetingSystemProducer(producer, { stopManager: false });
           continue;
         }
         deliverManagedMeetingSystemChunk(producer, chunk);
@@ -6092,14 +6094,13 @@ class IPCHandlers {
     };
 
     const startManagedMeetingSystemAudio = (event, manager, warningLabel) => {
-      const win = BrowserWindow.fromWebContents(event.sender);
       const inputBinding = activeMeetingInputBinding;
       const producer = { manager, inputRejected: false };
       return manager.start({
         onChunk: (chunk) => {
           if (producer.inputRejected) return false;
           if (activeMeetingInputBinding !== inputBinding) {
-            rejectManagedMeetingSystemProducer(producer);
+            rejectManagedMeetingSystemProducer(producer, { stopManager: false });
             return false;
           }
           if (inputBinding?.active !== true) {
@@ -6108,10 +6109,23 @@ class IPCHandlers {
           }
           return deliverManagedMeetingSystemChunk(producer, chunk);
         },
-        onError: (error) => {
-          if (win && !win.isDestroyed()) {
-            win.webContents.send("meeting-transcription-error", error.message);
+        onError: () => {
+          if (
+            producer.inputRejected ||
+            activeMeetingInputBinding !== inputBinding ||
+            inputBinding?.active !== true ||
+            inputBinding.owner?.isDestroyed?.()
+          ) {
+            rejectManagedMeetingSystemProducer(producer, { stopManager: false });
+            return;
           }
+          inputBinding.owner.send("meeting-transcription-source-state", {
+            source: "system",
+            state: "unavailable",
+            reason: "system-capture-error",
+            inputGeneration: inputBinding.inputGeneration,
+          });
+          rejectManagedMeetingSystemProducer(producer);
         },
         onWarning: (warning) => {
           debugLogger.warn(
