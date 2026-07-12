@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 
 test("startup marks interrupted recording sessions recovered without resuming them", () => {
@@ -68,4 +70,15 @@ test("startup recovery finalizes every degraded dual track and open gap", () => 
   } finally {
     repository.close();
   }
+});
+
+test("startup backfills legacy evidence before constructing retention cleanup", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+  const repositoryIndex = mainSource.indexOf("jarvisRepository = new JarvisRepository");
+  const backfillIndex = mainSource.indexOf("runLegacyRecordingBackfillAtStartup({");
+  const retentionIndex = mainSource.indexOf("retentionCleaner = new RetentionCleaner");
+
+  assert.ok(repositoryIndex >= 0);
+  assert.ok(backfillIndex > repositoryIndex);
+  assert.ok(retentionIndex > backfillIndex);
 });

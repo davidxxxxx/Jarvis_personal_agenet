@@ -4,15 +4,24 @@ const path = require("node:path");
 const RetentionCleaner = require("../../src/jarvis/main/RetentionCleaner");
 
 function repositoryWith(rows) {
-  const deleted = [];
+  const tombstoned = [];
+  const promoted = [];
   return {
-    deleted,
+    tombstoned,
+    promoted,
     listExpiredAudioChunks: () => rows,
-    deleteAudioChunk: (id) => deleted.push(id),
+    promoteSoonExpiringAudioJobs: (after, before) => {
+      promoted.push({ after, before });
+      return 0;
+    },
+    tombstoneChunk: (id, deletedAt) => {
+      tombstoned.push({ id, deletedAt });
+      return { changes: 1, jobsTerminated: 0 };
+    },
   };
 }
 
-test("deletes hundreds of expired rows through one async batch with mixed results", async () => {
+test("deletes hundreds of expired bytes through one async batch and tombstones confirmed rows", async () => {
   const rows = Array.from({ length: 240 }, (_, index) => ({
     id: `chunk-${index}`,
     path: `recording-${index}.wav`,
@@ -37,7 +46,11 @@ test("deletes hundreds of expired rows through one async batch with mixed result
   assert.deepEqual(await cleaner.clean(5_000), { deleted: 60, missing: 60, retry: 120 });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].paths.length, 240);
-  assert.equal(repository.deleted.length, 120);
+  assert.equal(repository.tombstoned.length, 120);
+  assert.deepEqual(repository.tombstoned[0], { id: "chunk-0", deletedAt: 5_000 });
+  assert.deepEqual(repository.promoted, [
+    { after: 5_000, before: 5_000 + RetentionCleaner.URGENT_WINDOW_MS },
+  ]);
 });
 
 test("overlapping cleanup requests share one invocation", async () => {
@@ -86,10 +99,10 @@ test("shutdown cancels an active helper and prevents late repository writes", as
   await cleaner.stop();
   assert.equal(cancelled, 1);
   assert.deepEqual(await cleaning, { deleted: 0, missing: 0, retry: 1 });
-  assert.deepEqual(repository.deleted, []);
+  assert.deepEqual(repository.tombstoned, []);
 });
 
-test("missing results remove metadata while unsafe and failed rows remain", async () => {
+test("missing results tombstone metadata while unsafe and failed rows remain", async () => {
   const rows = [
     { id: "missing", path: "missing.wav" },
     { id: "outside", path: "outside.wav" },
@@ -107,7 +120,69 @@ test("missing results remove metadata while unsafe and failed rows remain", asyn
   });
 
   assert.deepEqual(await cleaner.clean(5_000), { deleted: 0, missing: 1, retry: 2 });
-  assert.deepEqual(repository.deleted, ["missing"]);
+  assert.deepEqual(repository.tombstoned, [{ id: "missing", deletedAt: 5_000 }]);
+});
+
+test("promotes the exact 24-hour pre-expiry window even when no bytes are expired", async () => {
+  const repository = repositoryWith([]);
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => {
+      throw new Error("must not delete without expired chunks");
+    },
+  });
+
+  assert.deepEqual(await cleaner.clean(10_000), { deleted: 0, missing: 0, retry: 0 });
+  assert.deepEqual(repository.promoted, [
+    { after: 10_000, before: 10_000 + 24 * 60 * 60 * 1000 },
+  ]);
+});
+
+test("surfaces metadata transaction failures without claiming successful cleanup", async () => {
+  const logs = [];
+  const repository = repositoryWith([
+    { id: "db-fails", path: "db-fails.flac" },
+    { id: "succeeds", path: "succeeds.wav" },
+  ]);
+  repository.tombstoneChunk = (id, deletedAt) => {
+    if (id === "db-fails") throw new Error("database unavailable");
+    repository.tombstoned.push({ id, deletedAt });
+    return { changes: 1, jobsTerminated: 1 };
+  };
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => [
+      { status: "deleted", code: "deleted" },
+      { status: "missing", code: "file_not_found" },
+    ],
+    log: (counts) => logs.push(counts),
+  });
+
+  await assert.rejects(cleaner.clean(20_000), /retention metadata cleanup failed/);
+  assert.deepEqual(repository.tombstoned, [{ id: "succeeds", deletedAt: 20_000 }]);
+  assert.deepEqual(logs, [{ deleted: 0, missing: 1, retry: 1, metadataFailures: 1 }]);
+});
+
+test("surfaces and safely logs urgency query failures before touching audio", async () => {
+  const logs = [];
+  const repository = repositoryWith([{ id: "untouched", path: "untouched.wav" }]);
+  repository.promoteSoonExpiringAudioJobs = () => {
+    throw new Error("database unavailable");
+  };
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => {
+      throw new Error("audio deletion must not start");
+    },
+    log: (counts) => logs.push(counts),
+  });
+
+  await assert.rejects(cleaner.clean(30_000), /retention metadata preparation failed/);
+  assert.deepEqual(logs, [{ deleted: 0, missing: 0, retry: 1, metadataFailures: 1 }]);
+  assert.deepEqual(repository.tombstoned, []);
 });
 
 test("timer start is idempotent, contains async errors, stops, and ignores late callbacks", async () => {
@@ -120,7 +195,8 @@ test("timer start is idempotent, contains async errors, stops, and ignores late 
       listExpiredAudioChunks: () => {
         throw new Error("database unavailable");
       },
-      deleteAudioChunk() {},
+      promoteSoonExpiringAudioJobs() {},
+      tombstoneChunk() {},
     },
     recordingsRoot: path.resolve("recordings"),
     deleteBatch: async () => [],

@@ -313,8 +313,13 @@ test("audio metadata retention and interrupted session recovery stay in jarvis.d
   );
   assert.equal(repo.getSession("s1").status, "recovered");
   assert.equal(repo.getSession("s1").ended_at, 5000);
-  assert.equal(repo.deleteAudioChunk("chunk-1"), 1);
-  assert.deepEqual(repo.listAudioChunks("s1"), []);
+  assert.equal(repo.tombstoneChunk("chunk-1", 5_000).changes, 1);
+  const retained = repo.listAudioChunks("s1");
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0].path, "tombstone:chunk-1");
+  assert.equal(retained[0].deleted_at, 5_000);
+  assert.equal(retained[0].sha256, "a".repeat(64));
+  assert.equal(retained[0].started_at, 1_000);
   repo.close();
 });
 

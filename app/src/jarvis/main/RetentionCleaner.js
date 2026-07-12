@@ -2,6 +2,7 @@ const path = require("node:path");
 const { createSafeRecordingDelete } = require("./SafeRecordingDelete");
 
 const DAILY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const URGENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 class RetentionCleaner {
   constructor({
@@ -16,8 +17,11 @@ class RetentionCleaner {
     if (!repository || typeof repository.listExpiredAudioChunks !== "function") {
       throw new TypeError("repository.listExpiredAudioChunks must be a function");
     }
-    if (typeof repository.deleteAudioChunk !== "function") {
-      throw new TypeError("repository.deleteAudioChunk must be a function");
+    if (typeof repository.promoteSoonExpiringAudioJobs !== "function") {
+      throw new TypeError("repository.promoteSoonExpiringAudioJobs must be a function");
+    }
+    if (typeof repository.tombstoneChunk !== "function") {
+      throw new TypeError("repository.tombstoneChunk must be a function");
     }
     if (typeof recordingsRoot !== "string" || recordingsRoot.length === 0) {
       throw new TypeError("recordingsRoot is required");
@@ -43,7 +47,14 @@ class RetentionCleaner {
     const generation = this.generation;
     const run = async () => {
       const counts = { deleted: 0, retry: 0, missing: 0 };
-      const expired = this.repository.listExpiredAudioChunks(at);
+      let expired;
+      try {
+        this.repository.promoteSoonExpiringAudioJobs(at, at + URGENT_WINDOW_MS);
+        expired = this.repository.listExpiredAudioChunks(at);
+      } catch (error) {
+        this.log({ ...counts, retry: 1, metadataFailures: 1 });
+        throw new AggregateError([error], "retention metadata preparation failed");
+      }
       if (expired.length === 0) {
         this.log({ ...counts });
         return counts;
@@ -60,16 +71,29 @@ class RetentionCleaner {
       if (generation !== this.generation) {
         return { deleted: 0, retry: expired.length, missing: 0 };
       }
+      const metadataErrors = [];
       for (let index = 0; index < expired.length; index += 1) {
         const result = results[index] ?? { status: "retry" };
         if (result.status === "deleted" || result.status === "missing") {
-          this.repository.deleteAudioChunk(expired[index].id);
-          counts[result.status] += 1;
+          try {
+            this.repository.tombstoneChunk(expired[index].id, at);
+            counts[result.status] += 1;
+          } catch (error) {
+            counts.retry += 1;
+            metadataErrors.push(error);
+          }
         } else {
           counts.retry += 1;
         }
       }
-      this.log({ ...counts });
+      this.log(
+        metadataErrors.length > 0
+          ? { ...counts, metadataFailures: metadataErrors.length }
+          : { ...counts }
+      );
+      if (metadataErrors.length > 0) {
+        throw new AggregateError(metadataErrors, "retention metadata cleanup failed");
+      }
       return counts;
     };
     const promise = run().finally(() => {
@@ -108,3 +132,4 @@ class RetentionCleaner {
 }
 
 module.exports = RetentionCleaner;
+RetentionCleaner.URGENT_WINDOW_MS = URGENT_WINDOW_MS;

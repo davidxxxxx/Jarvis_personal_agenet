@@ -107,6 +107,43 @@ class CaptureEvidenceStore {
         SET path = 'tombstone:' || id, deleted_at = ?
         WHERE id = ? AND deleted_at IS NULL
       `),
+      expireUnfinishedChunkJobs: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'audio_expired_before_processing',
+            error_code = 'audio_expired_before_processing',
+            completed_at = @completedAt,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL
+        WHERE chunk_id = @chunkId
+          AND completed_at IS NULL
+          AND state NOT IN (
+            'completed', 'failed', 'cancelled', 'audio_expired_before_processing'
+          )
+      `),
+      promoteSoonExpiringAudioJobs: db.prepare(`
+        UPDATE processing_jobs
+        SET state = CASE
+              WHEN state IN ('pending', 'retry') THEN 'retention_urgent'
+              ELSE state
+            END,
+            priority = 0
+        WHERE job_type = 'transcribe_chunk'
+          AND completed_at IS NULL
+          AND state NOT IN (
+            'completed', 'failed', 'cancelled', 'audio_expired_before_processing'
+          )
+          AND chunk_id IN (
+            SELECT id FROM audio_chunks
+            WHERE deleted_at IS NULL
+              AND expires_at > @after
+              AND expires_at <= @before
+          )
+          AND (
+            priority <> 0
+            OR state IN ('pending', 'retry')
+          )
+      `),
     };
 
     this.commitChunkTransaction = db.transaction((chunk) => {
@@ -122,6 +159,18 @@ class CaptureEvidenceStore {
     this.createTracksTransaction = db.transaction((tracks) =>
       tracks.map((track) => this.createTrack(track))
     );
+    this.tombstoneChunkTransaction = db.transaction((id, deletedAt) => {
+      this._assertIdentifier(id, "chunkId");
+      this._assertSafeInteger(deletedAt, "deletedAt");
+      const chunk = this.statements.getChunk.get(id);
+      if (!chunk) return { changes: 0, jobsTerminated: 0 };
+      const tombstone = this.statements.tombstoneChunk.run(deletedAt, id);
+      const jobs = this.statements.expireUnfinishedChunkJobs.run({
+        chunkId: id,
+        completedAt: chunk.deleted_at ?? deletedAt,
+      });
+      return { changes: tombstone.changes, jobsTerminated: jobs.changes };
+    });
     this.interruptTrackTransaction = db.transaction(({ trackId, gap }) => {
       this._assertIdentifier(trackId, "trackId");
       if (!gap || typeof gap !== "object") throw new TypeError("gap is required");
@@ -365,7 +414,16 @@ class CaptureEvidenceStore {
   }
 
   tombstoneChunk(id, deletedAt = this.now()) {
-    return this.statements.tombstoneChunk.run(deletedAt, id);
+    return this.tombstoneChunkTransaction(id, deletedAt);
+  }
+
+  promoteSoonExpiringAudioJobs(after, before) {
+    this._assertSafeInteger(after, "retention urgency after");
+    this._assertSafeInteger(before, "retention urgency before");
+    if (before <= after) {
+      throw new RangeError("retention urgency before must be greater than after");
+    }
+    return this.statements.promoteSoonExpiringAudioJobs.run({ after, before }).changes;
   }
 
   enqueueChunkTranscription(chunk) {

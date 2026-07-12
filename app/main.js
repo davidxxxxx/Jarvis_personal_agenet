@@ -294,6 +294,9 @@ const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
 const JarvisService = require("./src/jarvis/main/JarvisService");
 const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
+const {
+  runLegacyRecordingBackfillAtStartup,
+} = require("./src/jarvis/main/LegacyRecordingBackfill");
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const { resolveRecordingsRoot } = require("./src/jarvis/main/recordingStorage");
@@ -412,6 +415,11 @@ function initializeCoreManagers() {
     process.env.JARVIS_RECORDINGS_DIR
   );
   jarvisRepository = new JarvisRepository(path.join(jarvisUserDataDir, "jarvis.db"));
+  runLegacyRecordingBackfillAtStartup({
+    repository: jarvisRepository,
+    recordingsRoot,
+    log: (message, details) => debugLogger.info(message, details, "jarvis"),
+  });
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: jarvisUserDataDir,

@@ -11,6 +11,30 @@ const DEFAULT_CLOUD_LIMIT_MICROUSD = 5_000_000;
 const MIN_CLOUD_LIMIT_MICROUSD = 5_000_000;
 const MAX_CLOUD_LIMIT_MICROUSD = 10_000_000;
 const CLOUD_RESERVATION_MICROUSD = 100_000;
+const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
+  recording: "active",
+  finalizing: "active",
+  paused: "paused",
+  completed: "ended",
+  recovered: "recovered",
+  failed: "failed",
+});
+
+function legacyTrackLifecycle(session) {
+  const state = LEGACY_TRACK_STATE_BY_SESSION_STATUS[session.status];
+  if (!state) throw new Error(`unsupported legacy session status: ${session.status}`);
+  const terminal = state === "ended" || state === "recovered" || state === "failed";
+  return {
+    state,
+    endedAt: terminal ? (session.ended_at ?? session.started_at) : null,
+  };
+}
+
+function compareStableIds(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
 
 function normalizeSpeakerName(value) {
   if (typeof value !== "string") throw new TypeError("displayName must be a string");
@@ -323,10 +347,62 @@ class JarvisRepository {
       `),
       listExpiredAudioChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
-        WHERE expires_at <= ?
+        WHERE expires_at <= ? AND deleted_at IS NULL
         ORDER BY expires_at ASC, id ASC
       `),
-      deleteAudioChunk: this.db.prepare("DELETE FROM audio_chunks WHERE id = ?"),
+      getSessionSourceTrack: this.db.prepare(`
+        SELECT * FROM audio_tracks
+        WHERE session_id = ? AND source_type = ?
+      `),
+      insertLegacyMicTrack: this.db.prepare(`
+        INSERT INTO audio_tracks (
+          id, session_id, source_type, device_id, device_label, strategy,
+          sample_rate, channels, started_at, ended_at, state
+        ) VALUES (
+          @id, @sessionId, 'mic', NULL, NULL, 'legacy_backfill',
+          24000, 1, @startedAt, @endedAt, @state
+        )
+      `),
+      listUntrackedAudioChunks: this.db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE session_id = ? AND track_id IS NULL AND deleted_at IS NULL
+        ORDER BY started_at ASC, ended_at ASC, id ASC
+      `),
+      getUntrackedAudioChunk: this.db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE id = ? AND session_id = ? AND track_id IS NULL AND deleted_at IS NULL
+      `),
+      getLastTrackSequence: this.db.prepare(`
+        SELECT COALESCE(MAX(sequence_number), -1) AS sequence_number
+        FROM audio_chunks WHERE track_id = ?
+      `),
+      linkLegacyAudioChunk: this.db.prepare(`
+        UPDATE audio_chunks
+        SET track_id = @trackId, source_type = 'mic', sequence_number = @sequenceNumber
+        WHERE id = @id AND session_id = @sessionId
+          AND track_id IS NULL AND deleted_at IS NULL
+      `),
+      syncChunkJobTrack: this.db.prepare(`
+        UPDATE processing_jobs SET track_id = @trackId
+        WHERE chunk_id = @chunkId AND track_id IS NULL
+      `),
+      getLegacyChunkTranscriptionJob: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = 'transcribe_chunk'
+          AND chunk_id = @chunkId
+          AND input_hash = @inputHash
+          AND input_version = 1
+          AND model_version = ''
+      `),
+      insertLegacyChunkTranscriptionJob: this.db.prepare(`
+        INSERT INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
+        ) VALUES (
+          @id, @sessionId, @trackId, @chunkId, 'transcribe_chunk', 'pending',
+          @inputHash, 1, '', @createdAt
+        )
+      `),
       listOpenSessions: this.db.prepare(`
         SELECT * FROM sessions
         WHERE status IN ('recording', 'paused', 'finalizing')
@@ -473,6 +549,65 @@ class JarvisRepository {
       }
       return openSessions.map((session) => this.statements.getSession.get(session.id));
     });
+
+    this._backfillLegacyMicChunks = this.db.transaction(
+      ({ sessionId, deterministicTrackId, chunkIds, createdAt }) => {
+        const session = this.statements.getSession.get(sessionId);
+        if (!session) throw new Error(`session ${sessionId} does not exist`);
+
+        let track = this.statements.getSessionSourceTrack.get(sessionId, "mic");
+        if (!track) {
+          const lifecycle = legacyTrackLifecycle(session);
+          this.statements.insertLegacyMicTrack.run({
+            id: deterministicTrackId,
+            sessionId,
+            startedAt: session.started_at,
+            endedAt: lifecycle.endedAt,
+            state: lifecycle.state,
+          });
+          track = this.statements.getSessionSourceTrack.get(sessionId, "mic");
+        }
+
+        const chunks = chunkIds
+          .map((id) => this.statements.getUntrackedAudioChunk.get(id, sessionId))
+          .filter(Boolean)
+          .filter((chunk) => chunk.source_type === "mic")
+          .sort(
+            (left, right) =>
+              left.started_at - right.started_at ||
+              left.ended_at - right.ended_at ||
+              compareStableIds(left.id, right.id)
+          );
+        let sequenceNumber =
+          this.statements.getLastTrackSequence.get(track.id).sequence_number + 1;
+        let linked = 0;
+        let jobsCreated = 0;
+        for (const chunk of chunks) {
+          const link = this.statements.linkLegacyAudioChunk.run({
+            id: chunk.id,
+            sessionId,
+            trackId: track.id,
+            sequenceNumber,
+          });
+          if (link.changes !== 1) continue;
+          sequenceNumber += 1;
+          linked += 1;
+          this.statements.syncChunkJobTrack.run({ chunkId: chunk.id, trackId: track.id });
+          const jobInput = { chunkId: chunk.id, inputHash: chunk.sha256 };
+          if (!this.statements.getLegacyChunkTranscriptionJob.get(jobInput)) {
+            this.statements.insertLegacyChunkTranscriptionJob.run({
+              id: `job_${crypto.randomUUID().replaceAll("-", "")}`,
+              sessionId,
+              trackId: track.id,
+              ...jobInput,
+              createdAt,
+            });
+            jobsCreated += 1;
+          }
+        }
+        return { linked, jobsCreated, trackId: track.id };
+      }
+    );
 
     this._reserveCloudUsage = this.db.transaction((input) => {
       const settings = this.statements.getCloudBudgetSettings.get();
@@ -1252,8 +1387,18 @@ class JarvisRepository {
     return this.captureEvidenceStore.commitChunk(chunk);
   }
 
-  tombstoneChunk(id, deletedAt) {
-    return this.captureEvidenceStore.tombstoneChunk(id, deletedAt);
+  tombstoneChunk(id, deletedAt = Date.now()) {
+    return this.captureEvidenceStore.tombstoneChunk(
+      assertId(id, "audioChunkId"),
+      assertInteger(deletedAt, "deletedAt")
+    );
+  }
+
+  promoteSoonExpiringAudioJobs(after, before) {
+    return this.captureEvidenceStore.promoteSoonExpiringAudioJobs(
+      assertInteger(after, "after"),
+      assertInteger(before, "before")
+    );
   }
 
   enqueueChunkTranscription(chunk) {
@@ -1280,16 +1425,29 @@ class JarvisRepository {
     return this.statements.listAudioChunks.all(assertId(sessionId, "sessionId"));
   }
 
+  listUntrackedAudioChunks(sessionId) {
+    return this.statements.listUntrackedAudioChunks.all(assertId(sessionId, "sessionId"));
+  }
+
+  backfillLegacyMicChunks({ sessionId, deterministicTrackId, chunkIds, createdAt = Date.now() }) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeTrackId = assertId(deterministicTrackId, "deterministicTrackId");
+    if (!Array.isArray(chunkIds)) throw new TypeError("chunkIds must be an array");
+    const safeChunkIds = [...new Set(chunkIds.map((id) => assertId(id, "audioChunkId")))];
+    return this._backfillLegacyMicChunks({
+      sessionId: safeSessionId,
+      deterministicTrackId: safeTrackId,
+      chunkIds: safeChunkIds,
+      createdAt: assertInteger(createdAt, "createdAt"),
+    });
+  }
+
   getAudioChunk(id) {
     return this.statements.getAudioChunk.get(assertId(id, "audioChunkId")) ?? null;
   }
 
   listExpiredAudioChunks(now = Date.now()) {
     return this.statements.listExpiredAudioChunks.all(assertInteger(now, "now"));
-  }
-
-  deleteAudioChunk(id) {
-    return this.statements.deleteAudioChunk.run(assertId(id, "audioChunkId")).changes;
   }
 
   recoverOpenSessions(at = Date.now()) {

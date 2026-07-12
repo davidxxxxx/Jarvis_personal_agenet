@@ -1026,6 +1026,128 @@ test("tombstones multiple chunks once while retaining evidence metadata", (t) =>
   assert.equal(rows[1].deleted_at, 201);
 });
 
+test("tombstoning atomically expires unfinished chunk jobs without rewriting terminal jobs", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  const inputs = [
+    ["pending", "pending", null],
+    ["running", "running", null],
+    ["retry", "retry", null],
+    ["completed", "completed", 88],
+    ["failed", "failed", 89],
+  ];
+  inputs.forEach(([id], index) => {
+    store.commitChunk(
+      chunk({
+        id: `c-${id}`,
+        sequenceNumber: index,
+        path: `${id}.wav`,
+        startedAt: 10 + index * 10,
+        endedAt: 20 + index * 10,
+        sha256: id,
+        expiresAt: 100,
+      })
+    );
+  });
+  for (const [id, state, completedAt] of inputs) {
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = ?, completed_at = ?, lease_owner = 'worker', lease_expires_at = 999,
+           next_retry_at = 500
+       WHERE chunk_id = ?`
+    ).run(state, completedAt, `c-${id}`);
+  }
+  db.prepare(
+    `INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at
+    ) VALUES ('diarize-pending', 's1', 't1', 'c-pending', 'diarize_chunk', 'pending', 'diarize', 1)`
+  ).run();
+
+  for (const [id] of inputs) store.tombstoneChunk(`c-${id}`, 200);
+
+  const jobs = db
+    .prepare(
+      `SELECT chunk_id, state, error_code, completed_at, lease_owner, lease_expires_at,
+              next_retry_at
+       FROM processing_jobs ORDER BY chunk_id`
+    )
+    .all();
+  for (const row of jobs.filter((job) => ["c-pending", "c-retry", "c-running"].includes(job.chunk_id))) {
+    assert.equal(row.state, "audio_expired_before_processing");
+    assert.equal(row.error_code, "audio_expired_before_processing");
+    assert.equal(row.completed_at, 200);
+    assert.equal(row.lease_owner, null);
+    assert.equal(row.lease_expires_at, null);
+    assert.equal(row.next_retry_at, null);
+  }
+  assert.equal(jobs.filter((job) => job.chunk_id === "c-pending").length, 2);
+  assert.deepEqual(
+    jobs.find((job) => job.chunk_id === "c-completed"),
+    {
+      chunk_id: "c-completed",
+      state: "completed",
+      error_code: null,
+      completed_at: 88,
+      lease_owner: "worker",
+      lease_expires_at: 999,
+      next_retry_at: 500,
+    }
+  );
+  assert.equal(jobs.find((job) => job.chunk_id === "c-failed").state, "failed");
+});
+
+test("promotes only unfinished transcription jobs strictly inside the 24-hour urgency range", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  const expiries = [100, 101, 200, 201];
+  expiries.forEach((expiresAt, index) => {
+    store.commitChunk(
+      chunk({
+        id: `c${index}`,
+        sequenceNumber: index,
+        path: `c${index}.wav`,
+        startedAt: 10 + index * 10,
+        endedAt: 20 + index * 10,
+        sha256: `hash${index}`,
+        expiresAt,
+      })
+    );
+  });
+  db.prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 50 WHERE chunk_id = 'c2'").run();
+
+  assert.equal(store.promoteSoonExpiringAudioJobs(100, 200), 1);
+  assert.equal(store.promoteSoonExpiringAudioJobs(100, 200), 0);
+  assert.deepEqual(
+    db.prepare("SELECT chunk_id, state, priority FROM processing_jobs ORDER BY chunk_id").all(),
+    [
+      { chunk_id: "c0", state: "pending", priority: 0 },
+      { chunk_id: "c1", state: "retention_urgent", priority: 0 },
+      { chunk_id: "c2", state: "completed", priority: 0 },
+      { chunk_id: "c3", state: "pending", priority: 0 },
+    ]
+  );
+});
+
+test("rolls back a tombstone when unfinished job termination fails", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk());
+  db.exec(`
+    CREATE TRIGGER reject_retention_job_update
+    BEFORE UPDATE ON processing_jobs
+    BEGIN
+      SELECT RAISE(ABORT, 'job update rejected');
+    END;
+  `);
+
+  assert.throws(() => store.tombstoneChunk("c1", 200), /job update rejected/i);
+  assert.deepEqual(db.prepare("SELECT path, deleted_at FROM audio_chunks WHERE id = 'c1'").get(), {
+    path: "c1.wav",
+    deleted_at: null,
+  });
+  assert.equal(db.prepare("SELECT state FROM processing_jobs WHERE chunk_id = 'c1'").get().state, "pending");
+});
+
 test("JarvisRepository delegates the complete capture evidence interface", () => {
   const repository = new JarvisRepository(":memory:");
   try {
