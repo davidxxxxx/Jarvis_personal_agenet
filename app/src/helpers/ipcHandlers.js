@@ -4664,10 +4664,16 @@ class IPCHandlers {
     let meetingNoteId = null;
     let activeMeetingCaptureMode = resolveMeetingCaptureMode();
     let activeJarvisSessionId = null;
+    let activeMeetingInputBinding = null;
+
+    const clearActiveMeetingInputBinding = () => {
+      activeMeetingInputBinding = null;
+    };
 
     const resetActiveMeetingCapture = () => {
       activeMeetingCaptureMode = resolveMeetingCaptureMode();
       activeJarvisSessionId = null;
+      clearActiveMeetingInputBinding();
     };
 
     const getLiveSpeakerProfiles = () => {
@@ -5651,6 +5657,7 @@ class IPCHandlers {
     ipcMain.handle("meeting-transcription-cancel", async () => {
       if (meetingTranscriptionPrepareState) {
         cancelInFlightMeetingPrepare();
+        clearActiveMeetingInputBinding();
         return { success: true };
       }
       if (isMeetingStreamingConnected() || meetingLocalTimer) {
@@ -5658,6 +5665,7 @@ class IPCHandlers {
       }
       meetingTranscriptionStartInProgress = false;
       meetingTranscriptionPrepareState = null;
+      clearActiveMeetingInputBinding();
       return { success: true };
     });
 
@@ -5677,6 +5685,21 @@ class IPCHandlers {
       }
 
       meetingTranscriptionStartInProgress = true;
+      const startInputBinding = {
+        ownerId: event.sender.id,
+        inputGeneration: crypto.randomUUID(),
+        active: false,
+        pendingManagedSystemChunks: [],
+      };
+      activeMeetingInputBinding = startInputBinding;
+      const completeMeetingTranscriptionStart = (result) => {
+        if (activeMeetingInputBinding !== startInputBinding) {
+          throw new Error("Meeting transcription start was superseded");
+        }
+        startInputBinding.active = true;
+        flushPendingManagedSystemChunks(startInputBinding);
+        return { ...result, inputGeneration: startInputBinding.inputGeneration };
+      };
       meetingStartedAt = Date.now();
       this.meetingDetectionEngine?.setUserRecording(true);
       try {
@@ -5728,12 +5751,12 @@ class IPCHandlers {
             captureMode,
             "during warm-start reuse"
           ));
-          return {
+          return completeMeetingTranscriptionStart({
             success: true,
             systemAudioMode,
             systemAudioStrategy,
             oneOnOneAttendee: meetingOneOnOneAttendee,
-          };
+          });
         }
 
         if (options.provider === "local") {
@@ -5770,12 +5793,12 @@ class IPCHandlers {
             systemAudioStrategy,
           });
 
-          return {
+          return completeMeetingTranscriptionStart({
             success: true,
             systemAudioMode,
             systemAudioStrategy,
             oneOnOneAttendee: meetingOneOnOneAttendee,
-          };
+          });
         }
 
         if (!ALLOWED_MEETING_PROVIDERS.has(options.provider)) {
@@ -5793,12 +5816,12 @@ class IPCHandlers {
           captureMode,
           "in realtime mode"
         ));
-        return {
+        return completeMeetingTranscriptionStart({
           success: true,
           systemAudioMode,
           systemAudioStrategy,
           oneOnOneAttendee: meetingOneOnOneAttendee,
-        };
+        });
       } catch (error) {
         await rollbackMeetingTranscriptionStart();
         this.meetingDetectionEngine?.setUserRecording(false);
@@ -5889,18 +5912,48 @@ class IPCHandlers {
       });
     };
 
+    const rejectManagedMeetingSystemProducer = (producer) => {
+      if (producer.inputRejected) return;
+      producer.inputRejected = true;
+      void producer.manager.stop().catch(() => {});
+    };
+
+    const deliverManagedMeetingSystemChunk = (producer, chunk) => {
+      if (producer.inputRejected) return false;
+      const accepted = sendMeetingAudio(chunk, "system");
+      if (accepted === false) {
+        rejectManagedMeetingSystemProducer(producer);
+      }
+      return accepted;
+    };
+
+    const flushPendingManagedSystemChunks = (inputBinding) => {
+      const pending = inputBinding.pendingManagedSystemChunks.splice(0);
+      for (const { producer, chunk } of pending) {
+        if (activeMeetingInputBinding !== inputBinding || inputBinding.active !== true) {
+          rejectManagedMeetingSystemProducer(producer);
+          continue;
+        }
+        deliverManagedMeetingSystemChunk(producer, chunk);
+      }
+    };
+
     const startManagedMeetingSystemAudio = (event, manager, warningLabel) => {
       const win = BrowserWindow.fromWebContents(event.sender);
-      let inputRejected = false;
+      const inputBinding = activeMeetingInputBinding;
+      const producer = { manager, inputRejected: false };
       return manager.start({
         onChunk: (chunk) => {
-          if (inputRejected) return false;
-          const accepted = sendMeetingAudio(chunk, "system");
-          if (accepted === false) {
-            inputRejected = true;
-            void manager.stop().catch(() => {});
+          if (producer.inputRejected) return false;
+          if (activeMeetingInputBinding !== inputBinding) {
+            rejectManagedMeetingSystemProducer(producer);
+            return false;
           }
-          return accepted;
+          if (inputBinding?.active !== true) {
+            inputBinding.pendingManagedSystemChunks.push({ producer, chunk });
+            return true;
+          }
+          return deliverManagedMeetingSystemChunk(producer, chunk);
         },
         onError: (error) => {
           if (win && !win.isDestroyed()) {
@@ -6003,17 +6056,27 @@ class IPCHandlers {
       }
     };
 
-    ipcMain.on("meeting-transcription-send", (event, audioBuffer, source) => {
+    ipcMain.on("meeting-transcription-send", (event, audioBuffer, source, inputGeneration) => {
+      const inputBinding = activeMeetingInputBinding;
+      if (
+        inputBinding?.active !== true ||
+        inputBinding.ownerId !== event.sender.id ||
+        inputBinding.inputGeneration !== inputGeneration
+      ) {
+        return;
+      }
       if (sendMeetingAudio(audioBuffer, source) !== false) return;
       if (!event.sender?.isDestroyed?.()) {
         event.sender.send("meeting-transcription-input-rejected", {
           source,
           reason: "jarvis-evidence-backpressure",
+          inputGeneration,
         });
       }
     });
 
     ipcMain.handle("meeting-transcription-stop", async () => {
+      clearActiveMeetingInputBinding();
       this.meetingDetectionEngine?.setUserRecording(false);
       try {
         if (this.audioTapManager) {

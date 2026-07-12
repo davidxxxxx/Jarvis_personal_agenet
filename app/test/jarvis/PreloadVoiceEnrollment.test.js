@@ -148,19 +148,32 @@ test("preload exposes narrow authoritative capture failure IPC", async () => {
 });
 
 test("preload exposes metadata-only meeting input rejection events", () => {
-  const { rootApi, listeners } = loadPreloadApi();
+  const { rootApi, listeners, sends } = loadPreloadApi();
   const rejected = [];
+  const chunk = new ArrayBuffer(4);
 
   const unsubscribe = rootApi.onMeetingTranscriptionInputRejected((payload) =>
     rejected.push(payload)
   );
+  rootApi.meetingTranscriptionSend(chunk, "system", "input-generation-1");
   listeners.get("meeting-transcription-input-rejected")(
     {},
-    { source: "system", reason: "jarvis-evidence-backpressure" }
+    {
+      source: "system",
+      reason: "jarvis-evidence-backpressure",
+      inputGeneration: "input-generation-1",
+    }
   );
 
+  assert.deepEqual(sends, [
+    ["meeting-transcription-send", chunk, "system", "input-generation-1"],
+  ]);
   assert.deepEqual(rejected, [
-    { source: "system", reason: "jarvis-evidence-backpressure" },
+    {
+      source: "system",
+      reason: "jarvis-evidence-backpressure",
+      inputGeneration: "input-generation-1",
+    },
   ]);
   unsubscribe();
   assert.equal(listeners.has("meeting-transcription-input-rejected"), false);

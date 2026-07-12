@@ -1756,9 +1756,14 @@ declare global {
         error?: string;
         systemAudioMode?: SystemAudioMode;
         systemAudioStrategy?: SystemAudioStrategy;
+        inputGeneration?: string;
         oneOnOneAttendee?: { displayName: string; email: string | null } | null;
       }>;
-      meetingTranscriptionSend?: (buffer: ArrayBuffer, source: "mic" | "system") => void;
+      meetingTranscriptionSend?: (
+        buffer: ArrayBuffer,
+        source: "mic" | "system",
+        inputGeneration: string
+      ) => void;
       meetingTranscriptionStop?: () => Promise<{
         success: boolean;
         transcript?: string;
@@ -1808,6 +1813,7 @@ declare global {
         callback: (payload: {
           source: "mic" | "system";
           reason: "jarvis-evidence-backpressure";
+          inputGeneration: string;
         }) => void
       ) => () => void;
 

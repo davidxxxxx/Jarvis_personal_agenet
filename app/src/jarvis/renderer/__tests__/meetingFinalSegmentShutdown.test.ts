@@ -40,6 +40,7 @@ class FakeTrack extends EventTarget {
 const streamFor = (streamTrack: FakeTrack) =>
   ({
     getAudioTracks: () => [streamTrack],
+    getVideoTracks: () => [],
     getTracks: () => [streamTrack],
   }) as unknown as MediaStream;
 
@@ -47,19 +48,35 @@ const inputDevice = (deviceId: string, label: string) =>
   ({ kind: "audioinput", deviceId, label }) as MediaDeviceInfo;
 
 class FakeAudioWorkletNode extends FakeAudioNode {
-  port = {
-    onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null,
-    postMessage: vi.fn(),
+  port: {
+    onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null;
+    postMessage: ReturnType<typeof vi.fn>;
   };
 
   constructor() {
     super();
+    const chunksOnAttach = workletChunksOnAttach.shift() ?? [];
+    let onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null = null;
+    this.port = {
+      get onmessage() {
+        return onmessage;
+      },
+      set onmessage(value) {
+        onmessage = value;
+        if (!value) return;
+        for (const chunk of chunksOnAttach) {
+          value({ data: chunk } as MessageEvent<ArrayBuffer>);
+        }
+      },
+      postMessage: vi.fn(),
+    };
     audioWorkletNodes.push(this);
   }
 }
 
 const audioContexts: FakeAudioContext[] = [];
 const audioWorkletNodes: FakeAudioWorkletNode[] = [];
+const workletChunksOnAttach: Array<ArrayBuffer[]> = [];
 
 class FakeAudioContext {
   state: AudioContextState = "running";
@@ -98,16 +115,20 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     | ((payload: {
         source: "mic" | "system";
         reason: "jarvis-evidence-backpressure";
+        inputGeneration: string;
       }) => void)
     | null;
+  let inputRejectedListeners: Array<NonNullable<typeof inputRejectedListener>>;
 
   beforeEach(() => {
     audioContexts.length = 0;
     audioWorkletNodes.length = 0;
+    workletChunksOnAttach.length = 0;
     track = new FakeTrack();
     segmentListener = null;
     segmentListenerDetached = false;
     inputRejectedListener = null;
+    inputRejectedListeners = [];
     vi.stubGlobal("AudioContext", FakeAudioContext);
     vi.stubGlobal("AudioWorkletNode", FakeAudioWorkletNode);
     Object.defineProperty(URL, "createObjectURL", {
@@ -129,6 +150,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         success: true,
         systemAudioMode: "unsupported" as const,
         systemAudioStrategy: "unsupported" as const,
+        inputGeneration: "input-generation-1",
       })),
       meetingTranscriptionSend: vi.fn(),
       onMeetingTranscriptionSegment: vi.fn((callback) => {
@@ -143,6 +165,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       onMeetingTranscriptionError: vi.fn(() => () => {}),
       onMeetingTranscriptionInputRejected: vi.fn((callback) => {
         inputRejectedListener = callback;
+        inputRejectedListeners.push(callback);
         return () => {
           inputRejectedListener = null;
         };
@@ -210,10 +233,16 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     const first = new ArrayBuffer(4);
     producer.port.onmessage?.({ data: first } as MessageEvent<ArrayBuffer>);
     expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenLastCalledWith(
+      first,
+      "mic",
+      "input-generation-1"
+    );
 
     inputRejectedListener?.({
       source: "mic",
       reason: "jarvis-evidence-backpressure",
+      inputGeneration: "input-generation-1",
     });
     await vi.waitFor(() => {
       expect(useMeetingRecordingStore.getState()).toMatchObject({
@@ -226,6 +255,155 @@ describe("Jarvis shutdown final meeting segment integration", () => {
 
     producer.port.onmessage?.({ data: new ArrayBuffer(4) } as MessageEvent<ArrayBuffer>);
     expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an old rejection after a new generation starts", async () => {
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementation(async () =>
+      streamFor(new FakeTrack())
+    );
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!)
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "unsupported",
+        systemAudioStrategy: "unsupported",
+        inputGeneration: "input-generation-old",
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "unsupported",
+        systemAudioStrategy: "unsupported",
+        inputGeneration: "input-generation-current",
+      });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Old",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-old",
+    });
+    const oldListener = inputRejectedListeners[0];
+    await stopRecording();
+    await startRecording({
+      noteId: null,
+      noteTitle: "Current",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-current",
+    });
+
+    oldListener({
+      source: "mic",
+      reason: "jarvis-evidence-backpressure",
+      inputGeneration: "input-generation-old",
+    });
+    await Promise.resolve();
+
+    expect(useMeetingRecordingStore.getState().isRecording).toBe(true);
+    expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledTimes(1);
+    const currentProducer = audioWorkletNodes.at(-1)!;
+    const currentChunk = new ArrayBuffer(4);
+    currentProducer.port.onmessage?.({ data: currentChunk } as MessageEvent<ArrayBuffer>);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenLastCalledWith(
+      currentChunk,
+      "mic",
+      "input-generation-current"
+    );
+  });
+
+  it("passes the current generation through buffered and immediate mic and system sends", async () => {
+    const micPending = new ArrayBuffer(4);
+    const systemPending = new ArrayBuffer(6);
+    workletChunksOnAttach.push([micPending], [systemPending]);
+    const systemTrack = new FakeTrack();
+    const systemStream = streamFor(systemTrack);
+    Object.assign(navigator.mediaDevices, {
+      getDisplayMedia: vi.fn(async () => systemStream),
+    });
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "loopback" as const,
+      strategy: "loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "loopback",
+      systemAudioStrategy: "loopback",
+      inputGeneration: "input-generation-dual",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Dual",
+      folderId: null,
+      captureSystemAudio: true,
+      jarvisSessionId: "s-dual",
+    });
+
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenNthCalledWith(
+      1,
+      micPending,
+      "mic",
+      "input-generation-dual"
+    );
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenNthCalledWith(
+      2,
+      systemPending,
+      "system",
+      "input-generation-dual"
+    );
+
+    const micImmediate = new ArrayBuffer(8);
+    const systemImmediate = new ArrayBuffer(10);
+    audioWorkletNodes[0].port.onmessage?.({ data: micImmediate } as MessageEvent<ArrayBuffer>);
+    audioWorkletNodes[1].port.onmessage?.({ data: systemImmediate } as MessageEvent<ArrayBuffer>);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenNthCalledWith(
+      3,
+      micImmediate,
+      "mic",
+      "input-generation-dual"
+    );
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenNthCalledWith(
+      4,
+      systemImmediate,
+      "system",
+      "input-generation-dual"
+    );
+  });
+
+  it("stops a buffered burst immediately when the current generation is rejected", async () => {
+    const first = new ArrayBuffer(4);
+    const second = new ArrayBuffer(4);
+    workletChunksOnAttach.push([first, second]);
+    vi.mocked(window.electronAPI.meetingTranscriptionSend!).mockImplementation(
+      (_chunk, _source, inputGeneration) => {
+        if (inputGeneration !== "input-generation-1") return;
+        inputRejectedListener?.({
+          source: "mic",
+          reason: "jarvis-evidence-backpressure",
+          inputGeneration,
+        });
+      }
+    );
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Burst",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-burst",
+    });
+    await vi.waitFor(() => {
+      expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledOnce();
+    });
+
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledWith(
+      first,
+      "mic",
+      "input-generation-1"
+    );
   });
 
   it("falls back to the system default when the pinned microphone cannot open", async () => {

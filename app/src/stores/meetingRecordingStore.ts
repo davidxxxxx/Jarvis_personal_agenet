@@ -445,6 +445,7 @@ let systemStream: MediaStream | null = null;
 let isRecordingFlag = false;
 let isStartingFlag = false;
 let meetingInputRejected = false;
+let activeMeetingInputGeneration: string | null = null;
 let isPrepared = false;
 let preparedMicOnly: boolean | null = null;
 let segmentsRefValue: TranscriptSegment[] = [];
@@ -721,6 +722,7 @@ function mergeFinalSegments(finalSegments: MeetingFinalSegment[] | undefined): v
 }
 
 async function cleanupCaptureSources(): Promise<void> {
+  activeMeetingInputGeneration = null;
   cancelActiveMicRecovery?.();
   cancelActiveMicRecovery = null;
 
@@ -846,6 +848,7 @@ export interface StartRecordingArgs {
 export async function startRecording(args: StartRecordingArgs): Promise<void> {
   if (isRecordingFlag || isStartingFlag || meetingStopCoordinator.hasPendingStop()) return;
   isStartingFlag = true;
+  activeMeetingInputGeneration = null;
 
   const initialEnabled =
     args.diarizationEnabled ??
@@ -1093,14 +1096,22 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       return;
     }
 
-    if (!startResult?.success) {
+    if (
+      !startResult?.success ||
+      typeof startResult.inputGeneration !== "string" ||
+      startResult.inputGeneration.length === 0
+    ) {
       logger.error(
         "Meeting transcription IPC start failed",
-        { error: startResult?.error },
+        { error: startResult?.error ?? "Missing meeting input generation" },
         "meeting"
       );
       useMeetingRecordingStore.setState({
-        error: startResult?.error || "Failed to start meeting transcription",
+        error:
+          startResult?.error ||
+          (startResult?.success
+            ? "Meeting transcription input binding failed"
+            : "Failed to start meeting transcription"),
         isRecording: false,
         isTranscribing: false,
       });
@@ -1110,6 +1121,8 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       isStartingFlag = false;
       return;
     }
+    const inputGeneration = startResult.inputGeneration;
+    activeMeetingInputGeneration = inputGeneration;
 
     const systemAudioMode = startResult.systemAudioMode || initialSystemAudioAccess.mode;
     const systemAudioStrategy = startResult.systemAudioStrategy || initialSystemAudioStrategy;
@@ -1290,8 +1303,15 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     if (errorCleanup) ipcCleanups.push(errorCleanup);
 
     const inputRejectedCleanup = window.electronAPI?.onMeetingTranscriptionInputRejected?.(
-      ({ source, reason }) => {
-        if (!isRecordingFlag || meetingInputRejected) return;
+      ({ source, reason, inputGeneration: rejectedGeneration }) => {
+        if (
+          !isRecordingFlag ||
+          meetingInputRejected ||
+          activeMeetingInputGeneration !== inputGeneration ||
+          rejectedGeneration !== inputGeneration
+        ) {
+          return;
+        }
         meetingInputRejected = true;
         useMeetingRecordingStore.setState({
           error: "Jarvis stopped accepting audio evidence.",
@@ -1324,10 +1344,21 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     let recoveryPromise: Promise<void> | null = null;
     let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
     let resolveRecoveryDelay: (() => void) | null = null;
+    const sendMeetingChunk = (chunk: ArrayBuffer, source: "mic" | "system"): boolean => {
+      if (
+        !isRecordingFlag ||
+        meetingInputRejected ||
+        activeMeetingInputGeneration !== inputGeneration
+      ) {
+        return false;
+      }
+      window.electronAPI?.meetingTranscriptionSend?.(chunk, source, inputGeneration);
+      return true;
+    };
     const onMicChunk = (chunk: ArrayBuffer) => {
       if (!isRecordingFlag || meetingInputRejected) return;
       if (socketReady) {
-        window.electronAPI?.meetingTranscriptionSend?.(chunk, "mic");
+        sendMeetingChunk(chunk, "mic");
         return;
       }
       pendingMicChunks.push(chunk.slice(0));
@@ -1585,7 +1616,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         onChunk: (chunk) => {
           if (!isRecordingFlag || meetingInputRejected) return;
           if (socketReady) {
-            window.electronAPI?.meetingTranscriptionSend?.(chunk, "system");
+            sendMeetingChunk(chunk, "system");
             return;
           }
           pendingSystemChunks.push(chunk.slice(0));
@@ -1624,10 +1655,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     socketReady = true;
 
     for (const chunk of pendingMicChunks) {
-      window.electronAPI?.meetingTranscriptionSend?.(chunk, "mic");
+      if (!sendMeetingChunk(chunk, "mic")) break;
     }
     for (const chunk of pendingSystemChunks) {
-      window.electronAPI?.meetingTranscriptionSend?.(chunk, "system");
+      if (!sendMeetingChunk(chunk, "system")) break;
     }
 
     const totalMs = performance.now() - startTime;
