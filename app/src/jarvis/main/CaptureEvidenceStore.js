@@ -90,11 +90,11 @@ class CaptureEvidenceStore {
         INSERT INTO audio_chunks (
           id, session_id, track_id, source_type, sequence_number, path,
           started_at, ended_at, duration_ms, sha256, expires_at,
-          transcription_status, write_state
+          transcription_status, write_state, format, file_sha256, sample_rate, channels
         ) VALUES (
           @id, @sessionId, @trackId, @sourceType, @sequenceNumber, @path,
           @startedAt, @endedAt, @durationMs, @sha256, @expiresAt,
-          'pending', 'committed'
+          'pending', 'committed', @format, @fileSha256, @sampleRate, @channels
         )
       `),
       getChunk: db.prepare("SELECT * FROM audio_chunks WHERE id = ?"),
@@ -114,6 +114,67 @@ class CaptureEvidenceStore {
           AND input_hash = @inputHash
           AND input_version = @inputVersion
           AND model_version = @modelVersion
+      `),
+      insertCompressionJob: db.prepare(`
+        INSERT INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state,
+          input_hash, input_version, model_version, created_at
+        ) VALUES (
+          @id, @sessionId, @trackId, @chunkId,
+          'compress_chunk', 'pending', @inputHash, 1, @modelVersion, @createdAt
+        )
+      `),
+      getCompressionJobByInput: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND input_hash = @inputHash
+          AND input_version = 1
+          AND model_version = @modelVersion
+      `),
+      getCompressionJob: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE id = ? AND job_type = 'compress_chunk'
+      `),
+      listCompressionChunks: db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE deleted_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs
+            WHERE processing_jobs.chunk_id = audio_chunks.id
+              AND processing_jobs.job_type = 'compress_chunk'
+          )
+        ORDER BY id
+      `),
+      getCompressionJobForChunk: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE chunk_id = ? AND job_type = 'compress_chunk'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `),
+      promoteChunkToFlac: db.prepare(`
+        UPDATE audio_chunks
+        SET path = @flacPath,
+            format = 'flac',
+            file_sha256 = @fileSha256,
+            sample_rate = @sampleRate,
+            channels = @channels
+        WHERE id = @chunkId
+          AND path = @wavPath
+          AND format = 'wav'
+          AND sha256 = @pcmSha256
+          AND deleted_at IS NULL
+      `),
+      completeCompressionJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'completed', completed_at = @completedAt,
+            next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+            error_code = NULL
+        WHERE id = @jobId
+          AND job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND input_hash = @pcmSha256
+          AND model_version = @encoderVersion
       `),
       tombstoneChunk: db.prepare(`
         UPDATE audio_chunks
@@ -166,8 +227,16 @@ class CaptureEvidenceStore {
           `chunk sequence ${chunk.sequenceNumber} already exists for track ${chunk.trackId}`
         );
       }
-      this.statements.insertChunk.run(chunk);
-      return this._insertChunkTranscription(chunk);
+      this.statements.insertChunk.run({
+        ...chunk,
+        format: chunk.format ?? "wav",
+        fileSha256: chunk.fileSha256 ?? null,
+        sampleRate: chunk.sampleRate ?? 24_000,
+        channels: chunk.channels ?? 1,
+      });
+      const transcription = this._insertChunkTranscription(chunk);
+      if (chunk.encoderVersion !== undefined) this._insertChunkCompression(chunk);
+      return transcription;
     });
     this.createTracksTransaction = db.transaction((tracks) =>
       tracks.map((track) => this.createTrack(track))
@@ -192,13 +261,25 @@ class CaptureEvidenceStore {
       }
       if (persisted.session_id !== chunk.sessionId) throw new Error("chunk session does not match");
       if (persisted.track_id !== chunk.trackId) throw new Error("chunk track does not match");
-      if (persisted.source_type !== chunk.sourceType) throw new Error("chunk source does not match");
+      if (persisted.source_type !== chunk.sourceType)
+        throw new Error("chunk source does not match");
       if (persisted.sha256 !== chunk.sha256) throw new Error("chunk input hash does not match");
       this._assertChunk(chunk);
 
       const input = this._transcriptionInput(chunk);
       const existing = this.statements.getTranscriptionJobByInput.get(input);
       return existing ?? this._insertChunkTranscription(chunk);
+    });
+    this.promoteChunkToFlacTransaction = db.transaction((input) => {
+      const chunk = this.statements.getChunk.get(input.chunkId);
+      if (!chunk) throw new Error(`chunk ${input.chunkId} does not exist`);
+      if (chunk.deleted_at !== null) throw new Error(`chunk ${input.chunkId} audio is deleted`);
+      const updated = this.statements.promoteChunkToFlac.run(input);
+      if (updated.changes !== 1) throw new Error("WAV authority changed before FLAC commit");
+      const completed = this.statements.completeCompressionJob.run(input);
+      if (completed.changes !== 1)
+        throw new Error("compression job does not match chunk authority");
+      return this._chunkResult(this.statements.getChunk.get(input.chunkId));
     });
     this.interruptTrackTransaction = db.transaction(
       ({ trackId, gap, sessionId = undefined, sessionStatus = undefined }) => {
@@ -510,6 +591,28 @@ class CaptureEvidenceStore {
     return this.commitChunkTransaction(chunk);
   }
 
+  getChunk(id) {
+    this._assertIdentifier(id, "chunkId");
+    const row = this.statements.getChunk.get(id);
+    return row ? this._chunkResult(row) : null;
+  }
+
+  promoteChunkToFlac(input) {
+    return this.promoteChunkToFlacTransaction(input);
+  }
+
+  getCompressionJob(id) {
+    this._assertIdentifier(id, "compressionJobId");
+    return this.statements.getCompressionJob.get(id) ?? null;
+  }
+
+  listCompressionRecoveryCandidates() {
+    return this.statements.listCompressionChunks.all().map((row) => ({
+      chunk: this._chunkResult(row),
+      job: this.statements.getCompressionJobForChunk.get(row.id),
+    }));
+  }
+
   tombstoneChunk(id, deletedAt = this.now()) {
     return this.tombstoneChunkTransaction(id, deletedAt);
   }
@@ -537,6 +640,38 @@ class CaptureEvidenceStore {
       createdAt: this.now(),
     });
     return this.statements.getTranscriptionJobByInput.get(input);
+  }
+
+  _insertChunkCompression(chunk) {
+    if (typeof chunk.encoderVersion !== "string" || chunk.encoderVersion.length === 0) {
+      throw new TypeError("encoderVersion must be a non-empty string");
+    }
+    const input = {
+      chunkId: chunk.id,
+      inputHash: chunk.sha256,
+      modelVersion: chunk.encoderVersion,
+    };
+    const existing = this.statements.getCompressionJobByInput.get(input);
+    if (existing) return existing;
+    this.statements.insertCompressionJob.run({
+      id: this.createId("job"),
+      sessionId: chunk.sessionId,
+      trackId: chunk.trackId,
+      ...input,
+      createdAt: this.now(),
+    });
+    return this.statements.getCompressionJobByInput.get(input);
+  }
+
+  _chunkResult(row) {
+    return {
+      ...row,
+      format: row.format ?? "wav",
+      pcm_sha256: row.sha256,
+      file_sha256: row.file_sha256 ?? null,
+      sample_rate: row.sample_rate ?? 24_000,
+      channels: row.channels ?? 1,
+    };
   }
 
   _transcriptionInput(chunk) {
@@ -649,10 +784,19 @@ class CaptureEvidenceStore {
   }
 
   _assertChunk(chunk) {
+    const format = chunk.format ?? "wav";
+    if (format !== "wav") throw new TypeError("committed audio evidence must be WAV");
+    const sampleRate = chunk.sampleRate ?? 24_000;
+    if (sampleRate !== 24_000) {
+      throw new RangeError("committed audio evidence must use 24 kHz sample rate");
+    }
+    const channels = chunk.channels ?? 1;
+    if (channels !== 1) throw new RangeError("committed audio evidence must be mono");
     const track = this.statements.getTrack.get(chunk.trackId);
     if (!track) throw new Error(`track ${chunk.trackId} does not exist`);
     if (track.session_id !== chunk.sessionId) throw new Error("chunk session does not match track");
-    if (track.source_type !== chunk.sourceType) throw new Error("chunk source does not match track");
+    if (track.source_type !== chunk.sourceType)
+      throw new Error("chunk source does not match track");
     const session = this.statements.getSession.get(chunk.sessionId);
     if (!session) throw new Error(`session ${chunk.sessionId} does not exist`);
     if (!Number.isSafeInteger(chunk.startedAt) || !Number.isSafeInteger(chunk.endedAt)) {

@@ -2,6 +2,9 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const MultiTrackAudioWriter = require("./MultiTrackAudioWriter");
+const AudioEvidenceReader = require("./AudioEvidenceReader");
+const FlacCompressionWorker = require("./FlacCompressionWorker");
+const { FLAC_ENCODER_VERSION } = require("./JarvisMigrations");
 const SpeechTriggeredCaptureGate = require("./SpeechTriggeredCaptureGate");
 const { hasSafeDiskSpace } = require("./retentionPolicy");
 const { assertId } = require("../shared/contracts");
@@ -57,6 +60,7 @@ class JarvisService {
     vadClassifier = null,
     maxVadQueueMs = DEFAULT_MAX_VAD_QUEUE_MS,
     vadTimeoutMs = DEFAULT_VAD_TIMEOUT_MS,
+    flacCompressionWorker = undefined,
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -110,6 +114,29 @@ class JarvisService {
     this.recordingsDir = recordingsDir
       ? path.resolve(recordingsDir)
       : path.join(userDataDir, "recordings");
+    if (flacCompressionWorker === undefined && repository.captureEvidenceStore) {
+      const reader = new AudioEvidenceReader();
+      flacCompressionWorker = new FlacCompressionWorker({
+        store: repository.captureEvidenceStore,
+        recordingsRoot: this.recordingsDir,
+        reader,
+      });
+    }
+    if (
+      flacCompressionWorker !== null &&
+      flacCompressionWorker !== undefined &&
+      typeof flacCompressionWorker.recoverStartup !== "function"
+    ) {
+      throw new TypeError("flacCompressionWorker.recoverStartup must be a function");
+    }
+    this.flacCompressionWorker = flacCompressionWorker ?? null;
+    this.compressionRecovery = Promise.resolve({
+      promoted: 0,
+      deletedWavs: 0,
+      removedInvalid: 0,
+      rolledBack: 0,
+    });
+    this.compressionWork = Promise.resolve({ completed: 0, failed: 0, skipped: 0 });
     this.broadcast = broadcast;
     this.now = now;
     this.fs = fsImpl;
@@ -679,7 +706,30 @@ class JarvisService {
     this._assertOpen();
     this._assertTime(at, "at");
     this._reconcileChunkRecoverySidecars();
+    if (this.flacCompressionWorker) {
+      this.compressionRecovery = Promise.resolve().then(() =>
+        this.flacCompressionWorker.recoverStartup()
+      );
+      this.compressionRecovery.catch(() => {});
+      this.compressionWork = this.compressionWork
+        .catch(() => {})
+        .then(async () => {
+          await this.compressionRecovery;
+          return typeof this.flacCompressionWorker.runPending === "function"
+            ? this.flacCompressionWorker.runPending()
+            : { completed: 0, failed: 0, skipped: 0 };
+        });
+      this.compressionWork.catch(() => {});
+    }
     return this.repository.recoverOpenSessions(at);
+  }
+
+  waitForCompressionRecovery() {
+    return this.compressionRecovery;
+  }
+
+  waitForCompressionIdle() {
+    return this.compressionWork;
   }
 
   getState() {
@@ -1178,12 +1228,31 @@ class JarvisService {
       openSources,
       onChunk: (chunk) => {
         if (this.closed) return null;
-        return this.repository.commitChunk({
+        const committed = this.repository.commitChunk({
           ...chunk,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
+          format: "wav",
+          sampleRate: WAV_SAMPLE_RATE,
+          channels: 1,
+          encoderVersion: FLAC_ENCODER_VERSION,
         });
+        this._scheduleCompressionWork();
+        return committed;
       },
     });
+  }
+
+  _scheduleCompressionWork() {
+    if (
+      !this.flacCompressionWorker ||
+      typeof this.flacCompressionWorker.runPending !== "function"
+    ) {
+      return;
+    }
+    this.compressionWork = this.compressionWork
+      .catch(() => {})
+      .then(() => this.flacCompressionWorker.runPending());
+    this.compressionWork.catch(() => {});
   }
 
   _reconcileChunkRecoverySidecars() {
@@ -1351,6 +1420,10 @@ class JarvisService {
       durationMs: metadata.durationMs,
       sha256: metadata.sha256,
       expiresAt: metadata.endedAt + AUDIO_RETENTION_MS,
+      format: "wav",
+      sampleRate: WAV_SAMPLE_RATE,
+      channels: 1,
+      encoderVersion: FLAC_ENCODER_VERSION,
     };
     const existing =
       typeof this.repository.getAudioChunk === "function"

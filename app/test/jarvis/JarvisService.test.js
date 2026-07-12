@@ -782,9 +782,12 @@ test("degraded public state keeps the durable session open with real evidence st
       repository.db.prepare("SELECT source_type, sequence_number FROM audio_chunks").all(),
       [{ source_type: "mic", sequence_number: 0 }]
     );
-    assert.equal(
-      repository.db.prepare("SELECT count(*) count FROM processing_jobs").get().count,
-      1
+    assert.deepEqual(
+      repository.db
+        .prepare("SELECT job_type FROM processing_jobs ORDER BY job_type")
+        .all()
+        .map((job) => job.job_type),
+      ["compress_chunk", "transcribe_chunk"]
     );
   } finally {
     service.shutdown();

@@ -1,0 +1,449 @@
+const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { getFFmpegPath } = require("../../helpers/ffmpegUtils");
+
+class FfmpegFlacEncoder {
+  constructor({ spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
+    this.spawn = spawnImpl;
+    this.getPath = getPath;
+  }
+
+  encode(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+      const ffmpegPath = this.getPath();
+      if (!ffmpegPath) {
+        reject(new Error("FFmpeg not found - required for FLAC evidence compression"));
+        return;
+      }
+      const child = this.spawn(
+        ffmpegPath,
+        [
+          "-v",
+          "error",
+          "-i",
+          inputPath,
+          "-map",
+          "0:a:0",
+          "-c:a",
+          "flac",
+          "-compression_level",
+          "8",
+          "-f",
+          "flac",
+          "-y",
+          outputPath,
+        ],
+        { stdio: ["ignore", "ignore", "pipe"], windowsHide: true }
+      );
+      let stderr = "";
+      let settled = false;
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        fn(value);
+      };
+      child.stderr.on("data", (data) => {
+        stderr = `${stderr}${data}`.slice(-4_096);
+      });
+      child.on("error", (error) =>
+        settle(reject, new Error(`FFmpeg process error: ${error.message}`))
+      );
+      child.on("close", (code) => {
+        if (code === 0) settle(resolve);
+        else
+          settle(
+            reject,
+            new Error(`FFmpeg FLAC encode exited with code ${code}: ${stderr.trim()}`)
+          );
+      });
+    });
+  }
+}
+
+class FlacCompressionWorker {
+  constructor({
+    store,
+    recordingsRoot,
+    encoder = new FfmpegFlacEncoder(),
+    reader,
+    fsImpl = fs.promises,
+    now = Date.now,
+    faultInjector = () => {},
+  }) {
+    if (!store || typeof store.getChunk !== "function") {
+      throw new TypeError("store.getChunk must be a function");
+    }
+    if (typeof store.promoteChunkToFlac !== "function") {
+      throw new TypeError("store.promoteChunkToFlac must be a function");
+    }
+    if (typeof recordingsRoot !== "string" || !path.isAbsolute(recordingsRoot)) {
+      throw new TypeError("recordingsRoot must be an absolute path");
+    }
+    if (!encoder || typeof encoder.encode !== "function") {
+      throw new TypeError("encoder.encode must be a function");
+    }
+    if (!reader || typeof reader.readVerifiedPcm !== "function") {
+      throw new TypeError("reader.readVerifiedPcm must be a function");
+    }
+    this.store = store;
+    this.recordingsRoot = path.resolve(recordingsRoot);
+    this.encoder = encoder;
+    this.reader = reader;
+    this.fs = fsImpl;
+    this.now = now;
+    this.faultInjector = faultInjector;
+  }
+
+  async run(job) {
+    let normalizedJob = this._job(job);
+    const persistedJob = this.store.getCompressionJob?.(normalizedJob.id);
+    if (persistedJob) normalizedJob = this._job(persistedJob);
+    const chunk = this.store.getChunk(normalizedJob.chunkId);
+    if (!chunk) throw new Error(`chunk ${normalizedJob.chunkId} does not exist`);
+    if (chunk.deleted_at !== null) throw new Error("audio_deleted");
+    if (chunk.expires_at <= this.now()) throw new Error("audio_expired");
+    if (chunk.pcm_sha256 !== normalizedJob.inputHash) throw new Error("pcm_hash_mismatch");
+    if (chunk.format === "flac" && normalizedJob.state === "completed") {
+      return { chunk, replayed: true };
+    }
+    if (chunk.format !== "wav") throw new Error("chunk_not_authoritative_wav");
+
+    const wavPath = this._contained(chunk.path);
+    const parsed = path.parse(wavPath);
+    const flacPath = this._contained(path.join(parsed.dir, `${parsed.name}.flac`));
+    const partialPath = `${flacPath}.partial`;
+    await this._assertSafeExistingFile(wavPath);
+    await this._assertSafeTarget(partialPath);
+    if (await this._exists(partialPath)) throw new Error("compression_partial_already_exists");
+    if (await this._exists(flacPath)) throw new Error("compression_final_already_exists");
+    const sourcePcm = await this.reader.readVerifiedPcm(chunk);
+    this._assertMetadata(sourcePcm, chunk);
+
+    try {
+      await this.encoder.encode(wavPath, partialPath);
+      await this._assertSafeExistingFile(partialPath);
+      const partialHandle = await this.fs.open(partialPath, "r+");
+      try {
+        await partialHandle.sync();
+      } finally {
+        await partialHandle.close();
+      }
+      const encodedPcm = await this.reader.readVerifiedPcm({
+        ...chunk,
+        path: partialPath,
+        format: "flac",
+      });
+      this._assertMetadata(encodedPcm, chunk);
+      if (Math.abs(encodedPcm.sampleCount - sourcePcm.sampleCount) > 1) {
+        throw new Error("duration_mismatch");
+      }
+      const encodedBytes = await this.fs.readFile(partialPath);
+      const fileSha256 = crypto.createHash("sha256").update(encodedBytes).digest("hex");
+      await this._injectFault("before_rename");
+      await this.fs.rename(partialPath, flacPath);
+      await this._injectFault("after_rename");
+      const promoted = this.store.promoteChunkToFlac({
+        chunkId: chunk.id,
+        jobId: normalizedJob.id,
+        encoderVersion: normalizedJob.encoderVersion,
+        pcmSha256: chunk.pcm_sha256,
+        wavPath,
+        flacPath,
+        fileSha256,
+        sampleRate: chunk.sample_rate,
+        channels: chunk.channels,
+        completedAt: this.now(),
+      });
+      await this._injectFault("before_wav_delete");
+      await this._assertSafeExistingFile(wavPath);
+      await this.fs.unlink(wavPath);
+      return { chunk: promoted, replayed: false };
+    } catch (error) {
+      if (!error.flacCrashPoint) {
+        try {
+          await this.fs.unlink(partialPath);
+        } catch (cleanupError) {
+          if (cleanupError?.code !== "ENOENT") throw cleanupError;
+        }
+      }
+      throw error;
+    }
+  }
+
+  async _injectFault(point) {
+    try {
+      await this.faultInjector(point);
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      error.flacCrashPoint = point;
+      throw error;
+    }
+  }
+
+  async runPending() {
+    if (typeof this.store.listCompressionRecoveryCandidates !== "function") {
+      throw new TypeError("store.listCompressionRecoveryCandidates must be a function");
+    }
+    const result = { completed: 0, failed: 0, skipped: 0 };
+    for (const { chunk, job } of this.store.listCompressionRecoveryCandidates()) {
+      if (!job || !["pending", "retry", "retention_urgent"].includes(job.state)) continue;
+      if (chunk.deleted_at !== null || chunk.expires_at <= this.now() || chunk.format !== "wav") {
+        result.skipped += 1;
+        continue;
+      }
+      try {
+        await this.run(job);
+        result.completed += 1;
+      } catch {
+        result.failed += 1;
+      }
+    }
+    return result;
+  }
+
+  async recoverStartup() {
+    if (typeof this.store.listCompressionRecoveryCandidates !== "function") {
+      throw new TypeError("store.listCompressionRecoveryCandidates must be a function");
+    }
+    const result = { promoted: 0, deletedWavs: 0, removedInvalid: 0, rolledBack: 0 };
+    for (const candidate of this.store.listCompressionRecoveryCandidates()) {
+      const { chunk, job } = candidate;
+      if (!job || chunk.deleted_at !== null || chunk.expires_at <= this.now()) continue;
+      try {
+        if (chunk.format === "wav") {
+          await this._recoverWav(chunk, this._job(job), result);
+        } else if (chunk.format === "flac") {
+          await this._recoverFlac(chunk, result);
+        }
+      } catch {
+        // One inaccessible artifact must not block independent authoritative rows.
+      }
+    }
+    return result;
+  }
+
+  async _recoverWav(chunk, job, result) {
+    const wavPath = this._contained(chunk.path);
+    const parsed = path.parse(wavPath);
+    const flacPath = this._contained(path.join(parsed.dir, `${parsed.name}.flac`));
+    const partialPath = `${flacPath}.partial`;
+    const temporaryPath = `${flacPath}.tmp`;
+    let sourcePcm;
+    try {
+      await this._assertSafeExistingFile(wavPath);
+      await this._assertSafeTarget(flacPath);
+      sourcePcm = await this.reader.readVerifiedPcm(chunk);
+      this._assertMetadata(sourcePcm, chunk);
+    } catch {
+      return;
+    }
+
+    if (await this._exists(temporaryPath)) {
+      await this.fs.unlink(temporaryPath);
+      result.removedInvalid += 1;
+    }
+    if (await this._exists(partialPath)) {
+      try {
+        await this._verifiedFlac(chunk, sourcePcm, partialPath);
+        if (await this._exists(flacPath)) {
+          await this.fs.unlink(partialPath);
+          result.removedInvalid += 1;
+        } else {
+          await this.fs.rename(partialPath, flacPath);
+        }
+      } catch {
+        await this.fs.unlink(partialPath);
+        result.removedInvalid += 1;
+      }
+    }
+    if (!(await this._exists(flacPath))) return;
+
+    let verified;
+    try {
+      verified = await this._verifiedFlac(chunk, sourcePcm, flacPath);
+    } catch {
+      await this.fs.unlink(flacPath);
+      result.rolledBack += 1;
+      return;
+    }
+    const promoted = this.store.promoteChunkToFlac({
+      chunkId: chunk.id,
+      jobId: job.id,
+      encoderVersion: job.encoderVersion,
+      pcmSha256: chunk.pcm_sha256,
+      wavPath,
+      flacPath,
+      fileSha256: verified.fileSha256,
+      sampleRate: chunk.sample_rate,
+      channels: chunk.channels,
+      completedAt: this.now(),
+    });
+    if (promoted.format !== "flac") throw new Error("FLAC recovery did not switch authority");
+    result.promoted += 1;
+    await this.fs.unlink(wavPath);
+  }
+
+  async _recoverFlac(chunk, result) {
+    const flacPath = this._contained(chunk.path);
+    let authoritativePcm;
+    try {
+      await this._assertSafeExistingFile(flacPath);
+      const fileBytes = await this.fs.readFile(flacPath);
+      const fileSha256 = crypto.createHash("sha256").update(fileBytes).digest("hex");
+      if (chunk.file_sha256 && fileSha256 !== chunk.file_sha256) return;
+      authoritativePcm = await this.reader.readVerifiedPcm(chunk);
+      this._assertMetadata(authoritativePcm, chunk);
+    } catch {
+      return;
+    }
+
+    const parsed = path.parse(flacPath);
+    for (const suffix of [".partial", ".tmp"]) {
+      const candidate = `${flacPath}${suffix}`;
+      if (await this._exists(candidate)) {
+        await this.fs.unlink(candidate);
+        result.removedInvalid += 1;
+      }
+    }
+    const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
+    if (!(await this._exists(wavPath))) return;
+    try {
+      const wavPcm = await this.reader.readVerifiedPcm({ ...chunk, path: wavPath, format: "wav" });
+      this._assertMetadata(wavPcm, chunk);
+      if (Math.abs(wavPcm.sampleCount - authoritativePcm.sampleCount) > 1) return;
+      await this._assertSafeExistingFile(wavPath);
+      await this.fs.unlink(wavPath);
+      result.deletedWavs += 1;
+    } catch {
+      // A conflicting non-authoritative file is preserved for diagnosis.
+    }
+  }
+
+  async _verifiedFlac(chunk, sourcePcm, candidatePath) {
+    const encodedPcm = await this.reader.readVerifiedPcm({
+      ...chunk,
+      path: candidatePath,
+      format: "flac",
+    });
+    this._assertMetadata(encodedPcm, chunk);
+    if (Math.abs(encodedPcm.sampleCount - sourcePcm.sampleCount) > 1) {
+      throw new Error("duration_mismatch");
+    }
+    const bytes = await this.fs.readFile(candidatePath);
+    return { fileSha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+  }
+
+  async _exists(candidate) {
+    try {
+      const stat = await this.fs.lstat(candidate);
+      return stat.isFile() && !stat.isSymbolicLink();
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  _assertMetadata(pcm, chunk) {
+    if (pcm.sampleRate !== chunk.sample_rate) throw new Error("sample_rate_mismatch");
+    if (pcm.channels !== chunk.channels) throw new Error("channels_mismatch");
+    if (!Number.isSafeInteger(pcm.sampleCount) || pcm.sampleCount <= 0) {
+      throw new Error("duration_mismatch");
+    }
+    const durationMs = Math.max(1, Math.round((pcm.sampleCount * 1_000) / pcm.sampleRate));
+    if (durationMs !== chunk.duration_ms) throw new Error("duration_mismatch");
+  }
+
+  async _assertSafeExistingFile(candidate) {
+    const resolved = this._contained(candidate);
+    const stat = await this.fs.lstat(resolved);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("audio evidence path is not a regular file or is a symbolic link");
+    }
+    const [rootReal, candidateReal] = await Promise.all([
+      this.fs.realpath(this.recordingsRoot),
+      this.fs.realpath(resolved),
+    ]);
+    if (!this._isContained(rootReal, candidateReal)) {
+      throw new Error("audio evidence path escapes recordings root");
+    }
+    return resolved;
+  }
+
+  async _assertSafeTarget(candidate) {
+    const resolved = this._contained(candidate);
+    const parent = path.dirname(resolved);
+    const parentStat = await this.fs.lstat(parent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+      throw new Error("audio evidence target parent is a symbolic link");
+    }
+    const [rootReal, parentReal] = await Promise.all([
+      this.fs.realpath(this.recordingsRoot),
+      this.fs.realpath(parent),
+    ]);
+    if (!this._isContained(rootReal, parentReal, true)) {
+      throw new Error("audio evidence target escapes recordings root");
+    }
+    try {
+      const targetStat = await this.fs.lstat(resolved);
+      if (!targetStat.isFile() || targetStat.isSymbolicLink()) {
+        throw new Error("audio evidence target is a symbolic link or not a regular file");
+      }
+      await this._assertSafeExistingFile(resolved);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    return resolved;
+  }
+
+  _contained(candidate) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) {
+      throw new TypeError("audio evidence path must be absolute");
+    }
+    const resolved = path.resolve(candidate);
+    const relative = path.relative(this.recordingsRoot, resolved);
+    if (
+      relative.length === 0 ||
+      path.isAbsolute(relative) ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`)
+    ) {
+      throw new Error("audio evidence path escapes recordings root");
+    }
+    return resolved;
+  }
+
+  _isContained(parent, candidate, allowSame = false) {
+    const relative = path.relative(parent, candidate);
+    return (
+      (allowSame || relative.length > 0) &&
+      !path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`)
+    );
+  }
+
+  _job(job) {
+    if (!job || typeof job !== "object") throw new TypeError("compression job is required");
+    const normalized = {
+      id: job.id,
+      chunkId: job.chunk_id ?? job.chunkId,
+      inputHash: job.input_hash ?? job.inputHash,
+      encoderVersion: job.model_version ?? job.encoderVersion,
+      state: job.state,
+    };
+    if (job.job_type !== undefined && job.job_type !== "compress_chunk") {
+      throw new TypeError("job must be compress_chunk");
+    }
+    for (const name of ["id", "chunkId", "inputHash", "encoderVersion"]) {
+      if (typeof normalized[name] !== "string" || normalized[name].length === 0) {
+        throw new TypeError(`compression job ${name} is required`);
+      }
+    }
+    return normalized;
+  }
+}
+
+module.exports = FlacCompressionWorker;
+module.exports.FfmpegFlacEncoder = FfmpegFlacEncoder;

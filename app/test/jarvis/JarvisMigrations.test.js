@@ -1,10 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
-const {
-  applyJarvisMigrations,
-  TARGET_VERSION,
-} = require("../../src/jarvis/main/JarvisMigrations");
+const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 
 function columnNames(db, table) {
   return db
@@ -52,19 +49,11 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
           "ready_at",
         ].includes(name)
       ),
-      [
-        "capture_mode",
-        "processing_state",
-        "timeline_version",
-        "finalized_at",
-        "ready_at",
-      ]
+      ["capture_mode", "processing_state", "timeline_version", "finalized_at", "ready_at"]
     );
     assert.deepEqual(
       columnNames(db, "audio_chunks").filter((name) =>
-        ["track_id", "source_type", "sequence_number", "write_state", "deleted_at"].includes(
-          name
-        )
+        ["track_id", "source_type", "sequence_number", "write_state", "deleted_at"].includes(name)
       ),
       ["track_id", "source_type", "sequence_number", "write_state", "deleted_at"]
     );
@@ -90,20 +79,24 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
         ('g1', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40);
     `);
     assert.throws(() =>
-      db.prepare(
-        `INSERT INTO processing_jobs (
+      db
+        .prepare(
+          `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
         ) VALUES ('j3', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 50)`
-      ).run()
+        )
+        .run()
     );
     assert.throws(() =>
-      db.prepare(
-        `INSERT INTO processing_jobs (
+      db
+        .prepare(
+          `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
         ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 50)`
-      ).run()
+        )
+        .run()
     );
     db.prepare(
       `INSERT INTO processing_jobs (
@@ -176,6 +169,10 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       sequence_number: 0,
       write_state: "committed",
       deleted_at: null,
+      format: "wav",
+      file_sha256: null,
+      sample_rate: 24000,
+      channels: 1,
     });
     assert.equal(db.prepare("SELECT count(*) AS count FROM audio_chunks").get().count, 2);
   } finally {
@@ -199,6 +196,55 @@ test("upgrades v4 databases with the bounded open-gap lookup index", () => {
         .prepare("PRAGMA index_list(audio_gaps)")
         .all()
         .some((index) => index.name === "idx_audio_gaps_track_ended_started")
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("upgrades committed WAV rows with one idempotent compression job", () => {
+  const db = new Database(":memory:");
+
+  try {
+    applyJarvisMigrations(db);
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 10, 'completed', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, ended_at, state
+      ) VALUES ('t1', 's1', 'mic', 24000, 1, 10, 20, 'ended');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at, format,
+        sample_rate, channels
+      ) VALUES (
+        'c1', 's1', 't1', 'mic', 0, 'c1.wav', 10, 20, 10, 'pcm-hash', 30,
+        'wav', 24000, 1
+      );
+      PRAGMA user_version = 5;
+    `);
+
+    applyJarvisMigrations(db, { now: () => 25 });
+    db.pragma("user_version = 5");
+    applyJarvisMigrations(db, { now: () => 26 });
+
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT chunk_id, job_type, state, input_hash, model_version, created_at
+           FROM processing_jobs`
+        )
+        .all(),
+      [
+        {
+          chunk_id: "c1",
+          job_type: "compress_chunk",
+          state: "pending",
+          input_hash: "pcm-hash",
+          model_version: "ffmpeg-flac-v1",
+          created_at: 25,
+        },
+      ]
     );
   } finally {
     db.close();
@@ -297,7 +343,10 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
     const result = applyJarvisMigrations(db);
 
     assert.deepEqual(result, { fromVersion: 1, toVersion: TARGET_VERSION });
-    assert.equal(db.prepare("SELECT model_version FROM processing_jobs WHERE id = 'j1'").get().model_version, "");
+    assert.equal(
+      db.prepare("SELECT model_version FROM processing_jobs WHERE id = 'j1'").get().model_version,
+      ""
+    );
     db.prepare(
       `INSERT INTO processing_jobs (
         id, session_id, track_id, chunk_id, job_type, state,
@@ -305,20 +354,24 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
       ) VALUES ('j2', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 30)`
     ).run();
     assert.throws(() =>
-      db.prepare(
-        `INSERT INTO processing_jobs (
+      db
+        .prepare(
+          `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
         ) VALUES ('j3', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 40)`
-      ).run()
+        )
+        .run()
     );
     assert.throws(() =>
-      db.prepare(
-        `INSERT INTO processing_jobs (
+      db
+        .prepare(
+          `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
         ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40)`
-      ).run()
+        )
+        .run()
     );
     db.prepare(
       `INSERT INTO processing_jobs (
@@ -328,12 +381,14 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
     ).run();
     assert.throws(
       () =>
-        db.prepare(
-          `INSERT INTO audio_chunks (
+        db
+          .prepare(
+            `INSERT INTO audio_chunks (
             id, session_id, track_id, source_type, sequence_number, path,
             started_at, ended_at, duration_ms, sha256, expires_at
           ) VALUES ('c3', 's1', 't1', 'system', 1, 'c3.wav', 30, 40, 10, 'other', 50)`
-        ).run(),
+          )
+          .run(),
       /track_id, audio_chunks.sequence_number/
     );
     assert.deepEqual(applyJarvisMigrations(db), {

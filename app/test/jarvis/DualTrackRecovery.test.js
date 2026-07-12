@@ -198,7 +198,16 @@ for (const failureOrder of [
       assert.equal(beforeRestart.tracks.length, 2);
       assert.equal(beforeRestart.gaps.filter((gap) => gap.ended_at === null).length, 1);
       assert.ok(beforeRestart.chunks.length >= 2);
-      assert.equal(beforeRestart.jobs.length, beforeRestart.chunks.length);
+      assert.equal(beforeRestart.jobs.length, beforeRestart.chunks.length * 2);
+      for (const chunk of beforeRestart.chunks) {
+        assert.deepEqual(
+          beforeRestart.jobs
+            .filter((job) => job.chunk_id === chunk.id)
+            .map((job) => job.job_type)
+            .sort(),
+          ["compress_chunk", "transcribe_chunk"]
+        );
+      }
       assert.deepEqual(
         [...new Set(beforeRestart.chunks.map((chunk) => chunk.source_type))].sort(),
         ["mic", "system"]
@@ -243,7 +252,7 @@ for (const failureOrder of [
         afterRecovery.gaps.every((gap) => gap.ended_at !== null),
         true
       );
-      assert.equal(afterRecovery.jobs.length, afterRecovery.chunks.length);
+      assert.equal(afterRecovery.jobs.length, afterRecovery.chunks.length * 2);
 
       const stableCounts = {
         chunks: afterRecovery.chunks.length,
@@ -345,8 +354,15 @@ test("startup reconciles a renamed WAV sidecar before finalizing its interrupted
     const evidence = snapshot(runtime.repository, sessionId);
     assert.equal(evidence.session.status, "recovered");
     assert.equal(evidence.chunks.length, 1);
-    assert.equal(evidence.jobs.length, 1);
-    assert.equal(evidence.jobs[0].chunk_id, evidence.chunks[0].id);
+    assert.equal(evidence.jobs.length, 2);
+    assert.equal(
+      evidence.jobs.every((job) => job.chunk_id === evidence.chunks[0].id),
+      true
+    );
+    assert.deepEqual(evidence.jobs.map((job) => job.job_type).sort(), [
+      "compress_chunk",
+      "transcribe_chunk",
+    ]);
     const remainingSidecars = fs
       .readdirSync(micDir)
       .filter((entry) => entry.endsWith(".recovery.json"))
@@ -359,7 +375,7 @@ test("startup reconciles a renamed WAV sidecar before finalizing its interrupted
     assert.deepEqual(runtime.service.recoverOpenSessions(63_000), []);
     const stableEvidence = snapshot(runtime.repository, sessionId);
     assert.equal(stableEvidence.chunks.length, 1);
-    assert.equal(stableEvidence.jobs.length, 1);
+    assert.equal(stableEvidence.jobs.length, 2);
     assert.deepEqual(
       fs
         .readdirSync(micDir)
