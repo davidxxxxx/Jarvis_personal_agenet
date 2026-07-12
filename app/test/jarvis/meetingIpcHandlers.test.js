@@ -898,6 +898,44 @@ test("normal stop preserves Jarvis identity through the final local transcriptio
   const stopped = await stopPromise;
   await new Promise((resolve) => setImmediate(resolve));
 
+  const rendererSegments = [];
+  for (const [channel, payload] of fixture.sent) {
+    if (channel !== "meeting-transcription-segment") continue;
+    if (payload.type === "final") {
+      rendererSegments.push({ ...payload });
+      continue;
+    }
+    if (payload.type === "correction") {
+      for (let index = 0; index < rendererSegments.length; index += 1) {
+        const segment = rendererSegments[index];
+        if (
+          segment.source === payload.source &&
+          segment.timestamp === payload.timestamp &&
+          segment.text === payload.originalText
+        ) {
+          rendererSegments[index] = {
+            ...segment,
+            originalText: segment.text,
+            text: payload.text,
+          };
+        }
+      }
+    }
+  }
+  for (const finalSegment of stopped.finalSegments) {
+    if (
+      rendererSegments.some(
+        (segment) =>
+          segment.source === finalSegment.source &&
+          segment.timestamp === finalSegment.timestamp &&
+          segment.text === finalSegment.text
+      )
+    ) {
+      continue;
+    }
+    rendererSegments.push({ ...finalSegment });
+  }
+
   const [, finalWhisperOptions] = fixture.whisperCalls[0];
   assert.equal(persistedDuringStop, 1);
   assert.equal(persisted.length, 1);
@@ -907,8 +945,16 @@ test("normal stop preserves Jarvis identity through the final local transcriptio
   assert.equal(stopWaitedForCorrection, true);
   assert.equal(fixture.transcriptRevisions.length, 1);
   assert.equal(fixture.transcriptRevisions[0].sessionId, "jarvis-final-flush");
+  assert.equal(rendererSegments.length, 1);
+  assert.equal(rendererSegments[0].text, "corrected bilingual transcript");
+  assert.equal(rendererSegments[0].originalText, "und der die das");
+  assert.equal(stopped.finalSegments.length, 1);
+  assert.equal(stopped.finalSegments[0].text, "corrected bilingual transcript");
+  assert.equal(stopped.finalSegments[0].source, "mic");
+  assert.equal(stopped.finalSegments[0].timestamp, rendererSegments[0].timestamp);
+  assert.equal(stopped.finalSegments[0].confidence, 0.25);
   assert.equal(stopped.success, true);
-  assert.match(stopped.transcript, /und der die das/);
+  assert.equal(stopped.transcript, "corrected bilingual transcript");
 });
 
 test("normal stop waits for an active periodic transcription and drains its tail", async (t) => {

@@ -4090,15 +4090,24 @@ class IPCHandlers {
       meetingLocalTranscript += `${meetingLocalTranscript ? " " : ""}${text}`;
     };
 
-    const storeMeetingDiarizationSegment = (text, source, timestamp, micSuppression = null) => {
-      meetingDiarizationSegments.push({
+    const storeMeetingDiarizationSegment = (
+      text,
+      source,
+      timestamp,
+      micSuppression = null,
+      confidence = null
+    ) => {
+      const segment = {
         text,
         source,
         timestamp,
+        ...(confidence == null ? {} : { confidence }),
         suppressionReason: source === "mic" ? micSuppression?.reason || null : null,
         hasBleedEvidence: source === "mic" ? !!micSuppression?.hasBleedEvidence : false,
         likelyRenderBleed: source === "mic" ? !!micSuppression?.likelyRenderBleed : false,
-      });
+      };
+      meetingDiarizationSegments.push(segment);
+      return segment;
     };
 
     const sendMeetingFinalSegment = ({
@@ -4114,7 +4123,13 @@ class IPCHandlers {
         appendMeetingLocalTranscript(text);
       }
 
-      storeMeetingDiarizationSegment(text, source, timestamp, micSuppression);
+      const authoritativeSegment = storeMeetingDiarizationSegment(
+        text,
+        source,
+        timestamp,
+        micSuppression,
+        confidence
+      );
 
       if (send) {
         send("meeting-transcription-segment", {
@@ -4125,6 +4140,7 @@ class IPCHandlers {
           ...(confidence == null ? {} : { confidence }),
         });
       }
+      return authoritativeSegment;
     };
 
     function flushPendingMicFinals(force = false) {
@@ -5191,7 +5207,7 @@ class IPCHandlers {
             }
           };
 
-          const requestCloudCorrection = () => {
+          const requestCloudCorrection = (authoritativeSegment) => {
             if (
               !quality.suspicious ||
               !correctionSessionId ||
@@ -5216,6 +5232,13 @@ class IPCHandlers {
                 ) {
                   return;
                 }
+                if (
+                  !meetingDiarizationSegments.includes(authoritativeSegment) ||
+                  authoritativeSegment.text !== text
+                ) {
+                  return;
+                }
+                authoritativeSegment.text = corrected.text;
                 try {
                   this.jarvisRepository?.addTranscriptRevision?.({
                     id: `revision_${crypto.randomUUID().replaceAll("-", "")}`,
@@ -5258,7 +5281,7 @@ class IPCHandlers {
           };
 
           const emitLocalFinal = () => {
-            sendMeetingFinalSegment({
+            const authoritativeSegment = sendMeetingFinalSegment({
               text,
               source,
               timestamp: segTimestamp,
@@ -5267,7 +5290,7 @@ class IPCHandlers {
               send: sendLocalSegment,
               includeInLocalTranscript: true,
             });
-            requestCloudCorrection();
+            requestCloudCorrection(authoritativeSegment);
           };
 
           if (source === "mic" && hasRiskyMicDuplicateProfile(micSuppression)) {

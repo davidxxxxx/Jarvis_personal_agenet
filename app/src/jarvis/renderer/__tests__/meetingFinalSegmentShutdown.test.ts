@@ -118,6 +118,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         type: "partial" | "final" | "retract" | "correction";
         originalText?: string;
         timestamp?: number;
+        confidence?: number;
       }) => void)
     | null;
   let segmentListenerDetached: boolean;
@@ -885,6 +886,62 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       timestamp: 1_900,
       revisionSource: "openai_correction",
     });
+  });
+
+  it("keeps one corrected segment when stop merges the authoritative main final", async () => {
+    const originalText = "und der die das";
+    const correctedText = "corrected bilingual transcript";
+    const timestamp = 1_900;
+    window.electronAPI.meetingTranscriptionStop = vi.fn(async () => {
+      segmentListener?.({
+        type: "final",
+        text: originalText,
+        source: "mic",
+        timestamp,
+        confidence: 0.25,
+      });
+      segmentListener?.({
+        type: "correction",
+        text: correctedText,
+        originalText,
+        source: "mic",
+        timestamp,
+        confidence: 0.95,
+      });
+      return {
+        success: true,
+        transcript: correctedText,
+        finalSegments: [
+          {
+            text: correctedText,
+            source: "mic" as const,
+            timestamp,
+            confidence: 0.25,
+          },
+        ],
+      };
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis corrected stop",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-corrected-stop",
+      diarizationEnabled: true,
+    });
+    const stopped = await stopRecording();
+
+    expect(stopped.success).toBe(true);
+    expect(stopped.finalSegments).toHaveLength(1);
+    expect(stopped.finalSegments?.[0]).toMatchObject({
+      text: correctedText,
+      originalText,
+      source: "mic",
+      timestamp,
+      revisionSource: "openai_correction",
+    });
+    expect(useMeetingRecordingStore.getState().segments).toHaveLength(1);
   });
 
   it("keeps listeners through source cleanup and syncs one returned final segment before ack", async () => {
