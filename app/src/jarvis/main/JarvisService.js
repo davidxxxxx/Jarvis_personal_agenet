@@ -61,6 +61,7 @@ class JarvisService {
     maxVadQueueMs = DEFAULT_MAX_VAD_QUEUE_MS,
     vadTimeoutMs = DEFAULT_VAD_TIMEOUT_MS,
     flacCompressionWorker = undefined,
+    audioEvidenceReader = undefined,
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -114,12 +115,14 @@ class JarvisService {
     this.recordingsDir = recordingsDir
       ? path.resolve(recordingsDir)
       : path.join(userDataDir, "recordings");
+    if (audioEvidenceReader === undefined) {
+      audioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: this.recordingsDir });
+    }
     if (flacCompressionWorker === undefined && repository.captureEvidenceStore) {
-      const reader = new AudioEvidenceReader();
       flacCompressionWorker = new FlacCompressionWorker({
         store: repository.captureEvidenceStore,
         recordingsRoot: this.recordingsDir,
-        reader,
+        reader: audioEvidenceReader,
       });
     }
     if (
@@ -130,6 +133,7 @@ class JarvisService {
       throw new TypeError("flacCompressionWorker.recoverStartup must be a function");
     }
     this.flacCompressionWorker = flacCompressionWorker ?? null;
+    this.audioEvidenceReader = audioEvidenceReader;
     this.compressionRecovery = Promise.resolve({
       promoted: 0,
       deletedWavs: 0,
@@ -707,9 +711,18 @@ class JarvisService {
     this._assertTime(at, "at");
     this._reconcileChunkRecoverySidecars();
     if (this.flacCompressionWorker) {
-      this.compressionRecovery = Promise.resolve().then(() =>
-        this.flacCompressionWorker.recoverStartup()
-      );
+      this.compressionRecovery = Promise.resolve()
+        .then(() =>
+          typeof this.audioEvidenceReader?.cleanupStaleTemporaryEvidence === "function"
+            ? this.audioEvidenceReader.cleanupStaleTemporaryEvidence({
+                getChunk: (id) =>
+                  this.repository.getAudioChunk?.(id) ??
+                  this.repository.captureEvidenceStore?.getChunk?.(id) ??
+                  null,
+              })
+            : 0
+        )
+        .then(() => this.flacCompressionWorker.recoverStartup());
       this.compressionRecovery.catch(() => {});
       this.compressionWork = this.compressionWork
         .catch(() => {})

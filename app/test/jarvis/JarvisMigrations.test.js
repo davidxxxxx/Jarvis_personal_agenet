@@ -173,6 +173,8 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       file_sha256: null,
       sample_rate: 24000,
       channels: 1,
+      retired_path: null,
+      retired_format: null,
     });
     assert.equal(db.prepare("SELECT count(*) AS count FROM audio_chunks").get().count, 2);
   } finally {
@@ -245,6 +247,147 @@ test("upgrades committed WAV rows with one idempotent compression job", () => {
           created_at: 25,
         },
       ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("compression identity rejects the same chunk and encoder version with a different hash", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 0, 'recording', 0);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'mic', 24000, 1, 0, 'active');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at
+      ) VALUES ('c1', 's1', 't1', 'mic', 0, 'c1.wav', 0, 10, 10, 'hash-a', 1000);
+      INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, created_at
+      ) VALUES ('compress-a', 's1', 't1', 'c1', 'compress_chunk', 'pending',
+        'hash-a', 1, 'ffmpeg-flac-v1', 10);
+    `);
+
+    assert.throws(() =>
+      db
+        .prepare(
+          `INSERT INTO processing_jobs (
+            id, session_id, track_id, chunk_id, job_type, state,
+            input_hash, input_version, model_version, created_at
+          ) VALUES ('compress-b', 's1', 't1', 'c1', 'compress_chunk', 'pending',
+            'hash-b', 1, 'ffmpeg-flac-v1', 20)`
+        )
+        .run()
+    );
+    db.prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, created_at
+      ) VALUES ('transcribe-b', 's1', 't1', 'c1', 'transcribe_chunk', 'pending',
+        'hash-b', 1, 'model-a', 20)`
+    ).run();
+  } finally {
+    db.close();
+  }
+});
+
+test("v7 deterministically merges duplicate compression identities without touching transcription", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      DROP INDEX idx_processing_jobs_compress_identity;
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 0, 'recording', 0);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'mic', 24000, 1, 0, 'active');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at
+      ) VALUES ('c1', 's1', 't1', 'mic', 0, 'c1.wav', 0, 10, 10, 'hash-a', 1000);
+      INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, input_hash,
+        input_version, model_version, attempt_count, error_code, created_at, completed_at
+      ) VALUES
+        ('compress-complete', 's1', 't1', 'c1', 'compress_chunk', 'completed',
+          'hash-a', 1, 'ffmpeg-flac-v1', 1, NULL, 10, 30),
+        ('compress-retry', 's1', 't1', 'c1', 'compress_chunk', 'retry',
+          'hash-b', 1, 'ffmpeg-flac-v1', 4, 'retry-diagnostic', 20, NULL),
+        ('transcribe', 's1', 't1', 'c1', 'transcribe_chunk', 'pending',
+          'hash-a', 1, 'model-a', 0, NULL, 10, NULL);
+      PRAGMA user_version = 6;
+    `);
+
+    applyJarvisMigrations(db, { now: () => 200 });
+
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, state, attempt_count, error_code
+           FROM processing_jobs WHERE job_type = 'compress_chunk'`
+        )
+        .all(),
+      [
+        {
+          id: "compress-complete",
+          state: "completed",
+          attempt_count: 4,
+          error_code: "retry-diagnostic",
+        },
+      ]
+    );
+    assert.equal(
+      db
+        .prepare("SELECT count(*) count FROM processing_jobs WHERE job_type = 'transcribe_chunk'")
+        .get().count,
+      1
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("v7 backfills only complete live committed authoritative WAV metadata", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 0, 'recording', 0);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'mic', 24000, 1, 0, 'active');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at, write_state,
+        deleted_at, format, sample_rate, channels
+      ) VALUES
+        ('valid', 's1', 't1', 'mic', 0, 'valid.wav', 0, 10, 10, 'hash-v', 1000, 'committed', NULL, 'wav', 24000, 1),
+        ('writing', 's1', 't1', 'mic', 1, 'writing.wav', 10, 20, 10, 'hash-w', 1000, 'writing', NULL, 'wav', 24000, 1),
+        ('failed', 's1', 't1', 'mic', 2, 'failed.wav', 20, 30, 10, 'hash-f', 1000, 'failed', NULL, 'wav', 24000, 1),
+        ('deleted', 's1', 't1', 'mic', 3, 'deleted.wav', 30, 40, 10, 'hash-d', 1000, 'committed', 50, 'wav', 24000, 1),
+        ('expired', 's1', 't1', 'mic', 4, 'expired.wav', 40, 50, 10, 'hash-e', 200, 'committed', NULL, 'wav', 24000, 1),
+        ('flac', 's1', 't1', 'mic', 5, 'flac.flac', 50, 60, 10, 'hash-l', 1000, 'committed', NULL, 'flac', 24000, 1),
+        ('incomplete', 's1', NULL, 'mic', 6, 'incomplete.wav', 60, 70, 10, 'hash-i', 1000, 'committed', NULL, 'wav', 24000, 1);
+      PRAGMA user_version = 6;
+    `);
+
+    applyJarvisMigrations(db, { now: () => 200 });
+
+    assert.deepEqual(
+      db
+        .prepare(
+          "SELECT chunk_id FROM processing_jobs WHERE job_type = 'compress_chunk' ORDER BY chunk_id"
+        )
+        .all(),
+      [{ chunk_id: "valid" }]
     );
   } finally {
     db.close();

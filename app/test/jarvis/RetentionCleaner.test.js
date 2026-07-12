@@ -134,9 +134,28 @@ test("promotes the exact 24-hour pre-expiry window even when no bytes are expire
   });
 
   assert.deepEqual(await cleaner.clean(10_000), { deleted: 0, missing: 0, retry: 0 });
-  assert.deepEqual(repository.promoted, [
-    { after: 10_000, before: 10_000 + 24 * 60 * 60 * 1000 },
-  ]);
+  assert.deepEqual(repository.promoted, [{ after: 10_000, before: 10_000 + 24 * 60 * 60 * 1000 }]);
+});
+
+test("retention cleanup asks the shared reader to remove proven stale leases", async () => {
+  const repository = repositoryWith([]);
+  repository.getAudioChunk = (id) => ({ id });
+  const calls = [];
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => [],
+    temporaryEvidenceCleaner: {
+      async cleanupStaleTemporaryEvidence({ getChunk }) {
+        calls.push(getChunk("c1"));
+        return 1;
+      },
+    },
+  });
+
+  await cleaner.clean(10_000);
+
+  assert.deepEqual(calls, [{ id: "c1" }]);
 });
 
 test("surfaces metadata transaction failures without claiming successful cleanup", async () => {
@@ -202,7 +221,13 @@ test("timer start is idempotent, contains async errors, stops, and ignores late 
     deleteBatch: async () => [],
     setIntervalImpl: (callback, intervalMs) => {
       intervalCallback = callback;
-      const timer = { intervalMs, unrefCalled: false, unref() { this.unrefCalled = true; } };
+      const timer = {
+        intervalMs,
+        unrefCalled: false,
+        unref() {
+          this.unrefCalled = true;
+        },
+      };
       intervals.push(timer);
       return timer;
     },

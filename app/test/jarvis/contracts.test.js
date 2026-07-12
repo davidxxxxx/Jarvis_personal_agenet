@@ -147,6 +147,31 @@ test("retention mode IPC validates mode and forwards a sanitized session id", ()
   assert.equal(calls.length, 1);
 });
 
+test("audio read IPC returns a verified playable WAV for authoritative FLAC", async () => {
+  const handlers = new Map();
+  const chunk = { id: "c1", format: "flac", path: "opaque.flac", pcm_sha256: "hash" };
+  const playable = Buffer.from("verified-wav");
+  const calls = [];
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({ getAudioChunk: () => chunk }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    audioEvidenceReader: {
+      async readPlayableWav(input) {
+        calls.push(input);
+        return playable;
+      },
+    },
+  });
+
+  const result = await handlers.get(CHANNELS.readAudioChunk)(null, "c1");
+
+  assert.equal(result, playable);
+  assert.deepEqual(calls, [chunk]);
+});
+
 test("start capture IPC rejects invalid source selections before calling the service", () => {
   let calls = 0;
   const handlers = new Map();

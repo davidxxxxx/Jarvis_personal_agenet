@@ -443,6 +443,8 @@ function initializeCoreManagers() {
         ? path.join(process.resourcesPath, "jarvis-native")
         : path.join(__dirname, "src", "jarvis", "native", "windows"),
     }),
+    artifactCleaner: jarvisService.flacCompressionWorker,
+    temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
   voiceEnrollmentService = new VoiceEnrollmentService({
@@ -484,6 +486,7 @@ function initializeCoreManagers() {
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler: jarvisAnalysisScheduler,
+    audioEvidenceReader: jarvisService.audioEvidenceReader,
   });
 
   const uiLanguage = environmentManager.getUiLanguage();
@@ -1164,10 +1167,7 @@ async function startApp() {
       .downloadModels()
       .then(async () => {
         const vadInitialization = await speechVadClassifier?.initialize();
-        if (
-          vadInitialization?.ok === true &&
-          speechVadClassifier?.isReady?.() === true
-        ) {
+        if (vadInitialization?.ok === true && speechVadClassifier?.isReady?.() === true) {
           jarvisService?.reportVadRecovered(Date.now());
         }
       })

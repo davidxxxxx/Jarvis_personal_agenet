@@ -128,8 +128,6 @@ class CaptureEvidenceStore {
         SELECT * FROM processing_jobs
         WHERE job_type = 'compress_chunk'
           AND chunk_id = @chunkId
-          AND input_hash = @inputHash
-          AND input_version = 1
           AND model_version = @modelVersion
       `),
       getCompressionJob: db.prepare(`
@@ -138,8 +136,7 @@ class CaptureEvidenceStore {
       `),
       listCompressionChunks: db.prepare(`
         SELECT * FROM audio_chunks
-        WHERE deleted_at IS NULL
-          AND EXISTS (
+        WHERE EXISTS (
             SELECT 1 FROM processing_jobs
             WHERE processing_jobs.chunk_id = audio_chunks.id
               AND processing_jobs.job_type = 'compress_chunk'
@@ -164,6 +161,8 @@ class CaptureEvidenceStore {
           AND format = 'wav'
           AND sha256 = @pcmSha256
           AND deleted_at IS NULL
+          AND expires_at > @completedAt
+          AND write_state = 'committed'
       `),
       completeCompressionJob: db.prepare(`
         UPDATE processing_jobs
@@ -176,9 +175,45 @@ class CaptureEvidenceStore {
           AND input_hash = @pcmSha256
           AND model_version = @encoderVersion
       `),
+      rollbackChunkToWav: db.prepare(`
+        UPDATE audio_chunks
+        SET path = @wavPath,
+            format = 'wav',
+            file_sha256 = NULL
+        WHERE id = @chunkId
+          AND path = @flacPath
+          AND format = 'flac'
+          AND sha256 = @pcmSha256
+          AND file_sha256 = @fileSha256
+          AND deleted_at IS NULL
+          AND write_state = 'committed'
+      `),
+      retryCompressionJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry', completed_at = NULL,
+            next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+            error_code = 'flac_authority_invalid_recovered'
+        WHERE id = @jobId
+          AND job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND model_version = @encoderVersion
+      `),
+      failCompressionRecovery: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'failed', error_code = 'flac_authority_invalid',
+            completed_at = @failedAt,
+            next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL
+        WHERE id = @jobId
+          AND job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND model_version = @encoderVersion
+      `),
       tombstoneChunk: db.prepare(`
         UPDATE audio_chunks
-        SET path = 'tombstone:' || id, deleted_at = ?
+        SET retired_path = path,
+            retired_format = format,
+            path = 'tombstone:' || id,
+            deleted_at = ?
         WHERE id = ? AND deleted_at IS NULL
       `),
       expireUnfinishedChunkJobs: db.prepare(`
@@ -274,11 +309,21 @@ class CaptureEvidenceStore {
       const chunk = this.statements.getChunk.get(input.chunkId);
       if (!chunk) throw new Error(`chunk ${input.chunkId} does not exist`);
       if (chunk.deleted_at !== null) throw new Error(`chunk ${input.chunkId} audio is deleted`);
+      if (chunk.expires_at <= input.completedAt) {
+        throw new Error(`chunk ${input.chunkId} audio_expired`);
+      }
       const updated = this.statements.promoteChunkToFlac.run(input);
       if (updated.changes !== 1) throw new Error("WAV authority changed before FLAC commit");
       const completed = this.statements.completeCompressionJob.run(input);
       if (completed.changes !== 1)
         throw new Error("compression job does not match chunk authority");
+      return this._chunkResult(this.statements.getChunk.get(input.chunkId));
+    });
+    this.rollbackChunkToWavTransaction = db.transaction((input) => {
+      const rolledBack = this.statements.rollbackChunkToWav.run(input);
+      if (rolledBack.changes !== 1) throw new Error("FLAC authority changed before WAV rollback");
+      const retried = this.statements.retryCompressionJob.run(input);
+      if (retried.changes !== 1) throw new Error("compression job cannot be restored for retry");
       return this._chunkResult(this.statements.getChunk.get(input.chunkId));
     });
     this.interruptTrackTransaction = db.transaction(
@@ -601,6 +646,16 @@ class CaptureEvidenceStore {
     return this.promoteChunkToFlacTransaction(input);
   }
 
+  rollbackChunkToWav(input) {
+    return this.rollbackChunkToWavTransaction(input);
+  }
+
+  markCompressionRecoveryFailure(input) {
+    const failed = this.statements.failCompressionRecovery.run(input);
+    if (failed.changes !== 1) throw new Error("compression recovery failure was not recorded");
+    return this.getCompressionJob(input.jobId);
+  }
+
   getCompressionJob(id) {
     this._assertIdentifier(id, "compressionJobId");
     return this.statements.getCompressionJob.get(id) ?? null;
@@ -669,6 +724,8 @@ class CaptureEvidenceStore {
       format: row.format ?? "wav",
       pcm_sha256: row.sha256,
       file_sha256: row.file_sha256 ?? null,
+      retired_path: row.retired_path ?? null,
+      retired_format: row.retired_format ?? null,
       sample_rate: row.sample_rate ?? 24_000,
       channels: row.channels ?? 1,
     };

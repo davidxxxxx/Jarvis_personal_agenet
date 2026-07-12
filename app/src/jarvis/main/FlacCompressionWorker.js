@@ -71,6 +71,7 @@ class FlacCompressionWorker {
     fsImpl = fs.promises,
     now = Date.now,
     faultInjector = () => {},
+    onRecoveryError = () => {},
   }) {
     if (!store || typeof store.getChunk !== "function") {
       throw new TypeError("store.getChunk must be a function");
@@ -94,6 +95,11 @@ class FlacCompressionWorker {
     this.fs = fsImpl;
     this.now = now;
     this.faultInjector = faultInjector;
+    if (typeof onRecoveryError !== "function") {
+      throw new TypeError("onRecoveryError must be a function");
+    }
+    this.onRecoveryError = onRecoveryError;
+    this.fixedRoot = null;
   }
 
   async run(job) {
@@ -102,12 +108,12 @@ class FlacCompressionWorker {
     if (persistedJob) normalizedJob = this._job(persistedJob);
     const chunk = this.store.getChunk(normalizedJob.chunkId);
     if (!chunk) throw new Error(`chunk ${normalizedJob.chunkId} does not exist`);
+    if (normalizedJob.state === "completed") {
+      return { chunk, replayed: true };
+    }
     if (chunk.deleted_at !== null) throw new Error("audio_deleted");
     if (chunk.expires_at <= this.now()) throw new Error("audio_expired");
     if (chunk.pcm_sha256 !== normalizedJob.inputHash) throw new Error("pcm_hash_mismatch");
-    if (chunk.format === "flac" && normalizedJob.state === "completed") {
-      return { chunk, replayed: true };
-    }
     if (chunk.format !== "wav") throw new Error("chunk_not_authoritative_wav");
 
     const wavPath = this._contained(chunk.path);
@@ -121,6 +127,9 @@ class FlacCompressionWorker {
     const sourcePcm = await this.reader.readVerifiedPcm(chunk);
     this._assertMetadata(sourcePcm, chunk);
 
+    let renamedFinal = false;
+    let promotedAuthority = false;
+    let fileSha256 = null;
     try {
       await this.encoder.encode(wavPath, partialPath);
       await this._assertSafeExistingFile(partialPath);
@@ -140,10 +149,16 @@ class FlacCompressionWorker {
         throw new Error("duration_mismatch");
       }
       const encodedBytes = await this.fs.readFile(partialPath);
-      const fileSha256 = crypto.createHash("sha256").update(encodedBytes).digest("hex");
+      fileSha256 = crypto.createHash("sha256").update(encodedBytes).digest("hex");
       await this._injectFault("before_rename");
       await this.fs.rename(partialPath, flacPath);
+      renamedFinal = true;
       await this._injectFault("after_rename");
+      await this._assertSafeExistingFile(flacPath);
+      const promotedBytes = await this.fs.readFile(flacPath);
+      if (crypto.createHash("sha256").update(promotedBytes).digest("hex") !== fileSha256) {
+        throw new Error("audio evidence file hash changed before promotion");
+      }
       const promoted = this.store.promoteChunkToFlac({
         chunkId: chunk.id,
         jobId: normalizedJob.id,
@@ -156,6 +171,7 @@ class FlacCompressionWorker {
         channels: chunk.channels,
         completedAt: this.now(),
       });
+      promotedAuthority = true;
       await this._injectFault("before_wav_delete");
       await this._assertSafeExistingFile(wavPath);
       await this.fs.unlink(wavPath);
@@ -163,9 +179,12 @@ class FlacCompressionWorker {
     } catch (error) {
       if (!error.flacCrashPoint) {
         try {
-          await this.fs.unlink(partialPath);
+          await this._safeUnlink(partialPath);
         } catch (cleanupError) {
           if (cleanupError?.code !== "ENOENT") throw cleanupError;
+        }
+        if (renamedFinal && !promotedAuthority) {
+          await this._removeUnownedFinal(chunk.id, flacPath, fileSha256);
         }
       }
       throw error;
@@ -210,18 +229,100 @@ class FlacCompressionWorker {
     const result = { promoted: 0, deletedWavs: 0, removedInvalid: 0, rolledBack: 0 };
     for (const candidate of this.store.listCompressionRecoveryCandidates()) {
       const { chunk, job } = candidate;
-      if (!job || chunk.deleted_at !== null || chunk.expires_at <= this.now()) continue;
+      if (!job) continue;
       try {
+        if (chunk.deleted_at !== null || chunk.expires_at <= this.now()) {
+          result.removedInvalid += await this.cleanupRetiredChunk(chunk, this.now());
+          continue;
+        }
         if (chunk.format === "wav") {
           await this._recoverWav(chunk, this._job(job), result);
         } else if (chunk.format === "flac") {
-          await this._recoverFlac(chunk, result);
+          await this._recoverFlac(chunk, this._job(job), result);
         }
       } catch {
-        // One inaccessible artifact must not block independent authoritative rows.
+        try {
+          this.onRecoveryError({
+            chunkId: chunk.id,
+            jobId: job.id,
+            code: "flac_recovery_failed",
+          });
+        } catch {
+          // Recovery telemetry must not block independent authoritative rows.
+        }
       }
     }
     return result;
+  }
+
+  async cleanupRetiredChunk(chunk, at = this.now()) {
+    if (!chunk || typeof chunk !== "object") throw new TypeError("chunk is required");
+    await this._validatedRoot();
+    const current = this.store.getChunk(chunk.id);
+    if (!current) return 0;
+    if (current.deleted_at === null && current.expires_at > at) return 0;
+    const authorityPath =
+      current.deleted_at === null
+        ? current.path
+        : (current.retired_path ?? chunk.retired_path ?? chunk.path);
+    if (typeof authorityPath !== "string" || !path.isAbsolute(authorityPath)) return 0;
+    const parsed = path.parse(this._contained(authorityPath));
+    const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
+    const flacPath = this._contained(path.join(parsed.dir, `${parsed.name}.flac`));
+    let removed = 0;
+    for (const candidate of [`${flacPath}.partial`, `${flacPath}.tmp`]) {
+      if (await this._exists(candidate)) {
+        await this._safeUnlink(candidate);
+        removed += 1;
+      }
+    }
+    const retiredFormat = current.retired_format ?? current.format;
+    if (retiredFormat === "wav" && (await this._exists(flacPath))) {
+      try {
+        const encodedPcm = await this.reader.readVerifiedPcm({
+          ...current,
+          path: flacPath,
+          format: "flac",
+        });
+        this._assertMetadata(encodedPcm, current);
+        await this._safeUnlink(flacPath);
+        removed += 1;
+      } catch {
+        // Preserve an artifact that cannot be proven to belong to this evidence row.
+      }
+    }
+    if (retiredFormat === "flac" && (await this._exists(wavPath))) {
+      try {
+        const wavPcm = await this.reader.readVerifiedPcm({
+          ...current,
+          path: wavPath,
+          format: "wav",
+        });
+        this._assertMetadata(wavPcm, current);
+        await this._safeUnlink(wavPath);
+        removed += 1;
+      } catch {
+        // Preserve an artifact that cannot be proven to belong to this evidence row.
+      }
+    }
+    return removed;
+  }
+
+  async _removeUnownedFinal(chunkId, flacPath, expectedFileHash) {
+    const current = this.store.getChunk(chunkId);
+    if (current?.format === "flac" && path.resolve(current.path) === path.resolve(flacPath)) return;
+    if (!(await this._exists(flacPath))) return;
+    await this._safeUnlink(flacPath, expectedFileHash);
+  }
+
+  async _safeUnlink(candidate, expectedFileHash = null) {
+    const safe = await this._assertSafeExistingFile(candidate);
+    if (expectedFileHash) {
+      const bytes = await this.fs.readFile(safe);
+      const actual = crypto.createHash("sha256").update(bytes).digest("hex");
+      if (actual !== expectedFileHash) throw new Error("audio evidence file hash changed");
+    }
+    await this.fs.unlink(safe);
   }
 
   async _recoverWav(chunk, job, result) {
@@ -241,20 +342,20 @@ class FlacCompressionWorker {
     }
 
     if (await this._exists(temporaryPath)) {
-      await this.fs.unlink(temporaryPath);
+      await this._safeUnlink(temporaryPath);
       result.removedInvalid += 1;
     }
     if (await this._exists(partialPath)) {
       try {
         await this._verifiedFlac(chunk, sourcePcm, partialPath);
         if (await this._exists(flacPath)) {
-          await this.fs.unlink(partialPath);
+          await this._safeUnlink(partialPath);
           result.removedInvalid += 1;
         } else {
           await this.fs.rename(partialPath, flacPath);
         }
       } catch {
-        await this.fs.unlink(partialPath);
+        await this._safeUnlink(partialPath);
         result.removedInvalid += 1;
       }
     }
@@ -264,7 +365,7 @@ class FlacCompressionWorker {
     try {
       verified = await this._verifiedFlac(chunk, sourcePcm, flacPath);
     } catch {
-      await this.fs.unlink(flacPath);
+      await this._safeUnlink(flacPath);
       result.rolledBack += 1;
       return;
     }
@@ -282,20 +383,23 @@ class FlacCompressionWorker {
     });
     if (promoted.format !== "flac") throw new Error("FLAC recovery did not switch authority");
     result.promoted += 1;
-    await this.fs.unlink(wavPath);
+    await this._safeUnlink(wavPath);
   }
 
-  async _recoverFlac(chunk, result) {
+  async _recoverFlac(chunk, job, result) {
     const flacPath = this._contained(chunk.path);
     let authoritativePcm;
     try {
       await this._assertSafeExistingFile(flacPath);
       const fileBytes = await this.fs.readFile(flacPath);
       const fileSha256 = crypto.createHash("sha256").update(fileBytes).digest("hex");
-      if (chunk.file_sha256 && fileSha256 !== chunk.file_sha256) return;
+      if (chunk.file_sha256 && fileSha256 !== chunk.file_sha256) {
+        throw new Error("file_hash_mismatch");
+      }
       authoritativePcm = await this.reader.readVerifiedPcm(chunk);
       this._assertMetadata(authoritativePcm, chunk);
     } catch {
+      await this._recoverInvalidFlacAuthority(chunk, job, flacPath, result);
       return;
     }
 
@@ -303,7 +407,7 @@ class FlacCompressionWorker {
     for (const suffix of [".partial", ".tmp"]) {
       const candidate = `${flacPath}${suffix}`;
       if (await this._exists(candidate)) {
-        await this.fs.unlink(candidate);
+        await this._safeUnlink(candidate);
         result.removedInvalid += 1;
       }
     }
@@ -314,14 +418,44 @@ class FlacCompressionWorker {
       this._assertMetadata(wavPcm, chunk);
       if (Math.abs(wavPcm.sampleCount - authoritativePcm.sampleCount) > 1) return;
       await this._assertSafeExistingFile(wavPath);
-      await this.fs.unlink(wavPath);
+      await this._safeUnlink(wavPath);
       result.deletedWavs += 1;
     } catch {
       // A conflicting non-authoritative file is preserved for diagnosis.
     }
   }
 
+  async _recoverInvalidFlacAuthority(chunk, job, flacPath, result) {
+    const parsed = path.parse(flacPath);
+    const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
+    try {
+      await this._assertSafeExistingFile(wavPath);
+      const wavPcm = await this.reader.readVerifiedPcm({ ...chunk, path: wavPath, format: "wav" });
+      this._assertMetadata(wavPcm, chunk);
+      const rolledBack = this.store.rollbackChunkToWav({
+        chunkId: chunk.id,
+        jobId: job.id,
+        encoderVersion: job.encoderVersion,
+        pcmSha256: chunk.pcm_sha256,
+        flacPath,
+        wavPath,
+        fileSha256: chunk.file_sha256,
+      });
+      if (rolledBack.format !== "wav") throw new Error("WAV authority rollback failed");
+      result.rolledBack += 1;
+    } catch (error) {
+      if (error?.message === "WAV authority rollback failed") throw error;
+      this.store.markCompressionRecoveryFailure({
+        chunkId: chunk.id,
+        jobId: job.id,
+        encoderVersion: job.encoderVersion,
+        failedAt: this.now(),
+      });
+    }
+  }
+
   async _verifiedFlac(chunk, sourcePcm, candidatePath) {
+    await this._assertSafeExistingFile(candidatePath);
     const encodedPcm = await this.reader.readVerifiedPcm({
       ...chunk,
       path: candidatePath,
@@ -338,7 +472,9 @@ class FlacCompressionWorker {
   async _exists(candidate) {
     try {
       const stat = await this.fs.lstat(candidate);
-      return stat.isFile() && !stat.isSymbolicLink();
+      return (
+        stat.isFile() && !stat.isSymbolicLink() && (stat.nlink === undefined || stat.nlink === 1)
+      );
     } catch (error) {
       if (error?.code === "ENOENT") return false;
       throw error;
@@ -358,11 +494,11 @@ class FlacCompressionWorker {
   async _assertSafeExistingFile(candidate) {
     const resolved = this._contained(candidate);
     const stat = await this.fs.lstat(resolved);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error("audio evidence path is not a regular file or is a symbolic link");
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.nlink !== undefined && stat.nlink !== 1)) {
+      throw new Error("audio evidence path must be a single-link regular file");
     }
     const [rootReal, candidateReal] = await Promise.all([
-      this.fs.realpath(this.recordingsRoot),
+      this._validatedRoot(),
       this.fs.realpath(resolved),
     ]);
     if (!this._isContained(rootReal, candidateReal)) {
@@ -379,7 +515,7 @@ class FlacCompressionWorker {
       throw new Error("audio evidence target parent is a symbolic link");
     }
     const [rootReal, parentReal] = await Promise.all([
-      this.fs.realpath(this.recordingsRoot),
+      this._validatedRoot(),
       this.fs.realpath(parent),
     ]);
     if (!this._isContained(rootReal, parentReal, true)) {
@@ -395,6 +531,28 @@ class FlacCompressionWorker {
       if (error?.code !== "ENOENT") throw error;
     }
     return resolved;
+  }
+
+  async _validatedRoot() {
+    const stat = await this.fs.lstat(this.recordingsRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("recordings root must be a real directory, not a junction or symbolic link");
+    }
+    const real = await this.fs.realpath(this.recordingsRoot);
+    const identity = {
+      real,
+      dev: stat.dev,
+      ino: stat.ino,
+    };
+    if (this.fixedRoot === null) this.fixedRoot = identity;
+    if (
+      this.fixedRoot.real !== identity.real ||
+      (this.fixedRoot.dev !== undefined && identity.dev !== this.fixedRoot.dev) ||
+      (this.fixedRoot.ino !== undefined && identity.ino !== this.fixedRoot.ino)
+    ) {
+      throw new Error("recordings root identity changed");
+    }
+    return this.fixedRoot.real;
   }
 
   _contained(candidate) {

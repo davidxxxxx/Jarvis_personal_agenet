@@ -8,9 +8,11 @@ const Database = require("better-sqlite3");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader");
+const { parsePcmWav } = require("../../src/jarvis/main/AudioEvidenceReader");
 const FlacCompressionWorker = require("../../src/jarvis/main/FlacCompressionWorker");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
+const RetentionCleaner = require("../../src/jarvis/main/RetentionCleaner");
 const { getFFmpegPath } = require("../../src/helpers/ffmpegUtils");
 
 const SAMPLE_RATE = 24_000;
@@ -188,6 +190,23 @@ test("completed compression replay is a no-op", async (t) => {
   assert.deepEqual(replay.chunk, first.chunk);
 });
 
+for (const retired of ["expired", "tombstoned"]) {
+  test(`completed compression replay is an immediate no-op when audio is ${retired}`, async (t) => {
+    const { db, store, worker, job } = fixture(t);
+    const first = await worker.run(job);
+    if (retired === "expired") {
+      db.prepare("UPDATE audio_chunks SET expires_at = 100 WHERE id = 'c1'").run();
+    } else {
+      store.tombstoneChunk("c1", 100);
+    }
+
+    const replay = await worker.run(job);
+
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.chunk.id, first.chunk.id);
+  });
+}
+
 test("startup completes a verified partial left by a crash before rename", async (t) => {
   const { store, wavPath, makeWorker, job } = fixture(t);
   const worker = makeWorker({
@@ -246,6 +265,119 @@ test("startup finishes WAV cleanup after authority transaction crash", async (t)
   assert.equal(recovered.deletedWavs, 1);
   assert.equal(fs.existsSync(wavPath), false);
   assert.equal(store.getChunk("c1").format, "flac");
+});
+
+for (const damage of ["missing", "corrupt"]) {
+  test(`startup rolls ${damage} authoritative FLAC back to a verified WAV and retries`, async (t) => {
+    const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
+    const compressed = await worker.run(job);
+    fs.writeFileSync(wavPath, wavFor(pcm));
+    if (damage === "missing") fs.unlinkSync(compressed.chunk.path);
+    else fs.writeFileSync(compressed.chunk.path, "corrupt-flac");
+
+    const recovered = await makeWorker().recoverStartup();
+
+    const chunk = store.getChunk("c1");
+    const retried = db
+      .prepare("SELECT state, completed_at, error_code FROM processing_jobs WHERE id = ?")
+      .get(job.id);
+    assert.equal(chunk.format, "wav");
+    assert.equal(chunk.path, wavPath);
+    assert.deepEqual(retried, {
+      state: "retry",
+      completed_at: null,
+      error_code: "flac_authority_invalid_recovered",
+    });
+    assert.equal(recovered.rolledBack, 1);
+  });
+}
+
+test("startup records a diagnostic failure when neither FLAC nor sibling WAV is valid", async (t) => {
+  const { db, store, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  fs.writeFileSync(compressed.chunk.path, "corrupt-flac");
+
+  await makeWorker().recoverStartup();
+
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+    { state: "failed", error_code: "flac_authority_invalid" }
+  );
+});
+
+test("promotion rejection after retention wins removes the renamed non-authoritative FLAC", async (t) => {
+  const { root, db, store, wavPath, makeWorker, job } = fixture(t);
+  let clock = 100;
+  let worker;
+  const repository = {
+    promoteSoonExpiringAudioJobs: () => 0,
+    listExpiredAudioChunks: (at) =>
+      db.prepare("SELECT * FROM audio_chunks WHERE expires_at <= ? AND deleted_at IS NULL").all(at),
+    tombstoneChunk: (id, at) => store.tombstoneChunk(id, at),
+  };
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: root,
+    deleteBatch: async (_root, paths) => {
+      await Promise.all(paths.map((candidate) => fs.promises.unlink(candidate)));
+      return paths.map(() => ({ status: "deleted" }));
+    },
+    artifactCleaner: {
+      cleanupRetiredChunk: (chunk, at) => worker.cleanupRetiredChunk(chunk, at),
+    },
+  });
+  db.prepare("UPDATE audio_chunks SET expires_at = 200 WHERE id = 'c1'").run();
+  worker = makeWorker({
+    now: () => clock,
+    async faultInjector(point) {
+      if (point !== "after_rename") return;
+      clock = 200;
+      await cleaner.clean(clock);
+    },
+  });
+
+  await assert.rejects(worker.run(job), /audio is deleted|authority changed|audio_expired|ENOENT/);
+
+  assert.equal(store.getChunk("c1").deleted_at, 200);
+  assert.equal(fs.existsSync(wavPath.replace(/\.wav$/, ".flac")), false);
+});
+
+test("startup removes a verified orphan final FLAC after a rename crash later expires", async (t) => {
+  const { db, store, wavPath, makeWorker, job } = fixture(t);
+  const crashing = makeWorker({
+    faultInjector(point) {
+      if (point === "after_rename") throw new Error("simulated rename crash");
+    },
+  });
+  await assert.rejects(crashing.run(job), /simulated rename crash/);
+  const flacPath = wavPath.replace(/\.wav$/, ".flac");
+  db.prepare("UPDATE audio_chunks SET expires_at = 200 WHERE id = 'c1'").run();
+
+  const recovered = await makeWorker({ now: () => 200 }).recoverStartup();
+
+  assert.equal(store.getChunk("c1").format, "wav");
+  assert.equal(fs.existsSync(wavPath), true);
+  assert.equal(fs.existsSync(flacPath), false);
+  assert.equal(recovered.removedInvalid, 1);
+});
+
+test("startup uses retired database authority to clean a tombstoned rename-crash FLAC", async (t) => {
+  const { store, wavPath, makeWorker, job } = fixture(t);
+  const crashing = makeWorker({
+    faultInjector(point) {
+      if (point === "after_rename") throw new Error("simulated rename crash");
+    },
+  });
+  await assert.rejects(crashing.run(job), /simulated rename crash/);
+  const flacPath = wavPath.replace(/\.wav$/, ".flac");
+  store.tombstoneChunk("c1", 200);
+  fs.rmSync(wavPath, { force: true });
+
+  const recovered = await makeWorker({ now: () => 200 }).recoverStartup();
+
+  assert.equal(fs.existsSync(flacPath), false);
+  assert.equal(recovered.removedInvalid, 1);
 });
 
 test("startup removes invalid partial and temporary FLAC files", async (t) => {
@@ -313,7 +445,12 @@ test("startup continues with valid siblings after one cleanup operation fails", 
     }
     return fs.promises.unlink(candidate);
   };
-  const worker = makeWorker({ fsImpl, reader });
+  const recoveryErrors = [];
+  const worker = makeWorker({
+    fsImpl,
+    reader,
+    onRecoveryError: (entry) => recoveryErrors.push(entry),
+  });
 
   await worker.recoverStartup();
 
@@ -327,10 +464,15 @@ test("startup continues with valid siblings after one cleanup operation fails", 
       .get().state,
     "completed"
   );
+  assert.deepEqual(recoveryErrors, [
+    { chunkId: "c1", jobId: "job-2", code: "flac_recovery_failed" },
+  ]);
+  assert.deepEqual(Object.keys(recoveryErrors[0]).sort(), ["chunkId", "code", "jobId"]);
 });
 
 test("a leased transcription reads a verified temporary WAV across authority switch", async (t) => {
-  const { store, wavPath, pcm, reader, worker, job } = fixture(t);
+  const { root, store, wavPath, pcm, codec, worker, job } = fixture(t);
+  const reader = new AudioEvidenceReader({ decoder: codec, recordingsRoot: root });
   let releaseConsume;
   let signalReady;
   const ready = new Promise((resolve) => {
@@ -356,6 +498,41 @@ test("a leased transcription reads a verified temporary WAV across authority swi
   const leasedWav = await consuming;
   assert.deepEqual(parseWav(leasedWav).bytes, pcm);
   assert.equal(fs.existsSync(leasedPath), false);
+});
+
+test("startup removes only proven stale WAV leases inside the controlled direct child", async (t) => {
+  const { root, store, codec } = fixture(t);
+  const crashedReader = new AudioEvidenceReader({ decoder: codec, recordingsRoot: root });
+  let leasePath;
+  let signalLease;
+  let releaseLease;
+  const leased = new Promise((resolve) => {
+    signalLease = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseLease = resolve;
+  });
+  const abandoned = crashedReader.withVerifiedWav(store.getChunk("c1"), async (candidate) => {
+    leasePath = candidate;
+    signalLease();
+    await release;
+  });
+  await leased;
+  const outside = path.join(root, "do-not-delete.wav");
+  fs.writeFileSync(outside, "unrelated");
+  const startupReader = new AudioEvidenceReader({ decoder: codec, recordingsRoot: root });
+
+  const removed = await startupReader.cleanupStaleTemporaryEvidence({
+    getChunk: (id) => store.getChunk(id),
+  });
+
+  assert.equal(removed, 1);
+  assert.equal(fs.existsSync(leasePath), false);
+  assert.equal(fs.existsSync(outside), true);
+  assert.equal(path.dirname(path.dirname(leasePath)), root);
+  assert.equal(path.basename(path.dirname(leasePath)), ".evidence-tmp");
+  releaseLease();
+  await abandoned;
 });
 
 test("readPlayableWav supports legacy committed rows that expose only sha256", async (t) => {
@@ -559,6 +736,41 @@ test("JarvisService starts and exposes asynchronous FLAC startup recovery", asyn
   assert.equal(compression.promoted, 1);
 });
 
+test("JarvisService cleans stale verified WAV leases before FLAC startup recovery", async (t) => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-lease-recovery-"));
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => {
+    repository.close();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  });
+  const calls = [];
+  const audioEvidenceReader = {
+    async cleanupStaleTemporaryEvidence({ getChunk }) {
+      calls.push("leases");
+      assert.equal(typeof getChunk, "function");
+      return 1;
+    },
+  };
+  const flacCompressionWorker = {
+    async recoverStartup() {
+      calls.push("flac");
+      return { promoted: 0, deletedWavs: 0, removedInvalid: 0, rolledBack: 0 };
+    },
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    audioEvidenceReader,
+    flacCompressionWorker,
+  });
+
+  service.recoverOpenSessions(100);
+  await service.waitForCompressionRecovery();
+
+  assert.deepEqual(calls, ["leases", "flac"]);
+});
+
 test("rejects committed chunks whose evidence format does not match 24 kHz mono WAV", (t) => {
   const { root, store } = fixture(t);
   for (const invalid of [
@@ -626,6 +838,89 @@ test("rejects a junction that redirects an authoritative path outside recordings
   assert.equal(fs.existsSync(path.join(outsideDir, "speech.wav")), true);
 });
 
+test("rejects a recordings root that is itself a junction", async (t) => {
+  const { root, db, store, codec, reader, wavPath } = fixture(t);
+  const junctionRoot = `${root}-junction`;
+  t.after(() => fs.rmSync(junctionRoot, { recursive: true, force: true }));
+  try {
+    fs.symlinkSync(root, junctionRoot, "junction");
+  } catch (error) {
+    t.skip(`root junction unavailable: ${error.code}`);
+    return;
+  }
+  db.prepare("UPDATE audio_chunks SET path = ? WHERE id = 'c1'").run(
+    path.join(junctionRoot, "speech.wav")
+  );
+  const flacPath = path.join(junctionRoot, "speech.flac");
+  await codec.encode(wavPath, path.join(root, "speech.flac"));
+  db.prepare("UPDATE audio_chunks SET expires_at = 100 WHERE id = 'c1'").run();
+  const worker = new FlacCompressionWorker({
+    store,
+    recordingsRoot: junctionRoot,
+    encoder: codec,
+    reader,
+    now: () => 100,
+  });
+
+  await assert.rejects(
+    worker.cleanupRetiredChunk(store.getChunk("c1"), 100),
+    /recordings root|symbolic link|junction/
+  );
+  assert.equal(fs.existsSync(flacPath), true);
+});
+
+test("rejects a hard-linked authoritative WAV", async (t) => {
+  const { wavPath, worker, job } = fixture(t);
+  const outside = path.join(os.tmpdir(), `jarvis-authority-link-${crypto.randomUUID()}.wav`);
+  t.after(() => fs.rmSync(outside, { force: true }));
+  try {
+    fs.linkSync(wavPath, outside);
+  } catch (error) {
+    t.skip(`hard link unavailable: ${error.code}`);
+    return;
+  }
+
+  await assert.rejects(worker.run(job), /single-link|hard link/);
+
+  assert.equal(fs.existsSync(outside), true);
+});
+
+test("playable reader rejects a hard-linked authoritative file before decoding", async (t) => {
+  const { root, store, codec, wavPath } = fixture(t);
+  const outside = path.join(os.tmpdir(), `jarvis-reader-link-${crypto.randomUUID()}.wav`);
+  t.after(() => fs.rmSync(outside, { force: true }));
+  try {
+    fs.linkSync(wavPath, outside);
+  } catch (error) {
+    t.skip(`hard link unavailable: ${error.code}`);
+    return;
+  }
+  const reader = new AudioEvidenceReader({ decoder: codec, recordingsRoot: root });
+
+  await assert.rejects(reader.readPlayableWav(store.getChunk("c1")), /single-link|hard link/);
+});
+
+test("WAV parser rejects RIFF and data chunks that declare bytes beyond the file", () => {
+  const pcm = Buffer.alloc(100, 1);
+  const truncatedRiff = wavFor(pcm);
+  truncatedRiff.writeUInt32LE(truncatedRiff.length + 100, 4);
+  assert.throws(() => parsePcmWav(truncatedRiff), /invalid_pcm_wav/);
+
+  const truncatedData = wavFor(pcm);
+  truncatedData.writeUInt32LE(pcm.length + 2, 40);
+  assert.throws(() => parsePcmWav(truncatedData), /invalid_pcm_wav/);
+
+  const missingPadding = Buffer.concat([
+    Buffer.from("RIFF"),
+    Buffer.alloc(4),
+    Buffer.from("WAVEJUNK"),
+    Buffer.from([1, 0, 0, 0, 7]),
+    wavFor(pcm).subarray(12),
+  ]);
+  missingPadding.writeUInt32LE(missingPadding.length - 8, 4);
+  assert.throws(() => parsePcmWav(missingPadding), /invalid_pcm_wav/);
+});
+
 test("refuses a pre-existing partial hard link instead of overwriting external evidence", async (t) => {
   const { wavPath, worker, job } = fixture(t);
   const outside = path.join(os.tmpdir(), `jarvis-flac-target-${crypto.randomUUID()}`);
@@ -634,7 +929,7 @@ test("refuses a pre-existing partial hard link instead of overwriting external e
   t.after(() => fs.rmSync(outside, { force: true }));
   fs.linkSync(outside, partialPath);
 
-  await assert.rejects(worker.run(job), /partial_already_exists/);
+  await assert.rejects(worker.run(job), /partial_already_exists|single-link/);
 
   assert.equal(fs.readFileSync(outside, "utf8"), "preserve-me");
 });

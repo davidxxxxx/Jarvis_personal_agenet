@@ -72,11 +72,7 @@ function normalizeSourceInterruption(input) {
 }
 
 function normalizeSourceRestoration(input) {
-  assertExactKeys(
-    input,
-    ["at", "deviceId", "deviceLabel", "strategy"],
-    "source restoration"
-  );
+  assertExactKeys(input, ["at", "deviceId", "deviceLabel", "strategy"], "source restoration");
   return {
     at: assertLifecycleTime(input.at),
     deviceId: assertLifecycleString(input.deviceId, "source deviceId", 512, {
@@ -98,6 +94,7 @@ function registerJarvisIpc({
   voiceEnrollmentService,
   environmentManager,
   analysisScheduler,
+  audioEvidenceReader,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -174,6 +171,7 @@ function registerJarvisIpc({
     const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
     if (!chunk) return null;
     try {
+      if (audioEvidenceReader) return await audioEvidenceReader.readPlayableWav(chunk);
       return await fs.readFile(chunk.path);
     } catch (error) {
       if (error?.code === "ENOENT") return null;
@@ -238,11 +236,7 @@ function registerJarvisIpc({
     service.startCapture(normalizeCaptureStartInput(input))
   );
   ipcMain.handle(CHANNELS.setRetentionMode, (_event, id, retentionMode, at) =>
-    service.setRetentionMode(
-      assertId(id, "sessionId"),
-      assertRetentionMode(retentionMode),
-      at
-    )
+    service.setRetentionMode(assertId(id, "sessionId"), assertRetentionMode(retentionMode), at)
   );
   ipcMain.handle(CHANNELS.sourceInterrupted, (_event, id, sourceType, input) =>
     service.sourceInterrupted(

@@ -1,4 +1,4 @@
-const TARGET_VERSION = 6;
+const TARGET_VERSION = 7;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -26,7 +26,10 @@ const PROCESSING_JOBS_SCHEMA = `
 const PROCESSING_JOBS_INDEXES = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_chunk_input
   ON processing_jobs(job_type, chunk_id, input_hash, input_version, model_version)
-  WHERE chunk_id IS NOT NULL;
+  WHERE chunk_id IS NOT NULL AND job_type <> 'compress_chunk';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_compress_identity
+  ON processing_jobs(chunk_id, model_version)
+  WHERE chunk_id IS NOT NULL AND job_type = 'compress_chunk';
   CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_global_input
   ON processing_jobs(job_type, input_hash, input_version, model_version)
   WHERE chunk_id IS NULL;
@@ -67,7 +70,9 @@ const MIGRATION_BASE_SCHEMA = `
     format TEXT NOT NULL DEFAULT 'wav',
     file_sha256 TEXT,
     sample_rate INTEGER NOT NULL DEFAULT 24000,
-    channels INTEGER NOT NULL DEFAULT 1
+    channels INTEGER NOT NULL DEFAULT 1,
+    retired_path TEXT,
+    retired_format TEXT
   );
 `;
 
@@ -110,6 +115,49 @@ function rebuildLegacyProcessingJobs(db) {
   `);
 }
 
+function deduplicateCompressionJobs(db) {
+  const groups = db
+    .prepare(
+      `SELECT chunk_id, model_version
+       FROM processing_jobs
+       WHERE job_type = 'compress_chunk' AND chunk_id IS NOT NULL
+       GROUP BY chunk_id, model_version
+       HAVING count(*) > 1
+       ORDER BY chunk_id, model_version`
+    )
+    .all();
+  const list = db.prepare(
+    `SELECT * FROM processing_jobs
+     WHERE job_type = 'compress_chunk' AND chunk_id = ? AND model_version = ?`
+  );
+  const update = db.prepare(
+    `UPDATE processing_jobs
+     SET attempt_count = ?, error_code = ?
+     WHERE id = ?`
+  );
+  const remove = db.prepare("DELETE FROM processing_jobs WHERE id = ?");
+  const terminalRank = (job) => {
+    if (job.state === "completed") return 0;
+    if (["failed", "cancelled", "audio_expired_before_processing"].includes(job.state)) return 1;
+    return 2;
+  };
+  for (const group of groups) {
+    const jobs = list.all(group.chunk_id, group.model_version).sort((left, right) => {
+      const rank = terminalRank(left) - terminalRank(right);
+      if (rank !== 0) return rank;
+      const completion = (right.completed_at ?? -1) - (left.completed_at ?? -1);
+      if (completion !== 0) return completion;
+      const created = right.created_at - left.created_at;
+      return created !== 0 ? created : left.id.localeCompare(right.id);
+    });
+    const keeper = jobs[0];
+    const attemptCount = Math.max(...jobs.map((job) => job.attempt_count));
+    const diagnostic = jobs.find((job) => job.error_code !== null)?.error_code ?? null;
+    update.run(attemptCount, keeper.error_code ?? diagnostic, keeper.id);
+    for (const duplicate of jobs.slice(1)) remove.run(duplicate.id);
+  }
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -142,6 +190,8 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "audio_chunks", "file_sha256 TEXT");
     addColumn(db, "audio_chunks", "sample_rate INTEGER NOT NULL DEFAULT 24000");
     addColumn(db, "audio_chunks", "channels INTEGER NOT NULL DEFAULT 1");
+    addColumn(db, "audio_chunks", "retired_path TEXT");
+    addColumn(db, "audio_chunks", "retired_format TEXT");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS audio_tracks (
@@ -179,6 +229,11 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "audio_gaps", "peak_level REAL");
     db.exec(PROCESSING_JOBS_SCHEMA);
     rebuildLegacyProcessingJobs(db);
+    deduplicateCompressionJobs(db);
+    db.exec(`
+      DROP INDEX IF EXISTS idx_processing_jobs_chunk_input;
+      DROP INDEX IF EXISTS idx_processing_jobs_compress_identity;
+    `);
     db.exec(PROCESSING_JOBS_INDEXES);
     db.prepare(
       `INSERT OR IGNORE INTO processing_jobs (
@@ -190,7 +245,16 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         session_id, track_id, id, 'compress_chunk', 'pending',
         sha256, 1, ?, ?
       FROM audio_chunks
-      WHERE deleted_at IS NULL AND format = 'wav' AND expires_at > ?`
+      WHERE deleted_at IS NULL
+        AND expires_at > ?
+        AND format = 'wav'
+        AND write_state = 'committed'
+        AND track_id IS NOT NULL
+        AND length(path) > 0
+        AND length(sha256) > 0
+        AND duration_ms > 0
+        AND sample_rate = 24000
+        AND channels = 1`
     ).run(FLAC_ENCODER_VERSION, migratedAt, migratedAt);
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence

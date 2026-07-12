@@ -9,6 +9,8 @@ class RetentionCleaner {
     repository,
     recordingsRoot,
     deleteBatch = createSafeRecordingDelete(),
+    artifactCleaner = null,
+    temporaryEvidenceCleaner = null,
     now = Date.now,
     log = () => {},
     setIntervalImpl = setInterval,
@@ -33,6 +35,8 @@ class RetentionCleaner {
     this.repository = repository;
     this.recordingsRoot = path.resolve(recordingsRoot);
     this.deleteBatch = deleteBatch;
+    this.artifactCleaner = artifactCleaner;
+    this.temporaryEvidenceCleaner = temporaryEvidenceCleaner;
     this.now = now;
     this.log = log;
     this.setInterval = setIntervalImpl;
@@ -49,6 +53,11 @@ class RetentionCleaner {
       const counts = { deleted: 0, retry: 0, missing: 0 };
       let expired;
       try {
+        if (typeof this.temporaryEvidenceCleaner?.cleanupStaleTemporaryEvidence === "function") {
+          await this.temporaryEvidenceCleaner.cleanupStaleTemporaryEvidence({
+            getChunk: (id) => this.repository.getAudioChunk?.(id) ?? null,
+          });
+        }
         this.repository.promoteSoonExpiringAudioJobs(at, at + URGENT_WINDOW_MS);
         expired = this.repository.listExpiredAudioChunks(at);
       } catch (error) {
@@ -77,6 +86,9 @@ class RetentionCleaner {
         if (result.status === "deleted" || result.status === "missing") {
           try {
             this.repository.tombstoneChunk(expired[index].id, at);
+            if (typeof this.artifactCleaner?.cleanupRetiredChunk === "function") {
+              await this.artifactCleaner.cleanupRetiredChunk(expired[index], at);
+            }
             counts[result.status] += 1;
           } catch (error) {
             counts.retry += 1;
