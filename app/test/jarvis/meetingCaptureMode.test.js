@@ -4,6 +4,7 @@ const {
   resolveMeetingCaptureMode,
   resolveMeetingCaptureModeWithPlan,
   routeMicOnlyPcm,
+  routeJarvisPcm,
   dispatchRealtimePcm,
   settleMeetingPrepareBeforeStart,
 } = require("../../src/jarvis/main/meetingCaptureMode");
@@ -122,6 +123,160 @@ test("mic-only PCM stops downstream processing when the disk writer safe-stops",
 
   assert.equal(routed, false);
   assert.deepEqual(calls, ["persist"]);
+});
+
+test("persists exact system PCM before derived consumers", () => {
+  const calls = [];
+  const pcm = Buffer.from([1, 2, 3, 4]);
+
+  const routed = routeJarvisPcm({
+    sessionId: "s1",
+    sourceType: "system",
+    pcmBuffer: pcm,
+    appendPcm: (sessionId, source, input) => {
+      calls.push(["persist", sessionId, source, input, Buffer.from(input)]);
+      return true;
+    },
+    afterPersist: (input, source) => {
+      calls.push(["derived", source, input, Buffer.from(input)]);
+    },
+  });
+
+  assert.equal(routed, true);
+  assert.deepEqual(
+    calls.map((call) => call.slice(0, call[0] === "persist" ? 3 : 2)),
+    [
+      ["persist", "s1", "system"],
+      ["derived", "system"],
+    ]
+  );
+  assert.equal(calls[0][3], pcm);
+  assert.equal(calls[1][2], pcm);
+  assert.deepEqual(calls[0][4], pcm);
+  assert.deepEqual(calls[1][3], pcm);
+});
+
+test("routes microphone PCM through the source-neutral persistence callback exactly once", () => {
+  const pcm = Buffer.from([5, 6]);
+  const persisted = [];
+  const derived = [];
+
+  const routed = routeJarvisPcm({
+    sessionId: "s1",
+    sourceType: "mic",
+    pcmBuffer: pcm,
+    appendPcm: (...args) => {
+      persisted.push(args);
+      return true;
+    },
+    afterPersist: (...args) => derived.push(args),
+  });
+
+  assert.equal(routed, true);
+  assert.deepEqual(persisted, [["s1", "mic", pcm]]);
+  assert.deepEqual(derived, [[pcm, "mic"]]);
+});
+
+test("stops derived processing when Jarvis persistence applies backpressure", () => {
+  const calls = [];
+
+  const routed = routeJarvisPcm({
+    sessionId: "s1",
+    sourceType: "system",
+    pcmBuffer: Buffer.from([1, 0]),
+    appendPcm: () => {
+      calls.push("persist");
+      return false;
+    },
+    afterPersist: () => calls.push("derived"),
+  });
+
+  assert.equal(routed, false);
+  assert.deepEqual(calls, ["persist"]);
+});
+
+test("preserves current derived behavior when no Jarvis session is active", () => {
+  const pcm = Buffer.from([7, 8]);
+  const calls = [];
+
+  const routed = routeJarvisPcm({
+    sessionId: null,
+    sourceType: "system",
+    pcmBuffer: pcm,
+    appendPcm: () => calls.push("persist"),
+    afterPersist: (input, source) => calls.push(["derived", input, source]),
+  });
+
+  assert.equal(routed, true);
+  assert.deepEqual(calls, [["derived", pcm, "system"]]);
+});
+
+test("validates Jarvis routing inputs before invoking callbacks or mutating PCM", () => {
+  const pcm = Buffer.from([9, 10]);
+  const original = Buffer.from(pcm);
+  const appendPcm = () => {
+    throw new Error("must not be invoked");
+  };
+  const afterPersist = () => {
+    throw new Error("must not be invoked");
+  };
+
+  assert.throws(
+    () =>
+      routeJarvisPcm({
+        sessionId: "bad id",
+        sourceType: "mic",
+        pcmBuffer: pcm,
+        appendPcm,
+        afterPersist,
+      }),
+    /sessionId must be a safe identifier/
+  );
+  assert.throws(
+    () =>
+      routeJarvisPcm({
+        sessionId: null,
+        sourceType: "other",
+        pcmBuffer: pcm,
+        appendPcm,
+        afterPersist,
+      }),
+    /invalid source type/
+  );
+  assert.throws(
+    () =>
+      routeJarvisPcm({
+        sessionId: null,
+        sourceType: "mic",
+        pcmBuffer: new Uint8Array([1, 2]),
+        appendPcm,
+        afterPersist,
+      }),
+    /pcmBuffer must be a Buffer/
+  );
+  assert.throws(
+    () =>
+      routeJarvisPcm({
+        sessionId: null,
+        sourceType: "mic",
+        pcmBuffer: pcm,
+        appendPcm: null,
+        afterPersist,
+      }),
+    /appendPcm must be a function/
+  );
+  assert.throws(
+    () =>
+      routeJarvisPcm({
+        sessionId: null,
+        sourceType: "mic",
+        pcmBuffer: pcm,
+        appendPcm,
+        afterPersist: null,
+      }),
+    /afterPersist must be a function/
+  );
+  assert.deepEqual(pcm, original);
 });
 
 test("normal realtime mic dispatch retains upstream buffer transformation", () => {

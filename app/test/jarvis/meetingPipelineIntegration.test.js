@@ -27,17 +27,20 @@ test("renderer mic-only start bypasses system access and forwards Jarvis identit
   assert.match(source, /MIC_DISCONNECTED/);
 });
 
-test("main mic-only route uses the resolved mode and never finalizes Jarvis on meeting stop", () => {
+test("main Jarvis route uses the resolved mode and never finalizes Jarvis on meeting stop", () => {
   const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
 
   assert.match(source, /resolveMeetingCaptureModeWithPlan/);
-  assert.match(source, /routeMicOnlyPcm/);
+  assert.match(source, /routeJarvisPcm/);
   assert.match(source, /activeJarvisSessionId/);
   assert.match(
     source,
     /const startMeetingSystemAudio[\s\S]*?if \(captureMode\.micOnly\)[\s\S]*?systemAudioMode: "unsupported"/
   );
-  assert.match(source, /if \(activeMeetingCaptureMode\.micOnly\) return/);
+  assert.match(
+    source,
+    /if \(source === "system" && activeMeetingCaptureMode\.micOnly\) return false/
+  );
   assert.doesNotMatch(
     source,
     /ipcMain\.handle\("meeting-transcription-stop"[\s\S]*?jarvisService\.finishCapture/
@@ -57,6 +60,61 @@ test("main mic-only route uses the resolved mode and never finalizes Jarvis on m
     /text:\s*(?:pending\.text|latestSegment|text)\.slice/,
     "meeting recording must not log transcript bodies"
   );
+});
+
+test("main preserves an optional Jarvis identity for system and dual meeting capture", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+  const startSection = source.slice(
+    source.indexOf('ipcMain.handle("meeting-transcription-start"'),
+    source.indexOf("const writeMeetingDiarizationPcm")
+  );
+
+  assert.match(
+    startSection,
+    /activeJarvisSessionId\s*=\s*captureMode\.micOnly\s*\|\|\s*options\.jarvisSessionId\s*!=\s*null\s*\?\s*assertId\(options\.jarvisSessionId,\s*"jarvisSessionId"\)\s*:\s*null/
+  );
+  assert.match(startSection, /if \(activeJarvisSessionId && !this\.jarvisService\)/);
+});
+
+test("main routes exact mic and system PCM once before every derived consumer", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+  const sendSection = source.slice(
+    source.indexOf("const sendMeetingAudio"),
+    source.indexOf("const startManagedMeetingSystemAudio")
+  );
+
+  assert.equal((sendSection.match(/routeJarvisPcm\(/g) || []).length, 1);
+  assert.equal((sendSection.match(/\.appendPcm\(/g) || []).length, 1);
+  assert.doesNotMatch(sendSection, /appendMicPcm/);
+  assert.match(sendSection, /return routeJarvisPcm\(\{/);
+  assert.match(sendSection, /sourceType:\s*source/);
+  assert.match(sendSection, /pcmBuffer:\s*outboundBuffer/);
+  assert.match(
+    sendSection,
+    /appendPcm:\s*\(sessionId,\s*persistedSource,\s*buffer\)\s*=>\s*this\.jarvisService\.appendPcm\(sessionId,\s*persistedSource,\s*buffer\)/
+  );
+  assert.match(sendSection, /if \(persistedSource === "system"\)/);
+  assert.match(sendSection, /if \(persistedSource === "mic"\)/);
+  assert.match(
+    sendSection,
+    /const derivedBuffer = activeJarvisSessionId \? Buffer\.from\(buffer\) : buffer/
+  );
+
+  const routeIndex = sendSection.indexOf("return routeJarvisPcm");
+  for (const derivedConsumer of [
+    "recordSystemChunk",
+    "processSystemBuffer",
+    "processMeetingMicWithAec",
+    "analyzeMicChunk",
+    "feedAudio",
+    "writeMeetingDiarizationPcm",
+    "dispatchMeetingAudioBuffer",
+  ]) {
+    assert.ok(
+      routeIndex < sendSection.indexOf(derivedConsumer),
+      `${derivedConsumer} must be lexically contained after the evidence-first route`
+    );
+  }
 });
 
 test("Jarvis local mode uses stable bilingual windows with PCM overlap and quality confidence", () => {

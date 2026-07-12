@@ -1,3 +1,5 @@
+const { assertId, assertSourceType } = require("../shared/contracts");
+
 function resolveMeetingCaptureMode(options = {}, upstream = {}) {
   if (options.micOnly === true) {
     return {
@@ -39,6 +41,17 @@ function routeMicOnlyPcm({
   return true;
 }
 
+function routeJarvisPcm({ sessionId, sourceType, pcmBuffer, appendPcm, afterPersist }) {
+  const source = assertSourceType(sourceType);
+  if (!Buffer.isBuffer(pcmBuffer)) throw new TypeError("pcmBuffer must be a Buffer");
+  if (typeof appendPcm !== "function") throw new TypeError("appendPcm must be a function");
+  if (typeof afterPersist !== "function") throw new TypeError("afterPersist must be a function");
+
+  const id = sessionId == null ? null : assertId(sessionId, "sessionId");
+  if (id && appendPcm(id, source, pcmBuffer) === false) return false;
+  return afterPersist(pcmBuffer, source) !== false;
+}
+
 function dispatchRealtimePcm({
   buffer,
   source,
@@ -74,6 +87,7 @@ module.exports = {
   resolveMeetingCaptureMode,
   resolveMeetingCaptureModeWithPlan,
   routeMicOnlyPcm,
+  routeJarvisPcm,
   dispatchRealtimePcm,
   settleMeetingPrepareBeforeStart,
 };

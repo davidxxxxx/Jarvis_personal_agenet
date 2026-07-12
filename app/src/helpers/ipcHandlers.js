@@ -38,7 +38,7 @@ const { assertId } = require("../jarvis/shared/contracts");
 const {
   resolveMeetingCaptureMode,
   resolveMeetingCaptureModeWithPlan,
-  routeMicOnlyPcm,
+  routeJarvisPcm,
   dispatchRealtimePcm,
   settleMeetingPrepareBeforeStart,
 } = require("../jarvis/main/meetingCaptureMode");
@@ -5686,10 +5686,11 @@ class IPCHandlers {
         );
         let { systemAudioMode, systemAudioStrategy } = captureMode;
         activeMeetingCaptureMode = captureMode;
-        activeJarvisSessionId = captureMode.micOnly
-          ? assertId(options.jarvisSessionId, "jarvisSessionId")
-          : null;
-        if (captureMode.micOnly && !this.jarvisService) {
+        activeJarvisSessionId =
+          captureMode.micOnly || options.jarvisSessionId != null
+            ? assertId(options.jarvisSessionId, "jarvisSessionId")
+            : null;
+        if (activeJarvisSessionId && !this.jarvisService) {
           throw new Error("Jarvis capture service is unavailable");
         }
         if (
@@ -5820,66 +5821,72 @@ class IPCHandlers {
     const sendMeetingAudio = (audioBuffer, source) => {
       const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
 
-      if (source === "system") {
-        if (activeMeetingCaptureMode.micOnly) return;
-        const receivedAt = Date.now();
-        meetingEchoLeakDetector.recordSystemChunk(outboundBuffer, receivedAt);
-        if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(outboundBuffer)) {
-          meetingAecEnabled = false;
-        }
-        flushPendingMeetingMicChunks();
+      if (source === "system" && activeMeetingCaptureMode.micOnly) return false;
 
-        if (meetingLiveSpeakerActive) {
-          void liveSpeakerIdentifier.feedAudio(outboundBuffer);
-        }
+      return routeJarvisPcm({
+        sessionId: activeJarvisSessionId,
+        sourceType: source,
+        pcmBuffer: outboundBuffer,
+        appendPcm: (sessionId, persistedSource, buffer) =>
+          this.jarvisService.appendPcm(sessionId, persistedSource, buffer),
+        afterPersist: (buffer, persistedSource) => {
+          const derivedBuffer = activeJarvisSessionId ? Buffer.from(buffer) : buffer;
 
-        writeMeetingDiarizationPcm(outboundBuffer, receivedAt);
-        dispatchMeetingAudioBuffer(outboundBuffer, "system");
-        return;
-      }
-
-      if (source === "mic") {
-        if (activeMeetingCaptureMode.micOnly) {
-          routeMicOnlyPcm({
-            sessionId: activeJarvisSessionId,
-            pcmBuffer: outboundBuffer,
-            appendMicPcm: (sessionId, buffer) => this.jarvisService.appendMicPcm(sessionId, buffer),
-            feedSpeaker: (buffer) => {
-              if (meetingLiveSpeakerActive) {
-                void liveSpeakerIdentifier.feedAudio(buffer);
-              }
-            },
-            writeDiarization: (buffer) => writeMeetingDiarizationPcm(buffer, Date.now()),
-            dispatchTranscription: (buffer, micSource) =>
-              dispatchMeetingAudioBuffer(buffer, micSource, { preserveExactInput: true }),
-          });
-          return;
-        }
-
-        if (processMeetingMicWithAec(outboundBuffer)) {
-          return;
-        }
-
-        if (!hasNativeMeetingSystemAudio()) {
-          const analysis = meetingEchoLeakDetector.analyzeMicChunk(outboundBuffer);
-          if (analysis?.shouldMute && !meetingAecEnabled) {
-            if (!meetingLocalMode) {
-              dispatchMeetingAudioBuffer(Buffer.alloc(outboundBuffer.length), "mic");
+          if (persistedSource === "system") {
+            const receivedAt = Date.now();
+            meetingEchoLeakDetector.recordSystemChunk(derivedBuffer, receivedAt);
+            if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(derivedBuffer)) {
+              meetingAecEnabled = false;
             }
-            return;
+            flushPendingMeetingMicChunks();
+
+            if (meetingLiveSpeakerActive) {
+              void liveSpeakerIdentifier.feedAudio(derivedBuffer);
+            }
+
+            writeMeetingDiarizationPcm(derivedBuffer, receivedAt);
+            dispatchMeetingAudioBuffer(derivedBuffer, "system");
+            return true;
           }
 
-          dispatchMeetingAudioBuffer(outboundBuffer, "mic");
-          return;
-        }
+          if (persistedSource === "mic") {
+            if (activeMeetingCaptureMode.micOnly) {
+              if (meetingLiveSpeakerActive) {
+                void liveSpeakerIdentifier.feedAudio(derivedBuffer);
+              }
+              writeMeetingDiarizationPcm(derivedBuffer, Date.now());
+              dispatchMeetingAudioBuffer(derivedBuffer, "mic", { preserveExactInput: true });
+              return true;
+            }
 
-        meetingPendingMicChunks.push({
-          buffer: outboundBuffer,
-          queuedAt: Date.now(),
-        });
-        flushPendingMeetingMicChunks();
-        return;
-      }
+            if (processMeetingMicWithAec(derivedBuffer)) {
+              return true;
+            }
+
+            if (!hasNativeMeetingSystemAudio()) {
+              const analysis = meetingEchoLeakDetector.analyzeMicChunk(derivedBuffer);
+              if (analysis?.shouldMute && !meetingAecEnabled) {
+                if (!meetingLocalMode) {
+                  dispatchMeetingAudioBuffer(Buffer.alloc(derivedBuffer.length), "mic");
+                }
+                return true;
+              }
+
+              dispatchMeetingAudioBuffer(derivedBuffer, "mic");
+              return true;
+            }
+
+            meetingPendingMicChunks.push({
+              buffer: derivedBuffer,
+              queuedAt: Date.now(),
+            });
+            flushPendingMeetingMicChunks();
+            return true;
+          }
+
+          return true;
+        },
+      });
     };
 
     const startManagedMeetingSystemAudio = (event, manager, warningLabel) => {
