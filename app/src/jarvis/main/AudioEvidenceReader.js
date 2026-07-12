@@ -3,6 +3,11 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const { getFFmpegPath } = require("../../helpers/ffmpegUtils");
+const {
+  ffmpegExitError,
+  ffmpegProcessError,
+  isTransientIoError,
+} = require("./AudioEvidenceErrors");
 
 function parsePcmWav(wav) {
   if (!Buffer.isBuffer(wav) || wav.length < 44) throw new Error("invalid_pcm_wav");
@@ -60,10 +65,16 @@ function runFfmpeg(args, { spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
       reject(new Error("FFmpeg not found - required for audio evidence decoding"));
       return;
     }
-    const child = spawnImpl(ffmpegPath, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    let child;
+    try {
+      child = spawnImpl(ffmpegPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (error) {
+      reject(ffmpegProcessError(error));
+      return;
+    }
     const stdout = [];
     let stdoutBytes = 0;
     let stderr = "";
@@ -85,12 +96,10 @@ function runFfmpeg(args, { spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
       }
       stdout.push(data);
     });
-    child.on("error", (error) =>
-      settle(reject, new Error(`FFmpeg process error: ${error.message}`))
-    );
+    child.on("error", (error) => settle(reject, ffmpegProcessError(error)));
     child.on("close", (code) => {
       if (code === 0) settle(resolve, Buffer.concat(stdout));
-      else settle(reject, new Error(`FFmpeg decode exited with code ${code}: ${stderr.trim()}`));
+      else settle(reject, ffmpegExitError(code, stderr));
     });
   });
 }
@@ -438,3 +447,4 @@ module.exports = AudioEvidenceReader;
 module.exports.wavForPcm = wavForPcm;
 module.exports.parsePcmWav = parsePcmWav;
 module.exports.FfmpegPcmDecoder = FfmpegPcmDecoder;
+module.exports.isTransientIoError = isTransientIoError;

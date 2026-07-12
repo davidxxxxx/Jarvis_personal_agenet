@@ -205,7 +205,6 @@ class CaptureEvidenceStore {
             retired_file_sha256 = NULL
         WHERE id = @chunkId
           AND retired_path = @retiredPath
-          AND retired_format = @retiredFormat
           AND retired_file_sha256 IS @retiredFileSha256
       `),
       setRetiredArtifactHash: db.prepare(`

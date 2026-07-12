@@ -1,14 +1,20 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { PassThrough } = require("node:stream");
 const Database = require("better-sqlite3");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader");
-const { parsePcmWav } = require("../../src/jarvis/main/AudioEvidenceReader");
+const {
+  FfmpegPcmDecoder,
+  isTransientIoError,
+  parsePcmWav,
+} = require("../../src/jarvis/main/AudioEvidenceReader");
 const FlacCompressionWorker = require("../../src/jarvis/main/FlacCompressionWorker");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
@@ -394,6 +400,132 @@ test("transiently locked authoritative FLAC stays authoritative until maintenanc
   );
 });
 
+for (const code of ["EBUSY", "EPERM", "EMFILE"]) {
+  test(`a ${code} decoder second-read keeps FLAC authoritative until maintenance retries`, async (t) => {
+    const { db, store, pcm, wavPath, reader, worker, makeWorker, job } = fixture(t);
+    const compressed = await worker.run(job);
+    fs.writeFileSync(wavPath, wavFor(pcm));
+    let locked = true;
+    const transientReader = {
+      async readVerifiedPcm(chunk) {
+        if (locked && chunk.format === "flac" && chunk.path === compressed.chunk.path) {
+          const error = new Error(`simulated decoder ${code}`);
+          error.code = code;
+          throw error;
+        }
+        return reader.readVerifiedPcm(chunk);
+      },
+    };
+    const maintenanceWorker = makeWorker({ reader: transientReader });
+
+    await maintenanceWorker.recoverStartup();
+
+    assert.equal(store.getChunk("c1").format, "flac");
+    assert.equal(store.getChunk("c1").path, compressed.chunk.path);
+    assert.equal(fs.existsSync(wavPath), true);
+    assert.deepEqual(
+      db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+      { state: "retry", error_code: "flac_authority_temporarily_unreadable" }
+    );
+
+    locked = false;
+    await maintenanceWorker.runMaintenance(100);
+
+    assert.equal(store.getChunk("c1").format, "flac");
+    assert.equal(fs.existsSync(wavPath), false);
+    assert.deepEqual(
+      db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+      { state: "completed", error_code: null }
+    );
+  });
+}
+
+test("FFmpeg decoder spawn errors preserve safe transient diagnostics", async () => {
+  const original = new Error("cannot open C:\\private\\meeting.flac");
+  original.code = "EBUSY";
+  const decoder = new FfmpegPcmDecoder({
+    getPath: () => "C:\\tools\\ffmpeg.exe",
+    spawnImpl() {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => {};
+      process.nextTick(() => child.emit("error", original));
+      return child;
+    },
+  });
+
+  await assert.rejects(
+    decoder.decode("C:\\private\\meeting.flac", "flac"),
+    (error) => {
+      assert.equal(error.code, "EBUSY");
+      assert.equal(error.cause, original);
+      assert.equal(error.classification, "transient_io");
+      assert.equal(error.message.includes("C:\\private"), false);
+      return true;
+    }
+  );
+});
+
+test("FFmpeg input-open resource failures are classified without exposing stderr", async () => {
+  const decoder = new FfmpegPcmDecoder({
+    getPath: () => "C:\\tools\\ffmpeg.exe",
+    spawnImpl() {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => {};
+      process.nextTick(() => {
+        child.stderr.end("C:\\private\\meeting.flac: Device or resource busy");
+        child.emit("close", 1);
+      });
+      return child;
+    },
+  });
+
+  await assert.rejects(
+    decoder.decode("C:\\private\\meeting.flac", "flac"),
+    (error) => {
+      assert.equal(error.code, "FFMPEG_INPUT_TRANSIENT");
+      assert.equal(error.exitCode, 1);
+      assert.equal(error.classification, "transient_io");
+      assert.equal(error.message.includes("C:\\private"), false);
+      return true;
+    }
+  );
+});
+
+test("transient I/O classification traverses causes and aggregate errors", () => {
+  const locked = new Error("locked");
+  locked.code = "EACCES";
+  const nested = new Error("decoder wrapper", { cause: new AggregateError([locked]) });
+
+  assert.equal(isTransientIoError(nested), true);
+  assert.equal(isTransientIoError(new Error("pcm_hash_mismatch")), false);
+});
+
+test("a non-transient decoder PCM hash mismatch still rolls FLAC authority back", async (t) => {
+  const { db, store, pcm, wavPath, reader, worker, makeWorker, job } = fixture(t);
+  await worker.run(job);
+  fs.writeFileSync(wavPath, wavFor(pcm));
+  const mismatchingReader = {
+    async readVerifiedPcm(chunk) {
+      if (chunk.format === "flac") throw new Error("pcm_hash_mismatch");
+      return reader.readVerifiedPcm(chunk);
+    },
+  };
+
+  const recovered = await makeWorker({ reader: mismatchingReader }).recoverStartup();
+
+  assert.equal(store.getChunk("c1").format, "wav");
+  assert.equal(store.getChunk("c1").path, wavPath);
+  assert.equal(recovered.rolledBack, 1);
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+    { state: "retry", error_code: "flac_authority_invalid_recovered" }
+  );
+});
+
 test("maintenance hashes and removes a readable legacy null-hash retired FLAC", async (t) => {
   const { db, store, worker, job } = fixture(t);
   const compressed = await worker.run(job);
@@ -412,6 +544,173 @@ test("maintenance hashes and removes a readable legacy null-hash retired FLAC", 
       .get(),
     { retired_path: null, retired_format: null, retired_file_sha256: null }
   );
+});
+
+test("retired cleanup cannot unlink a same-path authority promoted by concurrent run", async (t) => {
+  const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  const flacPath = compressed.chunk.path;
+  const flacHash = compressed.chunk.file_sha256;
+  fs.writeFileSync(wavPath, wavFor(pcm));
+  db.prepare(
+    `UPDATE audio_chunks
+     SET path = ?, format = 'wav', file_sha256 = NULL,
+         retired_path = ?, retired_format = 'flac', retired_file_sha256 = ?
+     WHERE id = 'c1'`
+  ).run(wavPath, flacPath, flacHash);
+  db.prepare(
+    "UPDATE processing_jobs SET state = 'retry', completed_at = NULL WHERE id = ?"
+  ).run(job.id);
+  const retried = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
+
+  let releaseFirstUnlink;
+  const firstUnlinkReleased = new Promise((resolve) => {
+    releaseFirstUnlink = resolve;
+  });
+  let markFirstUnlinkStarted;
+  const firstUnlinkStarted = new Promise((resolve) => {
+    markFirstUnlinkStarted = resolve;
+  });
+  let first = true;
+  const fsImpl = Object.create(fs.promises);
+  fsImpl.unlink = async (candidate) => {
+    if (candidate === flacPath && first) {
+      first = false;
+      markFirstUnlinkStarted();
+      await firstUnlinkReleased;
+    }
+    return fs.promises.unlink(candidate);
+  };
+  let markPromoted;
+  const promoted = new Promise((resolve) => {
+    markPromoted = resolve;
+  });
+  const originalPromote = store.promoteChunkToFlac.bind(store);
+  store.promoteChunkToFlac = (input) => {
+    const result = originalPromote(input);
+    markPromoted();
+    return result;
+  };
+  const maintenanceWorker = makeWorker({ fsImpl });
+
+  const cleaning = maintenanceWorker.cleanupRetiredBacklog();
+  await firstUnlinkStarted;
+  const running = maintenanceWorker.run(retried);
+  const prematurePromotion = await Promise.race([
+    promoted.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 30)),
+  ]);
+  releaseFirstUnlink();
+  await Promise.all([cleaning, running]);
+
+  assert.equal(prematurePromotion, false);
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(fs.existsSync(flacPath), true);
+});
+
+test("retired cleanup waits while a run is between rename and promotion", async (t) => {
+  const { store, makeWorker, job } = fixture(t);
+  let releaseRun;
+  const runReleased = new Promise((resolve) => {
+    releaseRun = resolve;
+  });
+  let markRenamed;
+  const renamed = new Promise((resolve) => {
+    markRenamed = resolve;
+  });
+  const worker = makeWorker({
+    async faultInjector(point) {
+      if (point !== "after_rename") return;
+      markRenamed();
+      await runReleased;
+    },
+  });
+
+  const running = worker.run(job);
+  await renamed;
+  let cleanupSettled = false;
+  const cleaning = worker.cleanupRetiredBacklog().finally(() => {
+    cleanupSettled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const prematureCleanup = cleanupSettled;
+  releaseRun();
+  await Promise.all([running, cleaning]);
+
+  assert.equal(prematureCleanup, false);
+  assert.equal(store.getChunk("c1").format, "flac");
+});
+
+test("retired cleanup revalidates locator and current authority after its hash read", async (t) => {
+  const { db, store, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  const flacPath = compressed.chunk.path;
+  store.tombstoneChunk("c1", 100);
+  db.prepare(
+    "UPDATE audio_chunks SET path = ?, format = 'wav', deleted_at = NULL, retired_path = ?, retired_format = 'flac' WHERE id = 'c1'"
+  ).run(path.join(path.dirname(flacPath), "replacement.wav"), flacPath);
+  let changedAuthority = false;
+  const fsImpl = Object.create(fs.promises);
+  fsImpl.readFile = async (candidate, ...args) => {
+    const bytes = await fs.promises.readFile(candidate, ...args);
+    if (candidate === flacPath && !changedAuthority) {
+      changedAuthority = true;
+      db.prepare("UPDATE audio_chunks SET path = ?, format = 'flac' WHERE id = 'c1'").run(
+        flacPath
+      );
+    }
+    return bytes;
+  };
+
+  const cleaned = await makeWorker({ fsImpl }).cleanupRetiredBacklog();
+
+  assert.deepEqual(cleaned, { removed: 0, retry: 0 });
+  assert.equal(fs.existsSync(flacPath), true);
+  assert.equal(store.getChunk("c1").path, flacPath);
+});
+
+test("retired locator clear is conditional on chunk path and hash, not format metadata", async (t) => {
+  const { db, store, worker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  store.tombstoneChunk("c1", 100);
+  db.prepare("UPDATE audio_chunks SET retired_format = 'wav' WHERE id = 'c1'").run();
+
+  const cleared = store.clearRetiredArtifact({
+    chunkId: "c1",
+    retiredPath: compressed.chunk.path,
+    retiredFormat: "flac",
+    retiredFileSha256: compressed.chunk.file_sha256,
+  });
+
+  assert.equal(cleared, 1);
+  assert.equal(store.getChunkForMaintenance("c1").retired_path, null);
+});
+
+test("a rejected authority operation does not poison the serial tail", async (t) => {
+  const { store, worker, job } = fixture(t);
+
+  await assert.rejects(
+    worker.run({ ...job, id: "missing-job", chunk_id: "missing" }),
+    /does not exist/
+  );
+  const result = await worker.run(job);
+  await worker.waitForIdle();
+
+  assert.equal(result.chunk.format, "flac");
+  assert.equal(store.getChunk("c1").format, "flac");
+});
+
+test("queued runPending and recoverStartup use non-reentrant private operations", async (t) => {
+  const { store, worker } = fixture(t);
+
+  await Promise.race([
+    Promise.all([worker.runPending(), worker.recoverStartup()]),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("authority operation queue deadlocked")), 1_000)
+    ),
+  ]);
+
+  assert.equal(store.getChunk("c1").format, "flac");
 });
 
 test("maintenance preserves a locked legacy null-hash retired FLAC for retry", async (t) => {
@@ -579,6 +878,7 @@ test("promotion rejection after retention wins removes the renamed non-authorita
   const { root, db, store, wavPath, makeWorker, job } = fixture(t);
   let clock = 100;
   let worker;
+  let retentionCleanup;
   const repository = {
     promoteSoonExpiringAudioJobs: () => 0,
     listExpiredAudioChunks: (at) =>
@@ -602,11 +902,15 @@ test("promotion rejection after retention wins removes the renamed non-authorita
     async faultInjector(point) {
       if (point !== "after_rename") return;
       clock = 200;
-      await cleaner.clean(clock);
+      retentionCleanup = cleaner.clean(clock);
+      while (store.getChunk("c1").deleted_at === null) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
     },
   });
 
   await assert.rejects(worker.run(job), /audio is deleted|authority changed|audio_expired|ENOENT/);
+  await retentionCleanup;
 
   assert.equal(store.getChunk("c1").deleted_at, 200);
   assert.equal(fs.existsSync(wavPath.replace(/\.wav$/, ".flac")), false);
