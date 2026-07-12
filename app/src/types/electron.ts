@@ -1832,8 +1832,12 @@ declare global {
       onMeetingTranscriptionSourceState?: (
         callback: (payload: {
           source: "system";
-          state: "unavailable";
-          reason: "system-capture-error";
+          state: "unavailable" | "recording";
+          reason:
+            | "system-capture-error"
+            | "system-capture-restored"
+            | "system-recovery-buffer-overflow"
+            | "system-recovery-delivery-failed";
           inputGeneration: string;
         }) => void
       ) => () => void;

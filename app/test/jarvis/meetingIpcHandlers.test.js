@@ -5,6 +5,7 @@ const Module = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { createBoundedRecoveryBuffer } = require("../../src/helpers/meetingRecoveryLoop");
 
 function createDeferred() {
   let resolve;
@@ -36,9 +37,11 @@ async function waitForTimed(predicate, description = "timed condition", timeoutM
 function createFixture({
   appendPcm = () => true,
   sourceInterrupted = () => {},
+  sourceRestored = () => {},
   onDerived = () => {},
   managedStartChunk = null,
   managedStartError = null,
+  managedStartSequence = [],
   managedStartDeferred = null,
   managedStopDeferred = null,
   aecStartDeferred = null,
@@ -55,6 +58,7 @@ function createFixture({
   const detectionStates = [];
   const managerStops = [];
   const managedStartAcceptances = [];
+  const recoveryLoopStarts = [];
   const derivedCalls = [];
   const lifecycle = [];
   const whisperCalls = [];
@@ -134,6 +138,23 @@ function createFixture({
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
     if (request === "electron") return electron;
+    if (request === "./meetingRecoveryLoop") {
+      const recoveryModule = originalLoad.call(this, request, parent, isMain);
+      return {
+        ...recoveryModule,
+        createMeetingRecoveryLoop: (options) => {
+          const loop = recoveryModule.createMeetingRecoveryLoop(options);
+          return {
+            ...loop,
+            start: () => {
+              const promise = loop.start();
+              if (!recoveryLoopStarts.includes(promise)) recoveryLoopStarts.push(promise);
+              return promise;
+            },
+          };
+        },
+      };
+    }
     if (request === "./openaiRealtimeStreaming" && realtimeConnectDeferred) {
       return ControllableRealtimeStreaming;
     }
@@ -154,13 +175,17 @@ function createFixture({
     start: async (options) => {
       lifecycle.push("manager-start");
       managedStarts.push(options);
-      if (managedStartChunk) {
-        managedStartAcceptances.push(options.onChunk(managedStartChunk));
+      const behavior = managedStartSequence[managedStarts.length - 1] ?? {};
+      const startChunks = behavior.chunks ?? [behavior.chunk ?? managedStartChunk].filter(Boolean);
+      const startError = behavior.error ?? managedStartError;
+      const startDeferred = behavior.deferred ?? managedStartDeferred;
+      for (const startChunk of startChunks) {
+        managedStartAcceptances.push(options.onChunk(startChunk));
       }
-      if (managedStartError) {
-        options.onError(managedStartError);
+      if (startError) {
+        options.onError(startError);
       }
-      if (managedStartDeferred) await managedStartDeferred.promise;
+      if (startDeferred) await startDeferred.promise;
     },
     stop: async () => {
       lifecycle.push("manager-stop");
@@ -217,7 +242,7 @@ function createFixture({
     linuxPortalAudioManager: null,
     windowsLoopbackAudioManager,
     meetingAecManager,
-    jarvisService: { appendPcm, sourceInterrupted },
+    jarvisService: { appendPcm, sourceInterrupted, sourceRestored },
     jarvisRepository: {
       addTranscriptRevision: (revision) => transcriptRevisions.push(revision),
     },
@@ -254,12 +279,67 @@ function createFixture({
     managedOptions: () => managedStarts.at(-1),
     managedStarts,
     managedStartAcceptances,
+    recoveryLoopStarts,
     cleanup: async () => {
       await handles.get("meeting-transcription-stop")?.();
       fs.rmSync(tempDir, { recursive: true, force: true });
     },
   };
 }
+
+test("bounded managed recovery buffer clears bytes and remains reusable after overflow", () => {
+  const buffer = createBoundedRecoveryBuffer(4);
+  const first = Buffer.from([1, 2]);
+
+  assert.equal(buffer.push(first), true);
+  first[0] = 99;
+  assert.equal(buffer.push(Buffer.from([3, 4])), true);
+  assert.equal(buffer.push(Buffer.from([5])), false);
+  assert.equal(buffer.byteLength, 4);
+  assert.equal(buffer.length, 2);
+
+  assert.deepEqual(buffer.drain(), [Buffer.from([1, 2]), Buffer.from([3, 4])]);
+  assert.equal(buffer.byteLength, 0);
+  assert.equal(buffer.length, 0);
+  assert.equal(buffer.push(Buffer.from([6, 7, 8, 9])), true);
+  buffer.clear();
+  assert.equal(buffer.byteLength, 0);
+  assert.equal(buffer.length, 0);
+});
+
+test("bounded recovery buffer copies ArrayBuffer and typed-array bytes", () => {
+  const buffer = createBoundedRecoveryBuffer(8);
+  const arrayBuffer = new Uint8Array([1, 2]).buffer;
+  const typedArray = new Uint8Array([3, 4]);
+
+  assert.equal(buffer.push(arrayBuffer), true);
+  assert.equal(buffer.push(typedArray), true);
+  new Uint8Array(arrayBuffer)[0] = 91;
+  typedArray[0] = 92;
+
+  assert.deepEqual(buffer.drain(), [Buffer.from([1, 2]), Buffer.from([3, 4])]);
+});
+
+test("bounded recovery buffer rejects invalid or oversized input before copying", () => {
+  const buffer = createBoundedRecoveryBuffer(4);
+  const oversized = Buffer.alloc(5);
+  const originalFrom = Buffer.from;
+  let copyCalls = 0;
+  Buffer.from = function countedBufferFrom(...args) {
+    copyCalls += 1;
+    return originalFrom.apply(Buffer, args);
+  };
+  try {
+    assert.equal(buffer.push(oversized), false);
+  } finally {
+    Buffer.from = originalFrom;
+  }
+
+  assert.equal(copyCalls, 0);
+  assert.doesNotThrow(() => assert.equal(buffer.push({ byteLength: 1 }), false));
+  assert.equal(buffer.byteLength, 0);
+  assert.equal(buffer.length, 0);
+});
 
 test("explicit stop supersedes a pending realtime prepare before its late connection can stay warm", async (t) => {
   const realtimeConnectDeferred = createDeferred();
@@ -347,6 +427,118 @@ test("managed system producer receives false and stops after Jarvis backpressure
   assert.equal(raced, false);
   assert.equal(appendCalls, 1);
   assert.deepEqual(fixture.managerStops, ["stop"]);
+});
+
+test("active managed system backpressure enters same-session recovery while mic remains live", async (t) => {
+  const interruptions = [];
+  const restorations = [];
+  const persisted = [];
+  let rejectFirstSystem = true;
+  const recoveryChunk = Buffer.from([7, 8]);
+  const micChunk = Buffer.from([9, 10]);
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [{}, { chunks: [recoveryChunk] }],
+    appendPcm: (sessionId, source, buffer) => {
+      if (source === "system" && rejectFirstSystem) {
+        rejectFirstSystem = false;
+        return false;
+      }
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+    },
+    sourceRestored: async (...args) => {
+      restorations.push(args);
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-active-backpressure" }
+  );
+  const accepted = fixture.managedStarts[0].onChunk(Buffer.from([1, 2]));
+  send({ sender: fixture.sender }, micChunk, "mic", started.inputGeneration);
+
+  assert.equal(accepted, false);
+  assert.deepEqual(persisted, [["jarvis-active-backpressure", "mic", micChunk]]);
+  await waitForTimed(() => fixture.managedStarts.length === 2, "the backpressure restart");
+  await waitForTimed(
+    () => persisted.some(([, source]) => source === "system"),
+    "the recovered system append"
+  );
+
+  assert.equal(interruptions.length, 1);
+  assert.equal(restorations.length, 1);
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, buffer]),
+    [
+      ["jarvis-active-backpressure", "mic", micChunk],
+      ["jarvis-active-backpressure", "system", recoveryChunk],
+    ]
+  );
+  assert.ok(fixture.managerStops.length >= 1);
+});
+
+test("active managed system append exceptions are contained and recover while mic remains live", async (t) => {
+  const interruptions = [];
+  const restorations = [];
+  const persisted = [];
+  let throwFirstSystem = true;
+  const recoveryChunk = Buffer.from([17, 18]);
+  const micChunk = Buffer.from([19, 20]);
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [{}, { chunks: [recoveryChunk] }],
+    appendPcm: (sessionId, source, buffer) => {
+      if (source === "system" && throwFirstSystem) {
+        throwFirstSystem = false;
+        throw new Error("active system evidence failure");
+      }
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+    },
+    sourceRestored: async (...args) => {
+      restorations.push(args);
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-active-throw" }
+  );
+  let accepted;
+  assert.doesNotThrow(() => {
+    accepted = fixture.managedStarts[0].onChunk(Buffer.from([3, 4]));
+  });
+  send({ sender: fixture.sender }, micChunk, "mic", started.inputGeneration);
+
+  assert.equal(accepted, false);
+  assert.deepEqual(persisted, [["jarvis-active-throw", "mic", micChunk]]);
+  await waitForTimed(() => fixture.managedStarts.length === 2, "the exception restart");
+  await waitForTimed(
+    () => persisted.some(([, source]) => source === "system"),
+    "the system append after exception"
+  );
+
+  assert.equal(interruptions.length, 1);
+  assert.equal(restorations.length, 1);
+  assert.deepEqual(persisted, [
+    ["jarvis-active-throw", "mic", micChunk],
+    ["jarvis-active-throw", "system", recoveryChunk],
+  ]);
+  assert.ok(fixture.managerStops.length >= 1);
 });
 
 test("managed system audio emitted during start is committed only after the start succeeds", async (t) => {
@@ -779,7 +971,10 @@ test("stopping and replacing the input binding cancels its system interruption r
     ["jarvis-interruption-old", "jarvis-interruption-new"]
   );
   assert.equal(
-    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    fixture.sent.filter(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" && payload.state === "unavailable"
+    ).length,
     2
   );
 });
@@ -810,9 +1005,383 @@ test("successful retried system interruption persistence is not duplicated", asy
   assert.equal(attempts, 2);
   assert.equal(fixture.managerStops.length, 1);
   assert.equal(
-    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    fixture.sent.filter(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" && payload.state === "unavailable"
+    ).length,
     1
   );
+});
+
+test("managed system recovery restores before flushing its synchronous first chunk while mic stays live", async (t) => {
+  const restoration = createDeferred();
+  const calls = [];
+  const recoveryChunk = Buffer.from([7, 8]);
+  const micChunk = Buffer.from([3, 4]);
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [{}, { chunk: recoveryChunk }],
+    appendPcm: (sessionId, source, buffer) => {
+      calls.push(["append", sessionId, source, buffer]);
+      return true;
+    },
+    sourceInterrupted: async (...args) => {
+      calls.push(["interrupted", ...args]);
+    },
+    sourceRestored: async (...args) => {
+      calls.push(["restored", ...args]);
+      await restoration.promise;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-managed-recovery" }
+  );
+  fixture.managedStarts[0].onError(new Error("current producer failed"));
+
+  await waitForTimed(() => fixture.managedStarts.length === 2, "the managed system restart");
+  await waitForTimed(
+    () => calls.some(([kind]) => kind === "restored"),
+    "the managed system restoration"
+  );
+  send({ sender: fixture.sender }, micChunk, "mic", started.inputGeneration);
+
+  assert.deepEqual(
+    calls.filter(([kind]) => kind === "interrupted").map((call) => call.slice(1, 3)),
+    [["jarvis-managed-recovery", "system"]]
+  );
+  assert.deepEqual(
+    calls.filter(([kind, , source]) => kind === "append" && source === "system"),
+    []
+  );
+  assert.equal(
+    calls.some(
+      ([kind, sessionId, source, buffer]) =>
+        kind === "append" &&
+        sessionId === "jarvis-managed-recovery" &&
+        source === "mic" &&
+        buffer === micChunk
+    ),
+    true
+  );
+
+  restoration.resolve();
+  await waitForTimed(
+    () => calls.some(([kind, , source]) => kind === "append" && source === "system"),
+    "the buffered system chunk flush"
+  );
+
+  const restoredIndex = calls.findIndex(([kind]) => kind === "restored");
+  const systemAppendIndex = calls.findIndex(
+    ([kind, , source]) => kind === "append" && source === "system"
+  );
+  assert.ok(restoredIndex >= 0 && restoredIndex < systemAppendIndex);
+  assert.deepEqual(calls[systemAppendIndex][3], recoveryChunk);
+  assert.deepEqual(calls[restoredIndex].slice(1), [
+    "jarvis-managed-recovery",
+    "system",
+    {
+      at: calls[restoredIndex][3].at,
+      deviceId: null,
+      deviceLabel: null,
+      strategy: "wasapi-loopback",
+    },
+  ]);
+});
+
+test("stop and a new input binding cancel a scheduled managed system restart", async (t) => {
+  const interruption = createDeferred();
+  let restorationCalls = 0;
+  const fixture = createFixture({
+    systemAvailable: true,
+    sourceInterrupted: async () => {
+      await interruption.promise;
+    },
+    sourceRestored: async () => {
+      restorationCalls += 1;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-scheduled-recovery-old" }
+  );
+  fixture.managedStarts[0].onError(new Error("schedule a recovery"));
+  interruption.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await stop({ sender: fixture.sender });
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-scheduled-recovery-new" }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  assert.equal(fixture.managedStarts.length, 1);
+  assert.equal(restorationCalls, 0);
+  assert.equal(
+    fixture.sent.some(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.inputGeneration !== undefined &&
+        payload.state === "recording"
+    ),
+    false
+  );
+});
+
+test("stop and a new input binding cancel an in-flight managed system restoration", async (t) => {
+  const restoration = createDeferred();
+  const persisted = [];
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [{}, {}],
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, buffer]);
+      return true;
+    },
+    sourceInterrupted: async () => {},
+    sourceRestored: async () => {
+      await restoration.promise;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-inflight-recovery-old" }
+  );
+  fixture.managedStarts[0].onError(new Error("begin in-flight recovery"));
+  await waitForTimed(() => fixture.managedStarts.length === 2, "the in-flight recovery manager");
+  const recoveryProducer = fixture.managedStarts[1];
+  const stopsBeforeCancellation = fixture.managerStops.length;
+
+  await stop({ sender: fixture.sender });
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-inflight-recovery-new" }
+  );
+  send(
+    { sender: fixture.sender },
+    Buffer.from([9, 10]),
+    "mic",
+    current.inputGeneration
+  );
+  const staleAccepted = recoveryProducer.onChunk(Buffer.from([1, 2]));
+  restoration.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(staleAccepted, false);
+  assert.ok(fixture.managerStops.length > stopsBeforeCancellation);
+  assert.deepEqual(
+    persisted.map(([sessionId, source]) => [sessionId, source]),
+    [["jarvis-inflight-recovery-new", "mic"]]
+  );
+  assert.equal(
+    fixture.sent.some(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.state === "recording" &&
+        payload.inputGeneration !== current.inputGeneration
+    ),
+    false
+  );
+});
+
+test("stop settles a post-restoration gap retry false and late persistence cannot revive it", async (t) => {
+  const restoration = createDeferred();
+  const gapPersistence = createDeferred();
+  const interruptions = [];
+  let restorationCalls = 0;
+  const persisted = [];
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [{}, {}],
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+      if (interruptions.length === 2) await gapPersistence.promise;
+    },
+    sourceRestored: async () => {
+      restorationCalls += 1;
+      await restoration.promise;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-post-restore-gap-old" }
+  );
+  fixture.managedStarts[0].onError(new Error("start recovery"));
+  await waitForTimed(() => fixture.managedStarts.length === 2, "the recovery candidate");
+  await waitForTimed(() => restorationCalls === 1, "the pending restoration");
+  assert.equal(fixture.recoveryLoopStarts.length, 1);
+  const recoveryPromise = fixture.recoveryLoopStarts[0];
+
+  fixture.managedStarts[1].onError(new Error("candidate failed after restoration began"));
+  restoration.resolve();
+  await waitForTimed(() => interruptions.length === 2, "the post-restoration gap persistence");
+
+  await stop({ sender: fixture.sender });
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-post-restore-gap-new" }
+  );
+  send({ sender: fixture.sender }, Buffer.from([31, 32]), "mic", current.inputGeneration);
+  gapPersistence.resolve();
+
+  const outcome = await Promise.race([
+    recoveryPromise.then((value) => ({ settled: true, value })),
+    new Promise((resolve) =>
+      setTimeout(() => resolve({ settled: false, value: null }), 250)
+    ),
+  ]);
+  assert.deepEqual(outcome, { settled: true, value: false });
+  assert.deepEqual(
+    persisted.map(([sessionId, source]) => [sessionId, source]),
+    [["jarvis-post-restore-gap-new", "mic"]]
+  );
+  assert.equal(
+    fixture.sent.some(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.state === "recording" &&
+        payload.inputGeneration !== current.inputGeneration
+    ),
+    false
+  );
+});
+
+test("managed recovery buffer overflow stops the candidate without appending and later retries", async (t) => {
+  const firstOverflowChunk = Buffer.alloc(300 * 1024, 1);
+  const secondOverflowChunk = Buffer.alloc(300 * 1024, 2);
+  const recoveredChunk = Buffer.from([11, 12, 13]);
+  const persisted = [];
+  let restorationCalls = 0;
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [
+      {},
+      { chunks: [firstOverflowChunk, secondOverflowChunk] },
+      { chunks: [recoveredChunk] },
+    ],
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    sourceInterrupted: async () => {},
+    sourceRestored: async () => {
+      restorationCalls += 1;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-overflow-recovery" }
+  );
+  fixture.managedStarts[0].onError(new Error("begin overflow recovery"));
+
+  await waitForTimed(() => fixture.managedStarts.length === 3, "a retry after buffer overflow");
+  await waitForTimed(
+    () => persisted.some(([, source]) => source === "system"),
+    "the post-overflow recovered system chunk"
+  );
+
+  assert.deepEqual(fixture.managedStartAcceptances, [true, false, true]);
+  assert.deepEqual(persisted, [
+    ["jarvis-overflow-recovery", "system", recoveredChunk],
+  ]);
+  assert.ok(fixture.managerStops.length >= 2);
+  assert.equal(restorationCalls, 1);
+  assert.equal(
+    fixture.sent.some(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.state === "unavailable" &&
+        payload.reason === "system-recovery-buffer-overflow" &&
+        payload.inputGeneration === started.inputGeneration
+    ),
+    true
+  );
+  assert.equal(
+    fixture.sent.some(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.state === "recording" &&
+        payload.reason === "system-capture-restored" &&
+        payload.inputGeneration === started.inputGeneration
+    ),
+    true
+  );
+});
+
+test("managed recovery reopens the gap and retries when buffered delivery throws", async (t) => {
+  const failedDeliveryChunk = Buffer.from([21, 22]);
+  const recoveredChunk = Buffer.from([23, 24]);
+  const interruptions = [];
+  const persisted = [];
+  let systemDeliveryAttempts = 0;
+  const fixture = createFixture({
+    systemAvailable: true,
+    managedStartSequence: [
+      {},
+      { chunks: [failedDeliveryChunk] },
+      { chunks: [recoveredChunk] },
+    ],
+    appendPcm: (sessionId, source, buffer) => {
+      if (source === "system") {
+        systemDeliveryAttempts += 1;
+        if (systemDeliveryAttempts === 1) throw new Error("temporary evidence delivery failure");
+      }
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+    },
+    sourceRestored: async () => {},
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-delivery-retry" }
+  );
+  fixture.managedStarts[0].onError(new Error("begin delivery recovery"));
+
+  await waitForTimed(() => fixture.managedStarts.length === 3, "a retry after delivery failure");
+  await waitForTimed(
+    () => persisted.some(([, source]) => source === "system"),
+    "the system chunk after delivery retry"
+  );
+
+  assert.equal(systemDeliveryAttempts, 2);
+  assert.deepEqual(persisted, [["jarvis-delivery-retry", "system", recoveredChunk]]);
+  assert.equal(interruptions.length, 2);
+  assert.equal(interruptions[1][2].reason, "system-recovery-delivery-failed");
+  assert.ok(fixture.managerStops.length >= 2);
 });
 
 test("cancel keeps the start gate until the cancelled attempt finishes rolling back", async (t) => {
@@ -863,48 +1432,53 @@ test("cancel keeps the start gate until the cancelled attempt finishes rolling b
   assert.deepEqual(persisted, [["jarvis-current-c", "mic"]]);
 });
 
-test("rollback invalidates native ingress before awaiting manager teardown", async (t) => {
-  const stopDeferred = createDeferred();
+test("initial managed system append exceptions recover without escaping the start", async (t) => {
+  const interruptions = [];
+  const restorations = [];
+  const persisted = [];
   let appendCalls = 0;
+  let throwFirstSystem = true;
+  const initialChunk = Buffer.from([1, 2]);
+  const micChunk = Buffer.from([3, 4]);
   const fixture = createFixture({
-    appendPcm: () => {
+    appendPcm: (sessionId, source, buffer) => {
       appendCalls += 1;
-      throw new Error("startup evidence failed");
+      if (source === "system" && throwFirstSystem) {
+        throwFirstSystem = false;
+        throw new Error("startup evidence failed");
+      }
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
     },
-    managedStartChunk: Buffer.from([1, 2]),
-    managedStopDeferred: stopDeferred,
+    managedStartChunk: initialChunk,
+    sourceInterrupted: async (...args) => interruptions.push(args),
+    sourceRestored: async (...args) => restorations.push(args),
     systemAvailable: true,
   });
   t.after(fixture.cleanup);
   const start = fixture.handles.get("meeting-transcription-start");
-  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
 
-  const startPromise = start(
+  const result = await start(
     { sender: fixture.sender },
     { provider: "local", jarvisSessionId: "jarvis-flush-failure" }
   );
-  await waitFor(() => fixture.managerStops.length >= 1);
-  const stopPromise = stop({ sender: fixture.sender });
-  await new Promise((resolve) => setImmediate(resolve));
-  const managerStopsBeforeRelease = fixture.managerStops.length;
+  send({ sender: fixture.sender }, micChunk, "mic", result.inputGeneration);
 
-  let acceptedDuringTeardown;
-  let callbackError = null;
-  try {
-    acceptedDuringTeardown = fixture.managedStarts[0].onChunk(Buffer.from([3, 4]));
-  } catch (error) {
-    callbackError = error;
-  }
-
-  stopDeferred.resolve();
-  const [result, stopped] = await Promise.all([startPromise, stopPromise]);
-  assert.equal(callbackError, null);
-  assert.equal(acceptedDuringTeardown, false);
-  assert.equal(appendCalls, 1);
-  assert.equal(managerStopsBeforeRelease, 1);
-  assert.equal(stopped.success, true);
-  assert.equal(result.success, false);
-  assert.match(result.error, /startup evidence failed/);
+  assert.equal(result.success, true);
+  await waitForTimed(() => fixture.managedStarts.length === 2, "initial delivery recovery");
+  await waitForTimed(
+    () => persisted.some(([, source]) => source === "system"),
+    "initial delivery recovered append"
+  );
+  assert.equal(appendCalls, 3);
+  assert.equal(interruptions.length, 1);
+  assert.equal(restorations.length, 1);
+  assert.deepEqual(persisted, [
+    ["jarvis-flush-failure", "mic", micChunk],
+    ["jarvis-flush-failure", "system", initialChunk],
+  ]);
+  assert.ok(fixture.managerStops.length >= 1);
 });
 
 test("owner destruction invalidates active ingress, cleans up, and cannot affect the next owner", async (t) => {

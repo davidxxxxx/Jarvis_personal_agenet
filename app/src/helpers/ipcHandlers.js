@@ -16,6 +16,10 @@ const OpenAIRealtimeStreaming = require("./openaiRealtimeStreaming");
 const { getCortiToken } = require("./cortiAuth");
 const { createTinfoilRealtimeSocket } = require("./tinfoilSecureClient");
 const AudioStorageManager = require("./audioStorage");
+const {
+  createBoundedRecoveryBuffer,
+  createMeetingRecoveryLoop,
+} = require("./meetingRecoveryLoop");
 
 // Tinfoil's only realtime STT model — fallback when the renderer omits one.
 const TINFOIL_REALTIME_MODEL = "voxtral-mini-4b-realtime";
@@ -77,6 +81,7 @@ const ALLOWED_MEETING_PROVIDERS = new Set([
 // Meeting capture runs at 24 kHz (see meetingRecordingStore AudioContext); cloud
 // streaming providers must be told the true PCM rate or they misread the audio.
 const MEETING_STREAM_SAMPLE_RATE = 24000;
+const MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES = 512 * 1024;
 
 function parseAttendees(raw) {
   if (!raw) return [];
@@ -4694,12 +4699,12 @@ class IPCHandlers {
         inputBinding.active = false;
         inputBinding.cancelled = true;
         inputBinding.pendingManagedSystemChunks.splice(0);
+        inputBinding.managedSystemRecovery?.cancel();
+        inputBinding.managedSystemRecovery = null;
+        inputBinding.currentManagedSystemProducer = null;
         const interruptionPersistence = inputBinding.systemInterruptionPersistence;
         if (interruptionPersistence) {
-          interruptionPersistence.cancelled = true;
-          if (interruptionPersistence.timer) clearTimeout(interruptionPersistence.timer);
-          interruptionPersistence.timer = null;
-          inputBinding.systemInterruptionPersistence = null;
+          interruptionPersistence.handle.cancel();
         }
         if (inputBinding.ownerDestroyedListener) {
           inputBinding.owner?.removeListener?.("destroyed", inputBinding.ownerDestroyedListener);
@@ -5813,6 +5818,8 @@ class IPCHandlers {
         cancelled: false,
         pendingManagedSystemChunks: [],
         systemInterruptionPersistence: null,
+        managedSystemRecovery: null,
+        currentManagedSystemProducer: null,
         ownerDestroyedListener: null,
         teardownPromise: null,
         startSettledPromise: new Promise((resolve) => {
@@ -6074,18 +6081,30 @@ class IPCHandlers {
     };
 
     const rejectManagedMeetingSystemProducer = (producer, { stopManager = true } = {}) => {
-      if (producer.inputRejected) return;
+      producer.recoveryBuffer?.clear();
+      if (producer.inputRejected) return producer.stopPromise || Promise.resolve();
       producer.inputRejected = true;
       if (stopManager) {
-        void producer.manager.stop().catch(() => {});
+        producer.stopPromise ||= producer.manager.stop().catch(() => {});
       }
+      return producer.stopPromise || Promise.resolve();
     };
 
     const deliverManagedMeetingSystemChunk = (producer, chunk) => {
       if (producer.inputRejected) return false;
-      const accepted = sendMeetingAudio(chunk, "system");
+      let accepted = false;
+      try {
+        accepted = sendMeetingAudio(chunk, "system");
+      } catch (error) {
+        debugLogger.warn(
+          "Managed system delivery failed; recovering",
+          { errorName: error?.name ?? "Error" },
+          "meeting"
+        );
+      }
       if (accepted === false) {
-        rejectManagedMeetingSystemProducer(producer);
+        if (producer.onDeliveryFailure) producer.onDeliveryFailure();
+        else rejectManagedMeetingSystemProducer(producer);
       }
       return accepted;
     };
@@ -6102,19 +6121,54 @@ class IPCHandlers {
     };
 
     const managedSystemInterruptionRetryDelaysMs = [50, 100, 250, 500, 1000, 2000, 5000];
-    const persistManagedSystemInterruption = (inputBinding, producer, sessionId) => {
-      if (!inputBinding || !sessionId || inputBinding.systemInterruptionPersistence) return;
+    const persistManagedSystemInterruption = (
+      inputBinding,
+      producer,
+      sessionId,
+      reason = "system-capture-error"
+    ) => {
+      if (!inputBinding || !sessionId) {
+        return { settled: Promise.resolve(false), cancel() {} };
+      }
+      if (inputBinding.systemInterruptionPersistence) {
+        return inputBinding.systemInterruptionPersistence.handle;
+      }
+      let resolveSettlement;
+      const settled = new Promise((resolve) => {
+        resolveSettlement = resolve;
+      });
       const persistence = {
         cancelled: false,
+        settled: false,
         timer: null,
         attempt: 0,
         producer,
         sessionId,
+        handle: null,
         payload: {
           at: Date.now(),
-          reason: "system-capture-error",
+          reason,
         },
       };
+      const finish = (result) => {
+        if (persistence.settled) return;
+        persistence.settled = true;
+        if (persistence.timer) clearTimeout(persistence.timer);
+        persistence.timer = null;
+        if (inputBinding.systemInterruptionPersistence === persistence) {
+          inputBinding.systemInterruptionPersistence = null;
+        }
+        resolveSettlement(result);
+      };
+      const handle = {
+        settled,
+        cancel() {
+          if (persistence.settled) return;
+          persistence.cancelled = true;
+          finish(false);
+        },
+      };
+      persistence.handle = handle;
       inputBinding.systemInterruptionPersistence = persistence;
 
       const isCurrent = () =>
@@ -6126,7 +6180,10 @@ class IPCHandlers {
         !inputBinding.owner?.isDestroyed?.();
 
       const attemptPersistence = async () => {
-        if (!isCurrent()) return;
+        if (!isCurrent()) {
+          finish(false);
+          return;
+        }
         try {
           await this.jarvisService.sourceInterrupted(
             sessionId,
@@ -6134,7 +6191,10 @@ class IPCHandlers {
             persistence.payload
           );
         } catch (error) {
-          if (!isCurrent()) return;
+          if (!isCurrent()) {
+            finish(false);
+            return;
+          }
           debugLogger.warn(
             "Failed to persist current Jarvis system-source interruption; retrying",
             { errorName: error?.name ?? "Error" },
@@ -6155,17 +6215,345 @@ class IPCHandlers {
           return;
         }
 
-        if (inputBinding.systemInterruptionPersistence === persistence) {
-          inputBinding.systemInterruptionPersistence = null;
-        }
+        const persistedWhileCurrent = isCurrent();
+        finish(persistedWhileCurrent);
       };
 
       void attemptPersistence();
+      return handle;
+    };
+
+    const publishManagedSystemSourceState = (inputBinding, state, reason) => {
+      if (
+        activeMeetingInputBinding !== inputBinding ||
+        inputBinding.active !== true ||
+        inputBinding.owner?.isDestroyed?.()
+      ) {
+        return;
+      }
+      inputBinding.owner.send("meeting-transcription-source-state", {
+        source: "system",
+        state,
+        reason,
+        inputGeneration: inputBinding.inputGeneration,
+      });
+    };
+
+    const persistManagedSystemGapAfterRestoration = (
+      inputBinding,
+      producer,
+      sessionId,
+      reason
+    ) => {
+      if (
+        activeMeetingInputBinding !== inputBinding ||
+        inputBinding.active !== true ||
+        activeJarvisSessionId !== sessionId
+      ) {
+        return Promise.resolve(false);
+      }
+      return persistManagedSystemInterruption(
+        inputBinding,
+        producer,
+        sessionId,
+        reason
+      ).settled;
+    };
+
+    const getManagedSystemRecovery = (inputBinding, manager, warningLabel, sessionId) => {
+      if (inputBinding.managedSystemRecovery) return inputBinding.managedSystemRecovery;
+
+      const recovery = {
+        failedProducer: null,
+        inFlightProducer: null,
+        loop: null,
+        start: null,
+        cancel: null,
+      };
+      const isCurrent = () =>
+        activeMeetingInputBinding === inputBinding &&
+        inputBinding.active === true &&
+        !inputBinding.cancelled &&
+        activeJarvisSessionId === sessionId &&
+        !inputBinding.owner?.isDestroyed?.();
+
+      const loop = createMeetingRecoveryLoop({
+        isCurrent,
+        attempt: async ({ isCurrent: attemptIsCurrent }) => {
+          const failedProducer = recovery.failedProducer;
+          recovery.failedProducer = null;
+          await failedProducer?.stopPromise;
+          if (!attemptIsCurrent()) return true;
+
+          const producer = {
+            manager,
+            inputRejected: false,
+            stopPromise: null,
+            startupFailed: false,
+            committed: false,
+            failed: false,
+            overflowed: false,
+            recoveryBuffer: createBoundedRecoveryBuffer(
+              MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES
+            ),
+          };
+          recovery.inFlightProducer = producer;
+          const rejectCandidate = () => rejectManagedMeetingSystemProducer(producer);
+          const onCandidateFailure = (reason) => {
+            if (producer.failed || producer.inputRejected) return;
+            producer.failed = true;
+            producer.failureReason = reason;
+            void rejectCandidate();
+          };
+
+          try {
+            await manager.start({
+              onChunk: (chunk) => {
+                if (!attemptIsCurrent() || producer.inputRejected) return false;
+                if (producer.committed) {
+                  let accepted = false;
+                  try {
+                    accepted = sendMeetingAudio(chunk, "system");
+                  } catch (error) {
+                    debugLogger.warn(
+                      "Managed system recovery delivery failed; retrying",
+                      { errorName: error?.name ?? "Error" },
+                      "meeting"
+                    );
+                  }
+                  if (accepted === false) {
+                    handleManagedSystemProducerFailure(
+                      inputBinding,
+                      producer,
+                      sessionId,
+                      manager,
+                      warningLabel,
+                      "system-recovery-delivery-failed"
+                    );
+                  }
+                  return accepted;
+                }
+
+                if (!producer.recoveryBuffer.push(chunk)) {
+                  producer.overflowed = true;
+                  onCandidateFailure("system-recovery-buffer-overflow");
+                  publishManagedSystemSourceState(
+                    inputBinding,
+                    "unavailable",
+                    "system-recovery-buffer-overflow"
+                  );
+                  debugLogger.warn(
+                    "Managed system recovery buffer reached its byte limit",
+                    { maxBytes: MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES },
+                    "meeting"
+                  );
+                  return false;
+                }
+                return true;
+              },
+              onError: () => {
+                if (producer.committed) {
+                  handleManagedSystemProducerFailure(
+                    inputBinding,
+                    producer,
+                    sessionId,
+                    manager,
+                    warningLabel,
+                    "system-capture-error"
+                  );
+                  return;
+                }
+                onCandidateFailure("system-capture-error");
+              },
+              onWarning: (warning) => {
+                debugLogger.warn(
+                  warningLabel,
+                  { code: warning.code, message: warning.message },
+                  "meeting"
+                );
+              },
+            });
+          } catch (error) {
+            onCandidateFailure("system-recovery-start-failed");
+            await producer.stopPromise;
+            recovery.inFlightProducer = null;
+            debugLogger.warn(
+              "Managed system recovery start failed; retrying",
+              { errorName: error?.name ?? "Error" },
+              "meeting"
+            );
+            return false;
+          }
+
+          if (!attemptIsCurrent()) {
+            await rejectCandidate();
+            recovery.inFlightProducer = null;
+            return true;
+          }
+          if (producer.failed || producer.overflowed) {
+            await producer.stopPromise;
+            recovery.inFlightProducer = null;
+            return false;
+          }
+
+          let restored = false;
+          try {
+            await this.jarvisService.sourceRestored(sessionId, "system", {
+              at: Date.now(),
+              deviceId: null,
+              deviceLabel: null,
+              strategy: "wasapi-loopback",
+            });
+            restored = true;
+          } catch (error) {
+            debugLogger.warn(
+              "Failed to persist managed system restoration; retrying",
+              { errorName: error?.name ?? "Error" },
+              "meeting"
+            );
+          }
+
+          if (!restored) {
+            await rejectCandidate();
+            recovery.inFlightProducer = null;
+            return false;
+          }
+          if (!attemptIsCurrent()) {
+            await rejectCandidate();
+            recovery.inFlightProducer = null;
+            return true;
+          }
+          if (producer.failed || producer.overflowed) {
+            await rejectCandidate();
+            const gapPersisted = await persistManagedSystemGapAfterRestoration(
+              inputBinding,
+              producer,
+              sessionId,
+              producer.failureReason || "system-recovery-candidate-failed"
+            );
+            recovery.inFlightProducer = null;
+            return !gapPersisted;
+          }
+
+          for (const bufferedChunk of producer.recoveryBuffer.drain()) {
+            if (!attemptIsCurrent() || producer.inputRejected) break;
+            let accepted = false;
+            try {
+              accepted = sendMeetingAudio(bufferedChunk, "system");
+            } catch (error) {
+              debugLogger.warn(
+                "Managed system recovery buffered delivery failed; retrying",
+                { errorName: error?.name ?? "Error" },
+                "meeting"
+              );
+            }
+            if (accepted === false) {
+              onCandidateFailure("system-recovery-delivery-failed");
+              break;
+            }
+          }
+          if (!attemptIsCurrent()) {
+            await rejectCandidate();
+            recovery.inFlightProducer = null;
+            return true;
+          }
+          if (producer.failed || producer.inputRejected) {
+            await rejectCandidate();
+            const gapPersisted = await persistManagedSystemGapAfterRestoration(
+              inputBinding,
+              producer,
+              sessionId,
+              producer.failureReason || "system-recovery-delivery-failed"
+            );
+            recovery.inFlightProducer = null;
+            return !gapPersisted;
+          }
+
+          producer.committed = true;
+          inputBinding.currentManagedSystemProducer = producer;
+          recovery.inFlightProducer = null;
+          publishManagedSystemSourceState(inputBinding, "recording", "system-capture-restored");
+          return true;
+        },
+      });
+      recovery.loop = loop;
+      recovery.start = () => loop.start();
+      recovery.cancel = () => {
+        loop.cancel();
+        recovery.failedProducer && rejectManagedMeetingSystemProducer(recovery.failedProducer);
+        recovery.inFlightProducer && rejectManagedMeetingSystemProducer(recovery.inFlightProducer);
+        recovery.failedProducer = null;
+        recovery.inFlightProducer = null;
+      };
+      inputBinding.managedSystemRecovery = recovery;
+      return recovery;
+    };
+
+    const handleManagedSystemProducerFailure = (
+      inputBinding,
+      producer,
+      sessionId,
+      manager,
+      warningLabel,
+      reason = "system-capture-error"
+    ) => {
+      if (
+        producer.inputRejected ||
+        activeMeetingInputBinding !== inputBinding ||
+        inputBinding.active !== true ||
+        inputBinding.currentManagedSystemProducer !== producer ||
+        inputBinding.owner?.isDestroyed?.() ||
+        activeJarvisSessionId !== sessionId
+      ) {
+        rejectManagedMeetingSystemProducer(producer, { stopManager: false });
+        return;
+      }
+      inputBinding.currentManagedSystemProducer = null;
+      rejectManagedMeetingSystemProducer(producer);
+      publishManagedSystemSourceState(inputBinding, "unavailable", reason);
+      const persistence = persistManagedSystemInterruption(
+        inputBinding,
+        producer,
+        sessionId,
+        reason
+      );
+      void persistence.settled.then((persisted) => {
+        if (!persisted || manager !== this.windowsLoopbackAudioManager) return;
+        const recovery = getManagedSystemRecovery(
+          inputBinding,
+          manager,
+          warningLabel,
+          sessionId
+        );
+        recovery.failedProducer = producer;
+        void recovery.start();
+      });
     };
 
     const startManagedMeetingSystemAudio = async (event, manager, warningLabel) => {
       const inputBinding = activeMeetingInputBinding;
-      const producer = { manager, inputRejected: false, startupFailed: false };
+      const producer = {
+        manager,
+        inputRejected: false,
+        startupFailed: false,
+        stopPromise: null,
+        committed: true,
+        onDeliveryFailure: null,
+      };
+      producer.onDeliveryFailure = () => {
+        if (!activeJarvisSessionId) {
+          rejectManagedMeetingSystemProducer(producer);
+          return;
+        }
+        handleManagedSystemProducerFailure(
+          inputBinding,
+          producer,
+          activeJarvisSessionId,
+          manager,
+          warningLabel,
+          "system-capture-error"
+        );
+      };
       await manager.start({
         onChunk: (chunk) => {
           if (producer.inputRejected) return false;
@@ -6193,20 +6581,18 @@ class IPCHandlers {
             rejectManagedMeetingSystemProducer(producer, { stopManager: false });
             return;
           }
-          if (activeJarvisSessionId) {
-            persistManagedSystemInterruption(
-              inputBinding,
-              producer,
-              activeJarvisSessionId
-            );
+          if (!activeJarvisSessionId) {
+            publishManagedSystemSourceState(inputBinding, "unavailable", "system-capture-error");
+            rejectManagedMeetingSystemProducer(producer);
+            return;
           }
-          inputBinding.owner.send("meeting-transcription-source-state", {
-            source: "system",
-            state: "unavailable",
-            reason: "system-capture-error",
-            inputGeneration: inputBinding.inputGeneration,
-          });
-          rejectManagedMeetingSystemProducer(producer);
+          handleManagedSystemProducerFailure(
+            inputBinding,
+            producer,
+            activeJarvisSessionId,
+            manager,
+            warningLabel
+          );
         },
         onWarning: (warning) => {
           debugLogger.warn(
@@ -6220,6 +6606,7 @@ class IPCHandlers {
         await manager.stop().catch(() => {});
         throw new Error("System audio producer failed during startup");
       }
+      inputBinding.currentManagedSystemProducer = producer;
     };
 
     const fallBackToMicOnly = async (context) => {

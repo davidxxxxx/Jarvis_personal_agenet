@@ -96,6 +96,7 @@ class FakeAudioWorkletNode extends FakeAudioNode {
 const audioContexts: FakeAudioContext[] = [];
 const audioWorkletNodes: FakeAudioWorkletNode[] = [];
 const workletChunksOnAttach: Array<ArrayBuffer[]> = [];
+let onAudioContextCreated: ((context: FakeAudioContext, index: number) => void) | null = null;
 
 class FakeAudioContext {
   state: AudioContextState = "running";
@@ -114,7 +115,9 @@ class FakeAudioContext {
   setSinkId = vi.fn(async () => {});
 
   constructor() {
+    const index = audioContexts.length;
     audioContexts.push(this);
+    onAudioContextCreated?.(this, index);
   }
 }
 
@@ -142,8 +145,12 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   let sourceStateListener:
     | ((payload: {
         source: "system";
-        state: "unavailable";
-        reason: "system-capture-error";
+        state: "unavailable" | "recording";
+        reason:
+          | "system-capture-error"
+          | "system-capture-restored"
+          | "system-recovery-buffer-overflow"
+          | "system-recovery-delivery-failed";
         inputGeneration: string;
       }) => void)
     | null;
@@ -153,6 +160,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     audioContexts.length = 0;
     audioWorkletNodes.length = 0;
     workletChunksOnAttach.length = 0;
+    onAudioContextCreated = null;
     track = new FakeTrack();
     segmentListener = null;
     segmentListenerDetached = false;
@@ -378,6 +386,93 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
       mic: "idle",
       system: "unavailable",
+    });
+  });
+
+  it("returns a current native system source to recording after main-managed recovery", async () => {
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-native-recovered",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Native system recovery state",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: false,
+      jarvisSessionId: "s-native-recovered",
+    });
+
+    sourceStateListener?.({
+      source: "system",
+      state: "unavailable",
+      reason: "system-capture-error",
+      inputGeneration: "input-generation-native-recovered",
+    });
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      error: "System audio capture stopped.",
+      captureSourceStates: { mic: "recording", system: "unavailable" },
+    });
+
+    sourceStateListener?.({
+      source: "system",
+      state: "recording",
+      reason: "system-capture-restored",
+      inputGeneration: "input-generation-native-recovered",
+    });
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      error: null,
+      captureSourceStates: { mic: "recording", system: "recording" },
+    });
+  });
+
+  it("accepts a visible main-managed delivery failure source-state reason", async () => {
+    type SourceStatePayload = Parameters<
+      Parameters<NonNullable<Window["electronAPI"]["onMeetingTranscriptionSourceState"]>>[0]
+    >[0];
+    const deliveryFailureState: SourceStatePayload = {
+      source: "system",
+      state: "unavailable",
+      reason: "system-recovery-delivery-failed",
+      inputGeneration: "input-generation-native-delivery-failed",
+    };
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-native-delivery-failed",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Native delivery failure state",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: false,
+      jarvisSessionId: "s-native-delivery-failed",
+    });
+    sourceStateListener?.(deliveryFailureState);
+
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      error: "System audio capture stopped.",
+      captureSourceStates: { mic: "recording", system: "unavailable" },
     });
   });
 
@@ -608,7 +703,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
 
     expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
       mic: "recording",
-      system: "unavailable",
+      system: "recovering",
     });
     await vi.waitFor(() => {
       expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledTimes(1);
@@ -618,6 +713,365 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       "system",
       expect.objectContaining({ reason: "system-renderer-ended" })
     );
+  });
+
+  it("recovers renderer loopback before replacement PCM while microphone PCM continues", async () => {
+    const micTrack = new FakeTrack("Physical microphone", "mic-survivor");
+    const initialSystemTrack = new FakeTrack("Old computer audio", "old-system-loopback");
+    const replacementSystemTrack = new FakeTrack(
+      "Replacement computer audio",
+      "replacement-system-loopback"
+    );
+    const initialSystemStream = streamFor(initialSystemTrack);
+    const replacementSystemStream = streamFor(replacementSystemTrack);
+    const restoration = createDeferred<
+      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>
+    >();
+    const replacementChunk = new ArrayBuffer(8);
+    const survivingMicChunk = new ArrayBuffer(6);
+    workletChunksOnAttach.push([], [], [replacementChunk]);
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(streamFor(micTrack));
+    Object.assign(navigator.mediaDevices, {
+      getDisplayMedia: vi
+        .fn()
+        .mockResolvedValueOnce(initialSystemStream)
+        .mockResolvedValueOnce(replacementSystemStream),
+    });
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "loopback" as const,
+      strategy: "loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "loopback",
+      systemAudioStrategy: "loopback",
+      inputGeneration: "renderer-loopback-recovery-generation",
+    });
+    vi.mocked(window.electronAPI.jarvis.sourceRestored).mockReturnValueOnce(restoration.promise);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Renderer loopback recovery",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-renderer-loopback-recovery",
+    });
+
+    initialSystemTrack.end();
+    initialSystemStream.dispatchEvent(new Event("inactive"));
+
+    await vi.waitFor(() => {
+      expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(2);
+      expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledOnce();
+    });
+    expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledOnce();
+    expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
+      mic: "recording",
+      system: "recovering",
+    });
+
+    audioWorkletNodes[0].port.onmessage?.({ data: survivingMicChunk } as MessageEvent<ArrayBuffer>);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledWith(
+      survivingMicChunk,
+      "mic",
+      "renderer-loopback-recovery-generation"
+    );
+    expect(
+      vi
+        .mocked(window.electronAPI.meetingTranscriptionSend!)
+        .mock.calls.some(([chunk, source]) => chunk === replacementChunk && source === "system")
+    ).toBe(false);
+
+    restoration.resolve({
+      sessionId: "s-renderer-loopback-recovery",
+      status: "recording",
+      startedAt: 1_000,
+      elapsedMs: 0,
+      errorCode: null,
+    });
+
+    await vi.waitFor(() => {
+      expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledWith(
+        replacementChunk,
+        "system",
+        "renderer-loopback-recovery-generation"
+      );
+      expect(useMeetingRecordingStore.getState().captureSourceStates.system).toBe("recording");
+    });
+    expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledWith(
+      "s-renderer-loopback-recovery",
+      "system",
+      expect.objectContaining({
+        deviceId: "replacement-system-loopback",
+        deviceLabel: "Replacement computer audio",
+        strategy: "loopback",
+      })
+    );
+    expect(
+      vi.mocked(window.electronAPI.jarvis.sourceRestored).mock.invocationCallOrder[0]
+    ).toBeLessThan(
+      vi
+        .mocked(window.electronAPI.meetingTranscriptionSend!)
+        .mock.invocationCallOrder.find((_, index) => {
+          const [chunk, source] = vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock.calls[
+            index
+          ];
+          return chunk === replacementChunk && source === "system";
+        }) as number
+    );
+  });
+
+  it("reopens the renderer gap and retries when a restored loopback cannot attach", async () => {
+    const micTrack = new FakeTrack("Physical microphone", "mic-attach-retry");
+    const initialSystemTrack = new FakeTrack("Old computer audio", "old-system-attach-retry");
+    const failedReplacementTrack = new FakeTrack(
+      "Failed replacement computer audio",
+      "failed-system-attach-retry"
+    );
+    const workingReplacementTrack = new FakeTrack(
+      "Working replacement computer audio",
+      "working-system-attach-retry"
+    );
+    const initialSystemStream = streamFor(initialSystemTrack);
+    const failedReplacementStream = streamFor(failedReplacementTrack);
+    const workingReplacementStream = streamFor(workingReplacementTrack);
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(streamFor(micTrack));
+    Object.assign(navigator.mediaDevices, {
+      getDisplayMedia: vi
+        .fn()
+        .mockResolvedValueOnce(initialSystemStream)
+        .mockResolvedValueOnce(failedReplacementStream)
+        .mockResolvedValueOnce(workingReplacementStream),
+    });
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "loopback" as const,
+      strategy: "loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "loopback",
+      systemAudioStrategy: "loopback",
+      inputGeneration: "renderer-loopback-attach-retry-generation",
+    });
+    onAudioContextCreated = (context, index) => {
+      if (index === 2) {
+        context.audioWorklet.addModule = vi.fn(async () => {
+          throw new Error("replacement worklet unavailable");
+        });
+      }
+    };
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Renderer attach retry",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-renderer-attach-retry",
+    });
+
+    initialSystemTrack.end();
+    initialSystemStream.dispatchEvent(new Event("inactive"));
+
+    await vi.waitFor(
+      () => {
+        expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(3);
+        expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledTimes(2);
+        expect(useMeetingRecordingStore.getState().captureSourceStates.system).toBe("recording");
+      },
+      { timeout: 2_000 }
+    );
+
+    expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledTimes(2);
+    expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenNthCalledWith(
+      2,
+      "s-renderer-attach-retry",
+      "system",
+      expect.objectContaining({ reason: "system-renderer-pipeline-attach-failed" })
+    );
+    expect(failedReplacementTrack.stop).toHaveBeenCalledOnce();
+    expect(workingReplacementTrack.stop).not.toHaveBeenCalled();
+  });
+
+  it("stops a renderer recovery candidate and ignores late restoration after a new generation", async () => {
+    const micTrack = new FakeTrack("Physical microphone", "mic-late-system-restore");
+    const initialSystemTrack = new FakeTrack("Old computer audio", "old-system-late-restore");
+    const replacementSystemTrack = new FakeTrack(
+      "Late replacement computer audio",
+      "late-system-restore"
+    );
+    const initialSystemStream = streamFor(initialSystemTrack);
+    const replacementSystemStream = streamFor(replacementSystemTrack);
+    const restoration = createDeferred<
+      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>
+    >();
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(micTrack))
+      .mockResolvedValueOnce(streamFor(new FakeTrack("New microphone", "new-mic-generation")));
+    Object.assign(navigator.mediaDevices, {
+      getDisplayMedia: vi
+        .fn()
+        .mockResolvedValueOnce(initialSystemStream)
+        .mockResolvedValueOnce(replacementSystemStream),
+    });
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "loopback" as const,
+      strategy: "loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!)
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "loopback",
+        systemAudioStrategy: "loopback",
+        inputGeneration: "old-renderer-loopback-generation",
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "unsupported",
+        systemAudioStrategy: "unsupported",
+        inputGeneration: "new-mic-only-generation",
+      });
+    vi.mocked(window.electronAPI.jarvis.sourceRestored).mockReturnValueOnce(restoration.promise);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Old renderer recovery",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-old-renderer-recovery",
+    });
+    initialSystemTrack.end();
+    await vi.waitFor(() => {
+      expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledOnce();
+    });
+
+    await stopRecording();
+    expect(replacementSystemTrack.stop).toHaveBeenCalledOnce();
+    await startRecording({
+      noteId: null,
+      noteTitle: "New mic generation",
+      folderId: null,
+      captureSystemAudio: false,
+      captureMicrophone: true,
+      jarvisSessionId: "s-new-mic-generation",
+    });
+
+    restoration.resolve({
+      sessionId: "s-old-renderer-recovery",
+      status: "recording",
+      startedAt: 1_000,
+      elapsedMs: 0,
+      errorCode: null,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledOnce();
+    expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledOnce();
+    expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(2);
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      captureSourceStates: { mic: "recording", system: "idle" },
+    });
+  });
+
+  it("releases each prior renderer system lifecycle owner across repeated recovery", async () => {
+    const micTrack = new FakeTrack("Physical microphone", "mic-lifecycle-owner");
+    const initialSystemTrack = new FakeTrack("Initial computer audio", "system-owner-initial");
+    const firstReplacementTrack = new FakeTrack(
+      "First replacement computer audio",
+      "system-owner-first"
+    );
+    const secondReplacementTrack = new FakeTrack(
+      "Second replacement computer audio",
+      "system-owner-second"
+    );
+    const initialSystemStream = streamFor(initialSystemTrack);
+    const firstReplacementStream = streamFor(firstReplacementTrack);
+    const secondReplacementStream = streamFor(secondReplacementTrack);
+    const initialTrackRemove = vi.spyOn(initialSystemTrack, "removeEventListener");
+    const initialStreamRemove = vi.spyOn(initialSystemStream, "removeEventListener");
+    const firstTrackRemove = vi.spyOn(firstReplacementTrack, "removeEventListener");
+    const firstStreamRemove = vi.spyOn(firstReplacementStream, "removeEventListener");
+    const secondTrackRemove = vi.spyOn(secondReplacementTrack, "removeEventListener");
+    const secondStreamRemove = vi.spyOn(secondReplacementStream, "removeEventListener");
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(streamFor(micTrack));
+    Object.assign(navigator.mediaDevices, {
+      getDisplayMedia: vi
+        .fn()
+        .mockResolvedValueOnce(initialSystemStream)
+        .mockResolvedValueOnce(firstReplacementStream)
+        .mockResolvedValueOnce(secondReplacementStream),
+    });
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "loopback" as const,
+      strategy: "loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "loopback",
+      systemAudioStrategy: "loopback",
+      inputGeneration: "renderer-lifecycle-owner-generation",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Renderer lifecycle owner",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-renderer-lifecycle-owner",
+    });
+
+    initialSystemTrack.end();
+    await vi.waitFor(
+      () => {
+        expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(2);
+        expect(useMeetingRecordingStore.getState().captureSourceStates.system).toBe("recording");
+      },
+      { timeout: 2_000 }
+    );
+    expect(initialTrackRemove).toHaveBeenCalledWith("ended", expect.any(Function));
+    expect(initialStreamRemove).toHaveBeenCalledWith("inactive", expect.any(Function));
+
+    firstReplacementTrack.end();
+    await vi.waitFor(
+      () => {
+        expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(3);
+        expect(useMeetingRecordingStore.getState().captureSourceStates.system).toBe("recording");
+      },
+      { timeout: 2_000 }
+    );
+    expect(firstTrackRemove).toHaveBeenCalledWith("ended", expect.any(Function));
+    expect(firstStreamRemove).toHaveBeenCalledWith("inactive", expect.any(Function));
+    expect(secondTrackRemove).not.toHaveBeenCalled();
+    expect(secondStreamRemove).not.toHaveBeenCalled();
+
+    initialSystemStream.dispatchEvent(new Event("inactive"));
+    firstReplacementStream.dispatchEvent(new Event("inactive"));
+    initialSystemTrack.dispatchEvent(new Event("ended"));
+    firstReplacementTrack.dispatchEvent(new Event("ended"));
+    await Promise.resolve();
+    expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledTimes(2);
+    expect(navigator.mediaDevices.getDisplayMedia).toHaveBeenCalledTimes(3);
+
+    await stopRecording();
+    expect(secondTrackRemove).toHaveBeenCalledWith("ended", expect.any(Function));
+    expect(secondStreamRemove).toHaveBeenCalledWith("inactive", expect.any(Function));
   });
 
   it("retries renderer system interruption persistence after ended and inactive are exhausted", async () => {
@@ -671,7 +1125,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledTimes(2);
     expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
       mic: "recording",
-      system: "unavailable",
+      system: "recovering",
     });
     vi.useRealTimers();
   });
