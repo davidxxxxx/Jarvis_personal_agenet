@@ -235,6 +235,61 @@ test("rejects invalid and stale restoration evidence without mutation", (t) => {
   assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "active");
 });
 
+test("restoration target state defaults active and accepts only active or paused", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  for (const [trackId, gapId] of [
+    ["t1", "g1"],
+    ["t2", "g2"],
+  ]) {
+    store.interruptTrack({
+      trackId,
+      gap: { id: gapId, trackId, startedAt: 20, reason: "device-change" },
+    });
+  }
+
+  const active = store.restoreTrack({ trackId: "t1", gapId: "g1", endedAt: 30 });
+  const paused = store.restoreTrack({
+    trackId: "t2",
+    gapId: "g2",
+    endedAt: 31,
+    targetState: "paused",
+  });
+  store.interruptTrack({
+    trackId: "t1",
+    gap: { id: "g3", trackId: "t1", startedAt: 32, reason: "device-change" },
+  });
+  assert.throws(
+    () =>
+      store.restoreTrack({
+        trackId: "t1",
+        gapId: "g3",
+        endedAt: 33,
+        targetState: "recovering",
+      }),
+    /target state/i
+  );
+
+  assert.equal(active.targetState, "active");
+  assert.equal(paused.targetState, "paused");
+  assert.deepEqual(
+    db.prepare("SELECT id, state, ended_at FROM audio_tracks ORDER BY id").all(),
+    [
+      { id: "t1", state: "recovering", ended_at: 32 },
+      { id: "t2", state: "paused", ended_at: 31 },
+    ]
+  );
+  assert.deepEqual(
+    db.prepare("SELECT id, ended_at FROM audio_gaps ORDER BY id").all(),
+    [
+      { id: "g1", ended_at: 30 },
+      { id: "g2", ended_at: 31 },
+      { id: "g3", ended_at: null },
+    ]
+  );
+});
+
 test("finalizes gaps tracks and session atomically", (t) => {
   const { db, store } = fixture(t);
   createTrack(store);
@@ -554,6 +609,51 @@ test("pause and resume retain recovering tracks and their open gaps", (t) => {
   ]);
   assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("resume rejects atomically when all tracks are recovering", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  for (const [trackId, gapId] of [
+    ["t1", "g1"],
+    ["t2", "g2"],
+  ]) {
+    store.interruptTrack({
+      trackId,
+      gap: { id: gapId, trackId, startedAt: 20, reason: "device-change" },
+    });
+  }
+  store.pauseCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "recovering" },
+      { trackId: "t2", expectedState: "recovering" },
+    ],
+    at: 30,
+  });
+
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "recovering" },
+          { trackId: "t2", expectedState: "recovering" },
+        ],
+        at: 40,
+      }),
+    /paused track/i
+  );
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "paused");
+  assert.deepEqual(db.prepare("SELECT id, state FROM audio_tracks ORDER BY id").all(), [
+    { id: "t1", state: "recovering" },
+    { id: "t2", state: "recovering" },
+  ]);
+  assert.deepEqual(db.prepare("SELECT id, ended_at FROM audio_gaps ORDER BY id").all(), [
+    { id: "g1", ended_at: null },
+    { id: "g2", ended_at: null },
+  ]);
 });
 
 test("finalization rejects timestamps before session start without tracks", (t) => {

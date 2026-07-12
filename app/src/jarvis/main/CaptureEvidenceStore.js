@@ -2,6 +2,7 @@ const MAX_CHUNK_DURATION_MS = 60_000;
 const MAX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TERMINAL_TRACK_STATES = new Set(["ended", "recovered", "failed"]);
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
+const RESTORATION_TARGET_STATES = new Set(["active", "paused"]);
 const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   completed: "ended",
   recovered: "recovered",
@@ -148,7 +149,10 @@ class CaptureEvidenceStore {
       return { trackId, gapId: gap.id };
     });
     this.restoreTrackTransaction = db.transaction(
-      ({ trackId, gapId, endedAt, recoveryAttempts = 1 }) => {
+      ({ trackId, gapId, endedAt, recoveryAttempts = 1, targetState = "active" }) => {
+        if (!RESTORATION_TARGET_STATES.has(targetState)) {
+          throw new TypeError("invalid restoration target state");
+        }
         this._assertIdentifier(trackId, "trackId");
         this._assertIdentifier(gapId, "gapId");
         this._assertSafeInteger(endedAt, "restoration endedAt");
@@ -167,9 +171,13 @@ class CaptureEvidenceStore {
         }
         const closed = this.closeGap(gapId, endedAt, recoveryAttempts);
         if (closed.changes !== 1) throw new Error(`gap ${gapId} is not open`);
-        const updated = this.setTrackState(trackId, "active", null);
+        const updated = this.setTrackState(
+          trackId,
+          targetState,
+          targetState === "paused" ? endedAt : null
+        );
         if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
-        return { trackId, gapId };
+        return { trackId, gapId, targetState };
       }
     );
     this.pauseCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
@@ -201,6 +209,9 @@ class CaptureEvidenceStore {
         sessionState: "paused",
         sourceStates: new Set(["paused", "recovering"]),
       });
+      if (!evidence.some(({ track }) => track.state === "paused")) {
+        throw new Error("resume requires at least one paused track");
+      }
       for (const { track } of evidence) {
         if (track.state !== "paused") continue;
         const updated = this.setTrackState(track.id, "active", null);

@@ -66,9 +66,19 @@ function createRepository() {
       if (gap) Object.assign(gap, { endedAt, recoveryAttempts });
       return gap;
     },
-    restoreTrack({ trackId, gapId, endedAt, recoveryAttempts = 1 }) {
+    restoreTrack({
+      trackId,
+      gapId,
+      endedAt,
+      recoveryAttempts = 1,
+      targetState = "active",
+    }) {
       this.closeGap(gapId, endedAt, recoveryAttempts);
-      return this.setTrackState(trackId, "active", null);
+      return this.setTrackState(
+        trackId,
+        targetState,
+        targetState === "paused" ? endedAt : null
+      );
     },
     pauseCapture({ sessionId, sources, at }) {
       for (const source of sources) {
@@ -1207,6 +1217,133 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
     assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 2)), false);
   } finally {
     service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("resume rejects repeatedly when all sources are recovering without side effects", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-recovering-resume-"));
+  const repository = createRepository();
+  let resumeCalls = 0;
+  const resumeCapture = repository.resumeCapture;
+  repository.resumeCapture = function (input) {
+    resumeCalls += 1;
+    return resumeCapture.call(this, input);
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 50,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
+    service.sourceInterrupted("s1", "system", { at: 30, reason: "device-change" });
+    let reopenCalls = 0;
+    const reopenSource = service.writer.reopenSource;
+    service.writer.reopenSource = function (...args) {
+      reopenCalls += 1;
+      return reopenSource.apply(this, args);
+    };
+
+    assert.throws(() => service.resumeCapture("s1", 40), /no paused sources/i);
+    assert.throws(() => service.resumeCapture("s1", 50), /no paused sources/i);
+    assert.equal(resumeCalls, 0);
+    assert.equal(reopenCalls, 0);
+    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.deepEqual(repository.tracks.map((track) => track.state), ["recovering", "recovering"]);
+    assert.deepEqual(repository.gaps.map((gap) => gap.endedAt), [null, null]);
+    const state = service.getState();
+    assert.equal(state.status, "paused");
+    assert.equal(state.sources.mic.state, "reconnecting");
+    assert.equal(state.sources.system.state, "reconnecting");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("manual pause restoration waits for explicit resume and preserves both sequences", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manual-pause-restore-"));
+  const repository = new JarvisRepository(":memory:");
+  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 60,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.appendPcm("s1", "mic", Buffer.alloc(48, 1));
+    service.appendPcm("s1", "system", Buffer.alloc(48, 2));
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    service.pauseCapture("s1", 30);
+    let reopenCalls = 0;
+    const reopenSource = service.writer.reopenSource;
+    service.writer.reopenSource = function (...args) {
+      reopenCalls += 1;
+      return reopenSource.apply(this, args);
+    };
+
+    const restored = service.sourceRestored("s1", "system", {
+      at: 40,
+      deviceId: "output-2",
+      deviceLabel: "New output",
+      strategy: "wasapi-loopback",
+    });
+    assert.equal(restored.status, "paused");
+    assert.equal(restored.sources.mic.state, "paused");
+    assert.equal(restored.sources.system.state, "paused");
+    assert.equal(restored.sources.system.gapId, null);
+    assert.equal(reopenCalls, 0);
+    assert.equal(service.writer.writers.has("system"), false);
+    assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 3)), false);
+    assert.equal(repository.getSession("s1").status, "paused");
+    assert.deepEqual(
+      repository.db.prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type").all(),
+      [
+        { source_type: "mic", state: "paused", ended_at: 30 },
+        { source_type: "system", state: "paused", ended_at: 40 },
+      ]
+    );
+    assert.equal(repository.db.prepare("SELECT ended_at FROM audio_gaps").get().ended_at, 40);
+
+    const resumed = service.resumeCapture("s1", 50);
+    assert.equal(resumed.status, "recording");
+    assert.equal(resumed.sources.mic.state, "active");
+    assert.equal(resumed.sources.system.state, "active");
+    assert.equal(reopenCalls, 2);
+    assert.equal(repository.getSession("s1").status, "recording");
+    assert.deepEqual(
+      repository.db.prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type").all(),
+      [
+        { source_type: "mic", state: "active", ended_at: null },
+        { source_type: "system", state: "active", ended_at: null },
+      ]
+    );
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 4)), true);
+    assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 5)), true);
+    service.finishCapture("s1", 60);
+    assert.deepEqual(
+      repository.db
+        .prepare("SELECT source_type, sequence_number FROM audio_chunks ORDER BY source_type, sequence_number")
+        .all(),
+      [
+        { source_type: "mic", sequence_number: 0 },
+        { source_type: "mic", sequence_number: 1 },
+        { source_type: "system", sequence_number: 0 },
+        { source_type: "system", sequence_number: 1 },
+      ]
+    );
+  } finally {
+    service.shutdown();
+    repository.close();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

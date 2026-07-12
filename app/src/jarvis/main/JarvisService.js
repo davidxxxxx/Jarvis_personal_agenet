@@ -197,6 +197,27 @@ class JarvisService {
       throw new TypeError("restoration source type must match the requested source");
     }
     const restored = normalizeSource({ ...restoration, sourceType: source.sourceType });
+    const isManualPause =
+      this.state.status === "paused" &&
+      Object.values(this.state.sources).some((entry) => entry.state === "paused");
+
+    if (isManualPause) {
+      this.repository.restoreTrack({
+        trackId: source.trackId,
+        gapId: source.gapId,
+        endedAt: restoration.at,
+        recoveryAttempts: 1,
+        targetState: "paused",
+      });
+      Object.assign(source, restored, {
+        state: "paused",
+        gapId: null,
+        interruptedAt: null,
+        reason: null,
+        errorCode: null,
+      });
+      return this._publish(restoration.at);
+    }
 
     try {
       this._assertSafeDiskSpace();
@@ -271,6 +292,9 @@ class JarvisService {
     this._assertOpen();
     this._assertActive(sessionId, "paused");
     this._assertTime(at, "at");
+    if (!Object.values(this.state.sources).some((source) => source.state === "paused")) {
+      throw new Error("capture has no paused sources to resume");
+    }
     try {
       this._assertSafeDiskSpace();
     } catch (error) {
