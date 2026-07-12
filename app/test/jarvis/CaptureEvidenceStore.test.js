@@ -90,6 +90,59 @@ test("stores track state and gap lifecycle evidence", (t) => {
   });
 });
 
+test("creates requested tracks atomically", (t) => {
+  const { db, store } = fixture(t);
+  const system = {
+    id: "t1",
+    sessionId: "s1",
+    sourceType: "system",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 10,
+  };
+
+  assert.throws(
+    () => store.createTracks([system, { ...system, sourceType: "mic" }]),
+    /audio_tracks\.id/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_tracks").get().count, 0);
+});
+
+test("rolls back interruption when its gap cannot be persisted", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.openGap({ id: "g1", trackId: "t1", startedAt: 11, reason: "existing" });
+
+  assert.throws(
+    () =>
+      store.interruptTrack({
+        trackId: "t1",
+        gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+      }),
+    /audio_gaps\.id/i
+  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
+    state: "active",
+    ended_at: null,
+  });
+});
+
+test("rolls back gap closure when restoration track is missing", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.interruptTrack({
+    trackId: "t1",
+    gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+  });
+
+  assert.throws(
+    () => store.restoreTrack({ trackId: "missing", gapId: "g1", endedAt: 30 }),
+    /track missing/i
+  );
+  assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
+  assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "recovering");
+});
+
 test("commits a chunk and one transcription job atomically", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -365,14 +418,17 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
       channels: 1,
       startedAt: 10,
     });
-    repository.setTrackState("t1", "recovering");
-    repository.openGap({ id: "g1", trackId: "t1", startedAt: 11, reason: "device_lost" });
-    repository.closeGap("g1", 12, 1);
+    repository.createTracks([]);
+    repository.interruptTrack({
+      trackId: "t1",
+      gap: { id: "g1", trackId: "t1", startedAt: 11, reason: "device_lost" },
+    });
+    repository.restoreTrack({ trackId: "t1", gapId: "g1", endedAt: 12, recoveryAttempts: 1 });
     repository.commitChunk(chunk());
     const job = repository.enqueueChunkTranscription(chunk());
     repository.tombstoneChunk("c1", 200);
 
-    assert.equal(repository.db.prepare("SELECT state FROM audio_tracks").get().state, "recovering");
+    assert.equal(repository.db.prepare("SELECT state FROM audio_tracks").get().state, "active");
     assert.equal(repository.db.prepare("SELECT ended_at FROM audio_gaps").get().ended_at, 12);
     assert.equal(job.job_type, "transcribe_chunk");
     assert.equal(repository.getAudioChunk("c1").deleted_at, 200);

@@ -155,6 +155,21 @@ test("start capture IPC rejects invalid source selections before calling the ser
   assert.equal(calls, 0);
 });
 
+test("capture modes require their exact unique source set", () => {
+  const { normalizeCaptureSources } = require("../../src/jarvis/shared/captureModes");
+  const mic = { sourceType: "mic" };
+  const system = { sourceType: "system" };
+
+  assert.throws(() => normalizeCaptureSources("dual", [mic, mic]), /exactly match/);
+  assert.throws(() => normalizeCaptureSources("mic", [mic, system]), /exactly match/);
+  assert.throws(() => normalizeCaptureSources("system", [mic]), /exactly match/);
+  assert.throws(() => normalizeCaptureSources("mic", [system]), /exactly match/);
+  assert.deepEqual(
+    normalizeCaptureSources("dual", [system, mic]).map((source) => source.sourceType),
+    ["mic", "system"]
+  );
+});
+
 test("contract exposes only the named Jarvis channels", () => {
   assert.deepEqual(
     Object.keys(CHANNELS).sort(),
@@ -489,9 +504,12 @@ test("failCapture IPC validates MIC codes and preserves authoritative failed bro
     },
     insertAudioChunk: () => {},
     createTrack: () => {},
+    createTracks: () => {},
     setTrackState: () => {},
     openGap: () => {},
+    interruptTrack: () => {},
     closeGap: () => {},
+    restoreTrack: () => {},
     commitChunk: () => {},
     recoverOpenSessions: () => [],
   };

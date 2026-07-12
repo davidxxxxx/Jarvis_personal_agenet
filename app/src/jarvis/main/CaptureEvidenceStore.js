@@ -42,6 +42,7 @@ class CaptureEvidenceStore {
         WHERE id = @id AND ended_at IS NULL
       `),
       getTrack: db.prepare("SELECT * FROM audio_tracks WHERE id = ?"),
+      getGap: db.prepare("SELECT * FROM audio_gaps WHERE id = ?"),
       findChunkSequence: db.prepare(`
         SELECT id FROM audio_chunks
         WHERE track_id = ? AND sequence_number = ?
@@ -92,6 +93,32 @@ class CaptureEvidenceStore {
       this.statements.insertChunk.run(chunk);
       return this._insertChunkTranscription(chunk);
     });
+    this.createTracksTransaction = db.transaction((tracks) =>
+      tracks.map((track) => this.createTrack(track))
+    );
+    this.interruptTrackTransaction = db.transaction(({ trackId, gap }) => {
+      const track = this.statements.getTrack.get(trackId);
+      if (!track) throw new Error(`track ${trackId} does not exist`);
+      if (gap.trackId !== trackId) throw new Error("gap track does not match transition track");
+      const updated = this.setTrackState(trackId, "recovering", gap.startedAt);
+      if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
+      this.openGap(gap);
+      return { trackId, gapId: gap.id };
+    });
+    this.restoreTrackTransaction = db.transaction(
+      ({ trackId, gapId, endedAt, recoveryAttempts = 1 }) => {
+        const track = this.statements.getTrack.get(trackId);
+        if (!track) throw new Error(`track ${trackId} does not exist`);
+        const gap = this.statements.getGap.get(gapId);
+        if (!gap) throw new Error(`gap ${gapId} does not exist`);
+        if (gap.track_id !== trackId) throw new Error("gap track does not match transition track");
+        const closed = this.closeGap(gapId, endedAt, recoveryAttempts);
+        if (closed.changes !== 1) throw new Error(`gap ${gapId} is not open`);
+        const updated = this.setTrackState(trackId, "active", null);
+        if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
+        return { trackId, gapId };
+      }
+    );
   }
 
   createTrack(track) {
@@ -110,6 +137,11 @@ class CaptureEvidenceStore {
     });
   }
 
+  createTracks(tracks) {
+    if (!Array.isArray(tracks)) throw new TypeError("tracks must be an array");
+    return this.createTracksTransaction(tracks);
+  }
+
   setTrackState(id, state, endedAt = null) {
     return this.statements.setTrackState.run({ id, state, endedAt });
   }
@@ -121,8 +153,16 @@ class CaptureEvidenceStore {
     });
   }
 
+  interruptTrack(input) {
+    return this.interruptTrackTransaction(input);
+  }
+
   closeGap(id, endedAt, recoveryAttempts = null) {
     return this.statements.closeGap.run({ id, endedAt, recoveryAttempts });
+  }
+
+  restoreTrack(input) {
+    return this.restoreTrackTransaction(input);
   }
 
   commitChunk(chunk) {

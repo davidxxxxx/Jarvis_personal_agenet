@@ -44,6 +44,10 @@ function createRepository() {
       tracks.push({ ...track });
       return track;
     },
+    createTracks(nextTracks) {
+      tracks.push(...nextTracks.map((track) => ({ ...track })));
+      return nextTracks;
+    },
     setTrackState(id, state, endedAt = null) {
       const track = tracks.find((entry) => entry.id === id);
       if (track) Object.assign(track, { state, endedAt });
@@ -53,10 +57,18 @@ function createRepository() {
       gaps.push({ ...gap, endedAt: null });
       return gap;
     },
+    interruptTrack({ trackId, gap }) {
+      this.setTrackState(trackId, "recovering", gap.startedAt);
+      return this.openGap(gap);
+    },
     closeGap(id, endedAt, recoveryAttempts = null) {
       const gap = gaps.find((entry) => entry.id === id);
       if (gap) Object.assign(gap, { endedAt, recoveryAttempts });
       return gap;
+    },
+    restoreTrack({ trackId, gapId, endedAt, recoveryAttempts = 1 }) {
+      this.closeGap(gapId, endedAt, recoveryAttempts);
+      return this.setTrackState(trackId, "active", null);
     },
     commitChunk(chunk) {
       chunks.push(chunk);
@@ -72,6 +84,18 @@ function createSafeFs() {
   const fsImpl = Object.create(fs);
   fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
   return fsImpl;
+}
+
+function dualSources() {
+  return [
+    { sourceType: "mic", deviceId: "mv7", deviceLabel: "MV7", strategy: "web-audio" },
+    {
+      sourceType: "system",
+      deviceId: null,
+      deviceLabel: "Output",
+      strategy: "wasapi-loopback",
+    },
+  ];
 }
 
 test("an explicit recordings directory controls disk checks and audio paths", () => {
@@ -579,6 +603,274 @@ test("degraded public state keeps the durable session open with real evidence st
   } finally {
     service.shutdown();
     repository.close();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("source restoration rejects a payload that spoofs another lane identity", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-identity-"));
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+
+    assert.throws(
+      () =>
+        service.sourceRestored("s1", "system", {
+          at: 30,
+          sourceType: "mic",
+          deviceId: "output-2",
+          deviceLabel: "New output",
+          strategy: "wasapi-loopback",
+        }),
+      /source type.*match/i
+    );
+    assert.equal(service.getState().sources.system.sourceType, "system");
+    assert.equal(service.getState().sources.system.state, "reconnecting");
+    assert.equal(service.getState().sources.mic.sourceType, "mic");
+    assert.equal(repository.tracks.find((track) => track.sourceType === "system").sourceType, "system");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+for (const lifecycle of ["pauseCapture", "finishCapture"]) {
+  test(`${lifecycle} settles a metadata close failure as terminal failed state`, () => {
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `jarvis-${lifecycle}-fault-`));
+    const repository = createRepository();
+    repository.commitChunk = () => {
+      throw new Error("metadata unavailable");
+    };
+    const service = new JarvisService({
+      repository,
+      userDataDir,
+      broadcast() {},
+      now: () => 20,
+      fsImpl: createSafeFs(),
+    });
+
+    try {
+      service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "mic", sources: [dualSources()[0]] });
+      service.appendMicPcm("s1", Buffer.alloc(48, 1));
+
+      const state = service[lifecycle]("s1", 20);
+
+      assert.equal(state.status, "failed");
+      assert.equal(state.errorCode, "AUDIO_WRITE_FAILED");
+      assert.equal(state.sources.mic.state, "failed");
+      assert.equal(repository.sessions.get("s1").status, "failed");
+      assert.equal(service.appendMicPcm("s1", Buffer.alloc(48, 2)), false);
+      assert.equal(
+        fs
+          .readdirSync(path.join(userDataDir, "recordings", "s1", "mic"))
+          .filter((name) => name.endsWith(".recovery.json")).length,
+        1
+      );
+    } finally {
+      service.shutdown();
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("disk loss during restoration fails the whole session and surviving lane", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-disk-"));
+  const repository = createRepository();
+  let diskChecks = 0;
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => {
+    diskChecks += 1;
+    return {
+      bsize: 1,
+      blocks: 200 * 1024 ** 3,
+      bavail: diskChecks === 1 ? 20 * 1024 ** 3 : 1024 ** 3,
+    };
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+
+    const state = service.sourceRestored("s1", "system", {
+      at: 30,
+      deviceId: "output-2",
+      deviceLabel: "New output",
+      strategy: "wasapi-loopback",
+    });
+
+    assert.equal(state.status, "failed");
+    assert.equal(state.errorCode, "DISK_SPACE_LOW");
+    assert.equal(state.sources.mic.state, "failed");
+    assert.equal(state.sources.system.state, "failed");
+    assert.equal(repository.sessions.get("s1").status, "failed");
+    assert.equal(repository.tracks.every((track) => track.state === "failed"), true);
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("interruption persistence failure leaves the original writer live and state unchanged", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-rollback-"));
+  const repository = createRepository();
+  repository.interruptTrack = () => {
+    throw new Error("gap persistence failed");
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+
+    assert.throws(
+      () => service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" }),
+      /gap persistence failed/
+    );
+    assert.equal(service.getState().status, "recording");
+    assert.equal(service.getState().sources.system.state, "active");
+    assert.equal(repository.gaps.length, 0);
+    assert.equal(repository.tracks.find((track) => track.sourceType === "system").state, "active");
+    assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 1)), true);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("restoration persistence failure removes the empty replacement and permits retry", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-rollback-"));
+  const repository = createRepository();
+  const restoreTrack = repository.restoreTrack;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.appendPcm("s1", "system", Buffer.alloc(48, 1));
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    repository.restoreTrack = () => {
+      throw new Error("restore persistence failed");
+    };
+
+    assert.throws(
+      () =>
+        service.sourceRestored("s1", "system", {
+          at: 30,
+          deviceId: "output-2",
+          deviceLabel: "New output",
+          strategy: "wasapi-loopback",
+        }),
+      /restore persistence failed/
+    );
+    assert.equal(service.getState().sources.system.state, "reconnecting");
+    assert.equal(repository.gaps[0].endedAt, null);
+
+    repository.restoreTrack = restoreTrack;
+    service.sourceRestored("s1", "system", {
+      at: 40,
+      deviceId: "output-2",
+      deviceLabel: "New output",
+      strategy: "wasapi-loopback",
+    });
+    assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 2)), true);
+    service.finishCapture("s1", 50);
+    assert.deepEqual(
+      repository.chunks
+        .filter((chunk) => chunk.sourceType === "system")
+        .map((chunk) => chunk.sequenceNumber),
+      [0, 1]
+    );
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("start track persistence failure leaves no active public session or tracks", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-start-rollback-"));
+  const repository = createRepository();
+  repository.createTracks = () => {
+    throw new Error("track batch failed");
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 10,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    assert.throws(
+      () => service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() }),
+      /track batch failed/
+    );
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "CAPTURE_START_FAILED");
+    assert.equal(Object.values(service.getState().sources).every((source) => source.state === "failed"), true);
+    assert.equal(repository.sessions.get("s1").status, "failed");
+    assert.equal(repository.tracks.length, 0);
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("duplicate interruption persists exactly one gap transition", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-idempotent-"));
+  const repository = createRepository();
+  const interruptTrack = repository.interruptTrack;
+  let transitions = 0;
+  repository.interruptTrack = function (input) {
+    transitions += 1;
+    return interruptTrack.call(this, input);
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    const duplicate = service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+
+    assert.equal(duplicate.status, "degraded");
+    assert.equal(transitions, 1);
+    assert.equal(repository.gaps.length, 1);
+  } finally {
+    service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

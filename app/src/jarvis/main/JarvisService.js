@@ -31,9 +31,12 @@ class JarvisService {
       "setSessionStatus",
       "recoverOpenSessions",
       "createTrack",
+      "createTracks",
       "setTrackState",
       "openGap",
+      "interruptTrack",
       "closeGap",
+      "restoreTrack",
       "commitChunk",
     ]) {
       if (typeof repository[method] !== "function") {
@@ -102,8 +105,9 @@ class JarvisService {
 
     try {
       this._assertSafeDiskSpace();
-      for (const source of Object.values(sources)) {
-        this.repository.createTrack({
+      this.writer = this._createWriter(id, path.join(this.recordingsDir, id));
+      this.repository.createTracks(
+        Object.values(sources).map((source) => ({
           id: source.trackId,
           sessionId: id,
           sourceType: source.sourceType,
@@ -114,12 +118,21 @@ class JarvisService {
           channels: 1,
           startedAt: normalized.startedAt,
           state: "active",
-        });
-      }
-      this.writer = this._createWriter(id, path.join(this.recordingsDir, id));
+        }))
+      );
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
-      if (diskError) this._failForDisk(diskError.code, normalized.startedAt);
+      if (diskError) {
+        this._failForDisk(diskError.code, normalized.startedAt);
+      } else {
+        this.writer?.abortAll?.();
+        this.writer = null;
+        for (const source of Object.values(this.state.sources)) source.state = "failed";
+        this._transitionSessionStatus("failed", normalized.startedAt);
+        this.state.errorCode = "CAPTURE_START_FAILED";
+        this._persistSessionStatus("failed", normalized.startedAt);
+        this._publish(normalized.startedAt);
+      }
       throw error;
     }
     return this._publish(normalized.startedAt);
@@ -130,12 +143,7 @@ class JarvisService {
     const id = assertId(sessionId, "sessionId");
     const type = assertSourceType(sourceType);
     if (id !== this.state.sessionId) throw new Error("capture session mismatch");
-    if (
-      this.state.status === "failed" &&
-      ["DISK_SPACE_LOW", "DISK_SPACE_CHECK_FAILED"].includes(this.state.errorCode)
-    ) {
-      return false;
-    }
+    if (this.state.status === "failed") return false;
     const source = this.state.sources[type];
     if (!source) throw new Error(`capture source was not requested: ${type}`);
     if (source.state !== "active") return false;
@@ -179,15 +187,38 @@ class JarvisService {
     if (source.state !== "reconnecting") {
       throw new Error(`capture source is not reconnecting: ${source.sourceType}`);
     }
-    const restored = normalizeSource({ sourceType: source.sourceType, ...restoration });
+    if (
+      restoration.sourceType !== undefined &&
+      restoration.sourceType !== source.sourceType
+    ) {
+      throw new TypeError("restoration source type must match the requested source");
+    }
+    const restored = normalizeSource({ ...restoration, sourceType: source.sourceType });
 
-    this._assertSafeDiskSpace();
+    try {
+      this._assertSafeDiskSpace();
+    } catch (error) {
+      const diskError = this._findDiskSpaceError(error);
+      if (diskError) return this._failForDisk(diskError.code, restoration.at);
+      throw error;
+    }
     this.writer.reopenSource(source.sourceType, {
       id: source.trackId,
       startedAt: restoration.at,
     });
-    if (source.gapId) this.repository.closeGap(source.gapId, restoration.at, 1);
-    this.repository.setTrackState(source.trackId, "active", null);
+    try {
+      this.repository.restoreTrack({
+        trackId: source.trackId,
+        gapId: source.gapId,
+        endedAt: restoration.at,
+        recoveryAttempts: 1,
+      });
+    } catch (error) {
+      try {
+        this.writer.closeSource(source.sourceType, restoration.at);
+      } catch {}
+      throw error;
+    }
     Object.assign(source, restored, {
       state: "active",
       gapId: null,
@@ -212,8 +243,9 @@ class JarvisService {
       this.writer.closeAll(at);
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
-      if (!diskError) throw error;
-      return this._failForDisk(diskError.code, at);
+      return diskError
+        ? this._failForDisk(diskError.code, at)
+        : this._failForAudioWrite(at);
     }
     for (const source of Object.values(this.state.sources)) {
       if (source.state !== "active") continue;
@@ -259,8 +291,9 @@ class JarvisService {
         this.writer.closeAll(at);
       } catch (error) {
         const diskError = this._findDiskSpaceError(error);
-        if (!diskError) throw error;
-        return this._failForDisk(diskError.code, at);
+        return diskError
+          ? this._failForDisk(diskError.code, at)
+          : this._failForAudioWrite(at);
       }
     }
     this.writer = null;
@@ -377,13 +410,29 @@ class JarvisService {
   }
 
   _interruptSource(sessionId, sourceType, { at, reason }, writerError = null) {
-    const source = this._assertSourceSession(sessionId, sourceType, ["recording", "degraded"]);
+    const source = this._assertSourceSession(sessionId, sourceType, [
+      "recording",
+      "degraded",
+      "paused",
+    ]);
     this._assertTime(at, "at");
     if (typeof reason !== "string" || reason.length === 0) {
       throw new TypeError("reason must be a non-empty string");
     }
     if (source.state === "reconnecting") return this._publicState(at);
     if (source.state !== "active") throw new Error(`capture source is not active: ${source.sourceType}`);
+
+    const gapId = `gap-${crypto.randomUUID()}`;
+    this.repository.interruptTrack({
+      trackId: source.trackId,
+      gap: {
+        id: gapId,
+        trackId: source.trackId,
+        startedAt: at,
+        reason,
+        recoveryAttempts: 0,
+      },
+    });
 
     let closeError = writerError;
     try {
@@ -393,15 +442,6 @@ class JarvisService {
       const diskError = this._findDiskSpaceError(error);
       if (diskError) return this._failForDisk(diskError.code, at);
     }
-    const gapId = `gap-${crypto.randomUUID()}`;
-    this.repository.setTrackState(source.trackId, "recovering", at);
-    this.repository.openGap({
-      id: gapId,
-      trackId: source.trackId,
-      startedAt: at,
-      reason,
-      recoveryAttempts: 0,
-    });
     Object.assign(source, {
       state: "reconnecting",
       gapId,
@@ -494,6 +534,16 @@ class JarvisService {
     this._finishSources(at, "failed");
     this._transitionSessionStatus("failed", at);
     this.state.errorCode = code;
+    this._persistSessionStatus("failed", at);
+    return this._publish(at);
+  }
+
+  _failForAudioWrite(at) {
+    this.writer?.abortAll?.();
+    this.writer = null;
+    this._finishSources(at, "failed");
+    this._transitionSessionStatus("failed", at);
+    this.state.errorCode = "AUDIO_WRITE_FAILED";
     this._persistSessionStatus("failed", at);
     return this._publish(at);
   }

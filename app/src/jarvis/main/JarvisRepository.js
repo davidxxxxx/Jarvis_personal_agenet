@@ -1203,6 +1203,10 @@ class JarvisRepository {
     return this.captureEvidenceStore.createTrack(track);
   }
 
+  createTracks(tracks) {
+    return this.captureEvidenceStore.createTracks(tracks);
+  }
+
   setTrackState(id, state, endedAt) {
     return this.captureEvidenceStore.setTrackState(id, state, endedAt);
   }
@@ -1211,8 +1215,16 @@ class JarvisRepository {
     return this.captureEvidenceStore.openGap(gap);
   }
 
+  interruptTrack(input) {
+    return this.captureEvidenceStore.interruptTrack(input);
+  }
+
   closeGap(id, endedAt, recoveryAttempts) {
     return this.captureEvidenceStore.closeGap(id, endedAt, recoveryAttempts);
+  }
+
+  restoreTrack(input) {
+    return this.captureEvidenceStore.restoreTrack(input);
   }
 
   commitChunk(chunk) {
