@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMeetingStopCoordinator } from "../../../stores/meetingStopCoordinator";
-import type { StopRecordingResult, TranscriptSegment } from "../../../stores/meetingRecordingStore";
+import {
+  CaptureSourcesUnavailableError,
+  type StopRecordingResult,
+  type TranscriptSegment,
+} from "../../../stores/meetingRecordingStore";
 import type { SessionState, SessionStatus } from "../sessionMachine";
 import {
   createRecordingController,
@@ -87,11 +91,13 @@ function createHarness({
   segments = [] as TranscriptSegment[],
   hasConsent = true,
   captureMode = "mic" as JarvisCaptureMode,
+  micDeviceId = null as string | null,
 }: {
   status?: SessionStatus;
   segments?: TranscriptSegment[];
   hasConsent?: boolean;
   captureMode?: JarvisCaptureMode;
+  micDeviceId?: string | null;
 } = {}) {
   const calls: string[] = [];
   let session = sessionFor(status);
@@ -112,6 +118,7 @@ function createHarness({
         mic_device_id: input.micDeviceId,
         language: input.language ?? "zh",
         created_at: input.startedAt,
+        capture_mode: input.captureMode ?? "mic",
       };
     }),
     setSessionStatus: vi.fn(async () => null),
@@ -124,6 +131,7 @@ function createHarness({
         mic_device_id: null,
         language: "zh",
         created_at: 1_000,
+        capture_mode: "mic",
       },
     ]),
     startCapture: vi.fn<RecordingDependencies["jarvis"]["startCapture"]>(async (input) => {
@@ -136,6 +144,22 @@ function createHarness({
         errorCode: null,
       };
     }),
+    sourceInterrupted: vi.fn<RecordingDependencies["jarvis"]["sourceInterrupted"]>(
+      async (id) => ({
+        sessionId: id,
+        status: "degraded",
+        startedAt: 1_000,
+        elapsedMs: 0,
+        errorCode: null,
+      })
+    ),
+    sourceRestored: vi.fn<RecordingDependencies["jarvis"]["sourceRestored"]>(async (id) => ({
+      sessionId: id,
+      status: "recording",
+      startedAt: 1_000,
+      elapsedMs: 0,
+      errorCode: null,
+    })),
     pauseCapture: vi.fn<RecordingDependencies["jarvis"]["pauseCapture"]>(async (id, at = 1_500) => {
       calls.push("jarvis:pause");
       return {
@@ -255,7 +279,7 @@ function createHarness({
     refreshPeople,
     createId,
     now: () => 1_000,
-    getMicDeviceId: () => null,
+    getMicDeviceId: () => micDeviceId,
     getLanguage: () => "zh",
     getCaptureMode: () => captureMode,
     hasRecordingConsent: () => hasConsent,
@@ -330,6 +354,15 @@ describe("Jarvis recording controller", () => {
       sessionId: "s1",
       startedAt: 1_000,
       micDeviceId: null,
+      captureMode: "mic",
+      sources: [
+        {
+          sourceType: "mic",
+          deviceId: null,
+          deviceLabel: null,
+          strategy: "web-audio",
+        },
+      ],
     });
     expect(harness.startRecording).toHaveBeenCalledWith({
       noteId: null,
@@ -349,21 +382,79 @@ describe("Jarvis recording controller", () => {
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
   });
 
-  it("passes the selected system-only mode through the real controller boundary", async () => {
-    const harness = createHarness({ captureMode: "system" });
-    const controller = createRecordingController(harness.deps);
+  it.each([
+    [
+      "mic",
+      [
+        {
+          sourceType: "mic",
+          deviceId: "physical-mic",
+          deviceLabel: null,
+          strategy: "web-audio",
+        },
+      ],
+    ],
+    [
+      "system",
+      [
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: null,
+          strategy: null,
+        },
+      ],
+    ],
+    [
+      "dual",
+      [
+        {
+          sourceType: "mic",
+          deviceId: "physical-mic",
+          deviceLabel: null,
+          strategy: "web-audio",
+        },
+        {
+          sourceType: "system",
+          deviceId: null,
+          deviceLabel: null,
+          strategy: null,
+        },
+      ],
+    ],
+  ] as const)(
+    "persists and starts the selected %s mode with exactly its requested sources",
+    async (captureMode, sources) => {
+      const harness = createHarness({ captureMode, micDeviceId: "physical-mic" });
+      const controller = createRecordingController(harness.deps);
+      const expectedMicDeviceId = captureMode === "system" ? null : "physical-mic";
 
-    await controller.start();
+      await controller.start();
 
-    expect(harness.startRecording).toHaveBeenCalledWith(
-      expect.objectContaining({
-        captureSystemAudio: true,
-        captureMicrophone: false,
-        micOnly: false,
-        requireAllSources: true,
-      })
-    );
-  });
+      expect(harness.jarvis.createSession).toHaveBeenCalledWith({
+        id: "s1",
+        startedAt: 1_000,
+        micDeviceId: expectedMicDeviceId,
+        language: "zh",
+        captureMode,
+      });
+      expect(harness.jarvis.startCapture).toHaveBeenCalledWith({
+        sessionId: "s1",
+        startedAt: 1_000,
+        micDeviceId: expectedMicDeviceId,
+        captureMode,
+        sources,
+      });
+      expect(harness.startRecording).toHaveBeenCalledWith(
+        expect.objectContaining({
+          captureSystemAudio: captureMode !== "mic",
+          captureMicrophone: captureMode !== "system",
+          micOnly: captureMode === "mic",
+          requireAllSources: true,
+        })
+      );
+    }
+  );
 
   it("stops upstream recording before pausing the main writer", async () => {
     const harness = createHarness({ status: "recording" });
@@ -391,6 +482,41 @@ describe("Jarvis recording controller", () => {
       })
     );
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
+  });
+
+  it("drains and invalidates an in-flight resume before shutdown acknowledges", async () => {
+    const resumeGate = deferred<void>();
+    const harness = createHarness({ status: "paused", segments: [stableSegment] });
+    vi.mocked(harness.jarvis.resumeCapture).mockImplementationOnce(async (id, at = 1_000) => {
+      harness.calls.push("jarvis:resume");
+      await resumeGate.promise;
+      return {
+        sessionId: id,
+        status: "recording",
+        startedAt: 1_000,
+        elapsedMs: at - 1_000,
+        errorCode: null,
+      };
+    });
+    const controller = createRecordingController(harness.deps);
+
+    const pendingResume = controller.resume();
+    await vi.waitFor(() => expect(harness.jarvis.resumeCapture).toHaveBeenCalledOnce());
+
+    const shutdownSettled = vi.fn();
+    const pendingShutdown = controller.shutdown().then(shutdownSettled);
+    await Promise.resolve();
+    await Promise.resolve();
+    const shutdownSettledBeforeResume = shutdownSettled.mock.calls.length;
+
+    resumeGate.resolve();
+    await expect(pendingResume).resolves.toBeUndefined();
+    await pendingShutdown;
+
+    expect(shutdownSettledBeforeResume).toBe(0);
+    expect(harness.startRecording).not.toHaveBeenCalled();
+    expect(harness.jarvis.pauseCapture).toHaveBeenCalledWith("s1", 1_000);
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "paused" });
   });
 
   it("stops upstream and persists stable segments before finishing capture", async () => {
@@ -479,6 +605,81 @@ describe("Jarvis recording controller", () => {
         expect.objectContaining({ id: "s1__seg-2", text: "Last words" }),
       ])
     );
+  });
+
+  it("stops a pending producer start before draining its activation", async () => {
+    const startGate = deferred<void>();
+    const harness = createHarness();
+    harness.startRecording.mockImplementationOnce(async () => {
+      harness.calls.push("upstream:start");
+      harness.setMeeting({ isRecording: true });
+      await startGate.promise;
+    });
+    harness.stopRecording.mockImplementationOnce(async () => {
+      harness.calls.push("upstream:stop");
+      harness.setMeeting({ isRecording: false });
+      startGate.resolve();
+      return { diarizationSessionId: null, success: true };
+    });
+    const controller = createRecordingController(harness.deps);
+
+    const pendingStart = controller.start();
+    await vi.waitFor(() => expect(harness.startRecording).toHaveBeenCalledOnce());
+
+    const pendingShutdown = controller.shutdown();
+    await Promise.resolve();
+    await Promise.resolve();
+    const stopCallsBeforeManualRelease = harness.stopRecording.mock.calls.length;
+    if (stopCallsBeforeManualRelease === 0) startGate.resolve();
+
+    await expect(pendingStart).resolves.toBeUndefined();
+    await pendingShutdown;
+
+    expect(stopCallsBeforeManualRelease).toBe(1);
+    expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: false });
+    expect(harness.stopRecording).toHaveBeenCalledTimes(1);
+    expect(harness.getSession()).toEqual(sessionFor("idle"));
+  });
+
+  it("drains and invalidates an in-flight start before shutdown acknowledges", async () => {
+    const readyGate = deferred<void>();
+    const harness = createHarness();
+    harness.ensureTranscriptionReady.mockImplementationOnce(() => readyGate.promise);
+    const controller = createRecordingController(harness.deps);
+
+    const pendingStart = controller.start();
+    await vi.waitFor(() => expect(harness.ensureTranscriptionReady).toHaveBeenCalledTimes(1));
+
+    const shutdownSettled = vi.fn();
+    const pendingShutdown = controller.shutdown().then(shutdownSettled);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(shutdownSettled).not.toHaveBeenCalled();
+
+    readyGate.resolve();
+    await expect(pendingStart).resolves.toBeUndefined();
+    await pendingShutdown;
+
+    expect(harness.jarvis.createSession).not.toHaveBeenCalled();
+    expect(harness.jarvis.startCapture).not.toHaveBeenCalled();
+    expect(harness.startRecording).not.toHaveBeenCalled();
+  });
+
+  it("invalidates an in-flight start when the controller is disposed", async () => {
+    const readyGate = deferred<void>();
+    const harness = createHarness();
+    harness.ensureTranscriptionReady.mockImplementationOnce(() => readyGate.promise);
+    const controller = createRecordingController(harness.deps);
+
+    const pendingStart = controller.start();
+    await vi.waitFor(() => expect(harness.ensureTranscriptionReady).toHaveBeenCalledTimes(1));
+    controller.dispose();
+    readyGate.resolve();
+    await expect(pendingStart).resolves.toBeUndefined();
+
+    expect(harness.jarvis.createSession).not.toHaveBeenCalled();
+    expect(harness.jarvis.startCapture).not.toHaveBeenCalled();
+    expect(harness.startRecording).not.toHaveBeenCalled();
   });
 
   it("rejects re-entry without issuing duplicate commands", async () => {
@@ -743,5 +944,28 @@ describe("Jarvis recording controller", () => {
     expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
     expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
     expect(harness.getSession()).toMatchObject({ status: "failed", errorCode: "MIC_PERMISSION" });
+  });
+
+  it("atomically fails required system capture without completing its tracks", async () => {
+    const harness = createHarness({ captureMode: "system" });
+    harness.startRecording.mockRejectedValueOnce(
+      new CaptureSourcesUnavailableError({ mic: "idle", system: "unavailable" })
+    );
+    const controller = createRecordingController(harness.deps);
+
+    await expect(controller.start()).rejects.toThrow("capture_source_unavailable");
+
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith(
+      "s1",
+      "capture_source_unavailable",
+      1_000
+    );
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.setSessionStatus).not.toHaveBeenCalled();
+    expect(harness.getSession()).toMatchObject({
+      status: "failed",
+      errorCode: "capture_source_unavailable",
+    });
+    expect(harness.deps.onError).toHaveBeenLastCalledWith("capture_source_unavailable");
   });
 });

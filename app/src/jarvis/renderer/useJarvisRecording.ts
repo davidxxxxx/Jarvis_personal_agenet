@@ -13,12 +13,17 @@ import {
 import { getSettings } from "../../stores/settingsStore";
 import type {
   JarvisControlAction,
+  JarvisCaptureFailureCode,
+  JarvisCaptureInput,
   JarvisCaptureMode,
+  JarvisCaptureSourceInput,
   JarvisPerson,
   JarvisRenamePersonInput,
   JarvisRuntimeState,
   JarvisSession,
   JarvisSessionInput,
+  JarvisSourceInterruptionInput,
+  JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
   JarvisTranscriptSegmentInput,
 } from "../types";
@@ -44,17 +49,23 @@ export interface RecordingJarvisApi {
   createSession: (input: JarvisSessionInput) => Promise<JarvisSession>;
   setSessionStatus: (id: string, status: "failed", at?: number) => Promise<JarvisSession | null>;
   listSessions: () => Promise<JarvisSession[]>;
-  startCapture: (input: {
-    sessionId: string;
-    startedAt: number;
-    micDeviceId: string | null;
-  }) => Promise<JarvisRuntimeState>;
+  startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
+  sourceInterrupted: (
+    id: string,
+    sourceType: "mic" | "system",
+    input: JarvisSourceInterruptionInput
+  ) => Promise<JarvisRuntimeState>;
+  sourceRestored: (
+    id: string,
+    sourceType: "mic" | "system",
+    input: JarvisSourceRestorationInput
+  ) => Promise<JarvisRuntimeState>;
   pauseCapture: (id: string, at?: number, errorCode?: string | null) => Promise<JarvisRuntimeState>;
   resumeCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
   finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
   failCapture: (
     id: string,
-    errorCode: "MIC_PERMISSION" | "MIC_DISCONNECTED",
+    errorCode: JarvisCaptureFailureCode,
     at?: number
   ) => Promise<JarvisRuntimeState>;
   upsertSegments: (
@@ -152,6 +163,13 @@ class RecordingOperationError extends Error {
   }
 }
 
+class RecordingActivationCancelledError extends Error {
+  constructor() {
+    super("capture activation was cancelled");
+    this.name = "RecordingActivationCancelledError";
+  }
+}
+
 function safeTimestamp(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) ? Math.round(value as number) : fallback;
 }
@@ -189,6 +207,20 @@ function errorCode(error: unknown, fallback: string): string {
   return error instanceof RecordingOperationError ? error.code : fallback;
 }
 
+function captureFailureCode(code: string): JarvisCaptureFailureCode {
+  switch (code) {
+    case "MIC_PERMISSION":
+    case "MIC_DISCONNECTED":
+    case "capture_source_unavailable":
+    case "capture_start_failed":
+    case "upstream_start_failed":
+    case "capture_activation_cancelled":
+      return code;
+    default:
+      return "capture_start_failed";
+  }
+}
+
 export function recordingArgs(
   id: string,
   captureMode: JarvisCaptureMode = "mic",
@@ -213,6 +245,30 @@ export function recordingArgs(
   };
 }
 
+function captureSources(
+  captureMode: JarvisCaptureMode,
+  micDeviceId: string | null
+): JarvisCaptureSourceInput[] {
+  const sources: JarvisCaptureSourceInput[] = [];
+  if (captureMode !== "system") {
+    sources.push({
+      sourceType: "mic",
+      deviceId: micDeviceId,
+      deviceLabel: null,
+      strategy: "web-audio",
+    });
+  }
+  if (captureMode !== "mic") {
+    sources.push({
+      sourceType: "system",
+      deviceId: null,
+      deviceLabel: null,
+      strategy: null,
+    });
+  }
+  return sources;
+}
+
 export function createRecordingController(deps: RecordingDependencies): RecordingController {
   let activeOperation: JarvisControlAction | null = null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -226,6 +282,8 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   let segmentsFrozen = false;
   let disposed = false;
   let sessionCaptureMode: JarvisCaptureMode | null = null;
+  let activationGeneration = 0;
+  let activeActivationSettled: Promise<void> | null = null;
 
   const transition = (event: SessionEvent): SessionState => {
     const next = reduceSession(deps.getSessionState(), event);
@@ -245,6 +303,26 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   const end = (): void => {
     activeOperation = null;
     deps.onOperationChange(null);
+  };
+
+  const trackActivation = () => {
+    const generation = ++activationGeneration;
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    activeActivationSettled = settled;
+    return {
+      assertCurrent: (): void => {
+        if (disposed || generation !== activationGeneration) {
+          throw new RecordingActivationCancelledError();
+        }
+      },
+      settle: (): void => {
+        if (activeActivationSettled === settled) activeActivationSettled = null;
+        resolveSettled();
+      },
+    };
   };
 
   const clearPersistTimer = (): void => {
@@ -294,15 +372,13 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     }
   };
 
-  const failMainCapture = async (
-    id: string,
-    code: "MIC_PERMISSION" | "MIC_DISCONNECTED"
-  ): Promise<void> => {
+  const failMainCapture = async (id: string, code: JarvisCaptureFailureCode): Promise<void> => {
     try {
       await deps.jarvis.failCapture(id, code, deps.now());
     } catch {
-      await finishMainCapture(id);
-      await markPersistedSessionFailed(id);
+      // Do not synthesize a failed session after completing its tracks. If the
+      // authoritative transaction is unavailable, startup recovery keeps the
+      // still-open capture truthful and can reconcile it on the next launch.
     }
   };
 
@@ -325,6 +401,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   };
 
   const start = async (): Promise<void> => {
+    if (disposed || shutdownPromise) {
+      throw new Error("recording controller is shutting down");
+    }
     const state = deps.getSessionState();
     if (!["idle", "completed", "failed"].includes(state.status)) {
       throw new Error(`cannot start from ${state.status}`);
@@ -347,6 +426,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     const startedAt = deps.now();
     const starting = reduceSession(state, { type: "STARTING", id, at: startedAt });
     begin("start");
+    const activation = trackActivation();
     deps.setSessionState(starting);
     let sessionCreated = false;
     let captureStarted = false;
@@ -355,17 +435,28 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
 
     try {
       await deps.ensureTranscriptionReady();
-      const micDeviceId = deps.getMicDeviceId();
+      activation.assertCurrent();
+      const micDeviceId = captureMode === "system" ? null : deps.getMicDeviceId();
       await deps.jarvis.createSession({
         id,
         startedAt,
         micDeviceId,
         language: deps.getLanguage(),
+        captureMode,
       });
       sessionCreated = true;
-      await deps.jarvis.startCapture({ sessionId: id, startedAt, micDeviceId });
+      activation.assertCurrent();
+      await deps.jarvis.startCapture({
+        sessionId: id,
+        startedAt,
+        micDeviceId,
+        captureMode,
+        sources: captureSources(captureMode, micDeviceId),
+      });
       captureStarted = true;
+      activation.assertCurrent();
       await deps.startRecording(recordingArgs(id, captureMode));
+      activation.assertCurrent();
       const meetingSnapshot = deps.getMeetingSnapshot();
       if (!meetingSnapshot.isRecording) {
         const code = ["MIC_PERMISSION", "MIC_DISCONNECTED"].includes(meetingSnapshot.error ?? "")
@@ -378,7 +469,27 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       }
       transition({ type: "STARTED", id, at: startedAt });
       await refreshSessions();
+      activation.assertCurrent();
     } catch (error) {
+      if (error instanceof RecordingActivationCancelledError) {
+        if (deps.getMeetingSnapshot().isRecording) {
+          try {
+            await deps.stopRecording({ throwOnError: false });
+          } catch {
+            // Cancellation still closes the main writer even if producer cleanup fails.
+          }
+        }
+        if (captureStarted) {
+          await failMainCapture(id, "capture_activation_cancelled");
+        } else if (sessionCreated) {
+          await markPersistedSessionFailed(id);
+        }
+        const current = deps.getSessionState();
+        if (current.id === id && ["starting", "recording"].includes(current.status)) {
+          deps.setSessionState(state);
+        }
+        return;
+      }
       const code = errorCode(error, "capture_start_failed");
       const isMicError = code === "MIC_PERMISSION" || code === "MIC_DISCONNECTED";
       if (captureStarted && isMicError) {
@@ -390,16 +501,27 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         try {
           await deps.jarvis.pauseCapture(id, deps.now(), code);
         } catch {
-          await failMainCapture(id, code as "MIC_PERMISSION" | "MIC_DISCONNECTED");
+          await failMainCapture(id, captureFailureCode(code));
         }
       } else {
-        if (captureStarted) await finishMainCapture(id);
-        if (sessionCreated) await markPersistedSessionFailed(id);
+        if (captureStarted) {
+          if (deps.getMeetingSnapshot().isRecording) {
+            try {
+              await deps.stopRecording({ throwOnError: false });
+            } catch {
+              // The authoritative main failure remains the terminal source of truth.
+            }
+          }
+          await failMainCapture(id, captureFailureCode(code));
+        } else if (sessionCreated) {
+          await markPersistedSessionFailed(id);
+        }
       }
       failCurrentSession(code);
       throw error;
     } finally {
       end();
+      activation.settle();
     }
   };
 
@@ -460,10 +582,14 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   };
 
   const resume = async (): Promise<void> => {
+    if (disposed || shutdownPromise) {
+      throw new Error("recording controller is shutting down");
+    }
     const state = deps.getSessionState();
     const at = deps.now();
     const resumed = reduceSession(state, { type: "RESUMED", at });
     begin("resume");
+    const activation = trackActivation();
     let mainResumed = false;
 
     try {
@@ -475,6 +601,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       }
       await deps.jarvis.resumeCapture(state.id as string, at);
       mainResumed = true;
+      activation.assertCurrent();
       const seedSegments = deps.getMeetingSnapshot().segments;
       await deps.startRecording(
         recordingArgs(
@@ -483,6 +610,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
           seedSegments
         )
       );
+      activation.assertCurrent();
       const meetingSnapshot = deps.getMeetingSnapshot();
       if (!meetingSnapshot.isRecording) {
         const code = ["MIC_PERMISSION", "MIC_DISCONNECTED"].includes(meetingSnapshot.error ?? "")
@@ -497,7 +625,29 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       }
       deps.setSessionState(resumed);
       await refreshSessions();
+      activation.assertCurrent();
     } catch (error) {
+      if (error instanceof RecordingActivationCancelledError) {
+        if (deps.getMeetingSnapshot().isRecording) {
+          try {
+            await deps.stopRecording({ throwOnError: false });
+          } catch {
+            // Main capture still returns to a non-recording state when teardown fails.
+          }
+        }
+        if (mainResumed && state.id) {
+          try {
+            await deps.jarvis.pauseCapture(state.id, deps.now());
+          } catch {
+            await failMainCapture(state.id, "capture_activation_cancelled");
+          }
+        }
+        const current = deps.getSessionState();
+        if (current.id === state.id && current.status === "recording") {
+          deps.setSessionState(state);
+        }
+        return;
+      }
       const code = errorCode(error, "capture_resume_failed");
       if (mainResumed && state.id) {
         const isMicError = code === "MIC_PERMISSION" || code === "MIC_DISCONNECTED";
@@ -525,6 +675,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       throw error;
     } finally {
       end();
+      activation.settle();
     }
   };
 
@@ -618,15 +769,21 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
 
   const shutdown = (): Promise<void> => {
     if (!shutdownPromise) {
+      activationGeneration += 1;
+      const activationToDrain = activeActivationSettled;
       shutdownPromise = (async () => {
         let stopError: unknown = null;
-        if (deps.getMeetingSnapshot().isRecording) {
+        const stopActiveProducer = async (): Promise<void> => {
+          if (!deps.getMeetingSnapshot().isRecording) return;
           try {
             await deps.stopRecording({ throwOnError: false });
           } catch (error) {
-            stopError = error;
+            stopError ??= error;
           }
-        }
+        };
+        await stopActiveProducer();
+        if (activationToDrain) await activationToDrain;
+        await stopActiveProducer();
         segmentsFrozen = true;
         clearPersistTimer();
         pendingPersistence = null;
@@ -680,6 +837,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     flushPendingPersistence,
     shutdown,
     dispose: () => {
+      activationGeneration += 1;
       disposed = true;
       pendingPersistence = null;
       clearPersistTimer();
@@ -692,6 +850,10 @@ const rendererJarvisApi: RecordingJarvisApi = {
   setSessionStatus: (id, status, at) => window.electronAPI.jarvis.setSessionStatus(id, status, at),
   listSessions: () => window.electronAPI.jarvis.listSessions(),
   startCapture: (input) => window.electronAPI.jarvis.startCapture(input),
+  sourceInterrupted: (id, sourceType, input) =>
+    window.electronAPI.jarvis.sourceInterrupted(id, sourceType, input),
+  sourceRestored: (id, sourceType, input) =>
+    window.electronAPI.jarvis.sourceRestored(id, sourceType, input),
   pauseCapture: (id, at, errorCode) => window.electronAPI.jarvis.pauseCapture(id, at, errorCode),
   resumeCapture: (id, at) => window.electronAPI.jarvis.resumeCapture(id, at),
   finishCapture: (id, at) => window.electronAPI.jarvis.finishCapture(id, at),

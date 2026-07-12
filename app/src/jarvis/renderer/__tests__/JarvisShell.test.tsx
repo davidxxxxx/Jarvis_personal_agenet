@@ -1,7 +1,8 @@
 import { render, screen } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../../../i18n";
 import JarvisShell from "../JarvisShell";
+import { useJarvisStore } from "../jarvisStore";
 
 vi.mock("../../../components/WindowControls", () => ({
   default: () => <div data-testid="jarvis-window-controls">controls</div>,
@@ -42,6 +43,13 @@ vi.mock("../useJarvisRecording", () => ({
 
 beforeAll(async () => {
   await i18n.changeLanguage("zh-CN");
+});
+
+beforeEach(() => {
+  useJarvisStore.setState({
+    captureMode: "mic",
+    sourceStates: { mic: "recording", system: "idle" },
+  });
 });
 
 describe("JarvisShell", () => {

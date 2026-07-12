@@ -26,6 +26,8 @@ const CHANNELS = Object.freeze({
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
   startCapture: "jarvis:capture:start",
+  sourceInterrupted: "jarvis:capture:source-interrupted",
+  sourceRestored: "jarvis:capture:source-restored",
   pauseCapture: "jarvis:capture:pause",
   resumeCapture: "jarvis:capture:resume",
   finishCapture: "jarvis:capture:finish",
@@ -63,10 +65,17 @@ function assertSessionStatus(value) {
   return value;
 }
 
-function assertMicErrorCode(value) {
-  if (value !== "MIC_PERMISSION" && value !== "MIC_DISCONNECTED") {
-    throw new TypeError("invalid microphone error code");
-  }
+const CAPTURE_FAILURE_CODES = new Set([
+  "MIC_PERMISSION",
+  "MIC_DISCONNECTED",
+  "capture_source_unavailable",
+  "capture_start_failed",
+  "upstream_start_failed",
+  "capture_activation_cancelled",
+]);
+
+function assertCaptureFailureCode(value) {
+  if (!CAPTURE_FAILURE_CODES.has(value)) throw new TypeError("invalid capture failure code");
   return value;
 }
 
@@ -75,7 +84,7 @@ module.exports = {
   SESSION_STATUSES,
   assertId,
   assertSessionStatus,
-  assertMicErrorCode,
+  assertCaptureFailureCode,
   assertCaptureMode,
   assertSourceType,
 };

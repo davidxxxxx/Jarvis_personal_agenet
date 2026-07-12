@@ -1,14 +1,30 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../../../i18n";
 import JarvisCaptureModeSelector from "../JarvisCaptureModeSelector";
 import { useJarvisStore } from "../jarvisStore";
 
 describe("JarvisCaptureModeSelector", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("zh-CN");
     useJarvisStore.setState({
       captureMode: "mic",
       sourceStates: { mic: "idle", system: "idle" },
     });
+  });
+
+  it("uses natural English accessible labels when the UI language is English", async () => {
+    await i18n.changeLanguage("en");
+    const onChange = vi.fn();
+    render(<JarvisCaptureModeSelector value="dual" onChange={onChange} disabled={false} />);
+
+    expect(screen.getByRole("group", { name: "Capture audio" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Microphone only" })).not.toBeChecked();
+    expect(screen.getByRole("radio", { name: "Computer audio only" })).not.toBeChecked();
+    expect(screen.getByRole("radio", { name: "Microphone and computer audio" })).toBeChecked();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Computer audio only" }));
+    expect(onChange).toHaveBeenCalledWith("system");
   });
 
   it("exposes the three approved capture choices as an accessible radio group", () => {

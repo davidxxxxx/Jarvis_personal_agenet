@@ -6,6 +6,48 @@ const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds.ts");
 
+test("persists the selected capture mode on session creation", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+
+  const session = repo.createSession({
+    id: "dual-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "dual",
+  });
+
+  assert.equal(session.capture_mode, "dual");
+  assert.equal(repo.getSession("dual-session").capture_mode, "dual");
+});
+
+test("system-only session persistence cannot retain a microphone device id", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+
+  assert.throws(
+    () =>
+      repo.createSession({
+        id: "system-session-invalid",
+        startedAt: 1_000,
+        micDeviceId: "must-not-persist",
+        captureMode: "system",
+      }),
+    /system capture cannot persist a microphone device id/
+  );
+  assert.equal(repo.getSession("system-session-invalid"), null);
+
+  const session = repo.createSession({
+    id: "system-session-valid",
+    startedAt: 2_000,
+    micDeviceId: null,
+    captureMode: "system",
+  });
+
+  assert.equal(session.capture_mode, "system");
+  assert.equal(session.mic_device_id, null);
+});
+
 test("session-namespaced segment ids avoid restart-local raw id collisions", () => {
   const repo = new JarvisRepository(":memory:");
   repo.createSession({ id: "s1", startedAt: 1000, micDeviceId: null });

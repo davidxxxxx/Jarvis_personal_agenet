@@ -1,6 +1,6 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
-const { assertId, assertSessionStatus } = require("../shared/contracts");
+const { assertCaptureMode, assertId, assertSessionStatus } = require("../shared/contracts");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("./JarvisMigrations");
 
@@ -265,9 +265,9 @@ class JarvisRepository {
     this.statements = {
       createSession: this.db.prepare(`
         INSERT INTO sessions (
-          id, started_at, status, mic_device_id, language, created_at
+          id, started_at, status, mic_device_id, language, created_at, capture_mode
         ) VALUES (
-          @id, @startedAt, 'recording', @micDeviceId, @language, @createdAt
+          @id, @startedAt, 'recording', @micDeviceId, @language, @createdAt, @captureMode
         )
       `),
       setSessionStatus: this.db.prepare(`
@@ -639,11 +639,15 @@ class JarvisRepository {
     });
   }
 
-  createSession({ id, startedAt, micDeviceId, language = "zh" }) {
+  createSession({ id, startedAt, micDeviceId, language = "zh", captureMode = "mic" }) {
     const sessionId = assertId(id, "sessionId");
     assertInteger(startedAt, "startedAt");
+    const mode = assertCaptureMode(captureMode);
     if (micDeviceId !== null && micDeviceId !== undefined && typeof micDeviceId !== "string") {
       throw new TypeError("micDeviceId must be a string or null");
+    }
+    if (mode === "system" && micDeviceId !== null && micDeviceId !== undefined) {
+      throw new TypeError("system capture cannot persist a microphone device id");
     }
     if (typeof language !== "string" || language.length === 0 || language.length > 32) {
       throw new TypeError("language must be a non-empty string of at most 32 characters");
@@ -655,6 +659,7 @@ class JarvisRepository {
       micDeviceId: micDeviceId ?? null,
       language,
       createdAt: Date.now(),
+      captureMode: mode,
     });
     return this.getSession(sessionId);
   }

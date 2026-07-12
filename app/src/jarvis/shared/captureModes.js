@@ -73,6 +73,13 @@ function normalizeCaptureStartInput(input) {
         ]
       : input.sources
   );
+  if (input.micDeviceId !== undefined) {
+    const requestedMicDeviceId = optionalString(input.micDeviceId, "micDeviceId");
+    const sourceMicDeviceId = sources.find((source) => source.sourceType === "mic")?.deviceId ?? null;
+    if (requestedMicDeviceId !== sourceMicDeviceId) {
+      throw new TypeError("micDeviceId must match the selected capture sources");
+    }
+  }
   return { ...input, captureMode, sources };
 }
 

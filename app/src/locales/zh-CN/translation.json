@@ -58,6 +58,36 @@
     "micFallback": "首选麦克风已断开，正在使用 {{device}} 继续录音。",
     "recordingError": "录音无法继续，请检查麦克风后重试。",
     "operationError": "操作失败，请重试",
+    "capture": {
+      "groupLabel": "采集声音",
+      "restoringSources": "正在恢复音频来源…",
+      "noActiveSource": "当前没有活动的音频来源",
+      "modes": {
+        "mic": "仅麦克风",
+        "system": "仅电脑声音",
+        "dual": "麦克风和电脑声音"
+      },
+      "sources": {
+        "mic": "麦克风",
+        "system": "电脑声音"
+      },
+      "status": {
+        "idle": "未启用",
+        "checking": "检查中",
+        "ready": "已就绪",
+        "unavailable": "不可用",
+        "recording": "录制中",
+        "recovering": "恢复中"
+      },
+      "sourceStatus": "{{source}}：{{status}}",
+      "retry": "重试",
+      "continueWithAvailableSource": "使用可用音源继续",
+      "unavailable": {
+        "mic": "麦克风不可用，请重试或选择其他音源。",
+        "system": "电脑声音不可用，请重试或选择其他音源。",
+        "dual": "一个或多个所选音源不可用，请重试或使用可用音源继续。"
+      }
+    },
     "consentTitle": "确认录音授权",
     "consentDescription": "Jarvis 只会在你手动开始后录音。请确保已告知相关人员且录音行为符合法律和场景要求。",
     "consentAudioRetention": "音频文件保留 7 天。",

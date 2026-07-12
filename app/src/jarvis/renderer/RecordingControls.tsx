@@ -92,14 +92,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
     !["idle", "completed", "failed"].includes(session.status) || commandPending;
 
   const sourceLabel = (state: JarvisCaptureSourceState): string =>
-    ({
-      idle: "未启用",
-      checking: "检查中",
-      ready: "已就绪",
-      unavailable: "不可用",
-      recording: "录制中",
-      recovering: "恢复中",
-    })[state];
+    t(`jarvis.capture.status.${state}`);
   const micRequired = captureMode !== "system";
   const systemRequired = captureMode !== "mic";
   const hasRequiredSourceFailure =
@@ -107,6 +100,18 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
     (systemRequired && sourceStates.system === "unavailable");
   const isAvailable = (state: JarvisCaptureSourceState): boolean =>
     state === "ready" || state === "recording";
+  const selectedSourceStates =
+    captureMode === "mic"
+      ? [sourceStates.mic]
+      : captureMode === "system"
+        ? [sourceStates.system]
+        : [sourceStates.mic, sourceStates.system];
+  const hasActiveCaptureSource = selectedSourceStates.some(isAvailable);
+  const hasRecoveringCaptureSource =
+    selectedSourceStates.some((state) => state === "recovering") ||
+    (micRequired && recording.micRecoveryStatus === "reconnecting");
+  const isRecordingWithoutActiveSource = isRecording && !hasActiveCaptureSource;
+  const isActivelyListening = isRecording && hasActiveCaptureSource;
   const availableCaptureMode: JarvisCaptureMode | null =
     isAvailable(sourceStates.mic) && isAvailable(sourceStates.system)
       ? "dual"
@@ -125,11 +130,22 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
 
   const elapsed = useMemo(() => formatDuration(activeElapsedMs(recording, now)), [now, recording]);
   const micPercent = Math.round(Math.max(0, Math.min(1, recording.micLevel)) * 100);
-  const statusLabel = isRecording
-    ? t("jarvis.listening")
-    : isPaused
-      ? t("jarvis.paused")
-      : t(`jarvis.status.${session.status}`);
+  const statusLabel = isRecordingWithoutActiveSource
+    ? t(
+        hasRecoveringCaptureSource
+          ? "jarvis.capture.restoringSources"
+          : "jarvis.capture.noActiveSource"
+      )
+    : isRecording
+      ? t("jarvis.listening")
+      : isPaused
+        ? t("jarvis.paused")
+        : t(`jarvis.status.${session.status}`);
+  const computerAudioLabel = t("jarvis.capture.sources.system");
+  const recordingErrorKey =
+    recording.error === "capture_source_unavailable"
+      ? `jarvis.capture.unavailable.${captureMode}`
+      : "jarvis.recordingError";
 
   const run = async (action: () => Promise<void>): Promise<void> => {
     if (invocationRef.current || recording.operation !== null) return;
@@ -169,9 +185,9 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
     <header className="px-6 py-5">
       <div
         className={`rounded-2xl border p-4 shadow-sm transition-colors ${
-          isRecording
+          isActivelyListening
             ? "border-red-500/40 bg-red-500/[0.06]"
-            : isPaused
+            : isPaused || isRecordingWithoutActiveSource
               ? "border-amber-500/40 bg-amber-500/[0.06]"
               : "border-border/50 bg-card/70"
         }`}
@@ -180,9 +196,13 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <div
               role={isSystemOnly ? "img" : undefined}
-              aria-label={isSystemOnly ? "电脑声音" : undefined}
+              aria-label={isSystemOnly ? computerAudioLabel : undefined}
               className={`grid size-11 shrink-0 place-items-center rounded-xl ${
-                isRecording ? "bg-red-500 text-white" : "bg-muted text-muted-foreground"
+                isActivelyListening
+                  ? "bg-red-500 text-white"
+                  : isRecordingWithoutActiveSource
+                    ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                    : "bg-muted text-muted-foreground"
               }`}
             >
               {isSystemOnly ? (
@@ -195,9 +215,9 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
               <div className="flex items-center gap-2">
                 <span
                   className={`size-2.5 rounded-full ${
-                    isRecording
+                    isActivelyListening
                       ? "animate-pulse bg-red-500"
-                      : isPaused
+                      : isPaused || isRecordingWithoutActiveSource
                         ? "bg-amber-500"
                         : "bg-muted-foreground/40"
                   }`}
@@ -209,7 +229,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
               </div>
               <p className="mt-0.5 truncate text-xs text-muted-foreground">
                 {isSystemOnly
-                  ? "电脑声音"
+                  ? computerAudioLabel
                   : recording.activeMicLabel || microphoneName || t("jarvis.defaultMicrophone")}
               </p>
             </div>
@@ -228,7 +248,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
                 <div className="h-1.5 overflow-hidden rounded-full bg-muted">
                   <div
                     className={`h-full rounded-full transition-[width] duration-100 ${
-                      isRecording ? "bg-red-500" : "bg-primary"
+                      isActivelyListening ? "bg-red-500" : "bg-primary"
                     }`}
                     style={{ width: `${micPercent}%` }}
                   />
@@ -289,12 +309,22 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
         </div>
         {(recording.error || actionError) && (
           <p role="alert" className="mt-3 text-xs text-destructive">
-            {t(actionError ? "jarvis.operationError" : "jarvis.recordingError")}
+            {t(actionError ? "jarvis.operationError" : recordingErrorKey)}
           </p>
         )}
         <div aria-live="polite" className="mt-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
-          <span>{`麦克风：${sourceLabel(sourceStates.mic)}`}</span>
-          <span>{`电脑声音：${sourceLabel(sourceStates.system)}`}</span>
+          <span>
+            {t("jarvis.capture.sourceStatus", {
+              source: t("jarvis.capture.sources.mic"),
+              status: sourceLabel(sourceStates.mic),
+            })}
+          </span>
+          <span>
+            {t("jarvis.capture.sourceStatus", {
+              source: computerAudioLabel,
+              status: sourceLabel(sourceStates.system),
+            })}
+          </span>
         </div>
         {hasRequiredSourceFailure && (
           <div className="mt-3 flex flex-wrap gap-2">
@@ -304,7 +334,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
               disabled={sourceSemanticsLocked}
               onClick={retryCaptureSources}
             >
-              重试
+              {t("jarvis.capture.retry")}
             </Button>
             <Button
               type="button"
@@ -312,7 +342,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
               disabled={sourceSemanticsLocked || availableCaptureMode === null}
               onClick={continueWithAvailableSource}
             >
-              使用可用音源继续
+              {t("jarvis.capture.continueWithAvailableSource")}
             </Button>
           </div>
         )}

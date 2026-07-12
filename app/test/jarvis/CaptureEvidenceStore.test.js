@@ -87,6 +87,9 @@ test("stores track state and gap lifecycle evidence", (t) => {
     ended_at: 40,
     reason: "device_lost",
     recovery_attempts: 2,
+    restored_device_id: null,
+    restored_device_label: null,
+    restored_strategy: null,
   });
 });
 
@@ -142,6 +145,129 @@ test("rolls back gap closure when restoration track is missing", (t) => {
   );
   assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
   assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "recovering");
+});
+
+test("interrupt transition rolls back track and gap when its session status write fails", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  db.exec(`
+    CREATE TRIGGER reject_interrupt_session_status
+    BEFORE UPDATE ON sessions
+    BEGIN
+      SELECT RAISE(ABORT, 'session status unavailable');
+    END;
+  `);
+
+  assert.throws(
+    () =>
+      store.interruptTrack({
+        trackId: "t1",
+        sessionId: "s1",
+        sessionStatus: "recording",
+        gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+      }),
+    /session status unavailable/i
+  );
+  assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "active");
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_gaps").get().count, 0);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("restoration transition rolls back gap track and metadata when session status write fails", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.interruptTrack({
+    trackId: "t1",
+    gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+  });
+  db.prepare("UPDATE sessions SET status='paused' WHERE id='s1'").run();
+  db.exec(`
+    CREATE TRIGGER reject_restore_session_status
+    BEFORE UPDATE ON sessions
+    BEGIN
+      SELECT RAISE(ABORT, 'session status unavailable');
+    END;
+  `);
+
+  assert.throws(
+    () =>
+      store.restoreTrack({
+        trackId: "t1",
+        gapId: "g1",
+        endedAt: 30,
+        sessionId: "s1",
+        sessionStatus: "recording",
+        deviceId: "device-2",
+        deviceLabel: "Replacement output",
+        strategy: "renderer-loopback",
+      }),
+    /session status unavailable/i
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT state, ended_at, device_id, device_label, strategy FROM audio_tracks WHERE id='t1'"
+      )
+      .get(),
+    {
+      state: "recovering",
+      ended_at: 20,
+      device_id: "device-1",
+      device_label: "PC audio",
+      strategy: "wasapi-loopback",
+    }
+  );
+  assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "paused");
+});
+
+test("restoration preserves initial track identity and timestamps replacement metadata on the gap", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.interruptTrack({
+    trackId: "t1",
+    gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+  });
+
+  store.restoreTrack({
+    trackId: "t1",
+    gapId: "g1",
+    endedAt: 30,
+    sessionId: "s1",
+    sessionStatus: "recording",
+    deviceId: "device-2",
+    deviceLabel: "Replacement output",
+    strategy: "renderer-loopback",
+  });
+
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT state, ended_at, device_id, device_label, strategy FROM audio_tracks WHERE id='t1'"
+      )
+      .get(),
+    {
+      state: "active",
+      ended_at: null,
+      device_id: "device-1",
+      device_label: "PC audio",
+      strategy: "wasapi-loopback",
+    }
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT ended_at, restored_device_id, restored_device_label, restored_strategy FROM audio_gaps WHERE id='g1'"
+      )
+      .get(),
+    {
+      ended_at: 30,
+      restored_device_id: "device-2",
+      restored_device_label: "Replacement output",
+      restored_strategy: "renderer-loopback",
+    }
+  );
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
 });
 
 test("rejects invalid and stale interruption evidence without mutation", (t) => {
@@ -955,6 +1081,38 @@ test("rejects chunks whose track session or source does not match", (t) => {
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
 });
 
+test("rejects a chunk that starts before its persisted track or session", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+
+  assert.throws(
+    () =>
+      store.commitChunk(
+        chunk({ startedAt: 9, endedAt: 19, durationMs: 10, expiresAt: 30 })
+      ),
+    /before.*track or session/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
+test("rejects a chunk that ends after its persisted track or session", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.setTrackState("t1", "ended", 20);
+  db.prepare("UPDATE sessions SET status='completed', ended_at=20 WHERE id='s1'").run();
+
+  assert.throws(
+    () =>
+      store.commitChunk(
+        chunk({ startedAt: 20, endedAt: 21, durationMs: 1, expiresAt: 30 })
+      ),
+    /after.*track or session/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
+});
+
 test("rejects enqueue metadata that does not match the persisted chunk", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -1203,7 +1361,7 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
       sources: [{ trackId: "t1", gapId: null }],
       trackState: "ended",
       sessionStatus: "completed",
-      at: 13,
+      at: 20,
     });
     repository.commitChunk(chunk());
     const job = repository.enqueueChunkTranscription(chunk());

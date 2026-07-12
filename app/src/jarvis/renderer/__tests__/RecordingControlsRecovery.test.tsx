@@ -38,7 +38,8 @@ beforeAll(async () => {
 });
 
 describe("RecordingControls microphone recovery", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await i18n.changeLanguage("zh-CN");
     localStorage.setItem("jarvisRecordingConsentVersion", "1");
     useJarvisStore.setState({
       captureMode: "mic",
@@ -60,6 +61,39 @@ describe("RecordingControls microphone recovery", () => {
     });
   });
 
+  it("localizes system-only source status and unavailable recovery actions in English", async () => {
+    await i18n.changeLanguage("en");
+    useJarvisStore.setState({
+      captureMode: "system",
+      sourceStates: { mic: "idle", system: "unavailable" },
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: "session-1",
+            status: "failed",
+            startedAt: 1_000,
+            activeSince: null,
+            accumulatedMs: 0,
+            errorCode: "capture_source_unavailable",
+          },
+          error: "capture_source_unavailable",
+        })}
+      />
+    );
+
+    expect(screen.getByRole("img", { name: "Computer audio" })).toBeInTheDocument();
+    expect(screen.getByText("Microphone: Not enabled")).toBeInTheDocument();
+    expect(screen.getByText("Computer audio: Unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Computer audio is unavailable. Retry or choose another source."
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue with available source" })).toBeDisabled();
+  });
+
   it("shows a non-fatal reconnecting notice while controls remain available", () => {
     render(
       <RecordingControls
@@ -77,6 +111,38 @@ describe("RecordingControls microphone recovery", () => {
     expect(screen.getByRole("button", { name: "暂停" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "结束并总结" })).toBeEnabled();
   });
+
+  it.each([
+    [
+      "recovering",
+      { mic: "recovering", system: "unavailable" },
+      "Restoring audio sources…",
+    ],
+    [
+      "unavailable",
+      { mic: "unavailable", system: "unavailable" },
+      "No active audio source",
+    ],
+  ] as const)(
+    "shows %s instead of Listening while durable recording has no active source",
+    async (_case, sourceStates, expectedStatus) => {
+      await i18n.changeLanguage("en");
+      const pause = vi.fn().mockResolvedValue(undefined);
+      useJarvisStore.setState({ captureMode: "dual", sourceStates });
+
+      render(<RecordingControls recording={fakeRecording({ pause })} />);
+
+      expect(screen.queryByText("Listening")).not.toBeInTheDocument();
+      const status = screen.getByText(expectedStatus);
+      expect(status).toBeInTheDocument();
+      expect(status.parentElement?.querySelector(".animate-pulse")).toBeNull();
+      const pauseButton = screen.getByRole("button", { name: "Pause" });
+      expect(pauseButton).toBeEnabled();
+
+      fireEvent.click(pauseButton);
+      await waitFor(() => expect(pause).toHaveBeenCalledOnce());
+    }
+  );
 
   it("shows the restored physical microphone", () => {
     render(

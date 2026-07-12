@@ -313,3 +313,93 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
     db.close();
   }
 });
+
+test("upgrades v2 gaps with timestamped restoration binding columns without losing evidence", () => {
+  const db = new Database(":memory:");
+
+  try {
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL,
+        mic_device_id TEXT,
+        language TEXT NOT NULL DEFAULT 'zh',
+        created_at INTEGER NOT NULL,
+        capture_mode TEXT NOT NULL DEFAULT 'mic',
+        processing_state TEXT NOT NULL DEFAULT 'pending',
+        timeline_version INTEGER NOT NULL DEFAULT 1,
+        finalized_at INTEGER,
+        ready_at INTEGER
+      );
+      CREATE TABLE audio_chunks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        transcription_status TEXT NOT NULL DEFAULT 'pending',
+        track_id TEXT,
+        source_type TEXT NOT NULL DEFAULT 'mic',
+        sequence_number INTEGER NOT NULL DEFAULT 0,
+        write_state TEXT NOT NULL DEFAULT 'committed',
+        deleted_at INTEGER
+      );
+      CREATE TABLE audio_tracks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        device_id TEXT,
+        device_label TEXT,
+        strategy TEXT,
+        sample_rate INTEGER NOT NULL,
+        channels INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        state TEXT NOT NULL,
+        UNIQUE(session_id, source_type)
+      );
+      CREATE TABLE audio_gaps (
+        id TEXT PRIMARY KEY,
+        track_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        reason TEXT NOT NULL,
+        recovery_attempts INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO sessions (id, started_at, status, created_at)
+        VALUES ('s1', 10, 'recording', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, device_id, device_label, strategy,
+        sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'mic', 'mic-old', 'Old mic', 'web-audio', 24000, 1, 10, 'recovering');
+      INSERT INTO audio_gaps (id, track_id, started_at, reason, recovery_attempts)
+        VALUES ('g1', 't1', 20, 'device-change', 2);
+      PRAGMA user_version = 2;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 2, toVersion: TARGET_VERSION });
+    assert.equal(db.pragma("user_version", { simple: true }), TARGET_VERSION);
+    assert.deepEqual(
+      columnNames(db, "audio_gaps").filter((name) => name.startsWith("restored_")),
+      ["restored_device_id", "restored_device_label", "restored_strategy"]
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM audio_gaps WHERE id = 'g1'").get(), {
+      id: "g1",
+      track_id: "t1",
+      started_at: 20,
+      ended_at: null,
+      reason: "device-change",
+      recovery_attempts: 2,
+      restored_device_id: null,
+      restored_device_label: null,
+      restored_strategy: null,
+    });
+  } finally {
+    db.close();
+  }
+});

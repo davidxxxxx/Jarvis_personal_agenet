@@ -24,16 +24,28 @@ async function waitFor(predicate, description = "condition") {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function waitForTimed(predicate, description = "timed condition", timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
+
 function createFixture({
   appendPcm = () => true,
+  sourceInterrupted = () => {},
   onDerived = () => {},
   managedStartChunk = null,
+  managedStartError = null,
   managedStartDeferred = null,
   managedStopDeferred = null,
   aecStartDeferred = null,
   transcribeLocalWhisper = async () => ({ success: true, text: "" }),
   maybeCorrect = null,
   warmStreaming = false,
+  realtimeConnectDeferred = null,
   systemAvailable = false,
   aecAvailable = false,
 } = {}) {
@@ -48,6 +60,7 @@ function createFixture({
   const whisperCalls = [];
   const correctionCalls = [];
   const transcriptRevisions = [];
+  const realtimeInstances = [];
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-meeting-ipc-"));
   const createSender = (id) => {
     const webContents = new EventEmitter();
@@ -94,11 +107,36 @@ function createFixture({
     },
     net: { fetch: async () => ({ ok: false, json: async () => ({}) }) },
   };
+  class ControllableRealtimeStreaming {
+    constructor() {
+      this.isConnected = false;
+      this.completedSegments = [];
+      this.disconnectCalls = 0;
+      realtimeInstances.push(this);
+    }
+
+    async connect() {
+      lifecycle.push("realtime-connect-start");
+      await realtimeConnectDeferred.promise;
+      this.isConnected = true;
+      lifecycle.push("realtime-connect-complete");
+    }
+
+    async disconnect() {
+      this.disconnectCalls += 1;
+      this.isConnected = false;
+      lifecycle.push("realtime-disconnect");
+      return { text: "" };
+    }
+  }
 
   const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
     if (request === "electron") return electron;
+    if (request === "./openaiRealtimeStreaming" && realtimeConnectDeferred) {
+      return ControllableRealtimeStreaming;
+    }
     return originalLoad.call(this, request, parent, isMain);
   };
   let IPCHandlers;
@@ -118,6 +156,9 @@ function createFixture({
       managedStarts.push(options);
       if (managedStartChunk) {
         managedStartAcceptances.push(options.onChunk(managedStartChunk));
+      }
+      if (managedStartError) {
+        options.onError(managedStartError);
       }
       if (managedStartDeferred) await managedStartDeferred.promise;
     },
@@ -156,7 +197,9 @@ function createFixture({
     },
   });
   const instance = Object.assign(Object.create(IPCHandlers.prototype), {
-    environmentManager: {},
+    environmentManager: realtimeConnectDeferred
+      ? { getOpenAIKey: () => "test-placeholder-key" }
+      : {},
     databaseManager: {},
     whisperManager: {
       transcribeLocalWhisper: async (...args) => {
@@ -174,7 +217,7 @@ function createFixture({
     linuxPortalAudioManager: null,
     windowsLoopbackAudioManager,
     meetingAecManager,
-    jarvisService: { appendPcm },
+    jarvisService: { appendPcm, sourceInterrupted },
     jarvisRepository: {
       addTranscriptRevision: (revision) => transcriptRevisions.push(revision),
     },
@@ -206,6 +249,7 @@ function createFixture({
     whisperCalls,
     correctionCalls,
     transcriptRevisions,
+    realtimeInstances,
     derivedCalls,
     managedOptions: () => managedStarts.at(-1),
     managedStarts,
@@ -216,6 +260,40 @@ function createFixture({
     },
   };
 }
+
+test("explicit stop supersedes a pending realtime prepare before its late connection can stay warm", async (t) => {
+  const realtimeConnectDeferred = createDeferred();
+  const fixture = createFixture({ realtimeConnectDeferred });
+  t.after(fixture.cleanup);
+  const prepare = fixture.handles.get("meeting-transcription-prepare");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  const preparePromise = prepare(
+    { sender: fixture.sender },
+    { provider: "openai-realtime", mode: "byok", micOnly: true }
+  );
+  await waitFor(
+    () => fixture.lifecycle.includes("realtime-connect-start"),
+    "the pending realtime prepare connection"
+  );
+
+  let stopSettled = false;
+  const stopPromise = stop({ sender: fixture.sender }).then((result) => {
+    stopSettled = true;
+    return result;
+  });
+  await waitFor(() => stopSettled, "explicit stop while prepare is pending");
+  const stopped = await stopPromise;
+
+  realtimeConnectDeferred.resolve();
+  const prepared = await preparePromise;
+
+  assert.equal(stopped.success, true);
+  assert.deepEqual(prepared, { success: false, error: "Prepare superseded" });
+  assert.equal(fixture.realtimeInstances.length, 1);
+  assert.equal(fixture.realtimeInstances[0].isConnected, false);
+  assert.equal(fixture.realtimeInstances[0].disconnectCalls, 1);
+});
 
 test("unsupported non-mic-only start rolls back Jarvis identity before later audio or starts", async (t) => {
   const persisted = [];
@@ -304,6 +382,31 @@ test("managed system audio emitted during start is committed only after the star
   assert.equal(calls[0][3], startupChunk);
   assert.notEqual(calls[1][2], startupChunk);
   assert.deepEqual(fixture.managerStops, []);
+});
+
+test("managed system failure during start falls back before reporting the source available", async (t) => {
+  const interruptions = [];
+  const fixture = createFixture({
+    managedStartError: new Error("system producer failed during startup"),
+    sourceInterrupted: (...args) => interruptions.push(args),
+    systemAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  const result = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-startup-system-failure" }
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.systemAudioStrategy, "loopback");
+  assert.deepEqual(fixture.managerStops, ["stop"]);
+  assert.deepEqual(interruptions, []);
+  assert.equal(
+    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    0
+  );
 });
 
 test("renderer ingress receives a metadata-only rejection when Jarvis stops accepting PCM", async (t) => {
@@ -531,7 +634,11 @@ test("a stale managed system callback is gated before a newer dual-track session
 });
 
 test("managed system errors publish only for their current input generation", async (t) => {
-  const fixture = createFixture({ systemAvailable: true });
+  const interruptions = [];
+  const fixture = createFixture({
+    systemAvailable: true,
+    sourceInterrupted: (...args) => interruptions.push(args),
+  });
   t.after(fixture.cleanup);
   const start = fixture.handles.get("meeting-transcription-start");
   const stop = fixture.handles.get("meeting-transcription-stop");
@@ -552,6 +659,7 @@ test("managed system errors publish only for their current input generation", as
   oldProducer.onError(new Error("stale producer"));
   const stopsAfterStaleError = fixture.managerStops.length;
   currentProducer.onError(new Error("current producer"));
+  currentProducer.onError(new Error("duplicate current producer error"));
 
   assert.deepEqual(
     fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state"),
@@ -570,11 +678,140 @@ test("managed system errors publish only for their current input generation", as
   assert.equal(stopsBeforeStaleError, 1);
   assert.equal(stopsAfterStaleError, stopsBeforeStaleError);
   assert.equal(fixture.managerStops.length, 2);
+  assert.equal(interruptions.length, 1);
+  assert.equal(interruptions[0][0], "jarvis-source-state-current");
+  assert.equal(interruptions[0][1], "system");
+  assert.deepEqual(interruptions[0][2], {
+    at: interruptions[0][2].at,
+    reason: "system-capture-error",
+  });
+  assert.equal(Number.isSafeInteger(interruptions[0][2].at), true);
   assert.equal(
     fixture.sent.some(([, payload]) =>
       JSON.stringify(payload).includes("private device details")
     ),
     false
+  );
+});
+
+test("managed system interruption persistence retries after producer failure is consumed", async (t) => {
+  const interruptions = [];
+  const fixture = createFixture({
+    systemAvailable: true,
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+      if (interruptions.length === 1) {
+        throw new Error("temporary persistence failure");
+      }
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-interruption-retry" }
+  );
+  fixture.managedStarts[0].onError(new Error("system producer failed"));
+
+  assert.equal(interruptions.length, 1);
+  assert.equal(fixture.managerStops.length, 1);
+  assert.equal(
+    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    1
+  );
+
+  await waitForTimed(
+    () => interruptions.length === 2,
+    "the current system interruption persistence retry"
+  );
+
+  assert.equal(interruptions[0][0], "jarvis-interruption-retry");
+  assert.equal(interruptions[0][1], "system");
+  assert.deepEqual(interruptions[1], interruptions[0]);
+  assert.equal(
+    fixture.sent.filter(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-source-state" &&
+        payload.inputGeneration === started.inputGeneration
+    ).length,
+    1
+  );
+});
+
+test("stopping and replacing the input binding cancels its system interruption retry", async (t) => {
+  const interruptions = [];
+  const fixture = createFixture({
+    systemAvailable: true,
+    sourceInterrupted: async (...args) => {
+      interruptions.push(args);
+      if (args[0] === "jarvis-interruption-old") {
+        throw new Error("old persistence unavailable");
+      }
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-interruption-old" }
+  );
+  fixture.managedStarts[0].onError(new Error("old producer failed"));
+  await waitForTimed(() => interruptions.length === 1, "the first old-binding attempt");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await stop({ sender: fixture.sender });
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-interruption-new" }
+  );
+  fixture.managedStarts[1].onError(new Error("new producer failed"));
+  await waitForTimed(
+    () => interruptions.some(([sessionId]) => sessionId === "jarvis-interruption-new"),
+    "the new-binding persistence"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.deepEqual(
+    interruptions.map(([sessionId]) => sessionId),
+    ["jarvis-interruption-old", "jarvis-interruption-new"]
+  );
+  assert.equal(
+    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    2
+  );
+});
+
+test("successful retried system interruption persistence is not duplicated", async (t) => {
+  let attempts = 0;
+  const fixture = createFixture({
+    systemAvailable: true,
+    sourceInterrupted: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("response was lost after persistence");
+      }
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-interruption-idempotent" }
+  );
+  fixture.managedStarts[0].onError(new Error("producer ended"));
+
+  await waitForTimed(() => attempts === 2, "the successful persistence retry");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.equal(attempts, 2);
+  assert.equal(fixture.managerStops.length, 1);
+  assert.equal(
+    fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
+    1
   );
 });
 

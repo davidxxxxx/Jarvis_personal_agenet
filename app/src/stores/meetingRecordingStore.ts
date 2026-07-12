@@ -34,7 +34,11 @@ import {
   orderMicrophoneRecoveryCandidates,
   type MicrophoneRecoveryCandidate,
 } from "../jarvis/renderer/microphoneRecoveryPolicy";
-import type { JarvisCaptureSourceStates } from "../jarvis/types";
+import type {
+  JarvisCaptureSourceStates,
+  JarvisSourceInterruptionInput,
+  JarvisSourceRestorationInput,
+} from "../jarvis/types";
 
 export interface TranscriptSegment {
   id: string;
@@ -209,10 +213,23 @@ const getMeetingTranscriptionOptions = (
   return { provider: `${provider.id}-realtime` as const, model, mode };
 };
 
+const stoppedMediaStreams = new WeakSet<MediaStream>();
 const stopMediaStream = (stream: MediaStream | null) => {
+  if (!stream || stoppedMediaStreams.has(stream)) return;
+  stoppedMediaStreams.add(stream);
   try {
-    stream?.getTracks().forEach((track) => track.stop());
+    stream.getTracks().forEach((track) => track.stop());
   } catch {}
+};
+
+const closingAudioContexts = new WeakMap<AudioContext, Promise<void>>();
+const closeAudioContextOnce = (context: AudioContext | null): Promise<void> => {
+  if (!context) return Promise.resolve();
+  const existing = closingAudioContexts.get(context);
+  if (existing) return existing;
+  const closing = context.close().catch(() => undefined);
+  closingAudioContexts.set(context, closing);
+  return closing;
 };
 
 const getDisplayCaptureOptions = (mode: "loopback" | "portal") => {
@@ -386,16 +403,29 @@ const createAudioPipeline = async ({
   stream,
   context,
   onChunk,
+  cancellation,
+  isCancelled,
 }: {
   stream: MediaStream;
   context: AudioContext;
   onChunk: (chunk: ArrayBuffer) => void;
+  cancellation?: Promise<void>;
+  isCancelled?: () => boolean;
 }) => {
+  const awaitPipelineStep = async (step: Promise<unknown>): Promise<void> => {
+    if (isCancelled?.()) throw new Error("MIC_RECOVERY_CANCELLED");
+    if (cancellation) {
+      await Promise.race([step, cancellation]);
+    } else {
+      await step;
+    }
+    if (isCancelled?.()) throw new Error("MIC_RECOVERY_CANCELLED");
+  };
   if (context.state === "suspended") {
-    await context.resume();
+    await awaitPipelineStep(context.resume());
   }
 
-  await context.audioWorklet.addModule(getMeetingWorkletBlobUrl());
+  await awaitPipelineStep(context.audioWorklet.addModule(getMeetingWorkletBlobUrl()));
 
   const source = context.createMediaStreamSource(stream);
   const processor = new AudioWorkletNode(context, "meeting-pcm-processor");
@@ -456,6 +486,7 @@ let systemProcessor: AudioWorkletNode | null = null;
 let systemStream: MediaStream | null = null;
 let isRecordingFlag = false;
 let isStartingFlag = false;
+let captureAttemptGeneration = 0;
 let meetingInputRejected = false;
 let activeMeetingInputGeneration: string | null = null;
 let isPrepared = false;
@@ -472,6 +503,10 @@ let recentSystemSpeaker: RecentSystemSpeaker | null = null;
 let speakerLocks: Map<string, string> = new Map();
 let pushConfigTimeout: ReturnType<typeof setTimeout> | null = null;
 let cancelActiveMicRecovery: (() => void) | null = null;
+let cancelPendingCaptureSetup: (() => void) | null = null;
+let cancelPendingMicrophoneCapture: (() => void) | null = null;
+let cancelPendingRendererSystemCapture: (() => void) | null = null;
+let cancelActiveRendererSystemInterruptionPersistence: (() => void) | null = null;
 
 export const useMeetingRecordingStore = create<MeetingRecordingState>()(() => ({
   isRecording: false,
@@ -739,9 +774,29 @@ interface CaptureCleanupOptions {
 }
 
 async function cleanupCaptureSources(options: CaptureCleanupOptions = {}): Promise<void> {
+  captureAttemptGeneration += 1;
   activeMeetingInputGeneration = null;
+  if (preparePromise) {
+    prepareGeneration += 1;
+    preparePromise = null;
+    prepareMicOnly = null;
+    isPrepared = false;
+    preparedMicOnly = null;
+    try {
+      const cancellation = window.electronAPI?.meetingTranscriptionCancel?.();
+      void cancellation?.catch(() => undefined);
+    } catch {}
+  }
+  cancelPendingCaptureSetup?.();
+  cancelPendingCaptureSetup = null;
+  cancelPendingMicrophoneCapture?.();
+  cancelPendingMicrophoneCapture = null;
+  cancelPendingRendererSystemCapture?.();
+  cancelPendingRendererSystemCapture = null;
   cancelActiveMicRecovery?.();
   cancelActiveMicRecovery = null;
+  cancelActiveRendererSystemInterruptionPersistence?.();
+  cancelActiveRendererSystemInterruptionPersistence = null;
 
   await flushAndDisconnectProcessor(micProcessor);
   micProcessor = null;
@@ -867,9 +922,142 @@ export interface StartRecordingArgs {
 
 export async function startRecording(args: StartRecordingArgs): Promise<void> {
   if (isRecordingFlag || isStartingFlag || meetingStopCoordinator.hasPendingStop()) return;
+  const captureAttempt = ++captureAttemptGeneration;
+  const isCurrentCaptureAttempt = () => captureAttemptGeneration === captureAttempt;
+  let rejectCaptureSetupCancellation!: (reason: Error) => void;
+  const captureSetupCancellation = new Promise<never>((_resolve, reject) => {
+    rejectCaptureSetupCancellation = reject;
+  });
+  const cancelThisCaptureSetup = () => {
+    rejectCaptureSetupCancellation(new Error("CAPTURE_SETUP_CANCELLED"));
+  };
+  const awaitCaptureSetupStep = async (step: Promise<unknown>): Promise<void> => {
+    await Promise.race([step, captureSetupCancellation]);
+    if (!isCurrentCaptureAttempt()) throw new Error("CAPTURE_SETUP_CANCELLED");
+  };
+  cancelPendingCaptureSetup = cancelThisCaptureSetup;
   isStartingFlag = true;
   activeMeetingInputGeneration = null;
   let acceptedMainInputGeneration: string | null = null;
+  let pendingMicrophoneStream: MediaStream | null = null;
+  let pendingMicrophoneContext: AudioContext | null = null;
+  let pendingMicrophoneOwnershipOpen = true;
+  const releasedPendingMicrophoneStreams = new WeakSet<MediaStream>();
+  const stopPendingMicrophoneStream = (stream: MediaStream | null) => {
+    if (!stream || releasedPendingMicrophoneStreams.has(stream)) return;
+    releasedPendingMicrophoneStreams.add(stream);
+    stopMediaStream(stream);
+  };
+  const releasePendingMicrophoneStream = () => {
+    const stream = pendingMicrophoneStream;
+    pendingMicrophoneStream = null;
+    stopPendingMicrophoneStream(stream);
+  };
+  const releasePendingMicrophoneContext = (): Promise<void> => {
+    const context = pendingMicrophoneContext;
+    pendingMicrophoneContext = null;
+    return closeAudioContextOnce(context);
+  };
+  const claimPendingMicrophoneStream = (stream: MediaStream | null) => {
+    if (!stream) return;
+    if (!pendingMicrophoneOwnershipOpen) {
+      stopPendingMicrophoneStream(stream);
+      return;
+    }
+    if (pendingMicrophoneStream && pendingMicrophoneStream !== stream) {
+      stopPendingMicrophoneStream(pendingMicrophoneStream);
+    }
+    pendingMicrophoneStream = stream;
+  };
+  const claimPendingMicrophoneContext = (context: AudioContext) => {
+    if (!pendingMicrophoneOwnershipOpen) {
+      void closeAudioContextOnce(context);
+      return;
+    }
+    if (pendingMicrophoneContext && pendingMicrophoneContext !== context) {
+      void closeAudioContextOnce(pendingMicrophoneContext);
+    }
+    pendingMicrophoneContext = context;
+  };
+  const transferPendingMicrophoneCapture = (stream: MediaStream, context: AudioContext) => {
+    if (
+      !pendingMicrophoneOwnershipOpen ||
+      pendingMicrophoneStream !== stream ||
+      pendingMicrophoneContext !== context
+    ) {
+      return false;
+    }
+    if (pendingMicrophoneStream === stream) pendingMicrophoneStream = null;
+    if (pendingMicrophoneContext === context) pendingMicrophoneContext = null;
+    return true;
+  };
+  const closePendingMicrophoneOwnership = () => {
+    pendingMicrophoneOwnershipOpen = false;
+    releasePendingMicrophoneStream();
+    void releasePendingMicrophoneContext();
+  };
+  cancelPendingMicrophoneCapture = closePendingMicrophoneOwnership;
+  let pendingRendererSystemStream: MediaStream | null = null;
+  let pendingRendererSystemContext: AudioContext | null = null;
+  let pendingRendererSystemOwnershipOpen = true;
+  const releasedPendingRendererSystemStreams = new WeakSet<MediaStream>();
+  const stopPendingRendererSystemStream = (stream: MediaStream | null) => {
+    if (!stream || releasedPendingRendererSystemStreams.has(stream)) return;
+    releasedPendingRendererSystemStreams.add(stream);
+    stopMediaStream(stream);
+  };
+  const releasePendingRendererSystemStream = () => {
+    const stream = pendingRendererSystemStream;
+    pendingRendererSystemStream = null;
+    stopPendingRendererSystemStream(stream);
+  };
+  const releasePendingRendererSystemContext = (): Promise<void> => {
+    const context = pendingRendererSystemContext;
+    pendingRendererSystemContext = null;
+    return closeAudioContextOnce(context);
+  };
+  const claimPendingRendererSystemStream = (stream: MediaStream | null) => {
+    if (!stream) return;
+    if (!pendingRendererSystemOwnershipOpen) {
+      stopPendingRendererSystemStream(stream);
+      return;
+    }
+    if (pendingRendererSystemStream && pendingRendererSystemStream !== stream) {
+      stopPendingRendererSystemStream(pendingRendererSystemStream);
+    }
+    pendingRendererSystemStream = stream;
+  };
+  const claimPendingRendererSystemContext = (context: AudioContext) => {
+    if (!pendingRendererSystemOwnershipOpen) {
+      void closeAudioContextOnce(context);
+      return;
+    }
+    if (pendingRendererSystemContext && pendingRendererSystemContext !== context) {
+      void closeAudioContextOnce(pendingRendererSystemContext);
+    }
+    pendingRendererSystemContext = context;
+  };
+  const transferPendingRendererSystemCapture = (
+    stream: MediaStream,
+    context: AudioContext
+  ): boolean => {
+    if (
+      !pendingRendererSystemOwnershipOpen ||
+      pendingRendererSystemStream !== stream ||
+      pendingRendererSystemContext !== context
+    ) {
+      return false;
+    }
+    pendingRendererSystemStream = null;
+    pendingRendererSystemContext = null;
+    return true;
+  };
+  const closePendingRendererSystemOwnership = () => {
+    pendingRendererSystemOwnershipOpen = false;
+    releasePendingRendererSystemStream();
+    void releasePendingRendererSystemContext();
+  };
+  cancelPendingRendererSystemCapture = closePendingRendererSystemOwnership;
   const captureMicrophone = args.captureMicrophone !== false;
   const captureSystemAudio = args.captureSystemAudio !== false;
   const micOnly = args.micOnly ?? !captureSystemAudio;
@@ -945,7 +1133,13 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       })
     ) {
       logger.debug("Waiting for compatible in-flight prepare to finish...", {}, "meeting");
-      await preparePromise;
+      try {
+        await Promise.race([preparePromise, captureSetupCancellation]);
+      } catch (error) {
+        if (isCurrentCaptureAttempt()) throw error;
+        return;
+      }
+      if (!isCurrentCaptureAttempt()) return;
     } else {
       prepareGeneration += 1;
       preparePromise = null;
@@ -958,10 +1152,68 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     isPrepared = false;
   }
 
+  type MainManagedSystemStateEvent = {
+    source: "system";
+    state: "unavailable";
+    reason: "system-capture-error";
+    inputGeneration: string;
+  };
+  let acceptedSourceStateGeneration: string | null = null;
+  let sourceStateHandledInMain: boolean | null = null;
+  const pendingMainManagedSystemStates = new Map<string, MainManagedSystemStateEvent>();
+  let mainManagedSystemUnavailable = false;
+  const applyMainManagedSystemState = (payload: MainManagedSystemStateEvent) => {
+    if (
+      sourceStateHandledInMain !== true ||
+      payload.inputGeneration !== acceptedSourceStateGeneration ||
+      !isCurrentCaptureAttempt() ||
+      !isRecordingFlag
+    ) {
+      return;
+    }
+    mainManagedSystemUnavailable = true;
+    useMeetingRecordingStore.setState({
+      error: "System audio capture stopped.",
+      captureSourceStates: {
+        ...useMeetingRecordingStore.getState().captureSourceStates,
+        system: "unavailable",
+      },
+    });
+  };
+  const earlySourceStateCleanup = window.electronAPI?.onMeetingTranscriptionSourceState?.(
+    (payload) => {
+      if (
+        payload.source !== "system" ||
+        payload.state !== "unavailable" ||
+        !isCurrentCaptureAttempt() ||
+        !isRecordingFlag
+      ) {
+        return;
+      }
+      if (acceptedSourceStateGeneration === null || sourceStateHandledInMain === null) {
+        pendingMainManagedSystemStates.set(payload.inputGeneration, payload);
+        if (pendingMainManagedSystemStates.size > 8) {
+          const oldestGeneration = pendingMainManagedSystemStates.keys().next().value;
+          if (oldestGeneration !== undefined) {
+            pendingMainManagedSystemStates.delete(oldestGeneration);
+          }
+        }
+        return;
+      }
+      applyMainManagedSystemState(payload);
+    }
+  );
+  let sourceStateCleanupTransferred = false;
+
   try {
     const startTime = performance.now();
+    const resolvedSystemAudioAccess = await Promise.race([
+      systemAudioAccessPromise,
+      captureSetupCancellation,
+    ]);
+    if (!isCurrentCaptureAttempt()) return;
     const initialSystemAudioAccess =
-      (await systemAudioAccessPromise) ?? getFallbackSystemAudioAccess();
+      resolvedSystemAudioAccess ?? getFallbackSystemAudioAccess();
     const { initialSystemAudioStrategy, initialDisplayCaptureStrategy, systemCapturePromise } =
       !captureSystemAudio
         ? {
@@ -970,20 +1222,30 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             systemCapturePromise: Promise.resolve({ stream: null, error: null }),
           }
         : prepareMeetingSystemAudioCapture(initialSystemAudioAccess);
+    const trackedSystemCapturePromise = systemCapturePromise.then((result) => {
+      claimPendingRendererSystemStream(result.stream);
+      return result;
+    });
     let micFailureCode: "MIC_PERMISSION" | "MIC_DISCONNECTED" | null = null;
     let usedDefaultMicFallback = false;
 
-    const [startResult, micResult, initialSystemCaptureResult] = await Promise.all([
-      window.electronAPI?.meetingTranscriptionStart?.({
-        ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true, args),
-        noteId: args.noteId ?? null,
-        micOnly,
-        jarvisSessionId: args.jarvisSessionId ?? null,
-      }),
-      captureMicrophone
+    const [startResult, micResult, initialSystemCaptureResult] = await Promise.race([
+      Promise.all([
+        window.electronAPI?.meetingTranscriptionStart?.({
+          ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true, args),
+          noteId: args.noteId ?? null,
+          micOnly,
+          jarvisSessionId: args.jarvisSessionId ?? null,
+        }),
+        (captureMicrophone
         ? getMeetingMicConstraints().then(async (constraints) => {
+            if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
             try {
               const initialMicStream = await navigator.mediaDevices.getUserMedia(constraints);
+              if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
+                stopMediaStream(initialMicStream);
+                return null;
+              }
               if (!micOnly) return initialMicStream;
 
               const recoveredMicStream = await reacquireIfDead(
@@ -991,6 +1253,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
                 () => Promise.resolve(constraints),
                 logger
               );
+              if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
+                stopMediaStream(recoveredMicStream);
+                return null;
+              }
               const recoveredTrack = recoveredMicStream.getAudioTracks()[0];
               if (
                 !recoveredTrack ||
@@ -1003,6 +1269,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               }
               return recoveredMicStream;
             } catch (err) {
+              if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
               const hasExactDevice =
                 typeof constraints.audio === "object" &&
                 constraints.audio !== null &&
@@ -1015,11 +1282,13 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
                 const selectedDeviceId = getSettings().selectedMicDeviceId || null;
                 const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+                if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
                 const candidates = orderMicrophoneRecoveryCandidates(
                   devices,
                   selectedDeviceId
                 ).filter((candidate) => candidate.deviceId !== selectedDeviceId);
                 for (const candidate of candidates) {
+                  if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
                   try {
                     const candidateStream = await navigator.mediaDevices.getUserMedia({
                       audio: {
@@ -1027,6 +1296,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
                         ...MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
                       },
                     });
+                    if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
+                      stopMediaStream(candidateStream);
+                      return null;
+                    }
                     const candidateTrack = candidateStream.getAudioTracks()[0];
                     if (
                       candidateTrack &&
@@ -1057,9 +1330,14 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
                 }
 
                 try {
+                  if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
                   const fallbackStream = await navigator.mediaDevices.getUserMedia({
                     audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
                   });
+                  if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
+                    stopMediaStream(fallbackStream);
+                    return null;
+                  }
                   const fallbackTrack = fallbackStream.getAudioTracks()[0];
                   if (
                     !fallbackTrack ||
@@ -1085,9 +1363,14 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               }
               if (hasExactDevice) {
                 try {
+                  if (!isCurrentCaptureAttempt() || !isRecordingFlag) return null;
                   const fallbackStream = await navigator.mediaDevices.getUserMedia({
                     audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
                   });
+                  if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
+                    stopMediaStream(fallbackStream);
+                    return null;
+                  }
                   logger.info(
                     "Meeting mic capture recovered using default device",
                     { error: (err as Error).message },
@@ -1116,17 +1399,22 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               return null;
             }
           })
-        : Promise.resolve(null),
-      systemCapturePromise,
+        : Promise.resolve(null)
+        ).then((stream) => {
+          claimPendingMicrophoneStream(stream);
+          return stream;
+        }),
+        trackedSystemCapturePromise,
+      ]),
+      captureSetupCancellation,
     ]);
     let systemCaptureResult = initialSystemCaptureResult;
 
     const streamsMs = performance.now() - startTime;
-    if (!isRecordingFlag) {
+    if (!isCurrentCaptureAttempt() || !isRecordingFlag) {
       logger.info("Meeting transcription aborted during setup (stop called)", {}, "meeting");
       stopMediaStream(micResult);
-      stopMediaStream(systemCaptureResult.stream);
-      isStartingFlag = false;
+      releasePendingRendererSystemStream();
       return;
     }
 
@@ -1150,7 +1438,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         isTranscribing: false,
       });
       stopMediaStream(micResult);
-      stopMediaStream(systemCaptureResult.stream);
+      releasePendingRendererSystemStream();
       isRecordingFlag = false;
       isStartingFlag = false;
       return;
@@ -1158,6 +1446,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     const inputGeneration = startResult.inputGeneration;
     acceptedMainInputGeneration = inputGeneration;
     activeMeetingInputGeneration = inputGeneration;
+    acceptedSourceStateGeneration = inputGeneration;
 
     const systemAudioMode = startResult.systemAudioMode || initialSystemAudioAccess.mode;
     const systemAudioStrategy = startResult.systemAudioStrategy || initialSystemAudioStrategy;
@@ -1166,10 +1455,20 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       systemAudioStrategy,
       systemCaptureResult,
     });
+    claimPendingRendererSystemStream(systemCaptureResult.stream);
+    if (
+      !isCurrentCaptureAttempt() ||
+      !isRecordingFlag ||
+      activeMeetingInputGeneration !== inputGeneration
+    ) {
+      stopMediaStream(micResult);
+      releasePendingRendererSystemStream();
+      return;
+    }
     const systemAudioHandledInMain =
       systemAudioMode !== "unsupported" && !isRendererSystemAudioStrategy(systemAudioStrategy);
     if (systemAudioHandledInMain && systemCaptureResult.stream) {
-      stopMediaStream(systemCaptureResult.stream);
+      releasePendingRendererSystemStream();
       systemCaptureResult = { stream: null, error: null };
     }
     const systemCaptureError = systemAudioHandledInMain ? null : systemCaptureResult.error;
@@ -1183,16 +1482,26 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         : "idle",
     };
     useMeetingRecordingStore.setState({ captureSourceStates: sourceStates });
+    sourceStateHandledInMain = systemAudioHandledInMain;
+    const pendingState = pendingMainManagedSystemStates.get(inputGeneration);
+    pendingMainManagedSystemStates.clear();
+    if (pendingState) {
+      applyMainManagedSystemState(pendingState);
+    }
+    if (mainManagedSystemUnavailable) sourceStates.system = "unavailable";
 
     const missingRequiredSource =
       (captureMicrophone && !micResult) ||
-      (captureSystemAudio && !systemAudioHandledInMain && !systemCaptureResult.stream);
+      (captureSystemAudio &&
+        (systemAudioHandledInMain
+          ? mainManagedSystemUnavailable
+          : !systemCaptureResult.stream));
     if (args.requireAllSources && missingRequiredSource) {
       logger.warn("Meeting transcription required capture source unavailable", {}, "meeting");
       activeMeetingInputGeneration = null;
       isRecordingFlag = false;
       stopMediaStream(micResult);
-      stopMediaStream(systemCaptureResult.stream);
+      releasePendingRendererSystemStream();
       useMeetingRecordingStore.setState({
         error: "capture_source_unavailable",
         isRecording: false,
@@ -1211,7 +1520,11 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       });
     }
 
-    if (!micResult && !systemCaptureResult.stream && !systemAudioHandledInMain) {
+    if (
+      !micResult &&
+      !systemCaptureResult.stream &&
+      (!systemAudioHandledInMain || mainManagedSystemUnavailable)
+    ) {
       logger.error("Meeting transcription has no available audio source", {}, "meeting");
       useMeetingRecordingStore.setState({
         error:
@@ -1227,6 +1540,11 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       isRecordingFlag = false;
       isStartingFlag = false;
       return;
+    }
+
+    if (earlySourceStateCleanup) {
+      ipcCleanups.push(earlySourceStateCleanup);
+      sourceStateCleanupTransferred = true;
     }
 
     const segmentCleanup = window.electronAPI?.onMeetingTranscriptionSegment?.(
@@ -1388,28 +1706,6 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     );
     if (inputRejectedCleanup) ipcCleanups.push(inputRejectedCleanup);
 
-    const sourceStateCleanup = window.electronAPI?.onMeetingTranscriptionSourceState?.(
-      ({ source, state, inputGeneration: sourceGeneration }) => {
-        if (
-          source !== "system" ||
-          state !== "unavailable" ||
-          !isRecordingFlag ||
-          activeMeetingInputGeneration !== inputGeneration ||
-          sourceGeneration !== inputGeneration
-        ) {
-          return;
-        }
-        useMeetingRecordingStore.setState({
-          error: "System audio capture stopped.",
-          captureSourceStates: {
-            ...useMeetingRecordingStore.getState().captureSourceStates,
-            system: "unavailable",
-          },
-        });
-      }
-    );
-    if (sourceStateCleanup) ipcCleanups.push(sourceStateCleanup);
-
     if (startResult.oneOnOneAttendee) {
       const synthetic: SpeakerIdentification = {
         speakerId: "speaker_0",
@@ -1428,10 +1724,157 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     let socketReady = false;
 
     const selectedMicDeviceId = getSettings().selectedMicDeviceId || null;
+    const jarvisSessionId = args.jarvisSessionId ?? null;
     let recoveryGeneration = 0;
     let recoveryPromise: Promise<void> | null = null;
     let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
     let resolveRecoveryDelay: (() => void) | null = null;
+    let micEvidenceInterrupted = false;
+    let pendingMicInterruption: JarvisSourceInterruptionInput | null = null;
+    type MicRecoveryCandidateOwner = {
+      stream: MediaStream;
+      context: AudioContext | null;
+      released: boolean;
+      transferred: boolean;
+      cancellation: Promise<void>;
+      cancel: () => void;
+      closePromise: Promise<void> | null;
+    };
+    let pendingMicRecoveryCandidate: MicRecoveryCandidateOwner | null = null;
+    const closeMicRecoveryCandidateContext = (
+      owner: MicRecoveryCandidateOwner
+    ): Promise<void> => {
+      if (!owner.context) return Promise.resolve();
+      if (!owner.closePromise) {
+        owner.closePromise = closeAudioContextOnce(owner.context);
+      }
+      return owner.closePromise;
+    };
+    const releaseMicRecoveryCandidate = (
+      owner: MicRecoveryCandidateOwner | null = pendingMicRecoveryCandidate
+    ): Promise<void> => {
+      if (!owner || owner.transferred) return Promise.resolve();
+      if (!owner.released) {
+        owner.released = true;
+        owner.cancel();
+        stopMediaStream(owner.stream);
+      }
+      if (pendingMicRecoveryCandidate === owner) pendingMicRecoveryCandidate = null;
+      return closeMicRecoveryCandidateContext(owner);
+    };
+    const createMicRecoveryCandidate = (stream: MediaStream): MicRecoveryCandidateOwner => {
+      void releaseMicRecoveryCandidate();
+      let cancel!: () => void;
+      const cancellation = new Promise<void>((resolve) => {
+        cancel = resolve;
+      });
+      const owner: MicRecoveryCandidateOwner = {
+        stream,
+        context: null,
+        released: false,
+        transferred: false,
+        cancellation,
+        cancel,
+        closePromise: null,
+      };
+      pendingMicRecoveryCandidate = owner;
+      return owner;
+    };
+    const transferMicRecoveryCandidate = (owner: MicRecoveryCandidateOwner): boolean => {
+      if (owner.released || owner.transferred) return false;
+      owner.transferred = true;
+      if (pendingMicRecoveryCandidate === owner) pendingMicRecoveryCandidate = null;
+      return true;
+    };
+    let rendererSystemInterrupted = false;
+    let rendererSystemPersistenceGeneration = 0;
+    let rendererSystemPersistenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let resolveRendererSystemPersistenceDelay: (() => void) | null = null;
+    let rendererSystemPersistencePromise: Promise<void> | null = null;
+    const isCurrentInput = () =>
+      isCurrentCaptureAttempt() &&
+      isRecordingFlag &&
+      !meetingInputRejected &&
+      activeMeetingInputGeneration === inputGeneration;
+    const notifySourceInterrupted = async (
+      sourceType: "mic" | "system",
+      reason: string,
+      at = Date.now()
+    ): Promise<boolean> => {
+      if (!isCurrentInput()) return false;
+      if (!jarvisSessionId) return true;
+      try {
+        await window.electronAPI.jarvis.sourceInterrupted(jarvisSessionId, sourceType, {
+          at,
+          reason,
+        });
+        return isCurrentInput();
+      } catch {
+        logger.info("Jarvis source interruption persistence will retry", { sourceType }, "meeting");
+        return false;
+      }
+    };
+    const persistMicInterruption = async (reason: string): Promise<boolean> => {
+      const payload = pendingMicInterruption ?? { at: Date.now(), reason };
+      pendingMicInterruption = payload;
+      const persisted = await notifySourceInterrupted("mic", payload.reason, payload.at);
+      if (persisted) pendingMicInterruption = null;
+      return persisted;
+    };
+    const waitForRendererSystemPersistenceDelay = (delayMs: number): Promise<void> =>
+      new Promise((resolve) => {
+        resolveRendererSystemPersistenceDelay = resolve;
+        rendererSystemPersistenceTimer = setTimeout(() => {
+          rendererSystemPersistenceTimer = null;
+          resolveRendererSystemPersistenceDelay = null;
+          resolve();
+        }, delayMs);
+      });
+    const cancelRendererSystemInterruptionPersistence = () => {
+      rendererSystemPersistenceGeneration += 1;
+      if (rendererSystemPersistenceTimer) clearTimeout(rendererSystemPersistenceTimer);
+      rendererSystemPersistenceTimer = null;
+      resolveRendererSystemPersistenceDelay?.();
+      resolveRendererSystemPersistenceDelay = null;
+    };
+    cancelActiveRendererSystemInterruptionPersistence =
+      cancelRendererSystemInterruptionPersistence;
+    const persistRendererSystemInterruption = (reason: string) => {
+      if (rendererSystemInterrupted || rendererSystemPersistencePromise) return;
+      rendererSystemInterrupted = true;
+      const generation = rendererSystemPersistenceGeneration;
+      const interruptedAt = Date.now();
+      rendererSystemPersistencePromise = (async () => {
+        for (
+          let attempt = 0;
+          isCurrentInput() && generation === rendererSystemPersistenceGeneration;
+          attempt += 1
+        ) {
+          if (attempt > 0) {
+            await waitForRendererSystemPersistenceDelay(
+              getMicrophoneRecoveryDelay(attempt)
+            );
+          }
+          if (!isCurrentInput() || generation !== rendererSystemPersistenceGeneration) return;
+          if (await notifySourceInterrupted("system", reason, interruptedAt)) return;
+        }
+      })().finally(() => {
+        rendererSystemPersistencePromise = null;
+      });
+    };
+    const notifyMicRestored = async (
+      payload: JarvisSourceRestorationInput
+    ): Promise<boolean> => {
+      if (!isCurrentInput()) return false;
+      if (!jarvisSessionId) return true;
+      try {
+        await window.electronAPI.jarvis.sourceRestored(jarvisSessionId, "mic", payload);
+        return isCurrentInput();
+      } catch {
+        logger.info("Jarvis microphone restoration persistence will retry", {}, "meeting");
+        return false;
+      }
+    };
     const sendMeetingChunk = (chunk: ArrayBuffer, source: "mic" | "system"): boolean => {
       if (
         !isRecordingFlag ||
@@ -1452,13 +1895,26 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       pendingMicChunks.push(chunk.slice(0));
     };
 
-    let attachMicPipeline: (stream: MediaStream, fallbackActive: boolean) => Promise<void>;
+    let attachMicPipeline: (
+      stream: MediaStream,
+      fallbackActive: boolean,
+      expectedRecoveryGeneration: number
+    ) => Promise<boolean>;
 
     const activeMicLabel = (stream: MediaStream): string =>
       stream.getAudioTracks()[0]?.label?.trim() || "";
     const isUsableMicStream = (stream: MediaStream): boolean => {
       const streamTrack = stream.getAudioTracks()[0];
       return Boolean(streamTrack && streamTrack.readyState === "live" && !streamTrack.muted);
+    };
+    const isUsableSystemStream = (stream: MediaStream): boolean => {
+      const streamTrack = stream.getAudioTracks()[0];
+      return Boolean(
+        streamTrack &&
+        streamTrack.readyState === "live" &&
+        !streamTrack.muted &&
+        stream.active !== false
+      );
     };
     const recoveryLog = (error: unknown, candidate?: MicrophoneRecoveryCandidate) => ({
       attempt: useMeetingRecordingStore.getState().micRecoveryAttempt,
@@ -1480,6 +1936,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       });
     const cancelRecovery = () => {
       recoveryGeneration += 1;
+      void releaseMicRecoveryCandidate();
       if (recoveryTimer) clearTimeout(recoveryTimer);
       recoveryTimer = null;
       resolveRecoveryDelay?.();
@@ -1491,10 +1948,18 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     };
     cancelActiveMicRecovery = cancelRecovery;
 
-    const acquireRecoveryStream = async (): Promise<MediaStream | null> => {
+    const acquireRecoveryStream = async (
+      expectedRecoveryGeneration: number
+    ): Promise<MediaStream | null> => {
+      const recoveryIsCurrent = () =>
+        isRecordingFlag &&
+        expectedRecoveryGeneration === recoveryGeneration &&
+        isCurrentInput();
       const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+      if (!recoveryIsCurrent()) return null;
       const candidates = orderMicrophoneRecoveryCandidates(devices, selectedMicDeviceId);
       for (const candidate of candidates) {
+        if (!recoveryIsCurrent()) return null;
         try {
           const stream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -1502,6 +1967,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               ...MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
             },
           });
+          if (!recoveryIsCurrent()) {
+            stopMediaStream(stream);
+            return null;
+          }
           if (isUsableMicStream(stream) && !isDeniedAutomaticMicrophone(activeMicLabel(stream))) {
             return stream;
           }
@@ -1516,9 +1985,14 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       }
 
       try {
+        if (!recoveryIsCurrent()) return null;
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
         });
+        if (!recoveryIsCurrent()) {
+          stopMediaStream(stream);
+          return null;
+        }
         if (isUsableMicStream(stream) && !isDeniedAutomaticMicrophone(activeMicLabel(stream))) {
           return stream;
         }
@@ -1550,23 +2024,69 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               mic: "recovering",
             },
           });
+          if (!micEvidenceInterrupted) {
+            micEvidenceInterrupted = await persistMicInterruption("mic-track-ended");
+            if (!micEvidenceInterrupted) {
+              await waitForRecoveryDelay(getMicrophoneRecoveryDelay(attempt));
+              continue;
+            }
+          }
           await waitForRecoveryDelay(getMicrophoneRecoveryDelay(attempt));
           if (!isRecordingFlag || generation !== recoveryGeneration) return;
 
-          const replacement = await acquireRecoveryStream();
+          const replacement = await acquireRecoveryStream(generation);
           if (!replacement) continue;
           if (!isRecordingFlag || generation !== recoveryGeneration) {
             stopMediaStream(replacement);
             return;
           }
+          const recoveryOwner = createMicRecoveryCandidate(replacement);
 
           try {
-            const replacementDeviceId =
-              replacement.getAudioTracks()[0]?.getSettings().deviceId || null;
-            await attachMicPipeline(
+            const replacementTrack = replacement.getAudioTracks()[0];
+            if (!replacementTrack) {
+              stopMediaStream(replacement);
+              continue;
+            }
+            const replacementDeviceId = replacementTrack.getSettings().deviceId || null;
+            const restorationPayload: JarvisSourceRestorationInput = {
+              at: Date.now(),
+              deviceId: replacementDeviceId,
+              deviceLabel: replacementTrack.label?.trim() || null,
+              strategy: "web-audio",
+            };
+            let restorationPersisted = false;
+            for (
+              let persistenceAttempt = 0;
+              isRecordingFlag && generation === recoveryGeneration && isCurrentInput();
+              persistenceAttempt += 1
+            ) {
+              if (persistenceAttempt > 0) {
+                await waitForRecoveryDelay(getMicrophoneRecoveryDelay(persistenceAttempt));
+              }
+              if (!isRecordingFlag || generation !== recoveryGeneration || !isCurrentInput()) break;
+              restorationPersisted = await notifyMicRestored(restorationPayload);
+              if (restorationPersisted) break;
+            }
+            if (!restorationPersisted) {
+              await releaseMicRecoveryCandidate(recoveryOwner);
+              return;
+            }
+            micEvidenceInterrupted = false;
+            const attached = await attachMicPipeline(
               replacement,
-              !selectedMicDeviceId || replacementDeviceId !== selectedMicDeviceId
+              !selectedMicDeviceId || replacementDeviceId !== selectedMicDeviceId,
+              generation
             );
+            if (!attached) return;
+            if (
+              generation !== recoveryGeneration ||
+              !isCurrentInput() ||
+              micStream !== replacement
+            ) {
+              if (micStream === replacement) stopMediaStream(replacement);
+              return;
+            }
             useMeetingRecordingStore.setState({
               micRecoveryStatus: "restored",
               micRecoveryAttempt: 0,
@@ -1582,7 +2102,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             );
             return;
           } catch (error) {
-            stopMediaStream(replacement);
+            await releaseMicRecoveryCandidate(recoveryOwner);
+            micEvidenceInterrupted = await persistMicInterruption(
+              "mic-pipeline-attach-failed"
+            );
             logger.info(
               "Jarvis microphone recovery pipeline unavailable",
               recoveryLog(error),
@@ -1602,25 +2125,59 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       });
     };
 
-    attachMicPipeline = async (stream, fallbackActive) => {
+    attachMicPipeline = async (stream, fallbackActive, expectedRecoveryGeneration) => {
       const track = stream.getAudioTracks()[0];
-      if (!track || track.readyState === "ended" || track.muted) {
-        stopMediaStream(stream);
+      const recoveryOwner =
+        pendingMicRecoveryCandidate?.stream === stream ? pendingMicRecoveryCandidate : null;
+      const initialOwner = !recoveryOwner && pendingMicrophoneStream === stream;
+      if (!isUsableMicStream(stream)) {
+        if (recoveryOwner) {
+          await releaseMicRecoveryCandidate(recoveryOwner);
+        } else {
+          stopMediaStream(stream);
+        }
         throw new Error("MIC_DISCONNECTED");
       }
 
-      const ctx = new AudioContext({ sampleRate: 24000 });
+      const candidateChunks: ArrayBuffer[] = [];
+      let candidateCommitted = false;
+      const onCandidateChunk = (chunk: ArrayBuffer) => {
+        if (candidateCommitted) {
+          onMicChunk(chunk);
+          return;
+        }
+        candidateChunks.push(chunk);
+      };
+      let ctx: AudioContext | null = null;
       let pipeline: {
         source: MediaStreamAudioSourceNode;
         processor: AudioWorkletNode;
         analyser: AnalyserNode;
-      };
+      } | null = null;
       try {
-        await detachFromOutputDevice(ctx);
+        ctx = new AudioContext({ sampleRate: 24000 });
+        if (recoveryOwner) recoveryOwner.context = ctx;
+        if (initialOwner) claimPendingMicrophoneContext(ctx);
+        const detachPromise = detachFromOutputDevice(ctx);
+        if (recoveryOwner) {
+          await Promise.race([detachPromise, recoveryOwner.cancellation]);
+          if (recoveryOwner.released) throw new Error("MIC_RECOVERY_CANCELLED");
+        } else if (initialOwner) {
+          await awaitCaptureSetupStep(detachPromise);
+        } else {
+          await detachPromise;
+        }
         const { source, processor } = await createAudioPipeline({
           stream,
           context: ctx,
-          onChunk: onMicChunk,
+          onChunk: onCandidateChunk,
+          cancellation: recoveryOwner?.cancellation ??
+            (initialOwner ? captureSetupCancellation : undefined),
+          isCancelled: recoveryOwner
+            ? () => recoveryOwner.released
+            : initialOwner
+              ? () => !isCurrentCaptureAttempt()
+              : undefined,
         });
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 256;
@@ -1632,19 +2189,45 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         analyserSink.connect(ctx.destination);
         pipeline = { source, processor, analyser };
       } catch (error) {
-        stopMediaStream(stream);
-        await ctx.close().catch(() => undefined);
+        candidateChunks.length = 0;
+        if (recoveryOwner) {
+          await releaseMicRecoveryCandidate(recoveryOwner);
+        } else {
+          stopMediaStream(stream);
+          await closeAudioContextOnce(ctx);
+        }
         throw error;
       }
+      if (!ctx || !pipeline) {
+        if (recoveryOwner) {
+          await releaseMicRecoveryCandidate(recoveryOwner);
+        } else {
+          stopMediaStream(stream);
+          await closeAudioContextOnce(ctx);
+        }
+        throw new Error("MIC_PIPELINE_UNAVAILABLE");
+      }
+      const candidateContext = ctx;
       const { source, processor, analyser } = pipeline;
-
-      if (!isRecordingFlag) {
+      const cleanupCandidate = async () => {
         await flushAndDisconnectProcessor(processor);
+        candidateChunks.length = 0;
         source.disconnect();
         analyser.disconnect();
-        stopMediaStream(stream);
-        await ctx.close().catch(() => undefined);
-        return;
+        if (recoveryOwner) {
+          await releaseMicRecoveryCandidate(recoveryOwner);
+        } else {
+          stopMediaStream(stream);
+          await closeAudioContextOnce(candidateContext);
+        }
+      };
+      const recoveryIsCurrent = () =>
+        expectedRecoveryGeneration === recoveryGeneration && isCurrentInput();
+      let candidateIsUsable = isUsableMicStream(stream);
+      if (!recoveryIsCurrent() || !candidateIsUsable) {
+        await cleanupCandidate();
+        if (!candidateIsUsable && recoveryIsCurrent()) throw new Error("MIC_DISCONNECTED");
+        return false;
       }
 
       const oldProcessor = micProcessor;
@@ -1653,11 +2236,35 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       const oldStream = micStream;
       const oldContext = micContext;
 
+      await flushAndDisconnectProcessor(oldProcessor);
+      oldSource?.disconnect();
+      oldAnalyser?.disconnect();
+      if (oldStream && oldStream !== stream) stopMediaStream(oldStream);
+      if (oldContext && oldContext !== candidateContext) {
+        await oldContext.close().catch(() => undefined);
+      }
+
+      candidateIsUsable = isUsableMicStream(stream);
+      if (!recoveryIsCurrent() || !candidateIsUsable) {
+        await cleanupCandidate();
+        if (!candidateIsUsable && recoveryIsCurrent()) throw new Error("MIC_DISCONNECTED");
+        return false;
+      }
+
+      if (recoveryOwner && !transferMicRecoveryCandidate(recoveryOwner)) {
+        await cleanupCandidate();
+        return false;
+      }
+      if (initialOwner && !transferPendingMicrophoneCapture(stream, candidateContext)) {
+        await cleanupCandidate();
+        return false;
+      }
+
       micProcessor = processor;
       micSource = source;
       micAnalyser = analyser;
       micStream = stream;
-      micContext = ctx;
+      micContext = candidateContext;
 
       useMeetingRecordingStore.setState({
         activeMicLabel: track?.label || null,
@@ -1667,24 +2274,23 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
       if (captureMicrophone && track) {
         const onJarvisMicEnded = () => {
-          if (!isRecordingFlag) return;
+          if (!isCurrentInput() || micStream !== stream) return;
           beginMicRecovery();
         };
         track.addEventListener("ended", onJarvisMicEnded);
         ipcCleanups.push(() => track.removeEventListener("ended", onJarvisMicEnded));
       }
 
-      await flushAndDisconnectProcessor(oldProcessor);
-      oldSource?.disconnect();
-      oldAnalyser?.disconnect();
-      if (oldStream && oldStream !== stream) stopMediaStream(oldStream);
-      if (oldContext && oldContext !== ctx) await oldContext.close().catch(() => undefined);
+      for (const chunk of candidateChunks) onMicChunk(chunk);
+      candidateChunks.length = 0;
+      candidateCommitted = true;
 
       logger.info(
         "Mic capture started for meeting transcription",
-        { label: track?.label, settings: track?.getSettings(), fallbackActive },
+        { fallbackActive, sampleRate: track?.getSettings().sampleRate ?? null },
         "meeting"
       );
+      return true;
     };
 
     const throwPipelineFailure = (source: "mic" | "system", error: unknown): never => {
@@ -1704,84 +2310,235 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       throw error;
     };
 
+    let initialMicNeedsRecovery = false;
     if (micResult) {
+      const initialMicRecoveryGeneration = recoveryGeneration;
       try {
-        await attachMicPipeline(micResult, usedDefaultMicFallback);
+        const attached = await attachMicPipeline(
+          micResult,
+          usedDefaultMicFallback,
+          initialMicRecoveryGeneration
+        );
+        if (
+          !attached ||
+          initialMicRecoveryGeneration !== recoveryGeneration ||
+          !isCurrentInput() ||
+          micStream !== micResult
+        ) {
+          return;
+        }
       } catch (error) {
-        throwPipelineFailure("mic", error);
+        if (!isCurrentInput()) return;
+        const canContinueWithSystem =
+          !args.requireAllSources &&
+          (systemAudioHandledInMain || Boolean(systemCaptureResult.stream));
+        if (
+          error instanceof Error &&
+          error.message === "MIC_DISCONNECTED" &&
+          canContinueWithSystem
+        ) {
+          const interrupted = await notifySourceInterrupted(
+            "mic",
+            "mic-pipeline-attach-failed"
+          );
+          if (!interrupted || !isCurrentInput()) {
+            if (!isCurrentInput()) return;
+            throwPipelineFailure("mic", error);
+          }
+          micEvidenceInterrupted = true;
+          initialMicNeedsRecovery = true;
+          useMeetingRecordingStore.setState({
+            activeMicLabel: null,
+            currentMicLevel: 0,
+            micFallbackActive: true,
+            micRecoveryStatus: "reconnecting",
+            micRecoveryAttempt: 0,
+            error: "Microphone capture failed. Continuing with system audio only.",
+            captureSourceStates: {
+              ...useMeetingRecordingStore.getState().captureSourceStates,
+              mic: "recovering",
+            },
+          });
+        } else {
+          throwPipelineFailure("mic", error);
+        }
       }
-      useMeetingRecordingStore.setState({
-        captureSourceStates: {
-          ...useMeetingRecordingStore.getState().captureSourceStates,
-          mic: "recording",
-        },
-      });
+      if (!initialMicNeedsRecovery) {
+        useMeetingRecordingStore.setState({
+          captureSourceStates: {
+            ...useMeetingRecordingStore.getState().captureSourceStates,
+            mic: "recording",
+          },
+        });
+      }
     }
 
     if (captureSystemAudio && systemAudioHandledInMain) {
-      useMeetingRecordingStore.setState({
-        captureSourceStates: {
-          ...useMeetingRecordingStore.getState().captureSourceStates,
-          system: "recording",
-        },
-      });
+      if (mainManagedSystemUnavailable) {
+        const hasSurvivingMic =
+          !initialMicNeedsRecovery &&
+          micStream !== null &&
+          isUsableMicStream(micStream);
+        if (args.requireAllSources || !hasSurvivingMic) {
+          throwPipelineFailure("system", new Error("SYSTEM_DISCONNECTED"));
+        }
+        useMeetingRecordingStore.setState({
+          error: "System audio capture stopped.",
+          captureSourceStates: {
+            ...useMeetingRecordingStore.getState().captureSourceStates,
+            system: "unavailable",
+          },
+        });
+      } else {
+        useMeetingRecordingStore.setState({
+          captureSourceStates: {
+            ...useMeetingRecordingStore.getState().captureSourceStates,
+            system: "recording",
+          },
+        });
+      }
     }
 
     if (systemCaptureResult.stream) {
       const stream = systemCaptureResult.stream;
-      systemStream = stream;
+      let attached = false;
+      let candidateContext: AudioContext | null = null;
+      let candidateSource: MediaStreamAudioSourceNode | null = null;
+      let candidateProcessor: AudioWorkletNode | null = null;
+      let candidateCleaned = false;
+      const candidateChunks: ArrayBuffer[] = [];
+      let candidateCommitted = false;
+      let unavailableButContinuing = false;
+      const onSystemChunk = (chunk: ArrayBuffer) => {
+        if (!isCurrentInput()) return;
+        if (socketReady) {
+          sendMeetingChunk(chunk, "system");
+          return;
+        }
+        pendingSystemChunks.push(chunk.slice(0));
+      };
+      const onSystemCandidateChunk = (chunk: ArrayBuffer) => {
+        if (candidateCommitted) {
+          onSystemChunk(chunk);
+          return;
+        }
+        candidateChunks.push(chunk);
+      };
+      const cleanupSystemCandidate = async () => {
+        if (candidateCleaned) return;
+        candidateCleaned = true;
+        await flushAndDisconnectProcessor(candidateProcessor);
+        candidateChunks.length = 0;
+        candidateSource?.disconnect();
+        if (pendingRendererSystemStream === stream) {
+          releasePendingRendererSystemStream();
+        } else {
+          stopPendingRendererSystemStream(stream);
+        }
+        await closeAudioContextOnce(candidateContext);
+      };
       try {
         const ctx = new AudioContext({ sampleRate: 24000 });
-        systemContext = ctx;
-        await detachFromOutputDevice(ctx);
+        candidateContext = ctx;
+        claimPendingRendererSystemContext(ctx);
+        await awaitCaptureSetupStep(detachFromOutputDevice(ctx));
 
         const { source, processor } = await createAudioPipeline({
           stream,
           context: ctx,
-          onChunk: (chunk) => {
-            if (!isRecordingFlag || meetingInputRejected) return;
-            if (socketReady) {
-              sendMeetingChunk(chunk, "system");
-              return;
-            }
-            pendingSystemChunks.push(chunk.slice(0));
-          },
+          onChunk: onSystemCandidateChunk,
+          cancellation: captureSetupCancellation,
+          isCancelled: () => !isCurrentCaptureAttempt(),
         });
-        systemSource = source;
-        systemProcessor = processor;
+        candidateSource = source;
+        candidateProcessor = processor;
 
-        const systemTrack = stream.getAudioTracks()[0];
-        const markRendererSystemUnavailable = () => {
-          if (
-            !isRecordingFlag ||
-            activeMeetingInputGeneration !== inputGeneration ||
-            systemStream !== stream
-          ) {
-            return;
+        if (!isCurrentInput()) {
+          await cleanupSystemCandidate();
+          return;
+        }
+
+        if (!isUsableSystemStream(stream)) {
+          await cleanupSystemCandidate();
+          if (!isCurrentInput()) return;
+
+          const hasSurvivingMic =
+            !initialMicNeedsRecovery &&
+            micStream !== null &&
+            isUsableMicStream(micStream);
+          if (args.requireAllSources || !hasSurvivingMic) {
+            throw new Error("SYSTEM_DISCONNECTED");
           }
+
+          const interrupted = await notifySourceInterrupted(
+            "system",
+            "system-renderer-ended"
+          );
+          if (!interrupted || !isCurrentInput()) {
+            if (!isCurrentInput()) return;
+            throw new Error("SYSTEM_INTERRUPTION_PERSIST_FAILED");
+          }
+          rendererSystemInterrupted = true;
+          unavailableButContinuing = true;
           useMeetingRecordingStore.setState({
-            error: "System audio capture stopped.",
+            error: "System audio capture failed. Continuing with microphone only.",
             captureSourceStates: {
               ...useMeetingRecordingStore.getState().captureSourceStates,
               system: "unavailable",
             },
           });
-        };
-        systemTrack?.addEventListener("ended", markRendererSystemUnavailable);
-        stream.addEventListener("inactive", markRendererSystemUnavailable);
-        ipcCleanups.push(() => {
-          systemTrack?.removeEventListener("ended", markRendererSystemUnavailable);
-          stream.removeEventListener("inactive", markRendererSystemUnavailable);
-        });
+        } else {
+          if (!transferPendingRendererSystemCapture(stream, ctx)) {
+            await cleanupSystemCandidate();
+            return;
+          }
+          systemStream = stream;
+          systemContext = ctx;
+          systemSource = source;
+          systemProcessor = processor;
+          attached = true;
+
+          const systemTrack = stream.getAudioTracks()[0];
+          const markRendererSystemUnavailable = () => {
+            if (!isCurrentInput() || systemStream !== stream) {
+              return;
+            }
+            useMeetingRecordingStore.setState({
+              error: "System audio capture stopped.",
+              captureSourceStates: {
+                ...useMeetingRecordingStore.getState().captureSourceStates,
+                system: "unavailable",
+              },
+            });
+            persistRendererSystemInterruption("system-renderer-ended");
+          };
+          systemTrack?.addEventListener("ended", markRendererSystemUnavailable);
+          stream.addEventListener("inactive", markRendererSystemUnavailable);
+          ipcCleanups.push(() => {
+            systemTrack?.removeEventListener("ended", markRendererSystemUnavailable);
+            stream.removeEventListener("inactive", markRendererSystemUnavailable);
+          });
+
+          for (const chunk of candidateChunks) onSystemChunk(chunk);
+          candidateChunks.length = 0;
+          candidateCommitted = true;
+        }
       } catch (error) {
+        if (!attached) {
+          await cleanupSystemCandidate();
+        }
+        if (!isCurrentInput()) return;
         throwPipelineFailure("system", error);
       }
-      useMeetingRecordingStore.setState({
-        captureSourceStates: {
-          ...useMeetingRecordingStore.getState().captureSourceStates,
-          system: "recording",
-        },
-      });
+      if (!unavailableButContinuing) {
+        if (!attached || !isCurrentInput() || systemStream !== stream) return;
+        useMeetingRecordingStore.setState({
+          captureSourceStates: {
+            ...useMeetingRecordingStore.getState().captureSourceStates,
+            system: "recording",
+          },
+        });
+      }
     } else if (systemCaptureError) {
       if (systemAudioStrategy === "loopback") {
         logger.warn(
@@ -1797,14 +2554,16 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       }
     }
 
-    if (!isRecordingFlag) {
+    if (initialMicNeedsRecovery && isCurrentInput()) {
+      beginMicRecovery();
+    }
+
+    if (!isCurrentInput()) {
       logger.info(
         "Meeting transcription aborted during pipeline setup (stop called)",
         {},
         "meeting"
       );
-      isStartingFlag = false;
-      await cleanup();
       return;
     }
 
@@ -1833,6 +2592,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       "meeting"
     );
   } catch (err) {
+    if (!isCurrentCaptureAttempt()) return;
     if (err instanceof CaptureSourcesUnavailableError) {
       const shouldAbortAcceptedMainStart = acceptedMainInputGeneration !== null;
       activeMeetingInputGeneration = null;
@@ -1886,6 +2646,21 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         isStartingFlag = false;
       }
     }
+  } finally {
+    if (!sourceStateCleanupTransferred) {
+      earlySourceStateCleanup?.();
+    }
+    if (cancelPendingRendererSystemCapture === closePendingRendererSystemOwnership) {
+      cancelPendingRendererSystemCapture = null;
+    }
+    if (cancelPendingCaptureSetup === cancelThisCaptureSetup) {
+      cancelPendingCaptureSetup = null;
+    }
+    if (cancelPendingMicrophoneCapture === closePendingMicrophoneOwnership) {
+      cancelPendingMicrophoneCapture = null;
+    }
+    closePendingMicrophoneOwnership();
+    closePendingRendererSystemOwnership();
   }
 }
 

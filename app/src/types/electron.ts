@@ -1,5 +1,6 @@
 import type {
   JarvisAudioChunk,
+  JarvisCaptureFailureCode,
   JarvisCaptureInput,
   JarvisControlAction,
   JarvisControlEnvelope,
@@ -10,6 +11,8 @@ import type {
   JarvisSessionInput,
   JarvisSessionQuery,
   JarvisSessionStatus,
+  JarvisSourceInterruptionInput,
+  JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
   JarvisTranscriptSegmentInput,
   JarvisVoiceEnrollmentPayload,
@@ -576,6 +579,16 @@ declare global {
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
+        sourceInterrupted: (
+          id: string,
+          sourceType: "mic" | "system",
+          input: JarvisSourceInterruptionInput
+        ) => Promise<JarvisRuntimeState>;
+        sourceRestored: (
+          id: string,
+          sourceType: "mic" | "system",
+          input: JarvisSourceRestorationInput
+        ) => Promise<JarvisRuntimeState>;
         pauseCapture: (
           id: string,
           at?: number,
@@ -585,7 +598,7 @@ declare global {
         finishCapture: (id: string, at?: number) => Promise<JarvisRuntimeState>;
         failCapture: (
           id: string,
-          errorCode: "MIC_PERMISSION" | "MIC_DISCONNECTED",
+          errorCode: JarvisCaptureFailureCode,
           at?: number
         ) => Promise<JarvisRuntimeState>;
         beginVoiceEnrollment: () => Promise<JarvisVoiceEnrollmentSession>;

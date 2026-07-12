@@ -57,9 +57,11 @@ function createRepository() {
       gaps.push({ ...gap, endedAt: null });
       return gap;
     },
-    interruptTrack({ trackId, gap }) {
+    interruptTrack({ trackId, gap, sessionId = null, sessionStatus = null }) {
       this.setTrackState(trackId, "recovering", gap.startedAt);
-      return this.openGap(gap);
+      const opened = this.openGap(gap);
+      if (sessionId && sessionStatus) this.setSessionStatus(sessionId, sessionStatus, gap.startedAt);
+      return opened;
     },
     closeGap(id, endedAt, recoveryAttempts = null) {
       const gap = gaps.find((entry) => entry.id === id);
@@ -72,13 +74,17 @@ function createRepository() {
       endedAt,
       recoveryAttempts = 1,
       targetState = "active",
+      sessionId = null,
+      sessionStatus = null,
     }) {
       this.closeGap(gapId, endedAt, recoveryAttempts);
-      return this.setTrackState(
+      const restored = this.setTrackState(
         trackId,
         targetState,
         targetState === "paused" ? endedAt : null
       );
+      if (sessionId && sessionStatus) this.setSessionStatus(sessionId, sessionStatus, endedAt);
+      return restored;
     },
     pauseCapture({ sessionId, sources, at }) {
       for (const source of sources) {
@@ -125,6 +131,118 @@ function dualSources() {
       strategy: "wasapi-loopback",
     },
   ];
+}
+
+test("rejects capture startup when its mode differs from the persisted session", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-mode-mismatch-"));
+  const repository = createRepository();
+  repository.sessions.get("s1").capture_mode = "system";
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    assert.throws(
+      () =>
+        service.startCapture({
+          sessionId: "s1",
+          startedAt: 1_000,
+          captureMode: "mic",
+          sources: [
+            {
+              sourceType: "mic",
+              deviceId: "mic-1",
+              deviceLabel: "Physical microphone",
+              strategy: "web-audio",
+            },
+          ],
+        }),
+      /capture mode does not match persisted session/
+    );
+    assert.equal(service.getState().status, "idle");
+    assert.deepEqual(repository.tracks, []);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of [
+  {
+    name: "system session retaining a microphone identity",
+    captureMode: "system",
+    persistedMicDeviceId: "legacy-mic",
+    inputMicDeviceId: null,
+    sources: [
+      {
+        sourceType: "system",
+        deviceId: null,
+        deviceLabel: "Windows output",
+        strategy: "wasapi-loopback",
+      },
+    ],
+    pattern: /system capture session must not persist a microphone device id/,
+  },
+  {
+    name: "mic source differing from the persisted microphone identity",
+    captureMode: "dual",
+    persistedMicDeviceId: "persisted-mic",
+    inputMicDeviceId: "replacement-mic",
+    sources: [
+      {
+        sourceType: "mic",
+        deviceId: "replacement-mic",
+        deviceLabel: "Replacement microphone",
+        strategy: "web-audio",
+      },
+      {
+        sourceType: "system",
+        deviceId: null,
+        deviceLabel: "Windows output",
+        strategy: "wasapi-loopback",
+      },
+    ],
+    pattern: /microphone source does not match persisted session/,
+  },
+]) {
+  test(`rejects ${scenario.name}`, () => {
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-source-mismatch-"));
+    const repository = createRepository();
+    Object.assign(repository.sessions.get("s1"), {
+      capture_mode: scenario.captureMode,
+      mic_device_id: scenario.persistedMicDeviceId,
+    });
+    const service = new JarvisService({
+      repository,
+      userDataDir,
+      broadcast() {},
+      now: () => 1_000,
+      fsImpl: createSafeFs(),
+    });
+
+    try {
+      assert.throws(
+        () =>
+          service.startCapture({
+            sessionId: "s1",
+            startedAt: 1_000,
+            micDeviceId: scenario.inputMicDeviceId,
+            captureMode: scenario.captureMode,
+            sources: scenario.sources,
+          }),
+        scenario.pattern
+      );
+      assert.equal(service.getState().status, "idle");
+      assert.deepEqual(repository.tracks, []);
+    } finally {
+      service.shutdown();
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  });
 }
 
 test("an explicit recordings directory controls disk checks and audio paths", () => {
@@ -582,7 +700,12 @@ test("a sticky writer failure isolates only its source", () => {
 test("degraded public state keeps the durable session open with real evidence storage", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-real-store-"));
   const repository = new JarvisRepository(":memory:");
-  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  repository.createSession({
+    id: "s1",
+    startedAt: 10,
+    micDeviceId: "mv7",
+    captureMode: "dual",
+  });
   const service = new JarvisService({
     repository,
     userDataDir,
@@ -629,6 +752,86 @@ test("degraded public state keeps the durable session open with real evidence st
       repository.db.prepare("SELECT count(*) count FROM processing_jobs").get().count,
       1
     );
+  } finally {
+    service.shutdown();
+    repository.close();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("real evidence storage timestamps a replacement binding without rewriting track identity", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-binding-history-"));
+  const repository = new JarvisRepository(":memory:");
+  repository.createSession({
+    id: "s1",
+    startedAt: 10,
+    micDeviceId: "mic-original",
+    captureMode: "mic",
+  });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 40,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [
+        {
+          sourceType: "mic",
+          deviceId: "mic-original",
+          deviceLabel: "Original microphone",
+          strategy: "web-audio",
+        },
+      ],
+    });
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 1)), true);
+    service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
+    const restored = service.sourceRestored("s1", "mic", {
+      at: 30,
+      deviceId: "mic-replacement",
+      deviceLabel: "Replacement microphone",
+      strategy: "web-audio",
+    });
+
+    assert.equal(restored.status, "recording");
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 2)), true);
+    assert.deepEqual(
+      repository.db
+        .prepare(
+          `SELECT device_id, device_label, strategy, state
+           FROM audio_tracks WHERE session_id = 's1' AND source_type = 'mic'`
+        )
+        .get(),
+      {
+        device_id: "mic-original",
+        device_label: "Original microphone",
+        strategy: "web-audio",
+        state: "active",
+      }
+    );
+    assert.deepEqual(
+      repository.db
+        .prepare(
+          `SELECT started_at, ended_at, restored_device_id, restored_device_label, restored_strategy
+           FROM audio_gaps`
+        )
+        .get(),
+      {
+        started_at: 20,
+        ended_at: 30,
+        restored_device_id: "mic-replacement",
+        restored_device_label: "Replacement microphone",
+        restored_strategy: "web-audio",
+      }
+    );
+    assert.equal(repository.getSession("s1").status, "recording");
+    service.finishCapture("s1", 40);
   } finally {
     service.shutdown();
     repository.close();
@@ -788,9 +991,97 @@ test("interruption persistence failure leaves the original writer live and state
   }
 });
 
+test("all-source interruption stays degraded and remains manually pausable", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-sources-recovering-"));
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [dualSources()[0]],
+    });
+
+    const interrupted = service.sourceInterrupted("s1", "mic", {
+      at: 20,
+      reason: "device-change",
+    });
+    assert.equal(interrupted.status, "degraded");
+    assert.equal(repository.sessions.get("s1").status, "recording");
+
+    const paused = service.pauseCapture("s1", 30);
+    assert.equal(paused.status, "paused");
+    assert.equal(repository.sessions.get("s1").status, "paused");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("source interruption persists its track gap and session status in one repository call", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-atomic-status-"));
+  const repository = createRepository();
+  const originalSetSessionStatus = repository.setSessionStatus;
+  repository.setSessionStatus = () => {
+    throw new Error("separate session status write is forbidden");
+  };
+  const originalInterruptTrack = repository.interruptTrack;
+  repository.interruptTrack = function (input) {
+    assert.equal(input.sessionId, "s1");
+    assert.equal(input.sessionStatus, "recording");
+    const session = this.sessions.get(input.sessionId);
+    const originalStatus = session.status;
+    try {
+      this.setSessionStatus = createRepository().setSessionStatus;
+      return originalInterruptTrack.call(this, input);
+    } finally {
+      session.status = input.sessionStatus ?? originalStatus;
+      this.setSessionStatus = () => {
+        throw new Error("separate session status write is forbidden");
+      };
+    }
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [dualSources()[0]],
+    });
+    const interrupted = service.sourceInterrupted("s1", "mic", {
+      at: 20,
+      reason: "device-change",
+    });
+
+    assert.equal(interrupted.status, "degraded");
+    assert.equal(interrupted.sources.mic.state, "reconnecting");
+  } finally {
+    repository.setSessionStatus = originalSetSessionStatus;
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
 test("restoration persistence failure removes the empty replacement and permits retry", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-rollback-"));
   const repository = createRepository();
+  const originalSetSessionStatus = repository.setSessionStatus;
   const restoreTrack = repository.restoreTrack;
   const service = new JarvisService({
     repository,
@@ -836,6 +1127,160 @@ test("restoration persistence failure removes the empty replacement and permits 
         .map((chunk) => chunk.sequenceNumber),
       [0, 1]
     );
+  } finally {
+    repository.setSessionStatus = originalSetSessionStatus;
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("source restoration persists its track gap and session status in one repository call", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-atomic-status-"));
+  const repository = createRepository();
+  const originalSetSessionStatus = repository.setSessionStatus;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [dualSources()[0]],
+    });
+    service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
+
+    const originalRestoreTrack = repository.restoreTrack;
+    repository.restoreTrack = function (input) {
+      assert.equal(input.sessionId, "s1");
+      assert.equal(input.sessionStatus, "recording");
+      const blockedSetSessionStatus = this.setSessionStatus;
+      try {
+        this.setSessionStatus = originalSetSessionStatus;
+        return originalRestoreTrack.call(this, input);
+      } finally {
+        this.setSessionStatus = blockedSetSessionStatus;
+      }
+    };
+    repository.setSessionStatus = () => {
+      throw new Error("separate session status write is forbidden");
+    };
+
+    const restored = service.sourceRestored("s1", "mic", {
+      at: 30,
+      deviceId: "mv7-restored",
+      deviceLabel: "MV7 restored",
+      strategy: "web-audio",
+    });
+    assert.equal(restored.status, "recording");
+    assert.equal(restored.sources.mic.state, "active");
+  } finally {
+    repository.setSessionStatus = originalSetSessionStatus;
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("a restoration retry succeeds after its committed response broadcast fails", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-retry-"));
+  const repository = createRepository();
+  let restoreCalls = 0;
+  const restoreTrack = repository.restoreTrack;
+  repository.restoreTrack = function (input) {
+    restoreCalls += 1;
+    return restoreTrack.call(this, input);
+  };
+  let broadcasts = 0;
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {
+      broadcasts += 1;
+      if (broadcasts === 3) throw new Error("restoration response broadcast failed");
+    },
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+  const restoration = {
+    at: 30,
+    deviceId: "mic-restored",
+    deviceLabel: "Restored microphone",
+    strategy: "web-audio",
+  };
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [dualSources()[0]],
+    });
+    service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
+
+    assert.throws(
+      () => service.sourceRestored("s1", "mic", restoration),
+      /restoration response broadcast failed/
+    );
+    const retried = service.sourceRestored("s1", "mic", restoration);
+
+    assert.equal(retried.status, "recording");
+    assert.equal(retried.sources.mic.state, "active");
+    assert.equal(restoreCalls, 1);
+    assert.equal(repository.gaps.length, 1);
+    assert.equal(repository.gaps[0].endedAt, 30);
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 2)), true);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("a stale restoration retry cannot close a newer interruption gap", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-stale-restore-retry-"));
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 50,
+    fsImpl: createSafeFs(),
+  });
+  const firstRestoration = {
+    at: 30,
+    deviceId: "mic-restored",
+    deviceLabel: "Restored microphone",
+    strategy: "web-audio",
+  };
+
+  try {
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "mic",
+      sources: [dualSources()[0]],
+    });
+    service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
+    service.sourceRestored("s1", "mic", firstRestoration);
+    service.sourceInterrupted("s1", "mic", { at: 40, reason: "device-change" });
+
+    assert.throws(
+      () => service.sourceRestored("s1", "mic", firstRestoration),
+      /before the current interruption/i
+    );
+    assert.equal(service.getState().sources.mic.state, "reconnecting");
+    assert.equal(repository.gaps[1].endedAt, null);
+
+    const restored = service.sourceRestored("s1", "mic", {
+      ...firstRestoration,
+      at: 50,
+    });
+    assert.equal(restored.sources.mic.state, "active");
+    assert.equal(repository.gaps[1].endedAt, 50);
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -1035,7 +1480,12 @@ test("shutdown finalization failure is observable, honest, and idempotent", () =
 test("disk failure while interrupting closes the persisted gap atomically", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-disk-real-"));
   const repository = new JarvisRepository(":memory:");
-  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  repository.createSession({
+    id: "s1",
+    startedAt: 10,
+    micDeviceId: "mv7",
+    captureMode: "dual",
+  });
   let diskChecks = 0;
   const fsImpl = Object.create(fs);
   fsImpl.statfsSync = () => ({
@@ -1221,7 +1671,7 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
   }
 });
 
-test("resume rejects repeatedly when all sources are recovering without side effects", () => {
+test("resume rejects while all sources are automatically recovering without side effects", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-recovering-resume-"));
   const repository = createRepository();
   let resumeCalls = 0;
@@ -1249,15 +1699,15 @@ test("resume rejects repeatedly when all sources are recovering without side eff
       return reopenSource.apply(this, args);
     };
 
-    assert.throws(() => service.resumeCapture("s1", 40), /no paused sources/i);
-    assert.throws(() => service.resumeCapture("s1", 50), /no paused sources/i);
+    assert.throws(() => service.resumeCapture("s1", 40), /capture session must be paused/i);
+    assert.throws(() => service.resumeCapture("s1", 50), /capture session must be paused/i);
     assert.equal(resumeCalls, 0);
     assert.equal(reopenCalls, 0);
-    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(repository.sessions.get("s1").status, "recording");
     assert.deepEqual(repository.tracks.map((track) => track.state), ["recovering", "recovering"]);
     assert.deepEqual(repository.gaps.map((gap) => gap.endedAt), [null, null]);
     const state = service.getState();
-    assert.equal(state.status, "paused");
+    assert.equal(state.status, "degraded");
     assert.equal(state.sources.mic.state, "reconnecting");
     assert.equal(state.sources.system.state, "reconnecting");
   } finally {
@@ -1269,7 +1719,12 @@ test("resume rejects repeatedly when all sources are recovering without side eff
 test("manual pause restoration waits for explicit resume and preserves both sequences", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-manual-pause-restore-"));
   const repository = new JarvisRepository(":memory:");
-  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  repository.createSession({
+    id: "s1",
+    startedAt: 10,
+    micDeviceId: "mv7",
+    captureMode: "dual",
+  });
   const service = new JarvisService({
     repository,
     userDataDir,

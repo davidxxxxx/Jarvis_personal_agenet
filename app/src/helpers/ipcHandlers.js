@@ -4694,6 +4694,13 @@ class IPCHandlers {
         inputBinding.active = false;
         inputBinding.cancelled = true;
         inputBinding.pendingManagedSystemChunks.splice(0);
+        const interruptionPersistence = inputBinding.systemInterruptionPersistence;
+        if (interruptionPersistence) {
+          interruptionPersistence.cancelled = true;
+          if (interruptionPersistence.timer) clearTimeout(interruptionPersistence.timer);
+          interruptionPersistence.timer = null;
+          inputBinding.systemInterruptionPersistence = null;
+        }
         if (inputBinding.ownerDestroyedListener) {
           inputBinding.owner?.removeListener?.("destroyed", inputBinding.ownerDestroyedListener);
           inputBinding.ownerDestroyedListener = null;
@@ -5805,6 +5812,7 @@ class IPCHandlers {
         active: false,
         cancelled: false,
         pendingManagedSystemChunks: [],
+        systemInterruptionPersistence: null,
         ownerDestroyedListener: null,
         teardownPromise: null,
         startSettledPromise: new Promise((resolve) => {
@@ -6093,10 +6101,72 @@ class IPCHandlers {
       }
     };
 
-    const startManagedMeetingSystemAudio = (event, manager, warningLabel) => {
+    const managedSystemInterruptionRetryDelaysMs = [50, 100, 250, 500, 1000, 2000, 5000];
+    const persistManagedSystemInterruption = (inputBinding, producer, sessionId) => {
+      if (!inputBinding || !sessionId || inputBinding.systemInterruptionPersistence) return;
+      const persistence = {
+        cancelled: false,
+        timer: null,
+        attempt: 0,
+        producer,
+        sessionId,
+        payload: {
+          at: Date.now(),
+          reason: "system-capture-error",
+        },
+      };
+      inputBinding.systemInterruptionPersistence = persistence;
+
+      const isCurrent = () =>
+        !persistence.cancelled &&
+        activeMeetingInputBinding === inputBinding &&
+        inputBinding.active === true &&
+        inputBinding.systemInterruptionPersistence === persistence &&
+        activeJarvisSessionId === sessionId &&
+        !inputBinding.owner?.isDestroyed?.();
+
+      const attemptPersistence = async () => {
+        if (!isCurrent()) return;
+        try {
+          await this.jarvisService.sourceInterrupted(
+            sessionId,
+            "system",
+            persistence.payload
+          );
+        } catch (error) {
+          if (!isCurrent()) return;
+          debugLogger.warn(
+            "Failed to persist current Jarvis system-source interruption; retrying",
+            { errorName: error?.name ?? "Error" },
+            "meeting"
+          );
+          const delay =
+            managedSystemInterruptionRetryDelaysMs[
+              Math.min(
+                persistence.attempt,
+                managedSystemInterruptionRetryDelaysMs.length - 1
+              )
+            ];
+          persistence.attempt += 1;
+          persistence.timer = setTimeout(() => {
+            persistence.timer = null;
+            void attemptPersistence();
+          }, delay);
+          return;
+        }
+
+        if (inputBinding.systemInterruptionPersistence === persistence) {
+          inputBinding.systemInterruptionPersistence = null;
+        }
+      };
+
+      void attemptPersistence();
+    };
+
+    const startManagedMeetingSystemAudio = async (event, manager, warningLabel) => {
       const inputBinding = activeMeetingInputBinding;
-      const producer = { manager, inputRejected: false };
-      return manager.start({
+      const producer = { manager, inputRejected: false, startupFailed: false };
+      await manager.start({
         onChunk: (chunk) => {
           if (producer.inputRejected) return false;
           if (activeMeetingInputBinding !== inputBinding) {
@@ -6113,11 +6183,22 @@ class IPCHandlers {
           if (
             producer.inputRejected ||
             activeMeetingInputBinding !== inputBinding ||
-            inputBinding?.active !== true ||
             inputBinding.owner?.isDestroyed?.()
           ) {
             rejectManagedMeetingSystemProducer(producer, { stopManager: false });
             return;
+          }
+          if (inputBinding?.active !== true) {
+            producer.startupFailed = true;
+            rejectManagedMeetingSystemProducer(producer, { stopManager: false });
+            return;
+          }
+          if (activeJarvisSessionId) {
+            persistManagedSystemInterruption(
+              inputBinding,
+              producer,
+              activeJarvisSessionId
+            );
           }
           inputBinding.owner.send("meeting-transcription-source-state", {
             source: "system",
@@ -6135,6 +6216,10 @@ class IPCHandlers {
           );
         },
       });
+      if (producer.startupFailed) {
+        await manager.stop().catch(() => {});
+        throw new Error("System audio producer failed during startup");
+      }
     };
 
     const fallBackToMicOnly = async (context) => {
@@ -6358,6 +6443,7 @@ class IPCHandlers {
     };
 
     ipcMain.handle("meeting-transcription-stop", async () => {
+      cancelInFlightMeetingPrepare();
       if (meetingTranscriptionStopPromise) return meetingTranscriptionStopPromise;
       if (meetingTranscriptionTeardownPromise) {
         await meetingTranscriptionTeardownPromise;

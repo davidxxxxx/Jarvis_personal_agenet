@@ -2,7 +2,8 @@ const {
   CHANNELS,
   assertId,
   assertSessionStatus,
-  assertMicErrorCode,
+  assertCaptureFailureCode,
+  assertSourceType,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const fs = require("node:fs/promises");
@@ -24,11 +25,69 @@ const REQUIRED_REPOSITORY_METHODS = [
 
 const REQUIRED_SERVICE_METHODS = [
   "startCapture",
+  "sourceInterrupted",
+  "sourceRestored",
   "pauseCapture",
   "resumeCapture",
   "finishCapture",
   "failCapture",
 ];
+
+function assertExactKeys(input, expected, name) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError(`${name} must be an object`);
+  }
+  const actual = Object.keys(input).sort();
+  const required = [...expected].sort();
+  if (JSON.stringify(actual) !== JSON.stringify(required)) {
+    throw new TypeError(`${name} has an invalid structure`);
+  }
+}
+
+function assertLifecycleTime(value) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError("source lifecycle at must be a non-negative safe integer");
+  }
+  return value;
+}
+
+function assertLifecycleString(value, name, maxLength, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string") throw new TypeError(`${name} must be a string or null`);
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > maxLength) {
+    throw new TypeError(`${name} must be non-empty and at most ${maxLength} characters`);
+  }
+  return trimmed;
+}
+
+function normalizeSourceInterruption(input) {
+  assertExactKeys(input, ["at", "reason"], "source interruption");
+  return {
+    at: assertLifecycleTime(input.at),
+    reason: assertLifecycleString(input.reason, "source interruption reason", 128),
+  };
+}
+
+function normalizeSourceRestoration(input) {
+  assertExactKeys(
+    input,
+    ["at", "deviceId", "deviceLabel", "strategy"],
+    "source restoration"
+  );
+  return {
+    at: assertLifecycleTime(input.at),
+    deviceId: assertLifecycleString(input.deviceId, "source deviceId", 512, {
+      nullable: true,
+    }),
+    deviceLabel: assertLifecycleString(input.deviceLabel, "source deviceLabel", 512, {
+      nullable: true,
+    }),
+    strategy: assertLifecycleString(input.strategy, "source strategy", 128, {
+      nullable: true,
+    }),
+  };
+}
 
 function registerJarvisIpc({
   ipcMain,
@@ -176,6 +235,20 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.startCapture, (_event, input) =>
     service.startCapture(normalizeCaptureStartInput(input))
   );
+  ipcMain.handle(CHANNELS.sourceInterrupted, (_event, id, sourceType, input) =>
+    service.sourceInterrupted(
+      assertId(id, "sessionId"),
+      assertSourceType(sourceType),
+      normalizeSourceInterruption(input)
+    )
+  );
+  ipcMain.handle(CHANNELS.sourceRestored, (_event, id, sourceType, input) =>
+    service.sourceRestored(
+      assertId(id, "sessionId"),
+      assertSourceType(sourceType),
+      normalizeSourceRestoration(input)
+    )
+  );
   ipcMain.handle(CHANNELS.pauseCapture, (_event, id, at, errorCode) =>
     service.pauseCapture(assertId(id, "sessionId"), at, errorCode)
   );
@@ -186,7 +259,7 @@ function registerJarvisIpc({
     service.finishCapture(assertId(id, "sessionId"), at)
   );
   ipcMain.handle(CHANNELS.failCapture, (_event, id, errorCode, at) =>
-    service.failCapture(assertId(id, "sessionId"), assertMicErrorCode(errorCode), at)
+    service.failCapture(assertId(id, "sessionId"), assertCaptureFailureCode(errorCode), at)
   );
   ipcMain.handle(CHANNELS.beginVoiceEnrollment, (event) => {
     bindEnrollmentOwner(event);

@@ -3,6 +3,14 @@ export type JarvisSessionStatus =
 
 export type JarvisCaptureMode = "mic" | "system" | "dual";
 
+export type JarvisCaptureFailureCode =
+  | "MIC_PERMISSION"
+  | "MIC_DISCONNECTED"
+  | "capture_source_unavailable"
+  | "capture_start_failed"
+  | "upstream_start_failed"
+  | "capture_activation_cancelled";
+
 export type JarvisCaptureSourceState =
   "idle" | "checking" | "ready" | "unavailable" | "recording" | "recovering";
 
@@ -19,12 +27,34 @@ export interface JarvisSessionInput {
   startedAt: number;
   micDeviceId: string | null;
   language?: string;
+  captureMode: JarvisCaptureMode;
+}
+
+export interface JarvisCaptureSourceInput {
+  sourceType: "mic" | "system";
+  deviceId: string | null;
+  deviceLabel: string | null;
+  strategy: string | null;
 }
 
 export interface JarvisCaptureInput {
   sessionId: string;
   startedAt: number;
   micDeviceId: string | null;
+  captureMode: JarvisCaptureMode;
+  sources: JarvisCaptureSourceInput[];
+}
+
+export interface JarvisSourceInterruptionInput {
+  at: number;
+  reason: string;
+}
+
+export interface JarvisSourceRestorationInput {
+  at: number;
+  deviceId: string | null;
+  deviceLabel: string | null;
+  strategy: string | null;
 }
 
 export interface JarvisSession {
@@ -35,6 +65,7 @@ export interface JarvisSession {
   mic_device_id: string | null;
   language: string;
   created_at: number;
+  capture_mode: JarvisCaptureMode;
 }
 
 export interface JarvisSessionQuery {
@@ -249,7 +280,7 @@ export type JarvisControlAction = "start" | "pause" | "resume" | "finish";
 
 export interface JarvisRuntimeState {
   sessionId: string | null;
-  status: "idle" | JarvisSessionStatus;
+  status: "idle" | "degraded" | JarvisSessionStatus;
   startedAt: number | null;
   elapsedMs: number;
   errorCode: string | null;

@@ -58,6 +58,18 @@
     "micFallback": "Preferred microphone disconnected. Continuing with {{device}}.",
     "recordingError": "Recording could not continue. Check the microphone and try again.",
     "operationError": "Operation failed. Please try again.",
+    "capture": {
+      "groupLabel": "Capture audio",
+      "restoringSources": "Restaurando fontes de áudio…",
+      "noActiveSource": "Nenhuma fonte de áudio ativa",
+      "modes": { "mic": "Microphone only", "system": "Computer audio only", "dual": "Microphone and computer audio" },
+      "sources": { "mic": "Microphone", "system": "Computer audio" },
+      "status": { "idle": "Not enabled", "checking": "Checking", "ready": "Ready", "unavailable": "Unavailable", "recording": "Recording", "recovering": "Recovering" },
+      "sourceStatus": "{{source}}: {{status}}",
+      "retry": "Retry",
+      "continueWithAvailableSource": "Continue with available source",
+      "unavailable": { "mic": "The microphone is unavailable. Retry or choose another source.", "system": "Computer audio is unavailable. Retry or choose another source.", "dual": "One or more selected audio sources are unavailable. Retry or continue with an available source." }
+    },
     "consentTitle": "Confirm recording permission",
     "consentDescription": "Jarvis records only when you start it. Make sure everyone is informed and recording is permitted.",
     "consentAudioRetention": "Audio files are retained for 7 days.",

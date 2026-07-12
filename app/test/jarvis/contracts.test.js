@@ -50,6 +50,8 @@ function createRepository(overrides = {}) {
 function createService(overrides = {}) {
   return {
     startCapture: () => "capture-started",
+    sourceInterrupted: () => "source-interrupted",
+    sourceRestored: () => "source-restored",
     pauseCapture: () => "capture-paused",
     resumeCapture: () => "capture-resumed",
     finishCapture: () => "capture-finished",
@@ -152,6 +154,38 @@ test("start capture IPC rejects invalid source selections before calling the ser
       }),
     /invalid capture mode/
   );
+  assert.throws(
+    () =>
+      handlers.get(CHANNELS.startCapture)(null, {
+        sessionId: "s1",
+        startedAt: 10,
+        micDeviceId: "contradictory-mic",
+        captureMode: "system",
+        sources: [
+          {
+            sourceType: "system",
+            deviceId: null,
+            deviceLabel: null,
+            strategy: "wasapi-loopback",
+          },
+        ],
+      }),
+    /micDeviceId must match the selected capture sources/
+  );
+  assert.throws(
+    () =>
+      handlers.get(CHANNELS.startCapture)(null, {
+        sessionId: "s1",
+        startedAt: 10,
+        micDeviceId: "mic-a",
+        captureMode: "dual",
+        sources: [
+          { sourceType: "mic", deviceId: "mic-b" },
+          { sourceType: "system", deviceId: null },
+        ],
+      }),
+    /micDeviceId must match the selected capture sources/
+  );
   assert.equal(calls, 0);
 });
 
@@ -168,6 +202,63 @@ test("capture modes require their exact unique source set", () => {
     normalizeCaptureSources("dual", [system, mic]).map((source) => source.sourceType),
     ["mic", "system"]
   );
+});
+
+test("source lifecycle IPC validates metadata and forwards only sanitized inputs", () => {
+  const interrupted = [];
+  const restored = [];
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService({
+      sourceInterrupted: (...args) => interrupted.push(args),
+      sourceRestored: (...args) => restored.push(args),
+    }),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  handlers.get(CHANNELS.sourceInterrupted)(null, "session-1", "mic", {
+    at: 1_100,
+    reason: "mic-track-ended",
+  });
+  handlers.get(CHANNELS.sourceRestored)(null, "session-1", "mic", {
+    at: 1_200,
+    deviceId: "physical-mic",
+    deviceLabel: "Physical microphone",
+    strategy: "web-audio",
+  });
+
+  assert.deepEqual(interrupted, [
+    ["session-1", "mic", { at: 1_100, reason: "mic-track-ended" }],
+  ]);
+  assert.deepEqual(restored, [
+    [
+      "session-1",
+      "mic",
+      {
+        at: 1_200,
+        deviceId: "physical-mic",
+        deviceLabel: "Physical microphone",
+        strategy: "web-audio",
+      },
+    ],
+  ]);
+
+  for (const [channel, args] of [
+    [CHANNELS.sourceInterrupted, ["../escape", "mic", { at: 1, reason: "ended" }]],
+    [CHANNELS.sourceInterrupted, ["session-1", "mixed", { at: 1, reason: "ended" }]],
+    [CHANNELS.sourceInterrupted, ["session-1", "mic", { at: 1, reason: "" }]],
+    [
+      CHANNELS.sourceRestored,
+      ["session-1", "mic", { at: 2, deviceId: 7, deviceLabel: null, strategy: null }],
+    ],
+  ]) {
+    assert.throws(() => handlers.get(channel)(null, ...args));
+  }
+  assert.equal(interrupted.length, 1);
+  assert.equal(restored.length, 1);
 });
 
 test("contract exposes only the named Jarvis channels", () => {
@@ -207,6 +298,8 @@ test("contract exposes only the named Jarvis channels", () => {
       "setMiniMaxKey",
       "setSessionStatus",
       "setTodoStatus",
+      "sourceInterrupted",
+      "sourceRestored",
       "startCapture",
       "stateChanged",
       "syncSegments",
@@ -236,6 +329,8 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.syncSegments,
       CHANNELS.upsertSegments,
       CHANNELS.startCapture,
+      CHANNELS.sourceInterrupted,
+      CHANNELS.sourceRestored,
       CHANNELS.pauseCapture,
       CHANNELS.resumeCapture,
       CHANNELS.finishCapture,
@@ -450,6 +545,8 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
 
   for (const method of [
     "startCapture",
+    "sourceInterrupted",
+    "sourceRestored",
     "pauseCapture",
     "resumeCapture",
     "finishCapture",
@@ -489,7 +586,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
   }
 });
 
-test("failCapture IPC validates MIC codes and preserves authoritative failed broadcast", () => {
+test("failCapture IPC validates known codes and preserves authoritative failed broadcast", () => {
   const fs = require("node:fs");
   const os = require("node:os");
   const path = require("node:path");
@@ -540,15 +637,15 @@ test("failCapture IPC validates MIC codes and preserves authoritative failed bro
     service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
     assert.throws(
       () => handlers.get(CHANNELS.failCapture)(null, "s1", "upstream_stop_failed", 1_100),
-      /microphone error code/
+      /capture failure code/
     );
-    handlers.get(CHANNELS.failCapture)(null, "s1", "MIC_DISCONNECTED", 1_100);
+    handlers.get(CHANNELS.failCapture)(null, "s1", "capture_source_unavailable", 1_100);
 
     assert.equal(service.getState().status, "failed");
-    assert.equal(service.getState().errorCode, "MIC_DISCONNECTED");
+    assert.equal(service.getState().errorCode, "capture_source_unavailable");
     assert.equal(session.status, "failed");
     assert.equal(broadcasts.at(-1).status, "failed");
-    assert.equal(broadcasts.at(-1).errorCode, "MIC_DISCONNECTED");
+    assert.equal(broadcasts.at(-1).errorCode, "capture_source_unavailable");
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });

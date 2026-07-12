@@ -3,6 +3,7 @@ const MAX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const TERMINAL_TRACK_STATES = new Set(["ended", "recovered", "failed"]);
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const RESTORATION_TARGET_STATES = new Set(["active", "paused"]);
+const SOURCE_LIFECYCLE_SESSION_STATUSES = new Set(["recording", "paused"]);
 const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   completed: "ended",
   recovered: "recovered",
@@ -46,7 +47,10 @@ class CaptureEvidenceStore {
       closeGap: db.prepare(`
         UPDATE audio_gaps
         SET ended_at = @endedAt,
-            recovery_attempts = COALESCE(@recoveryAttempts, recovery_attempts)
+            recovery_attempts = COALESCE(@recoveryAttempts, recovery_attempts),
+            restored_device_id = @restoredDeviceId,
+            restored_device_label = @restoredDeviceLabel,
+            restored_strategy = @restoredStrategy
         WHERE id = @id AND ended_at IS NULL
       `),
       getTrack: db.prepare("SELECT * FROM audio_tracks WHERE id = ?"),
@@ -181,39 +185,58 @@ class CaptureEvidenceStore {
       if (persisted.track_id !== chunk.trackId) throw new Error("chunk track does not match");
       if (persisted.source_type !== chunk.sourceType) throw new Error("chunk source does not match");
       if (persisted.sha256 !== chunk.sha256) throw new Error("chunk input hash does not match");
+      this._assertChunk(chunk);
 
       const input = this._transcriptionInput(chunk);
       const existing = this.statements.getTranscriptionJobByInput.get(input);
       return existing ?? this._insertChunkTranscription(chunk);
     });
-    this.interruptTrackTransaction = db.transaction(({ trackId, gap }) => {
-      this._assertIdentifier(trackId, "trackId");
-      if (!gap || typeof gap !== "object") throw new TypeError("gap is required");
-      this._assertIdentifier(gap.id, "gap id");
-      this._assertSafeInteger(gap.startedAt, "gap startedAt");
-      this._assertNonNegativeSafeInteger(gap.recoveryAttempts ?? 0, "gap recoveryAttempts");
-      if (typeof gap.reason !== "string" || gap.reason.length === 0) {
-        throw new TypeError("gap reason must be a non-empty string");
+    this.interruptTrackTransaction = db.transaction(
+      ({ trackId, gap, sessionId = undefined, sessionStatus = undefined }) => {
+        this._assertIdentifier(trackId, "trackId");
+        if (!gap || typeof gap !== "object") throw new TypeError("gap is required");
+        this._assertIdentifier(gap.id, "gap id");
+        this._assertSafeInteger(gap.startedAt, "gap startedAt");
+        this._assertNonNegativeSafeInteger(gap.recoveryAttempts ?? 0, "gap recoveryAttempts");
+        if (typeof gap.reason !== "string" || gap.reason.length === 0) {
+          throw new TypeError("gap reason must be a non-empty string");
+        }
+        const track = this.statements.getTrack.get(trackId);
+        if (!track) throw new Error(`track ${trackId} does not exist`);
+        if (gap.trackId !== trackId) throw new Error("gap track does not match transition track");
+        if (track.state !== "active" || track.ended_at !== null) {
+          throw new Error(`track ${trackId} must be active before interruption`);
+        }
+        if (gap.startedAt < track.started_at) {
+          throw new RangeError("gap startedAt must not be before track startedAt");
+        }
+        if (this.statements.getOpenGapForTrack.get(trackId)) {
+          throw new Error(`track ${trackId} already has an open gap`);
+        }
+        const updated = this.setTrackState(trackId, "recovering", gap.startedAt);
+        if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
+        this.openGap(gap);
+        this._transitionSourceSession({
+          track,
+          sessionId,
+          sessionStatus,
+        });
+        return { trackId, gapId: gap.id };
       }
-      const track = this.statements.getTrack.get(trackId);
-      if (!track) throw new Error(`track ${trackId} does not exist`);
-      if (gap.trackId !== trackId) throw new Error("gap track does not match transition track");
-      if (track.state !== "active" || track.ended_at !== null) {
-        throw new Error(`track ${trackId} must be active before interruption`);
-      }
-      if (gap.startedAt < track.started_at) {
-        throw new RangeError("gap startedAt must not be before track startedAt");
-      }
-      if (this.statements.getOpenGapForTrack.get(trackId)) {
-        throw new Error(`track ${trackId} already has an open gap`);
-      }
-      const updated = this.setTrackState(trackId, "recovering", gap.startedAt);
-      if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
-      this.openGap(gap);
-      return { trackId, gapId: gap.id };
-    });
+    );
     this.restoreTrackTransaction = db.transaction(
-      ({ trackId, gapId, endedAt, recoveryAttempts = 1, targetState = "active" }) => {
+      ({
+        trackId,
+        gapId,
+        endedAt,
+        recoveryAttempts = 1,
+        targetState = "active",
+        sessionId = undefined,
+        sessionStatus = undefined,
+        deviceId = undefined,
+        deviceLabel = undefined,
+        strategy = undefined,
+      }) => {
         if (!RESTORATION_TARGET_STATES.has(targetState)) {
           throw new TypeError("invalid restoration target state");
         }
@@ -233,7 +256,17 @@ class CaptureEvidenceStore {
         if (endedAt < gap.started_at) {
           throw new RangeError("restoration endedAt must not be before gap startedAt");
         }
-        const closed = this.closeGap(gapId, endedAt, recoveryAttempts);
+        const restoredMetadata = {
+          deviceId: deviceId === undefined ? track.device_id : deviceId,
+          deviceLabel: deviceLabel === undefined ? track.device_label : deviceLabel,
+          strategy: strategy === undefined ? track.strategy : strategy,
+        };
+        for (const [name, value] of Object.entries(restoredMetadata)) {
+          if (value !== null && (typeof value !== "string" || value.length > 512)) {
+            throw new TypeError(`${name} must be a string of at most 512 characters or null`);
+          }
+        }
+        const closed = this.closeGap(gapId, endedAt, recoveryAttempts, restoredMetadata);
         if (closed.changes !== 1) throw new Error(`gap ${gapId} is not open`);
         const updated = this.setTrackState(
           trackId,
@@ -241,6 +274,11 @@ class CaptureEvidenceStore {
           targetState === "paused" ? endedAt : null
         );
         if (updated.changes !== 1) throw new Error(`track ${trackId} was not updated`);
+        this._transitionSourceSession({
+          track,
+          sessionId,
+          sessionStatus,
+        });
         return { trackId, gapId, targetState };
       }
     );
@@ -404,8 +442,15 @@ class CaptureEvidenceStore {
     return this.interruptTrackTransaction(input);
   }
 
-  closeGap(id, endedAt, recoveryAttempts = null) {
-    return this.statements.closeGap.run({ id, endedAt, recoveryAttempts });
+  closeGap(id, endedAt, recoveryAttempts = null, restoredSource = null) {
+    return this.statements.closeGap.run({
+      id,
+      endedAt,
+      recoveryAttempts,
+      restoredDeviceId: restoredSource?.deviceId ?? null,
+      restoredDeviceLabel: restoredSource?.deviceLabel ?? null,
+      restoredStrategy: restoredSource?.strategy ?? null,
+    });
   }
 
   restoreTrack(input) {
@@ -541,13 +586,49 @@ class CaptureEvidenceStore {
     return evidence;
   }
 
+  _transitionSourceSession({ track, sessionId, sessionStatus }) {
+    const hasSessionTransition = sessionId !== undefined || sessionStatus !== undefined;
+    if (!hasSessionTransition) return;
+    this._assertIdentifier(sessionId, "sessionId");
+    if (!SOURCE_LIFECYCLE_SESSION_STATUSES.has(sessionStatus)) {
+      throw new TypeError("invalid source lifecycle session status");
+    }
+    if (track.session_id !== sessionId) {
+      throw new Error(`track ${track.id} does not belong to session ${sessionId}`);
+    }
+    const session = this.statements.getSession.get(sessionId);
+    if (!session) throw new Error(`session ${sessionId} does not exist`);
+    if (TERMINAL_SESSION_STATUSES.has(session.status)) {
+      throw new Error(`session ${sessionId} is already terminal`);
+    }
+    const transitioned = this.statements.transitionSession.run({
+      sessionId,
+      status: sessionStatus,
+      endedAt: null,
+    });
+    if (transitioned.changes !== 1) {
+      throw new Error(`session ${sessionId} was not updated`);
+    }
+  }
+
   _assertChunk(chunk) {
     const track = this.statements.getTrack.get(chunk.trackId);
     if (!track) throw new Error(`track ${chunk.trackId} does not exist`);
     if (track.session_id !== chunk.sessionId) throw new Error("chunk session does not match track");
     if (track.source_type !== chunk.sourceType) throw new Error("chunk source does not match track");
+    const session = this.statements.getSession.get(chunk.sessionId);
+    if (!session) throw new Error(`session ${chunk.sessionId} does not exist`);
     if (!Number.isSafeInteger(chunk.startedAt) || !Number.isSafeInteger(chunk.endedAt)) {
       throw new TypeError("chunk timestamps must be safe integers");
+    }
+    if (chunk.startedAt < track.started_at || chunk.startedAt < session.started_at) {
+      throw new RangeError("chunk startedAt must not be before its track or session startedAt");
+    }
+    if (
+      (track.ended_at !== null && chunk.endedAt > track.ended_at) ||
+      (session.ended_at !== null && chunk.endedAt > session.ended_at)
+    ) {
+      throw new RangeError("chunk endedAt must not be after its track or session endedAt");
     }
     const captureSpanMs = chunk.endedAt - chunk.startedAt;
     if (captureSpanMs <= 0) {

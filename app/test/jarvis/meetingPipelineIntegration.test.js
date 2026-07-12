@@ -2,8 +2,50 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { routeJarvisPcm } = require("../../src/jarvis/main/meetingCaptureMode");
 
 const appRoot = path.resolve(__dirname, "../..");
+
+test("production routing persists exact mic and system PCM before derived consumers", () => {
+  for (const sourceType of ["mic", "system"]) {
+    const calls = [];
+    const pcm = Buffer.from(sourceType === "mic" ? [1, 2, 3, 4] : [5, 6, 7, 8]);
+
+    const accepted = routeJarvisPcm({
+      sessionId: "session-integration",
+      sourceType,
+      pcmBuffer: pcm,
+      appendPcm(sessionId, persistedSource, persistedPcm) {
+        calls.push({
+          kind: "persist",
+          sessionId,
+          sourceType: persistedSource,
+          pcm: Buffer.from(persistedPcm),
+        });
+        return true;
+      },
+      afterPersist(derivedPcm, persistedSource) {
+        calls.push({
+          kind: "derived",
+          sourceType: persistedSource,
+          pcm: Buffer.from(derivedPcm),
+        });
+      },
+    });
+
+    assert.equal(accepted, true);
+    assert.deepEqual(
+      calls.map(({ kind, sourceType: source }) => [kind, source]),
+      [
+        ["persist", sourceType],
+        ["derived", sourceType],
+      ]
+    );
+    assert.equal(calls[0].sessionId, "session-integration");
+    assert.deepEqual(calls[0].pcm, pcm);
+    assert.deepEqual(calls[1].pcm, pcm);
+  }
+});
 
 test("renderer mic-only start bypasses system access and forwards Jarvis identity", () => {
   const source = fs.readFileSync(path.join(appRoot, "src/stores/meetingRecordingStore.ts"), "utf8");

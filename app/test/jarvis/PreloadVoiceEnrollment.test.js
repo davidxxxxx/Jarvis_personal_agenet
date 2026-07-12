@@ -147,6 +147,24 @@ test("preload exposes narrow authoritative capture failure IPC", async () => {
   ]);
 });
 
+test("preload exposes source interruption and restoration request-response IPC", async () => {
+  const { api, invokes } = loadPreloadApi();
+  const interruption = { at: 1_100, reason: "mic-track-ended" };
+  const restoration = {
+    at: 1_200,
+    deviceId: "physical-mic",
+    deviceLabel: "Physical microphone",
+    strategy: "web-audio",
+  };
+
+  assert.equal(await api.sourceInterrupted("s1", "mic", interruption), "invoked");
+  assert.equal(await api.sourceRestored("s1", "mic", restoration), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:capture:source-interrupted", "s1", "mic", interruption],
+    ["jarvis:capture:source-restored", "s1", "mic", restoration],
+  ]);
+});
+
 test("preload exposes metadata-only meeting input rejection events", () => {
   const { rootApi, listeners, sends } = loadPreloadApi();
   const rejected = [];

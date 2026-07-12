@@ -1,4 +1,4 @@
-const TARGET_VERSION = 2;
+const TARGET_VERSION = 3;
 
 const PROCESSING_JOBS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -139,9 +139,15 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         started_at INTEGER NOT NULL,
         ended_at INTEGER,
         reason TEXT NOT NULL,
-        recovery_attempts INTEGER NOT NULL DEFAULT 0
+        recovery_attempts INTEGER NOT NULL DEFAULT 0,
+        restored_device_id TEXT,
+        restored_device_label TEXT,
+        restored_strategy TEXT
       );
     `);
+    addColumn(db, "audio_gaps", "restored_device_id TEXT");
+    addColumn(db, "audio_gaps", "restored_device_label TEXT");
+    addColumn(db, "audio_gaps", "restored_strategy TEXT");
     db.exec(PROCESSING_JOBS_SCHEMA);
     rebuildLegacyProcessingJobs(db);
     db.exec(PROCESSING_JOBS_INDEXES);

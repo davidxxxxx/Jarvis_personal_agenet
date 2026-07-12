@@ -12,6 +12,24 @@ const {
 
 const AUDIO_RETENTION_MS = 7 * 86400000;
 const ACTIVE_SESSION_STATUSES = new Set(["recording", "degraded"]);
+const RECOVERY_SIDECAR_SUFFIX = ".wav.recovery.json";
+const RECOVERY_SIDECAR_MAX_BYTES = 16 * 1024;
+const WAV_HEADER_BYTES = 44;
+const WAV_SAMPLE_RATE = 24_000;
+const WAV_BYTES_PER_SAMPLE = 2;
+const MAX_CHUNK_PCM_BYTES = 60 * WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE;
+const RECOVERY_SIDECAR_KEYS = Object.freeze([
+  "durationMs",
+  "endedAt",
+  "id",
+  "path",
+  "sequenceNumber",
+  "sessionId",
+  "sha256",
+  "sourceType",
+  "startedAt",
+  "trackId",
+]);
 
 class DiskSpaceError extends Error {
   constructor(code) {
@@ -68,6 +86,7 @@ class JarvisService {
     this.writer = null;
     this.closing = false;
     this.closed = false;
+    this.completedRestorations = new Map();
     this.state = this._idleState();
   }
 
@@ -81,8 +100,23 @@ class JarvisService {
     }
     const session = this.repository.getSession(id);
     if (!session) throw new Error("capture session does not exist");
+    if (session.capture_mode !== null && session.capture_mode !== undefined) {
+      if (session.capture_mode !== normalized.captureMode) {
+        throw new Error("capture mode does not match persisted session");
+      }
+      const persistedMicDeviceId = session.mic_device_id ?? null;
+      const micSource = normalized.sources.find((source) => source.sourceType === "mic");
+      if (normalized.captureMode === "system") {
+        if (persistedMicDeviceId !== null) {
+          throw new Error("system capture session must not persist a microphone device id");
+        }
+      } else if (persistedMicDeviceId !== (micSource?.deviceId ?? null)) {
+        throw new Error("microphone source does not match persisted session");
+      }
+    }
 
     this.fs.mkdirSync(this.recordingsDir, { recursive: true });
+    this.completedRestorations.clear();
     const sources = {};
     for (const source of normalized.sources) {
       sources[source.sourceType] = {
@@ -182,14 +216,15 @@ class JarvisService {
 
   sourceRestored(sessionId, sourceType, restoration) {
     this._assertOpen();
-    const source = this._assertSourceSession(sessionId, sourceType, ["degraded", "paused"]);
+    const source = this._assertSourceSession(sessionId, sourceType, [
+      "recording",
+      "degraded",
+      "paused",
+    ]);
     if (!restoration || typeof restoration !== "object") {
       throw new TypeError("restoration is required");
     }
     this._assertTime(restoration.at, "at");
-    if (source.state !== "reconnecting") {
-      throw new Error(`capture source is not reconnecting: ${source.sourceType}`);
-    }
     if (
       restoration.sourceType !== undefined &&
       restoration.sourceType !== source.sourceType
@@ -197,9 +232,26 @@ class JarvisService {
       throw new TypeError("restoration source type must match the requested source");
     }
     const restored = normalizeSource({ ...restoration, sourceType: source.sourceType });
-    const isManualPause =
-      this.state.status === "paused" &&
-      Object.values(this.state.sources).some((entry) => entry.state === "paused");
+    if (source.state !== "reconnecting") {
+      const completed = this.completedRestorations.get(source.sourceType);
+      if (
+        completed?.sessionId === this.state.sessionId &&
+        completed.trackId === source.trackId &&
+        completed.at === restoration.at &&
+        completed.deviceId === restored.deviceId &&
+        completed.deviceLabel === restored.deviceLabel &&
+        completed.strategy === restored.strategy &&
+        completed.targetState === source.state
+      ) {
+        return this._publish(restoration.at);
+      }
+      throw new Error(`capture source is not reconnecting: ${source.sourceType}`);
+    }
+    if (source.interruptedAt !== null && restoration.at < source.interruptedAt) {
+      throw new RangeError("restoration time is before the current interruption");
+    }
+    const restoredGapId = source.gapId;
+    const isManualPause = this.state.status === "paused";
 
     if (isManualPause) {
       this.repository.restoreTrack({
@@ -208,6 +260,11 @@ class JarvisService {
         endedAt: restoration.at,
         recoveryAttempts: 1,
         targetState: "paused",
+        sessionId: this.state.sessionId,
+        sessionStatus: "paused",
+        deviceId: restored.deviceId,
+        deviceLabel: restored.deviceLabel,
+        strategy: restored.strategy,
       });
       Object.assign(source, restored, {
         state: "paused",
@@ -216,6 +273,7 @@ class JarvisService {
         reason: null,
         errorCode: null,
       });
+      this._rememberCompletedRestoration(source, restoredGapId, restoration.at, "paused");
       return this._publish(restoration.at);
     }
 
@@ -231,28 +289,37 @@ class JarvisService {
       startedAt: restoration.at,
     });
     try {
+      const status = Object.values(this.state.sources).every(
+        (entry) => entry === source || entry.state === "active"
+      )
+        ? "recording"
+        : "degraded";
       this.repository.restoreTrack({
         trackId: source.trackId,
         gapId: source.gapId,
         endedAt: restoration.at,
         recoveryAttempts: 1,
+        sessionId: this.state.sessionId,
+        sessionStatus: "recording",
+        deviceId: restored.deviceId,
+        deviceLabel: restored.deviceLabel,
+        strategy: restored.strategy,
       });
+      Object.assign(source, restored, {
+        state: "active",
+        gapId: null,
+        interruptedAt: null,
+        reason: null,
+        errorCode: null,
+      });
+      this._transitionSessionStatus(status, restoration.at);
+      this._rememberCompletedRestoration(source, restoredGapId, restoration.at, "active");
     } catch (error) {
       try {
         this.writer.closeSource(source.sourceType, restoration.at);
       } catch {}
       throw error;
     }
-    Object.assign(source, restored, {
-      state: "active",
-      gapId: null,
-      interruptedAt: null,
-      reason: null,
-      errorCode: null,
-    });
-    const status = this._deriveSessionStatus();
-    this._transitionSessionStatus(status, restoration.at);
-    this._persistSessionStatus(status, restoration.at);
     return this._publish(restoration.at);
   }
 
@@ -381,6 +448,7 @@ class JarvisService {
   recoverOpenSessions(at = this.now()) {
     this._assertOpen();
     this._assertTime(at, "at");
+    this._reconcileChunkRecoverySidecars();
     return this.repository.recoverOpenSessions(at);
   }
 
@@ -463,6 +531,274 @@ class JarvisService {
     });
   }
 
+  _reconcileChunkRecoverySidecars() {
+    let root;
+    try {
+      const rootStat = this.fs.lstatSync(this.recordingsDir);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return;
+      root = this.fs.realpathSync(this.recordingsDir);
+    } catch {
+      return;
+    }
+
+    let sessionEntries;
+    try {
+      sessionEntries = this.fs
+        .readdirSync(root, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name));
+    } catch {
+      return;
+    }
+
+    for (const sessionEntry of sessionEntries) {
+      let sessionId;
+      try {
+        sessionId = assertId(sessionEntry.name, "recovery sessionId");
+      } catch {
+        continue;
+      }
+      const sessionDir = this._recoveryDirectory(root, sessionId);
+      if (!sessionDir) continue;
+
+      for (const sourceType of ["mic", "system"]) {
+        const sourceDir = this._recoveryDirectory(sessionDir, sourceType);
+        if (!sourceDir) continue;
+        let sidecarEntries;
+        try {
+          sidecarEntries = this.fs
+            .readdirSync(sourceDir, { withFileTypes: true })
+            .filter((entry) => entry.name.endsWith(RECOVERY_SIDECAR_SUFFIX))
+            .sort((left, right) => left.name.localeCompare(right.name));
+        } catch {
+          continue;
+        }
+        for (const sidecarEntry of sidecarEntries) {
+          try {
+            this._reconcileChunkRecoverySidecar({
+              root,
+              sessionId,
+              sourceType,
+              sourceDir,
+              sidecarName: sidecarEntry.name,
+            });
+          } catch {
+            // Preserve invalid/conflicting evidence for diagnosis while allowing startup and
+            // valid sibling recovery to continue.
+          }
+        }
+      }
+    }
+  }
+
+  _recoveryDirectory(parent, name) {
+    const candidate = path.join(parent, name);
+    try {
+      const stat = this.fs.lstatSync(candidate);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+      const real = this.fs.realpathSync(candidate);
+      return this._isDirectChild(parent, real) ? real : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _reconcileChunkRecoverySidecar({ root, sessionId, sourceType, sourceDir, sidecarName }) {
+    const sidecarPath = path.join(sourceDir, sidecarName);
+    const sidecarStat = this.fs.lstatSync(sidecarPath);
+    if (
+      !sidecarStat.isFile() ||
+      sidecarStat.isSymbolicLink() ||
+      sidecarStat.size <= 0 ||
+      sidecarStat.size > RECOVERY_SIDECAR_MAX_BYTES
+    ) {
+      throw new Error("invalid audio recovery sidecar");
+    }
+    const sidecarRealPath = this.fs.realpathSync(sidecarPath);
+    if (!this._isDirectChild(sourceDir, sidecarRealPath)) {
+      throw new Error("audio recovery sidecar escapes its source directory");
+    }
+
+    const metadata = JSON.parse(this.fs.readFileSync(sidecarRealPath, "utf8"));
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+      throw new TypeError("audio recovery metadata must be an object");
+    }
+    if (
+      JSON.stringify(Object.keys(metadata).sort()) !== JSON.stringify(RECOVERY_SIDECAR_KEYS)
+    ) {
+      throw new TypeError("audio recovery metadata has an invalid structure");
+    }
+
+    const chunkId = assertId(metadata.id, "audio recovery chunkId");
+    const metadataSessionId = assertId(metadata.sessionId, "audio recovery sessionId");
+    const trackId = assertId(metadata.trackId, "audio recovery trackId");
+    const metadataSourceType = assertSourceType(metadata.sourceType);
+    if (metadataSessionId !== sessionId || metadataSourceType !== sourceType) {
+      throw new Error("audio recovery metadata does not match its directory");
+    }
+    if (sidecarName !== `${chunkId}${RECOVERY_SIDECAR_SUFFIX}`) {
+      throw new Error("audio recovery filename does not match its chunk id");
+    }
+    if (!Number.isSafeInteger(metadata.sequenceNumber) || metadata.sequenceNumber < 0) {
+      throw new RangeError("audio recovery sequenceNumber must be non-negative");
+    }
+    for (const name of ["startedAt", "endedAt", "durationMs"]) {
+      if (!Number.isSafeInteger(metadata[name])) {
+        throw new TypeError(`audio recovery ${name} must be a safe integer`);
+      }
+    }
+    if (
+      metadata.durationMs <= 0 ||
+      metadata.durationMs > 60_000 ||
+      metadata.endedAt - metadata.startedAt !== metadata.durationMs
+    ) {
+      throw new RangeError("audio recovery duration is invalid");
+    }
+    if (typeof metadata.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(metadata.sha256)) {
+      throw new TypeError("audio recovery sha256 is invalid");
+    }
+    if (typeof metadata.path !== "string" || !path.isAbsolute(metadata.path)) {
+      throw new TypeError("audio recovery path must be absolute");
+    }
+    if (!this.repository.getSession(metadataSessionId)) {
+      throw new Error("audio recovery session does not exist");
+    }
+
+    const wavName = sidecarName.slice(0, -".recovery.json".length);
+    const wavPath = path.join(sourceDir, wavName);
+    const wavStat = this.fs.lstatSync(wavPath);
+    if (!wavStat.isFile() || wavStat.isSymbolicLink()) {
+      throw new Error("audio recovery WAV is not a regular file");
+    }
+    if (
+      wavStat.size <= WAV_HEADER_BYTES ||
+      wavStat.size > WAV_HEADER_BYTES + MAX_CHUNK_PCM_BYTES
+    ) {
+      throw new RangeError("audio recovery WAV size is invalid");
+    }
+    const wavRealPath = this.fs.realpathSync(wavPath);
+    if (
+      !this._isDirectChild(sourceDir, wavRealPath) ||
+      !this._isContainedPath(root, wavRealPath) ||
+      !this._samePath(path.resolve(metadata.path), wavRealPath)
+    ) {
+      throw new Error("audio recovery WAV path is invalid");
+    }
+    const pcm = this._validatedRecoveryPcm(wavRealPath, metadata.durationMs);
+    const sha256 = crypto.createHash("sha256").update(pcm).digest("hex");
+    if (sha256 !== metadata.sha256) {
+      throw new Error("audio recovery WAV hash does not match metadata");
+    }
+
+    const chunk = {
+      id: chunkId,
+      sessionId: metadataSessionId,
+      trackId,
+      sourceType: metadataSourceType,
+      sequenceNumber: metadata.sequenceNumber,
+      path: wavRealPath,
+      startedAt: metadata.startedAt,
+      endedAt: metadata.endedAt,
+      durationMs: metadata.durationMs,
+      sha256: metadata.sha256,
+      expiresAt: metadata.endedAt + AUDIO_RETENTION_MS,
+    };
+    const existing =
+      typeof this.repository.getAudioChunk === "function"
+        ? this.repository.getAudioChunk(chunk.id)
+        : null;
+    if (existing) {
+      this._assertRecoveryChunkMatches(existing, chunk);
+      if (typeof this.repository.enqueueChunkTranscription !== "function") {
+        throw new TypeError("repository.enqueueChunkTranscription must be a function");
+      }
+      this.repository.enqueueChunkTranscription(chunk);
+    } else {
+      this.repository.commitChunk(chunk);
+    }
+    this.fs.unlinkSync(sidecarRealPath);
+  }
+
+  _validatedRecoveryPcm(wavPath, durationMs) {
+    const wav = this.fs.readFileSync(wavPath);
+    if (wav.length <= WAV_HEADER_BYTES || wav.length > WAV_HEADER_BYTES + MAX_CHUNK_PCM_BYTES) {
+      throw new RangeError("audio recovery WAV size is invalid");
+    }
+    const pcmBytes = wav.length - WAV_HEADER_BYTES;
+    if (
+      pcmBytes % WAV_BYTES_PER_SAMPLE !== 0 ||
+      wav.toString("ascii", 0, 4) !== "RIFF" ||
+      wav.readUInt32LE(4) !== 36 + pcmBytes ||
+      wav.toString("ascii", 8, 16) !== "WAVEfmt " ||
+      wav.readUInt32LE(16) !== 16 ||
+      wav.readUInt16LE(20) !== 1 ||
+      wav.readUInt16LE(22) !== 1 ||
+      wav.readUInt32LE(24) !== WAV_SAMPLE_RATE ||
+      wav.readUInt32LE(28) !== WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE ||
+      wav.readUInt16LE(32) !== WAV_BYTES_PER_SAMPLE ||
+      wav.readUInt16LE(34) !== 16 ||
+      wav.toString("ascii", 36, 40) !== "data" ||
+      wav.readUInt32LE(40) !== pcmBytes
+    ) {
+      throw new Error("audio recovery WAV format is invalid");
+    }
+    if (
+      Math.max(1, Math.round((pcmBytes * 1000) / (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE))) !==
+      durationMs
+    ) {
+      throw new Error("audio recovery WAV duration does not match metadata");
+    }
+    return wav.subarray(WAV_HEADER_BYTES);
+  }
+
+  _assertRecoveryChunkMatches(existing, chunk) {
+    const expected = {
+      id: chunk.id,
+      session_id: chunk.sessionId,
+      track_id: chunk.trackId,
+      source_type: chunk.sourceType,
+      sequence_number: chunk.sequenceNumber,
+      path: chunk.path,
+      started_at: chunk.startedAt,
+      ended_at: chunk.endedAt,
+      duration_ms: chunk.durationMs,
+      sha256: chunk.sha256,
+      expires_at: chunk.expiresAt,
+    };
+    for (const [key, value] of Object.entries(expected)) {
+      const matches = key === "path" ? this._samePath(existing[key], value) : existing[key] === value;
+      if (!matches) throw new Error(`audio recovery chunk conflicts on ${key}`);
+    }
+  }
+
+  _isDirectChild(parent, candidate) {
+    const relative = path.relative(parent, candidate);
+    return (
+      relative.length > 0 &&
+      !path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !relative.includes(path.sep)
+    );
+  }
+
+  _isContainedPath(parent, candidate) {
+    const relative = path.relative(parent, candidate);
+    return (
+      relative.length > 0 &&
+      !path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`)
+    );
+  }
+
+  _samePath(left, right) {
+    const normalizedLeft = path.normalize(left);
+    const normalizedRight = path.normalize(right);
+    return process.platform === "win32"
+      ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+      : normalizedLeft === normalizedRight;
+  }
+
   _interruptSource(sessionId, sourceType, { at, reason }, writerError = null) {
     const source = this._assertSourceSession(sessionId, sourceType, [
       "recording",
@@ -479,6 +815,8 @@ class JarvisService {
     const gapId = `gap-${crypto.randomUUID()}`;
     this.repository.interruptTrack({
       trackId: source.trackId,
+      sessionId: this.state.sessionId,
+      sessionStatus: "recording",
       gap: {
         id: gapId,
         trackId: source.trackId,
@@ -487,6 +825,7 @@ class JarvisService {
         recoveryAttempts: 0,
       },
     });
+    this.completedRestorations.delete(source.sourceType);
 
     Object.assign(source, {
       state: "reconnecting",
@@ -505,9 +844,7 @@ class JarvisService {
       if (diskError) return this._failForDisk(diskError.code, at);
     }
     source.errorCode = closeError ? "AUDIO_WRITE_FAILED" : null;
-    const status = this._deriveSessionStatus();
-    this._transitionSessionStatus(status, at);
-    this._persistSessionStatus(status, at);
+    this._transitionSessionStatus("degraded", at);
     return this._publish(at);
   }
 
@@ -515,8 +852,20 @@ class JarvisService {
     const sources = Object.values(this.state.sources);
     const activeCount = sources.filter((source) => source.state === "active").length;
     if (activeCount === sources.length) return "recording";
-    if (activeCount > 0) return "degraded";
-    return "paused";
+    return "degraded";
+  }
+
+  _rememberCompletedRestoration(source, gapId, at, targetState) {
+    this.completedRestorations.set(source.sourceType, {
+      sessionId: this.state.sessionId,
+      trackId: source.trackId,
+      gapId,
+      at,
+      deviceId: source.deviceId,
+      deviceLabel: source.deviceLabel,
+      strategy: source.strategy,
+      targetState,
+    });
   }
 
   _transitionSessionStatus(status, at) {
