@@ -51,9 +51,15 @@ class FakeAudioWorkletNode extends FakeAudioNode {
     onmessage: null as ((event: MessageEvent<ArrayBuffer>) => void) | null,
     postMessage: vi.fn(),
   };
+
+  constructor() {
+    super();
+    audioWorkletNodes.push(this);
+  }
 }
 
 const audioContexts: FakeAudioContext[] = [];
+const audioWorkletNodes: FakeAudioWorkletNode[] = [];
 
 class FakeAudioContext {
   state: AudioContextState = "running";
@@ -88,12 +94,20 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       }) => void)
     | null;
   let segmentListenerDetached: boolean;
+  let inputRejectedListener:
+    | ((payload: {
+        source: "mic" | "system";
+        reason: "jarvis-evidence-backpressure";
+      }) => void)
+    | null;
 
   beforeEach(() => {
     audioContexts.length = 0;
+    audioWorkletNodes.length = 0;
     track = new FakeTrack();
     segmentListener = null;
     segmentListenerDetached = false;
+    inputRejectedListener = null;
     vi.stubGlobal("AudioContext", FakeAudioContext);
     vi.stubGlobal("AudioWorkletNode", FakeAudioWorkletNode);
     Object.defineProperty(URL, "createObjectURL", {
@@ -127,6 +141,12 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       onMeetingSpeakerIdentified: vi.fn(() => () => {}),
       onMeetingSpeakersMerged: vi.fn(() => () => {}),
       onMeetingTranscriptionError: vi.fn(() => () => {}),
+      onMeetingTranscriptionInputRejected: vi.fn((callback) => {
+        inputRejectedListener = callback;
+        return () => {
+          inputRejectedListener = null;
+        };
+      }),
       meetingTranscriptionStop: vi.fn(async () => ({ success: true })),
     } as unknown as Window["electronAPI"];
 
@@ -175,6 +195,37 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         jarvisSessionId: "s-local",
       })
     );
+  });
+
+  it("stops the renderer producer after authoritative Jarvis input rejection", async () => {
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-backpressure",
+      diarizationEnabled: true,
+    });
+    const producer = audioWorkletNodes[0];
+    const first = new ArrayBuffer(4);
+    producer.port.onmessage?.({ data: first } as MessageEvent<ArrayBuffer>);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
+
+    inputRejectedListener?.({
+      source: "mic",
+      reason: "jarvis-evidence-backpressure",
+    });
+    await vi.waitFor(() => {
+      expect(useMeetingRecordingStore.getState()).toMatchObject({
+        isRecording: false,
+        isTranscribing: false,
+        error: "Jarvis stopped accepting audio evidence.",
+      });
+      expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledOnce();
+    });
+
+    producer.port.onmessage?.({ data: new ArrayBuffer(4) } as MessageEvent<ArrayBuffer>);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the system default when the pinned microphone cannot open", async () => {

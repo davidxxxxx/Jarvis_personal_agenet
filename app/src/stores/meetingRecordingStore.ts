@@ -444,6 +444,7 @@ let systemProcessor: AudioWorkletNode | null = null;
 let systemStream: MediaStream | null = null;
 let isRecordingFlag = false;
 let isStartingFlag = false;
+let meetingInputRejected = false;
 let isPrepared = false;
 let preparedMicOnly: boolean | null = null;
 let segmentsRefValue: TranscriptSegment[] = [];
@@ -904,6 +905,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   });
 
   isRecordingFlag = true;
+  meetingInputRejected = false;
 
   if (preparePromise) {
     if (
@@ -1287,6 +1289,19 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     });
     if (errorCleanup) ipcCleanups.push(errorCleanup);
 
+    const inputRejectedCleanup = window.electronAPI?.onMeetingTranscriptionInputRejected?.(
+      ({ source, reason }) => {
+        if (!isRecordingFlag || meetingInputRejected) return;
+        meetingInputRejected = true;
+        useMeetingRecordingStore.setState({
+          error: "Jarvis stopped accepting audio evidence.",
+        });
+        logger.error("Meeting audio input rejected", { source, reason }, "meeting");
+        void stopRecording({ throwOnError: false });
+      }
+    );
+    if (inputRejectedCleanup) ipcCleanups.push(inputRejectedCleanup);
+
     if (startResult.oneOnOneAttendee) {
       const synthetic: SpeakerIdentification = {
         speakerId: "speaker_0",
@@ -1310,7 +1325,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
     let resolveRecoveryDelay: (() => void) | null = null;
     const onMicChunk = (chunk: ArrayBuffer) => {
-      if (!isRecordingFlag) return;
+      if (!isRecordingFlag || meetingInputRejected) return;
       if (socketReady) {
         window.electronAPI?.meetingTranscriptionSend?.(chunk, "mic");
         return;
@@ -1568,7 +1583,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         stream,
         context: ctx,
         onChunk: (chunk) => {
-          if (!isRecordingFlag) return;
+          if (!isRecordingFlag || meetingInputRejected) return;
           if (socketReady) {
             window.electronAPI?.meetingTranscriptionSend?.(chunk, "system");
             return;

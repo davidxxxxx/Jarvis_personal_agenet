@@ -1804,6 +1804,12 @@ declare global {
         ) => void
       ) => () => void;
       onMeetingTranscriptionError?: (callback: (error: string) => void) => () => void;
+      onMeetingTranscriptionInputRejected?: (
+        callback: (payload: {
+          source: "mic" | "system";
+          reason: "jarvis-evidence-backpressure";
+        }) => void
+      ) => () => void;
 
       // Speaker diarization
       downloadDiarizationModels?: () => Promise<{ success: boolean; error?: string }>;

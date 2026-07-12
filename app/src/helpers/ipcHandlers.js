@@ -5779,7 +5779,7 @@ class IPCHandlers {
         }
 
         if (!ALLOWED_MEETING_PROVIDERS.has(options.provider)) {
-          return { success: false, error: `Unsupported provider: ${options.provider}` };
+          throw new Error(`Unsupported provider: ${options.provider}`);
         }
 
         await connectRealtimeStreaming(event, options, captureMode);
@@ -5891,9 +5891,16 @@ class IPCHandlers {
 
     const startManagedMeetingSystemAudio = (event, manager, warningLabel) => {
       const win = BrowserWindow.fromWebContents(event.sender);
+      let inputRejected = false;
       return manager.start({
         onChunk: (chunk) => {
-          sendMeetingAudio(chunk, "system");
+          if (inputRejected) return false;
+          const accepted = sendMeetingAudio(chunk, "system");
+          if (accepted === false) {
+            inputRejected = true;
+            void manager.stop().catch(() => {});
+          }
+          return accepted;
         },
         onError: (error) => {
           if (win && !win.isDestroyed()) {
@@ -5996,8 +6003,14 @@ class IPCHandlers {
       }
     };
 
-    ipcMain.on("meeting-transcription-send", (_event, audioBuffer, source) => {
-      sendMeetingAudio(audioBuffer, source);
+    ipcMain.on("meeting-transcription-send", (event, audioBuffer, source) => {
+      if (sendMeetingAudio(audioBuffer, source) !== false) return;
+      if (!event.sender?.isDestroyed?.()) {
+        event.sender.send("meeting-transcription-input-rejected", {
+          source,
+          reason: "jarvis-evidence-backpressure",
+        });
+      }
     });
 
     ipcMain.handle("meeting-transcription-stop", async () => {

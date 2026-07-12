@@ -44,7 +44,8 @@ function loadPreloadApi() {
     Module._load = originalLoad;
     delete require.cache[preloadPath];
   }
-  return { api: exposed.get("electronAPI").jarvis, invokes, sends, listeners };
+  const rootApi = exposed.get("electronAPI");
+  return { api: rootApi.jarvis, rootApi, invokes, sends, listeners };
 }
 
 function payload(windows) {
@@ -144,4 +145,23 @@ test("preload exposes narrow authoritative capture failure IPC", async () => {
   assert.deepEqual(invokes, [
     ["jarvis:capture:fail", "s1", "MIC_DISCONNECTED", 1_100],
   ]);
+});
+
+test("preload exposes metadata-only meeting input rejection events", () => {
+  const { rootApi, listeners } = loadPreloadApi();
+  const rejected = [];
+
+  const unsubscribe = rootApi.onMeetingTranscriptionInputRejected((payload) =>
+    rejected.push(payload)
+  );
+  listeners.get("meeting-transcription-input-rejected")(
+    {},
+    { source: "system", reason: "jarvis-evidence-backpressure" }
+  );
+
+  assert.deepEqual(rejected, [
+    { source: "system", reason: "jarvis-evidence-backpressure" },
+  ]);
+  unsubscribe();
+  assert.equal(listeners.has("meeting-transcription-input-rejected"), false);
 });
