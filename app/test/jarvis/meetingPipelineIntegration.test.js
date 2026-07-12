@@ -9,17 +9,21 @@ test("renderer mic-only start bypasses system access and forwards Jarvis identit
   const source = fs.readFileSync(path.join(appRoot, "src/stores/meetingRecordingStore.ts"), "utf8");
 
   assert.match(source, /captureSystemAudio\?: boolean/);
+  assert.match(source, /captureMicrophone\?: boolean/);
+  assert.match(source, /requireAllSources\?: boolean/);
   assert.match(source, /jarvisSessionId\?: string \| null/);
   assert.match(
     source,
-    /args\.captureSystemAudio === false\s*\? Promise\.resolve\(DEFAULT_SYSTEM_AUDIO_ACCESS\)/
+    /!captureSystemAudio\s*\? Promise\.resolve\(DEFAULT_SYSTEM_AUDIO_ACCESS\)/
   );
-  assert.match(source, /micOnly: args\.captureSystemAudio === false/);
-  assert.match(source, /jarvisSessionId: args\.jarvisSessionId \?\? null/);
+  assert.match(source, /micOnly,/);
   assert.match(
     source,
-    /hasExactDevice[\s\S]*?args\.captureSystemAudio === false[\s\S]*?return null/
+    /captureMicrophone\s*\? getMeetingMicConstraints\(\)[\s\S]*?: Promise\.resolve\(null\)/
   );
+  assert.match(source, /jarvisSessionId: args\.jarvisSessionId \?\? null/);
+  assert.match(source, /hasExactDevice[\s\S]*?micOnly[\s\S]*?return null/);
+  assert.match(source, /args\.requireAllSources && missingRequiredSource/);
   assert.match(source, /import \{ reacquireIfDead \} from "\.\.\/helpers\/micTrackHealth"/);
   assert.match(source, /await reacquireIfDead\(/);
   assert.match(source, /addEventListener\("ended"/);

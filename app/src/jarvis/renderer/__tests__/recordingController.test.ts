@@ -4,11 +4,13 @@ import type { StopRecordingResult, TranscriptSegment } from "../../../stores/mee
 import type { SessionState, SessionStatus } from "../sessionMachine";
 import {
   createRecordingController,
+  recordingArgs,
   resolveJarvisWhisperModel,
   routeJarvisControl,
   type RecordingController,
   type RecordingDependencies,
 } from "../useJarvisRecording";
+import type { JarvisCaptureMode } from "../../types";
 
 describe("Jarvis local Whisper model", () => {
   it("defaults Jarvis to turbo without inheriting the global base default", () => {
@@ -22,6 +24,24 @@ describe("Jarvis local Whisper model", () => {
       "small"
     );
   });
+});
+
+describe("Jarvis capture argument mapping", () => {
+  it.each([
+    ["mic", false, true, true],
+    ["system", true, false, false],
+    ["dual", true, true, false],
+  ] as Array<[JarvisCaptureMode, boolean, boolean, boolean]>)(
+    "maps %s without silently changing its sources",
+    (mode, captureSystemAudio, captureMicrophone, micOnly) => {
+      expect(recordingArgs("session-1", mode)).toMatchObject({
+        captureSystemAudio,
+        captureMicrophone,
+        micOnly,
+        requireAllSources: true,
+      });
+    }
+  );
 });
 
 const stableSegment: TranscriptSegment = {
@@ -66,10 +86,12 @@ function createHarness({
   status = "idle",
   segments = [] as TranscriptSegment[],
   hasConsent = true,
+  captureMode = "mic" as JarvisCaptureMode,
 }: {
   status?: SessionStatus;
   segments?: TranscriptSegment[];
   hasConsent?: boolean;
+  captureMode?: JarvisCaptureMode;
 } = {}) {
   const calls: string[] = [];
   let session = sessionFor(status);
@@ -235,6 +257,7 @@ function createHarness({
     now: () => 1_000,
     getMicDeviceId: () => null,
     getLanguage: () => "zh",
+    getCaptureMode: () => captureMode,
     hasRecordingConsent: () => hasConsent,
     onError: vi.fn(),
     onOperationChange,
@@ -313,6 +336,9 @@ describe("Jarvis recording controller", () => {
       noteTitle: "今日记录",
       folderId: null,
       captureSystemAudio: false,
+      captureMicrophone: true,
+      micOnly: true,
+      requireAllSources: true,
       jarvisSessionId: "s1",
       diarizationEnabled: true,
       forceLocalTranscription: true,
@@ -321,6 +347,22 @@ describe("Jarvis recording controller", () => {
       localPromptMode: "bilingual-context",
     });
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
+  });
+
+  it("passes the selected system-only mode through the real controller boundary", async () => {
+    const harness = createHarness({ captureMode: "system" });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.start();
+
+    expect(harness.startRecording).toHaveBeenCalledWith(
+      expect.objectContaining({
+        captureSystemAudio: true,
+        captureMicrophone: false,
+        micOnly: false,
+        requireAllSources: true,
+      })
+    );
   });
 
   it("stops upstream recording before pausing the main writer", async () => {

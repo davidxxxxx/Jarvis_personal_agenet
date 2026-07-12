@@ -1,6 +1,13 @@
 export type JarvisSessionStatus =
   "recording" | "paused" | "finalizing" | "completed" | "recovered" | "failed";
 
+export type JarvisCaptureMode = "mic" | "system" | "dual";
+
+export type JarvisCaptureSourceState =
+  "idle" | "checking" | "ready" | "unavailable" | "recording" | "recovering";
+
+export type JarvisCaptureSourceStates = Record<"mic" | "system", JarvisCaptureSourceState>;
+
 export interface JarvisControlEnvelope {
   id: string;
   action: JarvisControlAction;

@@ -34,6 +34,7 @@ import {
   orderMicrophoneRecoveryCandidates,
   type MicrophoneRecoveryCandidate,
 } from "../jarvis/renderer/microphoneRecoveryPolicy";
+import type { JarvisCaptureSourceStates } from "../jarvis/types";
 
 export interface TranscriptSegment {
   id: string;
@@ -99,6 +100,17 @@ interface MeetingRecordingState {
   micRecoveryStatus: "idle" | "reconnecting" | "restored";
   micRecoveryAttempt: number;
   windowWidth: number;
+  captureSourceStates: JarvisCaptureSourceStates;
+}
+
+export class CaptureSourcesUnavailableError extends Error {
+  readonly sourceStates: JarvisCaptureSourceStates;
+
+  constructor(sourceStates: JarvisCaptureSourceStates) {
+    super("capture_source_unavailable");
+    this.name = "CaptureSourcesUnavailableError";
+    this.sourceStates = sourceStates;
+  }
 }
 
 const MEETING_AUDIO_BUFFER_SIZE = 800;
@@ -485,6 +497,7 @@ export const useMeetingRecordingStore = create<MeetingRecordingState>()(() => ({
   micRecoveryStatus: "idle",
   micRecoveryAttempt: 0,
   windowWidth: typeof window !== "undefined" ? window.innerWidth : SIDE_PANEL_BREAKPOINT_PX,
+  captureSourceStates: { mic: "idle", system: "idle" },
 }));
 
 export const getMicAnalyser = (): AnalyserNode | null => micAnalyser;
@@ -839,6 +852,9 @@ export interface StartRecordingArgs {
   noteTitle: string | null;
   folderId: number | null;
   captureSystemAudio?: boolean;
+  captureMicrophone?: boolean;
+  micOnly?: boolean;
+  requireAllSources?: boolean;
   jarvisSessionId?: string | null;
   seedSegments?: TranscriptSegment[];
   diarizationEnabled?: boolean | null;
@@ -854,6 +870,9 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   isStartingFlag = true;
   activeMeetingInputGeneration = null;
   let acceptedMainInputGeneration: string | null = null;
+  const captureMicrophone = args.captureMicrophone !== false;
+  const captureSystemAudio = args.captureSystemAudio !== false;
+  const micOnly = args.micOnly ?? !captureSystemAudio;
 
   const initialEnabled =
     args.diarizationEnabled ??
@@ -864,11 +883,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     Math.min(MAX_SPEAKER_COUNT, args.expectedCount ?? DEFAULT_EXPECTED_SPEAKER_COUNT)
   );
 
-  const systemAudioAccessPromise =
-    args.captureSystemAudio === false
-      ? Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS)
-      : (window.electronAPI?.checkSystemAudioAccess?.() ??
-        Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS));
+  const systemAudioAccessPromise = !captureSystemAudio
+    ? Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS)
+    : (window.electronAPI?.checkSystemAudioAccess?.() ??
+      Promise.resolve(DEFAULT_SYSTEM_AUDIO_ACCESS));
 
   logger.info("Meeting transcription starting...", {}, "meeting");
   const seed = args.seedSegments ?? [];
@@ -910,6 +928,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     micFallbackActive: false,
     micRecoveryStatus: "idle",
     micRecoveryAttempt: 0,
+    captureSourceStates: {
+      mic: captureMicrophone ? "checking" : "idle",
+      system: captureSystemAudio ? "checking" : "idle",
+    },
   });
 
   isRecordingFlag = true;
@@ -918,7 +940,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   if (preparePromise) {
     if (
       shouldAwaitRendererPrepare({
-        startMicOnly: args.captureSystemAudio === false,
+        startMicOnly: micOnly,
         prepareMicOnly,
       })
     ) {
@@ -932,7 +954,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       preparedMicOnly = null;
     }
   }
-  if (args.captureSystemAudio === false && preparedMicOnly !== true) {
+  if (micOnly && preparedMicOnly !== true) {
     isPrepared = false;
   }
 
@@ -941,7 +963,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     const initialSystemAudioAccess =
       (await systemAudioAccessPromise) ?? getFallbackSystemAudioAccess();
     const { initialSystemAudioStrategy, initialDisplayCaptureStrategy, systemCapturePromise } =
-      args.captureSystemAudio === false
+      !captureSystemAudio
         ? {
             initialSystemAudioStrategy: "unsupported" as const,
             initialDisplayCaptureStrategy: null,
@@ -955,139 +977,146 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       window.electronAPI?.meetingTranscriptionStart?.({
         ...getMeetingTranscriptionOptions(args.forceLocalTranscription === true, args),
         noteId: args.noteId ?? null,
-        micOnly: args.captureSystemAudio === false,
+        micOnly,
         jarvisSessionId: args.jarvisSessionId ?? null,
       }),
-      getMeetingMicConstraints().then(async (constraints) => {
-        try {
-          const initialMicStream = await navigator.mediaDevices.getUserMedia(constraints);
-          if (args.captureSystemAudio !== false) return initialMicStream;
-
-          const recoveredMicStream = await reacquireIfDead(
-            initialMicStream,
-            () => Promise.resolve(constraints),
-            logger
-          );
-          const recoveredTrack = recoveredMicStream.getAudioTracks()[0];
-          if (!recoveredTrack || recoveredTrack.readyState === "ended" || recoveredTrack.muted) {
-            micFailureCode = "MIC_DISCONNECTED";
-            stopMediaStream(recoveredMicStream);
-            return null;
-          }
-          return recoveredMicStream;
-        } catch (err) {
-          const hasExactDevice =
-            typeof constraints.audio === "object" &&
-            constraints.audio !== null &&
-            "deviceId" in constraints.audio;
-          if (hasExactDevice && args.captureSystemAudio === false) {
-            if (["NotAllowedError", "SecurityError"].includes((err as Error).name)) {
-              micFailureCode = "MIC_PERMISSION";
-              return null;
-            }
-
-            const selectedDeviceId = getSettings().selectedMicDeviceId || null;
-            const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
-            const candidates = orderMicrophoneRecoveryCandidates(devices, selectedDeviceId).filter(
-              (candidate) => candidate.deviceId !== selectedDeviceId
-            );
-            for (const candidate of candidates) {
-              try {
-                const candidateStream = await navigator.mediaDevices.getUserMedia({
-                  audio: {
-                    deviceId: { exact: candidate.deviceId },
-                    ...MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
-                  },
-                });
-                const candidateTrack = candidateStream.getAudioTracks()[0];
-                if (
-                  candidateTrack &&
-                  candidateTrack.readyState === "live" &&
-                  !candidateTrack.muted &&
-                  !isDeniedAutomaticMicrophone(candidateTrack.label)
-                ) {
-                  usedDefaultMicFallback = true;
-                  logger.info(
-                    "Selected Jarvis microphone unavailable; using physical fallback",
-                    { label: candidate.label },
-                    "meeting"
-                  );
-                  return candidateStream;
-                }
-                stopMediaStream(candidateStream);
-              } catch (candidateError) {
-                logger.info(
-                  "Initial Jarvis physical microphone fallback unavailable",
-                  {
-                    candidateLabel: candidate.label,
-                    errorName:
-                      candidateError instanceof Error ? candidateError.name : "UnknownError",
-                  },
-                  "meeting"
-                );
-              }
-            }
-
+      captureMicrophone
+        ? getMeetingMicConstraints().then(async (constraints) => {
             try {
-              const fallbackStream = await navigator.mediaDevices.getUserMedia({
-                audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
-              });
-              const fallbackTrack = fallbackStream.getAudioTracks()[0];
+              const initialMicStream = await navigator.mediaDevices.getUserMedia(constraints);
+              if (!micOnly) return initialMicStream;
+
+              const recoveredMicStream = await reacquireIfDead(
+                initialMicStream,
+                () => Promise.resolve(constraints),
+                logger
+              );
+              const recoveredTrack = recoveredMicStream.getAudioTracks()[0];
               if (
-                !fallbackTrack ||
-                fallbackTrack.readyState !== "live" ||
-                fallbackTrack.muted ||
-                isDeniedAutomaticMicrophone(fallbackTrack.label)
+                !recoveredTrack ||
+                recoveredTrack.readyState === "ended" ||
+                recoveredTrack.muted
               ) {
-                stopMediaStream(fallbackStream);
                 micFailureCode = "MIC_DISCONNECTED";
+                stopMediaStream(recoveredMicStream);
                 return null;
               }
-              usedDefaultMicFallback = true;
-              logger.info(
-                "Selected Jarvis microphone unavailable; using system default",
-                { errorCode: "MIC_DISCONNECTED" },
-                "meeting"
-              );
-              return fallbackStream;
-            } catch {
-              micFailureCode = "MIC_DISCONNECTED";
-              return null;
-            }
-          }
-          if (hasExactDevice) {
-            try {
-              const fallbackStream = await navigator.mediaDevices.getUserMedia({
-                audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
-              });
-              logger.info(
-                "Meeting mic capture recovered using default device",
-                { error: (err as Error).message },
-                "meeting"
-              );
-              return fallbackStream;
-            } catch (fallbackErr) {
+              return recoveredMicStream;
+            } catch (err) {
+              const hasExactDevice =
+                typeof constraints.audio === "object" &&
+                constraints.audio !== null &&
+                "deviceId" in constraints.audio;
+              if (hasExactDevice && micOnly) {
+                if (["NotAllowedError", "SecurityError"].includes((err as Error).name)) {
+                  micFailureCode = "MIC_PERMISSION";
+                  return null;
+                }
+
+                const selectedDeviceId = getSettings().selectedMicDeviceId || null;
+                const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+                const candidates = orderMicrophoneRecoveryCandidates(
+                  devices,
+                  selectedDeviceId
+                ).filter((candidate) => candidate.deviceId !== selectedDeviceId);
+                for (const candidate of candidates) {
+                  try {
+                    const candidateStream = await navigator.mediaDevices.getUserMedia({
+                      audio: {
+                        deviceId: { exact: candidate.deviceId },
+                        ...MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
+                      },
+                    });
+                    const candidateTrack = candidateStream.getAudioTracks()[0];
+                    if (
+                      candidateTrack &&
+                      candidateTrack.readyState === "live" &&
+                      !candidateTrack.muted &&
+                      !isDeniedAutomaticMicrophone(candidateTrack.label)
+                    ) {
+                      usedDefaultMicFallback = true;
+                      logger.info(
+                        "Selected Jarvis microphone unavailable; using physical fallback",
+                        { label: candidate.label },
+                        "meeting"
+                      );
+                      return candidateStream;
+                    }
+                    stopMediaStream(candidateStream);
+                  } catch (candidateError) {
+                    logger.info(
+                      "Initial Jarvis physical microphone fallback unavailable",
+                      {
+                        candidateLabel: candidate.label,
+                        errorName:
+                          candidateError instanceof Error ? candidateError.name : "UnknownError",
+                      },
+                      "meeting"
+                    );
+                  }
+                }
+
+                try {
+                  const fallbackStream = await navigator.mediaDevices.getUserMedia({
+                    audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
+                  });
+                  const fallbackTrack = fallbackStream.getAudioTracks()[0];
+                  if (
+                    !fallbackTrack ||
+                    fallbackTrack.readyState !== "live" ||
+                    fallbackTrack.muted ||
+                    isDeniedAutomaticMicrophone(fallbackTrack.label)
+                  ) {
+                    stopMediaStream(fallbackStream);
+                    micFailureCode = "MIC_DISCONNECTED";
+                    return null;
+                  }
+                  usedDefaultMicFallback = true;
+                  logger.info(
+                    "Selected Jarvis microphone unavailable; using system default",
+                    { errorCode: "MIC_DISCONNECTED" },
+                    "meeting"
+                  );
+                  return fallbackStream;
+                } catch {
+                  micFailureCode = "MIC_DISCONNECTED";
+                  return null;
+                }
+              }
+              if (hasExactDevice) {
+                try {
+                  const fallbackStream = await navigator.mediaDevices.getUserMedia({
+                    audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
+                  });
+                  logger.info(
+                    "Meeting mic capture recovered using default device",
+                    { error: (err as Error).message },
+                    "meeting"
+                  );
+                  return fallbackStream;
+                } catch (fallbackErr) {
+                  logger.error(
+                    "Meeting mic capture failed, continuing with system audio only",
+                    { error: (fallbackErr as Error).message },
+                    "meeting"
+                  );
+                  return null;
+                }
+              }
               logger.error(
                 "Meeting mic capture failed, continuing with system audio only",
-                { error: (fallbackErr as Error).message },
+                { error: (err as Error).message, constraints },
                 "meeting"
               );
+              if (micOnly) {
+                micFailureCode = ["NotAllowedError", "SecurityError"].includes((err as Error).name)
+                  ? "MIC_PERMISSION"
+                  : "MIC_DISCONNECTED";
+              }
               return null;
             }
-          }
-          logger.error(
-            "Meeting mic capture failed, continuing with system audio only",
-            { error: (err as Error).message, constraints },
-            "meeting"
-          );
-          if (args.captureSystemAudio === false) {
-            micFailureCode = ["NotAllowedError", "SecurityError"].includes((err as Error).name)
-              ? "MIC_PERMISSION"
-              : "MIC_DISCONNECTED";
-          }
-          return null;
-        }
-      }),
+          })
+        : Promise.resolve(null),
       systemCapturePromise,
     ]);
     let systemCaptureResult = initialSystemCaptureResult;
@@ -1145,7 +1174,49 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     }
     const systemCaptureError = systemAudioHandledInMain ? null : systemCaptureResult.error;
 
-    if (!micResult && (systemAudioHandledInMain || systemCaptureResult.stream)) {
+    const sourceStates: JarvisCaptureSourceStates = {
+      mic: captureMicrophone ? (micResult ? "ready" : "unavailable") : "idle",
+      system: captureSystemAudio
+        ? systemAudioHandledInMain || systemCaptureResult.stream
+          ? "ready"
+          : "unavailable"
+        : "idle",
+    };
+    useMeetingRecordingStore.setState({ captureSourceStates: sourceStates });
+
+    const missingRequiredSource =
+      (captureMicrophone && !micResult) ||
+      (captureSystemAudio && !systemAudioHandledInMain && !systemCaptureResult.stream);
+    if (args.requireAllSources && missingRequiredSource) {
+      logger.warn("Meeting transcription required capture source unavailable", {}, "meeting");
+      activeMeetingInputGeneration = null;
+      isRecordingFlag = false;
+      stopMediaStream(micResult);
+      stopMediaStream(systemCaptureResult.stream);
+      useMeetingRecordingStore.setState({
+        error: "capture_source_unavailable",
+        isRecording: false,
+        isTranscribing: false,
+      });
+      try {
+        await window.electronAPI?.meetingTranscriptionStop?.();
+      } catch (stopError) {
+        logger.error(
+          "Meeting transcription main cleanup failed after required source rejection",
+          { error: stopError instanceof Error ? stopError.message : "UnknownError" },
+          "meeting"
+        );
+      } finally {
+        isStartingFlag = false;
+      }
+      throw new CaptureSourcesUnavailableError(sourceStates);
+    }
+
+    if (
+      captureMicrophone &&
+      !micResult &&
+      (systemAudioHandledInMain || systemCaptureResult.stream)
+    ) {
       useMeetingRecordingStore.setState({
         error: "Microphone capture failed. Continuing with system audio only.",
       });
@@ -1370,10 +1441,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       pendingMicChunks.push(chunk.slice(0));
     };
 
-    let attachMicPipeline: (
-      stream: MediaStream,
-      fallbackActive: boolean
-    ) => Promise<void>;
+    let attachMicPipeline: (stream: MediaStream, fallbackActive: boolean) => Promise<void>;
 
     const activeMicLabel = (stream: MediaStream): string =>
       stream.getAudioTracks()[0]?.label?.trim() || "";
@@ -1423,10 +1491,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
               ...MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
             },
           });
-          if (
-            isUsableMicStream(stream) &&
-            !isDeniedAutomaticMicrophone(activeMicLabel(stream))
-          ) {
+          if (isUsableMicStream(stream) && !isDeniedAutomaticMicrophone(activeMicLabel(stream))) {
             return stream;
           }
           stopMediaStream(stream);
@@ -1443,10 +1508,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: MEETING_MIC_PRIMARY_AUDIO_CONSTRAINTS,
         });
-        if (
-          isUsableMicStream(stream) &&
-          !isDeniedAutomaticMicrophone(activeMicLabel(stream))
-        ) {
+        if (isUsableMicStream(stream) && !isDeniedAutomaticMicrophone(activeMicLabel(stream))) {
           return stream;
         }
         stopMediaStream(stream);
@@ -1472,6 +1534,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             micFallbackActive: true,
             micRecoveryStatus: "reconnecting",
             micRecoveryAttempt: attempt + 1,
+            captureSourceStates: {
+              ...useMeetingRecordingStore.getState().captureSourceStates,
+              mic: "recovering",
+            },
           });
           await waitForRecoveryDelay(getMicrophoneRecoveryDelay(attempt));
           if (!isRecordingFlag || generation !== recoveryGeneration) return;
@@ -1493,6 +1559,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
             useMeetingRecordingStore.setState({
               micRecoveryStatus: "restored",
               micRecoveryAttempt: 0,
+              captureSourceStates: {
+                ...useMeetingRecordingStore.getState().captureSourceStates,
+                mic: "recording",
+              },
             });
             logger.info(
               "Jarvis microphone recovered",
@@ -1584,7 +1654,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         error: null,
       });
 
-      if (args.captureSystemAudio === false && track) {
+      if (captureMicrophone && track) {
         const onJarvisMicEnded = () => {
           if (!isRecordingFlag) return;
           beginMicRecovery();
@@ -1659,6 +1729,12 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
 
     isStartingFlag = false;
     socketReady = true;
+    useMeetingRecordingStore.setState({
+      captureSourceStates: {
+        mic: captureMicrophone ? "recording" : "idle",
+        system: captureSystemAudio ? "recording" : "idle",
+      },
+    });
 
     for (const chunk of pendingMicChunks) {
       if (!sendMeetingChunk(chunk, "mic")) break;
@@ -1682,6 +1758,16 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       "meeting"
     );
   } catch (err) {
+    if (err instanceof CaptureSourcesUnavailableError) {
+      activeMeetingInputGeneration = null;
+      isRecordingFlag = false;
+      try {
+        await cleanup({ preserveStarting: true });
+      } finally {
+        isStartingFlag = false;
+      }
+      throw err;
+    }
     const shouldAbortAcceptedMainStart = acceptedMainInputGeneration !== null;
     activeMeetingInputGeneration = null;
     isRecordingFlag = false;
@@ -1741,6 +1827,7 @@ function resetStoppedMeetingState(): void {
     micFallbackActive: false,
     micRecoveryStatus: "idle",
     micRecoveryAttempt: 0,
+    captureSourceStates: { mic: "idle", system: "idle" },
   });
 }
 

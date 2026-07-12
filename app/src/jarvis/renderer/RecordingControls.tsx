@@ -6,7 +6,10 @@ import { getSettings } from "../../stores/settingsStore";
 import type { UseJarvisRecordingResult } from "./useJarvisRecording";
 import FirstUseConsentDialog from "./FirstUseConsentDialog";
 import JarvisMicrophoneSelector from "./JarvisMicrophoneSelector";
+import JarvisCaptureModeSelector from "./JarvisCaptureModeSelector";
+import { useJarvisStore } from "./jarvisStore";
 import { hasRecordingConsent } from "./recordingConsent";
+import type { JarvisCaptureMode, JarvisCaptureSourceState } from "../types";
 
 interface RecordingControlsProps {
   recording: UseJarvisRecordingResult;
@@ -72,11 +75,41 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
   const [actionError, setActionError] = useState(false);
   const invocationRef = useRef(false);
   const { session } = recording;
+  const captureMode = useJarvisStore((state) => state.captureMode);
+  const setCaptureMode = useJarvisStore((state) => state.setCaptureMode);
+  const sourceStates = useJarvisStore((state) => state.sourceStates);
   const microphoneName = useMicrophoneName(session.status);
   const isRecording = session.status === "recording";
   const isPaused = session.status === "paused";
   const isBusy = session.status === "starting" || session.status === "finalizing";
   const commandPending = recording.operation !== null || invoking;
+  const sourceSemanticsLocked =
+    !["idle", "completed", "failed"].includes(session.status) || commandPending;
+
+  const sourceLabel = (state: JarvisCaptureSourceState): string =>
+    ({
+      idle: "未启用",
+      checking: "检查中",
+      ready: "已就绪",
+      unavailable: "不可用",
+      recording: "录制中",
+      recovering: "恢复中",
+    })[state];
+  const micRequired = captureMode !== "system";
+  const systemRequired = captureMode !== "mic";
+  const hasRequiredSourceFailure =
+    (micRequired && sourceStates.mic === "unavailable") ||
+    (systemRequired && sourceStates.system === "unavailable");
+  const isAvailable = (state: JarvisCaptureSourceState): boolean =>
+    state === "ready" || state === "recording";
+  const availableCaptureMode: JarvisCaptureMode | null =
+    isAvailable(sourceStates.mic) && isAvailable(sourceStates.system)
+      ? "dual"
+      : isAvailable(sourceStates.mic)
+        ? "mic"
+        : isAvailable(sourceStates.system)
+          ? "system"
+          : null;
 
   useEffect(() => {
     if (!isRecording) return;
@@ -114,6 +147,12 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
       return;
     }
     setConsentOpen(true);
+  };
+
+  const continueWithAvailableSource = () => {
+    if (!availableCaptureMode) return;
+    setCaptureMode(availableCaptureMode);
+    void run(recording.start);
   };
 
   return (
@@ -233,6 +272,30 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             {t(actionError ? "jarvis.operationError" : "jarvis.recordingError")}
           </p>
         )}
+        <div aria-live="polite" className="mt-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
+          <span>{`麦克风：${sourceLabel(sourceStates.mic)}`}</span>
+          <span>{`电脑声音：${sourceLabel(sourceStates.system)}`}</span>
+        </div>
+        {hasRequiredSourceFailure && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={commandPending}
+              onClick={() => void run(recording.start)}
+            >
+              重试
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={commandPending || availableCaptureMode === null}
+              onClick={continueWithAvailableSource}
+            >
+              使用可用音源继续
+            </Button>
+          </div>
+        )}
         {recording.micRecoveryStatus === "reconnecting" ? (
           <p
             aria-live="polite"
@@ -254,7 +317,12 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             })}
           </p>
         ) : null}
-        <JarvisMicrophoneSelector disabled={isRecording || isBusy || commandPending} />
+        <JarvisCaptureModeSelector
+          value={captureMode}
+          onChange={setCaptureMode}
+          disabled={sourceSemanticsLocked}
+        />
+        {captureMode !== "system" && <JarvisMicrophoneSelector disabled={sourceSemanticsLocked} />}
       </div>
       <FirstUseConsentDialog
         open={consentOpen}

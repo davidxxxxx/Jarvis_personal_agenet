@@ -47,7 +47,7 @@ const streamFor = (streamTrack: FakeTrack) =>
 const inputDevice = (deviceId: string, label: string) =>
   ({ kind: "audioinput", deviceId, label }) as MediaDeviceInfo;
 
-const createDeferred = <T,>() => {
+const createDeferred = <T>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((resolvePromise, rejectPromise) => {
@@ -231,6 +231,130 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     );
   });
 
+  it("captures true system-only audio without requesting or sending microphone input", async () => {
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-system",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "System only",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: false,
+      micOnly: false,
+      requireAllSources: true,
+      jarvisSessionId: "s-system",
+    });
+
+    expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
+    expect(window.electronAPI.meetingTranscriptionStart).toHaveBeenCalledWith(
+      expect.objectContaining({ micOnly: false })
+    );
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      error: null,
+      captureSourceStates: { mic: "idle", system: "recording" },
+    });
+    expect(window.electronAPI.meetingTranscriptionSend).not.toHaveBeenCalledWith(
+      expect.any(ArrayBuffer),
+      "mic",
+      expect.any(String)
+    );
+  });
+
+  it("preserves the required-source diagnosis when main cleanup also fails", async () => {
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockRejectedValueOnce(
+      Object.assign(new Error("denied"), { name: "NotAllowedError" })
+    );
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-cleanup-failure",
+    });
+    vi.mocked(window.electronAPI.meetingTranscriptionStop!).mockRejectedValueOnce(
+      new Error("main stop failed")
+    );
+
+    await expect(
+      startRecording({
+        noteId: null,
+        noteTitle: "Dual cleanup failure",
+        folderId: null,
+        captureSystemAudio: true,
+        captureMicrophone: true,
+        requireAllSources: true,
+        jarvisSessionId: "s-cleanup-failure",
+      })
+    ).rejects.toMatchObject({
+      name: "CaptureSourcesUnavailableError",
+      sourceStates: { mic: "unavailable", system: "ready" },
+    });
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      error: "capture_source_unavailable",
+      isRecording: false,
+      captureSourceStates: { mic: "unavailable", system: "ready" },
+    });
+  });
+
+  it("rejects a dual-source start when mic is unavailable and atomically stops main capture", async () => {
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockRejectedValueOnce(
+      Object.assign(new Error("denied"), { name: "NotAllowedError" })
+    );
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-dual-required",
+    });
+
+    await expect(
+      startRecording({
+        noteId: null,
+        noteTitle: "Dual",
+        folderId: null,
+        captureSystemAudio: true,
+        captureMicrophone: true,
+        micOnly: false,
+        requireAllSources: true,
+        jarvisSessionId: "s-dual-required",
+      })
+    ).rejects.toMatchObject({
+      name: "CaptureSourcesUnavailableError",
+      sourceStates: { mic: "unavailable", system: "ready" },
+    });
+
+    expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledOnce();
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: false,
+      isTranscribing: false,
+      captureSourceStates: { mic: "unavailable", system: "ready" },
+    });
+    expect(audioContexts).toHaveLength(0);
+  });
+
   it("stops the renderer producer after authoritative Jarvis input rejection", async () => {
     await startRecording({
       noteId: null,
@@ -349,7 +473,14 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       noteTitle: "Dual",
       folderId: null,
       captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
       jarvisSessionId: "s-dual",
+    });
+
+    expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
+      mic: "recording",
+      system: "recording",
     });
 
     expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenNthCalledWith(
@@ -481,6 +612,56 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       });
     });
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers the microphone in dual mode without overwriting computer-audio state", async () => {
+    const replacementTrack = new FakeTrack("Replacement microphone", "replacement-mic");
+    const replacementCapture = createDeferred<MediaStream>();
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockImplementationOnce(() => replacementCapture.promise);
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-dual-recovery",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Dual recovery",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-dual-recovery",
+    });
+    track.end();
+
+    await vi.waitFor(() => {
+      expect(useMeetingRecordingStore.getState().captureSourceStates).toEqual({
+        mic: "recovering",
+        system: "recording",
+      });
+    });
+    replacementCapture.resolve(streamFor(replacementTrack));
+
+    await vi.waitFor(() => {
+      expect(useMeetingRecordingStore.getState()).toMatchObject({
+        isRecording: true,
+        activeMicLabel: "Replacement microphone",
+        micRecoveryStatus: "restored",
+        captureSourceStates: { mic: "recording", system: "recording" },
+      });
+    });
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+    expect(window.electronAPI.meetingTranscriptionStop).not.toHaveBeenCalled();
   });
 
   it("keeps retrying after failed recovery cycles without stopping the session", async () => {

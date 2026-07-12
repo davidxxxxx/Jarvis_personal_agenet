@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import {
+  CaptureSourcesUnavailableError,
   lockSpeaker,
   startRecording,
   stopRecording,
@@ -12,6 +13,7 @@ import {
 import { getSettings } from "../../stores/settingsStore";
 import type {
   JarvisControlAction,
+  JarvisCaptureMode,
   JarvisPerson,
   JarvisRenamePersonInput,
   JarvisRuntimeState,
@@ -114,6 +116,7 @@ export interface RecordingDependencies {
   now: () => number;
   getMicDeviceId: () => string | null;
   getLanguage: () => string;
+  getCaptureMode?: () => JarvisCaptureMode;
   hasRecordingConsent: () => boolean;
   onOperationChange: (operation: JarvisControlAction | null) => void;
   onError: (code: string | null) => void;
@@ -182,16 +185,24 @@ export function mapStableSegments(
 }
 
 function errorCode(error: unknown, fallback: string): string {
+  if (error instanceof CaptureSourcesUnavailableError) return "capture_source_unavailable";
   return error instanceof RecordingOperationError ? error.code : fallback;
 }
 
-function recordingArgs(id: string, seedSegments?: TranscriptSegment[]): StartRecordingArgs {
+export function recordingArgs(
+  id: string,
+  captureMode: JarvisCaptureMode = "mic",
+  seedSegments?: TranscriptSegment[]
+): StartRecordingArgs {
   const settings = getSettings();
   return {
     noteId: null,
     noteTitle: DEFAULT_NOTE_TITLE,
     folderId: null,
-    captureSystemAudio: false,
+    captureSystemAudio: captureMode !== "mic",
+    captureMicrophone: captureMode !== "system",
+    micOnly: captureMode === "mic",
+    requireAllSources: true,
     jarvisSessionId: id,
     diarizationEnabled: true,
     forceLocalTranscription: true,
@@ -214,6 +225,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   let shutdownPromise: Promise<void> | null = null;
   let segmentsFrozen = false;
   let disposed = false;
+  let sessionCaptureMode: JarvisCaptureMode | null = null;
 
   const transition = (event: SessionEvent): SessionState => {
     const next = reduceSession(deps.getSessionState(), event);
@@ -338,6 +350,8 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     deps.setSessionState(starting);
     let sessionCreated = false;
     let captureStarted = false;
+    const captureMode = deps.getCaptureMode?.() ?? "mic";
+    sessionCaptureMode = captureMode;
 
     try {
       await deps.ensureTranscriptionReady();
@@ -351,7 +365,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       sessionCreated = true;
       await deps.jarvis.startCapture({ sessionId: id, startedAt, micDeviceId });
       captureStarted = true;
-      await deps.startRecording(recordingArgs(id));
+      await deps.startRecording(recordingArgs(id, captureMode));
       const meetingSnapshot = deps.getMeetingSnapshot();
       if (!meetingSnapshot.isRecording) {
         const code = ["MIC_PERMISSION", "MIC_DISCONNECTED"].includes(meetingSnapshot.error ?? "")
@@ -462,7 +476,13 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       await deps.jarvis.resumeCapture(state.id as string, at);
       mainResumed = true;
       const seedSegments = deps.getMeetingSnapshot().segments;
-      await deps.startRecording(recordingArgs(state.id as string, seedSegments));
+      await deps.startRecording(
+        recordingArgs(
+          state.id as string,
+          sessionCaptureMode ?? deps.getCaptureMode?.() ?? "mic",
+          seedSegments
+        )
+      );
       const meetingSnapshot = deps.getMeetingSnapshot();
       if (!meetingSnapshot.isRecording) {
         const code = ["MIC_PERMISSION", "MIC_DISCONNECTED"].includes(meetingSnapshot.error ?? "")
@@ -714,6 +734,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micFallbackActive = useMeetingRecordingStore((state) => state.micFallbackActive);
   const micRecoveryStatus = useMeetingRecordingStore((state) => state.micRecoveryStatus);
   const micRecoveryAttempt = useMeetingRecordingStore((state) => state.micRecoveryAttempt);
+  const captureSourceStates = useMeetingRecordingStore((state) => state.captureSourceStates);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
   const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
@@ -779,6 +800,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       now: Date.now,
       getMicDeviceId: () => getSettings().selectedMicDeviceId || null,
       getLanguage: () => getSettings().preferredLanguage || "zh",
+      getCaptureMode: () => useJarvisStore.getState().captureMode,
       hasRecordingConsent,
       onOperationChange: (operation) => useJarvisStore.getState().setOperation(operation),
       onError: (code) => useJarvisStore.getState().setError(code),
@@ -786,6 +808,10 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   }
 
   const controller = controllerRef.current;
+
+  useEffect(() => {
+    useJarvisStore.getState().setSourceStates(captureSourceStates);
+  }, [captureSourceStates]);
 
   useEffect(() => {
     controller.handleSegmentsChanged(useMeetingRecordingStore.getState().segments);
