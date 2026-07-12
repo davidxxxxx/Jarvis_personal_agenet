@@ -1,14 +1,35 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const Module = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate, description = "condition") {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
+
 function createFixture({
   appendPcm = () => true,
   onDerived = () => {},
   managedStartChunk = null,
+  managedStartDeferred = null,
+  managedStopDeferred = null,
   systemAvailable = false,
   aecAvailable = false,
 } = {}) {
@@ -20,11 +41,22 @@ function createFixture({
   const managedStartAcceptances = [];
   const derivedCalls = [];
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-meeting-ipc-"));
-  const sender = {
-    id: 101,
-    isDestroyed: () => false,
-    send: (...args) => sent.push(args),
+  const createSender = (id) => {
+    const webContents = new EventEmitter();
+    let destroyed = false;
+    Object.assign(webContents, {
+      id,
+      isDestroyed: () => destroyed,
+      send: (...args) => sent.push(args),
+      destroy: () => {
+        if (destroyed) return;
+        destroyed = true;
+        webContents.emit("destroyed");
+      },
+    });
+    return webContents;
   };
+  const sender = createSender(101);
   const win = {
     isDestroyed: () => false,
     webContents: sender,
@@ -78,9 +110,11 @@ function createFixture({
       if (managedStartChunk) {
         managedStartAcceptances.push(options.onChunk(managedStartChunk));
       }
+      if (managedStartDeferred) await managedStartDeferred.promise;
     },
     stop: async () => {
       managerStops.push("stop");
+      if (managedStopDeferred) await managedStopDeferred.promise;
     },
   };
   const meetingAecManager = {
@@ -130,6 +164,7 @@ function createFixture({
     listeners,
     sent,
     sender,
+    createSender,
     detectionStates,
     managerStops,
     derivedCalls,
@@ -454,4 +489,252 @@ test("a stale managed system callback is gated before a newer dual-track session
   assert.equal(currentAccepted, true);
   assert.deepEqual(persisted, [["jarvis-current-dual", "system"]]);
   assert.equal(fixture.managerStops.length, 2);
+});
+
+test("cancel keeps the start gate until the cancelled attempt finishes rolling back", async (t) => {
+  const startDeferred = createDeferred();
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source) => {
+      persisted.push([sessionId, source]);
+      return true;
+    },
+    managedStartDeferred: startDeferred,
+    systemAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const cancel = fixture.handles.get("meeting-transcription-cancel");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const firstPromise = start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-cancelled-a" }
+  );
+  await waitFor(() => fixture.managedStarts.length === 1);
+
+  const cancelled = await cancel({ sender: fixture.sender });
+  const blocked = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-blocked-b" }
+  );
+
+  startDeferred.resolve();
+  const first = await firstPromise;
+  if (first.success) await stop({ sender: fixture.sender });
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-current-c" }
+  );
+  send({ sender: fixture.sender }, Buffer.from([1, 2]), "mic", current.inputGeneration);
+  const staleAccepted = fixture.managedStarts[0].onChunk(Buffer.from([3, 4]));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cancelled.success, true);
+  assert.deepEqual(blocked, { success: false, error: "Operation in progress" });
+  assert.equal(first.success, false);
+  assert.equal(current.success, true);
+  assert.equal(staleAccepted, false);
+  assert.deepEqual(persisted, [["jarvis-current-c", "mic"]]);
+});
+
+test("rollback invalidates native ingress before awaiting manager teardown", async (t) => {
+  const stopDeferred = createDeferred();
+  let appendCalls = 0;
+  const fixture = createFixture({
+    appendPcm: () => {
+      appendCalls += 1;
+      throw new Error("startup evidence failed");
+    },
+    managedStartChunk: Buffer.from([1, 2]),
+    managedStopDeferred: stopDeferred,
+    systemAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  const startPromise = start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-flush-failure" }
+  );
+  await waitFor(() => fixture.managerStops.length >= 1);
+
+  let acceptedDuringTeardown;
+  let callbackError = null;
+  try {
+    acceptedDuringTeardown = fixture.managedStarts[0].onChunk(Buffer.from([3, 4]));
+  } catch (error) {
+    callbackError = error;
+  }
+
+  stopDeferred.resolve();
+  const result = await startPromise;
+  assert.equal(callbackError, null);
+  assert.equal(acceptedDuringTeardown, false);
+  assert.equal(appendCalls, 1);
+  assert.equal(result.success, false);
+  assert.match(result.error, /startup evidence failed/);
+});
+
+test("owner destruction invalidates active ingress, cleans up, and cannot affect the next owner", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source) => {
+      persisted.push([sessionId, source]);
+      return true;
+    },
+    systemAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const first = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-destroyed-owner" }
+  );
+  const staleManagedInput = fixture.managedStarts[0];
+  assert.equal(fixture.sender.listenerCount("destroyed"), 1);
+
+  fixture.sender.destroy();
+  send({ sender: fixture.sender }, Buffer.from([1]), "mic", first.inputGeneration);
+  const staleAccepted = staleManagedInput.onChunk(Buffer.from([2]));
+  await waitFor(() => fixture.managerStops.length >= 1);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const nextSender = fixture.createSender(202);
+  const second = await start(
+    { sender: nextSender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-next-owner" }
+  );
+  const stopsBeforeOldEvent = fixture.managerStops.length;
+  fixture.sender.emit("destroyed");
+  send({ sender: nextSender }, Buffer.from([3]), "mic", second.inputGeneration);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(staleAccepted, false);
+  assert.equal(first.success, true);
+  assert.equal(second.success, true);
+  assert.equal(fixture.sender.listenerCount("destroyed"), 0);
+  assert.equal(nextSender.listenerCount("destroyed"), 1);
+  assert.equal(fixture.managerStops.length, stopsBeforeOldEvent);
+  assert.deepEqual(persisted, [["jarvis-next-owner", "mic"]]);
+
+  await stop({ sender: nextSender });
+  assert.equal(nextSender.listenerCount("destroyed"), 0);
+});
+
+test("an owner destroyed during startup cannot complete or leak a destruction listener", async (t) => {
+  const startDeferred = createDeferred();
+  const fixture = createFixture({ managedStartDeferred: startDeferred, systemAvailable: true });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+
+  const startPromise = start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-owner-race" }
+  );
+  await waitFor(() => fixture.managedStarts.length === 1);
+  fixture.sender.destroy();
+  startDeferred.resolve();
+
+  const result = await startPromise;
+  assert.equal(result.success, false);
+  assert.match(result.error, /owner.*destroyed/i);
+  assert.equal(fixture.sender.listenerCount("destroyed"), 0);
+});
+
+test("explicit stop blocks replacement starts until shared managers finish", async (t) => {
+  const stopDeferred = createDeferred();
+  const fixture = createFixture({ managedStopDeferred: stopDeferred, systemAvailable: true });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-stopping-a" }
+  );
+  const firstStopPromise = stop({ sender: fixture.sender });
+  await waitFor(() => fixture.managerStops.length >= 1, "the first manager stop");
+  const blockedPromise = start(
+    { sender: fixture.sender },
+    { provider: "unsupported", micOnly: true, jarvisSessionId: "jarvis-blocked-b" }
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  stopDeferred.resolve();
+  const [firstStop, blocked] = await Promise.all([firstStopPromise, blockedPromise]);
+
+  assert.deepEqual(blocked, { success: false, error: "Operation in progress" });
+  assert.equal(firstStop.success, true);
+
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-current-c" }
+  );
+
+  assert.equal(current.success, true);
+});
+
+test("concurrent explicit stops share one manager teardown", async (t) => {
+  const stopDeferred = createDeferred();
+  const fixture = createFixture({ managedStopDeferred: stopDeferred, systemAvailable: true });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-deduplicated-stop" }
+  );
+  const firstStopPromise = stop({ sender: fixture.sender });
+  await waitFor(() => fixture.managerStops.length >= 1, "the first manager stop");
+  const duplicateStopPromise = stop({ sender: fixture.sender });
+  await new Promise((resolve) => setImmediate(resolve));
+  const managerStopsBeforeRelease = fixture.managerStops.length;
+
+  stopDeferred.resolve();
+  const [firstStop, duplicateStop] = await Promise.all([firstStopPromise, duplicateStopPromise]);
+
+  assert.equal(managerStopsBeforeRelease, 1);
+  assert.deepEqual(duplicateStop, firstStop);
+});
+
+test("explicit stop and rollback of the same in-flight start share one teardown", async (t) => {
+  const startDeferred = createDeferred();
+  const stopDeferred = createDeferred();
+  const fixture = createFixture({
+    managedStartDeferred: startDeferred,
+    managedStopDeferred: stopDeferred,
+    systemAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  const startPromise = start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-start-stop-race" }
+  );
+  await waitFor(() => fixture.managedStarts.length === 1, "the in-flight manager start");
+  const stopPromise = stop({ sender: fixture.sender });
+  await waitFor(() => fixture.managerStops.length >= 1, "the explicit manager stop");
+
+  startDeferred.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  const managerStopsBeforeRelease = fixture.managerStops.length;
+  stopDeferred.resolve();
+  const [startResult, stopResult] = await Promise.all([startPromise, stopPromise]);
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-after-start-stop-race" }
+  );
+
+  assert.equal(startResult.success, false);
+  assert.equal(stopResult.success, true);
+  assert.equal(managerStopsBeforeRelease, 1);
+  assert.equal(current.success, true);
 });

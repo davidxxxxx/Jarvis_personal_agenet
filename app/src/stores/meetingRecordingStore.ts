@@ -849,6 +849,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
   if (isRecordingFlag || isStartingFlag || meetingStopCoordinator.hasPendingStop()) return;
   isStartingFlag = true;
   activeMeetingInputGeneration = null;
+  let acceptedMainInputGeneration: string | null = null;
 
   const initialEnabled =
     args.diarizationEnabled ??
@@ -1122,6 +1123,7 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       return;
     }
     const inputGeneration = startResult.inputGeneration;
+    acceptedMainInputGeneration = inputGeneration;
     activeMeetingInputGeneration = inputGeneration;
 
     const systemAudioMode = startResult.systemAudioMode || initialSystemAudioAccess.mode;
@@ -1676,6 +1678,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       "meeting"
     );
   } catch (err) {
+    const shouldAbortAcceptedMainStart = acceptedMainInputGeneration !== null;
+    activeMeetingInputGeneration = null;
+    isRecordingFlag = false;
+    isStartingFlag = false;
     logger.error(
       "Meeting transcription setup failed",
       { error: (err as Error).message },
@@ -1686,9 +1692,19 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
       isRecording: false,
       isTranscribing: false,
     });
-    isRecordingFlag = false;
-    isStartingFlag = false;
-    await cleanup();
+    try {
+      if (shouldAbortAcceptedMainStart) {
+        await window.electronAPI?.meetingTranscriptionStop?.();
+      }
+    } catch (stopError) {
+      logger.error(
+        "Meeting transcription main cleanup failed after renderer setup error",
+        { error: (stopError as Error).message },
+        "meeting"
+      );
+    } finally {
+      await cleanup();
+    }
   }
 }
 

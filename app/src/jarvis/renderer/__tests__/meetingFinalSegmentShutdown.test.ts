@@ -703,15 +703,26 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     });
   });
 
-  it("releases the stream and AudioContext when microphone pipeline setup fails", async () => {
-    vi.stubGlobal(
-      "AudioWorkletNode",
-      class {
-        constructor() {
-          throw new Error("worklet setup failed");
-        }
-      }
-    );
+  it("aborts main exactly once when renderer setup fails after start acceptance", async () => {
+    class FailingAudioContext extends FakeAudioContext {
+      createAnalyser = vi.fn(() => {
+        throw new Error("analyser setup failed");
+      });
+    }
+    vi.stubGlobal("AudioContext", FailingAudioContext);
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!)
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "unsupported",
+        systemAudioStrategy: "unsupported",
+        inputGeneration: "input-generation-failed-setup",
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        systemAudioMode: "unsupported",
+        systemAudioStrategy: "unsupported",
+        inputGeneration: "input-generation-next",
+      });
 
     await startRecording({
       noteId: null,
@@ -726,6 +737,35 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     expect(audioContexts).toHaveLength(1);
     expect(audioContexts[0].close).toHaveBeenCalledOnce();
     expect(useMeetingRecordingStore.getState().isRecording).toBe(false);
+    expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledOnce();
+
+    const staleProducer = audioWorkletNodes[0];
+    const nextTrack = new FakeTrack("Next microphone", "next-mic");
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValue(streamFor(nextTrack));
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis next",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-pipeline-next",
+      diarizationEnabled: true,
+    });
+    staleProducer.port.onmessage?.({ data: new ArrayBuffer(4) } as MessageEvent<ArrayBuffer>);
+    audioWorkletNodes.at(-1)?.port.onmessage?.({
+      data: new ArrayBuffer(8),
+    } as MessageEvent<ArrayBuffer>);
+
+    expect(window.electronAPI.meetingTranscriptionStart).toHaveBeenCalledTimes(2);
+    expect(window.electronAPI.meetingTranscriptionStop).toHaveBeenCalledOnce();
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledTimes(1);
+    expect(window.electronAPI.meetingTranscriptionSend).toHaveBeenCalledWith(
+      expect.any(ArrayBuffer),
+      "mic",
+      "input-generation-next"
+    );
+    expect(useMeetingRecordingStore.getState().isRecording).toBe(true);
   });
 
   it("applies a cloud correction to only the matching local segment", async () => {

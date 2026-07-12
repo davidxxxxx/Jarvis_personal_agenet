@@ -3975,6 +3975,8 @@ class IPCHandlers {
     });
 
     let meetingTranscriptionStartInProgress = false;
+    let meetingTranscriptionTeardownPromise = null;
+    let meetingTranscriptionStopPromise = null;
     let meetingTranscriptionPrepareState = null;
     let meetingTranscriptionPrepareGeneration = 0;
     let meetingPreparedCaptureMode = null;
@@ -4666,14 +4668,27 @@ class IPCHandlers {
     let activeJarvisSessionId = null;
     let activeMeetingInputBinding = null;
 
-    const clearActiveMeetingInputBinding = () => {
+    const clearActiveMeetingInputBinding = (inputBinding = activeMeetingInputBinding) => {
+      if (activeMeetingInputBinding !== inputBinding) return false;
+      if (inputBinding) {
+        inputBinding.active = false;
+        inputBinding.cancelled = true;
+        inputBinding.pendingManagedSystemChunks.splice(0);
+        if (inputBinding.ownerDestroyedListener) {
+          inputBinding.owner?.removeListener?.("destroyed", inputBinding.ownerDestroyedListener);
+          inputBinding.ownerDestroyedListener = null;
+        }
+        inputBinding.owner = null;
+      }
       activeMeetingInputBinding = null;
+      return true;
     };
 
-    const resetActiveMeetingCapture = () => {
+    const resetActiveMeetingCapture = (inputBinding = activeMeetingInputBinding) => {
+      if (!clearActiveMeetingInputBinding(inputBinding)) return false;
       activeMeetingCaptureMode = resolveMeetingCaptureMode();
       activeJarvisSessionId = null;
-      clearActiveMeetingInputBinding();
+      return true;
     };
 
     const getLiveSpeakerProfiles = () => {
@@ -5431,21 +5446,55 @@ class IPCHandlers {
       return results;
     };
 
-    const rollbackMeetingTranscriptionStart = async () => {
-      if (this.audioTapManager) {
-        await this.audioTapManager.stop().catch(() => {});
-      }
-      if (this.linuxPortalAudioManager) {
-        await this.linuxPortalAudioManager.stop().catch(() => {});
-      }
-      if (this.windowsLoopbackAudioManager) {
-        await this.windowsLoopbackAudioManager.stop().catch(() => {});
-      }
-      await stopMeetingAec();
-      await stopLiveSpeakerIdentification().catch(() => {});
-      resetMeetingLocalState();
-      await disconnectMeetingStreaming().catch(() => {});
-      resetActiveMeetingCapture();
+    const rollbackMeetingTranscriptionStart = (inputBinding) => {
+      // Revoke every ingress route and release queued startup buffers before the
+      // first asynchronous teardown step. Exact identity keeps an old attempt
+      // from resetting a newer binding.
+      resetActiveMeetingCapture(inputBinding);
+      if (inputBinding?.teardownPromise) return inputBinding.teardownPromise;
+
+      const teardownPromise = (async () => {
+        if (this.audioTapManager) {
+          await this.audioTapManager.stop().catch(() => {});
+        }
+        if (this.linuxPortalAudioManager) {
+          await this.linuxPortalAudioManager.stop().catch(() => {});
+        }
+        if (this.windowsLoopbackAudioManager) {
+          await this.windowsLoopbackAudioManager.stop().catch(() => {});
+        }
+        await stopMeetingAec();
+        await stopLiveSpeakerIdentification().catch(() => {});
+        resetMeetingLocalState();
+        await disconnectMeetingStreaming().catch(() => {});
+      })();
+      if (inputBinding) inputBinding.teardownPromise = teardownPromise;
+      return teardownPromise;
+    };
+
+    const trackMeetingTranscriptionTeardown = (teardownPromise, context) => {
+      const trackedPromise = teardownPromise
+        .catch((error) => {
+          debugLogger.error(`Meeting transcription ${context} teardown failed`, {
+            error: error.message,
+          });
+        })
+        .finally(() => {
+          if (meetingTranscriptionTeardownPromise === trackedPromise) {
+            meetingTranscriptionTeardownPromise = null;
+          }
+        });
+      meetingTranscriptionTeardownPromise = trackedPromise;
+      return trackedPromise;
+    };
+
+    const handleMeetingInputOwnerDestroyed = (inputBinding) => {
+      if (!resetActiveMeetingCapture(inputBinding)) return;
+      this.meetingDetectionEngine?.setUserRecording(false);
+      trackMeetingTranscriptionTeardown(
+        rollbackMeetingTranscriptionStart(inputBinding),
+        "destroyed-owner"
+      );
     };
 
     const setupDictationCallbacks = (streaming, event) => {
@@ -5657,15 +5706,19 @@ class IPCHandlers {
     ipcMain.handle("meeting-transcription-cancel", async () => {
       if (meetingTranscriptionPrepareState) {
         cancelInFlightMeetingPrepare();
-        clearActiveMeetingInputBinding();
+        resetActiveMeetingCapture();
+        return { success: true };
+      }
+      if (meetingTranscriptionStartInProgress) {
+        resetActiveMeetingCapture();
+        this.meetingDetectionEngine?.setUserRecording(false);
         return { success: true };
       }
       if (isMeetingStreamingConnected() || meetingLocalTimer) {
         return { success: false, reason: "recording-active" };
       }
-      meetingTranscriptionStartInProgress = false;
       meetingTranscriptionPrepareState = null;
-      clearActiveMeetingInputBinding();
+      resetActiveMeetingCapture();
       return { success: true };
     });
 
@@ -5679,22 +5732,37 @@ class IPCHandlers {
         debugLogger.debug("Meeting transcription start: compatible prepare completed");
       }
 
-      if (meetingTranscriptionStartInProgress) {
+      if (meetingTranscriptionStartInProgress || meetingTranscriptionTeardownPromise) {
         debugLogger.debug("Meeting transcription start already in progress, ignoring");
         return { success: false, error: "Operation in progress" };
       }
 
       meetingTranscriptionStartInProgress = true;
       const startInputBinding = {
+        owner: event.sender,
         ownerId: event.sender.id,
         inputGeneration: crypto.randomUUID(),
         active: false,
+        cancelled: false,
         pendingManagedSystemChunks: [],
+        ownerDestroyedListener: null,
+        teardownPromise: null,
       };
       activeMeetingInputBinding = startInputBinding;
       const completeMeetingTranscriptionStart = (result) => {
-        if (activeMeetingInputBinding !== startInputBinding) {
+        if (activeMeetingInputBinding !== startInputBinding || startInputBinding.cancelled) {
           throw new Error("Meeting transcription start was superseded");
+        }
+        if (event.sender.isDestroyed()) {
+          throw new Error("Meeting transcription owner was destroyed during startup");
+        }
+        const ownerDestroyedListener = () => handleMeetingInputOwnerDestroyed(startInputBinding);
+        startInputBinding.ownerDestroyedListener = ownerDestroyedListener;
+        event.sender.once("destroyed", ownerDestroyedListener);
+        if (event.sender.isDestroyed()) {
+          event.sender.removeListener("destroyed", ownerDestroyedListener);
+          startInputBinding.ownerDestroyedListener = null;
+          throw new Error("Meeting transcription owner was destroyed during startup");
         }
         startInputBinding.active = true;
         flushPendingManagedSystemChunks(startInputBinding);
@@ -5823,7 +5891,7 @@ class IPCHandlers {
           oneOnOneAttendee: meetingOneOnOneAttendee,
         });
       } catch (error) {
-        await rollbackMeetingTranscriptionStart();
+        await rollbackMeetingTranscriptionStart(startInputBinding);
         this.meetingDetectionEngine?.setUserRecording(false);
         debugLogger.error("Meeting transcription start error", { error: error.message });
         return { success: false, error: error.message };
@@ -6075,8 +6143,8 @@ class IPCHandlers {
       }
     });
 
-    ipcMain.handle("meeting-transcription-stop", async () => {
-      clearActiveMeetingInputBinding();
+    const performMeetingTranscriptionStop = async (stopInputBinding) => {
+      resetActiveMeetingCapture(stopInputBinding);
       this.meetingDetectionEngine?.setUserRecording(false);
       try {
         if (this.audioTapManager) {
@@ -6181,7 +6249,28 @@ class IPCHandlers {
         debugLogger.error("Meeting transcription stop error", { error: error.message });
         return { success: false, error: error.message };
       } finally {
-        resetActiveMeetingCapture();
+        resetActiveMeetingCapture(stopInputBinding);
+      }
+    };
+
+    ipcMain.handle("meeting-transcription-stop", async () => {
+      if (meetingTranscriptionStopPromise) return meetingTranscriptionStopPromise;
+      if (meetingTranscriptionTeardownPromise) {
+        await meetingTranscriptionTeardownPromise;
+        return { success: true };
+      }
+
+      const stopInputBinding = activeMeetingInputBinding;
+      const stopPromise = performMeetingTranscriptionStop(stopInputBinding);
+      if (stopInputBinding) stopInputBinding.teardownPromise = stopPromise;
+      meetingTranscriptionStopPromise = stopPromise;
+      trackMeetingTranscriptionTeardown(stopPromise, "explicit-stop");
+      try {
+        return await stopPromise;
+      } finally {
+        if (meetingTranscriptionStopPromise === stopPromise) {
+          meetingTranscriptionStopPromise = null;
+        }
       }
     });
 
