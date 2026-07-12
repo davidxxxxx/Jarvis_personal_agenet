@@ -1227,6 +1227,10 @@ class JarvisRepository {
     return this.captureEvidenceStore.restoreTrack(input);
   }
 
+  finalizeCapture(input) {
+    return this.captureEvidenceStore.finalizeCapture(input);
+  }
+
   commitChunk(chunk) {
     return this.captureEvidenceStore.commitChunk(chunk);
   }

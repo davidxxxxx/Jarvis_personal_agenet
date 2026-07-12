@@ -37,6 +37,7 @@ class JarvisService {
       "interruptTrack",
       "closeGap",
       "restoreTrack",
+      "finalizeCapture",
       "commitChunk",
     ]) {
       if (typeof repository[method] !== "function") {
@@ -123,7 +124,7 @@ class JarvisService {
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
       if (diskError) {
-        this._failForDisk(diskError.code, normalized.startedAt);
+        this._failForDisk(diskError.code, normalized.startedAt, []);
       } else {
         this.writer?.abortAll?.();
         this.writer = null;
@@ -297,10 +298,11 @@ class JarvisService {
       }
     }
     this.writer = null;
-    this._finishSources(at, "ended");
-    this._transitionSessionStatus("completed", at);
-    this._persistSessionStatus("completed", at);
-    return this._publish(at);
+    return this._finalizeCapture(at, {
+      trackState: "ended",
+      sessionStatus: "completed",
+      errorCode: null,
+    });
   }
 
   failCapture(sessionId, code, at = this.now()) {
@@ -318,11 +320,11 @@ class JarvisService {
       }
     }
     this.writer = null;
-    this._finishSources(at, "failed");
-    this._transitionSessionStatus("failed", at);
-    this.state.errorCode = code;
-    this._persistSessionStatus("failed", at);
-    return this._publish(at);
+    return this._finalizeCapture(at, {
+      trackState: "failed",
+      sessionStatus: "failed",
+      errorCode: code,
+    });
   }
 
   recoverOpenSessions(at = this.now()) {
@@ -349,24 +351,25 @@ class JarvisService {
           this.writer.closeAll(at);
         } catch (error) {
           this.writer.abortAll?.();
+          this.writer = null;
           if (["recording", "degraded", "paused"].includes(this.state.status)) {
             const diskError = this._findDiskSpaceError(error);
-            this._finishSources(at, "failed");
-            this._transitionSessionStatus("failed", at);
-            this.state.errorCode = diskError?.code ?? "AUDIO_WRITE_FAILED";
-            this._persistSessionStatus("failed", at);
-            this._publish(at);
+            this._finalizeCapture(at, {
+              trackState: "failed",
+              sessionStatus: "failed",
+              errorCode: diskError?.code ?? "AUDIO_WRITE_FAILED",
+            });
           }
-          this.writer = null;
           return;
         }
         this.writer = null;
       }
       if (["recording", "degraded", "paused"].includes(this.state.status)) {
-        this._finishSources(at, "recovered");
-        this._transitionSessionStatus("recovered", at);
-        this._persistSessionStatus("recovered", at);
-        this._publish(at);
+        this._finalizeCapture(at, {
+          trackState: "recovered",
+          sessionStatus: "recovered",
+          errorCode: null,
+        });
       }
     } finally {
       this.closed = true;
@@ -434,6 +437,14 @@ class JarvisService {
       },
     });
 
+    Object.assign(source, {
+      state: "reconnecting",
+      gapId,
+      interruptedAt: at,
+      reason,
+      errorCode: writerError ? "AUDIO_WRITE_FAILED" : null,
+    });
+
     let closeError = writerError;
     try {
       this.writer.closeSource(source.sourceType, at);
@@ -442,28 +453,11 @@ class JarvisService {
       const diskError = this._findDiskSpaceError(error);
       if (diskError) return this._failForDisk(diskError.code, at);
     }
-    Object.assign(source, {
-      state: "reconnecting",
-      gapId,
-      interruptedAt: at,
-      reason,
-      errorCode: closeError ? "AUDIO_WRITE_FAILED" : null,
-    });
+    source.errorCode = closeError ? "AUDIO_WRITE_FAILED" : null;
     const status = this._deriveSessionStatus();
     this._transitionSessionStatus(status, at);
     this._persistSessionStatus(status, at);
     return this._publish(at);
-  }
-
-  _finishSources(at, state) {
-    for (const source of Object.values(this.state.sources)) {
-      if (source.gapId) {
-        this.repository.closeGap(source.gapId, at, null);
-        source.gapId = null;
-      }
-      source.state = state;
-      this.repository.setTrackState(source.trackId, state, at);
-    }
   }
 
   _deriveSessionStatus() {
@@ -528,23 +522,59 @@ class JarvisService {
     return error?.cause ? this._findDiskSpaceError(error.cause) : null;
   }
 
-  _failForDisk(code, at) {
+  _failForDisk(code, at, durableSources) {
     this.writer?.abortAll?.();
     this.writer = null;
-    this._finishSources(at, "failed");
-    this._transitionSessionStatus("failed", at);
-    this.state.errorCode = code;
-    this._persistSessionStatus("failed", at);
-    return this._publish(at);
+    return this._finalizeCapture(at, {
+      trackState: "failed",
+      sessionStatus: "failed",
+      errorCode: code,
+      durableSources,
+    });
   }
 
   _failForAudioWrite(at) {
     this.writer?.abortAll?.();
     this.writer = null;
-    this._finishSources(at, "failed");
-    this._transitionSessionStatus("failed", at);
-    this.state.errorCode = "AUDIO_WRITE_FAILED";
-    this._persistSessionStatus("failed", at);
+    return this._finalizeCapture(at, {
+      trackState: "failed",
+      sessionStatus: "failed",
+      errorCode: "AUDIO_WRITE_FAILED",
+    });
+  }
+
+  _finalizeCapture(
+    at,
+    { trackState, sessionStatus, errorCode, durableSources = null }
+  ) {
+    const sources = Object.values(this.state.sources);
+    const evidenceSources =
+      durableSources ?? sources.map((source) => ({ trackId: source.trackId, gapId: source.gapId }));
+
+    for (const source of sources) {
+      source.state = trackState;
+      source.gapId = null;
+    }
+    this._transitionSessionStatus(sessionStatus, at);
+    this.state.errorCode = errorCode;
+
+    try {
+      this.repository.finalizeCapture({
+        sessionId: this.state.sessionId,
+        sources: evidenceSources,
+        trackState,
+        sessionStatus,
+        at,
+      });
+    } catch (error) {
+      if (sessionStatus !== "failed") {
+        for (const source of sources) source.state = "failed";
+        this._transitionSessionStatus("failed", at);
+        this.state.errorCode = "CAPTURE_FINALIZATION_FAILED";
+      }
+      this._publish(at);
+      throw error;
+    }
     return this._publish(at);
   }
 

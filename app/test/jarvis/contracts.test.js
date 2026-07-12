@@ -510,6 +510,9 @@ test("failCapture IPC validates MIC codes and preserves authoritative failed bro
     interruptTrack: () => {},
     closeGap: () => {},
     restoreTrack: () => {},
+    finalizeCapture: ({ sessionStatus }) => {
+      session.status = sessionStatus;
+    },
     commitChunk: () => {},
     recoverOpenSessions: () => [],
   };

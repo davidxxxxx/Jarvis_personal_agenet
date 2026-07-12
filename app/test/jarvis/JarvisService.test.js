@@ -70,6 +70,13 @@ function createRepository() {
       this.closeGap(gapId, endedAt, recoveryAttempts);
       return this.setTrackState(trackId, "active", null);
     },
+    finalizeCapture({ sessionId, sources, trackState, sessionStatus, at }) {
+      for (const source of sources) {
+        if (source.gapId) this.closeGap(source.gapId, at, null);
+        this.setTrackState(source.trackId, trackState, at);
+      }
+      return this.setSessionStatus(sessionId, sessionStatus, at);
+    },
     commitChunk(chunk) {
       chunks.push(chunk);
       return chunk;
@@ -871,6 +878,186 @@ test("duplicate interruption persists exactly one gap transition", () => {
     assert.equal(repository.gaps.length, 1);
   } finally {
     service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+function injectFinalizationFailure(repository, error) {
+  repository.setTrackState = () => {
+    throw error;
+  };
+  repository.closeGap = () => {
+    throw error;
+  };
+  repository.finalizeCapture = () => {
+    throw error;
+  };
+}
+
+test("finish persistence failure exposes failed public state and the original error", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-finish-persist-fault-"));
+  const repository = createRepository();
+  const persistenceError = new Error("terminal transaction failed");
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
+    injectFinalizationFailure(repository, persistenceError);
+
+    assert.throws(() => service.finishCapture("s1", 20), (error) => error === persistenceError);
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "CAPTURE_FINALIZATION_FAILED");
+    assert.equal(service.getState().sources.mic.state, "failed");
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(48)), false);
+    assert.doesNotThrow(() => service.shutdown());
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("error finalization failure closes public state and preserves the persistence error", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-fail-persist-fault-"));
+  const repository = createRepository();
+  const persistenceError = new Error("failed-session transaction failed");
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 30,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    injectFinalizationFailure(repository, persistenceError);
+
+    assert.throws(
+      () => service.failCapture("s1", "CAPTURE_FAILED", 30),
+      (error) => error === persistenceError
+    );
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "CAPTURE_FAILED");
+    assert.equal(
+      Object.values(service.getState().sources).every((source) => source.state === "failed"),
+      true
+    );
+    assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
+    assert.doesNotThrow(() => service.shutdown());
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("pause close-error finalization failure cannot leave a recording state without a writer", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-pause-persist-fault-"));
+  const repository = createRepository();
+  const persistenceError = new Error("audio failure transaction failed");
+  repository.commitChunk = () => {
+    throw new Error("metadata unavailable");
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
+    service.appendMicPcm("s1", Buffer.alloc(48, 1));
+    injectFinalizationFailure(repository, persistenceError);
+
+    assert.throws(() => service.pauseCapture("s1", 20), (error) => error === persistenceError);
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "AUDIO_WRITE_FAILED");
+    assert.equal(service.getState().sources.mic.state, "failed");
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(48, 2)), false);
+    assert.doesNotThrow(() => service.shutdown());
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("shutdown finalization failure is observable, honest, and idempotent", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-shutdown-persist-fault-"));
+  const repository = createRepository();
+  const persistenceError = new Error("shutdown transaction failed");
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
+    injectFinalizationFailure(repository, persistenceError);
+
+    assert.throws(() => service.shutdown(), (error) => error === persistenceError);
+    assert.equal(service.getState().status, "failed");
+    assert.equal(service.getState().errorCode, "CAPTURE_FINALIZATION_FAILED");
+    assert.equal(service.getState().sources.mic.state, "failed");
+    assert.doesNotThrow(() => service.shutdown());
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("disk failure while interrupting closes the persisted gap atomically", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-disk-real-"));
+  const repository = new JarvisRepository(":memory:");
+  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: "mv7" });
+  let diskChecks = 0;
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({
+    bsize: 1,
+    blocks: 200 * 1024 ** 3,
+    bavail: ++diskChecks === 1 ? 20 * 1024 ** 3 : 1024 ** 3,
+  });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 20,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.appendPcm("s1", "system", Buffer.alloc(48, 1));
+
+    const state = service.sourceInterrupted("s1", "system", {
+      at: 20,
+      reason: "device-change",
+    });
+
+    assert.equal(state.status, "failed");
+    assert.equal(state.errorCode, "DISK_SPACE_LOW");
+    assert.equal(repository.getSession("s1").status, "failed");
+    assert.equal(
+      repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get().count,
+      0
+    );
+    assert.deepEqual(
+      repository.db.prepare("SELECT DISTINCT state FROM audio_tracks").all(),
+      [{ state: "failed" }]
+    );
+  } finally {
+    service.shutdown();
+    repository.close();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });
