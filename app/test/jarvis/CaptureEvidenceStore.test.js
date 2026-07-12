@@ -921,6 +921,27 @@ test("enqueueChunkTranscription is idempotent by transcription input", (t) => {
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
 });
 
+test("rejects every transcription enqueue after a chunk is tombstoned", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk());
+  store.tombstoneChunk("c1", 200);
+
+  assert.throws(() => store.enqueueChunkTranscription(chunk()), /deleted/i);
+  assert.throws(
+    () =>
+      store.enqueueChunkTranscription(
+        chunk({ inputVersion: 2, modelVersion: "replacement-model" })
+      ),
+    /deleted/i
+  );
+  assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE chunk_id = 'c1'").get().state,
+    "audio_expired_before_processing"
+  );
+});
+
 test("rejects chunks whose track session or source does not match", (t) => {
   const { store, db } = fixture(t);
   db.prepare(

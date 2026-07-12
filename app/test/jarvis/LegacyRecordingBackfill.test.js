@@ -117,8 +117,11 @@ test("links only in-folder WAV and FLAC rows in stable chronology and fills only
   });
   repo.db.prepare(
     `INSERT INTO processing_jobs (
-      id, session_id, chunk_id, job_type, state, input_hash, created_at
-    ) VALUES ('existing-job', 's1', 'earlier', 'transcribe_chunk', 'pending', 'earlier', 1)`
+      id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at, completed_at
+    ) VALUES (
+      'existing-job', 's1', 'system-track', 'earlier',
+      'transcribe_chunk', 'completed', 'earlier', 1, 2
+    )`
   ).run();
 
   const first = backfillLegacyRecordings({ repository: repo, recordingsRoot: root });
@@ -169,11 +172,11 @@ test("links only in-folder WAV and FLAC rows in stable chronology and fills only
   );
   assert.deepEqual(
     repo.db
-      .prepare("SELECT chunk_id, track_id FROM processing_jobs ORDER BY chunk_id")
+      .prepare("SELECT chunk_id, track_id, state, completed_at FROM processing_jobs ORDER BY chunk_id")
       .all(),
     [
-      { chunk_id: "earlier", track_id: micTrackId },
-      { chunk_id: "later", track_id: micTrackId },
+      { chunk_id: "earlier", track_id: micTrackId, state: "completed", completed_at: 2 },
+      { chunk_id: "later", track_id: micTrackId, state: "pending", completed_at: null },
     ]
   );
 });
@@ -286,6 +289,56 @@ test("rolls back track and links when legacy job creation fails, then retries cl
     orphaned: [],
     jobsCreated: 1,
   });
+});
+
+test("rejects a cross-session chunk job and rolls back the whole legacy link", (t) => {
+  const root = tempRoot(t);
+  const repo = repository(t);
+  const sessionDir = path.join(root, "owner-session");
+  fs.mkdirSync(sessionDir);
+  repo.createSession({ id: "owner-session", startedAt: 10, micDeviceId: null });
+  repo.createSession({ id: "foreign-session", startedAt: 10, micDeviceId: null });
+  repo.createTrack({
+    id: "foreign-system",
+    sessionId: "foreign-session",
+    sourceType: "system",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 10,
+  });
+  addLegacyChunk(repo, {
+    id: "owned-chunk",
+    sessionId: "owner-session",
+    filePath: path.join(sessionDir, "owned.wav"),
+    startedAt: 20,
+  });
+  repo.db.prepare(
+    `INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at
+    ) VALUES (
+      'foreign-job', 'foreign-session', 'foreign-system', 'owned-chunk',
+      'diarize_chunk', 'pending', 'foreign', 1
+    )`
+  ).run();
+
+  assert.throws(
+    () => backfillLegacyRecordings({ repository: repo, recordingsRoot: root }),
+    /job session.*legacy chunk/i
+  );
+  assert.equal(
+    repo.db
+      .prepare("SELECT count(*) count FROM audio_tracks WHERE session_id = 'owner-session'")
+      .get().count,
+    0
+  );
+  assert.equal(
+    repo.db.prepare("SELECT track_id FROM audio_chunks WHERE id = 'owned-chunk'").get().track_id,
+    null
+  );
+  assert.deepEqual(
+    repo.db.prepare("SELECT session_id, track_id FROM processing_jobs WHERE id = 'foreign-job'").get(),
+    { session_id: "foreign-session", track_id: "foreign-system" }
+  );
 });
 
 test("startup wrapper contains failures and logs only a stable code", () => {

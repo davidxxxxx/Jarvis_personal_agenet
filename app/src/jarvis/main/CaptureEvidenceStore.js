@@ -171,6 +171,21 @@ class CaptureEvidenceStore {
       });
       return { changes: tombstone.changes, jobsTerminated: jobs.changes };
     });
+    this.enqueueChunkTranscriptionTransaction = db.transaction((chunk) => {
+      const persisted = this.statements.getChunk.get(chunk.id);
+      if (!persisted) throw new Error(`chunk ${chunk.id} does not exist`);
+      if (persisted.deleted_at !== null) {
+        throw new Error(`chunk ${chunk.id} audio is deleted`);
+      }
+      if (persisted.session_id !== chunk.sessionId) throw new Error("chunk session does not match");
+      if (persisted.track_id !== chunk.trackId) throw new Error("chunk track does not match");
+      if (persisted.source_type !== chunk.sourceType) throw new Error("chunk source does not match");
+      if (persisted.sha256 !== chunk.sha256) throw new Error("chunk input hash does not match");
+
+      const input = this._transcriptionInput(chunk);
+      const existing = this.statements.getTranscriptionJobByInput.get(input);
+      return existing ?? this._insertChunkTranscription(chunk);
+    });
     this.interruptTrackTransaction = db.transaction(({ trackId, gap }) => {
       this._assertIdentifier(trackId, "trackId");
       if (!gap || typeof gap !== "object") throw new TypeError("gap is required");
@@ -427,16 +442,7 @@ class CaptureEvidenceStore {
   }
 
   enqueueChunkTranscription(chunk) {
-    const persisted = this.statements.getChunk.get(chunk.id);
-    if (!persisted) throw new Error(`chunk ${chunk.id} does not exist`);
-    if (persisted.session_id !== chunk.sessionId) throw new Error("chunk session does not match");
-    if (persisted.track_id !== chunk.trackId) throw new Error("chunk track does not match");
-    if (persisted.source_type !== chunk.sourceType) throw new Error("chunk source does not match");
-    if (persisted.sha256 !== chunk.sha256) throw new Error("chunk input hash does not match");
-
-    const input = this._transcriptionInput(chunk);
-    const existing = this.statements.getTranscriptionJobByInput.get(input);
-    return existing ?? this._insertChunkTranscription(chunk);
+    return this.enqueueChunkTranscriptionTransaction(chunk);
   }
 
   _insertChunkTranscription(chunk) {

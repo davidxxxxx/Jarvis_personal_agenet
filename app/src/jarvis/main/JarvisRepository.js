@@ -384,7 +384,13 @@ class JarvisRepository {
       `),
       syncChunkJobTrack: this.db.prepare(`
         UPDATE processing_jobs SET track_id = @trackId
-        WHERE chunk_id = @chunkId AND track_id IS NULL
+        WHERE chunk_id = @chunkId
+      `),
+      listChunkJobsForLegacyLink: this.db.prepare(`
+        SELECT id, session_id, track_id, state
+        FROM processing_jobs
+        WHERE chunk_id = ?
+        ORDER BY id
       `),
       getLegacyChunkTranscriptionJob: this.db.prepare(`
         SELECT * FROM processing_jobs
@@ -583,6 +589,10 @@ class JarvisRepository {
         let linked = 0;
         let jobsCreated = 0;
         for (const chunk of chunks) {
+          const existingJobs = this.statements.listChunkJobsForLegacyLink.all(chunk.id);
+          if (existingJobs.some((job) => job.session_id !== sessionId)) {
+            throw new Error("processing job session does not match legacy chunk session");
+          }
           const link = this.statements.linkLegacyAudioChunk.run({
             id: chunk.id,
             sessionId,
