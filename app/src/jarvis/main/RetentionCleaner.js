@@ -52,10 +52,18 @@ class RetentionCleaner {
     const run = async () => {
       const counts = { deleted: 0, retry: 0, missing: 0 };
       let temporaryEvidenceFailures = 0;
+      let retiredArtifactRemoved = 0;
+      let retiredArtifactRetry = 0;
+      let retiredArtifactMaintenanceFailures = 0;
       const report = (extra = {}) => ({
         ...counts,
         ...extra,
         ...(temporaryEvidenceFailures > 0 ? { temporaryEvidenceFailures } : {}),
+        ...(retiredArtifactRemoved > 0 ? { retiredArtifactRemoved } : {}),
+        ...(retiredArtifactRetry > 0 ? { retiredArtifactRetry } : {}),
+        ...(retiredArtifactMaintenanceFailures > 0
+          ? { retiredArtifactMaintenanceFailures }
+          : {}),
       });
       let expired;
       if (typeof this.temporaryEvidenceCleaner?.cleanupStaleTemporaryEvidence === "function") {
@@ -65,6 +73,15 @@ class RetentionCleaner {
           });
         } catch {
           temporaryEvidenceFailures = 1;
+        }
+      }
+      if (typeof this.artifactCleaner?.runMaintenance === "function") {
+        try {
+          const maintenance = await this.artifactCleaner.runMaintenance(at);
+          retiredArtifactRemoved += maintenance?.removed ?? 0;
+          retiredArtifactRetry += maintenance?.retry ?? 0;
+        } catch {
+          retiredArtifactMaintenanceFailures = 1;
         }
       }
       try {
@@ -96,13 +113,19 @@ class RetentionCleaner {
         if (result.status === "deleted" || result.status === "missing") {
           try {
             this.repository.tombstoneChunk(expired[index].id, at);
-            if (typeof this.artifactCleaner?.cleanupRetiredChunk === "function") {
-              await this.artifactCleaner.cleanupRetiredChunk(expired[index], at);
-            }
             counts[result.status] += 1;
           } catch (error) {
             counts.retry += 1;
             metadataErrors.push(error);
+            continue;
+          }
+          if (typeof this.artifactCleaner?.cleanupRetiredChunk === "function") {
+            try {
+              retiredArtifactRemoved +=
+                (await this.artifactCleaner.cleanupRetiredChunk(expired[index], at)) ?? 0;
+            } catch {
+              retiredArtifactRetry += 1;
+            }
           }
         } else {
           counts.retry += 1;

@@ -334,24 +334,58 @@ class AudioEvidenceReader {
     });
     const controller = new AbortController();
     let timer = null;
+    let result;
+    let primaryError;
+    let hasPrimaryError = false;
     try {
       assertLive();
       const consumption = Promise.resolve().then(() => consume(temporary.path, controller.signal));
-      if (!hasDeadline) return await consumption;
-      const expired = new Promise((_resolve, reject) => {
-        timer = this.setTimeout(() => {
-          const error = new Error("audio_expired");
-          error.code = "audio_expired";
-          controller.abort(error);
-          reject(error);
-        }, Math.max(0, deadline - this.now()));
-        timer?.unref?.();
-      });
-      return await Promise.race([consumption, expired]);
-    } finally {
-      if (timer !== null) this.clearTimeout(timer);
-      await temporary.remove();
+      if (!hasDeadline) {
+        result = await consumption;
+      } else {
+        const expired = new Promise((_resolve, reject) => {
+          timer = this.setTimeout(() => {
+            const error = new Error("audio_expired");
+            error.code = "audio_expired";
+            controller.abort(error);
+            reject(error);
+          }, Math.max(0, deadline - this.now()));
+          timer?.unref?.();
+        });
+        result = await Promise.race([consumption, expired]);
+      }
+    } catch (error) {
+      primaryError = error;
+      hasPrimaryError = true;
     }
+    let cleanupError = null;
+    try {
+      if (timer !== null) this.clearTimeout(timer);
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await temporary.remove();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (hasPrimaryError) {
+      if (
+        cleanupError &&
+        (typeof primaryError === "object" || typeof primaryError === "function") &&
+        primaryError !== null &&
+        primaryError.cause === undefined
+      ) {
+        try {
+          primaryError.cause = cleanupError;
+        } catch {
+          // Preserve the primary failure even when it is not extensible.
+        }
+      }
+      throw primaryError;
+    }
+    if (cleanupError) throw cleanupError;
+    return result;
   }
 
   async readPlayableWav(chunk) {

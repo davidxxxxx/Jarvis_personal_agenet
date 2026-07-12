@@ -1374,6 +1374,15 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
     assert.equal(repository.getSession("s1").status, "completed");
     assert.equal(job.job_type, "transcribe_chunk");
     assert.equal(repository.getAudioChunk("c1").deleted_at, 200);
+    assert.deepEqual(
+      repository.listRetiredArtifactBacklog().map((row) => ({
+        id: row.id,
+        retired_path: row.retired_path,
+        retired_file_sha256: row.retired_file_sha256,
+      })),
+      [{ id: "c1", retired_path: "c1.wav", retired_file_sha256: null }]
+    );
+    assert.equal(Object.hasOwn(repository.getAudioChunk("c1"), "retired_path"), false);
   } finally {
     repository.close();
   }

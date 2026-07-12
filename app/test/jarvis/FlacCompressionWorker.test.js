@@ -356,20 +356,176 @@ test("failed corrupt-FLAC deletion persists exact provenance for expiry startup 
   );
 });
 
+test("transiently locked authoritative FLAC stays authoritative until maintenance verifies it", async (t) => {
+  const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  fs.writeFileSync(wavPath, wavFor(pcm));
+  let locked = true;
+  const fsImpl = Object.create(fs.promises);
+  fsImpl.readFile = async (candidate, ...args) => {
+    if (locked && candidate === compressed.chunk.path) {
+      const error = new Error("simulated sharing violation");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return fs.promises.readFile(candidate, ...args);
+  };
+  const maintenanceWorker = makeWorker({ fsImpl });
+
+  await maintenanceWorker.recoverStartup();
+
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(store.getChunk("c1").path, compressed.chunk.path);
+  assert.equal(fs.existsSync(wavPath), true);
+  assert.equal(store.getChunkForMaintenance("c1").retired_path, null);
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+    { state: "retry", error_code: "flac_authority_temporarily_unreadable" }
+  );
+
+  locked = false;
+  await maintenanceWorker.runMaintenance(100);
+
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(fs.existsSync(wavPath), false);
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+    { state: "completed", error_code: null }
+  );
+});
+
+test("maintenance hashes and removes a readable legacy null-hash retired FLAC", async (t) => {
+  const { db, store, worker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  store.tombstoneChunk("c1", 100);
+  db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
+
+  const removed = await worker.cleanupRetiredChunk(store.getChunk("c1"), 100);
+
+  assert.equal(removed, 1);
+  assert.equal(fs.existsSync(compressed.chunk.path), false);
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT retired_path, retired_format, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'"
+      )
+      .get(),
+    { retired_path: null, retired_format: null, retired_file_sha256: null }
+  );
+});
+
+test("maintenance preserves a locked legacy null-hash retired FLAC for retry", async (t) => {
+  const { db, store, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  store.tombstoneChunk("c1", 100);
+  db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
+  const fsImpl = Object.create(fs.promises);
+  fsImpl.readFile = async (candidate, ...args) => {
+    if (candidate === compressed.chunk.path) {
+      const error = new Error("simulated sharing violation");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return fs.promises.readFile(candidate, ...args);
+  };
+
+  await assert.rejects(
+    makeWorker({ fsImpl }).cleanupRetiredChunk(store.getChunk("c1"), 100),
+    { code: "EBUSY" }
+  );
+
+  assert.equal(fs.existsSync(compressed.chunk.path), true);
+  assert.deepEqual(
+    db
+      .prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'")
+      .get(),
+    { retired_path: compressed.chunk.path, retired_file_sha256: null }
+  );
+});
+
+test("maintenance clears a missing legacy null-hash retired locator", async (t) => {
+  const { db, store, worker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  store.tombstoneChunk("c1", 100);
+  db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
+  fs.unlinkSync(compressed.chunk.path);
+
+  assert.equal(await worker.cleanupRetiredChunk(store.getChunk("c1"), 100), 1);
+  assert.deepEqual(
+    db
+      .prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'")
+      .get(),
+    { retired_path: null, retired_file_sha256: null }
+  );
+});
+
+test("online maintenance retries a tombstoned retired FLAC in the next cycle", async (t) => {
+  const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
+  const compressed = await worker.run(job);
+  fs.writeFileSync(wavPath, wavFor(pcm));
+  db.prepare(
+    `UPDATE audio_chunks
+     SET path = ?, format = 'wav', file_sha256 = NULL, expires_at = 100,
+         retired_path = ?, retired_format = 'flac', retired_file_sha256 = ?
+     WHERE id = 'c1'`
+  ).run(wavPath, compressed.chunk.path, compressed.chunk.file_sha256);
+  let locked = true;
+  const fsImpl = Object.create(fs.promises);
+  fsImpl.unlink = async (candidate) => {
+    if (locked && candidate === compressed.chunk.path) {
+      const error = new Error("simulated sharing violation");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return fs.promises.unlink(candidate);
+  };
+  const maintenanceWorker = makeWorker({ fsImpl, now: () => 100 });
+  const repository = {
+    promoteSoonExpiringAudioJobs: (after, before) =>
+      store.promoteSoonExpiringAudioJobs(after, before),
+    listExpiredAudioChunks: (at) =>
+      db
+        .prepare("SELECT id FROM audio_chunks WHERE expires_at <= ? AND deleted_at IS NULL")
+        .all(at)
+        .map(({ id }) => store.getChunk(id)),
+    tombstoneChunk: (id, at) => store.tombstoneChunk(id, at),
+    getAudioChunk: (id) => store.getChunk(id),
+  };
+  const logs = [];
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.dirname(wavPath),
+    deleteBatch: async (_root, paths) => {
+      await Promise.all(paths.map((candidate) => fs.promises.unlink(candidate)));
+      return paths.map(() => ({ status: "deleted", code: "deleted" }));
+    },
+    artifactCleaner: maintenanceWorker,
+    log: (entry) => logs.push(entry),
+  });
+
+  assert.deepEqual(await cleaner.clean(100), { deleted: 1, missing: 0, retry: 0 });
+  assert.equal(store.getChunk("c1").deleted_at, 100);
+  assert.equal(store.getChunkForMaintenance("c1").retired_path, compressed.chunk.path);
+  assert.equal(fs.existsSync(compressed.chunk.path), true);
+
+  locked = false;
+  assert.deepEqual(await cleaner.clean(101), { deleted: 0, missing: 0, retry: 0 });
+  assert.equal(fs.existsSync(compressed.chunk.path), false);
+  assert.equal(store.getChunkForMaintenance("c1").retired_path, null);
+  assert.ok(logs.some((entry) => entry.retiredArtifactRetry >= 1));
+  assert.ok(logs.some((entry) => entry.retiredArtifactRemoved >= 1));
+});
+
 test("retired provenance cleanup never deletes the current authoritative file", async (t) => {
   const { db, store, wavPath, makeWorker } = fixture(t);
-  const actualFileSha256 = crypto
-    .createHash("sha256")
-    .update(fs.readFileSync(wavPath))
-    .digest("hex");
   db.prepare(
     `UPDATE audio_chunks
      SET expires_at = 100,
          retired_path = path,
          retired_format = format,
-         retired_file_sha256 = ?
+         retired_file_sha256 = NULL
      WHERE id = 'c1'`
-  ).run(actualFileSha256);
+  ).run();
 
   await makeWorker({ now: () => 100 }).cleanupRetiredChunk(
     store.getChunkForMaintenance("c1"),
@@ -685,6 +841,89 @@ test("withVerifiedWav aborts and removes a lease when its deadline crosses", asy
   assert.equal(
     await reader.cleanupStaleTemporaryEvidence({ getChunk: (id) => store.getChunk(id) }),
     0
+  );
+});
+
+test("withVerifiedWav preserves audio_expired when deadline cleanup is locked", async (t) => {
+  const { root, store, codec } = fixture(t, { expiresAt: 1_200 });
+  let now = 1_100;
+  let deadlineCallback;
+  let signalReady;
+  const ready = new Promise((resolve) => {
+    signalReady = resolve;
+  });
+  const cleanupError = new Error("simulated lease sharing violation");
+  cleanupError.code = "EBUSY";
+  const reader = new AudioEvidenceReader({
+    decoder: codec,
+    recordingsRoot: root,
+    now: () => now,
+    setTimeoutImpl: (callback) => {
+      deadlineCallback = callback;
+      return { unref() {} };
+    },
+    clearTimeoutImpl: () => {},
+    temporaryWav: {
+      async write() {
+        return {
+          path: path.join(root, ".evidence-tmp", "locked.wav"),
+          async remove() {
+            throw cleanupError;
+          },
+        };
+      },
+    },
+  });
+  const consuming = reader.withVerifiedWav(
+    store.getChunk("c1"),
+    async (_temporaryPath, signal) => {
+      signalReady(signal);
+      return new Promise(() => {});
+    }
+  );
+  const signal = await ready;
+  now = 1_200;
+  deadlineCallback();
+
+  await assert.rejects(consuming, (error) => {
+    assert.equal(error.code, "audio_expired");
+    assert.equal(error.cause, cleanupError);
+    return true;
+  });
+  assert.equal(signal.aborted, true);
+});
+
+test("withVerifiedWav preserves a consumer error when cleanup also fails", async (t) => {
+  const { root, store, codec } = fixture(t);
+  const consumerError = new Error("consumer failed");
+  consumerError.code = "consumer_failed";
+  const cleanupError = new Error("simulated lease sharing violation");
+  cleanupError.code = "EPERM";
+  const reader = new AudioEvidenceReader({
+    decoder: codec,
+    recordingsRoot: root,
+    now: () => 100,
+    temporaryWav: {
+      async write() {
+        return {
+          path: path.join(root, ".evidence-tmp", "locked.wav"),
+          async remove() {
+            throw cleanupError;
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    reader.withVerifiedWav(store.getChunk("c1"), async () => {
+      throw consumerError;
+    }),
+    (error) => {
+      assert.equal(error, consumerError);
+      assert.equal(error.cause, cleanupError);
+      return true;
+    }
   );
 });
 

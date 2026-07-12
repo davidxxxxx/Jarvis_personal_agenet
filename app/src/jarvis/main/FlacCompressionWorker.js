@@ -262,6 +262,67 @@ class FlacCompressionWorker {
     return result;
   }
 
+  async runMaintenance(at = this.now()) {
+    const recovery = { promoted: 0, deletedWavs: 0, removedInvalid: 0, rolledBack: 0 };
+    let retry = 0;
+    if (typeof this.store.listCompressionRecoveryCandidates === "function") {
+      for (const candidate of this.store.listCompressionRecoveryCandidates()) {
+        const { chunk, job } = candidate;
+        if (
+          !job ||
+          job.error_code !== "flac_authority_temporarily_unreadable" ||
+          chunk.deleted_at !== null ||
+          chunk.expires_at <= at ||
+          chunk.format !== "flac"
+        ) {
+          continue;
+        }
+        try {
+          await this._recoverFlac(chunk, this._job(job), recovery);
+          if (this.store.getCompressionJob?.(job.id)?.state === "retry") retry += 1;
+        } catch {
+          retry += 1;
+          try {
+            this.onRecoveryError({
+              chunkId: chunk.id,
+              jobId: job.id,
+              code: "flac_recovery_failed",
+            });
+          } catch {
+            // Maintenance telemetry must not block independent rows.
+          }
+        }
+      }
+    }
+    const retired = await this.cleanupRetiredBacklog();
+    return { removed: retired.removed, retry: retired.retry + retry };
+  }
+
+  async cleanupRetiredBacklog() {
+    if (typeof this.store.listRetiredArtifactBacklog !== "function") {
+      return { removed: 0, retry: 0 };
+    }
+    let removed = 0;
+    let retry = 0;
+    for (const chunk of this.store.listRetiredArtifactBacklog()) {
+      try {
+        removed += await this._cleanupRetiredArtifact(chunk.id);
+      } catch {
+        retry += 1;
+        try {
+          this.onRecoveryError({
+            chunkId: chunk.id,
+            jobId: null,
+            code: "retired_artifact_cleanup_failed",
+          });
+        } catch {
+          // Maintenance telemetry must not block independent rows.
+        }
+      }
+    }
+    return { removed, retry };
+  }
+
   async cleanupRetiredChunk(chunk, at = this.now()) {
     if (!chunk || typeof chunk !== "object") throw new TypeError("chunk is required");
     await this._validatedRoot();
@@ -338,7 +399,7 @@ class FlacCompressionWorker {
     if (!chunk?.retired_path) return 0;
     const retiredPath = this._contained(chunk.retired_path);
     if (path.resolve(chunk.path) === path.resolve(retiredPath)) return 0;
-    const identity = {
+    let identity = {
       chunkId: chunk.id,
       retiredPath: chunk.retired_path,
       retiredFormat: chunk.retired_format,
@@ -355,9 +416,17 @@ class FlacCompressionWorker {
       typeof chunk.retired_file_sha256 !== "string" ||
       !/^[0-9a-f]{64}$/.test(chunk.retired_file_sha256)
     ) {
-      return 0;
+      if (typeof this.store.setRetiredArtifactHash !== "function") return 0;
+      const bytes = await this.fs.readFile(retiredPath);
+      const retiredFileSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      const recorded = this.store.setRetiredArtifactHash({
+        ...identity,
+        retiredFileSha256,
+      });
+      if (recorded !== 1) return 0;
+      identity = { ...identity, retiredFileSha256 };
     }
-    await this._safeUnlink(retiredPath, chunk.retired_file_sha256);
+    await this._safeUnlink(retiredPath, identity.retiredFileSha256);
     this.store.clearRetiredArtifact(identity);
     return 1;
   }
@@ -426,11 +495,20 @@ class FlacCompressionWorker {
   async _recoverFlac(chunk, job, result) {
     const flacPath = this._contained(chunk.path);
     let authoritativePcm;
-    let actualFileSha256 = null;
+    let fileBytes;
     try {
       await this._assertSafeExistingFile(flacPath);
-      const fileBytes = await this.fs.readFile(flacPath);
-      actualFileSha256 = crypto.createHash("sha256").update(fileBytes).digest("hex");
+      fileBytes = await this.fs.readFile(flacPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        await this._recoverInvalidFlacAuthority(chunk, job, flacPath, null, result);
+        return;
+      }
+      this._markTemporarilyUnreadableFlac(chunk, job, flacPath);
+      return;
+    }
+    const actualFileSha256 = crypto.createHash("sha256").update(fileBytes).digest("hex");
+    try {
       if (chunk.file_sha256 && actualFileSha256 !== chunk.file_sha256) {
         throw new Error("file_hash_mismatch");
       }
@@ -446,6 +524,13 @@ class FlacCompressionWorker {
       );
       return;
     }
+
+    this.store.markCompressionRecoveryVerified?.({
+      chunkId: chunk.id,
+      jobId: job.id,
+      encoderVersion: job.encoderVersion,
+      verifiedAt: this.now(),
+    });
 
     const parsed = path.parse(flacPath);
     for (const suffix of [".partial", ".tmp"]) {
@@ -467,6 +552,17 @@ class FlacCompressionWorker {
     } catch {
       // A conflicting non-authoritative file is preserved for diagnosis.
     }
+  }
+
+  _markTemporarilyUnreadableFlac(chunk, job, flacPath) {
+    if (typeof this.store.markCompressionRecoveryRetry !== "function") return;
+    this.store.markCompressionRecoveryRetry({
+      chunkId: chunk.id,
+      jobId: job.id,
+      encoderVersion: job.encoderVersion,
+      flacPath,
+      fileSha256: chunk.file_sha256,
+    });
   }
 
   async _recoverInvalidFlacAuthority(

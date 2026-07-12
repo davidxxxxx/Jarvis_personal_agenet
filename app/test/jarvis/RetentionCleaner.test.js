@@ -181,6 +181,81 @@ test("temporary evidence cleanup failure is isolated and reported without privat
   assert.equal(JSON.stringify(logs).includes("private"), false);
 });
 
+test("retired artifact maintenance runs every cycle and reports privacy-safe counts", async () => {
+  const logs = [];
+  const repository = repositoryWith([]);
+  let cycle = 0;
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => [],
+    artifactCleaner: {
+      async runMaintenance() {
+        cycle += 1;
+        if (cycle === 1) return { removed: 0, retry: 1 };
+        return { removed: 1, retry: 0 };
+      },
+    },
+    log: (entry) => logs.push(entry),
+  });
+
+  assert.deepEqual(await cleaner.clean(16_000), { deleted: 0, missing: 0, retry: 0 });
+  assert.deepEqual(await cleaner.clean(17_000), { deleted: 0, missing: 0, retry: 0 });
+  assert.deepEqual(logs, [
+    { deleted: 0, missing: 0, retry: 0, retiredArtifactRetry: 1 },
+    { deleted: 0, missing: 0, retry: 0, retiredArtifactRemoved: 1 },
+  ]);
+});
+
+test("one retired artifact failure does not block sibling tombstones", async () => {
+  const logs = [];
+  const repository = repositoryWith([
+    { id: "locked", path: "locked.wav" },
+    { id: "sibling", path: "sibling.wav" },
+  ]);
+  const cleaned = [];
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => [
+      { status: "deleted", code: "deleted" },
+      { status: "deleted", code: "deleted" },
+    ],
+    artifactCleaner: {
+      async runMaintenance() {
+        return { removed: 0, retry: 0 };
+      },
+      async cleanupRetiredChunk(chunk) {
+        if (chunk.id === "locked") {
+          const error = new Error("C:\\private\\locked.flac");
+          error.code = "EBUSY";
+          throw error;
+        }
+        cleaned.push(chunk.id);
+        return 1;
+      },
+    },
+    log: (entry) => logs.push(entry),
+  });
+
+  assert.deepEqual(await cleaner.clean(18_000), { deleted: 2, missing: 0, retry: 0 });
+  assert.deepEqual(repository.tombstoned, [
+    { id: "locked", deletedAt: 18_000 },
+    { id: "sibling", deletedAt: 18_000 },
+  ]);
+  assert.deepEqual(cleaned, ["sibling"]);
+  assert.deepEqual(logs, [
+    {
+      deleted: 2,
+      missing: 0,
+      retry: 0,
+      retiredArtifactRemoved: 1,
+      retiredArtifactRetry: 1,
+    },
+  ]);
+  assert.equal(JSON.stringify(logs).includes("private"), false);
+});
+
 test("surfaces metadata transaction failures without claiming successful cleanup", async () => {
   const logs = [];
   const repository = repositoryWith([

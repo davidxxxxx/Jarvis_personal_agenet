@@ -145,6 +145,11 @@ class CaptureEvidenceStore {
           )
         ORDER BY id
       `),
+      listRetiredArtifactBacklog: db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE retired_path IS NOT NULL
+        ORDER BY id
+      `),
       getCompressionJobForChunk: db.prepare(`
         SELECT * FROM processing_jobs
         WHERE chunk_id = ? AND job_type = 'compress_chunk'
@@ -203,6 +208,15 @@ class CaptureEvidenceStore {
           AND retired_format = @retiredFormat
           AND retired_file_sha256 IS @retiredFileSha256
       `),
+      setRetiredArtifactHash: db.prepare(`
+        UPDATE audio_chunks
+        SET retired_file_sha256 = @retiredFileSha256
+        WHERE id = @chunkId
+          AND retired_path = @retiredPath
+          AND retired_format IS @retiredFormat
+          AND retired_file_sha256 IS NULL
+          AND path <> @retiredPath
+      `),
       retryCompressionJob: db.prepare(`
         UPDATE processing_jobs
         SET state = 'retry', completed_at = NULL,
@@ -222,6 +236,36 @@ class CaptureEvidenceStore {
           AND job_type = 'compress_chunk'
           AND chunk_id = @chunkId
           AND model_version = @encoderVersion
+      `),
+      retryUnreadableFlacRecovery: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry', error_code = 'flac_authority_temporarily_unreadable',
+            completed_at = NULL, next_retry_at = NULL,
+            lease_owner = NULL, lease_expires_at = NULL
+        WHERE id = @jobId
+          AND job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND model_version = @encoderVersion
+          AND EXISTS (
+            SELECT 1 FROM audio_chunks
+            WHERE id = @chunkId
+              AND path = @flacPath
+              AND format = 'flac'
+              AND file_sha256 IS @fileSha256
+              AND deleted_at IS NULL
+          )
+      `),
+      completeUnreadableFlacRecovery: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'completed', error_code = NULL,
+            completed_at = @verifiedAt, next_retry_at = NULL,
+            lease_owner = NULL, lease_expires_at = NULL
+        WHERE id = @jobId
+          AND job_type = 'compress_chunk'
+          AND chunk_id = @chunkId
+          AND model_version = @encoderVersion
+          AND state = 'retry'
+          AND error_code = 'flac_authority_temporarily_unreadable'
       `),
       tombstoneChunk: db.prepare(`
         UPDATE audio_chunks
@@ -685,6 +729,20 @@ class CaptureEvidenceStore {
     return this.statements.clearRetiredArtifact.run(input).changes;
   }
 
+  setRetiredArtifactHash(input) {
+    return this.statements.setRetiredArtifactHash.run(input).changes;
+  }
+
+  markCompressionRecoveryRetry(input) {
+    const retried = this.statements.retryUnreadableFlacRecovery.run(input);
+    if (retried.changes !== 1) throw new Error("compression recovery retry was not recorded");
+    return this.getCompressionJob(input.jobId);
+  }
+
+  markCompressionRecoveryVerified(input) {
+    return this.statements.completeUnreadableFlacRecovery.run(input).changes;
+  }
+
   getCompressionJob(id) {
     this._assertIdentifier(id, "compressionJobId");
     return this.statements.getCompressionJob.get(id) ?? null;
@@ -695,6 +753,12 @@ class CaptureEvidenceStore {
       chunk: this._maintenanceChunkResult(row),
       job: this.statements.getCompressionJobForChunk.get(row.id),
     }));
+  }
+
+  listRetiredArtifactBacklog() {
+    return this.statements.listRetiredArtifactBacklog
+      .all()
+      .map((row) => this._maintenanceChunkResult(row));
   }
 
   tombstoneChunk(id, deletedAt = this.now()) {

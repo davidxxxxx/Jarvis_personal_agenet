@@ -1514,6 +1514,10 @@ class JarvisRepository {
       .map(toPublicAudioChunk);
   }
 
+  listRetiredArtifactBacklog() {
+    return this.captureEvidenceStore.listRetiredArtifactBacklog();
+  }
+
   recoverOpenSessions(at = Date.now()) {
     return this._recoverOpenSessions(assertInteger(at, "at"));
   }
