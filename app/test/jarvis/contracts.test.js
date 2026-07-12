@@ -172,6 +172,37 @@ test("audio read IPC returns a verified playable WAV for authoritative FLAC", as
   assert.deepEqual(calls, [chunk]);
 });
 
+test("retired provenance is private at audio IPC boundaries", () => {
+  const handlers = new Map();
+  const privateChunk = {
+    id: "c1",
+    session_id: "s1",
+    path: "speech.wav",
+    format: "wav",
+    retired_path: "private.flac",
+    retired_format: "flac",
+    retired_file_sha256: "b".repeat(64),
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      listAudioChunks: () => [privateChunk],
+      getSessionDetail: () => ({ session: { id: "s1" }, audioChunks: [privateChunk] }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const list = handlers.get(CHANNELS.listAudioChunks)(null, "s1");
+  const detail = handlers.get(CHANNELS.getSessionDetail)(null, "s1");
+  for (const chunk of [list[0], detail.audioChunks[0]]) {
+    assert.equal(Object.hasOwn(chunk, "retired_path"), false);
+    assert.equal(Object.hasOwn(chunk, "retired_format"), false);
+    assert.equal(Object.hasOwn(chunk, "retired_file_sha256"), false);
+  }
+});
+
 test("start capture IPC rejects invalid source selections before calling the service", () => {
   let calls = 0;
   const handlers = new Map();

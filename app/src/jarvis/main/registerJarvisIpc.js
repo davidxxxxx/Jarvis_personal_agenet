@@ -7,6 +7,7 @@ const {
   assertRetentionMode,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
+const { toPublicAudioChunk, toPublicSessionDetail } = require("./AudioChunkPublicView");
 const fs = require("node:fs/promises");
 
 const REQUIRED_REPOSITORY_METHODS = [
@@ -165,7 +166,7 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
-    repository.listAudioChunks(assertId(sessionId, "sessionId"))
+    repository.listAudioChunks(assertId(sessionId, "sessionId")).map(toPublicAudioChunk)
   );
   ipcMain.handle(CHANNELS.readAudioChunk, async (_event, audioChunkId) => {
     const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
@@ -179,7 +180,7 @@ function registerJarvisIpc({
     }
   });
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
-    repository.getSessionDetail(assertId(sessionId, "sessionId"))
+    toPublicSessionDetail(repository.getSessionDetail(assertId(sessionId, "sessionId")))
   );
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
     if (typeof query !== "string") throw new TypeError("query must be a string");

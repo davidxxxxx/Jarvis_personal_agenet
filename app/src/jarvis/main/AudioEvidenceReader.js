@@ -276,6 +276,9 @@ class AudioEvidenceReader {
     temporaryWav = null,
     recordingsRoot = null,
     fsImpl = fs.promises,
+    now = Date.now,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
   } = {}) {
     temporaryWav ??= defaultTemporaryWav(recordingsRoot);
     if (!decoder || typeof decoder.decode !== "function") {
@@ -288,6 +291,9 @@ class AudioEvidenceReader {
     this.temporaryWav = temporaryWav;
     this.recordingsRoot = typeof recordingsRoot === "string" ? path.resolve(recordingsRoot) : null;
     this.fs = fsImpl;
+    this.now = now;
+    this.setTimeout = setTimeoutImpl;
+    this.clearTimeout = clearTimeoutImpl;
     this.fixedRoot = null;
   }
 
@@ -307,16 +313,43 @@ class AudioEvidenceReader {
     return pcm;
   }
 
-  async withVerifiedWav(chunk, consume) {
+  async withVerifiedWav(chunk, consume, { deadline: requestedDeadline } = {}) {
     if (typeof consume !== "function") throw new TypeError("consume must be a function");
+    const deadlines = [chunk?.expires_at, requestedDeadline].filter(Number.isFinite);
+    const hasDeadline = deadlines.length > 0;
+    const deadline = hasDeadline ? Math.min(...deadlines) : null;
+    const assertLive = () => {
+      if (hasDeadline && this.now() >= deadline) {
+        const error = new Error("audio_expired");
+        error.code = "audio_expired";
+        throw error;
+      }
+    };
+    assertLive();
     const pcm = await this.readVerifiedPcm(chunk);
+    assertLive();
     const temporary = await this.temporaryWav.write(pcm, {
       chunkId: chunk.id,
       pcmSha256: chunk.pcm_sha256 ?? chunk.sha256,
     });
+    const controller = new AbortController();
+    let timer = null;
     try {
-      return await consume(temporary.path);
+      assertLive();
+      const consumption = Promise.resolve().then(() => consume(temporary.path, controller.signal));
+      if (!hasDeadline) return await consumption;
+      const expired = new Promise((_resolve, reject) => {
+        timer = this.setTimeout(() => {
+          const error = new Error("audio_expired");
+          error.code = "audio_expired";
+          controller.abort(error);
+          reject(error);
+        }, Math.max(0, deadline - this.now()));
+        timer?.unref?.();
+      });
+      return await Promise.race([consumption, expired]);
     } finally {
+      if (timer !== null) this.clearTimeout(timer);
       await temporary.remove();
     }
   }

@@ -51,21 +51,31 @@ class RetentionCleaner {
     const generation = this.generation;
     const run = async () => {
       const counts = { deleted: 0, retry: 0, missing: 0 };
+      let temporaryEvidenceFailures = 0;
+      const report = (extra = {}) => ({
+        ...counts,
+        ...extra,
+        ...(temporaryEvidenceFailures > 0 ? { temporaryEvidenceFailures } : {}),
+      });
       let expired;
-      try {
-        if (typeof this.temporaryEvidenceCleaner?.cleanupStaleTemporaryEvidence === "function") {
+      if (typeof this.temporaryEvidenceCleaner?.cleanupStaleTemporaryEvidence === "function") {
+        try {
           await this.temporaryEvidenceCleaner.cleanupStaleTemporaryEvidence({
             getChunk: (id) => this.repository.getAudioChunk?.(id) ?? null,
           });
+        } catch {
+          temporaryEvidenceFailures = 1;
         }
+      }
+      try {
         this.repository.promoteSoonExpiringAudioJobs(at, at + URGENT_WINDOW_MS);
         expired = this.repository.listExpiredAudioChunks(at);
       } catch (error) {
-        this.log({ ...counts, retry: 1, metadataFailures: 1 });
+        this.log(report({ retry: 1, metadataFailures: 1 }));
         throw new AggregateError([error], "retention metadata preparation failed");
       }
       if (expired.length === 0) {
-        this.log({ ...counts });
+        this.log(report());
         return counts;
       }
       let results;
@@ -100,8 +110,8 @@ class RetentionCleaner {
       }
       this.log(
         metadataErrors.length > 0
-          ? { ...counts, metadataFailures: metadataErrors.length }
-          : { ...counts }
+          ? report({ metadataFailures: metadataErrors.length })
+          : report()
       );
       if (metadataErrors.length > 0) {
         throw new AggregateError(metadataErrors, "retention metadata cleanup failed");

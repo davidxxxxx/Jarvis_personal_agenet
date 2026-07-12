@@ -158,6 +158,29 @@ test("retention cleanup asks the shared reader to remove proven stale leases", a
   assert.deepEqual(calls, [{ id: "c1" }]);
 });
 
+test("temporary evidence cleanup failure is isolated and reported without private details", async () => {
+  const logs = [];
+  const repository = repositoryWith([{ id: "expired", path: "private-recording.wav" }]);
+  const cleaner = new RetentionCleaner({
+    repository,
+    recordingsRoot: path.resolve("recordings"),
+    deleteBatch: async () => [{ status: "deleted", code: "deleted" }],
+    temporaryEvidenceCleaner: {
+      async cleanupStaleTemporaryEvidence() {
+        throw new Error("C:\\Users\\private\\secret-lease.wav");
+      },
+    },
+    log: (entry) => logs.push(entry),
+  });
+
+  assert.deepEqual(await cleaner.clean(15_000), { deleted: 1, missing: 0, retry: 0 });
+  assert.deepEqual(repository.tombstoned, [{ id: "expired", deletedAt: 15_000 }]);
+  assert.deepEqual(logs, [
+    { deleted: 1, missing: 0, retry: 0, temporaryEvidenceFailures: 1 },
+  ]);
+  assert.equal(JSON.stringify(logs).includes("private"), false);
+});
+
 test("surfaces metadata transaction failures without claiming successful cleanup", async () => {
   const logs = [];
   const repository = repositoryWith([

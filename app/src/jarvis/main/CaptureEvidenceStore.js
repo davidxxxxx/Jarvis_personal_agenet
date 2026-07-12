@@ -10,6 +10,8 @@ const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   failed: "failed",
 });
 
+const { toPublicAudioChunk } = require("./AudioChunkPublicView");
+
 class CaptureEvidenceStore {
   constructor(db, { createId, now = Date.now }) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
@@ -179,7 +181,10 @@ class CaptureEvidenceStore {
         UPDATE audio_chunks
         SET path = @wavPath,
             format = 'wav',
-            file_sha256 = NULL
+            file_sha256 = NULL,
+            retired_path = @flacPath,
+            retired_format = 'flac',
+            retired_file_sha256 = @retiredFileSha256
         WHERE id = @chunkId
           AND path = @flacPath
           AND format = 'flac'
@@ -187,6 +192,16 @@ class CaptureEvidenceStore {
           AND file_sha256 = @fileSha256
           AND deleted_at IS NULL
           AND write_state = 'committed'
+      `),
+      clearRetiredArtifact: db.prepare(`
+        UPDATE audio_chunks
+        SET retired_path = NULL,
+            retired_format = NULL,
+            retired_file_sha256 = NULL
+        WHERE id = @chunkId
+          AND retired_path = @retiredPath
+          AND retired_format = @retiredFormat
+          AND retired_file_sha256 IS @retiredFileSha256
       `),
       retryCompressionJob: db.prepare(`
         UPDATE processing_jobs
@@ -210,8 +225,12 @@ class CaptureEvidenceStore {
       `),
       tombstoneChunk: db.prepare(`
         UPDATE audio_chunks
-        SET retired_path = path,
-            retired_format = format,
+        SET retired_path = COALESCE(retired_path, path),
+            retired_format = COALESCE(retired_format, format),
+            retired_file_sha256 = COALESCE(
+              retired_file_sha256,
+              CASE WHEN format = 'flac' THEN file_sha256 ELSE NULL END
+            ),
             path = 'tombstone:' || id,
             deleted_at = ?
         WHERE id = ? AND deleted_at IS NULL
@@ -642,6 +661,12 @@ class CaptureEvidenceStore {
     return row ? this._chunkResult(row) : null;
   }
 
+  getChunkForMaintenance(id) {
+    this._assertIdentifier(id, "chunkId");
+    const row = this.statements.getChunk.get(id);
+    return row ? this._maintenanceChunkResult(row) : null;
+  }
+
   promoteChunkToFlac(input) {
     return this.promoteChunkToFlacTransaction(input);
   }
@@ -656,6 +681,10 @@ class CaptureEvidenceStore {
     return this.getCompressionJob(input.jobId);
   }
 
+  clearRetiredArtifact(input) {
+    return this.statements.clearRetiredArtifact.run(input).changes;
+  }
+
   getCompressionJob(id) {
     this._assertIdentifier(id, "compressionJobId");
     return this.statements.getCompressionJob.get(id) ?? null;
@@ -663,7 +692,7 @@ class CaptureEvidenceStore {
 
   listCompressionRecoveryCandidates() {
     return this.statements.listCompressionChunks.all().map((row) => ({
-      chunk: this._chunkResult(row),
+      chunk: this._maintenanceChunkResult(row),
       job: this.statements.getCompressionJobForChunk.get(row.id),
     }));
   }
@@ -719,6 +748,10 @@ class CaptureEvidenceStore {
   }
 
   _chunkResult(row) {
+    return toPublicAudioChunk(this._maintenanceChunkResult(row));
+  }
+
+  _maintenanceChunkResult(row) {
     return {
       ...row,
       format: row.format ?? "wav",
@@ -726,6 +759,7 @@ class CaptureEvidenceStore {
       file_sha256: row.file_sha256 ?? null,
       retired_path: row.retired_path ?? null,
       retired_format: row.retired_format ?? null,
+      retired_file_sha256: row.retired_file_sha256 ?? null,
       sample_rate: row.sample_rate ?? 24_000,
       channels: row.channels ?? 1,
     };

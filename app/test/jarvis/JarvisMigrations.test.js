@@ -175,6 +175,7 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       channels: 1,
       retired_path: null,
       retired_format: null,
+      retired_file_sha256: null,
     });
     assert.equal(db.prepare("SELECT count(*) AS count FROM audio_chunks").get().count, 2);
   } finally {

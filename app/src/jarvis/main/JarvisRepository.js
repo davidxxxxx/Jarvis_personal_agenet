@@ -8,6 +8,7 @@ const {
 } = require("../shared/captureModes");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("./JarvisMigrations");
+const { toPublicAudioChunk } = require("./AudioChunkPublicView");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -1474,15 +1475,19 @@ class JarvisRepository {
       transcriptionStatus: chunk.transcriptionStatus ?? "pending",
     };
     this.statements.insertAudioChunk.run(input);
-    return this.statements.getAudioChunk.get(input.id);
+    return toPublicAudioChunk(this.statements.getAudioChunk.get(input.id));
   }
 
   listAudioChunks(sessionId) {
-    return this.statements.listAudioChunks.all(assertId(sessionId, "sessionId"));
+    return this.statements.listAudioChunks
+      .all(assertId(sessionId, "sessionId"))
+      .map(toPublicAudioChunk);
   }
 
   listUntrackedAudioChunks(sessionId) {
-    return this.statements.listUntrackedAudioChunks.all(assertId(sessionId, "sessionId"));
+    return this.statements.listUntrackedAudioChunks
+      .all(assertId(sessionId, "sessionId"))
+      .map(toPublicAudioChunk);
   }
 
   backfillLegacyMicChunks({ sessionId, deterministicTrackId, chunkIds, createdAt = Date.now() }) {
@@ -1499,11 +1504,14 @@ class JarvisRepository {
   }
 
   getAudioChunk(id) {
-    return this.statements.getAudioChunk.get(assertId(id, "audioChunkId")) ?? null;
+    const row = this.statements.getAudioChunk.get(assertId(id, "audioChunkId"));
+    return row ? toPublicAudioChunk(row) : null;
   }
 
   listExpiredAudioChunks(now = Date.now()) {
-    return this.statements.listExpiredAudioChunks.all(assertInteger(now, "now"));
+    return this.statements.listExpiredAudioChunks
+      .all(assertInteger(now, "now"))
+      .map(toPublicAudioChunk);
   }
 
   recoverOpenSessions(at = Date.now()) {

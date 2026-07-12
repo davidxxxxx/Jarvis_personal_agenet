@@ -365,6 +365,40 @@ test("audio metadata retention and interrupted session recovery stay in jarvis.d
   repo.close();
 });
 
+test("retired provenance is private across repository audio views", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  repo.insertAudioChunk({
+    id: "chunk-1",
+    sessionId: "s1",
+    path: "audio/s1/chunk-1.wav",
+    startedAt: 1_000,
+    endedAt: 1_500,
+    durationMs: 500,
+    sha256: "a".repeat(64),
+    expiresAt: 4_000,
+  });
+  repo.db
+    .prepare(
+      `UPDATE audio_chunks
+       SET retired_path = 'private.flac', retired_format = 'flac',
+           retired_file_sha256 = ?
+       WHERE id = 'chunk-1'`
+    )
+    .run("b".repeat(64));
+
+  for (const chunk of [
+    repo.getAudioChunk("chunk-1"),
+    repo.listAudioChunks("s1")[0],
+    repo.getSessionDetail("s1").audioChunks[0],
+  ]) {
+    assert.equal(Object.hasOwn(chunk, "retired_path"), false);
+    assert.equal(Object.hasOwn(chunk, "retired_format"), false);
+    assert.equal(Object.hasOwn(chunk, "retired_file_sha256"), false);
+  }
+});
+
 test("schema initialization is idempotent and file databases use WAL", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-repository-"));
   const dbPath = path.join(directory, "jarvis.db");

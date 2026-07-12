@@ -1,4 +1,4 @@
-const TARGET_VERSION = 7;
+const TARGET_VERSION = 8;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -72,7 +72,8 @@ const MIGRATION_BASE_SCHEMA = `
     sample_rate INTEGER NOT NULL DEFAULT 24000,
     channels INTEGER NOT NULL DEFAULT 1,
     retired_path TEXT,
-    retired_format TEXT
+    retired_format TEXT,
+    retired_file_sha256 TEXT
   );
 `;
 
@@ -192,6 +193,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "audio_chunks", "channels INTEGER NOT NULL DEFAULT 1");
     addColumn(db, "audio_chunks", "retired_path TEXT");
     addColumn(db, "audio_chunks", "retired_format TEXT");
+    addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS audio_tracks (
