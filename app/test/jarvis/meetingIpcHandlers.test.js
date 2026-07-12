@@ -30,6 +30,10 @@ function createFixture({
   managedStartChunk = null,
   managedStartDeferred = null,
   managedStopDeferred = null,
+  aecStartDeferred = null,
+  transcribeLocalWhisper = async () => ({ success: true, text: "" }),
+  maybeCorrect = null,
+  warmStreaming = false,
   systemAvailable = false,
   aecAvailable = false,
 } = {}) {
@@ -40,6 +44,10 @@ function createFixture({
   const managerStops = [];
   const managedStartAcceptances = [];
   const derivedCalls = [];
+  const lifecycle = [];
+  const whisperCalls = [];
+  const correctionCalls = [];
+  const transcriptRevisions = [];
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-meeting-ipc-"));
   const createSender = (id) => {
     const webContents = new EventEmitter();
@@ -106,6 +114,7 @@ function createFixture({
   const windowsLoopbackAudioManager = {
     getCapability: async () => ({ available: systemAvailable }),
     start: async (options) => {
+      lifecycle.push("manager-start");
       managedStarts.push(options);
       if (managedStartChunk) {
         managedStartAcceptances.push(options.onChunk(managedStartChunk));
@@ -113,14 +122,21 @@ function createFixture({
       if (managedStartDeferred) await managedStartDeferred.promise;
     },
     stop: async () => {
+      lifecycle.push("manager-stop");
       managerStops.push("stop");
       if (managedStopDeferred) await managedStopDeferred.promise;
     },
   };
   const meetingAecManager = {
     isAvailable: () => aecAvailable,
-    start: async () => aecAvailable,
-    stop: async () => {},
+    start: async () => {
+      lifecycle.push("aec-start");
+      if (aecStartDeferred) await aecStartDeferred.promise;
+      return aecAvailable;
+    },
+    stop: async () => {
+      lifecycle.push("aec-stop");
+    },
     processSystemBuffer: (buffer) => {
       derivedCalls.push(["system", buffer]);
       onDerived("system", buffer);
@@ -132,11 +148,21 @@ function createFixture({
       return true;
     },
   };
+  const createWarmStreaming = (source) => ({
+    isConnected: true,
+    disconnect: async () => {
+      lifecycle.push(`${source}-stream-disconnect`);
+      return { text: "" };
+    },
+  });
   const instance = Object.assign(Object.create(IPCHandlers.prototype), {
     environmentManager: {},
     databaseManager: {},
     whisperManager: {
-      transcribeLocalWhisper: async () => ({ success: true, text: "" }),
+      transcribeLocalWhisper: async (...args) => {
+        whisperCalls.push(args);
+        return transcribeLocalWhisper(...args);
+      },
     },
     parakeetManager: {},
     diarizationManager: null,
@@ -149,13 +175,22 @@ function createFixture({
     windowsLoopbackAudioManager,
     meetingAecManager,
     jarvisService: { appendPcm },
-    jarvisRepository: null,
-    openAiCorrectionService: null,
+    jarvisRepository: {
+      addTranscriptRevision: (revision) => transcriptRevisions.push(revision),
+    },
+    openAiCorrectionService: maybeCorrect
+      ? {
+          maybeCorrect: async (request) => {
+            correctionCalls.push(request);
+            return maybeCorrect(request);
+          },
+        }
+      : null,
     speakerDiarizationEnabled: false,
     activeMeetingSpeakerConfig: null,
     whisperVadSettings: {},
-    _meetingMicStreaming: null,
-    _meetingSystemStreaming: null,
+    _meetingMicStreaming: warmStreaming ? createWarmStreaming("mic") : null,
+    _meetingSystemStreaming: warmStreaming ? createWarmStreaming("system") : null,
   });
   instance.setupHandlers();
 
@@ -167,6 +202,10 @@ function createFixture({
     createSender,
     detectionStates,
     managerStops,
+    lifecycle,
+    whisperCalls,
+    correctionCalls,
+    transcriptRevisions,
     derivedCalls,
     managedOptions: () => managedStarts.at(-1),
     managedStarts,
@@ -553,12 +592,16 @@ test("rollback invalidates native ingress before awaiting manager teardown", asy
   });
   t.after(fixture.cleanup);
   const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
 
   const startPromise = start(
     { sender: fixture.sender },
     { provider: "local", jarvisSessionId: "jarvis-flush-failure" }
   );
   await waitFor(() => fixture.managerStops.length >= 1);
+  const stopPromise = stop({ sender: fixture.sender });
+  await new Promise((resolve) => setImmediate(resolve));
+  const managerStopsBeforeRelease = fixture.managerStops.length;
 
   let acceptedDuringTeardown;
   let callbackError = null;
@@ -569,10 +612,12 @@ test("rollback invalidates native ingress before awaiting manager teardown", asy
   }
 
   stopDeferred.resolve();
-  const result = await startPromise;
+  const [result, stopped] = await Promise.all([startPromise, stopPromise]);
   assert.equal(callbackError, null);
   assert.equal(acceptedDuringTeardown, false);
   assert.equal(appendCalls, 1);
+  assert.equal(managerStopsBeforeRelease, 1);
+  assert.equal(stopped.success, true);
   assert.equal(result.success, false);
   assert.match(result.error, /startup evidence failed/);
 });
@@ -721,10 +766,16 @@ test("explicit stop and rollback of the same in-flight start share one teardown"
   );
   await waitFor(() => fixture.managedStarts.length === 1, "the in-flight manager start");
   const stopPromise = stop({ sender: fixture.sender });
-  await waitFor(() => fixture.managerStops.length >= 1, "the explicit manager stop");
+  let stopSettled = false;
+  stopPromise.finally(() => {
+    stopSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopSettled, false);
+  assert.equal(fixture.managerStops.length, 0);
 
   startDeferred.resolve();
-  await new Promise((resolve) => setImmediate(resolve));
+  await waitFor(() => fixture.managerStops.length >= 1, "the post-start rollback manager stop");
   const managerStopsBeforeRelease = fixture.managerStops.length;
   stopDeferred.resolve();
   const [startResult, stopResult] = await Promise.all([startPromise, stopPromise]);
@@ -737,4 +788,177 @@ test("explicit stop and rollback of the same in-flight start share one teardown"
   assert.equal(stopResult.success, true);
   assert.equal(managerStopsBeforeRelease, 1);
   assert.equal(current.success, true);
+});
+
+test("early explicit stop waits for startup settlement before one fresh rollback", async (t) => {
+  const aecStartDeferred = createDeferred();
+  const persisted = [];
+  const fixture = createFixture({
+    aecAvailable: true,
+    aecStartDeferred,
+    appendPcm: (...args) => {
+      persisted.push(args);
+      return true;
+    },
+    systemAvailable: true,
+    warmStreaming: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const startPromise = start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-early-stop" }
+  );
+  await waitFor(() => fixture.lifecycle.includes("aec-start"), "the deferred AEC start");
+
+  let stopSettled = false;
+  const stopPromise = stop({ sender: fixture.sender }).then((result) => {
+    stopSettled = true;
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopWasPendingBeforeStartupSettled = !stopSettled;
+
+  aecStartDeferred.resolve();
+  const [startResult, stopResult] = await Promise.all([startPromise, stopPromise]);
+  const managedStartsAfterRollback = fixture.managedStarts.length;
+  const lifecycleAfterRollback = [...fixture.lifecycle];
+
+  assert.equal(stopWasPendingBeforeStartupSettled, true);
+  assert.equal(startResult.success, false);
+  assert.equal(stopResult.success, true);
+  assert.equal(managedStartsAfterRollback, 0);
+  assert.equal(
+    lifecycleAfterRollback.filter((entry) => entry === "manager-stop").length,
+    1
+  );
+  assert.ok(
+    lifecycleAfterRollback.indexOf("aec-stop") > lifecycleAfterRollback.indexOf("aec-start")
+  );
+
+  const current = await start(
+    { sender: fixture.sender },
+    { provider: "local" }
+  );
+  send({ sender: fixture.sender }, Buffer.alloc(4), "mic", current.inputGeneration);
+  assert.equal(current.success, true);
+  assert.deepEqual(persisted, []);
+});
+
+test("normal stop preserves Jarvis identity through the final local transcription flush", async (t) => {
+  const finalTranscriptionDeferred = createDeferred();
+  const correctionDeferred = createDeferred();
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (...args) => {
+      persisted.push(args);
+      return true;
+    },
+    transcribeLocalWhisper: async () => finalTranscriptionDeferred.promise,
+    maybeCorrect: async () => correctionDeferred.promise,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const pcm = Buffer.alloc(4_800 * 2);
+  for (let offset = 0; offset < pcm.length; offset += 2) pcm.writeInt16LE(12_000, offset);
+
+  const started = await start(
+    { sender: fixture.sender },
+    {
+      provider: "local",
+      micOnly: true,
+      jarvisSessionId: "jarvis-final-flush",
+    }
+  );
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+
+  const stopPromise = stop({ sender: fixture.sender });
+  await waitFor(() => fixture.whisperCalls.length === 1, "the final local transcription");
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  const persistedDuringStop = persisted.length;
+
+  finalTranscriptionDeferred.resolve({ success: true, text: "und der die das" });
+  await waitFor(() => fixture.correctionCalls.length === 1, "the final cloud correction");
+  let stopSettledBeforeCorrection = false;
+  stopPromise.finally(() => {
+    stopSettledBeforeCorrection = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopWaitedForCorrection = !stopSettledBeforeCorrection;
+  correctionDeferred.resolve({
+    status: "corrected",
+    text: "corrected bilingual transcript",
+    confidence: 0.95,
+  });
+  const stopped = await stopPromise;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const [, finalWhisperOptions] = fixture.whisperCalls[0];
+  assert.equal(persistedDuringStop, 1);
+  assert.equal(persisted.length, 1);
+  assert.equal(typeof finalWhisperOptions.initialPrompt, "string");
+  assert.ok(finalWhisperOptions.initialPrompt.length > 0);
+  assert.equal(fixture.correctionCalls.length, 1);
+  assert.equal(stopWaitedForCorrection, true);
+  assert.equal(fixture.transcriptRevisions.length, 1);
+  assert.equal(fixture.transcriptRevisions[0].sessionId, "jarvis-final-flush");
+  assert.equal(stopped.success, true);
+  assert.match(stopped.transcript, /und der die das/);
+});
+
+test("normal stop waits for an active periodic transcription and drains its tail", async (t) => {
+  const periodicTranscriptionDeferred = createDeferred();
+  const originalSetInterval = global.setInterval;
+  let periodicTick = null;
+  global.setInterval = (callback, delay, ...args) => {
+    periodicTick = callback;
+    return originalSetInterval(() => {}, delay, ...args);
+  };
+  t.after(() => {
+    global.setInterval = originalSetInterval;
+  });
+  let transcriptionCall = 0;
+  const fixture = createFixture({
+    transcribeLocalWhisper: async () => {
+      transcriptionCall += 1;
+      if (transcriptionCall === 1) return periodicTranscriptionDeferred.promise;
+      return { success: true, text: "tail transcript" };
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const pcm = Buffer.alloc(4_800 * 2);
+  for (let offset = 0; offset < pcm.length; offset += 2) pcm.writeInt16LE(12_000, offset);
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-periodic-final-drain" }
+  );
+  global.setInterval = originalSetInterval;
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  periodicTick();
+  await waitFor(() => fixture.whisperCalls.length === 1, "the periodic transcription");
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+
+  const stopPromise = stop({ sender: fixture.sender });
+  let stopSettled = false;
+  stopPromise.finally(() => {
+    stopSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopWaitedForPeriodic = !stopSettled;
+  periodicTranscriptionDeferred.resolve({ success: true, text: "periodic transcript" });
+  const stopped = await stopPromise;
+
+  assert.equal(stopWaitedForPeriodic, true);
+  assert.equal(fixture.whisperCalls.length, 2);
+  assert.match(stopped.transcript, /periodic transcript/);
+  assert.match(stopped.transcript, /tail transcript/);
 });

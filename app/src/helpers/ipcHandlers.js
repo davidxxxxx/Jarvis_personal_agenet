@@ -3975,6 +3975,7 @@ class IPCHandlers {
     });
 
     let meetingTranscriptionStartInProgress = false;
+    let meetingTranscriptionStartAttempt = null;
     let meetingTranscriptionTeardownPromise = null;
     let meetingTranscriptionStopPromise = null;
     let meetingTranscriptionPrepareState = null;
@@ -4657,6 +4658,9 @@ class IPCHandlers {
     let meetingLocalModel = null;
     let meetingLocalLanguage = null;
     let meetingLocalTranscribing = false;
+    let meetingLocalTranscriptionPromise = null;
+    let meetingLocalGeneration = 0;
+    const meetingPendingCorrectionPromises = new Set();
     let meetingPendingMicChunks = [];
     let meetingPendingMicFinals = [];
     let meetingPendingMicFinalTimer = null;
@@ -4684,10 +4688,14 @@ class IPCHandlers {
       return true;
     };
 
-    const resetActiveMeetingCapture = (inputBinding = activeMeetingInputBinding) => {
-      if (!clearActiveMeetingInputBinding(inputBinding)) return false;
+    const resetMeetingCaptureIdentity = () => {
       activeMeetingCaptureMode = resolveMeetingCaptureMode();
       activeJarvisSessionId = null;
+    };
+
+    const resetActiveMeetingCapture = (inputBinding = activeMeetingInputBinding) => {
+      if (!clearActiveMeetingInputBinding(inputBinding)) return false;
+      resetMeetingCaptureIdentity();
       return true;
     };
 
@@ -5030,6 +5038,7 @@ class IPCHandlers {
     };
 
     const transcribeLocalMeetingChunk = async (source) => {
+      const transcriptionGeneration = meetingLocalGeneration;
       const chunks = meetingLocalBuffers[source];
       if (!chunks.length) return;
 
@@ -5096,6 +5105,8 @@ class IPCHandlers {
           });
         }
 
+        if (transcriptionGeneration !== meetingLocalGeneration) return;
+
         if (result?.success && result.text?.trim()) {
           let text = result.text.trim();
           if (activeJarvisSessionId) {
@@ -5105,6 +5116,7 @@ class IPCHandlers {
           const quality = classifyTranscriptQuality(text);
           const segTimestamp = Date.now();
           const correctionSessionId = activeJarvisSessionId;
+          const correctionGeneration = transcriptionGeneration;
           const correctionContext = meetingLocalTranscript;
           const correctionAudioMs = Math.round((pcm24k.length / 2 / 24_000) * 1_000);
           let micSuppression = null;
@@ -5187,7 +5199,7 @@ class IPCHandlers {
             ) {
               return;
             }
-            void this.openAiCorrectionService
+            const correctionPromise = this.openAiCorrectionService
               .maybeCorrect({
                 audioWav: wav,
                 audioMs: correctionAudioMs,
@@ -5197,6 +5209,7 @@ class IPCHandlers {
               .then((corrected) => {
                 if (
                   corrected?.status !== "corrected" ||
+                  correctionGeneration !== meetingLocalGeneration ||
                   correctionSessionId !== activeJarvisSessionId ||
                   !meetingLocalWin ||
                   meetingLocalWin.isDestroyed()
@@ -5237,7 +5250,11 @@ class IPCHandlers {
                   { error: error.message },
                   "jarvis"
                 );
+              })
+              .finally(() => {
+                meetingPendingCorrectionPromises.delete(correctionPromise);
               });
+            meetingPendingCorrectionPromises.add(correctionPromise);
           };
 
           const emitLocalFinal = () => {
@@ -5282,18 +5299,37 @@ class IPCHandlers {
       }
     };
 
-    const transcribeAllLocalBuffers = async () => {
-      if (meetingLocalTranscribing) return;
-      meetingLocalTranscribing = true;
-      try {
-        await transcribeLocalMeetingChunk("system");
-        await transcribeLocalMeetingChunk("mic");
-      } finally {
-        meetingLocalTranscribing = false;
+    const transcribeAllLocalBuffers = () => {
+      if (meetingLocalTranscriptionPromise) return meetingLocalTranscriptionPromise;
+      const transcriptionPromise = (async () => {
+        meetingLocalTranscribing = true;
+        try {
+          await transcribeLocalMeetingChunk("system");
+          await transcribeLocalMeetingChunk("mic");
+        } finally {
+          meetingLocalTranscribing = false;
+        }
+      })();
+      meetingLocalTranscriptionPromise = transcriptionPromise;
+      const clearTranscriptionPromise = () => {
+        if (meetingLocalTranscriptionPromise === transcriptionPromise) {
+          meetingLocalTranscriptionPromise = null;
+        }
+      };
+      void transcriptionPromise.then(clearTranscriptionPromise, clearTranscriptionPromise);
+      return transcriptionPromise;
+    };
+
+    const waitForPendingMeetingCorrections = async () => {
+      while (meetingPendingCorrectionPromises.size > 0) {
+        await Promise.allSettled([...meetingPendingCorrectionPromises]);
       }
     };
 
     const resetMeetingLocalState = () => {
+      meetingLocalGeneration += 1;
+      meetingLocalTranscriptionPromise = null;
+      meetingPendingCorrectionPromises.clear();
       if (meetingLocalTimer) {
         clearInterval(meetingLocalTimer);
         meetingLocalTimer = null;
@@ -5738,6 +5774,7 @@ class IPCHandlers {
       }
 
       meetingTranscriptionStartInProgress = true;
+      let resolveStartSettled;
       const startInputBinding = {
         owner: event.sender,
         ownerId: event.sender.id,
@@ -5747,12 +5784,19 @@ class IPCHandlers {
         pendingManagedSystemChunks: [],
         ownerDestroyedListener: null,
         teardownPromise: null,
+        startSettledPromise: new Promise((resolve) => {
+          resolveStartSettled = resolve;
+        }),
       };
       activeMeetingInputBinding = startInputBinding;
-      const completeMeetingTranscriptionStart = (result) => {
+      meetingTranscriptionStartAttempt = startInputBinding;
+      const assertMeetingTranscriptionStartCurrent = () => {
         if (activeMeetingInputBinding !== startInputBinding || startInputBinding.cancelled) {
           throw new Error("Meeting transcription start was superseded");
         }
+      };
+      const completeMeetingTranscriptionStart = (result) => {
+        assertMeetingTranscriptionStartCurrent();
         if (event.sender.isDestroyed()) {
           throw new Error("Meeting transcription owner was destroyed during startup");
         }
@@ -5775,6 +5819,7 @@ class IPCHandlers {
           options,
           getMeetingSystemAudioPlan
         );
+        assertMeetingTranscriptionStartCurrent();
         let { systemAudioMode, systemAudioStrategy } = captureMode;
         activeMeetingCaptureMode = captureMode;
         activeJarvisSessionId =
@@ -5790,6 +5835,7 @@ class IPCHandlers {
           (this._meetingMicStreaming || this._meetingSystemStreaming)
         ) {
           await disconnectMeetingStreaming();
+          assertMeetingTranscriptionStartCurrent();
         }
         meetingEchoLeakDetector.reset();
         meetingOneOnOneAttendee = resolveOneOnOneAttendeeForNote(options.noteId);
@@ -5798,6 +5844,7 @@ class IPCHandlers {
 
         if (systemAudioMode === "unsupported" && this._meetingSystemStreaming?.isConnected) {
           await this._meetingSystemStreaming.disconnect().catch(() => ({ text: "" }));
+          assertMeetingTranscriptionStartCurrent();
           this._meetingSystemStreaming = null;
         }
 
@@ -5811,7 +5858,9 @@ class IPCHandlers {
             attachMeetingStreamingHandlers(this._meetingSystemStreaming, win, "system");
           }
           await startMeetingAec(systemAudioMode);
+          assertMeetingTranscriptionStartCurrent();
           await startLiveSpeakerIdentification(win, systemAudioMode, captureMode.micOnly);
+          assertMeetingTranscriptionStartCurrent();
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,
             systemAudioMode,
@@ -5819,6 +5868,7 @@ class IPCHandlers {
             captureMode,
             "during warm-start reuse"
           ));
+          assertMeetingTranscriptionStartCurrent();
           return completeMeetingTranscriptionStart({
             success: true,
             systemAudioMode,
@@ -5828,6 +5878,7 @@ class IPCHandlers {
         }
 
         if (options.provider === "local") {
+          meetingLocalGeneration += 1;
           meetingLocalMode = true;
           meetingLocalProvider = options.localProvider || "whisper";
           meetingLocalModel = options.localModel || null;
@@ -5841,7 +5892,9 @@ class IPCHandlers {
             systemAudioMode,
             captureMode.micOnly
           );
+          assertMeetingTranscriptionStartCurrent();
           await startMeetingAec(systemAudioMode);
+          assertMeetingTranscriptionStartCurrent();
 
           meetingLocalTimer = setInterval(() => {
             transcribeAllLocalBuffers();
@@ -5854,6 +5907,7 @@ class IPCHandlers {
             captureMode,
             "in local meeting mode"
           ));
+          assertMeetingTranscriptionStartCurrent();
 
           debugLogger.debug("Meeting transcription started in local mode", {
             provider: meetingLocalProvider,
@@ -5874,9 +5928,12 @@ class IPCHandlers {
         }
 
         await connectRealtimeStreaming(event, options, captureMode);
+        assertMeetingTranscriptionStartCurrent();
         const realtimeWin = BrowserWindow.fromWebContents(event.sender);
         await startLiveSpeakerIdentification(realtimeWin, systemAudioMode, captureMode.micOnly);
+        assertMeetingTranscriptionStartCurrent();
         await startMeetingAec(systemAudioMode);
+        assertMeetingTranscriptionStartCurrent();
         ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
           event,
           systemAudioMode,
@@ -5884,6 +5941,7 @@ class IPCHandlers {
           captureMode,
           "in realtime mode"
         ));
+        assertMeetingTranscriptionStartCurrent();
         return completeMeetingTranscriptionStart({
           success: true,
           systemAudioMode,
@@ -5897,6 +5955,10 @@ class IPCHandlers {
         return { success: false, error: error.message };
       } finally {
         meetingTranscriptionStartInProgress = false;
+        resolveStartSettled();
+        if (meetingTranscriptionStartAttempt === startInputBinding) {
+          meetingTranscriptionStartAttempt = null;
+        }
       }
     });
 
@@ -6144,7 +6206,7 @@ class IPCHandlers {
     });
 
     const performMeetingTranscriptionStop = async (stopInputBinding) => {
-      resetActiveMeetingCapture(stopInputBinding);
+      clearActiveMeetingInputBinding(stopInputBinding);
       this.meetingDetectionEngine?.setUserRecording(false);
       try {
         if (this.audioTapManager) {
@@ -6171,11 +6233,16 @@ class IPCHandlers {
             meetingLocalTimer = null;
           }
           try {
+            const periodicTranscription = meetingLocalTranscriptionPromise;
             await transcribeAllLocalBuffers();
+            if (periodicTranscription) {
+              await transcribeAllLocalBuffers();
+            }
           } catch (err) {
             debugLogger.error("Local meeting final transcription failed", { error: err.message });
           }
           flushPendingMicFinals(true);
+          await waitForPendingMeetingCorrections();
           const { diarizationPcmPath, diarizationSegments, diarizationStartedAt } =
             await captureMeetingDiarizationState();
           const transcript =
@@ -6249,7 +6316,7 @@ class IPCHandlers {
         debugLogger.error("Meeting transcription stop error", { error: error.message });
         return { success: false, error: error.message };
       } finally {
-        resetActiveMeetingCapture(stopInputBinding);
+        resetMeetingCaptureIdentity();
       }
     };
 
@@ -6261,6 +6328,21 @@ class IPCHandlers {
       }
 
       const stopInputBinding = activeMeetingInputBinding;
+      const stopStartAttempt = meetingTranscriptionStartAttempt;
+      if (meetingTranscriptionStartInProgress && stopStartAttempt?.startSettledPromise) {
+        resetActiveMeetingCapture(stopStartAttempt);
+        this.meetingDetectionEngine?.setUserRecording(false);
+        const stopPromise = stopStartAttempt.startSettledPromise.then(() => ({ success: true }));
+        meetingTranscriptionStopPromise = stopPromise;
+        trackMeetingTranscriptionTeardown(stopPromise, "start-cancellation");
+        try {
+          return await stopPromise;
+        } finally {
+          if (meetingTranscriptionStopPromise === stopPromise) {
+            meetingTranscriptionStopPromise = null;
+          }
+        }
+      }
       const stopPromise = performMeetingTranscriptionStop(stopInputBinding);
       if (stopInputBinding) stopInputBinding.teardownPromise = stopPromise;
       meetingTranscriptionStopPromise = stopPromise;

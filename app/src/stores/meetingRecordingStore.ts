@@ -721,7 +721,11 @@ function mergeFinalSegments(finalSegments: MeetingFinalSegment[] | undefined): v
   for (const segment of finalSegments) commitFinalSegment(segment);
 }
 
-async function cleanupCaptureSources(): Promise<void> {
+interface CaptureCleanupOptions {
+  preserveStarting?: boolean;
+}
+
+async function cleanupCaptureSources(options: CaptureCleanupOptions = {}): Promise<void> {
   activeMeetingInputGeneration = null;
   cancelActiveMicRecovery?.();
   cancelActiveMicRecovery = null;
@@ -762,7 +766,7 @@ async function cleanupCaptureSources(): Promise<void> {
   isPrepared = false;
   preparedMicOnly = null;
   isRecordingFlag = false;
-  isStartingFlag = false;
+  if (!options.preserveStarting) isStartingFlag = false;
 }
 
 function detachMeetingListeners(): void {
@@ -770,8 +774,8 @@ function detachMeetingListeners(): void {
   ipcCleanups = [];
 }
 
-async function cleanup(): Promise<void> {
-  await cleanupCaptureSources();
+async function cleanup(options: CaptureCleanupOptions = {}): Promise<void> {
+  await cleanupCaptureSources(options);
   detachMeetingListeners();
 }
 
@@ -1681,7 +1685,6 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
     const shouldAbortAcceptedMainStart = acceptedMainInputGeneration !== null;
     activeMeetingInputGeneration = null;
     isRecordingFlag = false;
-    isStartingFlag = false;
     logger.error(
       "Meeting transcription setup failed",
       { error: (err as Error).message },
@@ -1703,7 +1706,11 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         "meeting"
       );
     } finally {
-      await cleanup();
+      try {
+        await cleanup({ preserveStarting: true });
+      } finally {
+        isStartingFlag = false;
+      }
     }
   }
 }

@@ -47,6 +47,16 @@ const streamFor = (streamTrack: FakeTrack) =>
 const inputDevice = (deviceId: string, label: string) =>
   ({ kind: "audioinput", deviceId, label }) as MediaDeviceInfo;
 
+const createDeferred = <T,>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+};
+
 class FakeAudioWorkletNode extends FakeAudioNode {
   port: {
     onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null;
@@ -765,6 +775,81 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       "mic",
       "input-generation-next"
     );
+    expect(useMeetingRecordingStore.getState().isRecording).toBe(true);
+  });
+
+  it("keeps concurrent starts gated until failed renderer setup is fully cleaned", async () => {
+    class FailingAudioContext extends FakeAudioContext {
+      createAnalyser = vi.fn(() => {
+        throw new Error("analyser setup failed");
+      });
+    }
+    const stopDeferred = createDeferred<{ success: true }>();
+    const mainStart = vi.mocked(window.electronAPI.meetingTranscriptionStart!);
+    const mainStop = vi.mocked(window.electronAPI.meetingTranscriptionStop!);
+    mainStart.mockReset().mockResolvedValue({
+      success: true,
+      systemAudioMode: "unsupported",
+      systemAudioStrategy: "unsupported",
+      inputGeneration: "input-generation-concurrent",
+    });
+    mainStart.mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "unsupported",
+      systemAudioStrategy: "unsupported",
+      inputGeneration: "input-generation-failed-setup",
+    });
+    mainStop.mockImplementation(() => stopDeferred.promise);
+    vi.stubGlobal("AudioContext", FailingAudioContext);
+
+    const failedStart = startRecording({
+      noteId: null,
+      noteTitle: "Jarvis failed setup",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-failed-setup-gate",
+      diarizationEnabled: true,
+    });
+    await vi.waitFor(() => expect(mainStop).toHaveBeenCalledOnce());
+
+    const concurrentTrack = new FakeTrack("Concurrent microphone", "concurrent-mic");
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValue(streamFor(concurrentTrack));
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis concurrent",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-concurrent-during-cleanup",
+      diarizationEnabled: true,
+    });
+    const startsBeforeCleanupRelease = mainStart.mock.calls.length;
+
+    stopDeferred.resolve({ success: true });
+    await failedStart;
+
+    expect(startsBeforeCleanupRelease).toBe(1);
+    expect(mainStop).toHaveBeenCalledOnce();
+    expect(useMeetingRecordingStore.getState().isRecording).toBe(false);
+
+    const nextTrack = new FakeTrack("Next microphone", "next-mic-after-cleanup");
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValue(streamFor(nextTrack));
+    mainStart.mockResolvedValue({
+      success: true,
+      systemAudioMode: "unsupported",
+      systemAudioStrategy: "unsupported",
+      inputGeneration: "input-generation-after-cleanup",
+    });
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis after cleanup",
+      folderId: null,
+      captureSystemAudio: false,
+      jarvisSessionId: "s-after-failed-setup-cleanup",
+      diarizationEnabled: true,
+    });
+
+    expect(mainStart).toHaveBeenCalledTimes(2);
     expect(useMeetingRecordingStore.getState().isRecording).toBe(true);
   });
 
