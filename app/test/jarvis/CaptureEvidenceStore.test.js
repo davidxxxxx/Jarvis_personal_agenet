@@ -316,6 +316,354 @@ test("finalization requires every session track and derives every open gap", (t)
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "failed");
 });
 
+test("pauses every active track and the session atomically", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  db.exec(`
+    CREATE TRIGGER reject_second_track_pause
+    BEFORE UPDATE OF state ON audio_tracks
+    WHEN NEW.id = 't2' AND NEW.state = 'paused'
+    BEGIN
+      SELECT RAISE(ABORT, 'second track pause blocked');
+    END
+  `);
+
+  assert.throws(
+    () =>
+      store.pauseCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "active" },
+          { trackId: "t2", expectedState: "active" },
+        ],
+        at: 20,
+      }),
+    /second track pause blocked/i
+  );
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "active" }]);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("pause requires exact ownership coverage chronology and current states", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+
+  assert.throws(
+    () =>
+      store.pauseCapture({
+        sessionId: "s1",
+        sources: [{ trackId: "t1", expectedState: "active" }],
+        at: 20,
+      }),
+    /every session track/i
+  );
+  assert.throws(
+    () =>
+      store.pauseCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "active" },
+          { trackId: "t2", expectedState: "recovering" },
+        ],
+        at: 20,
+      }),
+    /expected state/i
+  );
+  assert.throws(
+    () =>
+      store.pauseCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "active" },
+          { trackId: "t2", expectedState: "active" },
+        ],
+        at: 9,
+      }),
+    /session startedAt/i
+  );
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "active" }]);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("resume rolls back all track activations when session persistence fails", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  store.pauseCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "active" },
+      { trackId: "t2", expectedState: "active" },
+    ],
+    at: 20,
+  });
+  db.exec(`
+    CREATE TRIGGER reject_session_resume
+    BEFORE UPDATE OF status ON sessions
+    WHEN NEW.status = 'recording'
+    BEGIN
+      SELECT RAISE(ABORT, 'session resume blocked');
+    END
+  `);
+
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "paused" },
+          { trackId: "t2", expectedState: "paused" },
+        ],
+        at: 30,
+      }),
+    /session resume blocked/i
+  );
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "paused" }]);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "paused");
+});
+
+test("resume requires exact ownership coverage chronology and current states", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  store.pauseCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "active" },
+      { trackId: "t2", expectedState: "active" },
+    ],
+    at: 20,
+  });
+  db.prepare(
+    "INSERT INTO sessions (id, started_at, status, created_at) VALUES ('s2', 10, 'paused', 10)"
+  ).run();
+  createTrack(store, { id: "t3", sessionId: "s2", sourceType: "mic", deviceId: "other" });
+  store.setTrackState("t3", "paused", 20);
+
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [{ trackId: "t1", expectedState: "paused" }],
+        at: 30,
+      }),
+    /every session track/i
+  );
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "paused" },
+          { trackId: "t2", expectedState: "paused" },
+        ],
+        at: 19,
+      }),
+    /track endedAt/i
+  );
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "paused" },
+          { trackId: "t2", expectedState: "recovering" },
+        ],
+        at: 30,
+      }),
+    /expected state/i
+  );
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "paused" },
+          { trackId: "t3", expectedState: "paused" },
+        ],
+        at: 30,
+      }),
+    /does not belong/i
+  );
+  assert.deepEqual(
+    db.prepare("SELECT id, state FROM audio_tracks WHERE session_id='s1' ORDER BY id").all(),
+    [
+      { id: "t1", state: "paused" },
+      { id: "t2", state: "paused" },
+    ]
+  );
+
+  store.resumeCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "paused" },
+      { trackId: "t2", expectedState: "paused" },
+    ],
+    at: 30,
+  });
+  assert.throws(
+    () =>
+      store.resumeCapture({
+        sessionId: "s1",
+        sources: [
+          { trackId: "t1", expectedState: "active" },
+          { trackId: "t2", expectedState: "active" },
+        ],
+        at: 40,
+      }),
+    /must be paused/i
+  );
+});
+
+test("pause and resume retain recovering tracks and their open gaps", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, { id: "t2", sourceType: "mic", deviceId: "mic-1" });
+  store.interruptTrack({
+    trackId: "t1",
+    gap: { id: "g1", trackId: "t1", startedAt: 20, reason: "device-change" },
+  });
+
+  store.pauseCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "recovering" },
+      { trackId: "t2", expectedState: "active" },
+    ],
+    at: 30,
+  });
+  assert.deepEqual(db.prepare("SELECT id, state FROM audio_tracks ORDER BY id").all(), [
+    { id: "t1", state: "recovering" },
+    { id: "t2", state: "paused" },
+  ]);
+  assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
+
+  store.resumeCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", expectedState: "recovering" },
+      { trackId: "t2", expectedState: "paused" },
+    ],
+    at: 40,
+  });
+  assert.deepEqual(db.prepare("SELECT id, state FROM audio_tracks ORDER BY id").all(), [
+    { id: "t1", state: "recovering" },
+    { id: "t2", state: "active" },
+  ]);
+  assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("finalization rejects timestamps before session start without tracks", (t) => {
+  const { db, store } = fixture(t);
+
+  assert.throws(
+    () =>
+      store.finalizeCapture({
+        sessionId: "s1",
+        sources: [],
+        trackState: "recovered",
+        sessionStatus: "recovered",
+        at: 9,
+      }),
+    /session startedAt/i
+  );
+  assert.deepEqual(db.prepare("SELECT status, ended_at FROM sessions WHERE id='s1'").get(), {
+    status: "recording",
+    ended_at: null,
+  });
+});
+
+test("finalization rejects timestamps before a prior track end", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.setTrackState("t1", "paused", 30);
+
+  assert.throws(
+    () =>
+      store.finalizeCapture({
+        sessionId: "s1",
+        sources: [{ trackId: "t1", gapId: null }],
+        trackState: "ended",
+        sessionStatus: "completed",
+        at: 29,
+      }),
+    /track endedAt/i
+  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
+    state: "paused",
+    ended_at: 30,
+  });
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("finalization rejects stale repeated terminal transitions", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  store.finalizeCapture({
+    sessionId: "s1",
+    sources: [{ trackId: "t1", gapId: null }],
+    trackState: "ended",
+    sessionStatus: "completed",
+    at: 20,
+  });
+
+  assert.throws(
+    () =>
+      store.finalizeCapture({
+        sessionId: "s1",
+        sources: [{ trackId: "t1", gapId: null }],
+        trackState: "failed",
+        sessionStatus: "failed",
+        at: 30,
+      }),
+    /already terminal/i
+  );
+  assert.deepEqual(db.prepare("SELECT status, ended_at FROM sessions WHERE id='s1'").get(), {
+    status: "completed",
+    ended_at: 20,
+  });
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
+    state: "ended",
+    ended_at: 20,
+  });
+});
+
+for (const [sessionStatus, trackState] of [
+  ["recovered", "recovered"],
+  ["failed", "failed"],
+]) {
+  test(`finalization rejects an already ${sessionStatus} session`, (t) => {
+    const { db, store } = fixture(t);
+    createTrack(store);
+    store.finalizeCapture({
+      sessionId: "s1",
+      sources: [{ trackId: "t1", gapId: null }],
+      trackState,
+      sessionStatus,
+      at: 20,
+    });
+
+    assert.throws(
+      () =>
+        store.finalizeCapture({
+          sessionId: "s1",
+          sources: [{ trackId: "t1", gapId: null }],
+          trackState,
+          sessionStatus,
+          at: 30,
+        }),
+      /already terminal/i
+    );
+    assert.deepEqual(db.prepare("SELECT status, ended_at FROM sessions WHERE id='s1'").get(), {
+      status: sessionStatus,
+      ended_at: 20,
+    });
+  });
+}
+
 test("commits a chunk and one transcription job atomically", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -597,6 +945,16 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
       gap: { id: "g1", trackId: "t1", startedAt: 11, reason: "device_lost" },
     });
     repository.restoreTrack({ trackId: "t1", gapId: "g1", endedAt: 12, recoveryAttempts: 1 });
+    repository.pauseCapture({
+      sessionId: "s1",
+      sources: [{ trackId: "t1", expectedState: "active" }],
+      at: 12,
+    });
+    repository.resumeCapture({
+      sessionId: "s1",
+      sources: [{ trackId: "t1", expectedState: "paused" }],
+      at: 12,
+    });
     repository.finalizeCapture({
       sessionId: "s1",
       sources: [{ trackId: "t1", gapId: null }],

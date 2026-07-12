@@ -37,6 +37,8 @@ class JarvisService {
       "interruptTrack",
       "closeGap",
       "restoreTrack",
+      "pauseCapture",
+      "resumeCapture",
       "finalizeCapture",
       "commitChunk",
     ]) {
@@ -240,6 +242,14 @@ class JarvisService {
     if (errorCode !== null && (typeof errorCode !== "string" || errorCode.length === 0)) {
       throw new TypeError("errorCode must be a non-empty string or null");
     }
+    this.repository.pauseCapture({
+      sessionId: this.state.sessionId,
+      sources: Object.values(this.state.sources).map((source) => ({
+        trackId: source.trackId,
+        expectedState: source.state === "reconnecting" ? "recovering" : source.state,
+      })),
+      at,
+    });
     try {
       this.writer.closeAll(at);
     } catch (error) {
@@ -251,11 +261,9 @@ class JarvisService {
     for (const source of Object.values(this.state.sources)) {
       if (source.state !== "active") continue;
       source.state = "paused";
-      this.repository.setTrackState(source.trackId, "paused", at);
     }
     this._transitionSessionStatus("paused", at);
     this.state.errorCode = errorCode;
-    this._persistSessionStatus("paused", at);
     return this._publish(at);
   }
 
@@ -265,21 +273,40 @@ class JarvisService {
     this._assertTime(at, "at");
     try {
       this._assertSafeDiskSpace();
-      for (const source of Object.values(this.state.sources)) {
-        if (source.state !== "paused") continue;
-        this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
-        source.state = "active";
-        this.repository.setTrackState(source.trackId, "active", null);
-      }
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
       if (diskError) this._failForDisk(diskError.code, at);
       throw error;
     }
+    const reopenedSourceTypes = [];
+    try {
+      for (const source of Object.values(this.state.sources)) {
+        if (source.state !== "paused") continue;
+        this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
+        reopenedSourceTypes.push(source.sourceType);
+      }
+      this.repository.resumeCapture({
+        sessionId: this.state.sessionId,
+        sources: Object.values(this.state.sources).map((source) => ({
+          trackId: source.trackId,
+          expectedState: source.state === "reconnecting" ? "recovering" : source.state,
+        })),
+        at,
+      });
+    } catch (error) {
+      for (const sourceType of reopenedSourceTypes) {
+        try {
+          this.writer.closeSource(sourceType, at);
+        } catch {}
+      }
+      throw error;
+    }
+    for (const source of Object.values(this.state.sources)) {
+      if (source.state === "paused") source.state = "active";
+    }
     const status = this._deriveSessionStatus();
     this._transitionSessionStatus(status, at);
     this.state.errorCode = null;
-    this._persistSessionStatus(status, at);
     return this._publish(at);
   }
 
@@ -572,7 +599,9 @@ class JarvisService {
         this._transitionSessionStatus("failed", at);
         this.state.errorCode = "CAPTURE_FINALIZATION_FAILED";
       }
-      this._publish(at);
+      try {
+        this._publish(at);
+      } catch {}
       throw error;
     }
     return this._publish(at);

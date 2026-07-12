@@ -63,6 +63,11 @@ class CaptureEvidenceStore {
         SET status = @sessionStatus, ended_at = @at
         WHERE id = @sessionId
       `),
+      transitionSession: db.prepare(`
+        UPDATE sessions
+        SET status = @status, ended_at = @endedAt
+        WHERE id = @sessionId
+      `),
       findChunkSequence: db.prepare(`
         SELECT id FROM audio_chunks
         WHERE track_id = ? AND sequence_number = ?
@@ -167,6 +172,48 @@ class CaptureEvidenceStore {
         return { trackId, gapId };
       }
     );
+    this.pauseCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
+      const evidence = this._assertLifecycleTransition({
+        sessionId,
+        sources,
+        at,
+        sessionState: "recording",
+        sourceStates: new Set(["active", "recovering"]),
+      });
+      for (const { track } of evidence) {
+        if (track.state !== "active") continue;
+        const updated = this.setTrackState(track.id, "paused", at);
+        if (updated.changes !== 1) throw new Error(`track ${track.id} was not paused`);
+      }
+      const paused = this.statements.transitionSession.run({
+        sessionId,
+        status: "paused",
+        endedAt: null,
+      });
+      if (paused.changes !== 1) throw new Error(`session ${sessionId} was not paused`);
+      return { sessionId, status: "paused" };
+    });
+    this.resumeCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
+      const evidence = this._assertLifecycleTransition({
+        sessionId,
+        sources,
+        at,
+        sessionState: "paused",
+        sourceStates: new Set(["paused", "recovering"]),
+      });
+      for (const { track } of evidence) {
+        if (track.state !== "paused") continue;
+        const updated = this.setTrackState(track.id, "active", null);
+        if (updated.changes !== 1) throw new Error(`track ${track.id} was not resumed`);
+      }
+      const resumed = this.statements.transitionSession.run({
+        sessionId,
+        status: "recording",
+        endedAt: null,
+      });
+      if (resumed.changes !== 1) throw new Error(`session ${sessionId} was not resumed`);
+      return { sessionId, status: "recording" };
+    });
     this.finalizeCaptureTransaction = db.transaction(
       ({ sessionId, sources, trackState, sessionStatus, at }) => {
         this._assertIdentifier(sessionId, "sessionId");
@@ -183,6 +230,12 @@ class CaptureEvidenceStore {
         }
         const session = this.statements.getSession.get(sessionId);
         if (!session) throw new Error(`session ${sessionId} does not exist`);
+        if (TERMINAL_SESSION_STATUSES.has(session.status)) {
+          throw new Error(`session ${sessionId} is already terminal`);
+        }
+        if (at < session.started_at) {
+          throw new RangeError("finalization at must not be before session startedAt");
+        }
         const sessionTracks = this.statements.listTracksForSession.all(sessionId);
         if (sources.length !== sessionTracks.length) {
           throw new Error("finalization must include every session track exactly once");
@@ -205,6 +258,9 @@ class CaptureEvidenceStore {
           }
           if (at < track.started_at) {
             throw new RangeError("finalization at must not be before track startedAt");
+          }
+          if (track.ended_at !== null && at < track.ended_at) {
+            throw new RangeError("finalization at must not be before track endedAt");
           }
           const gaps = this.statements.listOpenGapsForTrack.all(source.trackId);
           if (source.gapId !== null && source.gapId !== undefined) {
@@ -281,6 +337,14 @@ class CaptureEvidenceStore {
     return this.restoreTrackTransaction(input);
   }
 
+  pauseCapture(input) {
+    return this.pauseCaptureTransaction(input);
+  }
+
+  resumeCapture(input) {
+    return this.resumeCaptureTransaction(input);
+  }
+
   finalizeCapture(input) {
     return this.finalizeCaptureTransaction(input);
   }
@@ -341,6 +405,65 @@ class CaptureEvidenceStore {
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new RangeError(`${name} must be a non-negative safe integer`);
     }
+  }
+
+  _assertLifecycleTransition({ sessionId, sources, at, sessionState, sourceStates }) {
+    this._assertIdentifier(sessionId, "sessionId");
+    this._assertSafeInteger(at, "transition at");
+    if (!Array.isArray(sources)) throw new TypeError("transition sources must be an array");
+    const session = this.statements.getSession.get(sessionId);
+    if (!session) throw new Error(`session ${sessionId} does not exist`);
+    if (session.status !== sessionState) {
+      throw new Error(`session ${sessionId} must be ${sessionState}`);
+    }
+    if (at < session.started_at) {
+      throw new RangeError("transition at must not be before session startedAt");
+    }
+    const sessionTracks = this.statements.listTracksForSession.all(sessionId);
+    if (sources.length !== sessionTracks.length) {
+      throw new Error("transition must include every session track exactly once");
+    }
+
+    const seenTrackIds = new Set();
+    const evidence = sources.map((source) => {
+      if (!source || typeof source !== "object") {
+        throw new TypeError("transition source is required");
+      }
+      this._assertIdentifier(source.trackId, "trackId");
+      if (!sourceStates.has(source.expectedState)) {
+        throw new TypeError("invalid transition expected state");
+      }
+      if (seenTrackIds.has(source.trackId)) {
+        throw new Error(`track ${source.trackId} is duplicated in transition`);
+      }
+      seenTrackIds.add(source.trackId);
+      const track = this.statements.getTrack.get(source.trackId);
+      if (!track) throw new Error(`track ${source.trackId} does not exist`);
+      if (track.session_id !== sessionId) {
+        throw new Error(`track ${source.trackId} does not belong to session ${sessionId}`);
+      }
+      if (track.state !== source.expectedState) {
+        throw new Error(`track ${source.trackId} does not match its expected state`);
+      }
+      if (at < track.started_at) {
+        throw new RangeError("transition at must not be before track startedAt");
+      }
+      if (track.ended_at !== null && at < track.ended_at) {
+        throw new RangeError("transition at must not be before track endedAt");
+      }
+      const openGap = this.statements.getOpenGapForTrack.get(track.id);
+      if (track.state === "recovering" && !openGap) {
+        throw new Error(`recovering track ${track.id} must have an open gap`);
+      }
+      if (track.state !== "recovering" && openGap) {
+        throw new Error(`non-recovering track ${track.id} must not have an open gap`);
+      }
+      return { track, openGap };
+    });
+    if (sessionTracks.some((track) => !seenTrackIds.has(track.id))) {
+      throw new Error("transition must include every session track exactly once");
+    }
+    return evidence;
   }
 
   _assertChunk(chunk) {

@@ -332,11 +332,9 @@ class JarvisRepository {
         WHERE status IN ('recording', 'paused', 'finalizing')
         ORDER BY started_at ASC, id ASC
       `),
-      recoverOpenSessions: this.db.prepare(`
-        UPDATE sessions
-        SET status = 'recovered', ended_at = @at
-        WHERE status IN ('recording', 'paused', 'finalizing')
-      `),
+      listSessionTracksForRecovery: this.db.prepare(
+        "SELECT id FROM audio_tracks WHERE session_id = ? ORDER BY id"
+      ),
       getCloudBudgetSettings: this.db.prepare(
         "SELECT provider, monthly_limit_microusd, enabled, updated_at FROM cloud_budget_settings WHERE provider = 'openai'"
       ),
@@ -461,7 +459,18 @@ class JarvisRepository {
 
     this._recoverOpenSessions = this.db.transaction((at) => {
       const openSessions = this.statements.listOpenSessions.all();
-      this.statements.recoverOpenSessions.run({ at });
+      for (const session of openSessions) {
+        const sources = this.statements.listSessionTracksForRecovery
+          .all(session.id)
+          .map((track) => ({ trackId: track.id, gapId: null }));
+        this.captureEvidenceStore.finalizeCapture({
+          sessionId: session.id,
+          sources,
+          trackState: "recovered",
+          sessionStatus: "recovered",
+          at,
+        });
+      }
       return openSessions.map((session) => this.statements.getSession.get(session.id));
     });
 
@@ -1225,6 +1234,14 @@ class JarvisRepository {
 
   restoreTrack(input) {
     return this.captureEvidenceStore.restoreTrack(input);
+  }
+
+  pauseCapture(input) {
+    return this.captureEvidenceStore.pauseCapture(input);
+  }
+
+  resumeCapture(input) {
+    return this.captureEvidenceStore.resumeCapture(input);
   }
 
   finalizeCapture(input) {
