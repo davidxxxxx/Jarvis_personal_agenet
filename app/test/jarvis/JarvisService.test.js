@@ -315,6 +315,33 @@ test("an explicit recordings directory controls disk checks and audio paths", ()
   }
 });
 
+test("reconfigures every evidence holder only while capture is inactive", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reconfigure-"));
+  const nextRoot = path.join(userDataDir, "next-recordings");
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl: createSafeFs(),
+  });
+  try {
+    service.reconfigureStorage({ recordingsDir: nextRoot });
+    assert.equal(service.recordingsDir, nextRoot);
+    assert.equal(service.audioEvidenceReader.recordingsRoot, nextRoot);
+
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.throws(
+      () => service.reconfigureStorage({ recordingsDir: path.join(userDataDir, "unsafe") }),
+      /capture must be inactive/
+    );
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
 test("pause closes audio, resume reuses the session, and finish stores seven-day metadata", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();
@@ -450,7 +477,7 @@ test("fails visibly before opening a writer when free disk is below the safety c
   }
 });
 
-test("checks disk again at each rotation and fails without a corrupt partial chunk", () => {
+test("checks disk again at each rotation, commits legal evidence, and safe-stops recoverably", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();
   let diskChecks = 0;
@@ -478,15 +505,17 @@ test("checks disk again at each rotation and fails without a corrupt partial chu
 
     assert.equal(accepted, false);
     assert.equal(diskChecks, 3);
-    assert.equal(service.getState().status, "failed");
-    assert.equal(service.getState().errorCode, "DISK_SPACE_LOW");
-    assert.equal(repository.chunks.length, 1);
+    assert.equal(service.getState().status, "paused");
+    assert.equal(service.getState().errorCode, "capture_stopped_low_disk");
+    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(repository.chunks.length, 2);
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(4_800, 1)), false);
     const sessionDir = path.join(userDataDir, "recordings", "s1", "mic");
     assert.equal(
       fs.readdirSync(sessionDir).some((name) => name.endsWith(".part")),
       false
     );
-    assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 1);
+    assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 2);
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -953,7 +982,7 @@ for (const lifecycle of ["pauseCapture", "finishCapture"]) {
       assert.equal(service.appendMicPcm("s1", Buffer.alloc(48, 2)), false);
       assert.equal(
         fs
-          .readdirSync(path.join(userDataDir, "recordings", "s1", "mic"))
+          .readdirSync(path.join(userDataDir, "recordings", "s1", "mic", "recovery"))
           .filter((name) => name.endsWith(".recovery.json")).length,
         1
       );
@@ -964,7 +993,7 @@ for (const lifecycle of ["pauseCapture", "finishCapture"]) {
   });
 }
 
-test("disk loss during restoration fails the whole session and surviving lane", () => {
+test("disk loss during restoration safe-stops the session and preserves the recovering lane", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-disk-"));
   const repository = createRepository();
   let diskChecks = 0;
@@ -1001,15 +1030,11 @@ test("disk loss during restoration fails the whole session and surviving lane", 
       strategy: "wasapi-loopback",
     });
 
-    assert.equal(state.status, "failed");
-    assert.equal(state.errorCode, "DISK_SPACE_LOW");
-    assert.equal(state.sources.mic.state, "failed");
-    assert.equal(state.sources.system.state, "failed");
-    assert.equal(repository.sessions.get("s1").status, "failed");
-    assert.equal(
-      repository.tracks.every((track) => track.state === "failed"),
-      true
-    );
+    assert.equal(state.status, "paused");
+    assert.equal(state.errorCode, "capture_stopped_low_disk");
+    assert.equal(state.sources.mic.state, "paused");
+    assert.equal(state.sources.system.state, "reconnecting");
+    assert.equal(repository.sessions.get("s1").status, "paused");
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
   } finally {
     service.shutdown();
@@ -1576,7 +1601,7 @@ test("shutdown finalization failure is observable, honest, and idempotent", () =
   }
 });
 
-test("disk failure while interrupting closes the persisted gap atomically", () => {
+test("disk failure while interrupting safe-stops with a recoverable open gap", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-disk-real-"));
   const repository = new JarvisRepository(":memory:");
   repository.createSession({
@@ -1614,17 +1639,20 @@ test("disk failure while interrupting closes the persisted gap atomically", () =
       reason: "device-change",
     });
 
-    assert.equal(state.status, "failed");
-    assert.equal(state.errorCode, "DISK_SPACE_LOW");
-    assert.equal(repository.getSession("s1").status, "failed");
+    assert.equal(state.status, "paused");
+    assert.equal(state.errorCode, "capture_stopped_low_disk");
+    assert.equal(repository.getSession("s1").status, "paused");
     assert.equal(
       repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get()
         .count,
-      0
+      1
     );
-    assert.deepEqual(repository.db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
-      { state: "failed" },
-    ]);
+    assert.deepEqual(
+      repository.db
+        .prepare("SELECT DISTINCT state FROM audio_tracks ORDER BY state")
+        .all(),
+      [{ state: "paused" }, { state: "recovering" }]
+    );
   } finally {
     service.shutdown();
     repository.close();

@@ -247,6 +247,11 @@ class JarvisRepository {
       throw new TypeError("dbPath must be a non-empty string");
     }
 
+    this.dbPath = dbPath;
+    this._open(dbPath);
+  }
+
+  _open(dbPath) {
     this.db = new Database(dbPath);
     try {
       this.db.pragma("foreign_keys = ON");
@@ -265,6 +270,16 @@ class JarvisRepository {
       this.db.close();
       throw error;
     }
+  }
+
+  reopen(dbPath = this.dbPath) {
+    if (typeof dbPath !== "string" || dbPath.length === 0) {
+      throw new TypeError("dbPath must be a non-empty string");
+    }
+    if (this.db?.open) this.db.close();
+    this.dbPath = dbPath;
+    this._open(dbPath);
+    return this;
   }
 
   _prepareStatements() {

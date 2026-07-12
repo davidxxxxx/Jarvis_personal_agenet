@@ -360,6 +360,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "getPersonDetail",
       "getSession",
       "getSessionDetail",
+      "getStorageStatus",
       "getTodayInsights",
       "getTopicDetail",
       "getVoiceEnrollmentStatus",
@@ -373,6 +374,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "listSessions",
       "listTodos",
       "listTopics",
+      "migrateStorage",
       "pauseCapture",
       "renamePerson",
       "resumeCapture",
@@ -669,6 +671,62 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
       new RegExp(`voiceEnrollmentService\\.${method} must be a function`)
     );
   }
+});
+
+test("storage IPC validates migration input, blocks active capture, and sanitizes failures", async () => {
+  const handlers = new Map();
+  const migrations = [];
+  let runtimeState = { status: "idle" };
+  const service = createService({ getState: () => runtimeState });
+  const storageManager = {
+    getStatus: async () => ({ state: "ok", currentRoot: "C:\\private\\jarvis" }),
+    migrate: async (input) => {
+      migrations.push(input);
+      if (input.to.endsWith("failure")) throw new Error(`secret path ${input.to}`);
+      return { switched: true };
+    },
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service,
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    storageManager,
+  });
+
+  assert.deepEqual(await handlers.get(CHANNELS.getStorageStatus)(), {
+    state: "ok",
+    currentRoot: "C:\\private\\jarvis",
+  });
+  await assert.rejects(
+    handlers.get(CHANNELS.migrateStorage)(null, { to: "relative" }),
+    /invalid storage migration request/
+  );
+  await assert.rejects(
+    handlers.get(CHANNELS.migrateStorage)(null, {
+      to: "C:\\target",
+      unexpected: true,
+    }),
+    /invalid storage migration request/
+  );
+
+  runtimeState = { status: "recording" };
+  await assert.rejects(
+    handlers.get(CHANNELS.migrateStorage)(null, { to: "C:\\target" }),
+    /capture must be inactive/
+  );
+  runtimeState = { status: "idle" };
+  assert.deepEqual(await handlers.get(CHANNELS.migrateStorage)(null, { to: "C:\\target" }), {
+    switched: true,
+  });
+  assert.deepEqual(migrations, [{ to: "C:\\target" }]);
+  await assert.rejects(
+    handlers.get(CHANNELS.migrateStorage)(null, { to: "C:\\failure" }),
+    (error) =>
+      error.message === "storage migration failed; the current data directory is unchanged" &&
+      !error.message.includes("C:\\failure")
+  );
 });
 
 test("failCapture IPC validates known codes and preserves authoritative failed broadcast", () => {

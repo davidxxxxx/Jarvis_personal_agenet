@@ -8,6 +8,11 @@ let cachedSafeTempDir = null;
 // Falls back to ProgramData when TEMP contains spaces or non-ASCII characters,
 // as many native binaries (whisper-server, ffmpeg) don't handle these paths correctly.
 function getSafeTempDir() {
+  if (process.env.JARVIS_DATA_ROOT && path.isAbsolute(process.env.JARVIS_DATA_ROOT)) {
+    const jarvisTemp = path.join(process.env.JARVIS_DATA_ROOT, "temp");
+    fs.mkdirSync(jarvisTemp, { recursive: true });
+    return jarvisTemp;
+  }
   if (cachedSafeTempDir) return cachedSafeTempDir;
 
   const systemTemp = os.tmpdir();
@@ -40,4 +45,8 @@ function getSafeTempDir() {
   }
 }
 
-module.exports = { getSafeTempDir };
+function resetSafeTempDir() {
+  cachedSafeTempDir = null;
+}
+
+module.exports = { getSafeTempDir, resetSafeTempDir };

@@ -190,6 +190,8 @@ test("retains deterministic recovery metadata and a sticky fault when the callba
     );
     assert.equal(fault.cause, callbackError);
     assert.equal(fault.evidenceEndedAt, 102);
+    const recoveryDir = path.join(dir, "recovery");
+    assert.equal(path.dirname(attemptedChunk.path), recoveryDir);
     assert.deepEqual(JSON.parse(fs.readFileSync(`${attemptedChunk.path}.recovery.json`, "utf8")), {
       id: attemptedChunk.id,
       sessionId: "s1",
@@ -214,8 +216,12 @@ test("retains deterministic recovery metadata and a sticky fault when the callba
       () => writer.close(500),
       (error) => error === fault
     );
-    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".wav")).length, 1);
-    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".recovery.json")).length, 1);
+    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".wav")).length, 0);
+    assert.equal(fs.readdirSync(recoveryDir).filter((name) => name.endsWith(".wav")).length, 1);
+    assert.equal(
+      fs.readdirSync(recoveryDir).filter((name) => name.endsWith(".recovery.json")).length,
+      1
+    );
   });
 });
 

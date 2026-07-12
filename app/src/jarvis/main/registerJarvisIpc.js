@@ -9,6 +9,7 @@ const {
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const { toPublicAudioChunk, toPublicSessionDetail } = require("./AudioChunkPublicView");
 const fs = require("node:fs/promises");
+const path = require("node:path");
 
 const REQUIRED_REPOSITORY_METHODS = [
   "createSession",
@@ -96,6 +97,7 @@ function registerJarvisIpc({
   environmentManager,
   analysisScheduler,
   audioEvidenceReader,
+  storageManager,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -172,7 +174,8 @@ function registerJarvisIpc({
     const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
     if (!chunk) return null;
     try {
-      if (audioEvidenceReader) return await audioEvidenceReader.readPlayableWav(chunk);
+      const currentReader = service.audioEvidenceReader ?? audioEvidenceReader;
+      if (currentReader) return await currentReader.readPlayableWav(chunk);
       return await fs.readFile(chunk.path);
     } catch (error) {
       if (error?.code === "ENOENT") return null;
@@ -293,6 +296,49 @@ function registerJarvisIpc({
     });
     return cloudBudgetStatus();
   });
+  if (storageManager !== undefined) {
+    if (
+      !storageManager ||
+      typeof storageManager.getStatus !== "function" ||
+      typeof storageManager.migrate !== "function"
+    ) {
+      throw new TypeError("storageManager must provide getStatus and migrate methods");
+    }
+    ipcMain.handle(CHANNELS.getStorageStatus, () => storageManager.getStatus());
+    ipcMain.handle(CHANNELS.migrateStorage, async (_event, input) => {
+      try {
+        assertExactKeys(input, ["to"], "storage migration request");
+        if (
+          typeof input.to !== "string" ||
+          input.to.length === 0 ||
+          input.to.length > 1024 ||
+          !path.isAbsolute(input.to) ||
+          input.to.includes("\0")
+        ) {
+          throw new TypeError("invalid storage migration request");
+        }
+      } catch {
+        throw new TypeError("invalid storage migration request");
+      }
+      const state = typeof service.getState === "function" ? service.getState() : null;
+      if (["recording", "degraded", "paused", "finalizing"].includes(state?.status)) {
+        throw new Error("capture must be inactive before storage migration");
+      }
+      try {
+        return await storageManager.migrate({ to: path.resolve(input.to) });
+      } catch (error) {
+        if (
+          typeof error?.message === "string" &&
+          /^(migration already in progress|destination is unsafe|migration interrupted)/.test(
+            error.message
+          )
+        ) {
+          throw error;
+        }
+        throw new Error("storage migration failed; the current data directory is unchanged");
+      }
+    });
+  }
 }
 
 module.exports = registerJarvisIpc;

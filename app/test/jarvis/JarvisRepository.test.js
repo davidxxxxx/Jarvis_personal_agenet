@@ -761,3 +761,22 @@ test("analysis evidence must belong to the target session and rolls back as a un
   assert.equal(repo.listMemories().length, 0);
   repo.close();
 });
+
+test("reopens the same repository object against a verified migrated database", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reopen-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const oldPath = path.join(root, "old", "jarvis.db");
+  const newPath = path.join(root, "new", "jarvis.db");
+  fs.mkdirSync(path.dirname(oldPath), { recursive: true });
+  fs.mkdirSync(path.dirname(newPath), { recursive: true });
+  const repo = new JarvisRepository(oldPath);
+  repo.createSession({ id: "migrated", startedAt: 1_000, micDeviceId: null });
+  repo.close();
+  fs.copyFileSync(oldPath, newPath);
+
+  repo.reopen(newPath);
+
+  assert.equal(repo.getSession("migrated").id, "migrated");
+  assert.equal(repo.dbPath, newPath);
+  repo.close();
+});

@@ -31,6 +31,8 @@ import type {
   JarvisTodo,
   JarvisTopic,
   JarvisTopicDetail,
+  JarvisStorageMigrationResult,
+  JarvisStorageStatus,
 } from "../jarvis/types";
 
 export type LocalTranscriptionProvider = "whisper" | "nvidia";
@@ -616,6 +618,8 @@ declare global {
         cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
         getCloudBudget: () => Promise<JarvisCloudBudgetStatus>;
         setCloudBudget: (input: JarvisCloudBudgetInput) => Promise<JarvisCloudBudgetStatus>;
+        getStorageStatus: () => Promise<JarvisStorageStatus>;
+        migrateStorage: (input: { to: string }) => Promise<JarvisStorageMigrationResult>;
         onControl: (callback: (envelope: JarvisControlEnvelope) => void) => () => void;
         controlReady: (rendererId: string) => void;
         claimControl: (

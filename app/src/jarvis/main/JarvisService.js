@@ -6,7 +6,7 @@ const AudioEvidenceReader = require("./AudioEvidenceReader");
 const FlacCompressionWorker = require("./FlacCompressionWorker");
 const { FLAC_ENCODER_VERSION } = require("./JarvisMigrations");
 const SpeechTriggeredCaptureGate = require("./SpeechTriggeredCaptureGate");
-const { hasSafeDiskSpace } = require("./retentionPolicy");
+const StorageGovernor = require("./StorageGovernor");
 const { assertId } = require("../shared/contracts");
 const {
   assertSourceType,
@@ -62,6 +62,7 @@ class JarvisService {
     vadTimeoutMs = DEFAULT_VAD_TIMEOUT_MS,
     flacCompressionWorker = undefined,
     audioEvidenceReader = undefined,
+    storageGovernor = undefined,
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -144,6 +145,22 @@ class JarvisService {
     this.broadcast = broadcast;
     this.now = now;
     this.fs = fsImpl;
+    this.storageGovernor =
+      storageGovernor ??
+      new StorageGovernor({
+        reserve: {
+          ensure() {},
+          release() {},
+        },
+      });
+    if (
+      !this.storageGovernor ||
+      typeof this.storageGovernor.inspect !== "function" ||
+      typeof this.storageGovernor.evaluate !== "function"
+    ) {
+      throw new TypeError("storageGovernor must provide evaluate and inspect methods");
+    }
+    this.emergencyCommit = false;
     this.vadClassifier = vadClassifier;
     this.maxVadQueueBytes = Math.round(
       (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE * maxVadQueueMs) / 1_000
@@ -299,12 +316,42 @@ class JarvisService {
     return this._publish(normalized.startedAt);
   }
 
+  async prepareStorageMigration() {
+    if (this.writer || ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)) {
+      throw new Error("capture must be inactive before storage migration");
+    }
+    await Promise.allSettled([this.compressionRecovery, this.compressionWork]);
+    if (this.retentionWork.size > 0) {
+      await Promise.allSettled([...this.retentionWork]);
+    }
+  }
+
+  reconfigureStorage({ recordingsDir }) {
+    if (this.writer || ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)) {
+      throw new Error("capture must be inactive before storage migration");
+    }
+    if (typeof recordingsDir !== "string" || !path.isAbsolute(recordingsDir)) {
+      throw new TypeError("recordingsDir must be absolute");
+    }
+    this.recordingsDir = path.resolve(recordingsDir);
+    this.fs.mkdirSync(this.recordingsDir, { recursive: true });
+    this.audioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: this.recordingsDir });
+    this.flacCompressionWorker = this.repository.captureEvidenceStore
+      ? new FlacCompressionWorker({
+          store: this.repository.captureEvidenceStore,
+          recordingsRoot: this.recordingsDir,
+          reader: this.audioEvidenceReader,
+        })
+      : null;
+    return this.recordingsDir;
+  }
+
   appendPcm(sessionId, sourceType, pcmBuffer) {
     if (this.closing || this.closed) return false;
     const id = assertId(sessionId, "sessionId");
     const type = assertSourceType(sourceType);
     if (id !== this.state.sessionId) throw new Error("capture session mismatch");
-    if (this.state.status === "failed") return false;
+    if (this.state.status === "failed" || this.state.status === "paused") return false;
     const source = this.state.sources[type];
     if (!source) throw new Error(`capture source was not requested: ${type}`);
     if (source.state !== "active") return false;
@@ -616,7 +663,10 @@ class JarvisService {
       this._assertSafeDiskSpace();
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
-      if (diskError) this._failForDisk(diskError.code, at);
+      if (diskError && this.state.errorCode !== "capture_stopped_low_disk") {
+        this.state.errorCode = "capture_stopped_low_disk";
+        this._publish(at);
+      }
       throw error;
     }
     const reopenedSourceTypes = [];
@@ -1205,6 +1255,9 @@ class JarvisService {
   }
 
   _failRetentionSwitch(at) {
+    if (this.state.status === "paused" && this.state.errorCode === "capture_stopped_low_disk") {
+      return this._publicState(at);
+    }
     if (this.state.status === "failed") return this._publicState(at);
     this._cancelAllVadWork();
     try {
@@ -1237,7 +1290,7 @@ class JarvisService {
       tracks,
       baseDir,
       now: this.now,
-      beforeChunk: () => this._assertSafeDiskSpace(),
+      beforeChunk: (pendingWriteBytes = 0) => this._assertSafeDiskSpace(pendingWriteBytes),
       openSources,
       onChunk: (chunk) => {
         if (this.closed) return null;
@@ -1300,27 +1353,34 @@ class JarvisService {
       for (const sourceType of ["mic", "system"]) {
         const sourceDir = this._recoveryDirectory(sessionDir, sourceType);
         if (!sourceDir) continue;
-        let sidecarEntries;
-        try {
-          sidecarEntries = this.fs
-            .readdirSync(sourceDir, { withFileTypes: true })
-            .filter((entry) => entry.name.endsWith(RECOVERY_SIDECAR_SUFFIX))
-            .sort((left, right) => left.name.localeCompare(right.name));
-        } catch {
-          continue;
-        }
-        for (const sidecarEntry of sidecarEntries) {
+        const evidenceDirectories = [];
+        const quarantineDir = this._recoveryDirectory(sourceDir, "recovery");
+        if (quarantineDir) evidenceDirectories.push(quarantineDir);
+        evidenceDirectories.push(sourceDir);
+
+        for (const evidenceDir of evidenceDirectories) {
+          let sidecarEntries;
           try {
-            this._reconcileChunkRecoverySidecar({
-              root,
-              sessionId,
-              sourceType,
-              sourceDir,
-              sidecarName: sidecarEntry.name,
-            });
+            sidecarEntries = this.fs
+              .readdirSync(evidenceDir, { withFileTypes: true })
+              .filter((entry) => entry.name.endsWith(RECOVERY_SIDECAR_SUFFIX))
+              .sort((left, right) => left.name.localeCompare(right.name));
           } catch {
-            // Preserve invalid/conflicting evidence for diagnosis while allowing startup and
-            // valid sibling recovery to continue.
+            continue;
+          }
+          for (const sidecarEntry of sidecarEntries) {
+            try {
+              this._reconcileChunkRecoverySidecar({
+                root,
+                sessionId,
+                sourceType,
+                sourceDir: evidenceDir,
+                sidecarName: sidecarEntry.name,
+              });
+            } catch {
+              // Preserve invalid/conflicting evidence for diagnosis while allowing startup and
+              // valid sibling recovery to continue.
+            }
           }
         }
       }
@@ -1640,7 +1700,8 @@ class JarvisService {
     );
   }
 
-  _assertSafeDiskSpace() {
+  _assertSafeDiskSpace(pendingWriteBytes = 0) {
+    if (this.emergencyCommit) return;
     let stats;
     try {
       stats = this.fs.statfsSync(this.recordingsDir);
@@ -1658,7 +1719,17 @@ class JarvisService {
     ) {
       throw new DiskSpaceError("DISK_SPACE_CHECK_FAILED");
     }
-    if (!hasSafeDiskSpace({ freeBytes, totalBytes })) {
+    let inspection;
+    try {
+      inspection = this.storageGovernor.inspect({
+        volumeBytes: totalBytes,
+        freeBytes,
+        pendingWriteBytes,
+      });
+    } catch {
+      throw new DiskSpaceError("DISK_SPACE_CHECK_FAILED");
+    }
+    if (inspection.state === "stopped") {
       throw new DiskSpaceError("DISK_SPACE_LOW");
     }
   }
@@ -1692,6 +1763,13 @@ class JarvisService {
   }
 
   _failForDisk(code, at, durableSources) {
+    if (
+      code === "DISK_SPACE_LOW" &&
+      this.writer &&
+      ACTIVE_SESSION_STATUSES.has(this.state.status)
+    ) {
+      return this._stopForLowDisk(at);
+    }
     this.writer?.abortAll?.();
     this.writer = null;
     return this._finalizeCapture(at, {
@@ -1700,6 +1778,43 @@ class JarvisService {
       errorCode: code,
       durableSources,
     });
+  }
+
+  _stopForLowDisk(at) {
+    this._cancelAllVadWork();
+    this.emergencyCommit = true;
+    try {
+      this.writer.closeAll(at);
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+    } catch (error) {
+      // AudioChunkWriter quarantines the completed WAV and its durable sidecar when SQLite
+      // commit fails. Never report that evidence as saved in this process.
+      this.writer = null;
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+      this._transitionSessionStatus("paused", at);
+      this.state.errorCode = "capture_stopped_low_disk";
+      try {
+        this._persistSessionStatus("paused", at);
+      } catch {}
+      this._publish(at);
+      throw error;
+    } finally {
+      this.emergencyCommit = false;
+    }
+    this.repository.pauseCapture({
+      sessionId: this.state.sessionId,
+      sources: Object.values(this.state.sources).map((source) => ({
+        trackId: source.trackId,
+        expectedState: source.state === "reconnecting" ? "recovering" : source.state,
+      })),
+      at,
+    });
+    for (const source of Object.values(this.state.sources)) {
+      if (source.state === "active") source.state = "paused";
+    }
+    this._transitionSessionStatus("paused", at);
+    this.state.errorCode = "capture_stopped_low_disk";
+    return this._publish(at);
   }
 
   _failForAudioWrite(at) {

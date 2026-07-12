@@ -45,10 +45,17 @@ class WhisperCudaManager {
 
   getCudaBinaryDir() {
     if (!this._binDir) {
-      this._binDir = path.join(app.getPath("userData"), "bin");
+      this._binDir =
+        process.env.JARVIS_DATA_ROOT && path.isAbsolute(process.env.JARVIS_DATA_ROOT)
+          ? path.join(process.env.JARVIS_DATA_ROOT, "components", "cuda")
+          : path.join(app.getPath("userData"), "bin");
       fs.mkdirSync(this._binDir, { recursive: true });
     }
     return this._binDir;
+  }
+
+  resetDataRoot() {
+    this._binDir = null;
   }
 
   getCudaBinaryPath() {

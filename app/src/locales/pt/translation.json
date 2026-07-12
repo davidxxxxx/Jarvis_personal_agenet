@@ -1,5 +1,24 @@
 {
   "jarvis": {
+    "storage": {
+      "title": "Storage",
+      "description": "Protect evidence space and move all Jarvis data safely.",
+      "free": "Free space",
+      "written24h": "Written in 24 hours",
+      "compressed24h": "Compressed in 24 hours",
+      "projectedDaily": "Projected daily growth",
+      "remaining": "Recordable time remaining",
+      "state": "Storage state",
+      "states": { "ok": "OK", "warning": "Warning", "stopped": "Stopped" },
+      "notAvailable": "Not available",
+      "days": "{{count}} days",
+      "currentRoot": "Current data directory",
+      "newRoot": "New data directory",
+      "migrate": "Migrate data",
+      "captureActive": "Finish or cancel capture before migrating data.",
+      "progress": "Copied {{completed}} of {{total}} files",
+      "error": "Storage information or migration could not be completed."
+    },
     "today": "Today",
     "people": "People",
     "topics": "Topics",

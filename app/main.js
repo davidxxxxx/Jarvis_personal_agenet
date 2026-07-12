@@ -300,7 +300,15 @@ const {
 } = require("./src/jarvis/main/LegacyRecordingBackfill");
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
-const { resolveRecordingsRoot } = require("./src/jarvis/main/recordingStorage");
+const {
+  DataRootConfig,
+  copyLegacyTreeSync,
+  resolveJarvisDataRoot,
+  resolveRecordingsRoot,
+} = require("./src/jarvis/main/recordingStorage");
+const StorageGovernor = require("./src/jarvis/main/StorageGovernor");
+const DataDirectoryMigrator = require("./src/jarvis/main/DataDirectoryMigrator");
+const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
@@ -349,6 +357,8 @@ let jarvisAnalysisScheduler = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
 let gracefulShutdownCoordinator = null;
+let jarvisStorageManager = null;
+let jarvisDataRootConfig = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -412,11 +422,53 @@ function initializeCoreManagers() {
   databaseManager = new DatabaseManager();
 
   const jarvisUserDataDir = app.getPath("userData");
-  const recordingsRoot = resolveRecordingsRoot(
-    jarvisUserDataDir,
-    process.env.JARVIS_RECORDINGS_DIR
-  );
-  jarvisRepository = new JarvisRepository(path.join(jarvisUserDataDir, "jarvis.db"));
+  jarvisDataRootConfig = new DataRootConfig({ userDataDir: jarvisUserDataDir });
+  const legacyConfiguredRecordings = process.env.JARVIS_RECORDINGS_DIR
+    ? resolveRecordingsRoot(jarvisUserDataDir, process.env.JARVIS_RECORDINGS_DIR)
+    : null;
+  const configuredDataRoot = jarvisDataRootConfig.hasSavedRoot()
+    ? jarvisDataRootConfig.load()
+    : legacyConfiguredRecordings
+      ? resolveJarvisDataRoot(jarvisUserDataDir, path.dirname(legacyConfiguredRecordings))
+      : jarvisDataRootConfig.load();
+  process.env.JARVIS_DATA_ROOT = configuredDataRoot;
+  const recordingsRoot = legacyConfiguredRecordings && !jarvisDataRootConfig.hasSavedRoot()
+    ? legacyConfiguredRecordings
+    : path.join(configuredDataRoot, "recordings");
+  for (const directory of [
+    configuredDataRoot,
+    recordingsRoot,
+    path.join(configuredDataRoot, "components", "cuda"),
+    path.join(configuredDataRoot, "models", "whisper-models"),
+    path.join(configuredDataRoot, "temp"),
+  ]) {
+    require("node:fs").mkdirSync(directory, { recursive: true });
+  }
+  const legacyDb = path.join(jarvisUserDataDir, "jarvis.db");
+  const configuredDb = path.join(configuredDataRoot, "jarvis.db");
+  if (
+    configuredDb !== legacyDb &&
+    require("node:fs").existsSync(legacyDb) &&
+    !require("node:fs").existsSync(configuredDb)
+  ) {
+    require("node:fs").copyFileSync(legacyDb, configuredDb, require("node:fs").constants.COPYFILE_EXCL);
+  }
+  const legacyRecordings = path.join(jarvisUserDataDir, "recordings");
+  if (
+    !process.env.JARVIS_RECORDINGS_DIR &&
+    legacyRecordings !== recordingsRoot &&
+    require("node:fs").existsSync(legacyRecordings) &&
+    require("node:fs").readdirSync(recordingsRoot).length === 0
+  ) {
+    copyLegacyTreeSync({ from: legacyRecordings, to: recordingsRoot });
+  }
+  jarvisRepository = new JarvisRepository(configuredDb);
+  const storageGovernor = new StorageGovernor({
+    reserve: new StorageGovernor.FileEmergencyReserve({
+      filePath: path.join(configuredDataRoot, ".emergency-reserve"),
+    }),
+  });
+  storageGovernor.ensureReserve();
   runLegacyRecordingBackfillAtStartup({
     repository: jarvisRepository,
     recordingsRoot,
@@ -430,6 +482,7 @@ function initializeCoreManagers() {
     userDataDir: jarvisUserDataDir,
     recordingsDir: recordingsRoot,
     vadClassifier: speechVadClassifier,
+    storageGovernor,
     broadcast: (state) => {
       windowManager?.sendToControlPanel("jarvis:state-changed", state);
       trayManager?.setJarvisState(state);
@@ -446,6 +499,38 @@ function initializeCoreManagers() {
     artifactCleaner: jarvisService.flacCompressionWorker,
     temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
+  });
+  let storageManagerRef = null;
+  const dataDirectoryMigrator = new DataDirectoryMigrator({
+    closeHolders: async () => {
+      await jarvisService.prepareStorageMigration();
+      jarvisRepository.close();
+    },
+    persistRoot: async (root) => {
+      jarvisDataRootConfig.save(root);
+    },
+    reopenHolders: async (root) => {
+      process.env.JARVIS_DATA_ROOT = root;
+      const nextRecordingsRoot = path.join(root, "recordings");
+      require("node:fs").mkdirSync(nextRecordingsRoot, { recursive: true });
+      jarvisRepository.reopen(path.join(root, "jarvis.db"));
+      jarvisService.reconfigureStorage({ recordingsDir: nextRecordingsRoot });
+      retentionCleaner.reconfigureStorage({
+        recordingsRoot: nextRecordingsRoot,
+        artifactCleaner: jarvisService.flacCompressionWorker,
+        temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
+      });
+      storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
+      storageGovernor.ensureReserve();
+      whisperCudaManager?.resetDataRoot?.();
+      require("./src/helpers/safeTempDir").resetSafeTempDir();
+    },
+    onProgress: (progress) => storageManagerRef?.setProgress(progress),
+  });
+  jarvisStorageManager = storageManagerRef = new JarvisStorageManager({
+    currentRoot: configuredDataRoot,
+    governor: storageGovernor,
+    migrator: dataDirectoryMigrator,
   });
   voiceEnrollmentService = new VoiceEnrollmentService({
     speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
@@ -487,6 +572,7 @@ function initializeCoreManagers() {
     environmentManager,
     analysisScheduler: jarvisAnalysisScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
+    storageManager: jarvisStorageManager,
   });
 
   const uiLanguage = environmentManager.getUiLanguage();

@@ -11,7 +11,7 @@ import type {
 } from "../types";
 import { initialSessionState, type SessionState } from "./sessionMachine";
 
-export type JarvisView = "today" | "people" | "topics" | "todos" | "memory";
+export type JarvisView = "today" | "people" | "topics" | "todos" | "memory" | "storage";
 
 interface JarvisRendererState {
   session: SessionState;

@@ -351,13 +351,17 @@ test("normal start continues to await a compatible in-flight prepare", async () 
   assert.equal(await waiting, "awaited");
 });
 
-test("disk cutoff is the greater of 5 GB and five percent of the volume", () => {
+test("disk cutoff is the greater of 5 GiB and three percent of the volume", () => {
   assert.equal(MIN_FREE_BYTES, 5 * 1024 ** 3);
   assert.equal(requiredFreeBytes(80 * 1024 ** 3), MIN_FREE_BYTES);
-  assert.equal(requiredFreeBytes(200 * 1024 ** 3), 10 * 1024 ** 3);
+  assert.equal(requiredFreeBytes(200 * 1024 ** 3), 6 * 1024 ** 3);
   assert.equal(
     hasSafeDiskSpace({ freeBytes: MIN_FREE_BYTES - 1, totalBytes: 80 * 1024 ** 3 }),
     false
   );
-  assert.equal(hasSafeDiskSpace({ freeBytes: 10 * 1024 ** 3, totalBytes: 200 * 1024 ** 3 }), true);
+  assert.equal(hasSafeDiskSpace({ freeBytes: 6 * 1024 ** 3, totalBytes: 200 * 1024 ** 3 }), false);
+  assert.equal(
+    hasSafeDiskSpace({ freeBytes: 6 * 1024 ** 3 + 1, totalBytes: 200 * 1024 ** 3 }),
+    true
+  );
 });

@@ -124,8 +124,9 @@ test("closeAll flushes every source and aggregates source-aware failures", () =>
     assert.doesNotThrow(() => writer.closeAll(1001));
     assert.equal(completed.length, 1);
     assert.equal(
-      fs.readdirSync(path.join(baseDir, "mic")).filter((name) => name.endsWith(".recovery.json"))
-        .length,
+      fs
+        .readdirSync(path.join(baseDir, "mic", "recovery"))
+        .filter((name) => name.endsWith(".recovery.json")).length,
       1
     );
     assert.equal(

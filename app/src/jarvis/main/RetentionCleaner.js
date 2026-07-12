@@ -46,6 +46,19 @@ class RetentionCleaner {
     this.generation = 0;
   }
 
+  setRecordingsRoot(recordingsRoot) {
+    if (typeof recordingsRoot !== "string" || !path.isAbsolute(recordingsRoot)) {
+      throw new TypeError("recordingsRoot must be absolute");
+    }
+    this.recordingsRoot = path.resolve(recordingsRoot);
+  }
+
+  reconfigureStorage({ recordingsRoot, artifactCleaner, temporaryEvidenceCleaner }) {
+    this.setRecordingsRoot(recordingsRoot);
+    this.artifactCleaner = artifactCleaner ?? null;
+    this.temporaryEvidenceCleaner = temporaryEvidenceCleaner ?? null;
+  }
+
   clean(at = this.now()) {
     if (this.activeCleanup) return this.activeCleanup;
     const generation = this.generation;

@@ -1,5 +1,24 @@
 {
   "jarvis": {
+    "storage": {
+      "title": "儲存空間",
+      "description": "保護證據儲存空間，並安全移轉全部 Jarvis 資料。",
+      "free": "可用空間",
+      "written24h": "過去 24 小時寫入",
+      "compressed24h": "過去 24 小時壓縮",
+      "projectedDaily": "預估每日成長",
+      "remaining": "剩餘可錄製時間",
+      "state": "儲存狀態",
+      "states": { "ok": "正常", "warning": "警告", "stopped": "已停止" },
+      "notAvailable": "暫無資料",
+      "days": "{{count}} 天",
+      "currentRoot": "目前資料目錄",
+      "newRoot": "新資料目錄",
+      "migrate": "移轉資料",
+      "captureActive": "請先完成或取消錄製，再移轉資料。",
+      "progress": "已複製 {{completed}} / {{total}} 個檔案",
+      "error": "無法完成儲存資訊讀取或移轉。"
+    },
     "today": "Today",
     "people": "People",
     "topics": "Topics",

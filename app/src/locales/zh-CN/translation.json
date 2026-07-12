@@ -1,5 +1,24 @@
 {
   "jarvis": {
+    "storage": {
+      "title": "存储",
+      "description": "保护证据存储空间，并安全迁移全部 Jarvis 数据。",
+      "free": "可用空间",
+      "written24h": "过去 24 小时写入",
+      "compressed24h": "过去 24 小时压缩",
+      "projectedDaily": "预计每日增长",
+      "remaining": "剩余可录制时间",
+      "state": "存储状态",
+      "states": { "ok": "正常", "warning": "警告", "stopped": "已停止" },
+      "notAvailable": "暂无数据",
+      "days": "{{count}} 天",
+      "currentRoot": "当前数据目录",
+      "newRoot": "新数据目录",
+      "migrate": "迁移数据",
+      "captureActive": "请先完成或取消录制，再迁移数据。",
+      "progress": "已复制 {{completed}} / {{total}} 个文件",
+      "error": "无法完成存储信息读取或迁移。"
+    },
     "today": "今天",
     "people": "人物",
     "topics": "主题",

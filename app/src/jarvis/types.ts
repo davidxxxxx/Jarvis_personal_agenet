@@ -280,6 +280,37 @@ export interface JarvisCloudBudgetInput {
   monthlyLimitMicrousd: number;
 }
 
+export type JarvisStorageState = "ok" | "warning" | "stopped";
+
+export interface JarvisStorageProgress {
+  state: "starting" | "copying" | "activating" | "complete" | "failed";
+  completedFiles: number;
+  totalFiles: number;
+}
+
+export interface JarvisStorageStatus {
+  state: JarvisStorageState;
+  volumeBytes: number;
+  freeBytes: number;
+  warningBytes: number;
+  stopBytes: number;
+  writtenBytes24h: number;
+  compressedBytes24h: number;
+  projectedDailyGrowthBytes: number;
+  remainingDays: number | null;
+  currentRoot: string;
+  progress: JarvisStorageProgress | null;
+  recoveryAction: string | null;
+}
+
+export interface JarvisStorageMigrationResult {
+  switched: boolean;
+  canDeleteOldRoot: boolean;
+  oldRoot?: string;
+  currentRoot?: string;
+  recoveryAction?: string;
+}
+
 export interface JarvisVoiceEnrollmentWindow {
   startSample: number;
   endSample: number;

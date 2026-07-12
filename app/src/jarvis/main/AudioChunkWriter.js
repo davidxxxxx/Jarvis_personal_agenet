@@ -94,7 +94,7 @@ class AudioChunkWriter {
     this.pending.push(Buffer.from(buffer));
     this.pendingBytes += buffer.length;
     while (this.pendingBytes >= this.chunkBytes) {
-      this.beforeChunk();
+      this.beforeChunk(this.chunkBytes);
       this._emit(this._take(this.chunkBytes), this.now());
     }
   }
@@ -104,7 +104,7 @@ class AudioChunkWriter {
     if (this.closed) return;
     this.closed = true;
     if (this.pendingBytes === 0) return;
-    this.beforeChunk();
+    this.beforeChunk(this.pendingBytes);
     this._emit(this._take(this.pendingBytes), at);
   }
 
@@ -218,6 +218,14 @@ class AudioChunkWriter {
     } catch (error) {
       this.fault = new Error(`audio chunk metadata commit failed for ${id}`, { cause: error });
       this.fault.evidenceEndedAt = endedAt;
+      try {
+        chunk = this._moveToRecoveryDirectory(chunk, recoveryPath);
+        this.fault.evidencePath = chunk.path;
+      } catch (recoveryError) {
+        // The original WAV and sidecar remain the durable fallback if quarantine fails.
+        this.fault.recoveryError = recoveryError;
+        this.fault.evidencePath = chunk.path;
+      }
       throw this.fault;
     }
 
@@ -227,6 +235,46 @@ class AudioChunkWriter {
       this.fault = new Error(`audio chunk recovery cleanup failed for ${id}`, { cause: error });
       this.fault.evidenceEndedAt = endedAt;
       throw this.fault;
+    }
+  }
+
+  _moveToRecoveryDirectory(chunk, originalSidecarPath) {
+    const recoveryDir = path.join(this.baseDir, "recovery");
+    fs.mkdirSync(recoveryDir, { recursive: true });
+    const recoveryStat = fs.lstatSync(recoveryDir);
+    if (!recoveryStat.isDirectory() || recoveryStat.isSymbolicLink()) {
+      throw new Error("audio recovery path must be a local directory");
+    }
+
+    const recoveryPath = path.join(recoveryDir, path.basename(chunk.path));
+    const recoverySidecarPath = `${recoveryPath}.recovery.json`;
+    const recoveryPartPath = `${recoverySidecarPath}.${crypto.randomUUID()}.tmp`;
+    const recoveredChunk = { ...chunk, path: recoveryPath };
+    let recoveryFd = null;
+
+    try {
+      recoveryFd = fs.openSync(recoveryPartPath, "wx");
+      fs.writeFileSync(recoveryFd, JSON.stringify(recoveredChunk));
+      fs.fsyncSync(recoveryFd);
+      fs.closeSync(recoveryFd);
+      recoveryFd = null;
+      fs.renameSync(recoveryPartPath, recoverySidecarPath);
+      fs.renameSync(chunk.path, recoveryPath);
+      try {
+        fs.unlinkSync(originalSidecarPath);
+      } catch {}
+      Object.assign(chunk, recoveredChunk);
+      return chunk;
+    } catch (error) {
+      if (recoveryFd !== null) {
+        try {
+          fs.closeSync(recoveryFd);
+        } catch {}
+      }
+      try {
+        fs.unlinkSync(recoveryPartPath);
+      } catch {}
+      throw error;
     }
   }
 }

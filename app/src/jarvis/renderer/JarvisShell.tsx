@@ -5,6 +5,7 @@ import {
   CheckSquare2,
   LockKeyhole,
   MessageSquareText,
+  HardDrive,
   UsersRound,
 } from "lucide-react";
 import { useJarvisStore, type JarvisView } from "./jarvisStore";
@@ -15,6 +16,7 @@ import MemoryView from "./MemoryView";
 import PeopleView from "./PeopleView";
 import TopicsView from "./TopicsView";
 import TodosView from "./TodosView";
+import JarvisStorageSettings from "./JarvisStorageSettings";
 
 const NAV_ITEMS: Array<{
   id: JarvisView;
@@ -25,6 +27,7 @@ const NAV_ITEMS: Array<{
   { id: "topics", icon: MessageSquareText },
   { id: "todos", icon: CheckSquare2 },
   { id: "memory", icon: BrainCircuit },
+  { id: "storage", icon: HardDrive },
 ];
 
 export default function JarvisShell() {
@@ -33,6 +36,7 @@ export default function JarvisShell() {
   const selectedView = useJarvisStore((state) => state.selectedView);
   const setSelectedView = useJarvisStore((state) => state.setSelectedView);
 
+  const captureActive = ["recording", "paused", "finalizing"].includes(recording.session.status);
   const content =
     selectedView === "people" ? (
       <PeopleView />
@@ -42,6 +46,8 @@ export default function JarvisShell() {
       <TodosView />
     ) : selectedView === "memory" ? (
       <MemoryView />
+    ) : selectedView === "storage" ? (
+      <JarvisStorageSettings captureActive={captureActive} />
     ) : (
       <TodayView recording={recording} />
     );
@@ -85,7 +91,7 @@ export default function JarvisShell() {
                   >
                     <span className="flex items-center gap-2 text-sm font-medium">
                       <Icon className="size-4" aria-hidden="true" />
-                      {t(`jarvis.${id}`)}
+                      {id === "storage" ? t("jarvis.storage.title") : t(`jarvis.${id}`)}
                     </span>
                   </button>
                 </li>

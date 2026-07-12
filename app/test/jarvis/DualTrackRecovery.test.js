@@ -145,7 +145,7 @@ function leaveMicRecoverySidecar(runtime, testRoot, sessionId) {
     false
   );
 
-  const recordingDir = path.join(testRoot, "recordings", sessionId, "mic");
+  const recordingDir = path.join(testRoot, "recordings", sessionId, "mic", "recovery");
   const sidecarName = fs
     .readdirSync(recordingDir)
     .find((entry) => entry.endsWith(".recovery.json"));
@@ -323,11 +323,12 @@ test("startup reconciles a renamed WAV sidecar before finalizing its interrupted
     assert.equal(micGap.started_at, 61_000);
 
     const micDir = path.join(testRoot, "recordings", sessionId, "mic");
+    const recoveryDir = path.join(micDir, "recovery");
     const validSidecarName = fs
-      .readdirSync(micDir)
+      .readdirSync(recoveryDir)
       .find((entry) => entry.endsWith(".recovery.json"));
     assert.ok(validSidecarName);
-    const validSidecarPath = path.join(micDir, validSidecarName);
+    const validSidecarPath = path.join(recoveryDir, validSidecarName);
     const validMetadata = JSON.parse(fs.readFileSync(validSidecarPath, "utf8"));
     const conflictingWavPath = path.join(micDir, "zz-conflict.wav");
     const conflictingSidecarPath = `${conflictingWavPath}.recovery.json`;
@@ -412,9 +413,12 @@ test("startup rejects an oversized recovery WAV before reading its contents", ()
     );
 
     const micDir = path.join(testRoot, "recordings", sessionId, "mic");
-    const sidecarName = fs.readdirSync(micDir).find((entry) => entry.endsWith(".recovery.json"));
+    const recoveryDir = path.join(micDir, "recovery");
+    const sidecarName = fs
+      .readdirSync(recoveryDir)
+      .find((entry) => entry.endsWith(".recovery.json"));
     assert.ok(sidecarName);
-    const sidecarPath = path.join(micDir, sidecarName);
+    const sidecarPath = path.join(recoveryDir, sidecarName);
     const metadata = JSON.parse(fs.readFileSync(sidecarPath, "utf8"));
     fs.appendFileSync(metadata.path, Buffer.of(0));
 

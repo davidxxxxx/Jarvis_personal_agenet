@@ -474,7 +474,7 @@ test("runtime switch from continuous closes the old writer before speech-trigger
   );
 });
 
-test("continuous to speech close preserves a disk cutoff error code", async (t) => {
+test("continuous to speech close preserves a recoverable low-disk safe-stop", async (t) => {
   let diskChecks = 0;
   const fsImpl = Object.create(fs);
   fsImpl.statfsSync = () => ({
@@ -486,15 +486,16 @@ test("continuous to speech close preserves a disk cutoff error code", async (t) 
     retentionMode: "continuous",
     vadClassifier: new DeterministicVad(),
     fsImpl,
+    now: () => 8_000,
   });
   await appendAndDrain(service, "mic", pcm(1_000, 8_000));
 
-  const state = service.setRetentionMode("s1", "speech_triggered", 1_000);
+  const state = service.setRetentionMode("s1", "speech_triggered", 8_000);
 
-  assert.equal(state.status, "failed");
-  assert.equal(state.errorCode, "DISK_SPACE_LOW");
-  assert.equal(state.sources.mic.state, "failed");
-  assert.equal(repository.getSession("s1").status, "failed");
+  assert.equal(state.status, "paused");
+  assert.equal(state.errorCode, "capture_stopped_low_disk");
+  assert.equal(state.sources.mic.state, "paused");
+  assert.equal(repository.getSession("s1").status, "paused");
   assert.equal(repository.getSession("s1").retention_mode, "speech_triggered");
 });
 

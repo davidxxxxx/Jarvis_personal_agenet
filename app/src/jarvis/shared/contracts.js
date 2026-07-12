@@ -39,6 +39,8 @@ const CHANNELS = Object.freeze({
   cancelVoiceEnrollment: "jarvis:voice-enrollment:cancel",
   getCloudBudget: "jarvis:cloud-budget:get",
   setCloudBudget: "jarvis:cloud-budget:set",
+  getStorageStatus: "jarvis:storage:status",
+  migrateStorage: "jarvis:storage:migrate",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",
 });
