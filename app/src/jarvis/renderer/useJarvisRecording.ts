@@ -19,6 +19,7 @@ import type {
   JarvisCaptureSourceInput,
   JarvisPerson,
   JarvisRenamePersonInput,
+  JarvisRetentionMode,
   JarvisRuntimeState,
   JarvisSession,
   JarvisSessionInput,
@@ -50,6 +51,11 @@ export interface RecordingJarvisApi {
   setSessionStatus: (id: string, status: "failed", at?: number) => Promise<JarvisSession | null>;
   listSessions: () => Promise<JarvisSession[]>;
   startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
+  setRetentionMode: (
+    id: string,
+    retentionMode: JarvisRetentionMode,
+    at?: number
+  ) => Promise<JarvisRuntimeState>;
   sourceInterrupted: (
     id: string,
     sourceType: "mic" | "system",
@@ -128,6 +134,7 @@ export interface RecordingDependencies {
   getMicDeviceId: () => string | null;
   getLanguage: () => string;
   getCaptureMode?: () => JarvisCaptureMode;
+  getRetentionMode?: () => JarvisRetentionMode;
   hasRecordingConsent: () => boolean;
   onOperationChange: (operation: JarvisControlAction | null) => void;
   onError: (code: string | null) => void;
@@ -135,6 +142,7 @@ export interface RecordingDependencies {
 
 export interface RecordingController {
   start: () => Promise<void>;
+  setRetentionMode: (retentionMode: JarvisRetentionMode) => Promise<JarvisRuntimeState>;
   pause: () => Promise<void>;
   pauseForError: (code: "MIC_PERMISSION" | "MIC_DISCONNECTED") => Promise<void>;
   resume: () => Promise<void>;
@@ -271,6 +279,7 @@ function captureSources(
 
 export function createRecordingController(deps: RecordingDependencies): RecordingController {
   let activeOperation: JarvisControlAction | null = null;
+  let retentionChangeActive = false;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   let persistenceTail: Promise<void> = Promise.resolve();
   let pendingPersistence: {
@@ -292,8 +301,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   };
 
   const begin = (operation: NonNullable<typeof activeOperation>): void => {
-    if (activeOperation) {
-      throw new Error(`cannot ${operation} while ${activeOperation} is in progress`);
+    if (activeOperation || retentionChangeActive) {
+      const pending = activeOperation ?? "retention change";
+      throw new Error(`cannot ${operation} while ${pending} is in progress`);
     }
     activeOperation = operation;
     deps.onOperationChange(operation);
@@ -431,6 +441,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     let sessionCreated = false;
     let captureStarted = false;
     const captureMode = deps.getCaptureMode?.() ?? "mic";
+    const retentionMode = deps.getRetentionMode?.() ?? "speech_triggered";
     sessionCaptureMode = captureMode;
 
     try {
@@ -443,6 +454,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         micDeviceId,
         language: deps.getLanguage(),
         captureMode,
+        retentionMode,
       });
       sessionCreated = true;
       activation.assertCurrent();
@@ -451,6 +463,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         startedAt,
         micDeviceId,
         captureMode,
+        retentionMode,
         sources: captureSources(captureMode, micDeviceId),
       });
       captureStarted = true;
@@ -531,6 +544,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     const paused = reduceSession(state, { type: "PAUSED", at });
     begin("pause");
     let upstreamStopped = false;
+    let authoritativeStateHandled = false;
 
     try {
       if (reportedError) {
@@ -544,11 +558,32 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         await stopUpstream();
         upstreamStopped = true;
       }
-      await deps.jarvis.pauseCapture(state.id as string, at, reportedError);
+      const runtime = await deps.jarvis.pauseCapture(state.id as string, at, reportedError);
+      if (runtime.status !== "paused") {
+        if (runtime.status === "failed") {
+          const code = runtime.errorCode || "capture_pause_failed";
+          authoritativeStateHandled = true;
+          failCurrentSession(code);
+          throw new RecordingOperationError(code, `main process pause failed: ${code}`);
+        }
+        const failed = await deps.jarvis.failCapture(
+          state.id as string,
+          "capture_pause_failed",
+          deps.now()
+        );
+        const code = failed.errorCode || "capture_pause_failed";
+        authoritativeStateHandled = true;
+        failCurrentSession(code);
+        throw new RecordingOperationError(
+          code,
+          `main process returned ${runtime.status} status after pause`
+        );
+      }
       deps.setSessionState(paused);
       await refreshSessions();
       if (reportedError) deps.onError(reportedError);
     } catch (error) {
+      if (authoritativeStateHandled) throw error;
       const code =
         reportedError ??
         errorCode(error, upstreamStopped ? "capture_pause_failed" : "upstream_stop_failed");
@@ -686,6 +721,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     begin("finish");
     let upstreamStopped = state.status === "paused";
     let mainFinished = false;
+    let authoritativeStateHandled = false;
 
     try {
       if (state.status === "recording") {
@@ -696,11 +732,32 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       deps.setSessionState(finalizing);
       const stableSegments = deps.getMeetingSnapshot().segments;
       await persistSnapshot(state.id as string, state.startedAt ?? at, stableSegments);
-      await deps.jarvis.finishCapture(state.id as string, deps.now());
+      const runtime = await deps.jarvis.finishCapture(state.id as string, deps.now());
+      if (runtime.status !== "completed") {
+        if (runtime.status === "failed") {
+          const code = runtime.errorCode || "capture_finish_failed";
+          authoritativeStateHandled = true;
+          failCurrentSession(code);
+          throw new RecordingOperationError(code, `main process finish failed: ${code}`);
+        }
+        const failed = await deps.jarvis.failCapture(
+          state.id as string,
+          "capture_finish_failed",
+          deps.now()
+        );
+        const code = failed.errorCode || "capture_finish_failed";
+        authoritativeStateHandled = true;
+        failCurrentSession(code);
+        throw new RecordingOperationError(
+          code,
+          `main process returned ${runtime.status} status after finish`
+        );
+      }
       mainFinished = true;
       transition({ type: "COMPLETED" });
       await refreshSessions();
     } catch (error) {
+      if (authoritativeStateHandled) throw error;
       const code = errorCode(
         error,
         upstreamStopped ? "capture_finish_failed" : "upstream_stop_failed"
@@ -826,8 +883,37 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     return person;
   };
 
+  const setRetentionMode = async (
+    retentionMode: JarvisRetentionMode
+  ): Promise<JarvisRuntimeState> => {
+    if (disposed || shutdownPromise) {
+      throw new Error("recording controller is shutting down");
+    }
+    if (activeOperation || retentionChangeActive) {
+      const pending = activeOperation ?? "retention change";
+      throw new Error(`cannot change retention while ${pending} is in progress`);
+    }
+    const state = deps.getSessionState();
+    if (!state.id || !["recording", "paused"].includes(state.status)) {
+      throw new Error(`cannot change retention from ${state.status}`);
+    }
+    retentionChangeActive = true;
+    deps.onError(null);
+    try {
+      const runtime = await deps.jarvis.setRetentionMode(state.id, retentionMode, deps.now());
+      if (runtime.errorCode) deps.onError(runtime.errorCode);
+      return runtime;
+    } catch (error) {
+      deps.onError(errorCode(error, "retention_mode_failed"));
+      throw error;
+    } finally {
+      retentionChangeActive = false;
+    }
+  };
+
   return {
     start,
+    setRetentionMode,
     pause,
     pauseForError,
     resume,
@@ -850,6 +936,8 @@ const rendererJarvisApi: RecordingJarvisApi = {
   setSessionStatus: (id, status, at) => window.electronAPI.jarvis.setSessionStatus(id, status, at),
   listSessions: () => window.electronAPI.jarvis.listSessions(),
   startCapture: (input) => window.electronAPI.jarvis.startCapture(input),
+  setRetentionMode: (id, retentionMode, at) =>
+    window.electronAPI.jarvis.setRetentionMode(id, retentionMode, at),
   sourceInterrupted: (id, sourceType, input) =>
     window.electronAPI.jarvis.sourceInterrupted(id, sourceType, input),
   sourceRestored: (id, sourceType, input) =>
@@ -866,6 +954,40 @@ const rendererJarvisApi: RecordingJarvisApi = {
   listPeople: () => window.electronAPI.jarvis.listPeople(),
 };
 
+export async function applyRecordingRetentionMode(
+  controller: RecordingController,
+  retentionMode: JarvisRetentionMode
+): Promise<void> {
+  const current = useJarvisStore.getState();
+  if (["recording", "paused"].includes(current.session.status)) {
+    const runtime = await controller.setRetentionMode(retentionMode);
+    const latest = useJarvisStore.getState();
+    if (runtime.retentionMode) latest.setRetentionMode(runtime.retentionMode);
+    latest.setRetentionRuntime(
+      runtime.effectiveRetentionMode ?? null,
+      runtime.retentionDegradedReason ?? null
+    );
+    if (runtime.status === "failed") {
+      const session = latest.session;
+      if (session.id === runtime.sessionId && ["recording", "paused"].includes(session.status)) {
+        latest.setSession(
+          reduceSession(session, {
+            type: "FAILED",
+            code: runtime.errorCode || "retention_mode_failed",
+          })
+        );
+      }
+    }
+    if (runtime.errorCode) latest.setError(runtime.errorCode);
+    return;
+  }
+  if (["starting", "finalizing"].includes(current.session.status)) {
+    throw new Error("retention mode is locked during a lifecycle transition");
+  }
+  current.setRetentionMode(retentionMode);
+  current.setRetentionRuntime(null, null);
+}
+
 export interface UseJarvisRecordingResult {
   session: SessionState;
   segments: TranscriptSegment[];
@@ -881,6 +1003,7 @@ export interface UseJarvisRecordingResult {
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   finish: () => Promise<void>;
+  setRetentionMode: (retentionMode: JarvisRetentionMode) => Promise<void>;
   renameSpeaker: (personId: string, displayName: string, isSelf?: boolean) => Promise<JarvisPerson>;
 }
 
@@ -963,6 +1086,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       getMicDeviceId: () => getSettings().selectedMicDeviceId || null,
       getLanguage: () => getSettings().preferredLanguage || "zh",
       getCaptureMode: () => useJarvisStore.getState().captureMode,
+      getRetentionMode: () => useJarvisStore.getState().retentionMode,
       hasRecordingConsent,
       onOperationChange: (operation) => useJarvisStore.getState().setOperation(operation),
       onError: (code) => useJarvisStore.getState().setError(code),
@@ -1015,6 +1139,13 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   useEffect(
     () =>
       window.electronAPI.jarvis.onStateChanged((state) => {
+        if (state.retentionMode) useJarvisStore.getState().setRetentionMode(state.retentionMode);
+        useJarvisStore
+          .getState()
+          .setRetentionRuntime(
+            state.effectiveRetentionMode ?? null,
+            state.retentionDegradedReason ?? null
+          );
         if (state.errorCode) useJarvisStore.getState().setError(state.errorCode);
         if (state.status === "failed") {
           const current = useJarvisStore.getState().session;
@@ -1099,6 +1230,10 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const pause = useCallback(() => controller.pause(), [controller]);
   const resume = useCallback(() => controller.resume(), [controller]);
   const finish = useCallback(() => controller.finish(), [controller]);
+  const setRetentionMode = useCallback(
+    (retentionMode: JarvisRetentionMode) => applyRecordingRetentionMode(controller, retentionMode),
+    [controller]
+  );
   const renameSpeaker = useCallback(
     (personId: string, displayName: string, isSelf?: boolean) =>
       controller.renameSpeaker(personId, displayName, isSelf),
@@ -1120,6 +1255,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     pause,
     resume,
     finish,
+    setRetentionMode,
     renameSpeaker,
   };
 }

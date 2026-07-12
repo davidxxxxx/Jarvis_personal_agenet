@@ -4,6 +4,7 @@ const {
   assertSessionStatus,
   assertCaptureFailureCode,
   assertSourceType,
+  assertRetentionMode,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const fs = require("node:fs/promises");
@@ -25,6 +26,7 @@ const REQUIRED_REPOSITORY_METHODS = [
 
 const REQUIRED_SERVICE_METHODS = [
   "startCapture",
+  "setRetentionMode",
   "sourceInterrupted",
   "sourceRestored",
   "pauseCapture",
@@ -234,6 +236,13 @@ function registerJarvisIpc({
   }
   ipcMain.handle(CHANNELS.startCapture, (_event, input) =>
     service.startCapture(normalizeCaptureStartInput(input))
+  );
+  ipcMain.handle(CHANNELS.setRetentionMode, (_event, id, retentionMode, at) =>
+    service.setRetentionMode(
+      assertId(id, "sessionId"),
+      assertRetentionMode(retentionMode),
+      at
+    )
   );
   ipcMain.handle(CHANNELS.sourceInterrupted, (_event, id, sourceType, input) =>
     service.sourceInterrupted(

@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "音訊保留模式",
+      "speechTriggered": "語音觸發",
+      "importantMeeting": "重要會議",
+      "listening": "正在聆聽",
+      "speechTriggeredDescription": "保留語音前 2 秒與後 3 秒，並抑制已確認的靜音。",
+      "continuousDescription": "重要會議會保留完整連續音訊。",
+      "degraded": "語音活動偵測暫時無法使用，目前正連續保留音訊。",
+      "degradedShort": "VAD 無法使用，正連續保留音訊"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

@@ -82,3 +82,12 @@ test("startup backfills legacy evidence before constructing retention cleanup", 
   assert.ok(backfillIndex > repositoryIndex);
   assert.ok(retentionIndex > backfillIndex);
 });
+
+test("model download wiring reports VAD recovery only after verified initialization", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+
+  assert.match(
+    mainSource,
+    /const vadInitialization = await speechVadClassifier\?\.initialize\(\);[\s\S]*?vadInitialization\?\.ok === true[\s\S]*?speechVadClassifier\?\.isReady\?\.\(\) === true[\s\S]*?jarvisService\?\.reportVadRecovered/
+  );
+});

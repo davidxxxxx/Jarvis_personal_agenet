@@ -1,6 +1,11 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const { assertCaptureMode, assertId, assertSessionStatus } = require("../shared/contracts");
+const {
+  RETENTION_MODES,
+  assertRetentionMode,
+  normalizeCapturePolicy,
+} = require("../shared/captureModes");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("./JarvisMigrations");
 
@@ -265,10 +270,17 @@ class JarvisRepository {
     this.statements = {
       createSession: this.db.prepare(`
         INSERT INTO sessions (
-          id, started_at, status, mic_device_id, language, created_at, capture_mode
+          id, started_at, status, mic_device_id, language, created_at, capture_mode,
+          retention_mode, capture_policy_json
         ) VALUES (
-          @id, @startedAt, 'recording', @micDeviceId, @language, @createdAt, @captureMode
+          @id, @startedAt, 'recording', @micDeviceId, @language, @createdAt, @captureMode,
+          @retentionMode, @capturePolicyJson
         )
+      `),
+      setSessionRetention: this.db.prepare(`
+        UPDATE sessions
+        SET retention_mode = @retentionMode, capture_policy_json = @capturePolicyJson
+        WHERE id = @id
       `),
       setSessionStatus: this.db.prepare(`
         UPDATE sessions
@@ -639,10 +651,20 @@ class JarvisRepository {
     });
   }
 
-  createSession({ id, startedAt, micDeviceId, language = "zh", captureMode = "mic" }) {
+  createSession({
+    id,
+    startedAt,
+    micDeviceId,
+    language = "zh",
+    captureMode = "mic",
+    retentionMode = RETENTION_MODES.SPEECH_TRIGGERED,
+    capturePolicy,
+  }) {
     const sessionId = assertId(id, "sessionId");
     assertInteger(startedAt, "startedAt");
     const mode = assertCaptureMode(captureMode);
+    const safeRetentionMode = assertRetentionMode(retentionMode);
+    const safeCapturePolicy = normalizeCapturePolicy(capturePolicy);
     if (micDeviceId !== null && micDeviceId !== undefined && typeof micDeviceId !== "string") {
       throw new TypeError("micDeviceId must be a string or null");
     }
@@ -660,7 +682,22 @@ class JarvisRepository {
       language,
       createdAt: Date.now(),
       captureMode: mode,
+      retentionMode: safeRetentionMode,
+      capturePolicyJson: JSON.stringify(safeCapturePolicy),
     });
+    return this.getSession(sessionId);
+  }
+
+  setSessionRetention(id, retentionMode, capturePolicy) {
+    const sessionId = assertId(id, "sessionId");
+    const safeRetentionMode = assertRetentionMode(retentionMode);
+    const safeCapturePolicy = normalizeCapturePolicy(capturePolicy);
+    const result = this.statements.setSessionRetention.run({
+      id: sessionId,
+      retentionMode: safeRetentionMode,
+      capturePolicyJson: JSON.stringify(safeCapturePolicy),
+    });
+    if (result.changes !== 1) throw new Error(`session ${sessionId} does not exist`);
     return this.getSession(sessionId);
   }
 
@@ -1372,6 +1409,10 @@ class JarvisRepository {
 
   openGap(gap) {
     return this.captureEvidenceStore.openGap(gap);
+  }
+
+  recordEvidenceGap(gap) {
+    return this.captureEvidenceStore.recordEvidenceGap(gap);
   }
 
   interruptTrack(input) {

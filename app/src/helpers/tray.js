@@ -12,7 +12,13 @@ class TrayManager {
     this.windowManager = null;
     this.jarvisControlQueue = null;
     this.attachedControlPanels = new WeakSet();
-    this.jarvisState = { status: "idle", errorCode: null };
+    this.jarvisState = {
+      status: "idle",
+      errorCode: null,
+      retentionMode: null,
+      effectiveRetentionMode: null,
+      retentionDegradedReason: null,
+    };
   }
 
   setWindows(mainWindow, controlPanelWindow) {
@@ -52,6 +58,18 @@ class TrayManager {
     this.jarvisState = {
       status: typeof state?.status === "string" ? state.status : "idle",
       errorCode: typeof state?.errorCode === "string" ? state.errorCode : null,
+      retentionMode:
+        state?.retentionMode === "speech_triggered" || state?.retentionMode === "continuous"
+          ? state.retentionMode
+          : null,
+      effectiveRetentionMode:
+        state?.effectiveRetentionMode === "speech_triggered" ||
+        state?.effectiveRetentionMode === "continuous" ||
+        state?.effectiveRetentionMode === "continuous_fallback"
+          ? state.effectiveRetentionMode
+          : null,
+      retentionDegradedReason:
+        typeof state?.retentionDegradedReason === "string" ? state.retentionDegradedReason : null,
     };
     this.updateTrayMenu();
   }
@@ -284,7 +302,7 @@ class TrayManager {
 
   buildJarvisControls() {
     const send = (action) => async () => this.sendJarvisControl(action);
-    if (this.jarvisState.status === "recording") {
+    if (["recording", "degraded"].includes(this.jarvisState.status)) {
       return [
         { label: i18nMain.t("jarvis.pause"), click: send("pause") },
         { label: i18nMain.t("jarvis.finish"), click: send("finish") },
@@ -309,12 +327,26 @@ class TrayManager {
   }
 
   getJarvisTooltip() {
-    const statusKey = ["recording", "paused", "finalizing", "completed", "failed"].includes(
-      this.jarvisState.status
-    )
-      ? this.jarvisState.status
-      : "idle";
-    const status = `Jarvis Memory · ${i18nMain.t(`jarvis.status.${statusKey}`)}`;
+    const activelyCapturing = ["recording", "degraded"].includes(this.jarvisState.status);
+    const statusKey = activelyCapturing
+      ? "recording"
+      : ["paused", "finalizing", "completed", "failed"].includes(this.jarvisState.status)
+        ? this.jarvisState.status
+        : "idle";
+    const statusLabel =
+      activelyCapturing && this.jarvisState.retentionMode === "continuous"
+        ? i18nMain.t("jarvis.retention.importantMeeting")
+        : activelyCapturing && this.jarvisState.retentionMode === "speech_triggered"
+          ? i18nMain.t("jarvis.retention.listening")
+          : i18nMain.t(`jarvis.status.${statusKey}`);
+    let status = `Jarvis Memory · ${statusLabel}`;
+    if (
+      ["recording", "degraded", "paused", "finalizing"].includes(this.jarvisState.status) &&
+      this.jarvisState.effectiveRetentionMode === "continuous_fallback" &&
+      this.jarvisState.retentionDegradedReason
+    ) {
+      status += ` · ${i18nMain.t("jarvis.retention.degradedShort")}`;
+    }
     return this.jarvisState.errorCode
       ? `${status} · ${i18nMain.t("jarvis.recordingError")}`
       : status;

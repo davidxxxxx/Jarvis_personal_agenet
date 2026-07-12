@@ -35,6 +35,12 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
     assert.ok(tables.includes("audio_tracks"));
     assert.ok(tables.includes("audio_gaps"));
     assert.ok(tables.includes("processing_jobs"));
+    assert.ok(
+      db
+        .prepare("PRAGMA index_list(audio_gaps)")
+        .all()
+        .some((index) => index.name === "idx_audio_gaps_track_ended_started")
+    );
 
     assert.deepEqual(
       columnNames(db, "sessions").filter((name) =>
@@ -147,6 +153,9 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       started_at: 10,
       status: "completed",
       capture_mode: "mic",
+      retention_mode: "continuous",
+      capture_policy_json:
+        '{"schemaVersion":1,"preRollMs":2000,"postRollMs":3000,"mergeGapMs":3000}',
       processing_state: "pending",
       timeline_version: 1,
       finalized_at: null,
@@ -169,6 +178,28 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       deleted_at: null,
     });
     assert.equal(db.prepare("SELECT count(*) AS count FROM audio_chunks").get().count, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("upgrades v4 databases with the bounded open-gap lookup index", () => {
+  const db = new Database(":memory:");
+
+  try {
+    applyJarvisMigrations(db);
+    db.exec(`
+      DROP INDEX idx_audio_gaps_track_ended_started;
+      PRAGMA user_version = 4;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 4, toVersion: TARGET_VERSION });
+    assert.ok(
+      db
+        .prepare("PRAGMA index_list(audio_gaps)")
+        .all()
+        .some((index) => index.name === "idx_audio_gaps_track_ended_started")
+    );
   } finally {
     db.close();
   }
@@ -398,6 +429,8 @@ test("upgrades v2 gaps with timestamped restoration binding columns without losi
       restored_device_id: null,
       restored_device_label: null,
       restored_strategy: null,
+      average_level: null,
+      peak_level: null,
     });
   } finally {
     db.close();

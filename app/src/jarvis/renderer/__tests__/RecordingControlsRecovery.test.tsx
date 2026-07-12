@@ -28,6 +28,7 @@ function fakeRecording(
     pause: vi.fn().mockResolvedValue(undefined),
     resume: vi.fn().mockResolvedValue(undefined),
     finish: vi.fn().mockResolvedValue(undefined),
+    setRetentionMode: vi.fn().mockResolvedValue(undefined),
     renameSpeaker: vi.fn().mockResolvedValue({}),
     ...overrides,
   };
@@ -44,6 +45,9 @@ describe("RecordingControls microphone recovery", () => {
     useJarvisStore.setState({
       captureMode: "mic",
       sourceStates: { mic: "idle", system: "idle" },
+      retentionMode: "speech_triggered",
+      effectiveRetentionMode: null,
+      retentionDegradedReason: null,
     });
     const mediaDevices = new EventTarget() as EventTarget & {
       enumerateDevices: ReturnType<typeof vi.fn>;
@@ -113,16 +117,8 @@ describe("RecordingControls microphone recovery", () => {
   });
 
   it.each([
-    [
-      "recovering",
-      { mic: "recovering", system: "unavailable" },
-      "Restoring audio sources…",
-    ],
-    [
-      "unavailable",
-      { mic: "unavailable", system: "unavailable" },
-      "No active audio source",
-    ],
+    ["recovering", { mic: "recovering", system: "unavailable" }, "Restoring audio sources…"],
+    ["unavailable", { mic: "unavailable", system: "unavailable" }, "No active audio source"],
   ] as const)(
     "shows %s instead of Listening while durable recording has no active source",
     async (_case, sourceStates, expectedStatus) => {
@@ -307,5 +303,121 @@ describe("RecordingControls microphone recovery", () => {
 
     expect(start).not.toHaveBeenCalled();
     expect(useJarvisStore.getState().captureMode).toBe("dual");
+  });
+
+  it.each(["recording", "paused"] as const)(
+    "allows retention changes during %s while capture source semantics stay locked",
+    async (status) => {
+      await i18n.changeLanguage("en");
+      const setRetentionMode = vi.fn(async (mode: "speech_triggered" | "continuous") => {
+        useJarvisStore.getState().setRetentionMode(mode);
+      });
+      useJarvisStore.setState({
+        retentionMode: "speech_triggered",
+        effectiveRetentionMode: "speech_triggered",
+        retentionDegradedReason: null,
+        sourceStates: { mic: "recording", system: "idle" },
+      });
+
+      render(
+        <RecordingControls
+          recording={fakeRecording({
+            session: {
+              id: "session-1",
+              status,
+              startedAt: 1_000,
+              activeSince: status === "recording" ? 1_000 : null,
+              accumulatedMs: status === "paused" ? 500 : 0,
+              errorCode: null,
+            },
+            setRetentionMode,
+          })}
+        />
+      );
+
+      const retention = screen.getByRole("combobox", { name: "Retention mode" });
+      expect(retention).toBeEnabled();
+      expect(screen.getByRole("radio", { name: "Microphone only" })).toBeDisabled();
+
+      fireEvent.change(retention, { target: { value: "continuous" } });
+      await waitFor(() => expect(setRetentionMode).toHaveBeenCalledWith("continuous"));
+      expect(retention).toHaveValue("continuous");
+      fireEvent.change(retention, { target: { value: "speech_triggered" } });
+      await waitFor(() => expect(setRetentionMode).toHaveBeenCalledWith("speech_triggered"));
+    }
+  );
+
+  it("allows choosing Important meeting before capture starts", async () => {
+    await i18n.changeLanguage("en");
+    const setRetentionMode = vi.fn().mockResolvedValue(undefined);
+    useJarvisStore.setState({
+      retentionMode: "speech_triggered",
+      effectiveRetentionMode: null,
+      retentionDegradedReason: null,
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: null,
+            status: "idle",
+            startedAt: null,
+            activeSince: null,
+            accumulatedMs: 0,
+            errorCode: null,
+          },
+          setRetentionMode,
+        })}
+      />
+    );
+
+    const selector = screen.getByRole("combobox", { name: "Retention mode" });
+    expect(selector).toBeEnabled();
+    fireEvent.change(selector, { target: { value: "continuous" } });
+    await waitFor(() => expect(setRetentionMode).toHaveBeenCalledWith("continuous"));
+  });
+
+  it("does not show stale VAD degradation after the session is terminal", async () => {
+    await i18n.changeLanguage("en");
+    useJarvisStore.setState({
+      retentionMode: "speech_triggered",
+      effectiveRetentionMode: "continuous_fallback",
+      retentionDegradedReason: "vad_unavailable",
+      sourceStates: { mic: "idle", system: "idle" },
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: "s1",
+            status: "completed",
+            startedAt: 0,
+            activeSince: null,
+            accumulatedMs: 100,
+            errorCode: null,
+          },
+        })}
+      />
+    );
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("shows the visible fail-open VAD degradation state", async () => {
+    await i18n.changeLanguage("en");
+    useJarvisStore.setState({
+      retentionMode: "speech_triggered",
+      effectiveRetentionMode: "continuous_fallback",
+      retentionDegradedReason: "vad_unavailable",
+      sourceStates: { mic: "recording", system: "idle" },
+    });
+
+    render(<RecordingControls recording={fakeRecording()} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Voice activity detection is unavailable. Audio is being kept continuously."
+    );
   });
 });

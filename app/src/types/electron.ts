@@ -2,6 +2,7 @@ import type {
   JarvisAudioChunk,
   JarvisCaptureFailureCode,
   JarvisCaptureInput,
+  JarvisRetentionMode,
   JarvisControlAction,
   JarvisControlEnvelope,
   JarvisPerson,
@@ -579,6 +580,11 @@ declare global {
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
+        setRetentionMode: (
+          id: string,
+          retentionMode: JarvisRetentionMode,
+          at?: number
+        ) => Promise<JarvisRuntimeState>;
         sourceInterrupted: (
           id: string,
           sourceType: "mic" | "system",

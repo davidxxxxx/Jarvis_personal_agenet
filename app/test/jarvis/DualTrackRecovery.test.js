@@ -47,7 +47,9 @@ function snapshot(repository, sessionId) {
       )
       .all(sessionId),
     chunks: repository.db
-      .prepare("SELECT * FROM audio_chunks WHERE session_id = ? ORDER BY source_type, sequence_number")
+      .prepare(
+        "SELECT * FROM audio_chunks WHERE session_id = ? ORDER BY source_type, sequence_number"
+      )
       .all(sessionId),
     jobs: repository.db
       .prepare("SELECT * FROM processing_jobs WHERE session_id = ? ORDER BY chunk_id, id")
@@ -74,7 +76,12 @@ function createRuntime(testRoot, sessionId) {
     now: () => clock,
     fsImpl: safeFs(),
   });
-  service.startCapture({ sessionId, startedAt: clock, captureMode: "dual", sources: dualSources() });
+  service.startCapture({
+    sessionId,
+    startedAt: clock,
+    captureMode: "dual",
+    sources: dualSources(),
+  });
 
   return {
     get repository() {
@@ -214,7 +221,10 @@ for (const failureOrder of [
       }
 
       const recovered = runtime.restartAndRecover(at + 1_000);
-      assert.deepEqual(recovered.map((session) => session.id), [sessionId]);
+      assert.deepEqual(
+        recovered.map((session) => session.id),
+        [sessionId]
+      );
       const afterRecovery = snapshot(runtime.repository, sessionId);
       assert.equal(afterRecovery.session.status, "recovered");
       assert.equal(afterRecovery.session.ended_at, at + 1_000);
@@ -229,7 +239,10 @@ for (const failureOrder of [
           { sourceType: "system", state: "recovered", endedAt: at + 1_000 },
         ]
       );
-      assert.equal(afterRecovery.gaps.every((gap) => gap.ended_at !== null), true);
+      assert.equal(
+        afterRecovery.gaps.every((gap) => gap.ended_at !== null),
+        true
+      );
       assert.equal(afterRecovery.jobs.length, afterRecovery.chunks.length);
 
       const stableCounts = {
@@ -281,15 +294,29 @@ test("startup reconciles a renamed WAV sidecar before finalizing its interrupted
     };
 
     runtime.setClock(61_000);
-    assert.equal(runtime.service.appendPcm("session-sidecar-recovery", "mic", Buffer.alloc(ONE_SECOND_BYTES * 60, 0x5a)), false);
+    assert.equal(
+      runtime.service.appendPcm(
+        "session-sidecar-recovery",
+        "mic",
+        Buffer.alloc(ONE_SECOND_BYTES * 60, 0x5a)
+      ),
+      false
+    );
     const recordingFiles = fs.readdirSync(path.join(testRoot, "recordings"), { recursive: true });
     assert.equal(recordingFiles.filter((entry) => entry.endsWith(".wav")).length, 1);
     assert.equal(recordingFiles.filter((entry) => entry.endsWith(".recovery.json")).length, 1);
     assert.equal(snapshot(runtime.repository, sessionId).chunks.length, 0);
     assert.equal(snapshot(runtime.repository, sessionId).jobs.length, 0);
+    const interruptedEvidence = snapshot(runtime.repository, sessionId);
+    const micTrack = interruptedEvidence.tracks.find((track) => track.source_type === "mic");
+    const micGap = interruptedEvidence.gaps.find((gap) => gap.track_id === micTrack.id);
+    assert.equal(micTrack.ended_at, 61_000);
+    assert.equal(micGap.started_at, 61_000);
 
     const micDir = path.join(testRoot, "recordings", sessionId, "mic");
-    const validSidecarName = fs.readdirSync(micDir).find((entry) => entry.endsWith(".recovery.json"));
+    const validSidecarName = fs
+      .readdirSync(micDir)
+      .find((entry) => entry.endsWith(".recovery.json"));
     assert.ok(validSidecarName);
     const validSidecarPath = path.join(micDir, validSidecarName);
     const validMetadata = JSON.parse(fs.readFileSync(validSidecarPath, "utf8"));
@@ -311,7 +338,10 @@ test("startup reconciles a renamed WAV sidecar before finalizing its interrupted
     );
 
     const recovered = runtime.restartAndRecover(62_000);
-    assert.deepEqual(recovered.map((session) => session.id), [sessionId]);
+    assert.deepEqual(
+      recovered.map((session) => session.id),
+      [sessionId]
+    );
     const evidence = snapshot(runtime.repository, sessionId);
     assert.equal(evidence.session.status, "recovered");
     assert.equal(evidence.chunks.length, 1);

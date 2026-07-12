@@ -2,7 +2,15 @@ const path = require("node:path");
 const AudioChunkWriter = require("./AudioChunkWriter");
 
 class MultiTrackAudioWriter {
-  constructor({ sessionId, tracks, baseDir, now, onChunk, beforeChunk = () => {} }) {
+  constructor({
+    sessionId,
+    tracks,
+    baseDir,
+    now,
+    onChunk,
+    beforeChunk = () => {},
+    openSources = true,
+  }) {
     this.sessionId = sessionId;
     this.baseDir = baseDir;
     this.now = now;
@@ -10,9 +18,16 @@ class MultiTrackAudioWriter {
     this.beforeChunk = beforeChunk;
     this.writers = new Map();
     this.nextSequenceNumbers = new Map();
-    for (const [sourceType, track] of Object.entries(tracks)) {
-      this._openSource(sourceType, track);
+    this.tracks = new Map(Object.entries(tracks));
+    if (openSources) {
+      for (const [sourceType, track] of this.tracks) {
+        this._openSource(sourceType, track);
+      }
     }
+  }
+
+  hasSource(sourceType) {
+    return this.writers.has(sourceType);
   }
 
   append(sourceType, pcm) {
@@ -34,7 +49,9 @@ class MultiTrackAudioWriter {
 
   reopenSource(sourceType, track) {
     if (this.writers.has(sourceType)) throw new Error(`audio source is already active: ${sourceType}`);
-    this._openSource(sourceType, track);
+    const definition = { ...(this.tracks.get(sourceType) || {}), ...track };
+    this.tracks.set(sourceType, definition);
+    this._openSource(sourceType, definition);
   }
 
   closeAll(at) {

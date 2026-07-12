@@ -26,6 +26,7 @@ const CHANNELS = Object.freeze({
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
   startCapture: "jarvis:capture:start",
+  setRetentionMode: "jarvis:capture:set-retention-mode",
   sourceInterrupted: "jarvis:capture:source-interrupted",
   sourceRestored: "jarvis:capture:source-restored",
   pauseCapture: "jarvis:capture:pause",
@@ -42,7 +43,7 @@ const CHANNELS = Object.freeze({
   stateChanged: "jarvis:state-changed",
 });
 
-const { assertCaptureMode, assertSourceType } = require("./captureModes");
+const { assertCaptureMode, assertSourceType, assertRetentionMode } = require("./captureModes");
 
 const SESSION_STATUSES = new Set([
   "recording",
@@ -70,6 +71,8 @@ const CAPTURE_FAILURE_CODES = new Set([
   "MIC_DISCONNECTED",
   "capture_source_unavailable",
   "capture_start_failed",
+  "capture_pause_failed",
+  "capture_finish_failed",
   "upstream_start_failed",
   "capture_activation_cancelled",
 ]);
@@ -87,4 +90,5 @@ module.exports = {
   assertCaptureFailureCode,
   assertCaptureMode,
   assertSourceType,
+  assertRetentionMode,
 };

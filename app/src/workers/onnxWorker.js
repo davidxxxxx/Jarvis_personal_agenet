@@ -1,6 +1,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const SileroVadRuntime = require("./SileroVadRuntime");
 
 let logStream = null;
 
@@ -38,6 +39,7 @@ let speakerSession = null;
 let speakerInputName = null;
 let textSession = null;
 let textTokenizer = null;
+let vadRuntime = null;
 
 function log(level, message, extra) {
   if (!logStream) return;
@@ -338,12 +340,57 @@ async function textEmbed({ text }) {
   return { embeddingBuffer: embedding.buffer };
 }
 
+async function vadLoad({ modelPath }) {
+  loadOrt();
+  if (!vadRuntime) vadRuntime = new SileroVadRuntime({ ort });
+  await vadRuntime.load(modelPath, SESSION_OPTIONS);
+  log("info", "VAD session loaded");
+  return { ok: true };
+}
+
+async function vadReload({ modelPath }) {
+  loadOrt();
+  if (!vadRuntime) vadRuntime = new SileroVadRuntime({ ort });
+  const result = await vadRuntime.reload(modelPath, SESSION_OPTIONS);
+  log("info", "VAD session reloaded");
+  return result;
+}
+
+async function vadClassify(payload) {
+  if (!vadRuntime) throw new Error("VAD session not loaded");
+  return vadRuntime.classify(payload);
+}
+
+async function vadHealth() {
+  if (!vadRuntime) throw new Error("VAD session not loaded");
+  return vadRuntime.health();
+}
+
+function vadReset({ streamId } = {}) {
+  if (!vadRuntime) return { ok: true };
+  return vadRuntime.reset(streamId);
+}
+
+function vadResetSession({ sessionId }) {
+  if (!vadRuntime) return { ok: true };
+  return vadRuntime.resetSession(sessionId);
+}
+
 const handlers = {
-  ping: () => ({ ok: true, sessions: { speaker: !!speakerSession, text: !!textSession } }),
+  ping: () => ({
+    ok: true,
+    sessions: { speaker: !!speakerSession, text: !!textSession, vad: !!vadRuntime?.session },
+  }),
   "speaker.load": speakerLoad,
   "speaker.extract": speakerExtract,
   "text.load": textLoad,
   "text.embed": textEmbed,
+  "vad.load": vadLoad,
+  "vad.reload": vadReload,
+  "vad.health": vadHealth,
+  "vad.classify": vadClassify,
+  "vad.reset": vadReset,
+  "vad.resetSession": vadResetSession,
   shutdown: () => {
     log("info", "shutdown requested");
     setImmediate(() => process.exit(0));

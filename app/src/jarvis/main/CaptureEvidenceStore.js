@@ -44,6 +44,15 @@ class CaptureEvidenceStore {
           @id, @trackId, @startedAt, @reason, @recoveryAttempts
         )
       `),
+      recordEvidenceGap: db.prepare(`
+        INSERT INTO audio_gaps (
+          id, track_id, started_at, ended_at, reason, recovery_attempts,
+          average_level, peak_level
+        ) VALUES (
+          @id, @trackId, @startedAt, @endedAt, @reason, 0,
+          @averageLevel, @peakLevel
+        )
+      `),
       closeGap: db.prepare(`
         UPDATE audio_gaps
         SET ended_at = @endedAt,
@@ -436,6 +445,34 @@ class CaptureEvidenceStore {
       ...gap,
       recoveryAttempts: gap.recoveryAttempts ?? 0,
     });
+  }
+
+  recordEvidenceGap(gap) {
+    if (!gap || typeof gap !== "object" || Array.isArray(gap)) {
+      throw new TypeError("evidence gap is required");
+    }
+    this._assertIdentifier(gap.id, "gapId");
+    this._assertIdentifier(gap.trackId, "trackId");
+    this._assertSafeInteger(gap.startedAt, "gap startedAt");
+    this._assertSafeInteger(gap.endedAt, "gap endedAt");
+    if (gap.endedAt <= gap.startedAt) {
+      throw new RangeError("evidence gap endedAt must be after startedAt");
+    }
+    if (gap.reason !== "silence_suppressed" && gap.reason !== "vad_degraded") {
+      throw new TypeError("invalid evidence gap reason");
+    }
+    for (const [name, value] of [
+      ["averageLevel", gap.averageLevel],
+      ["peakLevel", gap.peakLevel],
+    ]) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw new RangeError(`${name} must be between zero and one`);
+      }
+    }
+    if (gap.averageLevel > gap.peakLevel) {
+      throw new RangeError("averageLevel must not exceed peakLevel");
+    }
+    return this.statements.recordEvidenceGap.run(gap);
   }
 
   interruptTrack(input) {

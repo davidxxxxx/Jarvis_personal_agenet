@@ -165,6 +165,15 @@ test("preload exposes source interruption and restoration request-response IPC",
   ]);
 });
 
+test("preload exposes the narrow retention mode switch IPC", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  assert.equal(await api.setRetentionMode("s1", "continuous", 1_300), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:capture:set-retention-mode", "s1", "continuous", 1_300],
+  ]);
+});
+
 test("preload exposes metadata-only meeting input rejection events", () => {
   const { rootApi, listeners, sends } = loadPreloadApi();
   const rejected = [];

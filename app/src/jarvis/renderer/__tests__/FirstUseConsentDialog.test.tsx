@@ -24,6 +24,7 @@ const idleRecording = {
   pause: vi.fn(),
   resume: vi.fn(),
   finish: vi.fn(),
+  setRetentionMode: vi.fn(),
   renameSpeaker: vi.fn(),
 };
 

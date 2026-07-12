@@ -5,6 +5,8 @@ import type {
   JarvisCaptureSourceStates,
   JarvisControlAction,
   JarvisPerson,
+  JarvisRetentionMode,
+  JarvisEffectiveRetentionMode,
   JarvisSession,
 } from "../types";
 import { initialSessionState, type SessionState } from "./sessionMachine";
@@ -19,6 +21,9 @@ interface JarvisRendererState {
   operation: JarvisControlAction | null;
   error: string | null;
   captureMode: JarvisCaptureMode;
+  retentionMode: JarvisRetentionMode;
+  effectiveRetentionMode: JarvisEffectiveRetentionMode | null;
+  retentionDegradedReason: string | null;
   sourceStates: JarvisCaptureSourceStates;
   setSession: (session: SessionState) => void;
   setSessions: (sessions: JarvisSession[]) => void;
@@ -27,6 +32,11 @@ interface JarvisRendererState {
   setOperation: (operation: JarvisControlAction | null) => void;
   setError: (error: string | null) => void;
   setCaptureMode: (captureMode: JarvisCaptureMode) => void;
+  setRetentionMode: (retentionMode: JarvisRetentionMode) => void;
+  setRetentionRuntime: (
+    effectiveRetentionMode: JarvisEffectiveRetentionMode | null,
+    retentionDegradedReason: string | null
+  ) => void;
   setSourceStates: (sourceStates: JarvisCaptureSourceStates) => void;
   setSourceState: (source: "mic" | "system", state: JarvisCaptureSourceState) => void;
 }
@@ -39,6 +49,9 @@ export const useJarvisStore = create<JarvisRendererState>()((set) => ({
   operation: null,
   error: null,
   captureMode: "mic",
+  retentionMode: "speech_triggered",
+  effectiveRetentionMode: null,
+  retentionDegradedReason: null,
   sourceStates: { mic: "idle", system: "idle" },
   setSession: (session) => set({ session }),
   setSessions: (sessions) => set({ sessions }),
@@ -47,6 +60,9 @@ export const useJarvisStore = create<JarvisRendererState>()((set) => ({
   setOperation: (operation) => set({ operation }),
   setError: (error) => set({ error }),
   setCaptureMode: (captureMode) => set({ captureMode }),
+  setRetentionMode: (retentionMode) => set({ retentionMode }),
+  setRetentionRuntime: (effectiveRetentionMode, retentionDegradedReason) =>
+    set({ effectiveRetentionMode, retentionDegradedReason }),
   setSourceStates: (sourceStates) => set({ sourceStates }),
   setSourceState: (source, state) =>
     set((current) => ({ sourceStates: { ...current.sourceStates, [source]: state } })),

@@ -90,6 +90,8 @@ test("stores track state and gap lifecycle evidence", (t) => {
     restored_device_id: null,
     restored_device_label: null,
     restored_strategy: null,
+    average_level: null,
+    peak_level: null,
   });
 });
 

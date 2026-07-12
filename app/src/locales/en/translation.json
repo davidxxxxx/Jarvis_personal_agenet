@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "Retention mode",
+      "speechTriggered": "Speech-triggered",
+      "importantMeeting": "Important meeting",
+      "listening": "Listening",
+      "speechTriggeredDescription": "Keeps speech with 2 seconds before and 3 seconds after, while suppressing confirmed silence.",
+      "continuousDescription": "Keeps the full audio stream for important meetings.",
+      "degraded": "Voice activity detection is unavailable. Audio is being kept continuously.",
+      "degradedShort": "VAD unavailable; keeping continuous audio"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

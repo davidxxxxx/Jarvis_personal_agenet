@@ -22,11 +22,13 @@ function createRepository() {
   const chunks = [];
   const tracks = [];
   const gaps = [];
+  const evidenceGaps = [];
   return {
     sessions,
     chunks,
     tracks,
     gaps,
+    evidenceGaps,
     getSession(id) {
       return sessions.get(id) ?? null;
     },
@@ -60,7 +62,8 @@ function createRepository() {
     interruptTrack({ trackId, gap, sessionId = null, sessionStatus = null }) {
       this.setTrackState(trackId, "recovering", gap.startedAt);
       const opened = this.openGap(gap);
-      if (sessionId && sessionStatus) this.setSessionStatus(sessionId, sessionStatus, gap.startedAt);
+      if (sessionId && sessionStatus)
+        this.setSessionStatus(sessionId, sessionStatus, gap.startedAt);
       return opened;
     },
     closeGap(id, endedAt, recoveryAttempts = null) {
@@ -105,6 +108,18 @@ function createRepository() {
       }
       return this.setSessionStatus(sessionId, sessionStatus, at);
     },
+    setSessionRetention(sessionId, retentionMode, capturePolicy) {
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.retention_mode = retentionMode;
+        session.capture_policy_json = JSON.stringify(capturePolicy);
+      }
+      return session ?? null;
+    },
+    recordEvidenceGap(gap) {
+      evidenceGaps.push({ ...gap });
+      return gap;
+    },
     commitChunk(chunk) {
       chunks.push(chunk);
       return chunk;
@@ -119,6 +134,23 @@ function createSafeFs() {
   const fsImpl = Object.create(fs);
   fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
   return fsImpl;
+}
+
+for (const requiredMethod of ["setSessionRetention", "recordEvidenceGap"]) {
+  test(`constructor requires repository.${requiredMethod}`, () => {
+    const repository = createRepository();
+    delete repository[requiredMethod];
+
+    assert.throws(
+      () =>
+        new JarvisService({
+          repository,
+          userDataDir: path.join(os.tmpdir(), "jarvis-required-repository-method"),
+          broadcast() {},
+        }),
+      new RegExp(`repository\\.${requiredMethod}`)
+    );
+  });
 }
 
 function dualSources() {
@@ -270,7 +302,10 @@ test("an explicit recordings directory controls disk checks and audio paths", ()
     service.finishCapture("s1", 1_100);
 
     assert.equal(checkedPaths.length > 0, true);
-    assert.equal(checkedPaths.every((checkedPath) => checkedPath === recordingsDir), true);
+    assert.equal(
+      checkedPaths.every((checkedPath) => checkedPath === recordingsDir),
+      true
+    );
     assert.equal(repository.chunks.length, 1);
     assert.equal(repository.chunks[0].path.startsWith(recordingsDir), true);
   } finally {
@@ -320,8 +355,12 @@ test("pause closes audio, resume reuses the session, and finish stores seven-day
     );
     assert.deepEqual(Object.keys(broadcasts.at(-1)).sort(), [
       "captureMode",
+      "capturePolicy",
+      "effectiveRetentionMode",
       "elapsedMs",
       "errorCode",
+      "retentionDegradedReason",
+      "retentionMode",
       "sessionId",
       "sources",
       "startedAt",
@@ -443,7 +482,10 @@ test("checks disk again at each rotation and fails without a corrupt partial chu
     assert.equal(service.getState().errorCode, "DISK_SPACE_LOW");
     assert.equal(repository.chunks.length, 1);
     const sessionDir = path.join(userDataDir, "recordings", "s1", "mic");
-    assert.equal(fs.readdirSync(sessionDir).some((name) => name.endsWith(".part")), false);
+    assert.equal(
+      fs.readdirSync(sessionDir).some((name) => name.endsWith(".part")),
+      false
+    );
     assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 1);
   } finally {
     service.shutdown();
@@ -494,10 +536,7 @@ test("shutdown is idempotent and rejects late capture callbacks into closed stat
     service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
     service.beginShutdown();
     assert.equal(service.appendMicPcm("s1", Buffer.alloc(4_800, 1)), false);
-    assert.throws(
-      () => service.resumeCapture("s1", 1_100),
-      /shutting down/
-    );
+    assert.throws(() => service.resumeCapture("s1", 1_100), /shutting down/);
     service.shutdown();
     service.shutdown();
     assert.equal(repository.chunks.length, 0);
@@ -736,16 +775,11 @@ test("degraded public state keeps the durable session open with real evidence st
 
     assert.equal(state.status, "degraded");
     assert.equal(repository.getSession("s1").status, "recording");
-    assert.equal(
-      repository.db.prepare("SELECT count(*) count FROM audio_gaps").get().count,
-      1
-    );
+    assert.equal(repository.db.prepare("SELECT count(*) count FROM audio_gaps").get().count, 1);
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48, 1)), true);
     service.finishCapture("s1", 30);
     assert.deepEqual(
-      repository.db
-        .prepare("SELECT source_type, sequence_number FROM audio_chunks")
-        .all(),
+      repository.db.prepare("SELECT source_type, sequence_number FROM audio_chunks").all(),
       [{ source_type: "mic", sequence_number: 0 }]
     );
     assert.equal(
@@ -819,7 +853,7 @@ test("real evidence storage timestamps a replacement binding without rewriting t
       repository.db
         .prepare(
           `SELECT started_at, ended_at, restored_device_id, restored_device_label, restored_strategy
-           FROM audio_gaps`
+           FROM audio_gaps WHERE reason = 'device-change'`
         )
         .get(),
       {
@@ -851,7 +885,12 @@ test("source restoration rejects a payload that spoofs another lane identity", (
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
 
     assert.throws(
@@ -868,7 +907,10 @@ test("source restoration rejects a payload that spoofs another lane identity", (
     assert.equal(service.getState().sources.system.sourceType, "system");
     assert.equal(service.getState().sources.system.state, "reconnecting");
     assert.equal(service.getState().sources.mic.sourceType, "mic");
-    assert.equal(repository.tracks.find((track) => track.sourceType === "system").sourceType, "system");
+    assert.equal(
+      repository.tracks.find((track) => track.sourceType === "system").sourceType,
+      "system"
+    );
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -891,7 +933,12 @@ for (const lifecycle of ["pauseCapture", "finishCapture"]) {
     });
 
     try {
-      service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "mic", sources: [dualSources()[0]] });
+      service.startCapture({
+        sessionId: "s1",
+        startedAt: 10,
+        captureMode: "mic",
+        sources: [dualSources()[0]],
+      });
       service.appendMicPcm("s1", Buffer.alloc(48, 1));
 
       const state = service[lifecycle]("s1", 20);
@@ -936,7 +983,12 @@ test("disk loss during restoration fails the whole session and surviving lane", 
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
 
     const state = service.sourceRestored("s1", "system", {
@@ -951,7 +1003,10 @@ test("disk loss during restoration fails the whole session and surviving lane", 
     assert.equal(state.sources.mic.state, "failed");
     assert.equal(state.sources.system.state, "failed");
     assert.equal(repository.sessions.get("s1").status, "failed");
-    assert.equal(repository.tracks.every((track) => track.state === "failed"), true);
+    assert.equal(
+      repository.tracks.every((track) => track.state === "failed"),
+      true
+    );
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
   } finally {
     service.shutdown();
@@ -974,7 +1029,12 @@ test("interruption persistence failure leaves the original writer live and state
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
 
     assert.throws(
       () => service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" }),
@@ -1092,7 +1152,12 @@ test("restoration persistence failure removes the empty replacement and permits 
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.appendPcm("s1", "system", Buffer.alloc(48, 1));
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
     repository.restoreTrack = () => {
@@ -1303,12 +1368,21 @@ test("start track persistence failure leaves no active public session or tracks"
 
   try {
     assert.throws(
-      () => service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() }),
+      () =>
+        service.startCapture({
+          sessionId: "s1",
+          startedAt: 10,
+          captureMode: "dual",
+          sources: dualSources(),
+        }),
       /track batch failed/
     );
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "CAPTURE_START_FAILED");
-    assert.equal(Object.values(service.getState().sources).every((source) => source.state === "failed"), true);
+    assert.equal(
+      Object.values(service.getState().sources).every((source) => source.state === "failed"),
+      true
+    );
     assert.equal(repository.sessions.get("s1").status, "failed");
     assert.equal(repository.tracks.length, 0);
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
@@ -1336,9 +1410,17 @@ test("duplicate interruption persists exactly one gap transition", () => {
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
-    const duplicate = service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
+    const duplicate = service.sourceInterrupted("s1", "system", {
+      at: 20,
+      reason: "device-change",
+    });
 
     assert.equal(duplicate.status, "degraded");
     assert.equal(transitions, 1);
@@ -1371,7 +1453,10 @@ test("finish persistence failure exposes failed public state and the original er
     service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
     injectFinalizationFailure(repository, persistenceError);
 
-    assert.throws(() => service.finishCapture("s1", 20), (error) => error === persistenceError);
+    assert.throws(
+      () => service.finishCapture("s1", 20),
+      (error) => error === persistenceError
+    );
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "CAPTURE_FINALIZATION_FAILED");
     assert.equal(service.getState().sources.mic.state, "failed");
@@ -1396,7 +1481,12 @@ test("error finalization failure closes public state and preserves the persisten
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
     injectFinalizationFailure(repository, persistenceError);
 
@@ -1438,7 +1528,10 @@ test("pause close-error finalization failure cannot leave a recording state with
     service.appendMicPcm("s1", Buffer.alloc(48, 1));
     injectFinalizationFailure(repository, persistenceError);
 
-    assert.throws(() => service.pauseCapture("s1", 20), (error) => error === persistenceError);
+    assert.throws(
+      () => service.pauseCapture("s1", 20),
+      (error) => error === persistenceError
+    );
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "AUDIO_WRITE_FAILED");
     assert.equal(service.getState().sources.mic.state, "failed");
@@ -1466,7 +1559,10 @@ test("shutdown finalization failure is observable, honest, and idempotent", () =
     service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
     injectFinalizationFailure(repository, persistenceError);
 
-    assert.throws(() => service.shutdown(), (error) => error === persistenceError);
+    assert.throws(
+      () => service.shutdown(),
+      (error) => error === persistenceError
+    );
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "CAPTURE_FINALIZATION_FAILED");
     assert.equal(service.getState().sources.mic.state, "failed");
@@ -1502,7 +1598,12 @@ test("disk failure while interrupting closes the persisted gap atomically", () =
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.appendPcm("s1", "system", Buffer.alloc(48, 1));
 
     const state = service.sourceInterrupted("s1", "system", {
@@ -1514,13 +1615,13 @@ test("disk failure while interrupting closes the persisted gap atomically", () =
     assert.equal(state.errorCode, "DISK_SPACE_LOW");
     assert.equal(repository.getSession("s1").status, "failed");
     assert.equal(
-      repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get().count,
+      repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get()
+        .count,
       0
     );
-    assert.deepEqual(
-      repository.db.prepare("SELECT DISTINCT state FROM audio_tracks").all(),
-      [{ state: "failed" }]
-    );
+    assert.deepEqual(repository.db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
+      { state: "failed" },
+    ]);
   } finally {
     service.shutdown();
     repository.close();
@@ -1544,9 +1645,17 @@ test("pause persistence failure leaves every writer and public source active", (
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
 
-    assert.throws(() => service.pauseCapture("s1", 20), (error) => error === persistenceError);
+    assert.throws(
+      () => service.pauseCapture("s1", 20),
+      (error) => error === persistenceError
+    );
     assert.equal(service.getState().status, "recording");
     assert.equal(service.getState().sources.mic.state, "active");
     assert.equal(service.getState().sources.system.state, "active");
@@ -1627,7 +1736,10 @@ test("resume persistence failure removes replacements and retry preserves sequen
     assert.equal(service.resumeCapture("s1", 40).status, "recording");
     assert.equal(service.appendMicPcm("s1", Buffer.alloc(48, 3)), true);
     service.finishCapture("s1", 50);
-    assert.deepEqual(repository.chunks.map((chunk) => chunk.sequenceNumber), [0, 1]);
+    assert.deepEqual(
+      repository.chunks.map((chunk) => chunk.sequenceNumber),
+      [0, 1]
+    );
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -1646,7 +1758,12 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
 
     const paused = service.pauseCapture("s1", 30);
@@ -1654,7 +1771,10 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
     assert.equal(paused.sources.mic.state, "paused");
     assert.equal(paused.sources.system.state, "reconnecting");
     assert.equal(repository.tracks.find((track) => track.sourceType === "mic").state, "paused");
-    assert.equal(repository.tracks.find((track) => track.sourceType === "system").state, "recovering");
+    assert.equal(
+      repository.tracks.find((track) => track.sourceType === "system").state,
+      "recovering"
+    );
     assert.equal(repository.gaps[0].endedAt, null);
 
     const resumed = service.resumeCapture("s1", 40);
@@ -1689,7 +1809,12 @@ test("resume rejects while all sources are automatically recovering without side
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.sourceInterrupted("s1", "mic", { at: 20, reason: "device-change" });
     service.sourceInterrupted("s1", "system", { at: 30, reason: "device-change" });
     let reopenCalls = 0;
@@ -1704,8 +1829,14 @@ test("resume rejects while all sources are automatically recovering without side
     assert.equal(resumeCalls, 0);
     assert.equal(reopenCalls, 0);
     assert.equal(repository.sessions.get("s1").status, "recording");
-    assert.deepEqual(repository.tracks.map((track) => track.state), ["recovering", "recovering"]);
-    assert.deepEqual(repository.gaps.map((gap) => gap.endedAt), [null, null]);
+    assert.deepEqual(
+      repository.tracks.map((track) => track.state),
+      ["recovering", "recovering"]
+    );
+    assert.deepEqual(
+      repository.gaps.map((gap) => gap.endedAt),
+      [null, null]
+    );
     const state = service.getState();
     assert.equal(state.status, "degraded");
     assert.equal(state.sources.mic.state, "reconnecting");
@@ -1734,7 +1865,12 @@ test("manual pause restoration waits for explicit resume and preserves both sequ
   });
 
   try {
-    service.startCapture({ sessionId: "s1", startedAt: 10, captureMode: "dual", sources: dualSources() });
+    service.startCapture({
+      sessionId: "s1",
+      startedAt: 10,
+      captureMode: "dual",
+      sources: dualSources(),
+    });
     service.appendPcm("s1", "mic", Buffer.alloc(48, 1));
     service.appendPcm("s1", "system", Buffer.alloc(48, 2));
     service.sourceInterrupted("s1", "system", { at: 20, reason: "device-change" });
@@ -1761,13 +1897,19 @@ test("manual pause restoration waits for explicit resume and preserves both sequ
     assert.equal(service.appendPcm("s1", "system", Buffer.alloc(48, 3)), false);
     assert.equal(repository.getSession("s1").status, "paused");
     assert.deepEqual(
-      repository.db.prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type").all(),
+      repository.db
+        .prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type")
+        .all(),
       [
         { source_type: "mic", state: "paused", ended_at: 30 },
         { source_type: "system", state: "paused", ended_at: 40 },
       ]
     );
-    assert.equal(repository.db.prepare("SELECT ended_at FROM audio_gaps").get().ended_at, 40);
+    assert.equal(
+      repository.db.prepare("SELECT ended_at FROM audio_gaps WHERE reason = 'device-change'").get()
+        .ended_at,
+      40
+    );
 
     const resumed = service.resumeCapture("s1", 50);
     assert.equal(resumed.status, "recording");
@@ -1776,7 +1918,9 @@ test("manual pause restoration waits for explicit resume and preserves both sequ
     assert.equal(reopenCalls, 2);
     assert.equal(repository.getSession("s1").status, "recording");
     assert.deepEqual(
-      repository.db.prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type").all(),
+      repository.db
+        .prepare("SELECT source_type, state, ended_at FROM audio_tracks ORDER BY source_type")
+        .all(),
       [
         { source_type: "mic", state: "active", ended_at: null },
         { source_type: "system", state: "active", ended_at: null },
@@ -1787,7 +1931,9 @@ test("manual pause restoration waits for explicit resume and preserves both sequ
     service.finishCapture("s1", 60);
     assert.deepEqual(
       repository.db
-        .prepare("SELECT source_type, sequence_number FROM audio_chunks ORDER BY source_type, sequence_number")
+        .prepare(
+          "SELECT source_type, sequence_number FROM audio_chunks ORDER BY source_type, sequence_number"
+        )
         .all(),
       [
         { source_type: "mic", sequence_number: 0 },
@@ -1824,7 +1970,10 @@ test("finalization persistence error survives a throwing failure broadcast", () 
 
   try {
     service.startCapture({ sessionId: "s1", startedAt: 10, micDeviceId: "mic-1" });
-    assert.throws(() => service.finishCapture("s1", 20), (error) => error === persistenceError);
+    assert.throws(
+      () => service.finishCapture("s1", 20),
+      (error) => error === persistenceError
+    );
     assert.equal(service.getState().status, "failed");
     assert.equal(service.getState().errorCode, "CAPTURE_FINALIZATION_FAILED");
   } finally {

@@ -3,11 +3,24 @@ export type JarvisSessionStatus =
 
 export type JarvisCaptureMode = "mic" | "system" | "dual";
 
+export type JarvisRetentionMode = "speech_triggered" | "continuous";
+
+export type JarvisEffectiveRetentionMode = JarvisRetentionMode | "continuous_fallback";
+
+export interface JarvisCapturePolicy {
+  schemaVersion: number;
+  preRollMs: number;
+  postRollMs: number;
+  mergeGapMs: number;
+}
+
 export type JarvisCaptureFailureCode =
   | "MIC_PERMISSION"
   | "MIC_DISCONNECTED"
   | "capture_source_unavailable"
   | "capture_start_failed"
+  | "capture_pause_failed"
+  | "capture_finish_failed"
   | "upstream_start_failed"
   | "capture_activation_cancelled";
 
@@ -28,6 +41,7 @@ export interface JarvisSessionInput {
   micDeviceId: string | null;
   language?: string;
   captureMode: JarvisCaptureMode;
+  retentionMode?: JarvisRetentionMode;
 }
 
 export interface JarvisCaptureSourceInput {
@@ -42,6 +56,8 @@ export interface JarvisCaptureInput {
   startedAt: number;
   micDeviceId: string | null;
   captureMode: JarvisCaptureMode;
+  retentionMode?: JarvisRetentionMode;
+  capturePolicy?: JarvisCapturePolicy;
   sources: JarvisCaptureSourceInput[];
 }
 
@@ -66,6 +82,8 @@ export interface JarvisSession {
   language: string;
   created_at: number;
   capture_mode: JarvisCaptureMode;
+  retention_mode?: JarvisRetentionMode;
+  capture_policy_json?: string;
 }
 
 export interface JarvisSessionQuery {
@@ -284,4 +302,9 @@ export interface JarvisRuntimeState {
   startedAt: number | null;
   elapsedMs: number;
   errorCode: string | null;
+  captureMode?: JarvisCaptureMode | null;
+  retentionMode?: JarvisRetentionMode | null;
+  effectiveRetentionMode?: JarvisEffectiveRetentionMode | null;
+  retentionDegradedReason?: string | null;
+  capturePolicy?: JarvisCapturePolicy | null;
 }

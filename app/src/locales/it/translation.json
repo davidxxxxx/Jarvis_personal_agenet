@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "Modalità di conservazione",
+      "speechTriggered": "Attivata dalla voce",
+      "importantMeeting": "Riunione importante",
+      "listening": "In ascolto",
+      "speechTriggeredDescription": "Conserva la voce con 2 secondi prima e 3 secondi dopo, eliminando il silenzio confermato.",
+      "continuousDescription": "Conserva l’intero flusso audio per le riunioni importanti.",
+      "degraded": "Il rilevamento dell’attività vocale non è disponibile. L’audio viene conservato in modo continuo.",
+      "degradedShort": "VAD non disponibile; audio continuo conservato"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

@@ -7,6 +7,16 @@
     "memory": "记忆库",
     "liveConversation": "实时对话",
     "listening": "正在监听",
+    "retention": {
+      "groupLabel": "音频保留模式",
+      "speechTriggered": "语音触发",
+      "importantMeeting": "重要会议",
+      "listening": "正在监听",
+      "speechTriggeredDescription": "保留语音前 2 秒和后 3 秒，并抑制已确认的静音。",
+      "continuousDescription": "重要会议会保留完整连续音频。",
+      "degraded": "语音活动检测暂不可用，当前正在连续保留音频。",
+      "degradedShort": "VAD 不可用，正在连续保留音频"
+    },
     "paused": "已暂停",
     "currentTopic": "当前主题",
     "newTodos": "新待办",

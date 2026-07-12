@@ -81,3 +81,74 @@ test("idle and terminal tray states offer start through the renderer control cha
     ["start", "start", "start", "start"]
   );
 });
+
+test("tray omits stale VAD fallback after capture is terminal", () => {
+  changeLanguage("en");
+  const manager = new TrayManager();
+
+  manager.setJarvisState({
+    status: "completed",
+    errorCode: null,
+    retentionMode: "speech_triggered",
+    effectiveRetentionMode: "continuous_fallback",
+    retentionDegradedReason: "vad_unavailable",
+  });
+
+  assert.equal(manager.getJarvisTooltip(), "Jarvis Memory · Finished");
+});
+
+test("tray distinguishes listening, important meetings, and visible VAD fallback", () => {
+  changeLanguage("en");
+  const manager = new TrayManager();
+
+  manager.setJarvisState({
+    status: "recording",
+    errorCode: null,
+    retentionMode: "speech_triggered",
+    effectiveRetentionMode: "speech_triggered",
+    retentionDegradedReason: null,
+  });
+  assert.equal(manager.getJarvisTooltip(), "Jarvis Memory · Listening");
+
+  manager.setJarvisState({
+    status: "recording",
+    errorCode: null,
+    retentionMode: "continuous",
+    effectiveRetentionMode: "continuous",
+    retentionDegradedReason: null,
+  });
+  assert.equal(manager.getJarvisTooltip(), "Jarvis Memory · Important meeting");
+
+  manager.setJarvisState({
+    status: "recording",
+    errorCode: null,
+    retentionMode: "speech_triggered",
+    effectiveRetentionMode: "continuous_fallback",
+    retentionDegradedReason: "vad_unavailable",
+  });
+  assert.equal(
+    manager.getJarvisTooltip(),
+    "Jarvis Memory · Listening · VAD unavailable; keeping continuous audio"
+  );
+});
+
+test("degraded capture keeps active controls and retention-aware tooltip", () => {
+  changeLanguage("en");
+  const manager = new TrayManager();
+
+  for (const [retentionMode, label] of [
+    ["speech_triggered", "Listening"],
+    ["continuous", "Important meeting"],
+  ]) {
+    manager.setJarvisState({
+      status: "degraded",
+      errorCode: null,
+      retentionMode,
+      effectiveRetentionMode: retentionMode,
+      retentionDegradedReason: null,
+    });
+    const controls = manager.buildJarvisControls().map((item) => item.label);
+    assert.deepEqual(controls, ["Pause", "Finish and summarize"]);
+    assert.equal(manager.getJarvisTooltip(), `Jarvis Memory · ${label}`);
+  }
+});

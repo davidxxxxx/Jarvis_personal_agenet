@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "Aufbewahrungsmodus",
+      "speechTriggered": "Sprachaktiviert",
+      "importantMeeting": "Wichtiges Meeting",
+      "listening": "Mithören",
+      "speechTriggeredDescription": "Speichert Sprache mit 2 Sekunden Vorlauf und 3 Sekunden Nachlauf und unterdrückt bestätigte Stille.",
+      "continuousDescription": "Speichert den vollständigen Audiostream für wichtige Meetings.",
+      "degraded": "Die Sprachaktivitätserkennung ist nicht verfügbar. Audio wird fortlaufend gespeichert.",
+      "degradedShort": "VAD nicht verfügbar; Audio wird fortlaufend gespeichert"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

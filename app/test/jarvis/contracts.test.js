@@ -6,6 +6,7 @@ const {
   assertSessionStatus,
   assertCaptureMode,
   assertSourceType,
+  assertRetentionMode,
 } = require("../../src/jarvis/shared/contracts");
 const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
 
@@ -50,6 +51,7 @@ function createRepository(overrides = {}) {
 function createService(overrides = {}) {
   return {
     startCapture: () => "capture-started",
+    setRetentionMode: () => "retention-mode-set",
     sourceInterrupted: () => "source-interrupted",
     sourceRestored: () => "source-restored",
     pauseCapture: () => "capture-paused",
@@ -115,8 +117,34 @@ test("contract rejects path traversal and unknown states", () => {
   assert.throws(() => assertSessionStatus("degraded"), /invalid session status/);
   assert.equal(assertCaptureMode("dual"), "dual");
   assert.equal(assertSourceType("system"), "system");
+  assert.equal(assertRetentionMode("speech_triggered"), "speech_triggered");
   assert.throws(() => assertCaptureMode("auto"), /invalid capture mode/);
   assert.throws(() => assertSourceType("mixed"), /invalid source type/);
+  assert.throws(() => assertRetentionMode("adaptive"), /invalid retention mode/);
+});
+
+test("retention mode IPC validates mode and forwards a sanitized session id", () => {
+  const calls = [];
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService({ setRetentionMode: (...args) => calls.push(args) }),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  handlers.get(CHANNELS.setRetentionMode)(null, "session-1", "continuous", 1_100);
+  assert.deepEqual(calls, [["session-1", "continuous", 1_100]]);
+  assert.throws(
+    () => handlers.get(CHANNELS.setRetentionMode)(null, "session-1", "adaptive", 1_200),
+    /invalid retention mode/
+  );
+  assert.throws(
+    () => handlers.get(CHANNELS.setRetentionMode)(null, "../escape", "continuous", 1_200),
+    /safe identifier/
+  );
+  assert.equal(calls.length, 1);
 });
 
 test("start capture IPC rejects invalid source selections before calling the service", () => {
@@ -230,9 +258,7 @@ test("source lifecycle IPC validates metadata and forwards only sanitized inputs
     strategy: "web-audio",
   });
 
-  assert.deepEqual(interrupted, [
-    ["session-1", "mic", { at: 1_100, reason: "mic-track-ended" }],
-  ]);
+  assert.deepEqual(interrupted, [["session-1", "mic", { at: 1_100, reason: "mic-track-ended" }]]);
   assert.deepEqual(restored, [
     [
       "session-1",
@@ -297,6 +323,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "setCloudBudget",
       "setMiniMaxKey",
       "setSessionStatus",
+      "setRetentionMode",
       "setTodoStatus",
       "sourceInterrupted",
       "sourceRestored",
@@ -326,6 +353,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.listSessions,
       CHANNELS.renamePerson,
       CHANNELS.setSessionStatus,
+      CHANNELS.setRetentionMode,
       CHANNELS.syncSegments,
       CHANNELS.upsertSegments,
       CHANNELS.startCapture,
@@ -545,6 +573,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
 
   for (const method of [
     "startCapture",
+    "setRetentionMode",
     "sourceInterrupted",
     "sourceRestored",
     "pauseCapture",
@@ -612,6 +641,8 @@ test("failCapture IPC validates known codes and preserves authoritative failed b
     finalizeCapture: ({ sessionStatus }) => {
       session.status = sessionStatus;
     },
+    setSessionRetention: () => {},
+    recordEvidenceGap: () => {},
     commitChunk: () => {},
     recoverOpenSessions: () => [],
   };

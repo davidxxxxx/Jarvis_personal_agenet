@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "Режим хранения",
+      "speechTriggered": "По голосу",
+      "importantMeeting": "Важная встреча",
+      "listening": "Прослушивание",
+      "speechTriggeredDescription": "Сохраняет речь с 2 секундами до и 3 секундами после, удаляя подтверждённую тишину.",
+      "continuousDescription": "Сохраняет весь аудиопоток для важных встреч.",
+      "degraded": "Определение голосовой активности недоступно. Аудио сохраняется непрерывно.",
+      "degradedShort": "VAD недоступен; сохраняется непрерывное аудио"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

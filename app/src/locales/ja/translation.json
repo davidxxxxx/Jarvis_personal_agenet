@@ -7,6 +7,16 @@
     "memory": "Memory",
     "liveConversation": "Live conversation",
     "listening": "Listening",
+    "retention": {
+      "groupLabel": "保存モード",
+      "speechTriggered": "音声検出",
+      "importantMeeting": "重要な会議",
+      "listening": "リスニング中",
+      "speechTriggeredDescription": "発話の前2秒と後3秒を保存し、確認された無音を除外します。",
+      "continuousDescription": "重要な会議では音声全体を保存します。",
+      "degraded": "音声活動検出を利用できません。音声を連続して保存しています。",
+      "degradedShort": "VADを利用できないため連続音声を保存中"
+    },
     "paused": "Paused",
     "currentTopic": "Current topic",
     "newTodos": "New todos",

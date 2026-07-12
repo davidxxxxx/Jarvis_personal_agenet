@@ -217,6 +217,7 @@ class AudioChunkWriter {
       this.onChunk(chunk);
     } catch (error) {
       this.fault = new Error(`audio chunk metadata commit failed for ${id}`, { cause: error });
+      this.fault.evidenceEndedAt = endedAt;
       throw this.fault;
     }
 
@@ -224,6 +225,7 @@ class AudioChunkWriter {
       fs.unlinkSync(recoveryPath);
     } catch (error) {
       this.fault = new Error(`audio chunk recovery cleanup failed for ${id}`, { cause: error });
+      this.fault.evidenceEndedAt = endedAt;
       throw this.fault;
     }
   }

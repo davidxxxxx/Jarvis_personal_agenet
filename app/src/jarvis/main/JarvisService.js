@@ -2,12 +2,15 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const MultiTrackAudioWriter = require("./MultiTrackAudioWriter");
+const SpeechTriggeredCaptureGate = require("./SpeechTriggeredCaptureGate");
 const { hasSafeDiskSpace } = require("./retentionPolicy");
 const { assertId } = require("../shared/contracts");
 const {
   assertSourceType,
+  assertRetentionMode,
   normalizeCaptureStartInput,
   normalizeSource,
+  parseCapturePolicyJson,
 } = require("../shared/captureModes");
 
 const AUDIO_RETENTION_MS = 7 * 86400000;
@@ -18,6 +21,10 @@ const WAV_HEADER_BYTES = 44;
 const WAV_SAMPLE_RATE = 24_000;
 const WAV_BYTES_PER_SAMPLE = 2;
 const MAX_CHUNK_PCM_BYTES = 60 * WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE;
+const VAD_FRAME_MS = 100;
+const VAD_FRAME_BYTES = (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE * VAD_FRAME_MS) / 1_000;
+const DEFAULT_MAX_VAD_QUEUE_MS = 10_000;
+const DEFAULT_VAD_TIMEOUT_MS = 5_000;
 const RECOVERY_SIDECAR_KEYS = Object.freeze([
   "durationMs",
   "endedAt",
@@ -40,7 +47,17 @@ class DiskSpaceError extends Error {
 }
 
 class JarvisService {
-  constructor({ repository, userDataDir, recordingsDir, broadcast, now = Date.now, fsImpl = fs }) {
+  constructor({
+    repository,
+    userDataDir,
+    recordingsDir,
+    broadcast,
+    now = Date.now,
+    fsImpl = fs,
+    vadClassifier = null,
+    maxVadQueueMs = DEFAULT_MAX_VAD_QUEUE_MS,
+    vadTimeoutMs = DEFAULT_VAD_TIMEOUT_MS,
+  }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
     }
@@ -58,6 +75,8 @@ class JarvisService {
       "pauseCapture",
       "resumeCapture",
       "finalizeCapture",
+      "setSessionRetention",
+      "recordEvidenceGap",
       "commitChunk",
     ]) {
       if (typeof repository[method] !== "function") {
@@ -72,6 +91,17 @@ class JarvisService {
     if (!fsImpl || typeof fsImpl.mkdirSync !== "function") {
       throw new TypeError("fsImpl.mkdirSync must be a function");
     }
+    if (
+      vadClassifier !== null &&
+      (typeof vadClassifier !== "object" || typeof vadClassifier.classify !== "function")
+    ) {
+      throw new TypeError("vadClassifier.classify must be a function");
+    }
+    for (const [name, value] of Object.entries({ maxVadQueueMs, vadTimeoutMs })) {
+      if (!Number.isSafeInteger(value) || value <= 0 || value > 60_000) {
+        throw new RangeError(`${name} must be between 1 and 60000 ms`);
+      }
+    }
 
     this.repository = repository;
     if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
@@ -83,6 +113,15 @@ class JarvisService {
     this.broadcast = broadcast;
     this.now = now;
     this.fs = fsImpl;
+    this.vadClassifier = vadClassifier;
+    this.maxVadQueueBytes = Math.round(
+      (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE * maxVadQueueMs) / 1_000
+    );
+    this.vadTimeoutMs = vadTimeoutMs;
+    this.retentionGeneration = 0;
+    this.retentionWork = new Set();
+    this.vadSessionReset = false;
+    this.interruptingSources = new Set();
     this.writer = null;
     this.closing = false;
     this.closed = false;
@@ -94,8 +133,13 @@ class JarvisService {
     this._assertOpen();
     const normalized = normalizeCaptureStartInput(input);
     const id = assertId(normalized.sessionId, "sessionId");
+    this.vadSessionReset = false;
     this._assertTime(normalized.startedAt, "startedAt");
-    if (this.writer || ACTIVE_SESSION_STATUSES.has(this.state.status) || this.state.status === "paused") {
+    if (
+      this.writer ||
+      ACTIVE_SESSION_STATUSES.has(this.state.status) ||
+      this.state.status === "paused"
+    ) {
       throw new Error("a capture session is already active");
     }
     const session = this.repository.getSession(id);
@@ -114,11 +158,43 @@ class JarvisService {
         throw new Error("microphone source does not match persisted session");
       }
     }
+    const persistedRetentionMode = session.retention_mode ?? null;
+    if (persistedRetentionMode !== null && persistedRetentionMode !== normalized.retentionMode) {
+      throw new Error("retention mode does not match persisted session");
+    }
+    const persistedCapturePolicy = parseCapturePolicyJson(session.capture_policy_json);
+    if (
+      session.capture_policy_json !== null &&
+      session.capture_policy_json !== undefined &&
+      JSON.stringify(persistedCapturePolicy) !== JSON.stringify(normalized.capturePolicy)
+    ) {
+      throw new Error("capture policy does not match persisted session");
+    }
 
     this.fs.mkdirSync(this.recordingsDir, { recursive: true });
     this.completedRestorations.clear();
+    this.retentionGeneration += 1;
+    const classifierReady = this._isVadReady();
+    const effectiveRetentionMode =
+      normalized.retentionMode === "speech_triggered" && classifierReady
+        ? "speech_triggered"
+        : normalized.retentionMode === "continuous" && classifierReady
+          ? "continuous"
+          : "continuous_fallback";
     const sources = {};
     for (const source of normalized.sources) {
+      const gate = new SpeechTriggeredCaptureGate({
+        sampleRate: WAV_SAMPLE_RATE,
+        ...normalized.capturePolicy,
+        mode: normalized.retentionMode,
+      });
+      if (!classifierReady) {
+        gate.reportVadFailure(
+          source.sourceType,
+          new Error("VAD unavailable"),
+          normalized.startedAt
+        );
+      }
       sources[source.sourceType] = {
         ...source,
         trackId: `track-${crypto.randomUUID()}`,
@@ -127,6 +203,17 @@ class JarvisService {
         interruptedAt: null,
         reason: null,
         errorCode: null,
+        gate,
+        timelineAnchorAt: normalized.startedAt,
+        timelineFrames: 0,
+        captureCursorAt: normalized.startedAt,
+        vadQueue: [],
+        vadQueueBytes: 0,
+        vadInFlight: null,
+        vadProcessing: false,
+        vadProcessingGeneration: null,
+        vadGeneration: this.retentionGeneration,
+        writerOpen: effectiveRetentionMode !== "speech_triggered",
       };
     }
     this.state = {
@@ -137,12 +224,18 @@ class JarvisService {
       accumulatedMs: 0,
       errorCode: null,
       captureMode: normalized.captureMode,
+      retentionMode: normalized.retentionMode,
+      effectiveRetentionMode,
+      retentionDegradedReason: classifierReady ? null : "vad_unavailable",
+      capturePolicy: normalized.capturePolicy,
       sources,
     };
 
     try {
       this._assertSafeDiskSpace();
-      this.writer = this._createWriter(id, path.join(this.recordingsDir, id));
+      this.writer = this._createWriter(id, path.join(this.recordingsDir, id), {
+        openSources: effectiveRetentionMode !== "speech_triggered",
+      });
       this.repository.createTracks(
         Object.values(sources).map((source) => ({
           id: source.trackId,
@@ -187,23 +280,145 @@ class JarvisService {
     if (!ACTIVE_SESSION_STATUSES.has(this.state.status) || !this.writer) {
       throw new Error("capture session is not recording");
     }
-    try {
-      this.writer.append(type, pcmBuffer);
-      return true;
-    } catch (error) {
-      const diskError = this._findDiskSpaceError(error);
-      if (diskError) {
-        this._failForDisk(diskError.code, this.now());
-        return false;
-      }
-      if (error instanceof TypeError || error instanceof RangeError) throw error;
-      this._interruptSource(id, type, { at: this.now(), reason: "audio-write-failed" }, error);
-      return false;
+    const pcm = Buffer.isBuffer(pcmBuffer) ? pcmBuffer : Buffer.from(pcmBuffer ?? []);
+    if (pcm.length % WAV_BYTES_PER_SAMPLE !== 0) {
+      throw new RangeError("PCM must contain complete signed 16-bit little-endian samples");
     }
+    if (pcm.length === 0) return true;
+
+    const frames = this._retentionFrames(source, pcm);
+    for (const frame of frames) {
+      if (this.state.effectiveRetentionMode === "speech_triggered") {
+        if (!this._enqueueVadFrame(source, frame, true)) return false;
+        continue;
+      }
+
+      if (!this._appendRetainedPcm(source, frame)) return false;
+      if (this.state.effectiveRetentionMode === "continuous" && this._isVadReady()) {
+        if (!this._enqueueVadFrame(source, frame, false)) return false;
+      } else if (this.state.effectiveRetentionMode === "continuous_fallback") {
+        // Audio is already fail-open durable. Feed deterministic placeholder probability only
+        // to accumulate truthful degraded audio levels without running inference inline.
+        source.gate.accept({
+          sourceType: source.sourceType,
+          pcm: frame.pcm,
+          capturedAt: frame.startedAt,
+          speechProbability: 0,
+        });
+      }
+    }
+    return true;
   }
 
   appendMicPcm(sessionId, pcmBuffer) {
     return this.appendPcm(sessionId, "mic", pcmBuffer);
+  }
+
+  async whenRetentionIdle() {
+    while (this.retentionWork.size > 0) {
+      await Promise.allSettled([...this.retentionWork]);
+    }
+  }
+
+  setRetentionMode(sessionId, retentionMode, at = this.now()) {
+    this._assertOpen();
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
+    const requestedMode = assertRetentionMode(retentionMode);
+    this._assertTime(at, "at");
+    if (requestedMode === this.state.retentionMode) return this._publish(at);
+
+    this.repository.setSessionRetention(
+      this.state.sessionId,
+      requestedMode,
+      this.state.capturePolicy
+    );
+    this.state.retentionMode = requestedMode;
+    try {
+      this.retentionGeneration += 1;
+      const generation = this.retentionGeneration;
+      for (const source of Object.values(this.state.sources)) {
+        const pending = this._cancelSourceVad(source);
+        const gateDecision = source.gate.switchMode(source.sourceType, requestedMode, at);
+        if (!this._applyGateDecision(source, gateDecision)) {
+          return this._failRetentionSwitch(at);
+        }
+        for (const frame of pending.filter((entry) => entry.persistOnDecision)) {
+          if (!this._appendRetainedPcm(source, frame)) {
+            return this._failRetentionSwitch(at);
+          }
+        }
+        if (requestedMode === "speech_triggered" && source.state === "active") {
+          try {
+            this._closeRetentionWriter(source, source.captureCursorAt);
+          } catch (error) {
+            this._handleAudioWriteFailure(source, error, source.captureCursorAt);
+            return this._failRetentionSwitch(at);
+          }
+        }
+        this._resetSourceVadRuntime(source, generation);
+      }
+
+      const classifierReady = this._isVadReady();
+      this.state.effectiveRetentionMode = classifierReady ? requestedMode : "continuous_fallback";
+      this.state.retentionDegradedReason = classifierReady ? null : "vad_unavailable";
+      if (!classifierReady) {
+        for (const source of Object.values(this.state.sources)) {
+          if (
+            !this._applyGateDecision(
+              source,
+              source.gate.reportVadFailure(source.sourceType, new Error("VAD unavailable"), at)
+            )
+          ) {
+            return this._failRetentionSwitch(at);
+          }
+        }
+      }
+    } catch {
+      return this._failRetentionSwitch(at);
+    }
+    return this._publish(at);
+  }
+
+  reportVadRecovered(at = this.now()) {
+    if (this.closing || this.closed || !this._isVadReady()) {
+      return this._publicState(at);
+    }
+    if (!ACTIVE_SESSION_STATUSES.has(this.state.status) && this.state.status !== "paused") {
+      return this._publicState(at);
+    }
+    this._assertTime(at, "at");
+    if (this.state.effectiveRetentionMode !== "continuous_fallback") {
+      return this._publicState(at);
+    }
+
+    this.retentionGeneration += 1;
+    const generation = this.retentionGeneration;
+    for (const source of Object.values(this.state.sources)) {
+      const pending = this._cancelSourceVad(source);
+      for (const frame of pending.filter((entry) => entry.persistOnDecision)) {
+        if (!this._appendRetainedPcm(source, frame)) return this._publicState(at);
+      }
+      if (
+        !this._applyGateDecision(
+          source,
+          source.gate.reportVadRecovered(source.sourceType, source.captureCursorAt)
+        )
+      ) {
+        return this._publicState(at);
+      }
+      if (this.state.retentionMode === "speech_triggered") {
+        try {
+          this._closeRetentionWriter(source, source.captureCursorAt);
+        } catch (error) {
+          this._handleAudioWriteFailure(source, error, source.captureCursorAt);
+          return this._publicState(at);
+        }
+      }
+      this._resetSourceVadRuntime(source, generation);
+    }
+    this.state.effectiveRetentionMode = this.state.retentionMode;
+    this.state.retentionDegradedReason = null;
+    return this._publish(at);
   }
 
   sourceInterrupted(sessionId, sourceType, interruption) {
@@ -225,10 +440,7 @@ class JarvisService {
       throw new TypeError("restoration is required");
     }
     this._assertTime(restoration.at, "at");
-    if (
-      restoration.sourceType !== undefined &&
-      restoration.sourceType !== source.sourceType
-    ) {
+    if (restoration.sourceType !== undefined && restoration.sourceType !== source.sourceType) {
       throw new TypeError("restoration source type must match the requested source");
     }
     const restored = normalizeSource({ ...restoration, sourceType: source.sourceType });
@@ -284,10 +496,14 @@ class JarvisService {
       if (diskError) return this._failForDisk(diskError.code, restoration.at);
       throw error;
     }
-    this.writer.reopenSource(source.sourceType, {
-      id: source.trackId,
-      startedAt: restoration.at,
-    });
+    this._resetSourceAfterBoundary(source, restoration.at);
+    if (this.state.effectiveRetentionMode !== "speech_triggered") {
+      this.writer.reopenSource(source.sourceType, {
+        id: source.trackId,
+        startedAt: restoration.at,
+      });
+      source.writerOpen = true;
+    }
     try {
       const status = Object.values(this.state.sources).every(
         (entry) => entry === source || entry.state === "active"
@@ -317,6 +533,7 @@ class JarvisService {
     } catch (error) {
       try {
         this.writer.closeSource(source.sourceType, restoration.at);
+        source.writerOpen = false;
       } catch {}
       throw error;
     }
@@ -330,6 +547,9 @@ class JarvisService {
     if (errorCode !== null && (typeof errorCode !== "string" || errorCode.length === 0)) {
       throw new TypeError("errorCode must be a non-empty string or null");
     }
+    if (!this._flushRetentionBoundary(at)) {
+      return this.state.status === "failed" ? this._publicState(at) : this._failForAudioWrite(at);
+    }
     this.repository.pauseCapture({
       sessionId: this.state.sessionId,
       sources: Object.values(this.state.sources).map((source) => ({
@@ -340,11 +560,10 @@ class JarvisService {
     });
     try {
       this.writer.closeAll(at);
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
     } catch (error) {
       const diskError = this._findDiskSpaceError(error);
-      return diskError
-        ? this._failForDisk(diskError.code, at)
-        : this._failForAudioWrite(at);
+      return diskError ? this._failForDisk(diskError.code, at) : this._failForAudioWrite(at);
     }
     for (const source of Object.values(this.state.sources)) {
       if (source.state !== "active") continue;
@@ -373,8 +592,12 @@ class JarvisService {
     try {
       for (const source of Object.values(this.state.sources)) {
         if (source.state !== "paused") continue;
-        this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
-        reopenedSourceTypes.push(source.sourceType);
+        this._resetSourceAfterBoundary(source, at);
+        if (this.state.effectiveRetentionMode !== "speech_triggered") {
+          this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
+          source.writerOpen = true;
+          reopenedSourceTypes.push(source.sourceType);
+        }
       }
       this.repository.resumeCapture({
         sessionId: this.state.sessionId,
@@ -388,6 +611,7 @@ class JarvisService {
       for (const sourceType of reopenedSourceTypes) {
         try {
           this.writer.closeSource(sourceType, at);
+          this.state.sources[sourceType].writerOpen = false;
         } catch {}
       }
       throw error;
@@ -406,13 +630,15 @@ class JarvisService {
     this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(at, "at");
     if (ACTIVE_SESSION_STATUSES.has(this.state.status)) {
+      if (!this._flushRetentionBoundary(at)) {
+        return this.state.status === "failed" ? this._publicState(at) : this._failForAudioWrite(at);
+      }
       try {
         this.writer.closeAll(at);
+        for (const source of Object.values(this.state.sources)) source.writerOpen = false;
       } catch (error) {
         const diskError = this._findDiskSpaceError(error);
-        return diskError
-          ? this._failForDisk(diskError.code, at)
-          : this._failForAudioWrite(at);
+        return diskError ? this._failForDisk(diskError.code, at) : this._failForAudioWrite(at);
       }
     }
     this.writer = null;
@@ -431,8 +657,12 @@ class JarvisService {
       throw new TypeError("code must be a non-empty string");
     }
     if (ACTIVE_SESSION_STATUSES.has(this.state.status)) {
+      if (!this._flushRetentionBoundary(at) && this.state.status === "failed") {
+        return this._publicState(at);
+      }
       try {
         this.writer.closeAll(at);
+        for (const source of Object.values(this.state.sources)) source.writerOpen = false;
       } catch {
         this.writer.abortAll?.();
       }
@@ -466,8 +696,14 @@ class JarvisService {
     try {
       const at = this.now();
       if (this.writer) {
+        let flushFailed = false;
+        if (["recording", "degraded", "paused"].includes(this.state.status)) {
+          flushFailed = !this._flushRetentionBoundary(at);
+          if (!this.writer) return;
+        }
         try {
           this.writer.closeAll(at);
+          for (const source of Object.values(this.state.sources)) source.writerOpen = false;
         } catch (error) {
           this.writer.abortAll?.();
           this.writer = null;
@@ -482,6 +718,14 @@ class JarvisService {
           return;
         }
         this.writer = null;
+        if (flushFailed && ["recording", "degraded", "paused"].includes(this.state.status)) {
+          this._finalizeCapture(at, {
+            trackState: "failed",
+            sessionStatus: "failed",
+            errorCode: "AUDIO_WRITE_FAILED",
+          });
+          return;
+        }
       }
       if (["recording", "degraded", "paused"].includes(this.state.status)) {
         this._finalizeCapture(at, {
@@ -504,11 +748,421 @@ class JarvisService {
       accumulatedMs: 0,
       errorCode: null,
       captureMode: null,
+      retentionMode: null,
+      effectiveRetentionMode: null,
+      retentionDegradedReason: null,
+      capturePolicy: null,
       sources: {},
     };
   }
 
-  _createWriter(sessionId, baseDir) {
+  _isVadReady() {
+    if (!this.vadClassifier) return false;
+    if (typeof this.vadClassifier.isReady !== "function") return true;
+    try {
+      return this.vadClassifier.isReady() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  *_retentionFrames(source, pcm) {
+    for (let offset = 0; offset < pcm.length; offset += VAD_FRAME_BYTES) {
+      const slice = Buffer.from(
+        pcm.subarray(offset, Math.min(offset + VAD_FRAME_BYTES, pcm.length))
+      );
+      const frames = slice.length / WAV_BYTES_PER_SAMPLE;
+      const startedAt =
+        source.timelineAnchorAt + Math.round((source.timelineFrames * 1_000) / WAV_SAMPLE_RATE);
+      source.timelineFrames += frames;
+      const endedAt =
+        source.timelineAnchorAt + Math.round((source.timelineFrames * 1_000) / WAV_SAMPLE_RATE);
+      source.captureCursorAt = endedAt;
+      yield {
+        sourceType: source.sourceType,
+        pcm: slice,
+        startedAt,
+        endedAt,
+      };
+    }
+  }
+
+  _enqueueVadFrame(source, frame, persistOnDecision) {
+    const queued = { ...frame, persistOnDecision };
+    if (source.vadQueueBytes + queued.pcm.length > this.maxVadQueueBytes) {
+      if (!this._degradeRetention("vad_queue_overflow", frame.startedAt)) return false;
+      return !persistOnDecision || this._appendRetainedPcm(source, frame);
+    }
+    source.vadQueue.push(queued);
+    source.vadQueueBytes += queued.pcm.length;
+    this._scheduleVad(source);
+    return true;
+  }
+
+  _scheduleVad(source) {
+    if (source.vadProcessing || source.vadQueue.length === 0 || !this._isVadReady()) return;
+    const generation = source.vadGeneration;
+    source.vadProcessing = true;
+    source.vadProcessingGeneration = generation;
+    const work = new Promise((resolve) => setImmediate(resolve))
+      .then(async () => {
+        while (source.vadQueue.length > 0 && source.vadGeneration === generation) {
+          const frame = source.vadQueue.shift();
+          source.vadInFlight = frame;
+          let speechProbability;
+          try {
+            speechProbability = await this._classifyVad(source, frame, generation);
+          } catch (error) {
+            if (source.vadGeneration === generation) {
+              this._degradeRetention("vad_unavailable", frame.startedAt, error);
+            }
+            return;
+          }
+          if (source.vadGeneration !== generation || source.vadInFlight !== frame) return;
+          source.vadInFlight = null;
+          source.vadQueueBytes = Math.max(0, source.vadQueueBytes - frame.pcm.length);
+          const gateDecision = source.gate.accept({
+            sourceType: source.sourceType,
+            pcm: frame.pcm,
+            capturedAt: frame.startedAt,
+            speechProbability,
+          });
+          if (frame.persistOnDecision) {
+            if (!this._applyGateDecision(source, gateDecision)) return;
+          } else {
+            if (!this._applyGateDecision(source, { ...gateDecision, writes: [] })) return;
+          }
+        }
+      })
+      .catch((error) => {
+        if (source.vadGeneration === generation) {
+          this._degradeRetention("vad_unavailable", source.captureCursorAt, error);
+        }
+      })
+      .finally(() => {
+        if (source.vadProcessingGeneration !== generation) return;
+        source.vadProcessing = false;
+        source.vadProcessingGeneration = null;
+        if (source.vadQueue.length > 0) this._scheduleVad(source);
+      });
+    this.retentionWork.add(work);
+    work.then(
+      () => this.retentionWork.delete(work),
+      () => this.retentionWork.delete(work)
+    );
+  }
+
+  _classifyVad(source, frame, generation) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("VAD classification timed out")),
+        this.vadTimeoutMs
+      );
+      timer.unref?.();
+    });
+    const classification = Promise.resolve().then(() =>
+      this.vadClassifier.classify({
+        sessionId: this.state.sessionId,
+        sourceType: source.sourceType,
+        streamId: `${this.state.sessionId}:${source.sourceType}:${generation}`,
+        sampleRate: WAV_SAMPLE_RATE,
+        pcm: Buffer.from(frame.pcm),
+      })
+    );
+    return Promise.race([classification, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  _cancelSourceVad(source) {
+    const currentGeneration = Number.isSafeInteger(source.vadGeneration) ? source.vadGeneration : 0;
+    if (this.state.sessionId) {
+      this._resetVadStream(`${this.state.sessionId}:${source.sourceType}:${currentGeneration}`);
+    }
+    source.vadGeneration = currentGeneration + 1;
+    const pending = [];
+    if (source.vadInFlight) pending.push(source.vadInFlight);
+    pending.push(...source.vadQueue);
+    source.vadQueue = [];
+    source.vadQueueBytes = 0;
+    source.vadInFlight = null;
+    source.vadProcessing = false;
+    source.vadProcessingGeneration = null;
+    return pending.sort((left, right) => left.startedAt - right.startedAt);
+  }
+
+  _cancelAllVadWork() {
+    this.retentionGeneration += 1;
+    const pendingBySource = new Map();
+    for (const source of Object.values(this.state.sources)) {
+      pendingBySource.set(source.sourceType, this._cancelSourceVad(source));
+    }
+    return pendingBySource;
+  }
+
+  _resetSourceVadRuntime(source, generation = this.retentionGeneration) {
+    const currentGeneration = Number.isSafeInteger(source.vadGeneration) ? source.vadGeneration : 0;
+    const minimumGeneration = Number.isSafeInteger(generation) ? generation : 0;
+    source.vadGeneration = Math.max(currentGeneration + 1, minimumGeneration);
+    source.vadQueue = [];
+    source.vadQueueBytes = 0;
+    source.vadInFlight = null;
+    source.vadProcessing = false;
+    source.vadProcessingGeneration = null;
+  }
+
+  _resetVadStream(streamId) {
+    if (typeof this.vadClassifier?.reset !== "function") return;
+    try {
+      Promise.resolve(this.vadClassifier.reset(streamId)).catch(() => {});
+    } catch {
+      // VAD state cleanup is best effort and must not block synchronous capture control.
+    }
+  }
+
+  _resetVadSessionOnce(sessionId) {
+    if (
+      !sessionId ||
+      this.vadSessionReset ||
+      typeof this.vadClassifier?.resetSession !== "function"
+    ) {
+      return;
+    }
+    this.vadSessionReset = true;
+    try {
+      Promise.resolve(this.vadClassifier.resetSession(sessionId)).catch(() => {});
+    } catch {
+      // VAD state cleanup is best effort and must not block synchronous finalization.
+    }
+  }
+
+  _resetSourceAfterBoundary(source, at) {
+    this._resetSourceVadRuntime(source);
+    source.timelineAnchorAt = at;
+    source.timelineFrames = 0;
+    source.captureCursorAt = at;
+    source.gate = new SpeechTriggeredCaptureGate({
+      sampleRate: WAV_SAMPLE_RATE,
+      ...this.state.capturePolicy,
+      mode: this.state.retentionMode,
+    });
+    if (this.state.effectiveRetentionMode === "continuous_fallback") {
+      source.gate.reportVadFailure(source.sourceType, new Error("VAD unavailable"), at);
+    }
+    source.writerOpen = this.writer?.hasSource?.(source.sourceType) ?? false;
+  }
+
+  _flushSourceRetentionBoundary(source, at) {
+    const pending = this._cancelSourceVad(source);
+    const boundaryAt = Math.max(source.captureCursorAt, Math.min(at, source.captureCursorAt));
+    if (!this._applyGateDecision(source, source.gate.finish(source.sourceType, boundaryAt))) {
+      return false;
+    }
+    for (const frame of pending) {
+      if (frame.persistOnDecision && !this._appendRetainedPcm(source, frame)) return false;
+    }
+    return true;
+  }
+
+  _flushRetentionBoundary(at) {
+    for (const source of Object.values(this.state.sources)) {
+      if (!this._flushSourceRetentionBoundary(source, at)) {
+        if (this.state.status === "failed" || !this.writer) return false;
+        // A normal writer fault isolates only this source. Keep draining healthy lanes so
+        // pause/finish can make one authoritative lifecycle transition for the session.
+      }
+    }
+    return true;
+  }
+
+  _degradeRetention(reason, at, error = null) {
+    try {
+      this.vadClassifier?.reportFailure?.(error ?? new Error(reason));
+    } catch {
+      // The capture path still fails open if classifier invalidation itself fails.
+    }
+    if (
+      this.closing ||
+      this.closed ||
+      (!ACTIVE_SESSION_STATUSES.has(this.state.status) && this.state.status !== "paused") ||
+      !this.writer
+    ) {
+      return false;
+    }
+    if (this.state.effectiveRetentionMode === "continuous_fallback") {
+      this.state.retentionDegradedReason = reason;
+      return true;
+    }
+    const pendingBySource = this._cancelAllVadWork();
+    this.state.effectiveRetentionMode = "continuous_fallback";
+    this.state.retentionDegradedReason = reason;
+    for (const source of Object.values(this.state.sources)) {
+      const failed = source.gate.reportVadFailure(
+        source.sourceType,
+        error ?? new Error(reason),
+        Math.min(source.captureCursorAt, Math.max(source.timelineAnchorAt, at))
+      );
+      if (!this._applyGateDecision(source, failed)) {
+        if (this.state.status === "failed" || !this.writer) return false;
+        continue;
+      }
+      for (const frame of pendingBySource.get(source.sourceType) || []) {
+        if (frame.persistOnDecision && !this._appendRetainedPcm(source, frame)) {
+          if (this.state.status === "failed" || !this.writer) return false;
+          break;
+        }
+      }
+    }
+    try {
+      this._publish(this.now());
+    } catch {}
+    return true;
+  }
+
+  _appendRetainedPcm(source, frame) {
+    if (
+      !this.writer ||
+      source.state !== "active" ||
+      !ACTIVE_SESSION_STATUSES.has(this.state.status)
+    ) {
+      return false;
+    }
+    try {
+      if (!this.writer.hasSource(source.sourceType)) {
+        this.writer.reopenSource(source.sourceType, {
+          id: source.trackId,
+          startedAt: frame.startedAt,
+        });
+        source.writerOpen = true;
+      }
+      this.writer.append(source.sourceType, frame.pcm);
+      return true;
+    } catch (error) {
+      const durableEvidenceEnd = this._findEvidenceEndedAt(error);
+      const evidenceEndedAt = Number.isSafeInteger(durableEvidenceEnd)
+        ? Math.min(frame.endedAt, durableEvidenceEnd)
+        : frame.startedAt;
+      return this._handleAudioWriteFailure(
+        source,
+        error,
+        Math.max(source.timelineAnchorAt, evidenceEndedAt)
+      );
+    }
+  }
+
+  _handleAudioWriteFailure(source, error, at) {
+    const diskError = this._findDiskSpaceError(error);
+    if (diskError) {
+      this._failForDisk(diskError.code, at);
+      return false;
+    }
+    this._cancelSourceVad(source);
+    try {
+      this._interruptSource(
+        this.state.sessionId,
+        source.sourceType,
+        { at, reason: "audio-write-failed" },
+        error
+      );
+    } catch {
+      try {
+        this._failForAudioWrite(at);
+      } catch {}
+    }
+    return false;
+  }
+
+  _closeRetentionWriter(source, at) {
+    if (!this.writer?.hasSource?.(source.sourceType)) {
+      source.writerOpen = false;
+      return;
+    }
+    this.writer.closeSource(source.sourceType, at);
+    source.writerOpen = false;
+  }
+
+  _applyGateDecision(source, gateDecision) {
+    let metadataError = null;
+    for (const gap of gateDecision.gapsToCommit) {
+      if (gap.reason === "silence_suppressed") {
+        try {
+          this._closeRetentionWriter(source, gap.startedAt);
+        } catch (error) {
+          return this._handleAudioWriteFailure(source, error, gap.startedAt);
+        }
+      }
+      try {
+        this._recordRetentionGap(source, gap);
+      } catch (error) {
+        metadataError = error;
+        break;
+      }
+    }
+    for (const write of gateDecision.writes) {
+      if (!this._appendRetainedPcm(source, write)) return false;
+    }
+    if (metadataError) {
+      this._failForCaptureEvidence(Math.max(source.captureCursorAt, this.now()));
+      return false;
+    }
+    return true;
+  }
+
+  _recordRetentionGap(source, gap) {
+    if (gap.endedAt <= gap.startedAt) return;
+    this.repository.recordEvidenceGap({
+      id: `gap-${crypto.randomUUID()}`,
+      trackId: source.trackId,
+      startedAt: gap.startedAt,
+      endedAt: gap.endedAt,
+      reason: gap.reason,
+      averageLevel: gap.averageLevel,
+      peakLevel: gap.peakLevel,
+    });
+  }
+
+  _failForCaptureEvidence(at) {
+    this._cancelAllVadWork();
+    try {
+      this.writer?.closeAll?.(at);
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+    } catch (error) {
+      const diskError = this._findDiskSpaceError(error);
+      return diskError ? this._failForDisk(diskError.code, at) : this._failForAudioWrite(at);
+    }
+    this.writer = null;
+    try {
+      return this._finalizeCapture(at, {
+        trackState: "failed",
+        sessionStatus: "failed",
+        errorCode: "CAPTURE_EVIDENCE_FAILED",
+      });
+    } catch {
+      return this._publicState(at);
+    }
+  }
+
+  _failRetentionSwitch(at) {
+    if (this.state.status === "failed") return this._publicState(at);
+    this._cancelAllVadWork();
+    try {
+      this.writer?.closeAll?.(at);
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+    } catch {
+      this.writer?.abortAll?.();
+    }
+    this.writer = null;
+    try {
+      return this._finalizeCapture(at, {
+        trackState: "failed",
+        sessionStatus: "failed",
+        errorCode: "RETENTION_SWITCH_FAILED",
+      });
+    } catch {
+      return this._publicState(at);
+    }
+  }
+
+  _createWriter(sessionId, baseDir, { openSources = true } = {}) {
     const tracks = Object.fromEntries(
       Object.values(this.state.sources).map((source) => [
         source.sourceType,
@@ -521,6 +1175,7 @@ class JarvisService {
       baseDir,
       now: this.now,
       beforeChunk: () => this._assertSafeDiskSpace(),
+      openSources,
       onChunk: (chunk) => {
         if (this.closed) return null;
         return this.repository.commitChunk({
@@ -622,9 +1277,7 @@ class JarvisService {
     if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
       throw new TypeError("audio recovery metadata must be an object");
     }
-    if (
-      JSON.stringify(Object.keys(metadata).sort()) !== JSON.stringify(RECOVERY_SIDECAR_KEYS)
-    ) {
+    if (JSON.stringify(Object.keys(metadata).sort()) !== JSON.stringify(RECOVERY_SIDECAR_KEYS)) {
       throw new TypeError("audio recovery metadata has an invalid structure");
     }
 
@@ -669,10 +1322,7 @@ class JarvisService {
     if (!wavStat.isFile() || wavStat.isSymbolicLink()) {
       throw new Error("audio recovery WAV is not a regular file");
     }
-    if (
-      wavStat.size <= WAV_HEADER_BYTES ||
-      wavStat.size > WAV_HEADER_BYTES + MAX_CHUNK_PCM_BYTES
-    ) {
+    if (wavStat.size <= WAV_HEADER_BYTES || wavStat.size > WAV_HEADER_BYTES + MAX_CHUNK_PCM_BYTES) {
       throw new RangeError("audio recovery WAV size is invalid");
     }
     const wavRealPath = this.fs.realpathSync(wavPath);
@@ -765,7 +1415,8 @@ class JarvisService {
       expires_at: chunk.expiresAt,
     };
     for (const [key, value] of Object.entries(expected)) {
-      const matches = key === "path" ? this._samePath(existing[key], value) : existing[key] === value;
+      const matches =
+        key === "path" ? this._samePath(existing[key], value) : existing[key] === value;
       if (!matches) throw new Error(`audio recovery chunk conflicts on ${key}`);
     }
   }
@@ -810,42 +1461,57 @@ class JarvisService {
       throw new TypeError("reason must be a non-empty string");
     }
     if (source.state === "reconnecting") return this._publicState(at);
-    if (source.state !== "active") throw new Error(`capture source is not active: ${source.sourceType}`);
+    if (source.state !== "active")
+      throw new Error(`capture source is not active: ${source.sourceType}`);
 
-    const gapId = `gap-${crypto.randomUUID()}`;
-    this.repository.interruptTrack({
-      trackId: source.trackId,
-      sessionId: this.state.sessionId,
-      sessionStatus: "recording",
-      gap: {
-        id: gapId,
-        trackId: source.trackId,
-        startedAt: at,
-        reason,
-        recoveryAttempts: 0,
-      },
-    });
-    this.completedRestorations.delete(source.sourceType);
-
-    Object.assign(source, {
-      state: "reconnecting",
-      gapId,
-      interruptedAt: at,
-      reason,
-      errorCode: writerError ? "AUDIO_WRITE_FAILED" : null,
-    });
-
-    let closeError = writerError;
-    try {
-      this.writer.closeSource(source.sourceType, at);
-    } catch (error) {
-      closeError ??= error;
-      const diskError = this._findDiskSpaceError(error);
-      if (diskError) return this._failForDisk(diskError.code, at);
+    if (!writerError && !this._flushSourceRetentionBoundary(source, at)) {
+      return this._publicState(at);
     }
-    source.errorCode = closeError ? "AUDIO_WRITE_FAILED" : null;
-    this._transitionSessionStatus("degraded", at);
-    return this._publish(at);
+    if (source.state === "reconnecting" || this.state.status === "failed") {
+      return this._publicState(at);
+    }
+    if (this.interruptingSources.has(source.sourceType)) return this._publicState(at);
+    this.interruptingSources.add(source.sourceType);
+
+    try {
+      const gapId = `gap-${crypto.randomUUID()}`;
+      this.repository.interruptTrack({
+        trackId: source.trackId,
+        sessionId: this.state.sessionId,
+        sessionStatus: "recording",
+        gap: {
+          id: gapId,
+          trackId: source.trackId,
+          startedAt: at,
+          reason,
+          recoveryAttempts: 0,
+        },
+      });
+      this.completedRestorations.delete(source.sourceType);
+
+      Object.assign(source, {
+        state: "reconnecting",
+        gapId,
+        interruptedAt: at,
+        reason,
+        errorCode: writerError ? "AUDIO_WRITE_FAILED" : null,
+      });
+
+      let closeError = writerError;
+      try {
+        this.writer?.closeSource?.(source.sourceType, at);
+        source.writerOpen = false;
+      } catch (error) {
+        closeError ??= error;
+        const diskError = this._findDiskSpaceError(error);
+        if (diskError) return this._failForDisk(diskError.code, at);
+      }
+      source.errorCode = closeError ? "AUDIO_WRITE_FAILED" : null;
+      this._transitionSessionStatus("degraded", at);
+      return this._publish(at);
+    } finally {
+      this.interruptingSources.delete(source.sourceType);
+    }
   }
 
   _deriveSessionStatus() {
@@ -922,6 +1588,23 @@ class JarvisService {
     return error?.cause ? this._findDiskSpaceError(error.cause) : null;
   }
 
+  _findEvidenceEndedAt(error) {
+    let endedAt = Number.isSafeInteger(error?.evidenceEndedAt) ? error.evidenceEndedAt : null;
+    if (error instanceof AggregateError) {
+      for (const nested of error.errors) {
+        const nestedEndedAt = this._findEvidenceEndedAt(nested);
+        if (Number.isSafeInteger(nestedEndedAt)) {
+          endedAt = endedAt === null ? nestedEndedAt : Math.max(endedAt, nestedEndedAt);
+        }
+      }
+    }
+    const causeEndedAt = error?.cause ? this._findEvidenceEndedAt(error.cause) : null;
+    if (Number.isSafeInteger(causeEndedAt)) {
+      endedAt = endedAt === null ? causeEndedAt : Math.max(endedAt, causeEndedAt);
+    }
+    return endedAt;
+  }
+
   _failForDisk(code, at, durableSources) {
     this.writer?.abortAll?.();
     this.writer = null;
@@ -943,10 +1626,9 @@ class JarvisService {
     });
   }
 
-  _finalizeCapture(
-    at,
-    { trackState, sessionStatus, errorCode, durableSources = null }
-  ) {
+  _finalizeCapture(at, { trackState, sessionStatus, errorCode, durableSources = null }) {
+    this._cancelAllVadWork();
+    this._resetVadSessionOnce(this.state.sessionId);
     const sources = Object.values(this.state.sources);
     const evidenceSources =
       durableSources ?? sources.map((source) => ({ trackId: source.trackId, gapId: source.gapId }));
@@ -1017,8 +1699,25 @@ class JarvisService {
       elapsedMs: this.state.accumulatedMs + activeMs,
       errorCode: this.state.errorCode,
       captureMode: this.state.captureMode,
+      retentionMode: this.state.retentionMode,
+      effectiveRetentionMode: this.state.effectiveRetentionMode,
+      retentionDegradedReason: this.state.retentionDegradedReason,
+      capturePolicy: this.state.capturePolicy,
       sources: Object.fromEntries(
-        Object.entries(this.state.sources).map(([sourceType, source]) => [sourceType, { ...source }])
+        Object.entries(this.state.sources).map(([sourceType, source]) => {
+          const {
+            gate: _gate,
+            vadQueue: _vadQueue,
+            vadInFlight: _vadInFlight,
+            vadProcessing: _vadProcessing,
+            vadProcessingGeneration: _vadProcessingGeneration,
+            vadGeneration: _vadGeneration,
+            timelineAnchorAt: _timelineAnchorAt,
+            timelineFrames: _timelineFrames,
+            ...publicSource
+          } = source;
+          return [sourceType, publicSource];
+        })
       ),
     };
   }

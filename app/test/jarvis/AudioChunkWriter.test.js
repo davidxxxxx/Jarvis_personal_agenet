@@ -61,7 +61,10 @@ test("rotates exact 24 kHz mono s16le WAV files atomically and preserves leftove
       assert.equal(wav.readUInt32LE(24), 24000);
       assert.equal(wav.readUInt16LE(34), 16);
       assert.equal(wav.readUInt32LE(40), wav.length - 44);
-      assert.equal(chunk.sha256, crypto.createHash("sha256").update(wav.subarray(44)).digest("hex"));
+      assert.equal(
+        chunk.sha256,
+        crypto.createHash("sha256").update(wav.subarray(44)).digest("hex")
+      );
       assert.equal(chunk.sessionId, "s1");
       assert.equal(chunk.trackId, "tm");
       assert.equal(chunk.sourceType, "mic");
@@ -105,7 +108,14 @@ test("does not advertise a chunk when the atomic rename fails", (t) => {
       return realRenameSync(from, to);
     });
 
-    assert.throws(() => writer.append(Buffer.alloc(48, 1)), /rename failed/);
+    assert.throws(
+      () => writer.append(Buffer.alloc(48, 1)),
+      (error) => {
+        assert.match(error.message, /rename failed/);
+        assert.equal(error.evidenceEndedAt, undefined);
+        return true;
+      }
+    );
     assert.deepEqual(completed, []);
     assert.deepEqual(fs.readdirSync(dir), []);
   });
@@ -179,6 +189,7 @@ test("retains deterministic recovery metadata and a sticky fault when the callba
       }
     );
     assert.equal(fault.cause, callbackError);
+    assert.equal(fault.evidenceEndedAt, 102);
     assert.deepEqual(JSON.parse(fs.readFileSync(`${attemptedChunk.path}.recovery.json`, "utf8")), {
       id: attemptedChunk.id,
       sessionId: "s1",
@@ -195,13 +206,48 @@ test("retains deterministic recovery metadata and a sticky fault when the callba
     assert.equal(writer.sequenceNumber, 1);
     assert.equal(writer.startedAt, 102);
 
-    assert.throws(() => writer.append(Buffer.alloc(48, 2)), (error) => error === fault);
-    assert.throws(() => writer.close(500), (error) => error === fault);
-    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".wav")).length, 1);
-    assert.equal(
-      fs.readdirSync(dir).filter((name) => name.endsWith(".recovery.json")).length,
-      1
+    assert.throws(
+      () => writer.append(Buffer.alloc(48, 2)),
+      (error) => error === fault
     );
+    assert.throws(
+      () => writer.close(500),
+      (error) => error === fault
+    );
+    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".wav")).length, 1);
+    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".recovery.json")).length, 1);
+  });
+});
+
+test("marks the durable end when recovery cleanup fails after the chunk callback", (t) => {
+  withTempDir((dir) => {
+    const realUnlinkSync = fs.unlinkSync;
+    let attemptedChunk;
+    t.mock.method(fs, "unlinkSync", (target) => {
+      if (String(target).endsWith(".recovery.json")) throw new Error("cleanup failed");
+      return realUnlinkSync(target);
+    });
+    const writer = new AudioChunkWriter({
+      sessionId: "s1",
+      trackId: "tm",
+      sourceType: "mic",
+      baseDir: dir,
+      chunkSeconds: 0.002,
+      startedAt: 100,
+      onChunk(chunk) {
+        attemptedChunk = chunk;
+      },
+    });
+
+    assert.throws(
+      () => writer.append(Buffer.alloc(96, 1)),
+      (error) => {
+        assert.match(error.message, /audio chunk recovery cleanup failed/);
+        assert.equal(error.evidenceEndedAt, 102);
+        return true;
+      }
+    );
+    assert.equal(fs.existsSync(attemptedChunk.path), true);
   });
 });
 

@@ -1,4 +1,4 @@
-const TARGET_VERSION = 3;
+const TARGET_VERSION = 5;
 
 const PROCESSING_JOBS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -41,6 +41,8 @@ const MIGRATION_BASE_SCHEMA = `
     language TEXT NOT NULL DEFAULT 'zh',
     created_at INTEGER NOT NULL,
     capture_mode TEXT NOT NULL DEFAULT 'mic',
+    retention_mode TEXT NOT NULL DEFAULT 'speech_triggered',
+    capture_policy_json TEXT NOT NULL DEFAULT '{"schemaVersion":1,"preRollMs":2000,"postRollMs":3000,"mergeGapMs":3000}',
     processing_state TEXT NOT NULL DEFAULT 'pending',
     timeline_version INTEGER NOT NULL DEFAULT 1,
     finalized_at INTEGER,
@@ -108,6 +110,14 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     db.exec(MIGRATION_BASE_SCHEMA);
 
     addColumn(db, "sessions", "capture_mode TEXT NOT NULL DEFAULT 'mic'");
+    // Existing sessions were captured continuously. Keep that historical meaning while
+    // repository-created sessions explicitly opt into the new speech-triggered default.
+    addColumn(db, "sessions", "retention_mode TEXT NOT NULL DEFAULT 'continuous'");
+    addColumn(
+      db,
+      "sessions",
+      `capture_policy_json TEXT NOT NULL DEFAULT '{"schemaVersion":1,"preRollMs":2000,"postRollMs":3000,"mergeGapMs":3000}'`
+    );
     addColumn(db, "sessions", "processing_state TEXT NOT NULL DEFAULT 'pending'");
     addColumn(db, "sessions", "timeline_version INTEGER NOT NULL DEFAULT 1");
     addColumn(db, "sessions", "finalized_at INTEGER");
@@ -142,18 +152,24 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         recovery_attempts INTEGER NOT NULL DEFAULT 0,
         restored_device_id TEXT,
         restored_device_label TEXT,
-        restored_strategy TEXT
+        restored_strategy TEXT,
+        average_level REAL,
+        peak_level REAL
       );
     `);
     addColumn(db, "audio_gaps", "restored_device_id TEXT");
     addColumn(db, "audio_gaps", "restored_device_label TEXT");
     addColumn(db, "audio_gaps", "restored_strategy TEXT");
+    addColumn(db, "audio_gaps", "average_level REAL");
+    addColumn(db, "audio_gaps", "peak_level REAL");
     db.exec(PROCESSING_JOBS_SCHEMA);
     rebuildLegacyProcessingJobs(db);
     db.exec(PROCESSING_JOBS_INDEXES);
     db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence
       ON audio_chunks(track_id, sequence_number);
+      CREATE INDEX IF NOT EXISTS idx_audio_gaps_track_ended_started
+      ON audio_gaps(track_id, ended_at, started_at);
     `);
 
     db.pragma(`user_version = ${TARGET_VERSION}`);

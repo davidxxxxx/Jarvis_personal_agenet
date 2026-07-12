@@ -110,6 +110,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getMiniMaxConfig: () => ipcRenderer.invoke("jarvis:minimax:get-config"),
     setMiniMaxKey: (key) => ipcRenderer.invoke("jarvis:minimax:set-key", key),
     startCapture: (input) => ipcRenderer.invoke("jarvis:capture:start", input),
+    setRetentionMode: (id, retentionMode, at) =>
+      ipcRenderer.invoke("jarvis:capture:set-retention-mode", id, retentionMode, at),
     sourceInterrupted: (id, sourceType, input) =>
       ipcRenderer.invoke("jarvis:capture:source-interrupted", id, sourceType, input),
     sourceRestored: (id, sourceType, input) =>

@@ -293,6 +293,7 @@ const sidecarRegistry = require("./src/helpers/sidecarRegistry");
 const { reapStaleSidecars } = require("./src/helpers/sidecarReaper");
 const JarvisRepository = require("./src/jarvis/main/JarvisRepository");
 const JarvisService = require("./src/jarvis/main/JarvisService");
+const SpeechVadClassifier = require("./src/jarvis/main/SpeechVadClassifier");
 const RetentionCleaner = require("./src/jarvis/main/RetentionCleaner");
 const {
   runLegacyRecordingBackfillAtStartup,
@@ -339,6 +340,7 @@ let ipcHandlers = null;
 let cliBridge = null;
 let jarvisRepository = null;
 let jarvisService = null;
+let speechVadClassifier = null;
 let retentionCleaner = null;
 let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
@@ -420,10 +422,14 @@ function initializeCoreManagers() {
     recordingsRoot,
     log: (message, details) => debugLogger.info(message, details, "jarvis"),
   });
+  speechVadClassifier = new SpeechVadClassifier({
+    getModelPath: () => diarizationManager?.getVadModelPath?.() ?? null,
+  });
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: jarvisUserDataDir,
     recordingsDir: recordingsRoot,
+    vadClassifier: speechVadClassifier,
     broadcast: (state) => {
       windowManager?.sendToControlPanel("jarvis:state-changed", state);
       trayManager?.setJarvisState(state);
@@ -531,6 +537,9 @@ function initializeCoreManagers() {
   }
   parakeetManager = new ParakeetManager();
   diarizationManager = new DiarizationManager();
+  speechVadClassifier.startRecovery({
+    onRecovered: () => jarvisService?.reportVadRecovered(Date.now()),
+  });
   googleCalendarManager = new GoogleCalendarManager(databaseManager, windowManager);
   meetingDetectionEngine = new MeetingDetectionEngine(
     googleCalendarManager,
@@ -591,6 +600,9 @@ function registerSidecars() {
   if (parakeetManager) sidecarRegistry.register("parakeet", () => parakeetManager.stopServer());
   if (diarizationManager) {
     sidecarRegistry.register("diarization", () => diarizationManager.shutdown());
+  }
+  if (speechVadClassifier) {
+    sidecarRegistry.register("speech-vad", () => speechVadClassifier.stop());
   }
   const modelManager = require("./src/helpers/modelManagerBridge").default;
   sidecarRegistry.register("llama", () => modelManager.stopServer());
@@ -1148,11 +1160,22 @@ async function startApp() {
     diarizationManager.getBinaryPath() &&
     (!diarizationManager.isModelDownloaded() || !diarizationManager.isVadModelDownloaded())
   ) {
-    diarizationManager.downloadModels().catch((err) => {
-      debugLogger.debug("Diarization model auto-download error (non-fatal)", {
-        error: err.message,
+    diarizationManager
+      .downloadModels()
+      .then(async () => {
+        const vadInitialization = await speechVadClassifier?.initialize();
+        if (
+          vadInitialization?.ok === true &&
+          speechVadClassifier?.isReady?.() === true
+        ) {
+          jarvisService?.reportVadRecovered(Date.now());
+        }
+      })
+      .catch((err) => {
+        debugLogger.debug("Diarization model auto-download error (non-fatal)", {
+          error: err.message,
+        });
       });
-    });
   }
 
   const QdrantManager = require("./src/helpers/qdrantManager");

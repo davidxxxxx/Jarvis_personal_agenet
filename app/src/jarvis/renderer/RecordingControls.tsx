@@ -9,7 +9,7 @@ import JarvisMicrophoneSelector from "./JarvisMicrophoneSelector";
 import JarvisCaptureModeSelector from "./JarvisCaptureModeSelector";
 import { useJarvisStore } from "./jarvisStore";
 import { hasRecordingConsent } from "./recordingConsent";
-import type { JarvisCaptureMode, JarvisCaptureSourceState } from "../types";
+import type { JarvisCaptureMode, JarvisCaptureSourceState, JarvisRetentionMode } from "../types";
 
 interface RecordingControlsProps {
   recording: UseJarvisRecordingResult;
@@ -81,15 +81,20 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
   const { session } = recording;
   const captureMode = useJarvisStore((state) => state.captureMode);
   const setCaptureMode = useJarvisStore((state) => state.setCaptureMode);
+  const retentionMode = useJarvisStore((state) => state.retentionMode);
+  const effectiveRetentionMode = useJarvisStore((state) => state.effectiveRetentionMode);
+  const retentionDegradedReason = useJarvisStore((state) => state.retentionDegradedReason);
   const sourceStates = useJarvisStore((state) => state.sourceStates);
   const isSystemOnly = captureMode === "system";
   const microphoneName = useMicrophoneName(session.status, !isSystemOnly);
   const isRecording = session.status === "recording";
   const isPaused = session.status === "paused";
   const isBusy = session.status === "starting" || session.status === "finalizing";
+  const showsRetentionRuntime = ["recording", "paused", "finalizing"].includes(session.status);
   const commandPending = recording.operation !== null || invoking;
   const sourceSemanticsLocked =
     !["idle", "completed", "failed"].includes(session.status) || commandPending;
+  const retentionSemanticsLocked = isBusy || commandPending;
 
   const sourceLabel = (state: JarvisCaptureSourceState): string =>
     t(`jarvis.capture.status.${state}`);
@@ -137,7 +142,11 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           : "jarvis.capture.noActiveSource"
       )
     : isRecording
-      ? t("jarvis.listening")
+      ? t(
+          retentionMode === "continuous"
+            ? "jarvis.retention.importantMeeting"
+            : "jarvis.retention.listening"
+        )
       : isPaused
         ? t("jarvis.paused")
         : t(`jarvis.status.${session.status}`);
@@ -205,11 +214,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
                     : "bg-muted text-muted-foreground"
               }`}
             >
-              {isSystemOnly ? (
-                <MonitorSpeaker aria-hidden="true" />
-              ) : (
-                <Mic aria-hidden="true" />
-              )}
+              {isSystemOnly ? <MonitorSpeaker aria-hidden="true" /> : <Mic aria-hidden="true" />}
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
@@ -312,6 +317,16 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             {t(actionError ? "jarvis.operationError" : recordingErrorKey)}
           </p>
         )}
+        {showsRetentionRuntime &&
+          effectiveRetentionMode === "continuous_fallback" &&
+          retentionDegradedReason && (
+            <p
+              role="status"
+              className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {t("jarvis.retention.degraded")}
+            </p>
+          )}
         <div aria-live="polite" className="mt-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
           <span>
             {t("jarvis.capture.sourceStatus", {
@@ -369,6 +384,32 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             })}
           </p>
         ) : null}
+        <div className="mt-4 grid gap-1.5">
+          <label className="text-xs font-medium text-foreground" htmlFor="jarvis-retention-mode">
+            {t("jarvis.retention.groupLabel")}
+          </label>
+          <select
+            id="jarvis-retention-mode"
+            className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            value={retentionMode}
+            disabled={retentionSemanticsLocked}
+            onChange={(event) =>
+              void run(() =>
+                recording.setRetentionMode(event.currentTarget.value as JarvisRetentionMode)
+              )
+            }
+          >
+            <option value="speech_triggered">{t("jarvis.retention.speechTriggered")}</option>
+            <option value="continuous">{t("jarvis.retention.importantMeeting")}</option>
+          </select>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              retentionMode === "continuous"
+                ? "jarvis.retention.continuousDescription"
+                : "jarvis.retention.speechTriggeredDescription"
+            )}
+          </p>
+        </div>
         <JarvisCaptureModeSelector
           value={captureMode}
           onChange={setCaptureMode}
