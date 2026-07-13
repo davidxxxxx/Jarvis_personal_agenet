@@ -2,6 +2,10 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
+const {
+  DefaultFreeSpaceInspector,
+  releaseReserveSync,
+} = require("./SafeReserveFile");
 
 const GIB = 1024 ** 3;
 const DEFAULT_RESERVE_BYTES = 512 * 1024 ** 2;
@@ -20,7 +24,7 @@ class DefaultAllocationInspector {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$a=(Get-Item -LiteralPath $args[0] -Force).Attributes; [Console]::Write([int]$a)",
+            "& { $a=(Get-Item -LiteralPath $args[0] -Force).Attributes; [Console]::Write([int]$a) }",
             filePath,
           ],
           { windowsHide: true, timeout: 5_000, encoding: "utf8" }
@@ -50,6 +54,7 @@ class FileEmergencyReserve {
     sizeBytes = DEFAULT_RESERVE_BYTES,
     fsImpl = fs,
     allocationInspector = new DefaultAllocationInspector(),
+    freeSpaceInspector = new DefaultFreeSpaceInspector(),
   } = {}) {
     if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
       throw new TypeError("emergency reserve filePath must be absolute");
@@ -64,6 +69,10 @@ class FileEmergencyReserve {
       throw new TypeError("allocationInspector.inspect is required");
     }
     this.allocationInspector = allocationInspector;
+    if (!freeSpaceInspector || typeof freeSpaceInspector.inspect !== "function") {
+      throw new TypeError("freeSpaceInspector.inspect is required");
+    }
+    this.freeSpaceInspector = freeSpaceInspector;
   }
 
   ensure() {
@@ -100,11 +109,13 @@ class FileEmergencyReserve {
   }
 
   release() {
-    try {
-      this.fs.unlinkSync(this.filePath);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
+    return releaseReserveSync({
+      filePath: this.filePath,
+      sizeBytes: this.sizeBytes,
+      fsImpl: this.fs,
+      validate: (candidate, stat) => this._assertAllocated(candidate, stat),
+      freeSpaceInspector: this.freeSpaceInspector,
+    });
   }
 
   setFilePath(filePath) {
@@ -196,7 +207,9 @@ class StorageGovernor {
     const state = this.evaluate(input);
     if (state === "stop" && !this.reserveReleased) {
       try {
-        this.reserve.release();
+        if (this.reserve.release() !== true) {
+          throw new Error("reserve release was not confirmed");
+        }
         this.reserveReleased = true;
       } catch {
         throw new Error(

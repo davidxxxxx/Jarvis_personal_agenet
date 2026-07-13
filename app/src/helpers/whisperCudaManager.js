@@ -242,7 +242,11 @@ class WhisperCudaManager {
     return { success: false, error: "No active download to cancel" };
   }
 
-  async delete() {
+  delete() {
+    return processWriteGate.runWithWriteLease("cuda-component-delete", () => this._delete());
+  }
+
+  async _delete() {
     if (!isSupportedPlatform()) {
       return { success: false, error: "Not supported on this platform" };
     }

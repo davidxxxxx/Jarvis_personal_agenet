@@ -423,6 +423,12 @@ class ModelManager {
     this.currentServerModelId = null;
   }
 
+  async quiesce() {
+    await this.stopServer();
+  }
+
+  async resume() {}
+
   getServerStatus() {
     return this.serverManager.getStatus();
   }

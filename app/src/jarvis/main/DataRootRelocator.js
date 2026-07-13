@@ -93,7 +93,13 @@ class DataRootRelocator {
       token: operationToken,
     });
 
-    const repository = new this.Repository(path.resolve(databasePath));
+    const formalDatabasePath = path.resolve(databasePath);
+    const workDatabasePath = path.join(
+      path.dirname(formalDatabasePath),
+      `.jarvis-relocate-${operationId}-${operationToken}.db`
+    );
+    await this._prepareWorkDatabase(formalDatabasePath, workDatabasePath);
+    const repository = new this.Repository(workDatabasePath);
     let databaseLocators;
     try {
       const result = repository.relocateDataRoot({
@@ -102,7 +108,8 @@ class DataRootRelocator {
       });
       databaseLocators = result.relocated;
       await this.faultInjector("sqlite-relocation-wal-open", {
-        databasePath: path.resolve(databasePath),
+        databasePath: formalDatabasePath,
+        workDatabasePath,
         migrationId: operationId,
         token: operationToken,
       });
@@ -110,7 +117,50 @@ class DataRootRelocator {
     } finally {
       repository.close();
     }
+    await this._verifySqliteDatabase(workDatabasePath);
+    await this._fsyncFile(workDatabasePath);
+    await this.fs.rename(workDatabasePath, formalDatabasePath);
+    await this._fsyncDirectory(path.dirname(formalDatabasePath));
     return { databaseLocators, recoverySidecars };
+  }
+
+  async _prepareWorkDatabase(formalDatabasePath, workDatabasePath) {
+    const existing = await this.fs.lstat(workDatabasePath).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
+    if (existing !== null) {
+      if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1) {
+        throw new Error("SQLite relocation work database is unsafe");
+      }
+      return;
+    }
+    await this.fs.copyFile(formalDatabasePath, workDatabasePath, fs.constants.COPYFILE_EXCL);
+    await this._fsyncFile(workDatabasePath);
+    await this._fsyncDirectory(path.dirname(workDatabasePath));
+  }
+
+  async _verifySqliteDatabase(databasePath) {
+    const stat = await this.fs.lstat(databasePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size < 100) {
+      throw new Error("SQLite relocation work database is invalid");
+    }
+    const header = Buffer.alloc(16);
+    const handle = await this.fs.open(databasePath, "r");
+    try {
+      const { bytesRead } = await handle.read(header, 0, header.length, 0);
+      if (bytesRead !== header.length || header.toString("binary") !== "SQLite format 3\u0000") {
+        throw new Error("SQLite relocation work database is invalid");
+      }
+    } finally {
+      await handle.close();
+    }
+    const verifier = new this.Repository(databasePath);
+    try {
+      verifier.checkpointForMigration();
+    } finally {
+      verifier.close();
+    }
   }
 
   async _rewriteRecoverySidecars({ sourceRecordings, targetRecordings, migrationId, token }) {
@@ -214,6 +264,15 @@ class DataRootRelocator {
       }
     } finally {
       await handle?.close();
+    }
+  }
+
+  async _fsyncFile(filePath) {
+    const handle = await this.fs.open(filePath, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
     }
   }
 }

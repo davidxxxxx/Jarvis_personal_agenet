@@ -5,7 +5,7 @@ class MigrationCoordinator {
     if (!Array.isArray(providers)) throw new TypeError("providers must be an array");
     if (
       !writeGate ||
-      ["assertProducerAllowed", "close", "open", "waitForIdle"].some(
+      ["assertProducerAllowed", "close", "open", "waitForIdle", "runPrivilegedResume"].some(
         (method) => typeof writeGate[method] !== "function"
       )
     ) {
@@ -47,6 +47,8 @@ class MigrationCoordinator {
     this.writeGate.close();
     const providers = [...this.providers];
     let rollbackComplete = false;
+    let committedRoot = null;
+    let keepWriteGateClosed = false;
     const rollbackProviders = async (root) => {
       if (rollbackComplete) return;
       const errors = [];
@@ -68,6 +70,15 @@ class MigrationCoordinator {
         }
       },
       rollback: rollbackProviders,
+      commit: (root) => {
+        if (typeof root !== "string" || root.length === 0) {
+          throw new TypeError("committed migration root is required");
+        }
+        committedRoot = root;
+      },
+      failClosed: () => {
+        keepWriteGateClosed = true;
+      },
     };
 
     let result;
@@ -79,26 +90,39 @@ class MigrationCoordinator {
       result = await operation(lease);
     } catch (error) {
       operationError = error;
-      try {
-        await rollbackProviders(previousRoot);
-      } catch (rollbackError) {
-        operationError = new AggregateError(
-          [operationError, rollbackError],
-          "migration operation and rollback failed"
-        );
+      if (committedRoot !== null) {
+        keepWriteGateClosed = true;
+      } else {
+        try {
+          await rollbackProviders(previousRoot);
+        } catch (rollbackError) {
+          keepWriteGateClosed = true;
+          operationError = new AggregateError(
+            [operationError, rollbackError],
+            "migration operation and rollback failed"
+          );
+        }
       }
     }
 
     const resumeErrors = [];
-    for (const provider of [...providers].reverse()) {
-      try {
-        await provider.resume();
-      } catch (error) {
-        resumeErrors.push(error);
-      }
+    try {
+      await this.writeGate.runPrivilegedResume(async () => {
+        for (const provider of [...providers].reverse()) {
+          try {
+            await provider.resume();
+          } catch (error) {
+            resumeErrors.push(error);
+          }
+        }
+      });
+    } catch (error) {
+      resumeErrors.push(error);
     }
-    this.writeGate.open();
     this.active = false;
+    if (resumeErrors.length === 0 && !keepWriteGateClosed) {
+      this.writeGate.open();
+    }
     if (resumeErrors.length > 0) {
       if (operationError) resumeErrors.unshift(operationError);
       throw new AggregateError(resumeErrors, "migration provider resume failed");

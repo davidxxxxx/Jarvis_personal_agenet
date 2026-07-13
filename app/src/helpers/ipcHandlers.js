@@ -20,6 +20,7 @@ const {
   createBoundedRecoveryBuffer,
   createMeetingRecoveryLoop,
 } = require("./meetingRecoveryLoop");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 // Tinfoil's only realtime STT model — fallback when the renderer omits one.
 const TINFOIL_REALTIME_MODEL = "voxtral-mini-4b-realtime";
@@ -4271,14 +4272,21 @@ class IPCHandlers {
       const diarizationPcmPath = meetingDiarizationPath;
       const diarizationSegments = meetingDiarizationSegments;
       const diarizationStartedAt = meetingDiarizationStartedAt;
+      const diarizationLeaseRelease = meetingDiarizationLeaseRelease;
       if (meetingDiarizationStream) {
         await new Promise((resolve) => meetingDiarizationStream.end(resolve));
         meetingDiarizationStream = null;
       }
       meetingDiarizationPath = null;
       meetingDiarizationStartedAt = null;
+      meetingDiarizationLeaseRelease = null;
       meetingDiarizationSegments = [];
-      return { diarizationPcmPath, diarizationSegments, diarizationStartedAt };
+      return {
+        diarizationPcmPath,
+        diarizationSegments,
+        diarizationStartedAt,
+        diarizationLeaseRelease,
+      };
     };
 
     const attachMeetingStreamingHandlers = (streaming, win, source) => {
@@ -4649,6 +4657,7 @@ class IPCHandlers {
     let meetingDiarizationStream = null;
     let meetingDiarizationPath = null;
     let meetingDiarizationStartedAt = null;
+    let meetingDiarizationLeaseRelease = null;
     let meetingDiarizationSegments = [];
     let meetingLiveSpeakerActive = false;
     let meetingLiveSpeakerState = null;
@@ -5381,14 +5390,21 @@ class IPCHandlers {
       meetingNoteId = null;
       meetingLocalMode = false;
       meetingLocalBuffers = { mic: [], system: [] };
-      if (meetingDiarizationStream) {
-        meetingDiarizationStream.end();
-        meetingDiarizationStream = null;
-      }
-      if (meetingDiarizationPath) {
-        fs.unlink(meetingDiarizationPath, () => {});
-        meetingDiarizationPath = null;
-      }
+      const diarizationStream = meetingDiarizationStream;
+      const diarizationPath = meetingDiarizationPath;
+      const diarizationLeaseRelease = meetingDiarizationLeaseRelease;
+      meetingDiarizationStream = null;
+      meetingDiarizationPath = null;
+      meetingDiarizationLeaseRelease = null;
+      const cleanupDiarizationCapture = () => {
+        if (diarizationPath) {
+          fs.unlink(diarizationPath, () => diarizationLeaseRelease?.());
+        } else {
+          diarizationLeaseRelease?.();
+        }
+      };
+      if (diarizationStream) diarizationStream.end(cleanupDiarizationCapture);
+      else cleanupDiarizationCapture();
       meetingDiarizationStartedAt = null;
       meetingDiarizationSegments = [];
       meetingLocalWin = null;
@@ -6002,9 +6018,16 @@ class IPCHandlers {
 
     const writeMeetingDiarizationPcm = (buffer, receivedAt) => {
       if (!meetingDiarizationStream) {
-        meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
-        meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
-        meetingDiarizationStartedAt = receivedAt;
+        const release = processWriteGate.acquireWriteLease("diarization-capture-temp-audio");
+        try {
+          meetingDiarizationPath = path.join(os.tmpdir(), `ow-diarize-raw-${Date.now()}.pcm`);
+          meetingDiarizationStream = fs.createWriteStream(meetingDiarizationPath);
+          meetingDiarizationStartedAt = receivedAt;
+          meetingDiarizationLeaseRelease = release;
+        } catch (error) {
+          release();
+          throw error;
+        }
       }
       meetingDiarizationStream.write(buffer);
     };
@@ -6752,7 +6775,12 @@ class IPCHandlers {
           }
           flushPendingMicFinals(true);
           await waitForPendingMeetingCorrections();
-          const { diarizationPcmPath, diarizationSegments, diarizationStartedAt } =
+          const {
+            diarizationPcmPath,
+            diarizationSegments,
+            diarizationStartedAt,
+            diarizationLeaseRelease,
+          } =
             await captureMeetingDiarizationState();
           const transcript =
             diarizationSegments
@@ -6773,7 +6801,8 @@ class IPCHandlers {
             diarizationWin,
             liveSpeakerState,
             sessionSpeakerConfigSnapshot,
-            noteIdSnapshot
+            noteIdSnapshot,
+            diarizationLeaseRelease
           );
 
           const finalSegments = diarizationSegments.map(
@@ -6788,7 +6817,12 @@ class IPCHandlers {
         }
 
         const results = await disconnectMeetingStreaming({ flushPending: true });
-        const { diarizationPcmPath, diarizationSegments, diarizationStartedAt } =
+        const {
+          diarizationPcmPath,
+          diarizationSegments,
+          diarizationStartedAt,
+          diarizationLeaseRelease,
+        } =
           await captureMeetingDiarizationState();
         const transcript =
           diarizationSegments
@@ -6809,7 +6843,8 @@ class IPCHandlers {
           diarizationWin,
           liveSpeakerState,
           sessionSpeakerConfigSnapshot,
-          noteIdSnapshot
+          noteIdSnapshot,
+          diarizationLeaseRelease
         );
 
         const finalSegments = diarizationSegments.map(
@@ -9331,7 +9366,8 @@ class IPCHandlers {
     win,
     liveSpeakerState = null,
     sessionConfig = null,
-    noteId = null
+    noteId = null,
+    diarizationLeaseRelease = null
   ) {
     const send = (payload) => {
       if (win && !win.isDestroyed()) {
@@ -9340,8 +9376,19 @@ class IPCHandlers {
     };
 
     const diarizationEnabled = (sessionConfig?.enabled ?? this.speakerDiarizationEnabled) !== false;
+    let releaseCaptureLease = diarizationLeaseRelease;
+    const cleanupRawCapture = () => {
+      if (rawPcmPath) {
+        try {
+          fs.unlinkSync(rawPcmPath);
+        } catch (_) {}
+      }
+      releaseCaptureLease?.();
+      releaseCaptureLease = null;
+    };
 
     if (!diarizationEnabled || !this.diarizationManager?.isAvailable() || !rawPcmPath) {
+      cleanupRawCapture();
       send({
         segments: transcriptSegments.map((segment, index) => ({
           ...segment,
@@ -9351,9 +9398,7 @@ class IPCHandlers {
       return;
     }
 
-    const fs = require("fs");
-
-    (async () => {
+    void (async () => {
       let tmpWav = null;
       try {
         tmpWav = await this.diarizationManager.convertRawPcmToWav(rawPcmPath, 24000);
@@ -9516,9 +9561,7 @@ class IPCHandlers {
         debugLogger.warn("Background diarization failed", { error: err.message });
         send({ segments: [] });
       } finally {
-        try {
-          fs.unlinkSync(rawPcmPath);
-        } catch (_) {}
+        cleanupRawCapture();
         if (tmpWav) {
           try {
             fs.unlinkSync(tmpWav);

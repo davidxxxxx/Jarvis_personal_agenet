@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { createBoundedRecoveryBuffer } = require("../../src/helpers/meetingRecoveryLoop");
+const { processWriteGate } = require("../../src/jarvis/main/UnifiedRootWriteGate");
 
 function createDeferred() {
   let resolve;
@@ -51,6 +52,8 @@ function createFixture({
   realtimeConnectDeferred = null,
   systemAvailable = false,
   aecAvailable = false,
+  diarizationManager = null,
+  speakerDiarizationEnabled = false,
 } = {}) {
   const handles = new Map();
   const listeners = new Map();
@@ -233,7 +236,7 @@ function createFixture({
       },
     },
     parakeetManager: {},
-    diarizationManager: null,
+    diarizationManager,
     windowManager: { controlPanelWindow: win },
     meetingDetectionEngine: {
       setUserRecording: (value) => detectionStates.push(value),
@@ -254,7 +257,7 @@ function createFixture({
           },
         }
       : null,
-    speakerDiarizationEnabled: false,
+    speakerDiarizationEnabled,
     activeMeetingSpeakerConfig: null,
     whisperVadSettings: {},
     _meetingMicStreaming: warmStreaming ? createWarmStreaming("mic") : null,
@@ -339,6 +342,53 @@ test("bounded recovery buffer rejects invalid or oversized input before copying"
   assert.doesNotThrow(() => assert.equal(buffer.push({ byteLength: 1 }), false));
   assert.equal(buffer.byteLength, 0);
   assert.equal(buffer.length, 0);
+});
+
+test("meeting diarization holds capture-time write authority through raw PCM cleanup", async (t) => {
+  const conversion = createDeferred();
+  let rawPcmPath = null;
+  const fixture = createFixture({
+    diarizationManager: {
+      isAvailable: () => true,
+      async convertRawPcmToWav(candidate) {
+        rawPcmPath = candidate;
+        await conversion.promise;
+        throw new Error("fixture conversion stop");
+      },
+    },
+    speakerDiarizationEnabled: true,
+  });
+  t.after(async () => {
+    conversion.resolve();
+    processWriteGate.open();
+    await fixture.cleanup();
+  });
+  processWriteGate.open();
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "diarization-test" }
+  );
+  send({ sender: fixture.sender }, Buffer.from([1, 2, 3, 4]), "mic", started.inputGeneration);
+  processWriteGate.close();
+  let drained = false;
+  const idle = processWriteGate.waitForIdle().then(() => {
+    drained = true;
+  });
+  await stop({ sender: fixture.sender });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(drained, false);
+  assert.ok(rawPcmPath);
+  assert.equal(fs.existsSync(rawPcmPath), true);
+
+  conversion.resolve();
+  await idle;
+  assert.equal(fs.existsSync(rawPcmPath), false);
+  processWriteGate.open();
 });
 
 test("explicit stop supersedes a pending realtime prepare before its late connection can stay warm", async (t) => {

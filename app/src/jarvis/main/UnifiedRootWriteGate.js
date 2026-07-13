@@ -9,19 +9,20 @@ class UnifiedRootWriteGate {
   }
 
   assertProducerAllowed() {
-    if (!this.closed || this.context.getStore()?.gate === this) return;
+    const token = this.context.getStore();
+    if (!this.closed || (token?.gate === this && token.active === true)) return;
     const error = new Error("storage migration in progress");
     error.code = "STORAGE_MIGRATION_IN_PROGRESS";
     throw error;
   }
 
-  acquireWriteLease() {
+  acquireWriteLease(label = "write") {
     this.assertProducerAllowed();
     this.leases += 1;
-    let released = false;
+    const token = { gate: this, label, active: true, privileged: false };
     return () => {
-      if (released) return;
-      released = true;
+      if (!token.active) return;
+      token.active = false;
       this.leases -= 1;
       if (this.leases === 0) {
         const waiters = this.idleWaiters.splice(0);
@@ -32,12 +33,34 @@ class UnifiedRootWriteGate {
 
   runWithWriteLease(label, operation) {
     if (typeof operation !== "function") throw new TypeError("write operation is required");
-    const release = this.acquireWriteLease(label);
-    return this.context.run({ gate: this, label }, async () => {
+    this.assertProducerAllowed();
+    this.leases += 1;
+    const token = { gate: this, label, active: true, privileged: false };
+    return this.context.run(token, async () => {
       try {
         return await operation();
       } finally {
-        release();
+        if (token.active) {
+          token.active = false;
+          this.leases -= 1;
+          if (this.leases === 0) {
+            const waiters = this.idleWaiters.splice(0);
+            for (const resolve of waiters) resolve();
+          }
+        }
+      }
+    });
+  }
+
+  runPrivilegedResume(operation) {
+    if (typeof operation !== "function") throw new TypeError("resume operation is required");
+    if (!this.closed) throw new Error("privileged resume requires a closed migration gate");
+    const token = { gate: this, label: "migration-resume", active: true, privileged: true };
+    return this.context.run(token, async () => {
+      try {
+        return await operation();
+      } finally {
+        token.active = false;
       }
     });
   }

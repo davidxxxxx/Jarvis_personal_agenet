@@ -91,6 +91,25 @@ test("Windows volume identity is derived from the resolved final path, GUID, and
   assert.deepEqual(seen, ["D:\\resolved\\target"]);
 });
 
+test("Linux and Darwin volume identity comes from stat.dev rather than the path", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-posix-volume-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const left = path.join(base, "left");
+  const right = path.join(base, "right");
+  await fsp.mkdir(left);
+  await fsp.mkdir(right);
+  const expectedDev = String((await fsp.lstat(base)).dev);
+
+  for (const platform of ["linux", "darwin"]) {
+    const inspector = new DefaultVolumeInspector({ platform, fsImpl: fsp });
+    const leftResult = await inspector.inspect(path.join(left, "not-created-yet"));
+    const rightResult = await inspector.inspect(right);
+    assert.equal(leftResult.identity, `device:${expectedDev}`);
+    assert.equal(rightResult.identity, leftResult.identity);
+    assert.equal(leftResult.finalPath, await fsp.realpath(left));
+  }
+});
+
 test("production Windows inspector rejects a real junction when creation is available", async (t) => {
   if (process.platform !== "win32") return t.skip("Windows-only junction check");
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-real-junction-"));

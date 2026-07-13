@@ -3,11 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const debugLogger = require("./debugLogger");
-const { killProcess } = require("../utils/process");
-const { isPortAvailable } = require("../utils/serverUtils");
+const { gracefulStopProcess, isPortAvailable } = require("../utils/serverUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const { app } = require("electron");
 const sidecarPidFile = require("./sidecarPidFile");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 // Range kept clear of cliBridge (8200-8219) to avoid port-bind collisions.
 const PORT_RANGE_START = 8221;
@@ -21,7 +21,9 @@ const HEALTH_CHECK_FAILURE_THRESHOLD = 3;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 class LlamaServerManager {
-  constructor() {
+  constructor({ spawnImpl = spawn } = {}) {
+    if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
+    this.spawnImpl = spawnImpl;
     this.process = null;
     this.port = null;
     this.ready = false;
@@ -32,6 +34,7 @@ class LlamaServerManager {
     this.cachedServerBinaryPaths = null;
     this.activeBackend = null;
     this.idleTimer = null;
+    this.tempLifecycleRelease = null;
   }
 
   getServerBinaryPaths() {
@@ -225,13 +228,23 @@ class LlamaServerManager {
     return new Promise((resolve, reject) => {
       debugLogger.debug("Spawning llama-server", { binary: binaryPath, port: this.port, args });
 
-      this.process = spawn(binaryPath, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-        cwd: getSafeTempDir(),
-        env,
-        detached: process.platform !== "win32",
-      });
+      const tempDir = getSafeTempDir();
+      this.tempLifecycleRelease = processWriteGate.acquireWriteLease(
+        "llama-native-temp-lifecycle"
+      );
+      try {
+        this.process = this.spawnImpl(binaryPath, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          cwd: tempDir,
+          env,
+          detached: process.platform !== "win32",
+        });
+      } catch (error) {
+        this._releaseTempLifecycle();
+        reject(error);
+        return;
+      }
       sidecarPidFile.write("llama", this.process.pid);
 
       let stderrBuffer = "";
@@ -268,6 +281,7 @@ class LlamaServerManager {
         this.process = null;
         this.stopHealthCheck();
         sidecarPidFile.clear("llama");
+        this._releaseTempLifecycle();
       });
 
       const getProcessInfo = () => ({ stderr: stderrBuffer, exitCode, exitSignal });
@@ -330,28 +344,13 @@ class LlamaServerManager {
     this.stopHealthCheck();
 
     try {
-      killProcess(this.process, "SIGTERM");
-      await new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          if (this.process) killProcess(this.process, "SIGKILL");
-          resolve();
-        }, 5000);
-
-        if (this.process) {
-          this.process.once("close", () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        } else {
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
+      await gracefulStopProcess(this.process);
     } catch (error) {
       debugLogger.error("Error killing llama-server process", { error: error.message });
+      this.ready = false;
+      throw error;
     }
 
-    this.process = null;
     this.ready = false;
   }
 
@@ -515,41 +514,29 @@ class LlamaServerManager {
 
     if (!this.process) {
       this.ready = false;
+      this._releaseTempLifecycle();
       return;
     }
 
     debugLogger.debug("Stopping llama-server");
 
     try {
-      killProcess(this.process, "SIGTERM");
-
-      await new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          if (this.process) {
-            killProcess(this.process, "SIGKILL");
-          }
-          resolve();
-        }, 5000);
-
-        if (this.process) {
-          this.process.once("close", () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        } else {
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
+      await gracefulStopProcess(this.process);
     } catch (error) {
       debugLogger.error("Error stopping llama-server", { error: error.message });
+      this.ready = false;
+      throw error;
     }
 
-    this.process = null;
     this.ready = false;
     this.port = null;
     this.modelPath = null;
     this.activeBackend = null;
+  }
+
+  _releaseTempLifecycle() {
+    this.tempLifecycleRelease?.();
+    this.tempLifecycleRelease = null;
   }
 
   getStatus() {

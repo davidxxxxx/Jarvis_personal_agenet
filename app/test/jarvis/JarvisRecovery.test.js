@@ -109,5 +109,7 @@ test("main registers runtime and production composition providers without option
   assert.match(composition, /whisperManager/);
   assert.match(composition, /parakeetManager/);
   assert.match(composition, /diarizationManager/);
+  assert.match(composition, /modelManagerBridge/);
+  assert.match(mainSource, /whisperCudaManager\?\.resetDataRoot\?\.\(\)/);
   assert.match(mainSource, /storageComposition\.registerWriterProvider\(\)/);
 });

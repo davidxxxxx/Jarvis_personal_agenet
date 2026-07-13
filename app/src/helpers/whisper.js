@@ -622,7 +622,20 @@ class WhisperManager {
     };
   }
 
-  async deleteWhisperModel(modelName) {
+  deleteWhisperModel(modelName) {
+    return processWriteGate.runWithWriteLease("whisper-model-delete", () =>
+      this._deleteWhisperModel(modelName)
+    );
+  }
+
+  async quiesce() {
+    await this.cancelDownload();
+    await this.stopServer();
+  }
+
+  async resume() {}
+
+  async _deleteWhisperModel(modelName) {
     const modelPath = this.getModelPath(modelName);
 
     if (fs.existsSync(modelPath)) {
@@ -640,7 +653,13 @@ class WhisperManager {
     return { model: modelName, deleted: false, error: "Model not found", success: false };
   }
 
-  async deleteAllWhisperModels() {
+  deleteAllWhisperModels() {
+    return processWriteGate.runWithWriteLease("whisper-model-delete-all", () =>
+      this._deleteAllWhisperModels()
+    );
+  }
+
+  async _deleteAllWhisperModels() {
     const modelsDir = this.getModelsDir();
     let totalFreed = 0;
     let deletedCount = 0;

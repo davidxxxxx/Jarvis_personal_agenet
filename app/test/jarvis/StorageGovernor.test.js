@@ -1,4 +1,7 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 
 const StorageGovernor = require("../../src/jarvis/main/StorageGovernor");
@@ -42,7 +45,10 @@ test("releases the injectable emergency reserve at stop and exposes stopped publ
   const governor = new StorageGovernor({
     reserve: {
       ensure: () => calls.push("ensure"),
-      release: () => calls.push("release"),
+      release: () => {
+        calls.push("release");
+        return true;
+      },
     },
   });
 
@@ -77,6 +83,20 @@ test("fails safe when the emergency reserve cannot be prepared or released", () 
     () => releaseFailure.inspect({ volumeBytes: 100 * GIB, freeBytes: 4 * GIB }),
     /emergency storage reserve could not be released/
   );
+
+  const missingReserve = new StorageGovernor({
+    reserve: {
+      ensure() {},
+      release() {
+        return false;
+      },
+    },
+  });
+  assert.throws(
+    () => missingReserve.inspect({ volumeBytes: 100 * GIB, freeBytes: 4 * GIB }),
+    /emergency storage reserve could not be released/
+  );
+  assert.equal(missingReserve.reserveReleased, false);
 });
 
 test("reserve rejects a same-size linked, sparse, compressed, or under-allocated file", () => {
@@ -135,6 +155,59 @@ test("reserve rejects a hard-linked file even when size and allocation are valid
   });
 
   assert.throws(() => reserve.ensure(), /emergency reserve file is unsafe/);
+});
+
+test("reserve quarantine release preserves a replacement raced in after handle verification", (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-release-race-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const filePath = path.join(base, ".emergency-reserve");
+  const originalPath = path.join(base, "original-reserve");
+  fs.writeFileSync(filePath, "reserved");
+  let injected = false;
+  const fsImpl = Object.create(fs);
+  fsImpl.renameSync = (source, target) => {
+    if (!injected && source === filePath) {
+      injected = true;
+      fs.renameSync(filePath, originalPath);
+      fs.writeFileSync(filePath, "foreign!");
+    }
+    return fs.renameSync(source, target);
+  };
+  const reserve = new StorageGovernor.FileEmergencyReserve({
+    filePath,
+    sizeBytes: 8,
+    fsImpl,
+    allocationInspector: {
+      inspect: () => ({
+        allocatedBytes: 8,
+        reparse: false,
+        sparse: false,
+        compressed: false,
+      }),
+    },
+    freeSpaceInspector: { inspect: () => 1_000_000 },
+  });
+
+  assert.throws(() => reserve.release(), /emergency reserve file is unsafe/);
+  assert.equal(fs.readFileSync(filePath, "utf8"), "foreign!");
+  assert.equal(fs.readFileSync(originalPath, "utf8"), "reserved");
+});
+
+test("production reserve verifies real allocation and the released-free-space adapter", (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-real-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const filePath = path.join(base, ".emergency-reserve");
+  const freeSpace = [1_000_000, 1_000_000 + 1024 * 1024];
+  const reserve = new StorageGovernor.FileEmergencyReserve({
+    filePath,
+    sizeBytes: 1024 * 1024,
+    freeSpaceInspector: { inspect: () => freeSpace.shift() },
+  });
+
+  reserve.ensure();
+  assert.equal(fs.statSync(filePath).size, 1024 * 1024);
+  assert.equal(reserve.release(), true);
+  assert.equal(fs.existsSync(filePath), false);
 });
 
 test("rejects invalid or unsafe numeric inputs", () => {

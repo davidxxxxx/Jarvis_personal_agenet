@@ -213,10 +213,24 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
   await fsp.cp(oldRoot, newRoot, { recursive: true, errorOnExist: true, force: false });
   t.after(() => fsp.rm(base, { recursive: true, force: true }));
 
-  const result = await new DataRootRelocator().relocate({ oldRoot, newRoot });
+  const migrationId = `migration_${"1".repeat(32)}`;
+  const token = "2".repeat(64);
+  const result = await new DataRootRelocator().relocate({
+    oldRoot,
+    newRoot,
+    migrationId,
+    token,
+  });
   await fsp.rm(oldRoot, { recursive: true, force: true });
 
   assert.deepEqual(result, { databaseLocators: 1, recoverySidecars: 1 });
+  const workDatabase = path.join(
+    newRoot,
+    `.jarvis-relocate-${migrationId}-${token}.db`
+  );
+  assert.equal(fs.existsSync(workDatabase), false);
+  assert.equal(fs.existsSync(`${workDatabase}-wal`), false);
+  assert.equal(fs.existsSync(`${workDatabase}-shm`), false);
   const migrated = new JarvisRepository(path.join(newRoot, "jarvis.db"));
   const migratedChunk = migrated.getAudioChunk("c1");
   assert.equal(migratedChunk.path, newWav);

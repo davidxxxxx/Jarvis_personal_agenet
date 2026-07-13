@@ -577,7 +577,20 @@ class DiarizationManager {
     return header;
   }
 
-  async deleteModels() {
+  deleteModels() {
+    return processWriteGate.runWithWriteLease("diarization-model-delete", () =>
+      this._deleteModels()
+    );
+  }
+
+  async quiesce() {
+    await this.cancelDownload();
+    await this.shutdown();
+  }
+
+  async resume() {}
+
+  async _deleteModels() {
     const modelsDir = this.getModelsDir();
     const segDir = path.join(modelsDir, SEGMENTATION_DIR);
     const embPath = path.join(modelsDir, EMBEDDING_ONNX);

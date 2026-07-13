@@ -11,6 +11,7 @@ const {
 } = require("./ffmpegUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const ParakeetWsServer = require("./parakeetWsServer");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SAMPLE = 4; // float32
@@ -82,7 +83,13 @@ class ParakeetServerManager {
     return { wavBuffer, filesToCleanup: [tempInputPath, tempWavPath] };
   }
 
-  async transcribe(audioBuffer, options = {}) {
+  transcribe(audioBuffer, options = {}) {
+    return processWriteGate.runWithWriteLease("parakeet-temp-audio", () =>
+      this._transcribeWithLease(audioBuffer, options)
+    );
+  }
+
+  async _transcribeWithLease(audioBuffer, options = {}) {
     const { modelName = "parakeet-tdt-0.6b-v3" } = options;
 
     const modelDir = path.join(this.getModelsDir(), modelName);

@@ -128,12 +128,16 @@ class DefaultVolumeInspector {
   async inspect(candidate) {
     try {
       let existing = path.resolve(candidate);
+      let existingStat = null;
       while (true) {
         const stat = await this.fs.lstat(existing).catch((error) => {
           if (error?.code === "ENOENT") return null;
           throw error;
         });
-        if (stat) break;
+        if (stat) {
+          existingStat = stat;
+          break;
+        }
         const parent = path.dirname(existing);
         if (parent === existing) throw new Error("no existing target ancestor");
         existing = parent;
@@ -141,7 +145,15 @@ class DefaultVolumeInspector {
       const finalPath = await this.fs.realpath(existing);
       await this.fs.access(existing, fs.constants?.W_OK ?? 2);
       if (this.platform !== "win32") {
-        return { kind: "fixed", writable: true, identity: `device:${finalPath}`, finalPath };
+        if (!existingStat || !Number.isSafeInteger(Number(existingStat.dev))) {
+          throw new Error("device identity unavailable");
+        }
+        return {
+          kind: "fixed",
+          writable: true,
+          identity: `device:${String(existingStat.dev)}`,
+          finalPath,
+        };
       }
       if (/^\\\\/.test(finalPath)) return { kind: "network", writable: false };
       const metadata = normalizeMetadata(await this.metadataProvider(finalPath));

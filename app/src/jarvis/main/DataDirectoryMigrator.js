@@ -4,12 +4,15 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const MigrationCoordinator = require("./MigrationCoordinator");
+const { DirectoryLeaseProvider } = require("./DirectoryLease");
+const { releaseReserve } = require("./SafeReserveFile");
 const {
   DefaultPathInspector,
   DefaultVolumeInspector,
 } = require("./StoragePathInspector");
 
-const MANIFEST_VERSION = 2;
+const MANIFEST_VERSION = 3;
+const OWNERSHIP_MARKER = ".jarvis-migration-owner";
 
 function isWithin(parent, candidate) {
   const relative = path.relative(parent, candidate);
@@ -48,6 +51,8 @@ class DataDirectoryMigrator {
     journalRoot = null,
     pathInspector = new DefaultPathInspector(),
     directoryIdentityProvider = null,
+    directoryLeaseProvider = new DirectoryLeaseProvider({ fsImpl }),
+    faultInjector = async () => {},
   } = {}) {
     if (!fsImpl || typeof fsImpl.lstat !== "function" || typeof fsImpl.copyFile !== "function") {
       throw new TypeError("fsImpl must provide promise-based file operations");
@@ -103,6 +108,12 @@ class DataDirectoryMigrator {
     }
     this.directoryIdentityProvider =
       directoryIdentityProvider ?? ((directory) => this._captureDirectoryIdentity(directory));
+    if (!directoryLeaseProvider || typeof directoryLeaseProvider.acquire !== "function") {
+      throw new TypeError("directoryLeaseProvider.acquire is required");
+    }
+    this.directoryLeaseProvider = directoryLeaseProvider;
+    if (typeof faultInjector !== "function") throw new TypeError("faultInjector must be a function");
+    this.faultInjector = faultInjector;
     if (
       migrationCoordinator !== null &&
       (!migrationCoordinator ||
@@ -136,6 +147,11 @@ class DataDirectoryMigrator {
       const target = this._safeAbsolute(to, "destination");
       return await this.migrationCoordinator.runExclusive(async (lease) => {
       const targetVolume = await this._validateRoots(source, target);
+      const sourceLease = await this.directoryLeaseProvider.acquire(source);
+      let targetLease = null;
+      let parentLease = null;
+      try {
+      await this._assertLeaseCurrent(sourceLease);
       await this._assertDirectoryIdentity(targetVolume.anchor);
       this._throwIfAborted(signal);
 
@@ -147,36 +163,75 @@ class DataDirectoryMigrator {
         .digest("hex");
       const manifestPath = path.join(this.journalRoot, `${migrationKey}.json`);
       let manifest = await this._loadManifest(manifestPath);
-      if (manifest) this._validateManifest(manifest, source, target, entries, targetVolume);
-      else {
-        manifest = {
+      const pendingManifest =
+        manifest ??
+        {
           version: MANIFEST_VERSION,
           migrationId: `migration_${crypto.randomUUID().replaceAll("-", "")}`,
           token: crypto.randomBytes(32).toString("hex"),
-          sourceId: crypto.createHash("sha256").update(source).digest("hex"),
-          targetId: crypto.createHash("sha256").update(target).digest("hex"),
+          sourceIdentity: sourceLease.identity,
+          targetIdentity: null,
           targetVolumeIdentity: targetVolume.identity ?? null,
           phase: "copying",
           files: entries.map((entry) => ({ ...entry, copied: false })),
         };
+      const targetExists = await this._exists(target);
+      let markedTargetIdentity = null;
+      if (!targetExists) {
+        parentLease = await this.directoryLeaseProvider.acquire(targetVolume.anchorPath);
+        await this._assertLeaseCurrent(parentLease);
+        await this._createMissingTarget(targetVolume.anchorPath, target);
+      }
+      if (manifest === null) {
+        if (!(await this._isEmptyDirectory(target))) throw new Error("destination is unsafe");
+        await this._ensureOwnershipMarker(target, pendingManifest, { allowCreate: true });
+        markedTargetIdentity = await this.directoryIdentityProvider(target);
+      }
+      targetLease = await this.directoryLeaseProvider.acquire(target);
+      await this._assertLeaseCurrent(targetLease);
+      if (markedTargetIdentity !== null) {
+        await this._assertDirectoryIdentity(markedTargetIdentity);
+      }
+      await this._assertSameVolume(target, targetVolume);
+      if (manifest) {
+        this._validateManifest(
+          manifest,
+          source,
+          target,
+          entries,
+          targetVolume,
+          sourceLease,
+          targetLease
+        );
+      } else {
+        manifest = {
+          ...pendingManifest,
+          targetIdentity: targetLease.identity,
+        };
+        await this._ensureOwnershipMarker(target, manifest);
         await this._writeManifest(manifestPath, manifest);
       }
-      const staging = path.join(
-        path.dirname(target),
-        `.jarvis-migration-${manifest.migrationId}-${manifest.token.slice(0, 16)}`
-      );
+      if (manifest.phase === "copying") {
+        await this._ensureOwnershipMarker(target, manifest);
+        await this._assertExactTree(
+          target,
+          manifest.files.filter((entry) => entry.copied),
+          new Set([OWNERSHIP_MARKER])
+        );
+      } else {
+        await this._removeOwnershipMarker(target, manifest, { required: false });
+      }
+      await parentLease?.release();
+      parentLease = null;
 
-      const targetExists = await this._exists(target);
-      const targetIsEmpty = targetExists ? await this._isEmptyDirectory(target) : false;
-      let targetTreeIdentity = null;
-      if (!targetExists || (targetIsEmpty && manifest.phase === "copying")) {
-        const stagingIdentity = await this._ensureStaging(staging, manifest);
-        await this._assertSameVolume(staging, targetVolume);
+      if (manifest.phase === "copying") {
         let copiedThisRun = 0;
         for (const entry of manifest.files) {
           this._throwIfAborted(signal);
+          await this._assertLeaseCurrent(sourceLease);
+          await this._assertLeaseCurrent(targetLease);
           const sourceFile = this._inside(source, entry.relative);
-          const stagedFile = this._inside(staging, entry.relative);
+          const stagedFile = this._inside(target, entry.relative);
           if (entry.copied && (await this._verifiedFile(stagedFile, entry))) continue;
           await this.fs.mkdir(path.dirname(stagedFile), { recursive: true });
           await this.fs
@@ -210,7 +265,7 @@ class DataDirectoryMigrator {
           totalFiles: manifest.files.length,
         });
         for (const [index, entry] of manifest.files.entries()) {
-          if (!(await this._verifiedFile(this._inside(staging, entry.relative), entry))) {
+          if (!(await this._verifiedFile(this._inside(target, entry.relative), entry))) {
             throw new Error("migration verification failed");
           }
           this.onProgress({
@@ -221,13 +276,17 @@ class DataDirectoryMigrator {
         }
         manifest.phase = "verified";
         await this._writeManifest(manifestPath, manifest);
-        await this._assertExactTree(staging, manifest.files);
-        await this._assertDirectoryIdentity(stagingIdentity);
+        await this.faultInjector("copy-verified-before-marker-release", {
+          source,
+          target,
+          migrationId: manifest.migrationId,
+          token: manifest.token,
+        });
+        await this._removeOwnershipMarker(target, manifest);
+        await this._assertExactTree(target, manifest.files);
+        await this._assertLeaseCurrent(targetLease);
         await this._assertDirectoryIdentity(targetVolume.anchor);
-        if (targetIsEmpty) await this.fs.rmdir(target);
-        await this.fs.rename(staging, target);
         await this._assertSameVolume(target, targetVolume);
-        targetTreeIdentity = await this.directoryIdentityProvider(target);
       } else {
         if (!['verified', 'relocating', 'relocated', 'activated'].includes(manifest.phase)) {
           throw new Error("destination is unsafe");
@@ -253,7 +312,6 @@ class DataDirectoryMigrator {
             });
           }
         }
-        targetTreeIdentity = await this.directoryIdentityProvider(target);
       }
 
       if (manifest.phase === "activated") {
@@ -270,7 +328,8 @@ class DataDirectoryMigrator {
         await this._writeManifest(manifestPath, manifest);
       }
       if (manifest.phase === "relocating") {
-        await this._assertDirectoryIdentity(targetTreeIdentity);
+        await this._assertLeaseCurrent(sourceLease);
+        await this._assertLeaseCurrent(targetLease);
         await this._restoreTargetFromSource(source, target, manifest);
         await this.relocateTarget({
           oldRoot: source,
@@ -284,14 +343,15 @@ class DataDirectoryMigrator {
         await this._writeManifest(manifestPath, manifest);
       }
       if (manifest.phase !== "relocated") throw new Error("migration manifest is invalid");
-      await this._assertDirectoryIdentity(targetTreeIdentity);
+      await this._assertLeaseCurrent(sourceLease);
+      await this._assertLeaseCurrent(targetLease);
       const activationProof = {
         previous: source,
         target,
         migrationId: manifest.migrationId,
         token: manifest.token,
-        sourceIdentity: manifest.sourceId,
-        targetIdentity: manifest.targetVolumeIdentity ?? manifest.targetId,
+        sourceIdentity: sourceLease.identity,
+        targetIdentity: targetLease.identity,
         manifestPath,
         manifestSha256: await sha256(manifestPath, this.fs),
       };
@@ -312,6 +372,7 @@ class DataDirectoryMigrator {
         await lease.reopen(target, source);
         await this._releaseEmergencyReserve(source);
         await this.activationJournal.finalize(target);
+        lease.commit(target);
       } catch {
         try {
           this.onProgress({
@@ -350,6 +411,22 @@ class DataDirectoryMigrator {
         currentRoot: target,
         recoveryAction: "After verifying Jarvis data, delete the old data directory manually.",
       };
+      } finally {
+        const releases = [parentLease, targetLease, sourceLease]
+          .filter(Boolean)
+          .map(async (heldLease) => heldLease.release());
+        const results = await Promise.allSettled(releases);
+        const failures = results.filter((result) => result.status === "rejected");
+        if (failures.length > 0) {
+          // A leaked authoritative handle is more dangerous than preserving a pending return.
+          lease.failClosed();
+          // eslint-disable-next-line no-unsafe-finally
+          throw new AggregateError(
+            failures.map((result) => result.reason),
+            "directory lease release failed"
+          );
+        }
+      }
       }, { previousRoot: source });
     } finally {
       this.inProgress = false;
@@ -364,11 +441,23 @@ class DataDirectoryMigrator {
   }
 
   async validateActivationTarget(candidate, state) {
+    let sourceLease = null;
+    let targetLease = null;
     try {
       const target = this._safeAbsolute(candidate, "activation target");
       if (!state || typeof state !== "object" || state.target !== target) return false;
       if (!["persisted", "reopening"].includes(state.phase)) return false;
       const source = this._safeAbsolute(state.previous, "activation source");
+      sourceLease = await this.directoryLeaseProvider.acquire(source);
+      targetLease = await this.directoryLeaseProvider.acquire(target);
+      await this._assertLeaseCurrent(sourceLease);
+      await this._assertLeaseCurrent(targetLease);
+      if (
+        sourceLease.identity !== state.sourceIdentity ||
+        targetLease.identity !== state.targetIdentity
+      ) {
+        return false;
+      }
       const manifestPath = this._safeAbsolute(state.manifestPath, "activation manifest");
       if (
         manifestPath === this.journalRoot ||
@@ -391,10 +480,8 @@ class DataDirectoryMigrator {
         !["relocated", "activated"].includes(manifest.phase) ||
         manifest.migrationId !== state.migrationId ||
         manifest.token !== state.token ||
-        manifest.sourceId !== state.sourceIdentity ||
-        manifest.sourceId !== crypto.createHash("sha256").update(source).digest("hex") ||
-        manifest.targetId !== crypto.createHash("sha256").update(target).digest("hex") ||
-        (manifest.targetVolumeIdentity ?? manifest.targetId) !== state.targetIdentity ||
+        manifest.sourceIdentity !== state.sourceIdentity ||
+        manifest.targetIdentity !== state.targetIdentity ||
         !Array.isArray(manifest.files)
       ) {
         return false;
@@ -419,6 +506,10 @@ class DataDirectoryMigrator {
       return true;
     } catch {
       return false;
+    } finally {
+      await Promise.allSettled(
+        [targetLease, sourceLease].filter(Boolean).map((lease) => lease.release())
+      );
     }
   }
 
@@ -450,6 +541,7 @@ class DataDirectoryMigrator {
     }
     return {
       ...inspected,
+      anchorPath,
       anchor: await this.directoryIdentityProvider(anchorPath),
     };
   }
@@ -463,6 +555,9 @@ class DataDirectoryMigrator {
         this._throwIfAborted(signal);
         const relative = path.join(prefix, child.name);
         if (prefix === "" && child.name === ".emergency-reserve") continue;
+        if (prefix === "" && ["jarvis.db-wal", "jarvis.db-shm"].includes(child.name)) {
+          throw new Error("source contains active SQLite residue");
+        }
         const absolute = this._inside(root, relative);
         const stat = await this.fs.lstat(absolute);
         if (stat.isSymbolicLink()) throw new Error("source contains a link");
@@ -502,15 +597,23 @@ class DataDirectoryMigrator {
     }
   }
 
-  _validateManifest(manifest, source, target, entries, targetVolume) {
+  _validateManifest(
+    manifest,
+    source,
+    target,
+    entries,
+    targetVolume,
+    sourceLease,
+    targetLease
+  ) {
     if (
       manifest?.version !== MANIFEST_VERSION ||
       typeof manifest.migrationId !== "string" ||
       !/^migration_[0-9a-f]{32}$/.test(manifest.migrationId) ||
       typeof manifest.token !== "string" ||
       !/^[0-9a-f]{64}$/.test(manifest.token) ||
-      manifest.sourceId !== crypto.createHash("sha256").update(source).digest("hex") ||
-      manifest.targetId !== crypto.createHash("sha256").update(target).digest("hex") ||
+      manifest.sourceIdentity !== sourceLease.identity ||
+      manifest.targetIdentity !== targetLease.identity ||
       manifest.targetVolumeIdentity !== (targetVolume.identity ?? null) ||
       !Array.isArray(manifest.files) ||
       !["copying", "verified", "relocating", "relocated", "activated"].includes(manifest.phase) ||
@@ -576,7 +679,7 @@ class DataDirectoryMigrator {
         throw error;
       }
     }
-    await this._assertExactTree(target, files);
+    await this._assertNoUnexpectedTree(target, files, manifest);
     for (const entry of files) {
       if (!(await this._verifiedFile(this._inside(target, entry.relative), entry))) {
         throw new Error("migration verification failed");
@@ -649,29 +752,82 @@ class DataDirectoryMigrator {
     }
   }
 
-  async _ensureStaging(staging, manifest) {
-    const existing = await this.fs.lstat(staging).catch((error) => {
+  async _assertLeaseCurrent(lease) {
+    if (!lease || typeof lease.identity !== "string" || lease.identity.length === 0) {
+      throw new Error("directory lease identity unavailable");
+    }
+    if (typeof lease.assertCurrent === "function") await lease.assertCurrent();
+    else if (typeof lease.assertActive === "function") lease.assertActive();
+    else throw new Error("directory lease validation unavailable");
+  }
+
+  async _createMissingTarget(anchor, target) {
+    const relative = path.relative(anchor, target);
+    if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) {
+      throw new Error("destination is unsafe");
+    }
+    let cursor = anchor;
+    for (const component of relative.split(path.sep)) {
+      cursor = path.join(cursor, component);
+      await this.fs.mkdir(cursor, { recursive: false, mode: 0o700 });
+      const stat = await this.fs.lstat(cursor);
+      const inspected = await this.pathInspector.inspect(cursor, stat);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        inspected?.reparse ||
+        inspected?.mountPoint
+      ) {
+        throw new Error("destination is unsafe");
+      }
+    }
+  }
+
+  async _ensureOwnershipMarker(target, manifest, { allowCreate = false } = {}) {
+    const markerPath = this._inside(target, OWNERSHIP_MARKER);
+    const expected = `${manifest.migrationId}:${manifest.token}`;
+    const existing = await this.fs.lstat(markerPath).catch((error) => {
       if (error?.code === "ENOENT") return null;
       throw error;
     });
     if (existing === null) {
-      await this.fs.mkdir(staging, { recursive: false, mode: 0o700 });
+      if (
+        !allowCreate ||
+        manifest.files.some((entry) => entry.copied) ||
+        (await this.fs.readdir(target)).length !== 0
+      ) {
+        throw new Error("migration ownership marker is invalid");
+      }
+      const handle = await this.fs.open(markerPath, "wx", 0o600);
+      try {
+        await handle.writeFile(expected, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await this._fsyncDirectory(target);
+      return;
     }
-    const stat = await this.fs.lstat(staging);
-    const inspected = await this.pathInspector.inspect(staging, stat);
-    if (
-      !stat.isDirectory() ||
-      stat.isSymbolicLink() ||
-      inspected?.reparse ||
-      inspected?.mountPoint
-    ) {
-      throw new Error("migration staging tree is invalid");
+    if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1) {
+      throw new Error("migration ownership marker is invalid");
     }
-    await this._assertExactTree(
-      staging,
-      manifest.files.filter((entry) => entry.copied)
-    );
-    return this.directoryIdentityProvider(staging);
+    if ((await this.fs.readFile(markerPath, "utf8")) !== expected) {
+      throw new Error("migration ownership marker is invalid");
+    }
+  }
+
+  async _removeOwnershipMarker(target, manifest, { required = true } = {}) {
+    const markerPath = this._inside(target, OWNERSHIP_MARKER);
+    const expected = `${manifest.migrationId}:${manifest.token}`;
+    const actual = await this.fs.readFile(markerPath, "utf8").catch((error) => {
+      if (error?.code === "ENOENT" && !required) return null;
+      throw error;
+    });
+    if (actual === null) return false;
+    if (actual !== expected) throw new Error("migration ownership marker is invalid");
+    await this.fs.rm(markerPath, { force: false });
+    await this._fsyncDirectory(target);
+    return true;
   }
 
   async _captureDirectoryIdentity(directory) {
@@ -723,13 +879,14 @@ class DataDirectoryMigrator {
     }
   }
 
-  async _assertExactTree(root, expectedFiles) {
+  async _assertExactTree(root, expectedFiles, ignoredRootEntries = new Set()) {
     const expected = new Set(expectedFiles.map((entry) => path.normalize(entry.relative)));
     const actual = new Set();
     const walk = async (directory, prefix = "") => {
       const entries = await this.fs.readdir(directory, { withFileTypes: true });
       for (const entry of entries) {
         const relative = path.join(prefix, entry.name);
+        if (prefix === "" && ignoredRootEntries.has(entry.name)) continue;
         const absolute = this._inside(root, relative);
         const stat = await this.fs.lstat(absolute);
         const inspected = await this.pathInspector.inspect(absolute, stat);
@@ -796,13 +953,19 @@ class DataDirectoryMigrator {
               continue;
             }
           }
+          const workDatabase = `.jarvis-relocate-${manifest.migrationId}-${manifest.token}.db`;
+          const workKinds = new Map([
+            [workDatabase, "db"],
+            [`${workDatabase}-wal`, "wal"],
+            [`${workDatabase}-shm`, "shm"],
+          ]);
+          const workKind = workKinds.get(normalized);
           if (
-            expected.has("jarvis.db") &&
-            ["jarvis.db-wal", "jarvis.db-shm"].includes(normalized) &&
+            workKind &&
+            path.dirname(absolute) === path.resolve(root) &&
             (stat.nlink === undefined || stat.nlink === 1) &&
-            (await this._validSqliteResidue(absolute, normalized.endsWith("-wal") ? "wal" : "shm"))
+            (await this._validSqliteResidue(absolute, workKind))
           ) {
-            await this.fs.rm(absolute, { force: true });
             continue;
           }
         }
@@ -816,6 +979,17 @@ class DataDirectoryMigrator {
     const stat = await this.fs.lstat(filePath);
     if (!stat.isFile() || stat.isSymbolicLink()) return false;
     if (kind === "shm") return stat.size >= 32 * 1024 && stat.size % (32 * 1024) === 0;
+    if (kind === "db") {
+      if (stat.size < 100) return false;
+      const header = Buffer.alloc(16);
+      const handle = await this.fs.open(filePath, "r");
+      try {
+        const { bytesRead } = await handle.read(header, 0, header.length, 0);
+        return bytesRead === header.length && header.toString("binary") === "SQLite format 3\u0000";
+      } finally {
+        await handle.close();
+      }
+    }
     if (stat.size < 32) return false;
     const header = Buffer.alloc(32);
     const handle = await this.fs.open(filePath, "r");
@@ -851,12 +1025,21 @@ class DataDirectoryMigrator {
       throw error;
     });
     if (stat === null) return false;
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
-      throw new Error("emergency reserve file is unsafe");
-    }
-    await this.fs.rm(reservePath, { force: false });
-    await this._fsyncDirectory(root);
-    return true;
+    return releaseReserve({
+      filePath: reservePath,
+      sizeBytes: stat.size,
+      fsImpl: this.fs,
+      validate: async (_candidate, candidateStat) => {
+        if (
+          !candidateStat.isFile() ||
+          candidateStat.isSymbolicLink() ||
+          candidateStat.nlink !== 1 ||
+          candidateStat.size !== stat.size
+        ) {
+          throw new Error("emergency reserve file is unsafe");
+        }
+      },
+    });
   }
 
   async _assertSameVolume(candidate, expected) {

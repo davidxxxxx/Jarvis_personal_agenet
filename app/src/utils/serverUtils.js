@@ -53,25 +53,36 @@ function resolveBinaryPath(binaryName) {
   return null;
 }
 
-async function gracefulStopProcess(proc) {
-  killProcessGroup(proc, "SIGTERM");
-
-  await new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      if (proc) killProcessGroup(proc, "SIGKILL");
-      resolve();
-    }, GRACEFUL_STOP_TIMEOUT_MS);
-
-    if (proc) {
-      proc.once("close", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    } else {
+function waitForProcessClose(proc, timeoutMs) {
+  if (!proc || proc.exitCode !== null || proc.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (closed) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeout);
-      resolve();
-    }
+      proc.removeListener("close", onClose);
+      resolve(closed);
+    };
+    const onClose = () => finish(true);
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    proc.once("close", onClose);
   });
+}
+
+async function gracefulStopProcess(
+  proc,
+  {
+    gracefulTimeoutMs = GRACEFUL_STOP_TIMEOUT_MS,
+    forcedTimeoutMs = GRACEFUL_STOP_TIMEOUT_MS,
+  } = {}
+) {
+  if (!proc || proc.exitCode !== null || proc.signalCode != null) return;
+  killProcessGroup(proc, "SIGTERM");
+  if (await waitForProcessClose(proc, gracefulTimeoutMs)) return;
+  killProcessGroup(proc, "SIGKILL");
+  if (await waitForProcessClose(proc, forcedTimeoutMs)) return;
+  throw new Error("native process termination could not be confirmed");
 }
 
 module.exports = {

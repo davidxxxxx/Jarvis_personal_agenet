@@ -78,7 +78,7 @@ test("rolls every closed provider back in reverse order and does not open the ga
       events.push(`rollback:${name}`);
     },
     async resume() {
-      assert.throws(() => coordinator.assertProducerAllowed("resume-check"));
+      assert.doesNotThrow(() => coordinator.assertProducerAllowed("resume-check"));
       events.push(`resume:${name}`);
     },
   });
@@ -141,4 +141,81 @@ test("rolls closed providers back when copying fails before reopen", async () =>
     /copy interrupted/
   );
   assert.deepEqual(events, ["quiesce", "close", "rollback:old-root", "resume"]);
+});
+
+test("keeps committed providers on the new root and leaves the gate closed after a post-commit failure", async () => {
+  const events = [];
+  const coordinator = new MigrationCoordinator({
+    providers: [
+      {
+        name: "database",
+        async quiesce() {
+          events.push("quiesce");
+        },
+        async close() {
+          events.push("close");
+        },
+        async reopen(root) {
+          events.push(`reopen:${root}`);
+        },
+        async rollback(root) {
+          events.push(`rollback:${root}`);
+        },
+        async resume() {
+          events.push("resume");
+        },
+      },
+    ],
+  });
+
+  await assert.rejects(
+    coordinator.runExclusive(
+      async (lease) => {
+        await lease.reopen("new-root");
+        lease.commit("new-root");
+        throw new Error("lease release failed");
+      },
+      { previousRoot: "old-root" }
+    ),
+    /lease release failed/
+  );
+
+  assert.deepEqual(events, ["quiesce", "close", "reopen:new-root", "resume"]);
+  assert.throws(
+    () => coordinator.assertProducerAllowed(),
+    (error) => error?.code === "STORAGE_MIGRATION_IN_PROGRESS"
+  );
+});
+
+test("leaves the write gate closed when provider rollback cannot be completed", async (t) => {
+  const coordinator = new MigrationCoordinator({
+    providers: [
+      {
+        name: "database",
+        async quiesce() {},
+        async close() {},
+        async reopen() {},
+        async rollback() {
+          throw new Error("rollback failed");
+        },
+        async resume() {},
+      },
+    ],
+  });
+  t.after(() => coordinator.writeGate.open());
+
+  await assert.rejects(
+    coordinator.runExclusive(
+      async () => {
+        throw new Error("copy failed");
+      },
+      { previousRoot: "old-root" }
+    ),
+    /migration operation and rollback failed/
+  );
+
+  assert.throws(
+    () => coordinator.assertProducerAllowed(),
+    (error) => error?.code === "STORAGE_MIGRATION_IN_PROGRESS"
+  );
 });

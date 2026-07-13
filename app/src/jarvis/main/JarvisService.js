@@ -160,7 +160,9 @@ class JarvisService {
       new StorageGovernor({
         reserve: {
           ensure() {},
-          release() {},
+          release() {
+            return true;
+          },
         },
       });
     if (

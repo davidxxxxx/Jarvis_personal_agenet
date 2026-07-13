@@ -529,7 +529,20 @@ class ParakeetManager {
     };
   }
 
-  async deleteParakeetModel(modelName) {
+  deleteParakeetModel(modelName) {
+    return processWriteGate.runWithWriteLease("parakeet-model-delete", () =>
+      this._deleteParakeetModel(modelName)
+    );
+  }
+
+  async quiesce() {
+    await this.cancelDownload();
+    await this.stopServer();
+  }
+
+  async resume() {}
+
+  async _deleteParakeetModel(modelName) {
     const modelPath = this.getModelPath(modelName);
 
     if (fs.existsSync(modelPath)) {
@@ -559,7 +572,13 @@ class ParakeetManager {
     return { model: modelName, deleted: false, error: "Model not found", success: false };
   }
 
-  async deleteAllParakeetModels() {
+  deleteAllParakeetModels() {
+    return processWriteGate.runWithWriteLease("parakeet-model-delete-all", () =>
+      this._deleteAllParakeetModels()
+    );
+  }
+
+  async _deleteAllParakeetModels() {
     const modelsDir = this.getModelsDir();
     let totalFreed = 0;
     let deletedCount = 0;

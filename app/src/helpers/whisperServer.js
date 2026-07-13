@@ -6,12 +6,12 @@ const http = require("http");
 const os = require("os");
 const { app } = require("electron");
 const debugLogger = require("./debugLogger");
-const { killProcess } = require("../utils/process");
-const { isPortAvailable } = require("../utils/serverUtils");
+const { gracefulStopProcess, isPortAvailable } = require("../utils/serverUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const { convertToWav } = require("./ffmpegUtils");
 const sidecarPidFile = require("./sidecarPidFile");
 const { sanitizeWhisperVadConfig, DEFAULT_WHISPER_VAD_CONFIG } = require("./whisperVadConfig");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const PORT_RANGE_START = 8178;
 const PORT_RANGE_END = 8199;
@@ -160,8 +160,10 @@ function buildWhisperServerArgs({
 }
 
 class WhisperServerManager extends EventEmitter {
-  constructor() {
+  constructor({ spawnImpl = spawn } = {}) {
     super();
+    if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
+    this.spawnImpl = spawnImpl;
     this.process = null;
     this.hostname = "127.0.0.1";
     this.port = null;
@@ -177,6 +179,7 @@ class WhisperServerManager extends EventEmitter {
     this.vadSignature = "vad:off";
     this.threadSignature = "threads:default";
     this.lastStartOptions = {};
+    this.tempLifecycleRelease = null;
   }
 
   getFFmpegPath() {
@@ -470,13 +473,21 @@ class WhisperServerManager extends EventEmitter {
 
     const startTime = Date.now();
 
-    this.process = spawn(serverBinary, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      env: spawnEnv,
-      cwd: serverBinaryDir,
-      detached: process.platform !== "win32",
-    });
+    this.tempLifecycleRelease = processWriteGate.acquireWriteLease(
+      "whisper-native-temp-lifecycle"
+    );
+    try {
+      this.process = this.spawnImpl(serverBinary, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        env: spawnEnv,
+        cwd: serverBinaryDir,
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      this._releaseTempLifecycle();
+      throw error;
+    }
     sidecarPidFile.write("whisper", this.process.pid);
 
     let stderrBuffer = "";
@@ -505,6 +516,7 @@ class WhisperServerManager extends EventEmitter {
       this.process = null;
       this.stopHealthCheck();
       sidecarPidFile.clear("whisper");
+      this._releaseTempLifecycle();
     });
 
     try {
@@ -751,7 +763,13 @@ class WhisperServerManager extends EventEmitter {
     });
   }
 
-  async _convertToWav(audioBuffer) {
+  _convertToWav(audioBuffer) {
+    return processWriteGate.runWithWriteLease("whisper-temp-audio", () =>
+      this._convertToWavWithLease(audioBuffer)
+    );
+  }
+
+  async _convertToWavWithLease(audioBuffer) {
     const tempDir = getSafeTempDir();
     const timestamp = Date.now();
     const tempInputPath = path.join(tempDir, `whisper-input-${timestamp}.webm`);
@@ -777,6 +795,7 @@ class WhisperServerManager extends EventEmitter {
 
     if (this.isRemote) {
       debugLogger.debug("Disconnecting from remote whisper-server");
+      this._releaseTempLifecycle();
       this.ready = false;
       this.isRemote = false;
       this.hostname = "127.0.0.1";
@@ -786,40 +805,28 @@ class WhisperServerManager extends EventEmitter {
 
     if (!this.process) {
       this.ready = false;
+      this._releaseTempLifecycle();
       return;
     }
 
     debugLogger.debug("Stopping whisper-server");
 
     try {
-      killProcess(this.process, "SIGTERM");
-
-      await new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          if (this.process) {
-            killProcess(this.process, "SIGKILL");
-          }
-          resolve();
-        }, 5000);
-
-        if (this.process) {
-          this.process.once("close", () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        } else {
-          clearTimeout(timeout);
-          resolve();
-        }
-      });
+      await gracefulStopProcess(this.process);
     } catch (error) {
       debugLogger.error("Error stopping whisper-server", { error: error.message });
+      this.ready = false;
+      throw error;
     }
 
-    this.process = null;
     this.ready = false;
     this.port = null;
     this.modelPath = null;
+  }
+
+  _releaseTempLifecycle() {
+    this.tempLifecycleRelease?.();
+    this.tempLifecycleRelease = null;
   }
 
   getStatus() {

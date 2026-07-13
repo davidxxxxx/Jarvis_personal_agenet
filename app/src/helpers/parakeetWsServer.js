@@ -11,6 +11,7 @@ const {
 } = require("../utils/serverUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const sidecarPidFile = require("./sidecarPidFile");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const PORT_RANGE_START = 6006;
 const PORT_RANGE_END = 6029;
@@ -19,7 +20,9 @@ const HEALTH_CHECK_INTERVAL_MS = 5000;
 const TRANSCRIPTION_TIMEOUT_MS = 300000;
 
 class ParakeetWsServer {
-  constructor() {
+  constructor({ spawnImpl = spawn } = {}) {
+    if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
+    this.spawnImpl = spawnImpl;
     this.process = null;
     this.port = null;
     this.ready = false;
@@ -28,6 +31,7 @@ class ParakeetWsServer {
     this.startupPromise = null;
     this.healthCheckInterval = null;
     this.cachedWsBinaryPath = null;
+    this.tempLifecycleRelease = null;
   }
 
   getWsBinaryPath() {
@@ -81,12 +85,21 @@ class ParakeetWsServer {
 
     debugLogger.debug("Starting parakeet WS server", { port: this.port, modelName, args });
 
-    this.process = spawn(wsBinary, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      cwd: getSafeTempDir(),
-      detached: process.platform !== "win32",
-    });
+    const tempDir = getSafeTempDir();
+    this.tempLifecycleRelease = processWriteGate.acquireWriteLease(
+      "parakeet-native-temp-lifecycle"
+    );
+    try {
+      this.process = this.spawnImpl(wsBinary, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        cwd: tempDir,
+        detached: process.platform !== "win32",
+      });
+    } catch (error) {
+      this._releaseTempLifecycle();
+      throw error;
+    }
     sidecarPidFile.write("parakeet", this.process.pid);
 
     let stderrBuffer = "";
@@ -122,6 +135,7 @@ class ParakeetWsServer {
       this.stopHealthCheck();
       sidecarPidFile.clear("parakeet");
       readyResolve(false);
+      this._releaseTempLifecycle();
     });
 
     await this._waitForReady(readyFromStderr, () => ({ stderr: stderrBuffer, exitCode }));
@@ -152,14 +166,20 @@ class ParakeetWsServer {
   async _waitForReady(readySignal, getProcessInfo) {
     const startTime = Date.now();
 
+    let timeout;
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(
+      timeout = setTimeout(
         () => reject(new Error(`parakeet-ws failed to start within ${STARTUP_TIMEOUT_MS}ms`)),
         STARTUP_TIMEOUT_MS
       );
     });
 
-    const ready = await Promise.race([readySignal, timeoutPromise]);
+    let ready;
+    try {
+      ready = await Promise.race([readySignal, timeoutPromise]);
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!ready) {
       const info = getProcessInfo ? getProcessInfo() : {};
@@ -279,6 +299,7 @@ class ParakeetWsServer {
 
     if (!this.process) {
       this.ready = false;
+      this._releaseTempLifecycle();
       return;
     }
 
@@ -288,13 +309,19 @@ class ParakeetWsServer {
       await gracefulStopProcess(this.process);
     } catch (error) {
       debugLogger.error("Error stopping parakeet-ws server", { error: error.message });
+      this.ready = false;
+      throw error;
     }
 
-    this.process = null;
     this.ready = false;
     this.port = null;
     this.modelName = null;
     this.modelDir = null;
+  }
+
+  _releaseTempLifecycle() {
+    this.tempLifecycleRelease?.();
+    this.tempLifecycleRelease = null;
   }
 
   getStatus() {

@@ -434,6 +434,7 @@ async function initializeCoreManagers() {
       whisperManager,
       parakeetManager,
       diarizationManager,
+      require("./src/helpers/modelManagerBridge").default,
     ],
     onProgress: (progress) => storageManagerRef?.setProgress(progress),
   });
@@ -527,7 +528,7 @@ async function initializeCoreManagers() {
     });
     storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
     storageGovernor.ensureReserve();
-    whisperCudaManager.resetDataRoot();
+    whisperCudaManager?.resetDataRoot?.();
     require("./src/helpers/safeTempDir").resetSafeTempDir();
   };
   migrationCoordinator.register({
