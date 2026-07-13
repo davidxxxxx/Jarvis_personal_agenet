@@ -41,6 +41,8 @@ class WhisperCudaManager {
     this._binDir = null;
     this._downloadSignal = null;
     this._downloading = false;
+    this._activeDownload = null;
+    this._quiesced = false;
   }
 
   getCudaBinaryDir() {
@@ -96,7 +98,26 @@ class WhisperCudaManager {
     };
   }
 
-  async download(progressCallback) {
+  download(progressCallback) {
+    if (this._quiesced) {
+      const error = new Error("storage migration in progress");
+      error.code = "STORAGE_MIGRATION_IN_PROGRESS";
+      return Promise.reject(error);
+    }
+    const operation = Promise.resolve().then(() => this._download(progressCallback));
+    this._activeDownload = operation;
+    operation.then(
+      () => {
+        if (this._activeDownload === operation) this._activeDownload = null;
+      },
+      () => {
+        if (this._activeDownload === operation) this._activeDownload = null;
+      }
+    );
+    return operation;
+  }
+
+  async _download(progressCallback) {
     if (this._downloading) throw new Error("Download already in progress");
     if (!isSupportedPlatform()) {
       throw new Error(`CUDA binaries not available for ${process.platform}`);
@@ -195,6 +216,18 @@ class WhisperCudaManager {
       if (extractDir)
         await fsPromises.rm(extractDir, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  async quiesce() {
+    this._quiesced = true;
+    const active = this._activeDownload;
+    if (!active) return;
+    await this.cancelDownload();
+    await active.catch(() => {});
+  }
+
+  resume() {
+    this._quiesced = false;
   }
 
   async cancelDownload() {

@@ -1309,6 +1309,43 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
   );
 });
 
+test("records bounded idempotent WAV and FLAC byte telemetry in capture transactions", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(
+    chunk({
+      expiresAt: 1_000,
+      fileBytes: 144,
+      encoderVersion: "test-flac-v1",
+    })
+  );
+  const job = db
+    .prepare("SELECT id FROM processing_jobs WHERE chunk_id = 'c1' AND job_type = 'compress_chunk'")
+    .get();
+
+  store.promoteChunkToFlac({
+    chunkId: "c1",
+    jobId: job.id,
+    encoderVersion: "test-flac-v1",
+    pcmSha256: "abc",
+    wavPath: "c1.wav",
+    flacPath: "c1.flac",
+    fileSha256: "def",
+    fileBytes: 40,
+    sampleRate: 24_000,
+    channels: 1,
+    completedAt: 200,
+  });
+
+  assert.deepEqual(
+    db.prepare("SELECT kind, chunk_id, bytes, occurred_at FROM storage_usage_events ORDER BY kind").all(),
+    [
+      { kind: "flac_written", chunk_id: "c1", bytes: 40, occurred_at: 200 },
+      { kind: "wav_written", chunk_id: "c1", bytes: 144, occurred_at: 20 },
+    ]
+  );
+});
+
 test("rolls back a tombstone when unfinished job termination fails", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -1365,7 +1402,7 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
       sessionStatus: "completed",
       at: 20,
     });
-    repository.commitChunk(chunk());
+    repository.commitChunk(chunk({ fileBytes: 144 }));
     const job = repository.enqueueChunkTranscription(chunk());
     repository.tombstoneChunk("c1", 200);
 
@@ -1374,6 +1411,14 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
     assert.equal(repository.getSession("s1").status, "completed");
     assert.equal(job.job_type, "transcribe_chunk");
     assert.equal(repository.getAudioChunk("c1").deleted_at, 200);
+    assert.deepEqual(repository.getStorageUsageSince(20), {
+      writtenBytes24h: 144,
+      compressedBytes24h: 0,
+    });
+    assert.deepEqual(repository.getStorageUsageSince(21), {
+      writtenBytes24h: 0,
+      compressedBytes24h: 0,
+    });
     assert.deepEqual(
       repository.listRetiredArtifactBacklog().map((row) => ({
         id: row.id,

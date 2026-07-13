@@ -196,6 +196,7 @@ class FlacCompressionWorker {
         wavPath,
         flacPath,
         fileSha256,
+        fileBytes: promotedBytes.length,
         sampleRate: chunk.sample_rate,
         channels: chunk.channels,
         completedAt: this.now(),
@@ -556,6 +557,7 @@ class FlacCompressionWorker {
       wavPath,
       flacPath,
       fileSha256: verified.fileSha256,
+      fileBytes: verified.fileBytes,
       sampleRate: chunk.sample_rate,
       channels: chunk.channels,
       completedAt: this.now(),
@@ -704,7 +706,10 @@ class FlacCompressionWorker {
       throw new Error("duration_mismatch");
     }
     const bytes = await this.fs.readFile(candidatePath);
-    return { fileSha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+    return {
+      fileSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      fileBytes: bytes.length,
+    };
   }
 
   async _exists(candidate) {

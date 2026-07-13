@@ -153,6 +153,8 @@ test("preserves legacy sessions and chunks while backfilling evidence defaults",
       timeline_version: 1,
       finalized_at: null,
       ready_at: null,
+      stop_reason: null,
+      durable_boundary_at: null,
     });
     assert.deepEqual(db.prepare("SELECT * FROM audio_chunks WHERE id = 'c1'").get(), {
       id: "c1",

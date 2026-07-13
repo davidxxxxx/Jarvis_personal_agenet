@@ -62,3 +62,63 @@ test("deduplicates concurrent analysis and persists pseudonymous text-only resul
   assert.equal(applied.length, 1);
   assert.equal(scheduler.getStatus("s1").state, "ready");
 });
+
+test("quiesce blocks new analysis and waits for every in-flight request", async () => {
+  let resolveAnalysis;
+  const repository = {
+    getSessionDetail: () => ({
+      session: { id: "s1", started_at: 1 },
+      summary: null,
+      segments: [
+        {
+          id: "seg-1",
+          started_at: 2,
+          ended_at: 3,
+          person_id: null,
+          text: "stable",
+          is_stable: 1,
+        },
+      ],
+    }),
+    listPeople: () => [],
+    applyAnalysisResult() {},
+  };
+  const scheduler = new AnalysisScheduler({
+    repository,
+    client: {
+      analyze: () =>
+        new Promise((resolve) => {
+          resolveAnalysis = () =>
+            resolve({
+              result: {
+                summary: "done",
+                topics: [],
+                memories: [],
+                todos: [],
+                decisions: [],
+                suggestions: [],
+              },
+              usage: { inputTokens: 1, outputTokens: 1 },
+              model: "fixture",
+            });
+        }),
+    },
+    now: () => 10,
+  });
+  const running = scheduler.analyzeSession("s1", "incremental");
+  let drained = false;
+  const quiesced = scheduler.quiesce().then(() => {
+    drained = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(drained, false);
+  assert.throws(
+    () => scheduler.analyzeSession("s1", "final"),
+    (error) => error?.code === "STORAGE_MIGRATION_IN_PROGRESS"
+  );
+  resolveAnalysis();
+  await Promise.all([running, quiesced]);
+  scheduler.resume();
+  assert.doesNotThrow(() => scheduler.analyzeSession("s1", "incremental"));
+});

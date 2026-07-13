@@ -302,13 +302,16 @@ const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDe
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const {
   DataRootConfig,
+  adoptLegacyDatabaseSync,
   copyLegacyTreeSync,
   resolveJarvisDataRoot,
   resolveRecordingsRoot,
 } = require("./src/jarvis/main/recordingStorage");
 const StorageGovernor = require("./src/jarvis/main/StorageGovernor");
 const DataDirectoryMigrator = require("./src/jarvis/main/DataDirectoryMigrator");
+const DataRootRelocator = require("./src/jarvis/main/DataRootRelocator");
 const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
+const MigrationCoordinator = require("./src/jarvis/main/MigrationCoordinator");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
@@ -413,7 +416,7 @@ function cleanupOrphanedLinuxRestoreToken() {
   } catch {}
 }
 
-function initializeCoreManagers() {
+async function initializeCoreManagers() {
   setupProductionPath();
 
   debugLogger = require("./src/helpers/debugLogger");
@@ -427,14 +430,31 @@ function initializeCoreManagers() {
     ? resolveRecordingsRoot(jarvisUserDataDir, process.env.JARVIS_RECORDINGS_DIR)
     : null;
   const configuredDataRoot = jarvisDataRootConfig.hasSavedRoot()
-    ? jarvisDataRootConfig.load()
+    ? jarvisDataRootConfig.recoverActivation((candidate) => {
+        const candidateDb = path.join(candidate, "jarvis.db");
+        if (!require("node:fs").existsSync(candidateDb)) return false;
+        let candidateRepository = null;
+        try {
+          candidateRepository = new JarvisRepository(candidateDb);
+          candidateRepository.checkpointForMigration();
+          return true;
+        } catch {
+          return false;
+        } finally {
+          candidateRepository?.close();
+        }
+      })
     : legacyConfiguredRecordings
-      ? resolveJarvisDataRoot(jarvisUserDataDir, path.dirname(legacyConfiguredRecordings))
+      ? resolveJarvisDataRoot(
+          jarvisUserDataDir,
+          path.join(
+            path.dirname(legacyConfiguredRecordings),
+            `${path.basename(legacyConfiguredRecordings)}-data`
+          )
+        )
       : jarvisDataRootConfig.load();
   process.env.JARVIS_DATA_ROOT = configuredDataRoot;
-  const recordingsRoot = legacyConfiguredRecordings && !jarvisDataRootConfig.hasSavedRoot()
-    ? legacyConfiguredRecordings
-    : path.join(configuredDataRoot, "recordings");
+  const recordingsRoot = path.join(configuredDataRoot, "recordings");
   for (const directory of [
     configuredDataRoot,
     recordingsRoot,
@@ -451,14 +471,28 @@ function initializeCoreManagers() {
     require("node:fs").existsSync(legacyDb) &&
     !require("node:fs").existsSync(configuredDb)
   ) {
-    require("node:fs").copyFileSync(legacyDb, configuredDb, require("node:fs").constants.COPYFILE_EXCL);
+    adoptLegacyDatabaseSync({ from: legacyDb, to: configuredDb });
+  }
+  if (
+    legacyConfiguredRecordings &&
+    !jarvisDataRootConfig.hasSavedRoot() &&
+    legacyConfiguredRecordings !== recordingsRoot &&
+    require("node:fs").existsSync(legacyConfiguredRecordings)
+  ) {
+    copyLegacyTreeSync({ from: legacyConfiguredRecordings, to: recordingsRoot });
+    require("node:fs").mkdirSync(path.dirname(configuredDb), { recursive: true });
+    const customRelocator = new DataRootRelocator();
+    await customRelocator.relocateRecordings({
+      databasePath: configuredDb,
+      oldRecordingsRoot: legacyConfiguredRecordings,
+      newRecordingsRoot: recordingsRoot,
+    });
   }
   const legacyRecordings = path.join(jarvisUserDataDir, "recordings");
   if (
     !process.env.JARVIS_RECORDINGS_DIR &&
     legacyRecordings !== recordingsRoot &&
-    require("node:fs").existsSync(legacyRecordings) &&
-    require("node:fs").readdirSync(recordingsRoot).length === 0
+    require("node:fs").existsSync(legacyRecordings)
   ) {
     copyLegacyTreeSync({ from: legacyRecordings, to: recordingsRoot });
   }
@@ -477,12 +511,14 @@ function initializeCoreManagers() {
   speechVadClassifier = new SpeechVadClassifier({
     getModelPath: () => diarizationManager?.getVadModelPath?.() ?? null,
   });
+  const migrationCoordinator = new MigrationCoordinator();
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: jarvisUserDataDir,
     recordingsDir: recordingsRoot,
     vadClassifier: speechVadClassifier,
     storageGovernor,
+    migrationGate: migrationCoordinator,
     broadcast: (state) => {
       windowManager?.sendToControlPanel("jarvis:state-changed", state);
       trayManager?.setJarvisState(state);
@@ -500,37 +536,62 @@ function initializeCoreManagers() {
     temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
-  let storageManagerRef = null;
-  const dataDirectoryMigrator = new DataDirectoryMigrator({
-    closeHolders: async () => {
+  const reconfigureStorageHolders = async (root) => {
+    process.env.JARVIS_DATA_ROOT = root;
+    const nextRecordingsRoot = path.join(root, "recordings");
+    require("node:fs").mkdirSync(nextRecordingsRoot, { recursive: true });
+    jarvisRepository.reopen(path.join(root, "jarvis.db"));
+    jarvisService.reconfigureStorage({ recordingsDir: nextRecordingsRoot });
+    retentionCleaner.reconfigureStorage({
+      recordingsRoot: nextRecordingsRoot,
+      artifactCleaner: jarvisService.flacCompressionWorker,
+      temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
+    });
+    storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
+    storageGovernor.ensureReserve();
+    whisperCudaManager.resetDataRoot();
+    require("./src/helpers/safeTempDir").resetSafeTempDir();
+  };
+  migrationCoordinator.register({
+    name: "jarvis-runtime",
+    async quiesce() {
       await jarvisService.prepareStorageMigration();
+      await retentionCleaner.stop();
+      await jarvisAnalysisScheduler.quiesce();
+      await whisperCudaManager.quiesce();
+    },
+    async close() {
+      jarvisRepository.checkpointForMigration();
       jarvisRepository.close();
     },
-    persistRoot: async (root) => {
-      jarvisDataRootConfig.save(root);
+    reopen: reconfigureStorageHolders,
+    rollback: reconfigureStorageHolders,
+    async resume() {
+      jarvisAnalysisScheduler.resume();
+      whisperCudaManager.resume();
+      retentionCleaner.start();
     },
-    reopenHolders: async (root) => {
-      process.env.JARVIS_DATA_ROOT = root;
-      const nextRecordingsRoot = path.join(root, "recordings");
-      require("node:fs").mkdirSync(nextRecordingsRoot, { recursive: true });
-      jarvisRepository.reopen(path.join(root, "jarvis.db"));
-      jarvisService.reconfigureStorage({ recordingsDir: nextRecordingsRoot });
-      retentionCleaner.reconfigureStorage({
-        recordingsRoot: nextRecordingsRoot,
-        artifactCleaner: jarvisService.flacCompressionWorker,
-        temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
-      });
-      storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
-      storageGovernor.ensureReserve();
-      whisperCudaManager?.resetDataRoot?.();
-      require("./src/helpers/safeTempDir").resetSafeTempDir();
+  });
+  let storageManagerRef = null;
+  const dataDirectoryMigrator = new DataDirectoryMigrator({
+    migrationCoordinator,
+    journalRoot: path.join(jarvisUserDataDir, "jarvis-migration-journal"),
+    activationJournal: {
+      begin: (state) => jarvisDataRootConfig.beginActivation(state),
+      mark: (phase) => jarvisDataRootConfig.markActivationPhase(phase),
+      finalize: (root) => jarvisDataRootConfig.save(root),
+      rollback: (root) => jarvisDataRootConfig.save(root),
     },
+    persistRoot: async () => {},
+    relocateTarget: ({ oldRoot, newRoot }) =>
+      new DataRootRelocator().relocate({ oldRoot, newRoot }),
     onProgress: (progress) => storageManagerRef?.setProgress(progress),
   });
   jarvisStorageManager = storageManagerRef = new JarvisStorageManager({
     currentRoot: configuredDataRoot,
     governor: storageGovernor,
     migrator: dataDirectoryMigrator,
+    usageProvider: (since) => jarvisRepository.getStorageUsageSince(since),
   });
   voiceEnrollmentService = new VoiceEnrollmentService({
     speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
@@ -573,6 +634,13 @@ function initializeCoreManagers() {
     analysisScheduler: jarvisAnalysisScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
     storageManager: jarvisStorageManager,
+    pickStorageDirectory: async () => {
+      const result = await dialog.showOpenDialog({
+        title: "Choose Jarvis data directory",
+        properties: ["openDirectory", "createDirectory"],
+      });
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
   });
 
   const uiLanguage = environmentManager.getUiLanguage();
@@ -1013,7 +1081,7 @@ async function startApp() {
   reapStaleSidecars();
 
   // Phase 1: Core managers + IPC handlers before windows
-  initializeCoreManagers();
+  await initializeCoreManagers();
   await environmentManager.init();
   registerSidecars();
   startAuthBridgeServer();

@@ -98,6 +98,7 @@ function registerJarvisIpc({
   analysisScheduler,
   audioEvidenceReader,
   storageManager,
+  pickStorageDirectory,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -304,7 +305,18 @@ function registerJarvisIpc({
     ) {
       throw new TypeError("storageManager must provide getStatus and migrate methods");
     }
+    if (typeof pickStorageDirectory !== "function") {
+      throw new TypeError("pickStorageDirectory is required with storageManager");
+    }
     ipcMain.handle(CHANNELS.getStorageStatus, () => storageManager.getStatus());
+    ipcMain.handle(CHANNELS.pickStorageDirectory, async () => {
+      const selected = await pickStorageDirectory();
+      if (selected === null) return null;
+      if (typeof selected !== "string" || !path.isAbsolute(selected) || selected.includes("\0")) {
+        throw new Error("storage directory picker returned an invalid path");
+      }
+      return path.resolve(selected);
+    });
     ipcMain.handle(CHANNELS.migrateStorage, async (_event, input) => {
       try {
         assertExactKeys(input, ["to"], "storage migration request");

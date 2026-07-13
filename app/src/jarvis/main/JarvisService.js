@@ -20,6 +20,8 @@ const AUDIO_RETENTION_MS = 7 * 86400000;
 const ACTIVE_SESSION_STATUSES = new Set(["recording", "degraded"]);
 const RECOVERY_SIDECAR_SUFFIX = ".wav.recovery.json";
 const RECOVERY_SIDECAR_MAX_BYTES = 16 * 1024;
+const LOW_DISK_RECOVERY_VERSION = 1;
+const LOW_DISK_RECOVERY_KEYS = Object.freeze(["at", "sessionId", "sources", "version"]);
 const WAV_HEADER_BYTES = 44;
 const WAV_SAMPLE_RATE = 24_000;
 const WAV_BYTES_PER_SAMPLE = 2;
@@ -63,6 +65,7 @@ class JarvisService {
     flacCompressionWorker = undefined,
     audioEvidenceReader = undefined,
     storageGovernor = undefined,
+    migrationGate = null,
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -79,6 +82,7 @@ class JarvisService {
       "closeGap",
       "restoreTrack",
       "pauseCapture",
+      "pauseCaptureForLowDisk",
       "resumeCapture",
       "finalizeCapture",
       "setSessionRetention",
@@ -96,6 +100,12 @@ class JarvisService {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     if (!fsImpl || typeof fsImpl.mkdirSync !== "function") {
       throw new TypeError("fsImpl.mkdirSync must be a function");
+    }
+    if (
+      migrationGate !== null &&
+      (!migrationGate || typeof migrationGate.assertProducerAllowed !== "function")
+    ) {
+      throw new TypeError("migrationGate.assertProducerAllowed must be a function");
     }
     if (
       vadClassifier !== null &&
@@ -156,11 +166,13 @@ class JarvisService {
     if (
       !this.storageGovernor ||
       typeof this.storageGovernor.inspect !== "function" ||
-      typeof this.storageGovernor.evaluate !== "function"
+      typeof this.storageGovernor.evaluate !== "function" ||
+      typeof this.storageGovernor.ensureReserve !== "function"
     ) {
-      throw new TypeError("storageGovernor must provide evaluate and inspect methods");
+      throw new TypeError("storageGovernor must provide ensureReserve, evaluate, and inspect methods");
     }
     this.emergencyCommit = false;
+    this.migrationGate = migrationGate;
     this.vadClassifier = vadClassifier;
     this.maxVadQueueBytes = Math.round(
       (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE * maxVadQueueMs) / 1_000
@@ -179,6 +191,7 @@ class JarvisService {
 
   startCapture(input) {
     this._assertOpen();
+    this.migrationGate?.assertProducerAllowed("capture");
     const normalized = normalizeCaptureStartInput(input);
     const id = assertId(normalized.sessionId, "sessionId");
     this.vadSessionReset = false;
@@ -219,6 +232,7 @@ class JarvisService {
       throw new Error("capture policy does not match persisted session");
     }
 
+    this.storageGovernor.ensureReserve();
     this.fs.mkdirSync(this.recordingsDir, { recursive: true });
     this.completedRestorations.clear();
     this.retentionGeneration += 1;
@@ -659,6 +673,7 @@ class JarvisService {
     if (!Object.values(this.state.sources).some((source) => source.state === "paused")) {
       throw new Error("capture has no paused sources to resume");
     }
+    this.storageGovernor.ensureReserve();
     try {
       this._assertSafeDiskSpace();
     } catch (error) {
@@ -759,6 +774,7 @@ class JarvisService {
   recoverOpenSessions(at = this.now()) {
     this._assertOpen();
     this._assertTime(at, "at");
+    this._reconcileLowDiskRecoveryRecords();
     this._reconcileChunkRecoverySidecars();
     if (this.flacCompressionWorker) {
       this.compressionRecovery = Promise.resolve()
@@ -1296,6 +1312,7 @@ class JarvisService {
         if (this.closed) return null;
         const committed = this.repository.commitChunk({
           ...chunk,
+          fileBytes: this.fs.statSync(chunk.path).size,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
           format: "wav",
           sampleRate: WAV_SAMPLE_RATE,
@@ -1493,6 +1510,7 @@ class JarvisService {
       durationMs: metadata.durationMs,
       sha256: metadata.sha256,
       expiresAt: metadata.endedAt + AUDIO_RETENTION_MS,
+      fileBytes: this.fs.statSync(wavRealPath).size,
       format: "wav",
       sampleRate: WAV_SAMPLE_RATE,
       channels: 1,
@@ -1801,20 +1819,128 @@ class JarvisService {
     } finally {
       this.emergencyCommit = false;
     }
-    this.repository.pauseCapture({
+    const durableStop = {
       sessionId: this.state.sessionId,
       sources: Object.values(this.state.sources).map((source) => ({
         trackId: source.trackId,
         expectedState: source.state === "reconnecting" ? "recovering" : source.state,
       })),
       at,
-    });
+    };
+    try {
+      this.repository.pauseCaptureForLowDisk(durableStop);
+    } catch (error) {
+      this._writeLowDiskRecoveryRecord(durableStop);
+      for (const source of Object.values(this.state.sources)) {
+        if (source.state === "active") source.state = "paused";
+      }
+      this._transitionSessionStatus("paused", at);
+      this.state.errorCode = "capture_stopped_low_disk";
+      this._publish(at);
+      throw error;
+    }
     for (const source of Object.values(this.state.sources)) {
       if (source.state === "active") source.state = "paused";
     }
     this._transitionSessionStatus("paused", at);
     this.state.errorCode = "capture_stopped_low_disk";
     return this._publish(at);
+  }
+
+  _writeLowDiskRecoveryRecord({ sessionId, sources, at }) {
+    const recoveryDir = path.join(this.recordingsDir, ".session-recovery");
+    this.fs.mkdirSync(recoveryDir, { recursive: true, mode: 0o700 });
+    const directoryStat = this.fs.lstatSync(recoveryDir);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw new Error("low-disk recovery directory is unsafe");
+    }
+    const record = { version: LOW_DISK_RECOVERY_VERSION, sessionId, sources, at };
+    const payload = Buffer.from(JSON.stringify(record), "utf8");
+    if (payload.length > RECOVERY_SIDECAR_MAX_BYTES) {
+      throw new Error("low-disk recovery record is too large");
+    }
+    const finalPath = path.join(recoveryDir, `${crypto.randomUUID()}.json`);
+    const temporaryPath = `${finalPath}.${crypto.randomUUID()}.tmp`;
+    let handle = null;
+    try {
+      handle = this.fs.openSync(temporaryPath, "wx", 0o600);
+      this.fs.writeFileSync(handle, payload);
+      this.fs.fsyncSync(handle);
+      this.fs.closeSync(handle);
+      handle = null;
+      this.fs.renameSync(temporaryPath, finalPath);
+      this._fsyncRecoveryDirectory(recoveryDir);
+    } catch (error) {
+      if (handle !== null) this.fs.closeSync(handle);
+      try {
+        this.fs.unlinkSync(temporaryPath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") error.cleanupError = cleanupError;
+      }
+      throw error;
+    }
+  }
+
+  _reconcileLowDiskRecoveryRecords() {
+    const recoveryDir = path.join(this.recordingsDir, ".session-recovery");
+    let names;
+    try {
+      const directoryStat = this.fs.lstatSync(recoveryDir);
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+        throw new Error("low-disk recovery directory is unsafe");
+      }
+      names = this.fs.readdirSync(recoveryDir).sort();
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      throw error;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json") || !this._isDirectChild(recoveryDir, path.join(recoveryDir, name))) {
+        throw new Error("low-disk recovery directory contains an unexpected entry");
+      }
+      const recordPath = path.join(recoveryDir, name);
+      const stat = this.fs.lstatSync(recordPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > RECOVERY_SIDECAR_MAX_BYTES) {
+        throw new Error("low-disk recovery record is unsafe");
+      }
+      const record = JSON.parse(this.fs.readFileSync(recordPath, "utf8"));
+      if (
+        !record ||
+        typeof record !== "object" ||
+        Array.isArray(record) ||
+        JSON.stringify(Object.keys(record).sort()) !== JSON.stringify([...LOW_DISK_RECOVERY_KEYS]) ||
+        record.version !== LOW_DISK_RECOVERY_VERSION ||
+        !Number.isSafeInteger(record.at) ||
+        !Array.isArray(record.sources)
+      ) {
+        throw new Error("low-disk recovery record is invalid");
+      }
+      assertId(record.sessionId, "sessionId");
+      const session = this.repository.getSession(record.sessionId);
+      if (
+        session?.status !== "paused" ||
+        session?.stop_reason !== "capture_stopped_low_disk" ||
+        session?.durable_boundary_at !== record.at
+      ) {
+        this.repository.pauseCaptureForLowDisk(record);
+      }
+      this.fs.unlinkSync(recordPath);
+      this._fsyncRecoveryDirectory(recoveryDir);
+    }
+  }
+
+  _fsyncRecoveryDirectory(directory) {
+    let handle = null;
+    try {
+      handle = this.fs.openSync(directory, "r");
+      this.fs.fsyncSync(handle);
+    } catch (error) {
+      if (process.platform !== "win32" || !["EISDIR", "EPERM", "EACCES"].includes(error?.code)) {
+        throw error;
+      }
+    } finally {
+      if (handle !== null) this.fs.closeSync(handle);
+    }
   }
 
   _failForAudioWrite(at) {

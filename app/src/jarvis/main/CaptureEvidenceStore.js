@@ -76,12 +76,20 @@ class CaptureEvidenceStore {
       ),
       finalizeSession: db.prepare(`
         UPDATE sessions
-        SET status = @sessionStatus, ended_at = @at
+        SET status = @sessionStatus, ended_at = @at,
+            stop_reason = NULL, durable_boundary_at = NULL
         WHERE id = @sessionId
       `),
       transitionSession: db.prepare(`
         UPDATE sessions
-        SET status = @status, ended_at = @endedAt
+        SET status = @status, ended_at = @endedAt,
+            stop_reason = NULL, durable_boundary_at = NULL
+        WHERE id = @sessionId
+      `),
+      pauseSessionForLowDisk: db.prepare(`
+        UPDATE sessions
+        SET status = 'paused', ended_at = NULL,
+            stop_reason = 'capture_stopped_low_disk', durable_boundary_at = @at
         WHERE id = @sessionId
       `),
       findChunkSequence: db.prepare(`
@@ -100,6 +108,10 @@ class CaptureEvidenceStore {
         )
       `),
       getChunk: db.prepare("SELECT * FROM audio_chunks WHERE id = ?"),
+      recordStorageUsage: db.prepare(`
+        INSERT OR IGNORE INTO storage_usage_events (kind, chunk_id, bytes, occurred_at)
+        VALUES (@kind, @chunkId, @bytes, @occurredAt)
+      `),
       insertTranscriptionJob: db.prepare(`
         INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
@@ -331,6 +343,15 @@ class CaptureEvidenceStore {
         sampleRate: chunk.sampleRate ?? 24_000,
         channels: chunk.channels ?? 1,
       });
+      if (chunk.fileBytes !== undefined) {
+        this._assertPositiveSafeInteger(chunk.fileBytes, "chunk fileBytes");
+        this.statements.recordStorageUsage.run({
+          kind: "wav_written",
+          chunkId: chunk.id,
+          bytes: chunk.fileBytes,
+          occurredAt: chunk.endedAt,
+        });
+      }
       const transcription = this._insertChunkTranscription(chunk);
       if (chunk.encoderVersion !== undefined) this._insertChunkCompression(chunk);
       return transcription;
@@ -379,6 +400,15 @@ class CaptureEvidenceStore {
       const completed = this.statements.completeCompressionJob.run(input);
       if (completed.changes !== 1)
         throw new Error("compression job does not match chunk authority");
+      if (input.fileBytes !== undefined) {
+        this._assertPositiveSafeInteger(input.fileBytes, "FLAC fileBytes");
+        this.statements.recordStorageUsage.run({
+          kind: "flac_written",
+          chunkId: input.chunkId,
+          bytes: input.fileBytes,
+          occurredAt: input.completedAt,
+        });
+      }
       return this._chunkResult(this.statements.getChunk.get(input.chunkId));
     });
     this.rollbackChunkToWavTransaction = db.transaction((input) => {
@@ -479,7 +509,7 @@ class CaptureEvidenceStore {
         return { trackId, gapId, targetState };
       }
     );
-    this.pauseCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
+    const pauseCapture = ({ sessionId, sources, at }, lowDisk) => {
       const evidence = this._assertLifecycleTransition({
         sessionId,
         sources,
@@ -492,14 +522,23 @@ class CaptureEvidenceStore {
         const updated = this.setTrackState(track.id, "paused", at);
         if (updated.changes !== 1) throw new Error(`track ${track.id} was not paused`);
       }
-      const paused = this.statements.transitionSession.run({
+      const paused = lowDisk
+        ? this.statements.pauseSessionForLowDisk.run({ sessionId, at })
+        : this.statements.transitionSession.run({
+            sessionId,
+            status: "paused",
+            endedAt: null,
+          });
+      if (paused.changes !== 1) throw new Error(`session ${sessionId} was not paused`);
+      return {
         sessionId,
         status: "paused",
-        endedAt: null,
-      });
-      if (paused.changes !== 1) throw new Error(`session ${sessionId} was not paused`);
-      return { sessionId, status: "paused" };
-    });
+        stopReason: lowDisk ? "capture_stopped_low_disk" : null,
+        durableBoundaryAt: lowDisk ? at : null,
+      };
+    };
+    this.pauseCaptureTransaction = db.transaction((input) => pauseCapture(input, false));
+    this.pauseCaptureForLowDiskTransaction = db.transaction((input) => pauseCapture(input, true));
     this.resumeCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
       const evidence = this._assertLifecycleTransition({
         sessionId,
@@ -686,6 +725,10 @@ class CaptureEvidenceStore {
     return this.pauseCaptureTransaction(input);
   }
 
+  pauseCaptureForLowDisk(input) {
+    return this.pauseCaptureForLowDiskTransaction(input);
+  }
+
   resumeCapture(input) {
     return this.resumeCaptureTransaction(input);
   }
@@ -851,6 +894,11 @@ class CaptureEvidenceStore {
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new RangeError(`${name} must be a non-negative safe integer`);
     }
+  }
+
+  _assertPositiveSafeInteger(value, name) {
+    this._assertSafeInteger(value, name);
+    if (value <= 0) throw new RangeError(`${name} must be positive`);
   }
 
   _assertLifecycleTransition({ sessionId, sources, at, sessionState, sourceStates }) {

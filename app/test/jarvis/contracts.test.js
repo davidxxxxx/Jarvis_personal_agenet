@@ -376,6 +376,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "listTopics",
       "migrateStorage",
       "pauseCapture",
+      "pickStorageDirectory",
       "renamePerson",
       "resumeCapture",
       "setCloudBudget",
@@ -686,6 +687,7 @@ test("storage IPC validates migration input, blocks active capture, and sanitize
       return { switched: true };
     },
   };
+  const pickStorageDirectory = async () => "D:\\Jarvis";
   registerJarvisIpc({
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     repository: createRepository(),
@@ -693,7 +695,10 @@ test("storage IPC validates migration input, blocks active capture, and sanitize
     voiceEnrollmentService: createVoiceEnrollmentService(),
     environmentManager: { getOpenAIKey: () => null },
     storageManager,
+    pickStorageDirectory,
   });
+
+  assert.equal(await handlers.get(CHANNELS.pickStorageDirectory)(), "D:\\Jarvis");
 
   assert.deepEqual(await handlers.get(CHANNELS.getStorageStatus)(), {
     state: "ok",
@@ -751,6 +756,7 @@ test("failCapture IPC validates known codes and preserves authoritative failed b
     closeGap: () => {},
     restoreTrack: () => {},
     pauseCapture: () => {},
+    pauseCaptureForLowDisk: () => {},
     resumeCapture: () => {},
     finalizeCapture: ({ sessionStatus }) => {
       session.status = sessionStatus;

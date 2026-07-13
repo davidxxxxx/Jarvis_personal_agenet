@@ -91,3 +91,17 @@ test("model download wiring reports VAD recovery only after verified initializat
     /const vadInitialization = await speechVadClassifier\?\.initialize\(\);[\s\S]*?vadInitialization\?\.ok === true[\s\S]*?speechVadClassifier\?\.isReady\?\.\(\) === true[\s\S]*?jarvisService\?\.reportVadRecovered/
   );
 });
+
+test("production migration wiring drains cleanup and model producers without optional gaps", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+  const providerStart = mainSource.indexOf('name: "jarvis-runtime"');
+  const providerEnd = mainSource.indexOf("let storageManagerRef", providerStart);
+  const provider = mainSource.slice(providerStart, providerEnd);
+
+  assert.match(provider, /await retentionCleaner\.stop\(\)/);
+  assert.match(provider, /await jarvisAnalysisScheduler\.quiesce\(\)/);
+  assert.match(provider, /await whisperCudaManager\.quiesce\(\)/);
+  assert.match(provider, /jarvisAnalysisScheduler\.resume\(\)/);
+  assert.match(provider, /whisperCudaManager\.resume\(\)/);
+  assert.doesNotMatch(provider, /quiesce\?\.|resume\?\./);
+});

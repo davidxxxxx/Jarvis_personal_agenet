@@ -4,7 +4,7 @@ const path = require("node:path");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 class JarvisStorageManager {
-  constructor({ currentRoot, governor, migrator, fsImpl = fs, now = Date.now }) {
+  constructor({ currentRoot, governor, migrator, usageProvider, fsImpl = fs, now = Date.now }) {
     if (typeof currentRoot !== "string" || !path.isAbsolute(currentRoot)) {
       throw new TypeError("currentRoot must be absolute");
     }
@@ -14,9 +14,13 @@ class JarvisStorageManager {
     if (!migrator || typeof migrator.migrate !== "function") {
       throw new TypeError("migrator.migrate is required");
     }
+    if (typeof usageProvider !== "function") {
+      throw new TypeError("usageProvider is required");
+    }
     this.currentRoot = path.resolve(currentRoot);
     this.governor = governor;
     this.migrator = migrator;
+    this.usageProvider = usageProvider;
     this.fs = fsImpl;
     this.now = now;
     this.progress = null;
@@ -79,38 +83,16 @@ class JarvisStorageManager {
 
   _recentUsage() {
     const cutoff = this.now() - DAY_MS;
-    let writtenBytes24h = 0;
-    let compressedBytes24h = 0;
-    const walk = (directory) => {
-      let entries;
-      try {
-        entries = this.fs.readdirSync(directory, { withFileTypes: true });
-      } catch {
-        return;
+    const usage = this.usageProvider(cutoff);
+    for (const name of ["writtenBytes24h", "compressedBytes24h"]) {
+      if (!Number.isSafeInteger(usage?.[name]) || usage[name] < 0) {
+        throw new Error(`storage usage telemetry returned invalid ${name}`);
       }
-      for (const entry of entries) {
-        const absolute = path.join(directory, entry.name);
-        let stat;
-        try {
-          stat = this.fs.lstatSync(absolute);
-        } catch {
-          continue;
-        }
-        if (stat.isSymbolicLink()) continue;
-        if (stat.isDirectory()) walk(absolute);
-        else if (
-          stat.isFile() &&
-          stat.mtimeMs >= cutoff &&
-          entry.name !== ".emergency-reserve" &&
-          !entry.name.includes("migration-manifest")
-        ) {
-          writtenBytes24h += stat.size;
-          if (path.extname(entry.name).toLowerCase() === ".flac") compressedBytes24h += stat.size;
-        }
-      }
+    }
+    return {
+      writtenBytes24h: usage.writtenBytes24h,
+      compressedBytes24h: usage.compressedBytes24h,
     };
-    walk(this.currentRoot);
-    return { writtenBytes24h, compressedBytes24h };
   }
 }
 

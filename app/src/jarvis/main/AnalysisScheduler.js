@@ -23,6 +23,7 @@ class AnalysisScheduler {
     this.now = now;
     this.inFlight = new Map();
     this.status = new Map();
+    this.quiesced = false;
   }
 
   getStatus(sessionId) {
@@ -37,9 +38,23 @@ class AnalysisScheduler {
     if (kind !== "incremental" && kind !== "final") throw new TypeError("invalid analysis kind");
     const key = `${id}:${kind}`;
     if (this.inFlight.has(key)) return this.inFlight.get(key);
+    if (this.quiesced) {
+      const error = new Error("storage migration in progress");
+      error.code = "STORAGE_MIGRATION_IN_PROGRESS";
+      throw error;
+    }
     const promise = this._run(id, kind).finally(() => this.inFlight.delete(key));
     this.inFlight.set(key, promise);
     return promise;
+  }
+
+  async quiesce() {
+    this.quiesced = true;
+    await Promise.allSettled([...this.inFlight.values()]);
+  }
+
+  resume() {
+    this.quiesced = false;
   }
 
   async _run(sessionId, kind) {

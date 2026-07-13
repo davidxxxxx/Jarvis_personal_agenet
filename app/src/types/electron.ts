@@ -619,6 +619,7 @@ declare global {
         getCloudBudget: () => Promise<JarvisCloudBudgetStatus>;
         setCloudBudget: (input: JarvisCloudBudgetInput) => Promise<JarvisCloudBudgetStatus>;
         getStorageStatus: () => Promise<JarvisStorageStatus>;
+        pickStorageDirectory: () => Promise<string | null>;
         migrateStorage: (input: { to: string }) => Promise<JarvisStorageMigrationResult>;
         onControl: (callback: (envelope: JarvisControlEnvelope) => void) => () => void;
         controlReady: (rendererId: string) => void;

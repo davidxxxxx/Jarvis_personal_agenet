@@ -283,7 +283,14 @@ export interface JarvisCloudBudgetInput {
 export type JarvisStorageState = "ok" | "warning" | "stopped";
 
 export interface JarvisStorageProgress {
-  state: "starting" | "copying" | "activating" | "complete" | "failed";
+  state:
+    | "starting"
+    | "copying"
+    | "verifying"
+    | "activating"
+    | "rollback"
+    | "complete"
+    | "failed";
   completedFiles: number;
   totalFiles: number;
 }

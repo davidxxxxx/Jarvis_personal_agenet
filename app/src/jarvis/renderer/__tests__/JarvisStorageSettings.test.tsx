@@ -5,6 +5,7 @@ import JarvisStorageSettings from "../JarvisStorageSettings";
 
 const getStorageStatus = vi.fn();
 const migrateStorage = vi.fn();
+const pickStorageDirectory = vi.fn();
 
 beforeAll(async () => {
   await i18n.changeLanguage("en");
@@ -26,9 +27,10 @@ beforeEach(() => {
     recoveryAction: "Free disk space or migrate the Jarvis data directory.",
   });
   migrateStorage.mockReset().mockResolvedValue({ switched: true, canDeleteOldRoot: true });
+  pickStorageDirectory.mockReset().mockResolvedValue("D:\\Jarvis");
   Object.assign(window, {
     electronAPI: {
-      jarvis: { getStorageStatus, migrateStorage },
+      jarvis: { getStorageStatus, migrateStorage, pickStorageDirectory },
     },
   });
 });
@@ -52,10 +54,27 @@ describe("JarvisStorageSettings", () => {
     expect(screen.getByText("Finish or cancel capture before migrating data.")).toBeInTheDocument();
 
     rerender(<JarvisStorageSettings captureActive={false} />);
-    fireEvent.change(screen.getByLabelText("New data directory"), {
-      target: { value: "D:\\Jarvis" },
-    });
+    fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+    await waitFor(() => expect(pickStorageDirectory).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole("button", { name: "Migrate data" }));
     await waitFor(() => expect(migrateStorage).toHaveBeenCalledWith({ to: "D:\\Jarvis" }));
+  });
+
+  it("shows the old-root cleanup outcome after migration", async () => {
+    migrateStorage.mockResolvedValue({
+      switched: true,
+      canDeleteOldRoot: true,
+      oldRoot: "C:\\Jarvis",
+      currentRoot: "D:\\Jarvis",
+      recoveryAction: "Verify the migrated data before deleting the old directory.",
+    });
+    render(<JarvisStorageSettings captureActive={false} />);
+    await screen.findByRole("heading", { name: "Storage" });
+    fireEvent.click(screen.getByRole("button", { name: "Choose folder" }));
+    await waitFor(() => expect(pickStorageDirectory).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Migrate data" }));
+
+    expect(await screen.findByText("C:\\Jarvis")).toBeInTheDocument();
+    expect(screen.getByText("Verify the migrated data before deleting the old directory.")).toBeInTheDocument();
   });
 });

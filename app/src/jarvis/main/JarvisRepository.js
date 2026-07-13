@@ -1,5 +1,6 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
+const path = require("node:path");
 const { assertCaptureMode, assertId, assertSessionStatus } = require("../shared/contracts");
 const {
   RETENTION_MODES,
@@ -442,6 +443,14 @@ class JarvisRepository {
         WHERE status IN ('recording', 'paused', 'finalizing')
         ORDER BY started_at ASC, id ASC
       `),
+      getStorageUsageSince: this.db.prepare(`
+        SELECT
+          COALESCE(SUM(bytes), 0) AS written_bytes,
+          COALESCE(SUM(CASE WHEN kind = 'flac_written' THEN bytes ELSE 0 END), 0)
+            AS compressed_bytes
+        FROM storage_usage_events
+        WHERE occurred_at >= ?
+      `),
       listSessionTracksForRecovery: this.db.prepare(
         "SELECT id FROM audio_tracks WHERE session_id = ? ORDER BY id"
       ),
@@ -570,6 +579,13 @@ class JarvisRepository {
     this._recoverOpenSessions = this.db.transaction((at) => {
       const openSessions = this.statements.listOpenSessions.all();
       for (const session of openSessions) {
+        if (
+          session.status === "paused" &&
+          session.stop_reason === "capture_stopped_low_disk" &&
+          Number.isSafeInteger(session.durable_boundary_at)
+        ) {
+          continue;
+        }
         const sources = this.statements.listSessionTracksForRecovery
           .all(session.id)
           .map((track) => ({ trackId: track.id, gapId: null }));
@@ -1447,6 +1463,10 @@ class JarvisRepository {
     return this.captureEvidenceStore.pauseCapture(input);
   }
 
+  pauseCaptureForLowDisk(input) {
+    return this.captureEvidenceStore.pauseCaptureForLowDisk(input);
+  }
+
   resumeCapture(input) {
     return this.captureEvidenceStore.resumeCapture(input);
   }
@@ -1535,6 +1555,70 @@ class JarvisRepository {
 
   recoverOpenSessions(at = Date.now()) {
     return this._recoverOpenSessions(assertInteger(at, "at"));
+  }
+
+  getStorageUsageSince(since) {
+    const row = this.statements.getStorageUsageSince.get(assertInteger(since, "since"));
+    return {
+      writtenBytes24h: row.written_bytes,
+      compressedBytes24h: row.compressed_bytes,
+    };
+  }
+
+  checkpointForMigration() {
+    if (!this.db?.open) throw new Error("repository is closed");
+    if (this.dbPath === ":memory:") return { busy: 0, log: 0, checkpointed: 0 };
+    const result = this.db.pragma("wal_checkpoint(TRUNCATE)")[0] ?? {};
+    if (Number(result.busy) !== 0) throw new Error("repository WAL checkpoint is busy");
+    return result;
+  }
+
+  relocateDataRoot({ fromRecordingsRoot, toRecordingsRoot }) {
+    if (
+      typeof fromRecordingsRoot !== "string" ||
+      !path.isAbsolute(fromRecordingsRoot) ||
+      typeof toRecordingsRoot !== "string" ||
+      !path.isAbsolute(toRecordingsRoot)
+    ) {
+      throw new TypeError("recordings roots must be absolute");
+    }
+    const sourceRoot = path.resolve(fromRecordingsRoot);
+    const targetRoot = path.resolve(toRecordingsRoot);
+    const relativeInside = (root, candidate) => {
+      const relative = path.relative(root, candidate);
+      return relative !== "" &&
+        !path.isAbsolute(relative) &&
+        relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`)
+          ? relative
+          : null;
+    };
+    const relocate = (locator) => {
+      if (locator === null || locator === undefined) return null;
+      if (typeof locator !== "string" || !path.isAbsolute(locator)) {
+        throw new Error("audio locator escapes the previous recordings root");
+      }
+      const canonical = path.resolve(locator);
+      if (relativeInside(targetRoot, canonical) !== null) return canonical;
+      const relative = relativeInside(sourceRoot, canonical);
+      if (relative === null) {
+        throw new Error("audio locator escapes the previous recordings root");
+      }
+      return path.resolve(targetRoot, relative);
+    };
+    return this.db.transaction(() => {
+      const rows = this.db.prepare("SELECT id, path, retired_path FROM audio_chunks").all();
+      const updates = rows.map((row) => ({
+        id: row.id,
+        path: row.path.startsWith("tombstone:") ? row.path : relocate(row.path),
+        retiredPath: relocate(row.retired_path),
+      }));
+      const update = this.db.prepare(
+        "UPDATE audio_chunks SET path = @path, retired_path = @retiredPath WHERE id = @id"
+      );
+      for (const row of updates) update.run(row);
+      return { relocated: updates.length };
+    })();
   }
 
   close() {

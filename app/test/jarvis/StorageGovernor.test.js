@@ -8,7 +8,6 @@ const GIB = 1024 ** 3;
 
 test("uses the greater absolute and percentage thresholds at inclusive boundaries", () => {
   const governor = new StorageGovernor({ reserve: { ensure() {}, release() {} } });
-
   assert.equal(
     governor.evaluate({ volumeBytes: 100 * GIB, freeBytes: 20 * GIB }),
     "warning"
@@ -80,6 +79,35 @@ test("fails safe when the emergency reserve cannot be prepared or released", () 
   );
 });
 
+test("reserve rejects a same-size linked, sparse, compressed, or under-allocated file", () => {
+  const path = require("node:path");
+  const filePath = path.resolve("unsafe-reserve");
+  const fileStat = {
+    size: 8,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+  const fsImpl = {
+    mkdirSync() {},
+    lstatSync: () => fileStat,
+    statSync: () => fileStat,
+  };
+  for (const allocation of [
+    { allocatedBytes: 8, reparse: true, sparse: false, compressed: false },
+    { allocatedBytes: 8, reparse: false, sparse: true, compressed: false },
+    { allocatedBytes: 8, reparse: false, sparse: false, compressed: true },
+    { allocatedBytes: 7, reparse: false, sparse: false, compressed: false },
+  ]) {
+    const reserve = new StorageGovernor.FileEmergencyReserve({
+      filePath,
+      sizeBytes: 8,
+      fsImpl,
+      allocationInspector: { inspect: () => allocation },
+    });
+    assert.throws(() => reserve.ensure(), /emergency reserve file is unsafe/);
+  }
+});
+
 test("rejects invalid or unsafe numeric inputs", () => {
   const governor = new StorageGovernor({ reserve: { ensure() {}, release() {} } });
   assert.throws(() => governor.evaluate({ volumeBytes: 0, freeBytes: 1 }), /volumeBytes/);
@@ -96,19 +124,23 @@ test("status reports real 24-hour bytes, projection, remaining days, root and pr
   const path = require("node:path");
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-storage-status-"));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
-  await fsp.mkdir(path.join(root, "recordings"), { recursive: true });
-  await fsp.writeFile(path.join(root, "recordings", "recent.wav"), Buffer.alloc(100));
-  await fsp.writeFile(path.join(root, "recordings", "recent.flac"), Buffer.alloc(40));
-  await fsp.writeFile(path.join(root, "recordings", "old.wav"), Buffer.alloc(80));
-  const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
-  fs.utimesSync(path.join(root, "recordings", "old.wav"), old, old);
   const governor = new StorageGovernor({ reserve: { ensure() {}, release() {} } });
+  const now = 1_750_000_000_000;
+  let telemetrySince = null;
   const manager = new JarvisStorageManager({
     currentRoot: root,
     governor,
     fsImpl: Object.assign(Object.create(fs), {
       statfsSync: () => ({ bsize: 1, blocks: 100 * GIB, bavail: 30 * GIB }),
+      readdirSync: () => {
+        throw new Error("status must not walk the data root");
+      },
     }),
+    usageProvider(since) {
+      telemetrySince = since;
+      return { writtenBytes24h: 140, compressedBytes24h: 40 };
+    },
+    now: () => now,
     migrator: { migrate: async () => ({ switched: true }) },
   });
   manager.setProgress({ state: "copying", completedFiles: 1, totalFiles: 2 });
@@ -121,5 +153,6 @@ test("status reports real 24-hour bytes, projection, remaining days, root and pr
   assert.equal(status.compressedBytes24h, 40);
   assert.equal(status.projectedDailyGrowthBytes, 140);
   assert.equal(status.remainingDays, Math.floor((30 * GIB - 5 * GIB) / 140));
+  assert.equal(telemetrySince, now - 24 * 60 * 60 * 1000);
   assert.deepEqual(status.progress, { state: "copying", completedFiles: 1, totalFiles: 2 });
 });

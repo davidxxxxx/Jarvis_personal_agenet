@@ -40,6 +40,7 @@ const CHANNELS = Object.freeze({
   getCloudBudget: "jarvis:cloud-budget:get",
   setCloudBudget: "jarvis:cloud-budget:set",
   getStorageStatus: "jarvis:storage:status",
+  pickStorageDirectory: "jarvis:storage:pick-directory",
   migrateStorage: "jarvis:storage:migrate",
   control: "jarvis:control",
   stateChanged: "jarvis:state-changed",

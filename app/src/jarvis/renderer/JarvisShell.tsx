@@ -36,7 +36,9 @@ export default function JarvisShell() {
   const selectedView = useJarvisStore((state) => state.selectedView);
   const setSelectedView = useJarvisStore((state) => state.setSelectedView);
 
-  const captureActive = ["recording", "paused", "finalizing"].includes(recording.session.status);
+  const captureActive = ["recording", "degraded", "paused", "finalizing"].includes(
+    recording.session.status
+  );
   const content =
     selectedView === "people" ? (
       <PeopleView />

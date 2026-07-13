@@ -1,6 +1,21 @@
 {
   "jarvis": {
     "storage": {
+      "chooseFolder": "Choose folder",
+      "migrationComplete": "Migration complete",
+      "oldRoot": "Previous data directory",
+      "canDeleteOldRoot": "The previous directory can be deleted after verification.",
+      "keepOldRoot": "Keep the previous directory until recovery is complete.",
+      "errorAction": "The current directory is unchanged. Check free space and access, then try again.",
+      "phases": {
+        "starting": "Preparing migration",
+        "copying": "Copying data",
+        "verifying": "Verifying copied data",
+        "activating": "Activating the new directory",
+        "rollback": "Restoring the previous directory",
+        "complete": "Migration complete",
+        "failed": "Migration failed"
+      },
       "title": "存储",
       "description": "保护证据存储空间，并安全迁移全部 Jarvis 数据。",
       "free": "可用空间",

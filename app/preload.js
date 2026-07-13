@@ -133,6 +133,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getCloudBudget: () => ipcRenderer.invoke("jarvis:cloud-budget:get"),
     setCloudBudget: (input) => ipcRenderer.invoke("jarvis:cloud-budget:set", input),
     getStorageStatus: () => ipcRenderer.invoke("jarvis:storage:status"),
+    pickStorageDirectory: () => ipcRenderer.invoke("jarvis:storage:pick-directory"),
     migrateStorage: (input) => ipcRenderer.invoke("jarvis:storage:migrate", input),
     onControl: registerListener(
       "jarvis:control",

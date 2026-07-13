@@ -365,6 +365,48 @@ test("audio metadata retention and interrupted session recovery stay in jarvis.d
   repo.close();
 });
 
+test("low-disk stop atomically persists paused tracks, reason, and durable boundary across restart recovery", () => {
+  const repo = new JarvisRepository(":memory:");
+  repo.createSession({ id: "low-disk", startedAt: 1_000, micDeviceId: "mic-1" });
+  repo.createTrack({
+    id: "track-low-disk",
+    sessionId: "low-disk",
+    sourceType: "mic",
+    deviceId: "mic-1",
+    deviceLabel: "Mic",
+    strategy: "web-audio",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+    state: "active",
+  });
+
+  repo.pauseCaptureForLowDisk({
+    sessionId: "low-disk",
+    sources: [{ trackId: "track-low-disk", expectedState: "active" }],
+    at: 2_000,
+  });
+
+  const paused = repo.getSession("low-disk");
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.stop_reason, "capture_stopped_low_disk");
+  assert.equal(paused.durable_boundary_at, 2_000);
+  assert.equal(repo.db.prepare("SELECT state FROM audio_tracks WHERE id = ?").get("track-low-disk").state, "paused");
+
+  const recovered = repo.recoverOpenSessions(5_000);
+  assert.equal(recovered.find((session) => session.id === "low-disk").stop_reason, "capture_stopped_low_disk");
+  assert.equal(repo.getSession("low-disk").status, "paused");
+
+  repo.resumeCapture({
+    sessionId: "low-disk",
+    sources: [{ trackId: "track-low-disk", expectedState: "paused" }],
+    at: 6_000,
+  });
+  assert.equal(repo.getSession("low-disk").stop_reason, null);
+  assert.equal(repo.getSession("low-disk").durable_boundary_at, null);
+  repo.close();
+});
+
 test("retired provenance is private across repository audio views", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -779,4 +821,80 @@ test("reopens the same repository object against a verified migrated database", 
   assert.equal(repo.getSession("migrated").id, "migrated");
   assert.equal(repo.dbPath, newPath);
   repo.close();
+});
+
+test("checkpoints WAL and relocates every contained audio locator in one transaction", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-relocate-locators-"));
+  const oldRecordingsRoot = path.join(root, "old", "recordings");
+  const newRecordingsRoot = path.join(root, "new", "recordings");
+  const dbPath = path.join(root, "old", "jarvis.db");
+  fs.mkdirSync(path.join(oldRecordingsRoot, "s1", "mic"), { recursive: true });
+  const wavPath = path.join(oldRecordingsRoot, "s1", "mic", "chunk.wav");
+  const retiredPath = path.join(oldRecordingsRoot, "s1", "mic", "chunk.flac");
+  const repo = new JarvisRepository(dbPath);
+  t.after(() => {
+    repo.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  repo.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  repo.insertAudioChunk({
+    id: "c1",
+    sessionId: "s1",
+    path: wavPath,
+    startedAt: 1_000,
+    endedAt: 2_000,
+    durationMs: 1_000,
+    sha256: "a".repeat(64),
+    expiresAt: 10_000,
+  });
+  repo.db
+    .prepare("UPDATE audio_chunks SET retired_path = ?, retired_format = 'flac' WHERE id = ?")
+    .run(retiredPath, "c1");
+
+  repo.checkpointForMigration();
+  repo.relocateDataRoot({ fromRecordingsRoot: oldRecordingsRoot, toRecordingsRoot: newRecordingsRoot });
+  repo.relocateDataRoot({ fromRecordingsRoot: oldRecordingsRoot, toRecordingsRoot: newRecordingsRoot });
+
+  const row = repo.db.prepare("SELECT path, retired_path FROM audio_chunks WHERE id = ?").get("c1");
+  assert.equal(row.path, path.join(newRecordingsRoot, "s1", "mic", "chunk.wav"));
+  assert.equal(row.retired_path, path.join(newRecordingsRoot, "s1", "mic", "chunk.flac"));
+  assert.equal(repo.db.pragma("wal_checkpoint(PASSIVE)", { simple: true }), 0);
+});
+
+test("locator relocation rejects one escaping absolute path without partially updating rows", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reject-locator-"));
+  const oldRecordingsRoot = path.join(root, "old", "recordings");
+  const newRecordingsRoot = path.join(root, "new", "recordings");
+  fs.mkdirSync(oldRecordingsRoot, { recursive: true });
+  const repo = new JarvisRepository(path.join(root, "old", "jarvis.db"));
+  t.after(() => {
+    repo.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  repo.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  for (const [id, chunkPath] of [
+    ["safe", path.join(oldRecordingsRoot, "safe.wav")],
+    ["escape", path.join(root, "outside.wav")],
+  ]) {
+    repo.insertAudioChunk({
+      id,
+      sessionId: "s1",
+      path: chunkPath,
+      startedAt: 1_000,
+      endedAt: 2_000,
+      durationMs: 1_000,
+      sha256: id === "safe" ? "a".repeat(64) : "b".repeat(64),
+      expiresAt: 10_000,
+    });
+  }
+
+  assert.throws(
+    () =>
+      repo.relocateDataRoot({
+        fromRecordingsRoot: oldRecordingsRoot,
+        toRecordingsRoot: newRecordingsRoot,
+      }),
+    /audio locator escapes the previous recordings root/
+  );
+  assert.equal(repo.getAudioChunk("safe").path, path.join(oldRecordingsRoot, "safe.wav"));
 });

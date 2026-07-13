@@ -95,11 +95,21 @@ function createRepository() {
       }
       return this.setSessionStatus(sessionId, "paused", at);
     },
+    pauseCaptureForLowDisk({ sessionId, sources, at }) {
+      this.pauseCapture({ sessionId, sources, at });
+      const session = sessions.get(sessionId);
+      session.stop_reason = "capture_stopped_low_disk";
+      session.durable_boundary_at = at;
+      return session;
+    },
     resumeCapture({ sessionId, sources }) {
       for (const source of sources) {
         if (source.expectedState === "paused") this.setTrackState(source.trackId, "active", null);
       }
-      return this.setSessionStatus(sessionId, "recording", null);
+      const session = this.setSessionStatus(sessionId, "recording", null);
+      session.stop_reason = null;
+      session.durable_boundary_at = null;
+      return session;
     },
     finalizeCapture({ sessionId, sources, trackState, sessionStatus, at }) {
       for (const source of sources) {
@@ -164,6 +174,116 @@ function dualSources() {
     },
   ];
 }
+
+test("rejects capture startup while the process-wide migration gate is closed", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-migration-gate-"));
+  const repository = createRepository();
+  const migrationGate = {
+    assertProducerAllowed(kind) {
+      assert.equal(kind, "capture");
+      const error = new Error("storage migration in progress");
+      error.code = "STORAGE_MIGRATION_IN_PROGRESS";
+      throw error;
+    },
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    migrationGate,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl: createSafeFs(),
+  });
+
+  try {
+    assert.throws(
+      () =>
+        service.startCapture({
+          sessionId: "s1",
+          startedAt: 1_000,
+          micDeviceId: "mic-1",
+        }),
+      (error) => error?.code === "STORAGE_MIGRATION_IN_PROGRESS"
+    );
+    assert.equal(service.getState().status, "idle");
+    assert.deepEqual(repository.tracks, []);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("rebuilds and validates the emergency reserve before capture start and resume", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-lifecycle-"));
+  const repository = createRepository();
+  let ensureCalls = 0;
+  const storageGovernor = {
+    ensureReserve() {
+      ensureCalls += 1;
+    },
+    evaluate() {
+      return "ok";
+    },
+    inspect() {
+      return { state: "ok" };
+    },
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    fsImpl: createSafeFs(),
+    storageGovernor,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.pauseCapture("s1", 1_100);
+    service.resumeCapture("s1", 1_200);
+
+    assert.equal(ensureCalls, 2);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("keeps capture paused when the emergency reserve cannot be rebuilt", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-resume-fail-"));
+  const repository = createRepository();
+  let ensureCalls = 0;
+  const storageGovernor = {
+    ensureReserve() {
+      ensureCalls += 1;
+      if (ensureCalls > 1) throw new Error("reserve unavailable");
+    },
+    evaluate() {
+      return "ok";
+    },
+    inspect() {
+      return { state: "ok" };
+    },
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    fsImpl: createSafeFs(),
+    storageGovernor,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.pauseCapture("s1", 1_100);
+
+    assert.throws(() => service.resumeCapture("s1", 1_200), /reserve unavailable/);
+    assert.equal(service.getState().status, "paused");
+    assert.equal(repository.sessions.get("s1").status, "paused");
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
 
 test("rejects capture startup when its mode differs from the persisted session", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-mode-mismatch-"));
@@ -508,6 +628,8 @@ test("checks disk again at each rotation, commits legal evidence, and safe-stops
     assert.equal(service.getState().status, "paused");
     assert.equal(service.getState().errorCode, "capture_stopped_low_disk");
     assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(repository.sessions.get("s1").stop_reason, "capture_stopped_low_disk");
+    assert.equal(repository.sessions.get("s1").durable_boundary_at, 120_900);
     assert.equal(repository.chunks.length, 2);
     assert.equal(service.appendMicPcm("s1", Buffer.alloc(4_800, 1)), false);
     const sessionDir = path.join(userDataDir, "recordings", "s1", "mic");
@@ -516,6 +638,52 @@ test("checks disk again at each rotation, commits legal evidence, and safe-stops
       false
     );
     assert.equal(fs.readdirSync(sessionDir).filter((name) => name.endsWith(".wav")).length, 2);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("protects and reconciles a low-disk stop record when its database transaction fails", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-low-disk-recovery-"));
+  const repository = createRepository();
+  let diskChecks = 0;
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({
+    bsize: 1,
+    blocks: 200 * 1024 ** 3,
+    bavail: ++diskChecks < 3 ? 20 * 1024 ** 3 : 1024 ** 3,
+  });
+  const persistLowDisk = repository.pauseCaptureForLowDisk;
+  const persistenceError = new Error("low-disk pause transaction unavailable");
+  repository.pauseCaptureForLowDisk = () => {
+    throw persistenceError;
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.throws(
+      () => service.appendMicPcm("s1", Buffer.alloc(24_000 * 2 * 60 * 2, 1)),
+      (error) => error === persistenceError
+    );
+
+    const recoveryDir = path.join(userDataDir, "recordings", ".session-recovery");
+    assert.equal(fs.readdirSync(recoveryDir).filter((name) => name.endsWith(".json")).length, 1);
+    assert.equal(repository.sessions.get("s1").status, "recording");
+
+    repository.pauseCaptureForLowDisk = persistLowDisk;
+    service.recoverOpenSessions(130_000);
+
+    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(repository.sessions.get("s1").stop_reason, "capture_stopped_low_disk");
+    assert.deepEqual(fs.readdirSync(recoveryDir), []);
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-const TARGET_VERSION = 8;
+const TARGET_VERSION = 10;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -50,7 +50,9 @@ const MIGRATION_BASE_SCHEMA = `
     processing_state TEXT NOT NULL DEFAULT 'pending',
     timeline_version INTEGER NOT NULL DEFAULT 1,
     finalized_at INTEGER,
-    ready_at INTEGER
+    ready_at INTEGER,
+    stop_reason TEXT,
+    durable_boundary_at INTEGER
   );
   CREATE TABLE IF NOT EXISTS audio_chunks (
     id TEXT PRIMARY KEY,
@@ -182,6 +184,8 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "sessions", "timeline_version INTEGER NOT NULL DEFAULT 1");
     addColumn(db, "sessions", "finalized_at INTEGER");
     addColumn(db, "sessions", "ready_at INTEGER");
+    addColumn(db, "sessions", "stop_reason TEXT");
+    addColumn(db, "sessions", "durable_boundary_at INTEGER");
     addColumn(db, "audio_chunks", "track_id TEXT");
     addColumn(db, "audio_chunks", "source_type TEXT NOT NULL DEFAULT 'mic'");
     addColumn(db, "audio_chunks", "sequence_number INTEGER NOT NULL DEFAULT 0");
@@ -259,6 +263,15 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         AND channels = 1`
     ).run(FLAC_ENCODER_VERSION, migratedAt, migratedAt);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS storage_usage_events (
+        kind TEXT NOT NULL CHECK(kind IN ('wav_written','flac_written')),
+        chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        bytes INTEGER NOT NULL CHECK(bytes > 0),
+        occurred_at INTEGER NOT NULL,
+        PRIMARY KEY(kind, chunk_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_storage_usage_events_time
+      ON storage_usage_events(occurred_at, kind);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence
       ON audio_chunks(track_id, sequence_number);
       CREATE INDEX IF NOT EXISTS idx_audio_gaps_track_ended_started
