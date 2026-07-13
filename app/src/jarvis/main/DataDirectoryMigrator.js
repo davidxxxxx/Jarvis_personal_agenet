@@ -3,8 +3,11 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
 const MigrationCoordinator = require("./MigrationCoordinator");
+const {
+  DefaultPathInspector,
+  DefaultVolumeInspector,
+} = require("./StoragePathInspector");
 
 const MANIFEST_VERSION = 2;
 
@@ -14,36 +17,21 @@ function isWithin(parent, candidate) {
 }
 
 async function sha256(filePath, fsImpl) {
-  const bytes = await fsImpl.readFile(filePath);
-  return crypto.createHash("sha256").update(bytes).digest("hex");
-}
-
-class DefaultVolumeInspector {
-  async inspect(target) {
-    if (process.platform === "win32" && /^\\\\/.test(target)) {
-      return { kind: "network", writable: false };
+  const hash = crypto.createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const handle = await fsImpl.open(filePath, "r");
+  try {
+    let position = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
     }
-    if (process.platform !== "win32") return { kind: "fixed", writable: true };
-    const root = path.parse(target).root;
-    return new Promise((resolve) => {
-      execFile(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          "$d=[System.IO.DriveInfo]::new($args[0]); [Console]::Write($d.DriveType.ToString())",
-          root,
-        ],
-        { windowsHide: true, timeout: 5_000 },
-        (error, stdout) => {
-          if (error) return resolve({ kind: "unknown", writable: false });
-          const kind = String(stdout).trim().toLowerCase();
-          resolve({ kind: kind === "fixed" ? "fixed" : kind, writable: kind === "fixed" });
-        }
-      );
-    });
+  } finally {
+    await handle.close();
   }
+  return hash.digest("hex");
 }
 
 class DataDirectoryMigrator {
@@ -58,7 +46,8 @@ class DataDirectoryMigrator {
     relocateTarget = async () => {},
     activationJournal = null,
     journalRoot = null,
-    pathInspector = { inspect: async () => ({ reparse: false, mountPoint: false }) },
+    pathInspector = new DefaultPathInspector(),
+    directoryIdentityProvider = null,
   } = {}) {
     if (!fsImpl || typeof fsImpl.lstat !== "function" || typeof fsImpl.copyFile !== "function") {
       throw new TypeError("fsImpl must provide promise-based file operations");
@@ -109,6 +98,11 @@ class DataDirectoryMigrator {
       journalRoot ?? path.join(os.tmpdir(), `jarvis-migration-journal-${crypto.randomUUID()}`)
     );
     this.pathInspector = pathInspector;
+    if (directoryIdentityProvider !== null && typeof directoryIdentityProvider !== "function") {
+      throw new TypeError("directoryIdentityProvider must be a function");
+    }
+    this.directoryIdentityProvider =
+      directoryIdentityProvider ?? ((directory) => this._captureDirectoryIdentity(directory));
     if (
       migrationCoordinator !== null &&
       (!migrationCoordinator ||
@@ -142,6 +136,7 @@ class DataDirectoryMigrator {
       const target = this._safeAbsolute(to, "destination");
       return await this.migrationCoordinator.runExclusive(async (lease) => {
       const targetVolume = await this._validateRoots(source, target);
+      await this._assertDirectoryIdentity(targetVolume.anchor);
       this._throwIfAborted(signal);
 
       const entries = await this._scanSource(source, signal);
@@ -173,8 +168,9 @@ class DataDirectoryMigrator {
 
       const targetExists = await this._exists(target);
       const targetIsEmpty = targetExists ? await this._isEmptyDirectory(target) : false;
+      let targetTreeIdentity = null;
       if (!targetExists || (targetIsEmpty && manifest.phase === "copying")) {
-        await this._ensureStaging(staging, manifest);
+        const stagingIdentity = await this._ensureStaging(staging, manifest);
         await this._assertSameVolume(staging, targetVolume);
         let copiedThisRun = 0;
         for (const entry of manifest.files) {
@@ -226,15 +222,18 @@ class DataDirectoryMigrator {
         manifest.phase = "verified";
         await this._writeManifest(manifestPath, manifest);
         await this._assertExactTree(staging, manifest.files);
+        await this._assertDirectoryIdentity(stagingIdentity);
+        await this._assertDirectoryIdentity(targetVolume.anchor);
         if (targetIsEmpty) await this.fs.rmdir(target);
         await this.fs.rename(staging, target);
         await this._assertSameVolume(target, targetVolume);
+        targetTreeIdentity = await this.directoryIdentityProvider(target);
       } else {
         if (!['verified', 'relocating', 'relocated', 'activated'].includes(manifest.phase)) {
           throw new Error("destination is unsafe");
         }
         if (manifest.phase === 'relocating') {
-          await this._assertNoUnexpectedTree(target, manifest.files);
+          await this._assertNoUnexpectedTree(target, manifest.files, manifest);
         } else {
           await this._assertExactTree(target, manifest.files);
           this.onProgress({
@@ -254,6 +253,7 @@ class DataDirectoryMigrator {
             });
           }
         }
+        targetTreeIdentity = await this.directoryIdentityProvider(target);
       }
 
       if (manifest.phase === "activated") {
@@ -270,20 +270,33 @@ class DataDirectoryMigrator {
         await this._writeManifest(manifestPath, manifest);
       }
       if (manifest.phase === "relocating") {
-        await this._restoreTargetFromSource(source, target, manifest.files);
-        await this.relocateTarget({ oldRoot: source, newRoot: target });
+        await this._assertDirectoryIdentity(targetTreeIdentity);
+        await this._restoreTargetFromSource(source, target, manifest);
+        await this.relocateTarget({
+          oldRoot: source,
+          newRoot: target,
+          migrationId: manifest.migrationId,
+          token: manifest.token,
+        });
         if (failAfterRelocation) throw new Error("migration interrupted");
         await this._recordTargetHashes(target, manifest.files);
         manifest.phase = "relocated";
         await this._writeManifest(manifestPath, manifest);
       }
       if (manifest.phase !== "relocated") throw new Error("migration manifest is invalid");
-      await this.activationJournal.begin({
+      await this._assertDirectoryIdentity(targetTreeIdentity);
+      const activationProof = {
         previous: source,
         target,
         migrationId: manifest.migrationId,
         token: manifest.token,
+        sourceIdentity: manifest.sourceId,
         targetIdentity: manifest.targetVolumeIdentity ?? manifest.targetId,
+        manifestPath,
+        manifestSha256: await sha256(manifestPath, this.fs),
+      };
+      await this.activationJournal.begin({
+        ...activationProof,
       });
       this._throwIfAborted(signal);
       this.onProgress({
@@ -297,6 +310,7 @@ class DataDirectoryMigrator {
         await this.activationJournal.mark("persisted");
         await this.activationJournal.mark("reopening");
         await lease.reopen(target, source);
+        await this._releaseEmergencyReserve(source);
         await this.activationJournal.finalize(target);
       } catch {
         try {
@@ -308,6 +322,7 @@ class DataDirectoryMigrator {
           await this.activationJournal.mark("rollback");
           await this.persistRoot(source);
           await lease.rollback(source);
+          await this._releaseEmergencyReserve(target);
           await this.activationJournal.rollback(source);
           this.onProgress({
             state: "rollback",
@@ -348,6 +363,65 @@ class DataDirectoryMigrator {
     return path.resolve(value);
   }
 
+  async validateActivationTarget(candidate, state) {
+    try {
+      const target = this._safeAbsolute(candidate, "activation target");
+      if (!state || typeof state !== "object" || state.target !== target) return false;
+      if (!["persisted", "reopening"].includes(state.phase)) return false;
+      const source = this._safeAbsolute(state.previous, "activation source");
+      const manifestPath = this._safeAbsolute(state.manifestPath, "activation manifest");
+      if (
+        manifestPath === this.journalRoot ||
+        !isWithin(this.journalRoot, manifestPath) ||
+        !/^migration_[0-9a-f]{32}$/.test(state.migrationId) ||
+        !/^[a-f0-9]{64}$/.test(state.token) ||
+        !/^[a-f0-9]{64}$/.test(state.manifestSha256) ||
+        (await sha256(manifestPath, this.fs)) !== state.manifestSha256
+      ) {
+        return false;
+      }
+      const expectedManifestName = `${crypto
+        .createHash("sha256")
+        .update(`${source}\0${target}`)
+        .digest("hex")}.json`;
+      if (path.basename(manifestPath) !== expectedManifestName) return false;
+      const manifest = await this._loadManifest(manifestPath);
+      if (
+        manifest?.version !== MANIFEST_VERSION ||
+        !["relocated", "activated"].includes(manifest.phase) ||
+        manifest.migrationId !== state.migrationId ||
+        manifest.token !== state.token ||
+        manifest.sourceId !== state.sourceIdentity ||
+        manifest.sourceId !== crypto.createHash("sha256").update(source).digest("hex") ||
+        manifest.targetId !== crypto.createHash("sha256").update(target).digest("hex") ||
+        (manifest.targetVolumeIdentity ?? manifest.targetId) !== state.targetIdentity ||
+        !Array.isArray(manifest.files)
+      ) {
+        return false;
+      }
+      await this._assertSafeTargetAncestors(source, target);
+      const targetVolume = await this.volumeInspector.inspect(target);
+      if (!targetVolume || targetVolume.kind !== "fixed" || targetVolume.writable === false) {
+        return false;
+      }
+      if (
+        manifest.targetVolumeIdentity !== null &&
+        targetVolume.identity !== manifest.targetVolumeIdentity
+      ) {
+        return false;
+      }
+      await this._assertExactTree(target, manifest.files);
+      for (const entry of manifest.files) {
+        if (!(await this._verifiedTargetFile(this._inside(target, entry.relative), entry))) {
+          return false;
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async _validateRoots(source, target) {
     if (
       source === target ||
@@ -369,12 +443,15 @@ class DataDirectoryMigrator {
     if (targetStat?.isSymbolicLink() || (targetStat && !targetStat.isDirectory())) {
       throw new Error("destination is unsafe");
     }
-    await this._assertSafeTargetAncestors(source, target);
+    const anchorPath = await this._assertSafeTargetAncestors(source, target);
     const inspected = await this.volumeInspector.inspect(target);
     if (!inspected || inspected.writable === false || inspected.kind !== "fixed") {
       throw new Error("destination is unsafe");
     }
-    return inspected;
+    return {
+      ...inspected,
+      anchor: await this.directoryIdentityProvider(anchorPath),
+    };
   }
 
   async _scanSource(root, signal) {
@@ -477,8 +554,9 @@ class DataDirectoryMigrator {
     return (await sha256(filePath, this.fs)) === expected.targetSha256;
   }
 
-  async _restoreTargetFromSource(source, target, files) {
-    await this._assertNoUnexpectedTree(target, files);
+  async _restoreTargetFromSource(source, target, manifest) {
+    const files = manifest.files;
+    await this._assertNoUnexpectedTree(target, files, manifest);
     for (const entry of files) {
       const sourceFile = this._inside(source, entry.relative);
       if (!(await this._verifiedFile(sourceFile, entry))) {
@@ -486,7 +564,7 @@ class DataDirectoryMigrator {
       }
       const targetFile = this._inside(target, entry.relative);
       await this.fs.mkdir(path.dirname(targetFile), { recursive: true });
-      const temporary = `${targetFile}.${crypto.randomUUID()}.restore`;
+      const temporary = `${targetFile}.${manifest.migrationId}.${manifest.token}.${crypto.randomUUID()}.restore`;
       try {
         await this.fs.copyFile(sourceFile, temporary, fs.constants.COPYFILE_EXCL);
         await this._fsyncFile(temporary);
@@ -522,6 +600,7 @@ class DataDirectoryMigrator {
   async _assertSafeTargetAncestors(source, target) {
     let cursor = target;
     const missing = [];
+    let anchor = null;
     while (true) {
       const stat = await this.fs.lstat(cursor).catch((error) => {
         if (error?.code === "ENOENT") return null;
@@ -533,17 +612,25 @@ class DataDirectoryMigrator {
         if (inspectedPath?.reparse || inspectedPath?.mountPoint) {
           throw new Error("destination is unsafe");
         }
-        const real = await this.fs.realpath(cursor);
-        const resolvedTarget = path.resolve(real, ...missing.reverse());
-        const realSource = await this.fs.realpath(source);
-        if (isWithin(realSource, resolvedTarget) || isWithin(resolvedTarget, realSource)) {
-          throw new Error("destination is unsafe");
+        if (anchor === null) {
+          anchor = cursor;
+          const real = await this.fs.realpath(cursor);
+          const resolvedTarget = path.resolve(real, ...missing.reverse());
+          const realSource = await this.fs.realpath(source);
+          if (isWithin(realSource, resolvedTarget) || isWithin(resolvedTarget, realSource)) {
+            throw new Error("destination is unsafe");
+          }
         }
-        return;
+      } else if (anchor !== null) {
+        throw new Error("destination is unsafe");
+      } else {
+        missing.push(path.basename(cursor));
       }
-      missing.push(path.basename(cursor));
       const parent = path.dirname(cursor);
-      if (parent === cursor) throw new Error("destination is unsafe");
+      if (parent === cursor) {
+        if (anchor === null) throw new Error("destination is unsafe");
+        return anchor;
+      }
       cursor = parent;
     }
   }
@@ -584,6 +671,56 @@ class DataDirectoryMigrator {
       staging,
       manifest.files.filter((entry) => entry.copied)
     );
+    return this.directoryIdentityProvider(staging);
+  }
+
+  async _captureDirectoryIdentity(directory) {
+    const handle = await this.fs.open(directory, "r");
+    try {
+      const [handleStat, pathStat, finalPath, volume] = await Promise.all([
+        handle.stat(),
+        this.fs.lstat(directory),
+        this.fs.realpath(directory),
+        this.volumeInspector.inspect(directory),
+      ]);
+      if (
+        !handleStat.isDirectory() ||
+        !pathStat.isDirectory() ||
+        pathStat.isSymbolicLink() ||
+        handleStat.dev !== pathStat.dev ||
+        handleStat.ino !== pathStat.ino ||
+        !volume ||
+        volume.kind !== "fixed" ||
+        volume.writable === false
+      ) {
+        throw new Error("directory identity unavailable");
+      }
+      if (this.volumeInspector.requiresStableIdentity && !volume.identity) {
+        throw new Error("directory volume identity unavailable");
+      }
+      return Object.freeze({
+        path: path.resolve(directory),
+        dev: String(handleStat.dev),
+        ino: String(handleStat.ino),
+        finalPath: path.resolve(finalPath),
+        volumeIdentity: volume.identity ?? null,
+      });
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async _assertDirectoryIdentity(expected) {
+    if (!expected) throw new Error("directory identity unavailable");
+    const actual = await this.directoryIdentityProvider(expected.path);
+    if (
+      actual.dev !== expected.dev ||
+      actual.ino !== expected.ino ||
+      actual.finalPath !== expected.finalPath ||
+      actual.volumeIdentity !== expected.volumeIdentity
+    ) {
+      throw new Error("destination directory identity changed");
+    }
   }
 
   async _assertExactTree(root, expectedFiles) {
@@ -613,7 +750,7 @@ class DataDirectoryMigrator {
     }
   }
 
-  async _assertNoUnexpectedTree(root, expectedFiles) {
+  async _assertNoUnexpectedTree(root, expectedFiles, manifest = null) {
     const expected = new Map(
       expectedFiles.map((entry) => [path.normalize(entry.relative), entry])
     );
@@ -634,15 +771,69 @@ class DataDirectoryMigrator {
         if (!stat.isFile()) throw new Error("migration staging tree is invalid");
         const normalized = path.normalize(relative);
         if (expected.has(normalized)) continue;
-        const restoreMatch = normalized.match(/^(.*)\.[0-9a-f-]{36}\.restore$/i);
-        const original = restoreMatch ? expected.get(path.normalize(restoreMatch[1])) : null;
-        if (!original || !(await this._verifiedFile(absolute, original))) {
-          throw new Error("migration staging tree is invalid");
+        if (manifest) {
+          const escapedMigrationId = manifest.migrationId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const escapedToken = manifest.token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const ownedTemporary = normalized.match(
+            new RegExp(
+              `^(.*)\\.${escapedMigrationId}\\.${escapedToken}\\.[0-9a-f-]{36}\\.(tmp|restore)$`,
+              "i"
+            )
+          );
+          if (ownedTemporary) {
+            const original = expected.get(path.normalize(ownedTemporary[1]));
+            const isSidecarTemporary =
+              ownedTemporary[2].toLowerCase() === "tmp" &&
+              path.normalize(ownedTemporary[1]).endsWith(".wav.recovery.json");
+            const isRestoreTemporary = ownedTemporary[2].toLowerCase() === "restore";
+            if (
+              original &&
+              (isSidecarTemporary || isRestoreTemporary) &&
+              (stat.nlink === undefined || stat.nlink === 1) &&
+              path.dirname(absolute) === path.dirname(this._inside(root, original.relative))
+            ) {
+              await this.fs.rm(absolute, { force: true });
+              continue;
+            }
+          }
+          if (
+            expected.has("jarvis.db") &&
+            ["jarvis.db-wal", "jarvis.db-shm"].includes(normalized) &&
+            (stat.nlink === undefined || stat.nlink === 1) &&
+            (await this._validSqliteResidue(absolute, normalized.endsWith("-wal") ? "wal" : "shm"))
+          ) {
+            await this.fs.rm(absolute, { force: true });
+            continue;
+          }
         }
-        await this.fs.rm(absolute, { force: true });
+        throw new Error("migration staging tree is invalid");
       }
     };
     await walk(root);
+  }
+
+  async _validSqliteResidue(filePath, kind) {
+    const stat = await this.fs.lstat(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return false;
+    if (kind === "shm") return stat.size >= 32 * 1024 && stat.size % (32 * 1024) === 0;
+    if (stat.size < 32) return false;
+    const header = Buffer.alloc(32);
+    const handle = await this.fs.open(filePath, "r");
+    try {
+      const { bytesRead } = await handle.read(header, 0, header.length, 0);
+      if (bytesRead !== header.length) return false;
+    } finally {
+      await handle.close();
+    }
+    const magic = header.readUInt32BE(0);
+    const pageSizeField = header.readUInt32BE(8);
+    const pageSize = pageSizeField === 1 ? 65_536 : pageSizeField;
+    return (
+      [0x377f0682, 0x377f0683].includes(magic) &&
+      pageSize >= 512 &&
+      pageSize <= 65_536 &&
+      (pageSize & (pageSize - 1)) === 0
+    );
   }
 
   async _isEmptyDirectory(directory) {
@@ -651,6 +842,21 @@ class DataDirectoryMigrator {
     const inspected = await this.pathInspector.inspect(directory, stat);
     if (inspected?.reparse || inspected?.mountPoint) throw new Error("destination is unsafe");
     return (await this.fs.readdir(directory)).length === 0;
+  }
+
+  async _releaseEmergencyReserve(root) {
+    const reservePath = path.join(root, ".emergency-reserve");
+    const stat = await this.fs.lstat(reservePath).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
+    if (stat === null) return false;
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+      throw new Error("emergency reserve file is unsafe");
+    }
+    await this.fs.rm(reservePath, { force: false });
+    await this._fsyncDirectory(root);
+    return true;
   }
 
   async _assertSameVolume(candidate, expected) {
@@ -725,5 +931,6 @@ class DataDirectoryMigrator {
 }
 
 DataDirectoryMigrator.DefaultVolumeInspector = DefaultVolumeInspector;
+DataDirectoryMigrator.DefaultPathInspector = DefaultPathInspector;
 
 module.exports = DataDirectoryMigrator;

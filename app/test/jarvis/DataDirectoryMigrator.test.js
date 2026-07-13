@@ -41,6 +41,9 @@ function createMigrator(events, overrides = {}) {
     volumeInspector: {
       inspect: async () => ({ kind: "fixed", writable: true }),
     },
+    pathInspector: {
+      inspect: async () => ({ reparse: false, mountPoint: false }),
+    },
     closeHolders: async () => events.push("close"),
     persistRoot: async (root) => events.push(`persist:${path.basename(root)}`),
     reopenHolders: async (root) => events.push(`reopen:${path.basename(root)}`),
@@ -126,6 +129,53 @@ test("rolls configuration back and reopens the old root when the new root cannot
     "reopen:old-root",
   ]);
   assert.equal(fs.existsSync(from), true);
+});
+
+test("releases only the obsolete root reserve after success and the target reserve after rollback", async (t) => {
+  for (const outcome of ["success", "rollback"]) {
+    const base = await fsp.mkdtemp(path.join(os.tmpdir(), `jarvis-reserve-${outcome}-`));
+    t.after(() => fsp.rm(base, { recursive: true, force: true }));
+    const from = path.join(base, "old-root");
+    const to = path.join(base, "new-root");
+    await writeTree(from);
+    await fsp.writeFile(path.join(from, ".emergency-reserve"), Buffer.alloc(4096, 1));
+    await fsp.writeFile(path.join(from, "keep-old-data.txt"), "preserve");
+    let targetReopens = 0;
+    const releasedAllocation = [];
+    const fsImpl = Object.assign({}, fsp, {
+      async rm(candidate, options) {
+        if (path.basename(candidate) === ".emergency-reserve") {
+          const stat = await fsp.lstat(candidate);
+          releasedAllocation.push({ root: path.dirname(candidate), bytes: stat.size });
+        }
+        return fsp.rm(candidate, options);
+      },
+    });
+    const migrator = createMigrator([], {
+      fsImpl,
+      reopenHolders: async (root) => {
+        await fsp.writeFile(path.join(root, ".emergency-reserve"), Buffer.alloc(4096, 2));
+        if (root === to && outcome === "rollback" && targetReopens++ === 0) {
+          throw new Error("target reopen failed");
+        }
+      },
+    });
+
+    if (outcome === "success") await migrator.migrate({ from, to });
+    else await assert.rejects(migrator.migrate({ from, to }), /migration activation failed/);
+
+    if (outcome === "success") {
+      assert.equal(fs.existsSync(path.join(from, ".emergency-reserve")), false);
+      assert.equal(fs.existsSync(path.join(to, ".emergency-reserve")), true);
+    } else {
+      assert.equal(fs.existsSync(path.join(to, ".emergency-reserve")), false);
+      assert.equal(fs.existsSync(path.join(from, ".emergency-reserve")), true);
+    }
+    assert.equal(await fsp.readFile(path.join(from, "keep-old-data.txt"), "utf8"), "preserve");
+    assert.deepEqual(releasedAllocation, [
+      { root: outcome === "success" ? from : to, bytes: 4096 },
+    ]);
+  }
 });
 
 test("rejects roots, nested paths, network and removable destinations without leaking paths", async (t) => {
@@ -313,6 +363,79 @@ test("crash-resumes relocation from verified source bytes without accepting forg
   assert.match(manifest.files.find((entry) => entry.relative === "jarvis.db").targetSha256, /^[a-f0-9]{64}$/);
 });
 
+test("rejects forged relocation temp and SQLite residue names", async (t) => {
+  for (const residue of ["sidecar-temp", "wal", "extra"]) {
+    const base = await fsp.mkdtemp(path.join(os.tmpdir(), `jarvis-forged-residue-${residue}-`));
+    t.after(() => fsp.rm(base, { recursive: true, force: true }));
+    const from = path.join(base, "old-root");
+    const to = path.join(base, "new-root");
+    const journalRoot = path.join(base, "journal");
+    await writeTree(from);
+    const sidecar = path.join(from, "recordings", "orphan.wav.recovery.json");
+    await fsp.writeFile(sidecar, JSON.stringify({ path: path.join(from, "recordings", "orphan.wav") }));
+    const migrator = createMigrator([], { journalRoot });
+    await assert.rejects(
+      migrator.migrate({ from, to, failAfterRelocation: true }),
+      /migration interrupted/
+    );
+    const manifestName = (await fsp.readdir(journalRoot))[0];
+    const manifest = JSON.parse(await fsp.readFile(path.join(journalRoot, manifestName), "utf8"));
+    if (residue === "sidecar-temp") {
+      await fsp.writeFile(
+        `${path.join(to, "recordings", "orphan.wav.recovery.json")}.${manifest.migrationId}.${"0".repeat(64)}.${crypto.randomUUID()}.tmp`,
+        "forged"
+      );
+    } else if (residue === "wal") {
+      await fsp.writeFile(path.join(to, "jarvis.db-wal"), "forged-wal");
+    } else {
+      await fsp.writeFile(path.join(to, "unexpected.bin"), "forged-extra");
+    }
+    await assert.rejects(
+      migrator.migrate({ from, to }),
+      /migration staging tree is invalid/
+    );
+  }
+});
+
+test("streams migration hashes with a bounded fixed buffer for large files", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-streaming-hash-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const to = path.join(base, "new-root");
+  await writeTree(from);
+  const largeFile = path.join(from, "models", "whisper", "large.bin");
+  await fsp.writeFile(largeFile, Buffer.alloc(8 * 1024 * 1024, 0x5a));
+  let peakRead = 0;
+  let streamedReads = 0;
+  const fsImpl = {
+    ...fsp,
+    async readFile(candidate, ...args) {
+      if (path.basename(candidate) === "large.bin") {
+        throw new Error("large migration files must not use readFile");
+      }
+      return fsp.readFile(candidate, ...args);
+    },
+    async open(candidate, ...args) {
+      const handle = await fsp.open(candidate, ...args);
+      if (path.basename(candidate) !== "large.bin") return handle;
+      const originalRead = handle.read.bind(handle);
+      handle.read = async (buffer, offset, length, position) => {
+        peakRead = Math.max(peakRead, length);
+        streamedReads += 1;
+        return originalRead(buffer, offset, length, position);
+      };
+      return handle;
+    },
+  };
+  const migrator = createMigrator([], { fsImpl });
+
+  await migrator.migrate({ from, to });
+
+  assert.equal(streamedReads > 0, true);
+  assert.equal(peakRead, 64 * 1024);
+  assert.equal((await fsp.stat(path.join(to, "models", "whisper", "large.bin"))).size, 8 * 1024 * 1024);
+});
+
 test("persists every activation journal boundary before switching holders", async (t) => {
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-activation-boundaries-"));
   t.after(() => fsp.rm(base, { recursive: true, force: true }));
@@ -325,6 +448,11 @@ test("persists every activation journal boundary before switching holders", asyn
       assert.equal(input.previous, from);
       assert.equal(input.target, to);
       assert.match(input.migrationId, /^[A-Za-z0-9_-]+$/);
+      assert.match(input.token, /^[a-f0-9]{64}$/);
+      assert.equal(input.sourceIdentity.length > 0, true);
+      assert.equal(input.targetIdentity.length > 0, true);
+      assert.equal(path.isAbsolute(input.manifestPath), true);
+      assert.match(input.manifestSha256, /^[a-f0-9]{64}$/);
       events.push("journal:verified");
     },
     mark(phase) {
@@ -351,6 +479,61 @@ test("persists every activation journal boundary before switching holders", asyn
     "reopen:new-root",
     "journal:complete:new-root",
   ]);
+});
+
+test("startup activation validation rejects damaged targets and accepts an exact relocated tree", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-startup-activation-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const sourceTemplate = path.join(base, "source-template");
+  await writeTree(sourceTemplate);
+  const recoveryWav = path.join(sourceTemplate, "recordings", "recovery.wav");
+  await fsp.writeFile(recoveryWav, "recovery-pcm");
+  await fsp.writeFile(
+    `${recoveryWav}.recovery.json`,
+    JSON.stringify({ path: recoveryWav, sha256: "a".repeat(64) })
+  );
+
+  for (const phase of ["persisted", "reopening"]) {
+    for (const damage of ["none", "recording", "sidecar", "model", "identity"]) {
+      const caseRoot = path.join(base, `${phase}-${damage}`);
+      const from = path.join(caseRoot, "old-root");
+      const to = path.join(caseRoot, "new-root");
+      const journalRoot = path.join(caseRoot, "journal");
+      await fsp.cp(sourceTemplate, from, { recursive: true });
+      let proof = null;
+      const migrator = createMigrator([], {
+        journalRoot,
+        activationJournal: {
+          begin(input) {
+            proof = { ...input, phase };
+            throw new Error("simulated startup crash");
+          },
+          async mark() {},
+          async finalize() {},
+          async rollback() {},
+        },
+      });
+      await assert.rejects(migrator.migrate({ from, to }), /simulated startup crash/);
+      assert.ok(proof);
+      if (damage === "recording") {
+        await fsp.rm(path.join(to, "recordings", "a.wav"));
+      } else if (damage === "sidecar") {
+        await fsp.writeFile(
+          path.join(to, "recordings", "recovery.wav.recovery.json"),
+          "tampered"
+        );
+      } else if (damage === "model") {
+        await fsp.writeFile(path.join(to, "models", "whisper", "base.bin"), "tampered");
+      } else if (damage === "identity") {
+        proof = { ...proof, targetIdentity: "forged-target-identity" };
+      }
+      assert.equal(
+        await migrator.validateActivationTarget(to, proof),
+        damage === "none",
+        `${phase}/${damage}`
+      );
+    }
+  }
 });
 
 test("uses a protected journal and random staging while rejecting forged extra files", async (t) => {
@@ -408,6 +591,59 @@ test("rejects injected reparse ancestors and accepts only an existing empty targ
     }).migrate({ from, to: reparseTarget }),
     /destination is unsafe/
   );
+});
+
+test("inspects every existing destination ancestor through the volume root", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-target-ancestors-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const safeNearestAncestor = path.join(base, "safe", "nested");
+  const to = path.join(safeNearestAncestor, "new-root");
+  await writeTree(from);
+  await fsp.mkdir(safeNearestAncestor, { recursive: true });
+  const inspected = [];
+
+  await assert.rejects(
+    createMigrator([], {
+      pathInspector: {
+        inspect: async (candidate) => {
+          inspected.push(path.resolve(candidate));
+          return {
+            reparse: path.resolve(candidate) === path.resolve(base),
+            mountPoint: false,
+          };
+        },
+      },
+    }).migrate({ from, to }),
+    /destination is unsafe/
+  );
+  assert.equal(inspected.includes(path.resolve(safeNearestAncestor)), true);
+  assert.equal(inspected.includes(path.resolve(base)), true);
+  assert.equal(fs.existsSync(to), false);
+});
+
+test("rejects an ancestor swap when the preflight and postflight directory identities differ", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-ancestor-swap-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const to = path.join(base, "new-root");
+  await writeTree(from);
+  let captures = 0;
+  const migrator = createMigrator([], {
+    directoryIdentityProvider: async (candidate) => ({
+      path: path.resolve(candidate),
+      dev: "1",
+      ino: captures++ === 0 ? "safe-ancestor" : "swapped-ancestor",
+      finalPath: path.resolve(candidate),
+      volumeIdentity: "fixed-volume",
+    }),
+  });
+
+  await assert.rejects(
+    migrator.migrate({ from, to }),
+    /destination directory identity changed/
+  );
+  assert.equal(fs.existsSync(to), false);
 });
 
 test("rejects a created staging handle whose final volume identity changed", async (t) => {

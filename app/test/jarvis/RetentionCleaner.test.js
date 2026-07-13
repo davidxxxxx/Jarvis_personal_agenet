@@ -14,8 +14,8 @@ function repositoryWith(rows) {
       promoted.push({ after, before });
       return 0;
     },
-    tombstoneChunk: (id, deletedAt) => {
-      tombstoned.push({ id, deletedAt });
+    tombstoneChunk: (id, deletedAt, options) => {
+      tombstoned.push({ id, deletedAt, options });
       return { changes: 1, jobsTerminated: 0 };
     },
   };
@@ -47,7 +47,16 @@ test("deletes hundreds of expired bytes through one async batch and tombstones c
   assert.equal(calls.length, 1);
   assert.equal(calls[0].paths.length, 240);
   assert.equal(repository.tombstoned.length, 120);
-  assert.deepEqual(repository.tombstoned[0], { id: "chunk-0", deletedAt: 5_000 });
+  assert.deepEqual(repository.tombstoned[0], {
+    id: "chunk-0",
+    deletedAt: 5_000,
+    options: { storageDeleted: true },
+  });
+  assert.deepEqual(repository.tombstoned[1], {
+    id: "chunk-1",
+    deletedAt: 5_000,
+    options: { storageDeleted: true },
+  });
   assert.deepEqual(repository.promoted, [
     { after: 5_000, before: 5_000 + RetentionCleaner.URGENT_WINDOW_MS },
   ]);
@@ -120,7 +129,9 @@ test("missing results tombstone metadata while unsafe and failed rows remain", a
   });
 
   assert.deepEqual(await cleaner.clean(5_000), { deleted: 0, missing: 1, retry: 2 });
-  assert.deepEqual(repository.tombstoned, [{ id: "missing", deletedAt: 5_000 }]);
+  assert.deepEqual(repository.tombstoned, [
+    { id: "missing", deletedAt: 5_000, options: { storageDeleted: true } },
+  ]);
 });
 
 test("promotes the exact 24-hour pre-expiry window even when no bytes are expired", async () => {
@@ -174,7 +185,9 @@ test("temporary evidence cleanup failure is isolated and reported without privat
   });
 
   assert.deepEqual(await cleaner.clean(15_000), { deleted: 1, missing: 0, retry: 0 });
-  assert.deepEqual(repository.tombstoned, [{ id: "expired", deletedAt: 15_000 }]);
+  assert.deepEqual(repository.tombstoned, [
+    { id: "expired", deletedAt: 15_000, options: { storageDeleted: true } },
+  ]);
   assert.deepEqual(logs, [
     { deleted: 1, missing: 0, retry: 0, temporaryEvidenceFailures: 1 },
   ]);
@@ -240,8 +253,8 @@ test("one retired artifact failure does not block sibling tombstones", async () 
 
   assert.deepEqual(await cleaner.clean(18_000), { deleted: 2, missing: 0, retry: 0 });
   assert.deepEqual(repository.tombstoned, [
-    { id: "locked", deletedAt: 18_000 },
-    { id: "sibling", deletedAt: 18_000 },
+    { id: "locked", deletedAt: 18_000, options: { storageDeleted: true } },
+    { id: "sibling", deletedAt: 18_000, options: { storageDeleted: true } },
   ]);
   assert.deepEqual(cleaned, ["sibling"]);
   assert.deepEqual(logs, [
@@ -262,9 +275,9 @@ test("surfaces metadata transaction failures without claiming successful cleanup
     { id: "db-fails", path: "db-fails.flac" },
     { id: "succeeds", path: "succeeds.wav" },
   ]);
-  repository.tombstoneChunk = (id, deletedAt) => {
+  repository.tombstoneChunk = (id, deletedAt, options) => {
     if (id === "db-fails") throw new Error("database unavailable");
-    repository.tombstoned.push({ id, deletedAt });
+    repository.tombstoned.push({ id, deletedAt, options });
     return { changes: 1, jobsTerminated: 1 };
   };
   const cleaner = new RetentionCleaner({
@@ -278,7 +291,13 @@ test("surfaces metadata transaction failures without claiming successful cleanup
   });
 
   await assert.rejects(cleaner.clean(20_000), /retention metadata cleanup failed/);
-  assert.deepEqual(repository.tombstoned, [{ id: "succeeds", deletedAt: 20_000 }]);
+  assert.deepEqual(repository.tombstoned, [
+    {
+      id: "succeeds",
+      deletedAt: 20_000,
+      options: { storageDeleted: true },
+    },
+  ]);
   assert.deepEqual(logs, [{ deleted: 0, missing: 1, retry: 1, metadataFailures: 1 }]);
 });
 

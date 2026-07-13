@@ -11,6 +11,7 @@ const {
 } = require("./downloadUtils");
 const WhisperServerManager = require("./whisperServer");
 const { getModelsDirForService } = require("./modelDirUtils");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const modelRegistryData = require("../models/modelRegistryData.json");
 
@@ -496,7 +497,13 @@ class WhisperManager {
     return normalized === "[blank_audio]" || normalized === "[ blank_audio ]";
   }
 
-  async downloadWhisperModel(modelName, progressCallback = null) {
+  downloadWhisperModel(modelName, progressCallback = null) {
+    return processWriteGate.runWithWriteLease("whisper-model-download", () =>
+      this._downloadWhisperModel(modelName, progressCallback)
+    );
+  }
+
+  async _downloadWhisperModel(modelName, progressCallback = null) {
     this.validateModelName(modelName);
     const modelConfig = getWhisperModelConfig(modelName);
 

@@ -445,9 +445,11 @@ class JarvisRepository {
       `),
       getStorageUsageSince: this.db.prepare(`
         SELECT
-          COALESCE(SUM(bytes), 0) AS written_bytes,
+          COALESCE(SUM(CASE WHEN kind = 'wav_written' THEN bytes ELSE 0 END), 0)
+            AS written_bytes,
           COALESCE(SUM(CASE WHEN kind = 'flac_written' THEN bytes ELSE 0 END), 0)
-            AS compressed_bytes
+            AS compressed_bytes,
+          COALESCE(SUM(delta_bytes), 0) AS net_growth_bytes
         FROM storage_usage_events
         WHERE occurred_at >= ?
       `),
@@ -1479,10 +1481,12 @@ class JarvisRepository {
     return this.captureEvidenceStore.commitChunk(chunk);
   }
 
-  tombstoneChunk(id, deletedAt = Date.now()) {
+  tombstoneChunk(id, deletedAt = Date.now(), { storageDeleted = false } = {}) {
+    if (typeof storageDeleted !== "boolean") throw new TypeError("storageDeleted must be boolean");
     return this.captureEvidenceStore.tombstoneChunk(
       assertId(id, "audioChunkId"),
-      assertInteger(deletedAt, "deletedAt")
+      assertInteger(deletedAt, "deletedAt"),
+      { storageDeleted }
     );
   }
 
@@ -1562,6 +1566,7 @@ class JarvisRepository {
     return {
       writtenBytes24h: row.written_bytes,
       compressedBytes24h: row.compressed_bytes,
+      netGrowthBytes24h: row.net_growth_bytes,
     };
   }
 

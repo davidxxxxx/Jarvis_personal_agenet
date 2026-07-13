@@ -29,12 +29,14 @@ async function hashFile(filePath) {
 }
 
 class DataRootRelocator {
-  constructor({ fsImpl = fsp, Repository = JarvisRepository } = {}) {
+  constructor({ fsImpl = fsp, Repository = JarvisRepository, faultInjector = async () => {} } = {}) {
+    if (typeof faultInjector !== "function") throw new TypeError("faultInjector must be a function");
     this.fs = fsImpl;
     this.Repository = Repository;
+    this.faultInjector = faultInjector;
   }
 
-  async relocate({ oldRoot, newRoot }) {
+  async relocate({ oldRoot, newRoot, migrationId = null, token = null }) {
     if (
       typeof oldRoot !== "string" ||
       !path.isAbsolute(oldRoot) ||
@@ -50,10 +52,18 @@ class DataRootRelocator {
       databasePath: path.join(targetRoot, "jarvis.db"),
       oldRecordingsRoot: path.join(sourceRoot, "recordings"),
       newRecordingsRoot: path.join(targetRoot, "recordings"),
+      migrationId,
+      token,
     });
   }
 
-  async relocateRecordings({ databasePath, oldRecordingsRoot, newRecordingsRoot }) {
+  async relocateRecordings({
+    databasePath,
+    oldRecordingsRoot,
+    newRecordingsRoot,
+    migrationId = null,
+    token = null,
+  }) {
     for (const [name, value] of Object.entries({
       databasePath,
       oldRecordingsRoot,
@@ -68,9 +78,19 @@ class DataRootRelocator {
     if (sourceRecordings === targetRecordings) {
       return { databaseLocators: 0, recoverySidecars: 0 };
     }
+    const operationId =
+      typeof migrationId === "string" && /^migration_[a-f0-9]{32}$/.test(migrationId)
+        ? migrationId
+        : `adoption_${crypto.randomUUID().replaceAll("-", "")}`;
+    const operationToken =
+      typeof token === "string" && /^[a-f0-9]{64}$/.test(token)
+        ? token
+        : crypto.randomBytes(32).toString("hex");
     const recoverySidecars = await this._rewriteRecoverySidecars({
       sourceRecordings,
       targetRecordings,
+      migrationId: operationId,
+      token: operationToken,
     });
 
     const repository = new this.Repository(path.resolve(databasePath));
@@ -81,6 +101,11 @@ class DataRootRelocator {
         toRecordingsRoot: targetRecordings,
       });
       databaseLocators = result.relocated;
+      await this.faultInjector("sqlite-relocation-wal-open", {
+        databasePath: path.resolve(databasePath),
+        migrationId: operationId,
+        token: operationToken,
+      });
       repository.checkpointForMigration();
     } finally {
       repository.close();
@@ -88,7 +113,7 @@ class DataRootRelocator {
     return { databaseLocators, recoverySidecars };
   }
 
-  async _rewriteRecoverySidecars({ sourceRecordings, targetRecordings }) {
+  async _rewriteRecoverySidecars({ sourceRecordings, targetRecordings, migrationId, token }) {
     const targetStat = await this.fs.lstat(targetRecordings).catch((error) => {
       if (error?.code === "ENOENT") return null;
       throw error;
@@ -131,7 +156,11 @@ class DataRootRelocator {
         if (!wavStat.isFile() || wavStat.isSymbolicLink()) {
           throw new Error("migrated recovery WAV is unsafe");
         }
-        await this._writeVerifiedJson(absolute, { ...metadata, path: mappedPath });
+        await this._writeVerifiedJson(
+          absolute,
+          { ...metadata, path: mappedPath },
+          { migrationId, token }
+        );
         rewritten += 1;
       }
     };
@@ -150,10 +179,10 @@ class DataRootRelocator {
     return path.resolve(targetRoot, relative);
   }
 
-  async _writeVerifiedJson(filePath, value) {
+  async _writeVerifiedJson(filePath, value, { migrationId, token }) {
     const bytes = Buffer.from(JSON.stringify(value));
     const expectedHash = crypto.createHash("sha256").update(bytes).digest("hex");
-    const temporary = `${filePath}.${crypto.randomUUID()}.tmp`;
+    const temporary = `${filePath}.${migrationId}.${token}.${crypto.randomUUID()}.tmp`;
     const handle = await this.fs.open(temporary, "wx", 0o600);
     try {
       await handle.writeFile(bytes);
@@ -161,6 +190,12 @@ class DataRootRelocator {
     } finally {
       await handle.close();
     }
+    await this.faultInjector("sidecar-temp-fsynced", {
+      filePath,
+      temporary,
+      migrationId,
+      token,
+    });
     await this.fs.rename(temporary, filePath);
     await this._fsyncDirectory(path.dirname(filePath));
     if ((await hashFile(filePath)) !== expectedHash) {

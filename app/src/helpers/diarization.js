@@ -6,6 +6,7 @@ const debugLogger = require("./debugLogger");
 const { downloadFile, createDownloadSignal, checkDiskSpace } = require("./downloadUtils");
 const { resolveBinaryPath, gracefulStopProcess } = require("../utils/serverUtils");
 const { getModelsDirForService } = require("./modelDirUtils");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 const { convertToWav } = require("./ffmpegUtils");
 const { getSafeTempDir } = require("./safeTempDir");
 const { applyConfirmedSpeaker } = require("./speakerAssignmentPolicy");
@@ -121,7 +122,13 @@ class DiarizationManager {
     return fs.existsSync(this.getVadModelPath());
   }
 
-  async downloadModels(progressCallback = null) {
+  downloadModels(progressCallback = null) {
+    return processWriteGate.runWithWriteLease("diarization-model-download", () =>
+      this._downloadModels(progressCallback)
+    );
+  }
+
+  async _downloadModels(progressCallback = null) {
     const modelsDir = this.getModelsDir();
     await fsPromises.mkdir(modelsDir, { recursive: true });
 

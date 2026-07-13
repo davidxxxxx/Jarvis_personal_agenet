@@ -119,6 +119,7 @@ class FileEmergencyReserve {
     if (
       !stat.isFile() ||
       stat.isSymbolicLink() ||
+      stat.nlink !== 1 ||
       !allocation ||
       allocation.reparse ||
       allocation.sparse ||

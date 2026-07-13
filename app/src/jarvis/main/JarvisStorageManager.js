@@ -42,6 +42,7 @@ class JarvisStorageManager {
         volumeBytes: 0,
         writtenBytes24h: 0,
         compressedBytes24h: 0,
+        netGrowthBytes24h: 0,
         projectedDailyGrowthBytes: 0,
         remainingDays: 0,
         progress: this.progress,
@@ -53,7 +54,7 @@ class JarvisStorageManager {
     const freeBytes = Number(stats.bavail ?? stats.bfree) * blockSize;
     const inspected = this.governor.inspect({ volumeBytes, freeBytes });
     const usage = this._recentUsage();
-    const projectedDailyGrowthBytes = usage.writtenBytes24h;
+    const projectedDailyGrowthBytes = Math.max(0, usage.netGrowthBytes24h);
     const remainingDays =
       projectedDailyGrowthBytes > 0
         ? Math.max(0, Math.floor((freeBytes - inspected.stopBytes) / projectedDailyGrowthBytes))
@@ -89,9 +90,13 @@ class JarvisStorageManager {
         throw new Error(`storage usage telemetry returned invalid ${name}`);
       }
     }
+    if (!Number.isSafeInteger(usage?.netGrowthBytes24h)) {
+      throw new Error("storage usage telemetry returned invalid netGrowthBytes24h");
+    }
     return {
       writtenBytes24h: usage.writtenBytes24h,
       compressedBytes24h: usage.compressedBytes24h,
+      netGrowthBytes24h: usage.netGrowthBytes24h,
     };
   }
 }

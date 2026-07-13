@@ -109,8 +109,17 @@ class CaptureEvidenceStore {
       `),
       getChunk: db.prepare("SELECT * FROM audio_chunks WHERE id = ?"),
       recordStorageUsage: db.prepare(`
-        INSERT OR IGNORE INTO storage_usage_events (kind, chunk_id, bytes, occurred_at)
-        VALUES (@kind, @chunkId, @bytes, @occurredAt)
+        INSERT OR IGNORE INTO storage_usage_events
+          (kind, chunk_id, bytes, delta_bytes, occurred_at)
+        VALUES (@kind, @chunkId, @bytes, @deltaBytes, @occurredAt)
+      `),
+      getCurrentStorageBytes: db.prepare(`
+        SELECT bytes FROM storage_usage_events
+        WHERE chunk_id = @chunkId
+          AND kind = CASE @format
+            WHEN 'flac' THEN 'flac_written'
+            ELSE 'wav_written'
+          END
       `),
       insertTranscriptionJob: db.prepare(`
         INSERT INTO processing_jobs (
@@ -349,6 +358,7 @@ class CaptureEvidenceStore {
           kind: "wav_written",
           chunkId: chunk.id,
           bytes: chunk.fileBytes,
+          deltaBytes: chunk.fileBytes,
           occurredAt: chunk.endedAt,
         });
       }
@@ -359,12 +369,49 @@ class CaptureEvidenceStore {
     this.createTracksTransaction = db.transaction((tracks) =>
       tracks.map((track) => this.createTrack(track))
     );
-    this.tombstoneChunkTransaction = db.transaction((id, deletedAt) => {
+    this.clearRetiredArtifactTransaction = db.transaction((input) => {
+      this._assertSafeInteger(input.occurredAt, "retired artifact occurredAt");
+      let fileBytes = input.fileBytes;
+      if (fileBytes === undefined) {
+        fileBytes = this.statements.getCurrentStorageBytes.get({
+          chunkId: input.chunkId,
+          format: input.retiredFormat,
+        })?.bytes;
+      }
+      const cleared = this.statements.clearRetiredArtifact.run(input);
+      if (cleared.changes === 1 && fileBytes !== undefined) {
+        this._assertPositiveSafeInteger(fileBytes, "retired artifact fileBytes");
+        this.statements.recordStorageUsage.run({
+          kind: "retired_deleted",
+          chunkId: input.chunkId,
+          bytes: fileBytes,
+          deltaBytes: -fileBytes,
+          occurredAt: input.occurredAt,
+        });
+      }
+      return cleared.changes;
+    });
+    this.tombstoneChunkTransaction = db.transaction((id, deletedAt, { storageDeleted }) => {
       this._assertIdentifier(id, "chunkId");
       this._assertSafeInteger(deletedAt, "deletedAt");
       const chunk = this.statements.getChunk.get(id);
       if (!chunk) return { changes: 0, jobsTerminated: 0 };
       const tombstone = this.statements.tombstoneChunk.run(deletedAt, id);
+      if (tombstone.changes === 1 && storageDeleted) {
+        const storage = this.statements.getCurrentStorageBytes.get({
+          chunkId: id,
+          format: chunk.format,
+        });
+        if (storage) {
+          this.statements.recordStorageUsage.run({
+            kind: "retention_deleted",
+            chunkId: id,
+            bytes: storage.bytes,
+            deltaBytes: -storage.bytes,
+            occurredAt: deletedAt,
+          });
+        }
+      }
       const jobs = this.statements.expireUnfinishedChunkJobs.run({
         chunkId: id,
         completedAt: chunk.deleted_at ?? deletedAt,
@@ -406,6 +453,7 @@ class CaptureEvidenceStore {
           kind: "flac_written",
           chunkId: input.chunkId,
           bytes: input.fileBytes,
+          deltaBytes: input.fileBytes,
           occurredAt: input.completedAt,
         });
       }
@@ -768,7 +816,10 @@ class CaptureEvidenceStore {
   }
 
   clearRetiredArtifact(input) {
-    return this.statements.clearRetiredArtifact.run(input).changes;
+    return this.clearRetiredArtifactTransaction({
+      ...input,
+      occurredAt: input.occurredAt ?? this.now(),
+    });
   }
 
   setRetiredArtifactHash(input) {
@@ -803,8 +854,9 @@ class CaptureEvidenceStore {
       .map((row) => this._maintenanceChunkResult(row));
   }
 
-  tombstoneChunk(id, deletedAt = this.now()) {
-    return this.tombstoneChunkTransaction(id, deletedAt);
+  tombstoneChunk(id, deletedAt = this.now(), { storageDeleted = false } = {}) {
+    if (typeof storageDeleted !== "boolean") throw new TypeError("storageDeleted must be boolean");
+    return this.tombstoneChunkTransaction(id, deletedAt, { storageDeleted });
   }
 
   promoteSoonExpiringAudioJobs(after, before) {

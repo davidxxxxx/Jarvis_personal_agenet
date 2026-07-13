@@ -57,6 +57,19 @@ class DataRootConfig {
       }
       const expectedKeys = [
         "current",
+        "manifestPath",
+        "manifestSha256",
+        "migrationId",
+        "phase",
+        "previous",
+        "sourceIdentity",
+        "target",
+        "targetIdentity",
+        "token",
+        "version",
+      ];
+      const legacyVersionTwoKeys = [
+        "current",
         "migrationId",
         "phase",
         "previous",
@@ -64,9 +77,15 @@ class DataRootConfig {
         "targetIdentity",
         "version",
       ];
+      const actualKeys = Object.keys(parsed ?? {}).sort();
+      const isCurrentVersionTwo =
+        parsed?.version === 2 &&
+        JSON.stringify(actualKeys) === JSON.stringify(expectedKeys);
+      const isLegacyVersionTwo =
+        parsed?.version === 2 &&
+        JSON.stringify(actualKeys) === JSON.stringify(legacyVersionTwoKeys);
       if (
-        parsed?.version !== 2 ||
-        JSON.stringify(Object.keys(parsed).sort()) !== JSON.stringify(expectedKeys) ||
+        (!isCurrentVersionTwo && !isLegacyVersionTwo) ||
         !["verified", "activating", "persisted", "reopening", "rollback", "complete"].includes(
           parsed.phase
         )
@@ -74,26 +93,44 @@ class DataRootConfig {
         throw new Error("invalid data root configuration");
       }
       const current = assertSafeRoot(parsed.current, "configured Jarvis data root");
+      const normalized = isLegacyVersionTwo
+        ? {
+            ...parsed,
+            token: null,
+            sourceIdentity: null,
+            manifestPath: null,
+            manifestSha256: null,
+          }
+        : parsed;
       if (parsed.phase === "complete") {
         if (
           parsed.previous !== null ||
           parsed.target !== null ||
           parsed.migrationId !== null ||
-          parsed.targetIdentity !== null
+          parsed.targetIdentity !== null ||
+          normalized.token !== null ||
+          normalized.sourceIdentity !== null ||
+          normalized.manifestPath !== null ||
+          normalized.manifestSha256 !== null
         ) {
           throw new Error("invalid data root configuration");
         }
-        return { ...parsed, current };
+        return { ...normalized, current };
       }
       if (
         typeof parsed.migrationId !== "string" ||
         !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.migrationId) ||
-        (parsed.targetIdentity !== null && typeof parsed.targetIdentity !== "string")
+        (parsed.targetIdentity !== null && typeof parsed.targetIdentity !== "string") ||
+        (normalized.token !== null && !/^[a-f0-9]{64}$/.test(normalized.token)) ||
+        (normalized.sourceIdentity !== null && typeof normalized.sourceIdentity !== "string") ||
+        (normalized.manifestPath !== null && !path.isAbsolute(normalized.manifestPath)) ||
+        (normalized.manifestSha256 !== null &&
+          !/^[a-f0-9]{64}$/.test(normalized.manifestSha256))
       ) {
         throw new Error("invalid data root configuration");
       }
       return {
-        ...parsed,
+        ...normalized,
         current,
         previous: assertSafeRoot(parsed.previous, "previous Jarvis data root"),
         target: assertSafeRoot(parsed.target, "target Jarvis data root"),
@@ -116,15 +153,34 @@ class DataRootConfig {
     return safeRoot;
   }
 
-  beginActivation({ previous, target, migrationId, targetIdentity = null }) {
+  beginActivation({
+    previous,
+    target,
+    migrationId,
+    token,
+    sourceIdentity,
+    targetIdentity,
+    manifestPath,
+    manifestSha256,
+  }) {
     const safePrevious = assertSafeRoot(previous, "previous Jarvis data root");
     const safeTarget = assertSafeRoot(target, "target Jarvis data root");
     if (safePrevious === safeTarget) throw new Error("activation roots must differ");
     if (typeof migrationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(migrationId)) {
       throw new TypeError("migrationId is invalid");
     }
-    if (targetIdentity !== null && typeof targetIdentity !== "string") {
+    if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token)) {
+      throw new TypeError("migration token is invalid");
+    }
+    if (typeof sourceIdentity !== "string" || sourceIdentity.length === 0) {
+      throw new TypeError("sourceIdentity is invalid");
+    }
+    if (typeof targetIdentity !== "string" || targetIdentity.length === 0) {
       throw new TypeError("targetIdentity is invalid");
+    }
+    const safeManifestPath = assertSafeRoot(manifestPath, "migration manifest path");
+    if (typeof manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(manifestSha256)) {
+      throw new TypeError("manifestSha256 is invalid");
     }
     const state = {
       version: 2,
@@ -132,7 +188,11 @@ class DataRootConfig {
       previous: safePrevious,
       target: safeTarget,
       migrationId,
+      token,
+      sourceIdentity,
       targetIdentity,
+      manifestPath: safeManifestPath,
+      manifestSha256,
       phase: "verified",
     };
     this._writeState(state);
@@ -154,14 +214,14 @@ class DataRootConfig {
     return next;
   }
 
-  recoverActivation(validateRoot) {
+  async recoverActivation(validateRoot) {
     if (typeof validateRoot !== "function") throw new TypeError("validateRoot is required");
     const state = this.loadState();
     if (state.phase === "complete") return state.current;
     let selected = state.previous;
     if (["persisted", "reopening"].includes(state.phase)) {
       try {
-        if (validateRoot(state.target, state)) selected = state.target;
+        if (await validateRoot(state.target, state)) selected = state.target;
       } catch {
         selected = state.previous;
       }
@@ -177,7 +237,11 @@ class DataRootConfig {
       previous: null,
       target: null,
       migrationId: null,
+      token: null,
+      sourceIdentity: null,
       targetIdentity: null,
+      manifestPath: null,
+      manifestSha256: null,
       phase: "complete",
     };
   }

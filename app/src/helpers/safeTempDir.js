@@ -1,6 +1,7 @@
 const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 let cachedSafeTempDir = null;
 
@@ -9,6 +10,7 @@ let cachedSafeTempDir = null;
 // as many native binaries (whisper-server, ffmpeg) don't handle these paths correctly.
 function getSafeTempDir() {
   if (process.env.JARVIS_DATA_ROOT && path.isAbsolute(process.env.JARVIS_DATA_ROOT)) {
+    processWriteGate.assertProducerAllowed("temp-path");
     const jarvisTemp = path.join(process.env.JARVIS_DATA_ROOT, "temp");
     fs.mkdirSync(jarvisTemp, { recursive: true });
     return jarvisTemp;

@@ -1800,6 +1800,14 @@ class JarvisService {
 
   _stopForLowDisk(at) {
     this._cancelAllVadWork();
+    const durableStop = {
+      sessionId: this.state.sessionId,
+      sources: Object.values(this.state.sources).map((source) => ({
+        trackId: source.trackId,
+        expectedState: source.state === "reconnecting" ? "recovering" : source.state,
+      })),
+      at,
+    };
     this.emergencyCommit = true;
     try {
       this.writer.closeAll(at);
@@ -1812,21 +1820,23 @@ class JarvisService {
       this._transitionSessionStatus("paused", at);
       this.state.errorCode = "capture_stopped_low_disk";
       try {
-        this._persistSessionStatus("paused", at);
-      } catch {}
+        this.repository.pauseCaptureForLowDisk(durableStop);
+      } catch (pauseError) {
+        try {
+          this._writeLowDiskRecoveryRecord(durableStop);
+        } catch (recoveryError) {
+          error.lowDiskPauseError = pauseError;
+          error.lowDiskRecoveryError = recoveryError;
+        }
+      }
+      for (const source of Object.values(this.state.sources)) {
+        if (source.state === "active") source.state = "paused";
+      }
       this._publish(at);
       throw error;
     } finally {
       this.emergencyCommit = false;
     }
-    const durableStop = {
-      sessionId: this.state.sessionId,
-      sources: Object.values(this.state.sources).map((source) => ({
-        trackId: source.trackId,
-        expectedState: source.state === "reconnecting" ? "recovering" : source.state,
-      })),
-      at,
-    };
     try {
       this.repository.pauseCaptureForLowDisk(durableStop);
     } catch (error) {

@@ -302,16 +302,15 @@ const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDe
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const {
   DataRootConfig,
-  adoptLegacyDatabaseSync,
-  copyLegacyTreeSync,
   resolveJarvisDataRoot,
   resolveRecordingsRoot,
 } = require("./src/jarvis/main/recordingStorage");
+const {
+  adoptLegacyStorage,
+  createProductionStorageComposition,
+} = require("./src/jarvis/main/JarvisStorageBootstrap");
 const StorageGovernor = require("./src/jarvis/main/StorageGovernor");
-const DataDirectoryMigrator = require("./src/jarvis/main/DataDirectoryMigrator");
-const DataRootRelocator = require("./src/jarvis/main/DataRootRelocator");
 const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
-const MigrationCoordinator = require("./src/jarvis/main/MigrationCoordinator");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
@@ -426,24 +425,24 @@ async function initializeCoreManagers() {
 
   const jarvisUserDataDir = app.getPath("userData");
   jarvisDataRootConfig = new DataRootConfig({ userDataDir: jarvisUserDataDir });
+  let storageManagerRef = null;
+  const storageComposition = createProductionStorageComposition({
+    userDataDir: jarvisUserDataDir,
+    dataRootConfig: jarvisDataRootConfig,
+    getManagers: () => [
+      whisperCudaManager,
+      whisperManager,
+      parakeetManager,
+      diarizationManager,
+    ],
+    onProgress: (progress) => storageManagerRef?.setProgress(progress),
+  });
+  const hasSavedDataRoot = jarvisDataRootConfig.hasSavedRoot();
   const legacyConfiguredRecordings = process.env.JARVIS_RECORDINGS_DIR
     ? resolveRecordingsRoot(jarvisUserDataDir, process.env.JARVIS_RECORDINGS_DIR)
     : null;
-  const configuredDataRoot = jarvisDataRootConfig.hasSavedRoot()
-    ? jarvisDataRootConfig.recoverActivation((candidate) => {
-        const candidateDb = path.join(candidate, "jarvis.db");
-        if (!require("node:fs").existsSync(candidateDb)) return false;
-        let candidateRepository = null;
-        try {
-          candidateRepository = new JarvisRepository(candidateDb);
-          candidateRepository.checkpointForMigration();
-          return true;
-        } catch {
-          return false;
-        } finally {
-          candidateRepository?.close();
-        }
-      })
+  const configuredDataRoot = hasSavedDataRoot
+    ? await storageComposition.recoverActivation()
     : legacyConfiguredRecordings
       ? resolveJarvisDataRoot(
           jarvisUserDataDir,
@@ -466,36 +465,15 @@ async function initializeCoreManagers() {
   }
   const legacyDb = path.join(jarvisUserDataDir, "jarvis.db");
   const configuredDb = path.join(configuredDataRoot, "jarvis.db");
-  if (
-    configuredDb !== legacyDb &&
-    require("node:fs").existsSync(legacyDb) &&
-    !require("node:fs").existsSync(configuredDb)
-  ) {
-    adoptLegacyDatabaseSync({ from: legacyDb, to: configuredDb });
-  }
-  if (
-    legacyConfiguredRecordings &&
-    !jarvisDataRootConfig.hasSavedRoot() &&
-    legacyConfiguredRecordings !== recordingsRoot &&
-    require("node:fs").existsSync(legacyConfiguredRecordings)
-  ) {
-    copyLegacyTreeSync({ from: legacyConfiguredRecordings, to: recordingsRoot });
-    require("node:fs").mkdirSync(path.dirname(configuredDb), { recursive: true });
-    const customRelocator = new DataRootRelocator();
-    await customRelocator.relocateRecordings({
-      databasePath: configuredDb,
-      oldRecordingsRoot: legacyConfiguredRecordings,
-      newRecordingsRoot: recordingsRoot,
-    });
-  }
   const legacyRecordings = path.join(jarvisUserDataDir, "recordings");
-  if (
-    !process.env.JARVIS_RECORDINGS_DIR &&
-    legacyRecordings !== recordingsRoot &&
-    require("node:fs").existsSync(legacyRecordings)
-  ) {
-    copyLegacyTreeSync({ from: legacyRecordings, to: recordingsRoot });
-  }
+  await adoptLegacyStorage({
+    legacyDatabasePath: legacyDb,
+    databasePath: configuredDb,
+    legacyRecordingsRoot: hasSavedDataRoot
+      ? recordingsRoot
+      : (legacyConfiguredRecordings ?? legacyRecordings),
+    recordingsRoot,
+  });
   jarvisRepository = new JarvisRepository(configuredDb);
   const storageGovernor = new StorageGovernor({
     reserve: new StorageGovernor.FileEmergencyReserve({
@@ -511,7 +489,7 @@ async function initializeCoreManagers() {
   speechVadClassifier = new SpeechVadClassifier({
     getModelPath: () => diarizationManager?.getVadModelPath?.() ?? null,
   });
-  const migrationCoordinator = new MigrationCoordinator();
+  const migrationCoordinator = storageComposition.migrationCoordinator;
   jarvisService = new JarvisService({
     repository: jarvisRepository,
     userDataDir: jarvisUserDataDir,
@@ -558,7 +536,6 @@ async function initializeCoreManagers() {
       await jarvisService.prepareStorageMigration();
       await retentionCleaner.stop();
       await jarvisAnalysisScheduler.quiesce();
-      await whisperCudaManager.quiesce();
     },
     async close() {
       jarvisRepository.checkpointForMigration();
@@ -568,25 +545,11 @@ async function initializeCoreManagers() {
     rollback: reconfigureStorageHolders,
     async resume() {
       jarvisAnalysisScheduler.resume();
-      whisperCudaManager.resume();
       retentionCleaner.start();
     },
   });
-  let storageManagerRef = null;
-  const dataDirectoryMigrator = new DataDirectoryMigrator({
-    migrationCoordinator,
-    journalRoot: path.join(jarvisUserDataDir, "jarvis-migration-journal"),
-    activationJournal: {
-      begin: (state) => jarvisDataRootConfig.beginActivation(state),
-      mark: (phase) => jarvisDataRootConfig.markActivationPhase(phase),
-      finalize: (root) => jarvisDataRootConfig.save(root),
-      rollback: (root) => jarvisDataRootConfig.save(root),
-    },
-    persistRoot: async () => {},
-    relocateTarget: ({ oldRoot, newRoot }) =>
-      new DataRootRelocator().relocate({ oldRoot, newRoot }),
-    onProgress: (progress) => storageManagerRef?.setProgress(progress),
-  });
+  storageComposition.registerWriterProvider();
+  const dataDirectoryMigrator = storageComposition.dataDirectoryMigrator;
   jarvisStorageManager = storageManagerRef = new JarvisStorageManager({
     currentRoot: configuredDataRoot,
     governor: storageGovernor,

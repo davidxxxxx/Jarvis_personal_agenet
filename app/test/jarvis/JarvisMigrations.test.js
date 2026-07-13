@@ -637,3 +637,60 @@ test("upgrades v2 gaps with timestamped restoration binding columns without losi
     db.close();
   }
 });
+
+test("upgrades v10 storage telemetry to signed deltas without losing existing writes", () => {
+  const db = new Database(":memory:");
+
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('s1', 10, 'recording', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('t1', 's1', 'mic', 24000, 1, 10, 'active');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at
+      ) VALUES ('c1', 's1', 't1', 'mic', 0, 'c1.flac', 10, 20, 10, 'pcm', 1000);
+      ALTER TABLE storage_usage_events RENAME TO storage_usage_events_new_shape;
+      CREATE TABLE storage_usage_events (
+        kind TEXT NOT NULL CHECK(kind IN ('wav_written','flac_written')),
+        chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        bytes INTEGER NOT NULL CHECK(bytes > 0),
+        occurred_at INTEGER NOT NULL,
+        PRIMARY KEY(kind, chunk_id)
+      );
+      INSERT INTO storage_usage_events (kind, chunk_id, bytes, occurred_at)
+      VALUES ('wav_written', 'c1', 144, 20), ('flac_written', 'c1', 40, 30);
+      DROP TABLE storage_usage_events_new_shape;
+      PRAGMA user_version = 10;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 200 }), {
+      fromVersion: 10,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(
+      db.prepare(`
+        SELECT kind, bytes, delta_bytes, occurred_at
+        FROM storage_usage_events ORDER BY occurred_at
+      `).all(),
+      [
+        { kind: "wav_written", bytes: 144, delta_bytes: 144, occurred_at: 20 },
+        { kind: "flac_written", bytes: 40, delta_bytes: 40, occurred_at: 30 },
+      ]
+    );
+    assert.throws(
+      () =>
+        db.prepare(`
+          INSERT INTO storage_usage_events
+            (kind, chunk_id, bytes, delta_bytes, occurred_at)
+          VALUES ('retention_deleted', 'c1', 40, 40, 40)
+        `).run(),
+      /check constraint/i
+    );
+  } finally {
+    db.close();
+  }
+});

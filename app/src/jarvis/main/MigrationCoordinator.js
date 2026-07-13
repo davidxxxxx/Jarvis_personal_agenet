@@ -1,8 +1,19 @@
+const { processWriteGate } = require("./UnifiedRootWriteGate");
+
 class MigrationCoordinator {
-  constructor({ providers = [] } = {}) {
+  constructor({ providers = [], writeGate = processWriteGate } = {}) {
     if (!Array.isArray(providers)) throw new TypeError("providers must be an array");
+    if (
+      !writeGate ||
+      ["assertProducerAllowed", "close", "open", "waitForIdle"].some(
+        (method) => typeof writeGate[method] !== "function"
+      )
+    ) {
+      throw new TypeError("writeGate must provide the unified-root gate interface");
+    }
     this.providers = [];
     this.active = false;
+    this.writeGate = writeGate;
     for (const provider of providers) this.register(provider);
   }
 
@@ -26,16 +37,14 @@ class MigrationCoordinator {
   }
 
   assertProducerAllowed() {
-    if (!this.active) return;
-    const error = new Error("storage migration in progress");
-    error.code = "STORAGE_MIGRATION_IN_PROGRESS";
-    throw error;
+    this.writeGate.assertProducerAllowed();
   }
 
   async runExclusive(operation, { previousRoot } = {}) {
     if (typeof operation !== "function") throw new TypeError("migration operation is required");
     if (this.active) throw new Error("migration already in progress");
     this.active = true;
+    this.writeGate.close();
     const providers = [...this.providers];
     let rollbackComplete = false;
     const rollbackProviders = async (root) => {
@@ -65,6 +74,7 @@ class MigrationCoordinator {
     let operationError = null;
     try {
       for (const provider of providers) await provider.quiesce();
+      await this.writeGate.waitForIdle();
       for (const provider of providers) await provider.close();
       result = await operation(lease);
     } catch (error) {
@@ -87,6 +97,7 @@ class MigrationCoordinator {
         resumeErrors.push(error);
       }
     }
+    this.writeGate.open();
     this.active = false;
     if (resumeErrors.length > 0) {
       if (operationError) resumeErrors.unshift(operationError);

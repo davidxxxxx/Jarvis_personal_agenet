@@ -108,6 +108,35 @@ test("reserve rejects a same-size linked, sparse, compressed, or under-allocated
   }
 });
 
+test("reserve rejects a hard-linked file even when size and allocation are valid", () => {
+  const path = require("node:path");
+  const filePath = path.resolve("hard-linked-reserve");
+  const fileStat = {
+    size: 8,
+    nlink: 2,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+  const reserve = new StorageGovernor.FileEmergencyReserve({
+    filePath,
+    sizeBytes: 8,
+    fsImpl: {
+      mkdirSync() {},
+      lstatSync: () => fileStat,
+    },
+    allocationInspector: {
+      inspect: () => ({
+        allocatedBytes: 8,
+        reparse: false,
+        sparse: false,
+        compressed: false,
+      }),
+    },
+  });
+
+  assert.throws(() => reserve.ensure(), /emergency reserve file is unsafe/);
+});
+
 test("rejects invalid or unsafe numeric inputs", () => {
   const governor = new StorageGovernor({ reserve: { ensure() {}, release() {} } });
   assert.throws(() => governor.evaluate({ volumeBytes: 0, freeBytes: 1 }), /volumeBytes/);
@@ -138,7 +167,7 @@ test("status reports real 24-hour bytes, projection, remaining days, root and pr
     }),
     usageProvider(since) {
       telemetrySince = since;
-      return { writtenBytes24h: 140, compressedBytes24h: 40 };
+      return { writtenBytes24h: 140, compressedBytes24h: 40, netGrowthBytes24h: 60 };
     },
     now: () => now,
     migrator: { migrate: async () => ({ switched: true }) },
@@ -151,8 +180,30 @@ test("status reports real 24-hour bytes, projection, remaining days, root and pr
   assert.equal(status.currentRoot, root);
   assert.equal(status.writtenBytes24h, 140);
   assert.equal(status.compressedBytes24h, 40);
-  assert.equal(status.projectedDailyGrowthBytes, 140);
-  assert.equal(status.remainingDays, Math.floor((30 * GIB - 5 * GIB) / 140));
+  assert.equal(status.netGrowthBytes24h, 60);
+  assert.equal(status.projectedDailyGrowthBytes, 60);
+  assert.equal(status.remainingDays, Math.floor((30 * GIB - 5 * GIB) / 60));
   assert.equal(telemetrySince, now - 24 * 60 * 60 * 1000);
   assert.deepEqual(status.progress, { state: "copying", completedFiles: 1, totalFiles: 2 });
+});
+
+test("status does not project exhaustion when signed 24-hour growth is non-positive", async () => {
+  const path = require("node:path");
+  const manager = new JarvisStorageManager({
+    currentRoot: path.resolve("non-growing-root"),
+    governor: new StorageGovernor({ reserve: { ensure() {}, release() {} } }),
+    fsImpl: { statfsSync: () => ({ bsize: 1, blocks: 100 * GIB, bavail: 30 * GIB }) },
+    usageProvider: () => ({
+      writtenBytes24h: 140,
+      compressedBytes24h: 40,
+      netGrowthBytes24h: -20,
+    }),
+    migrator: { migrate: async () => ({ switched: true }) },
+  });
+
+  const status = await manager.getStatus();
+
+  assert.equal(status.netGrowthBytes24h, -20);
+  assert.equal(status.projectedDailyGrowthBytes, 0);
+  assert.equal(status.remainingDays, null);
 });

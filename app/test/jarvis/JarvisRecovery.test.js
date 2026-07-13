@@ -92,16 +92,22 @@ test("model download wiring reports VAD recovery only after verified initializat
   );
 });
 
-test("production migration wiring drains cleanup and model producers without optional gaps", () => {
+test("main registers runtime and production composition providers without optional gaps", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
   const providerStart = mainSource.indexOf('name: "jarvis-runtime"');
-  const providerEnd = mainSource.indexOf("let storageManagerRef", providerStart);
+  const providerEnd = mainSource.indexOf("storageComposition.registerWriterProvider()", providerStart);
   const provider = mainSource.slice(providerStart, providerEnd);
+  const compositionStart = mainSource.indexOf("createProductionStorageComposition({");
+  const compositionEnd = mainSource.indexOf("const hasSavedDataRoot", compositionStart);
+  const composition = mainSource.slice(compositionStart, compositionEnd);
 
   assert.match(provider, /await retentionCleaner\.stop\(\)/);
   assert.match(provider, /await jarvisAnalysisScheduler\.quiesce\(\)/);
-  assert.match(provider, /await whisperCudaManager\.quiesce\(\)/);
   assert.match(provider, /jarvisAnalysisScheduler\.resume\(\)/);
-  assert.match(provider, /whisperCudaManager\.resume\(\)/);
   assert.doesNotMatch(provider, /quiesce\?\.|resume\?\./);
+  assert.match(composition, /whisperCudaManager/);
+  assert.match(composition, /whisperManager/);
+  assert.match(composition, /parakeetManager/);
+  assert.match(composition, /diarizationManager/);
+  assert.match(mainSource, /storageComposition\.registerWriterProvider\(\)/);
 });

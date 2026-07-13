@@ -12,6 +12,7 @@ const {
 } = require("./downloadUtils");
 const ParakeetServerManager = require("./parakeetServer");
 const { getModelsDirForService } = require("./modelDirUtils");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const modelRegistryData = require("../models/modelRegistryData.json");
 
@@ -257,7 +258,13 @@ class ParakeetManager {
     return { success: true, text };
   }
 
-  async downloadParakeetModel(modelName, progressCallback = null) {
+  downloadParakeetModel(modelName, progressCallback = null) {
+    return processWriteGate.runWithWriteLease("parakeet-model-download", () =>
+      this._downloadParakeetModel(modelName, progressCallback)
+    );
+  }
+
+  async _downloadParakeetModel(modelName, progressCallback = null) {
     this.validateModelName(modelName);
     const modelConfig = getParakeetModelConfig(modelName);
 

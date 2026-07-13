@@ -1,4 +1,4 @@
-const TARGET_VERSION = 10;
+const TARGET_VERSION = 11;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -262,14 +262,37 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         AND sample_rate = 24000
         AND channels = 1`
     ).run(FLAC_ENCODER_VERSION, migratedAt, migratedAt);
+    if (fromVersion === 10) {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_storage_usage_events_time;
+        ALTER TABLE storage_usage_events RENAME TO storage_usage_events_v10;
+      `);
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS storage_usage_events (
-        kind TEXT NOT NULL CHECK(kind IN ('wav_written','flac_written')),
+        kind TEXT NOT NULL CHECK(kind IN (
+          'wav_written','flac_written','retired_deleted','retention_deleted'
+        )),
         chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
         bytes INTEGER NOT NULL CHECK(bytes > 0),
+        delta_bytes INTEGER NOT NULL CHECK(
+          (kind IN ('wav_written','flac_written') AND delta_bytes = bytes)
+          OR
+          (kind IN ('retired_deleted','retention_deleted') AND delta_bytes = -bytes)
+        ),
         occurred_at INTEGER NOT NULL,
         PRIMARY KEY(kind, chunk_id)
       );
+    `);
+    if (fromVersion === 10) {
+      db.exec(`
+        INSERT INTO storage_usage_events (kind, chunk_id, bytes, delta_bytes, occurred_at)
+        SELECT kind, chunk_id, bytes, bytes, occurred_at
+        FROM storage_usage_events_v10;
+        DROP TABLE storage_usage_events_v10;
+      `);
+    }
+    db.exec(`
       CREATE INDEX IF NOT EXISTS idx_storage_usage_events_time
       ON storage_usage_events(occurred_at, kind);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence

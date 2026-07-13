@@ -478,9 +478,10 @@ class FlacCompressionWorker {
       await this._assertSafeExistingFile(retiredPath);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
-      this.store.clearRetiredArtifact(identity);
+      this.store.clearRetiredArtifact({ ...identity, occurredAt: this.now() });
       return 1;
     }
+    const retiredStat = await this.fs.lstat(retiredPath);
     if (
       typeof chunk.retired_file_sha256 !== "string" ||
       !/^[0-9a-f]{64}$/.test(chunk.retired_file_sha256)
@@ -501,7 +502,11 @@ class FlacCompressionWorker {
       () => this._retiredIdentityStillValid(identity)
     );
     if (!removed) return 0;
-    this.store.clearRetiredArtifact(identity);
+    this.store.clearRetiredArtifact({
+      ...identity,
+      fileBytes: retiredStat.size,
+      occurredAt: this.now(),
+    });
     return 1;
   }
 

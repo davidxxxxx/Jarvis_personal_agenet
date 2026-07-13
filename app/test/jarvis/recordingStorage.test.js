@@ -60,7 +60,7 @@ test("data-root configuration persists atomically without deleting the previous 
   assert.equal(fs.existsSync(`${config.filePath}.tmp`), false);
 });
 
-test("activation journal resumes a validated persisted target and finalizes it", (t) => {
+test("activation journal resumes only after validating the persisted migration proof", async (t) => {
   const fs = require("node:fs");
   const os = require("node:os");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-root-activation-"));
@@ -73,11 +73,33 @@ test("activation journal resumes a validated persisted target and finalizes it",
     previous,
     target,
     migrationId: "migration-1",
+    token: "a".repeat(64),
+    sourceIdentity: "source-identity",
     targetIdentity: "fixed-volume:target",
+    manifestPath: path.join(root, "journal", "manifest.json"),
+    manifestSha256: "b".repeat(64),
   });
   config.markActivationPhase("persisted");
 
-  const recovered = config.recoverActivation((candidate) => candidate === target);
+  assert.deepEqual(config.loadState(), {
+    version: 2,
+    current: target,
+    previous,
+    target,
+    migrationId: "migration-1",
+    token: "a".repeat(64),
+    sourceIdentity: "source-identity",
+    targetIdentity: "fixed-volume:target",
+    manifestPath: path.join(root, "journal", "manifest.json"),
+    manifestSha256: "b".repeat(64),
+    phase: "persisted",
+  });
+  const recovered = await config.recoverActivation(async (candidate, state) => {
+    assert.equal(candidate, target);
+    assert.equal(state.token, "a".repeat(64));
+    assert.equal(state.manifestSha256, "b".repeat(64));
+    return true;
+  });
 
   assert.equal(recovered, target);
   assert.deepEqual(config.loadState(), {
@@ -86,12 +108,16 @@ test("activation journal resumes a validated persisted target and finalizes it",
     previous: null,
     target: null,
     migrationId: null,
+    token: null,
+    sourceIdentity: null,
     targetIdentity: null,
+    manifestPath: null,
+    manifestSha256: null,
     phase: "complete",
   });
 });
 
-test("activation journal rolls an invalid target back and reads version one configs", (t) => {
+test("activation journal rolls an invalid target back and reads version one configs", async (t) => {
   const fs = require("node:fs");
   const os = require("node:os");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-root-rollback-"));
@@ -103,9 +129,18 @@ test("activation journal rolls an invalid target back and reads version one conf
   fs.writeFileSync(config.filePath, JSON.stringify({ version: 1, root: previous }));
   assert.equal(config.load(), previous);
 
-  config.beginActivation({ previous, target, migrationId: "migration-2" });
+  config.beginActivation({
+    previous,
+    target,
+    migrationId: "migration-2",
+    token: "c".repeat(64),
+    sourceIdentity: "source-identity",
+    targetIdentity: "target-identity",
+    manifestPath: path.join(root, "journal", "manifest.json"),
+    manifestSha256: "d".repeat(64),
+  });
   config.markActivationPhase("reopening");
-  assert.equal(config.recoverActivation(() => false), previous);
+  assert.equal(await config.recoverActivation(async () => false), previous);
   assert.equal(config.load(), previous);
   assert.equal(config.loadState().phase, "complete");
 });

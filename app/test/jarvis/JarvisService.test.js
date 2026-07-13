@@ -690,6 +690,55 @@ test("protects and reconciles a low-disk stop record when its database transacti
   }
 });
 
+test("persists a low-disk pause record when the emergency chunk commit and pause transaction both fail", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-low-disk-chunk-failure-"));
+  const repository = createRepository();
+  let diskChecks = 0;
+  const fsImpl = Object.create(fs);
+  fsImpl.statfsSync = () => ({
+    bsize: 1,
+    blocks: 200 * 1024 ** 3,
+    bavail: ++diskChecks < 3 ? 20 * 1024 ** 3 : 1024 ** 3,
+  });
+  const commitChunk = repository.commitChunk;
+  const pauseLowDisk = repository.pauseCaptureForLowDisk;
+  const commitError = new Error("sqlite chunk commit failed");
+  repository.commitChunk = () => {
+    throw commitError;
+  };
+  repository.pauseCaptureForLowDisk = () => {
+    throw new Error("sqlite low-disk pause failed");
+  };
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_000,
+    fsImpl,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(4_800, 1)), true);
+    assert.throws(() => service._stopForLowDisk(1_100), /failed to close audio sources/);
+    const recoveryDir = path.join(userDataDir, "recordings", ".session-recovery");
+    assert.equal(fs.readdirSync(recoveryDir).filter((name) => name.endsWith(".json")).length, 1);
+
+    repository.commitChunk = commitChunk;
+    repository.pauseCaptureForLowDisk = pauseLowDisk;
+    service.recoverOpenSessions(130_000);
+
+    assert.equal(repository.sessions.get("s1").status, "paused");
+    assert.equal(repository.sessions.get("s1").stop_reason, "capture_stopped_low_disk");
+    assert.equal(repository.sessions.get("s1").durable_boundary_at, 1_100);
+    assert.equal(repository.tracks.every((track) => ["paused", "recovering"].includes(track.state)), true);
+    assert.deepEqual(fs.readdirSync(recoveryDir), []);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
 test("shutdown flushes the last chunk and marks an active session recovered", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-service-"));
   const repository = createRepository();

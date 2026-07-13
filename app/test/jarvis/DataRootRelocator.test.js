@@ -5,6 +5,7 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { fork } = require("node:child_process");
 
 const DataRootRelocator = require("../../src/jarvis/main/DataRootRelocator");
 const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader");
@@ -12,7 +13,9 @@ const FlacCompressionWorker = require("../../src/jarvis/main/FlacCompressionWork
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
 const RetentionCleaner = require("../../src/jarvis/main/RetentionCleaner");
+const { adoptLegacyStorage } = require("../../src/jarvis/main/JarvisStorageBootstrap");
 const { copyLegacyTreeSync } = require("../../src/jarvis/main/recordingStorage");
+const DataDirectoryMigrator = require("../../src/jarvis/main/DataDirectoryMigrator");
 
 function pcmWav(pcm) {
   const header = Buffer.alloc(44);
@@ -60,6 +63,86 @@ class LosslessFixtureCodec {
       sampleCount: bytes.readUInt32LE(12),
     };
   }
+}
+
+async function killAtRelocationCrashPoint({ source, target, journalRoot, point }) {
+  const fixture = path.join(__dirname, "fixtures", "relocationCrashChild.js");
+  const child = fork(fixture, [source, target, journalRoot, point], {
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  await new Promise((resolve, reject) => {
+    let reached = false;
+    child.on("message", (message) => {
+      if (message?.type !== "crash-point" || message.point !== point) return;
+      reached = true;
+      child.kill("SIGKILL");
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (!reached) {
+        reject(new Error(`child exited before ${point}: code=${code} signal=${signal} ${stderr}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function createCrashMigrationSource(root) {
+  const source = path.join(root, "old-root");
+  const recordings = path.join(source, "recordings");
+  const wav = path.join(recordings, "s1", "mic", "chunk-c1.wav");
+  const recoveryWav = path.join(recordings, "s1", "mic", "recovery", "chunk-recovery.wav");
+  const pcm = Buffer.alloc(48, 0x64);
+  await fsp.mkdir(path.dirname(wav), { recursive: true });
+  await fsp.mkdir(path.dirname(recoveryWav), { recursive: true });
+  await fsp.writeFile(wav, pcmWav(pcm));
+  await fsp.writeFile(recoveryWav, pcmWav(pcm));
+  const repository = new JarvisRepository(path.join(source, "jarvis.db"));
+  repository.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  repository.createTrack({
+    id: "track-c1",
+    sessionId: "s1",
+    sourceType: "mic",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  repository.commitChunk({
+    id: "c1",
+    sessionId: "s1",
+    trackId: "track-c1",
+    sourceType: "mic",
+    sequenceNumber: 0,
+    path: wav,
+    startedAt: 1_000,
+    endedAt: 1_001,
+    durationMs: 1,
+    sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
+    expiresAt: 10_000,
+  });
+  repository.checkpointForMigration();
+  repository.close();
+  await fsp.writeFile(
+    `${recoveryWav}.recovery.json`,
+    JSON.stringify({
+      id: "chunk-recovery",
+      sessionId: "s1",
+      trackId: "track-c1",
+      sourceType: "mic",
+      sequenceNumber: 1,
+      path: recoveryWav,
+      startedAt: 1_001,
+      endedAt: 1_002,
+      durationMs: 1,
+      sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
+    })
+  );
+  return { source, pcm };
 }
 
 test("relocates SQLite and recovery sidecar locators before the old root is deleted", async (t) => {
@@ -234,6 +317,10 @@ test("adopts a custom recordings root into unified storage before deleting the o
     durationMs: 1,
     sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
     expiresAt: 10_000,
+    format: "wav",
+    sampleRate: 24_000,
+    channels: 1,
+    encoderVersion: "fixture-flac-v1",
   });
   repository.checkpointForMigration();
   repository.close();
@@ -277,3 +364,173 @@ test("adopts a custom recordings root into unified storage before deleting the o
   assert.equal(fs.existsSync(sidecar.path), true);
   migrated.close();
 });
+
+test("adopts default userData recordings through the production coordinator", async (t) => {
+  const userDataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-default-recordings-"));
+  t.after(() => fsp.rm(userDataDir, { recursive: true, force: true }));
+  const legacyRecordings = path.join(userDataDir, "recordings");
+  const unifiedRoot = path.join(userDataDir, "jarvis");
+  const unifiedRecordings = path.join(unifiedRoot, "recordings");
+  const legacyDb = path.join(userDataDir, "jarvis.db");
+  const relativeWav = path.join("s1", "mic", "chunk-c1.wav");
+  const relativeRecovery = path.join("s1", "mic", "recovery", "chunk-recovery.wav");
+  const oldWav = path.join(legacyRecordings, relativeWav);
+  const oldRecoveryWav = path.join(legacyRecordings, relativeRecovery);
+  const pcm = Buffer.alloc(48, 0x53);
+  await fsp.mkdir(path.dirname(oldWav), { recursive: true });
+  await fsp.mkdir(path.dirname(oldRecoveryWav), { recursive: true });
+  await fsp.writeFile(oldWav, pcmWav(pcm));
+  await fsp.writeFile(oldRecoveryWav, pcmWav(pcm));
+  const legacy = new JarvisRepository(legacyDb);
+  legacy.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  legacy.createTrack({
+    id: "track-c1",
+    sessionId: "s1",
+    sourceType: "mic",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  legacy.commitChunk({
+    id: "c1",
+    sessionId: "s1",
+    trackId: "track-c1",
+    sourceType: "mic",
+    sequenceNumber: 0,
+    path: oldWav,
+    startedAt: 1_000,
+    endedAt: 1_001,
+    durationMs: 1,
+    sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
+    expiresAt: 10_000,
+    format: "wav",
+    sampleRate: 24_000,
+    channels: 1,
+    encoderVersion: "fixture-flac-v1",
+  });
+  legacy.checkpointForMigration();
+  legacy.close();
+  await fsp.writeFile(
+    `${oldRecoveryWav}.recovery.json`,
+    JSON.stringify({
+      id: "chunk-recovery",
+      sessionId: "s1",
+      trackId: "track-c1",
+      sourceType: "mic",
+      sequenceNumber: 1,
+      path: oldRecoveryWav,
+      startedAt: 1_001,
+      endedAt: 1_002,
+      durationMs: 1,
+      sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
+    })
+  );
+
+  const adopted = await adoptLegacyStorage({
+    legacyDatabasePath: legacyDb,
+    databasePath: path.join(unifiedRoot, "jarvis.db"),
+    legacyRecordingsRoot: legacyRecordings,
+    recordingsRoot: unifiedRecordings,
+  });
+  await fsp.rm(legacyRecordings, { recursive: true, force: true });
+
+  assert.deepEqual(adopted, {
+    databaseAdopted: true,
+    databaseLocators: 1,
+    recoverySidecars: 1,
+  });
+  const migrated = new JarvisRepository(path.join(unifiedRoot, "jarvis.db"));
+  const chunk = migrated.getAudioChunk("c1");
+  assert.equal(chunk.path, path.join(unifiedRecordings, relativeWav));
+  const reader = new AudioEvidenceReader({
+    recordingsRoot: unifiedRecordings,
+    decoder: new LosslessFixtureCodec(),
+  });
+  assert.deepEqual((await reader.readPlayableWav(chunk)).subarray(44), pcm);
+  const worker = new FlacCompressionWorker({
+    store: migrated.captureEvidenceStore,
+    recordingsRoot: unifiedRecordings,
+    encoder: new LosslessFixtureCodec(),
+    reader,
+    now: () => 2_000,
+  });
+  const compressionJob = migrated.db
+    .prepare("SELECT * FROM processing_jobs WHERE chunk_id = ? AND job_type = 'compress_chunk'")
+    .get("c1");
+  await worker.run(compressionJob);
+  const compressed = migrated.captureEvidenceStore.getChunkForMaintenance("c1");
+  assert.equal(compressed.format, "flac");
+  assert.equal(compressed.path.startsWith(unifiedRecordings), true);
+  assert.equal(fs.existsSync(compressed.path), true);
+  assert.equal(compressed.retired_path, null);
+  assert.equal(fs.existsSync(path.join(unifiedRecordings, relativeWav)), false);
+  const sidecar = JSON.parse(
+    await fsp.readFile(`${path.join(unifiedRecordings, relativeRecovery)}.recovery.json`, "utf8")
+  );
+  assert.equal(sidecar.path, path.join(unifiedRecordings, relativeRecovery));
+  const service = new JarvisService({
+    repository: migrated,
+    userDataDir: unifiedRoot,
+    recordingsDir: unifiedRecordings,
+    flacCompressionWorker: null,
+    broadcast() {},
+    now: () => 3_000,
+  });
+  assert.deepEqual(service.recoverOpenSessions(3_000).map((session) => session.id), ["s1"]);
+  assert.equal(migrated.getAudioChunk("chunk-recovery").path, sidecar.path);
+  assert.equal(fs.existsSync(`${sidecar.path}.recovery.json`), false);
+  const cleaner = new RetentionCleaner({
+    repository: migrated,
+    recordingsRoot: unifiedRecordings,
+    deleteBatch: async (_root, paths) =>
+      Promise.all(
+        paths.map(async (filePath) => {
+          await fsp.rm(filePath, { force: true });
+          return { status: "deleted" };
+        })
+      ),
+    artifactCleaner: worker,
+    temporaryEvidenceCleaner: reader,
+    now: () => 10_000,
+  });
+  assert.deepEqual(await cleaner.clean(10_000), { deleted: 1, retry: 0, missing: 0 });
+  assert.equal(migrated.getAudioChunk("c1").path, "tombstone:c1");
+  service.shutdown();
+  migrated.close();
+});
+
+for (const crashPoint of ["sidecar-temp-fsynced", "sqlite-relocation-wal-open"]) {
+  test(`resumes in a new process after forced termination at ${crashPoint}`, async (t) => {
+    const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-relocation-process-crash-"));
+    t.after(() => fsp.rm(base, { recursive: true, force: true }));
+    const { source, pcm } = await createCrashMigrationSource(base);
+    const target = path.join(base, "new-root");
+    const journalRoot = path.join(base, "journal");
+
+    await killAtRelocationCrashPoint({ source, target, journalRoot, point: crashPoint });
+
+    const relocator = new DataRootRelocator();
+    const migrator = new DataDirectoryMigrator({
+      journalRoot,
+      volumeInspector: {
+        inspect: async () => ({ kind: "fixed", writable: true, identity: "test-volume" }),
+      },
+      pathInspector: {
+        inspect: async () => ({ reparse: false, mountPoint: false }),
+      },
+      relocateTarget: ({ oldRoot, newRoot, migrationId, token }) =>
+        relocator.relocate({ oldRoot, newRoot, migrationId, token }),
+    });
+    const result = await migrator.migrate({ from: source, to: target });
+    assert.equal(result.switched, true);
+    const repository = new JarvisRepository(path.join(target, "jarvis.db"));
+    const chunk = repository.getAudioChunk("c1");
+    assert.equal(chunk.path.startsWith(path.join(target, "recordings")), true);
+    const reader = new AudioEvidenceReader({
+      recordingsRoot: path.join(target, "recordings"),
+      decoder: new LosslessFixtureCodec(),
+    });
+    assert.deepEqual((await reader.readPlayableWav(chunk)).subarray(44), pcm);
+    repository.close();
+  });
+}

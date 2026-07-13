@@ -14,6 +14,7 @@ const {
   findFiles,
 } = require("./downloadUtils");
 const { getSafeTempDir } = require("./safeTempDir");
+const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
 
 const GITHUB_RELEASE_URL = "https://api.github.com/repos/OpenWhispr/whisper.cpp/releases/latest";
 
@@ -104,7 +105,9 @@ class WhisperCudaManager {
       error.code = "STORAGE_MIGRATION_IN_PROGRESS";
       return Promise.reject(error);
     }
-    const operation = Promise.resolve().then(() => this._download(progressCallback));
+    const operation = processWriteGate.runWithWriteLease("cuda-component-download", () =>
+      this._download(progressCallback)
+    );
     this._activeDownload = operation;
     operation.then(
       () => {

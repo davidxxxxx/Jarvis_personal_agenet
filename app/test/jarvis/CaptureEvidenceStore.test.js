@@ -1309,7 +1309,7 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
   );
 });
 
-test("records bounded idempotent WAV and FLAC byte telemetry in capture transactions", (t) => {
+test("records idempotent signed storage growth and deletion telemetry in evidence transactions", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
   store.commitChunk(
@@ -1336,12 +1336,45 @@ test("records bounded idempotent WAV and FLAC byte telemetry in capture transact
     channels: 1,
     completedAt: 200,
   });
+  db.prepare(`
+    UPDATE audio_chunks
+    SET retired_path = 'c1.wav', retired_format = 'wav',
+        retired_file_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    WHERE id = 'c1'
+  `).run();
+  const retiredIdentity = {
+    chunkId: "c1",
+    retiredPath: "c1.wav",
+    retiredFileSha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    occurredAt: 201,
+  };
+  assert.equal(store.clearRetiredArtifact(retiredIdentity), 1);
+  assert.equal(store.clearRetiredArtifact(retiredIdentity), 0);
+  assert.equal(store.tombstoneChunk("c1", 202, { storageDeleted: true }).changes, 1);
+  assert.equal(store.tombstoneChunk("c1", 203, { storageDeleted: true }).changes, 0);
 
   assert.deepEqual(
-    db.prepare("SELECT kind, chunk_id, bytes, occurred_at FROM storage_usage_events ORDER BY kind").all(),
+    db.prepare(`
+      SELECT kind, chunk_id, bytes, delta_bytes, occurred_at
+      FROM storage_usage_events ORDER BY occurred_at
+    `).all(),
     [
-      { kind: "flac_written", chunk_id: "c1", bytes: 40, occurred_at: 200 },
-      { kind: "wav_written", chunk_id: "c1", bytes: 144, occurred_at: 20 },
+      { kind: "wav_written", chunk_id: "c1", bytes: 144, delta_bytes: 144, occurred_at: 20 },
+      { kind: "flac_written", chunk_id: "c1", bytes: 40, delta_bytes: 40, occurred_at: 200 },
+      {
+        kind: "retired_deleted",
+        chunk_id: "c1",
+        bytes: 144,
+        delta_bytes: -144,
+        occurred_at: 201,
+      },
+      {
+        kind: "retention_deleted",
+        chunk_id: "c1",
+        bytes: 40,
+        delta_bytes: -40,
+        occurred_at: 202,
+      },
     ]
   );
 });
@@ -1414,10 +1447,12 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
     assert.deepEqual(repository.getStorageUsageSince(20), {
       writtenBytes24h: 144,
       compressedBytes24h: 0,
+      netGrowthBytes24h: 144,
     });
     assert.deepEqual(repository.getStorageUsageSince(21), {
       writtenBytes24h: 0,
       compressedBytes24h: 0,
+      netGrowthBytes24h: 0,
     });
     assert.deepEqual(
       repository.listRetiredArtifactBacklog().map((row) => ({

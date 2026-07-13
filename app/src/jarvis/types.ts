@@ -303,6 +303,7 @@ export interface JarvisStorageStatus {
   stopBytes: number;
   writtenBytes24h: number;
   compressedBytes24h: number;
+  netGrowthBytes24h: number;
   projectedDailyGrowthBytes: number;
   remainingDays: number | null;
   currentRoot: string;

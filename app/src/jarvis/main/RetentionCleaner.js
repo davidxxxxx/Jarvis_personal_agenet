@@ -125,7 +125,9 @@ class RetentionCleaner {
         const result = results[index] ?? { status: "retry" };
         if (result.status === "deleted" || result.status === "missing") {
           try {
-            this.repository.tombstoneChunk(expired[index].id, at);
+            this.repository.tombstoneChunk(expired[index].id, at, {
+              storageDeleted: true,
+            });
             counts[result.status] += 1;
           } catch (error) {
             counts.retry += 1;
