@@ -10,6 +10,7 @@ const {
 } = require("../../src/jarvis/main/UnifiedRootWriteGate");
 const MigrationCoordinator = require("../../src/jarvis/main/MigrationCoordinator");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const { TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const { DataRootConfig } = require("../../src/jarvis/main/recordingStorage");
 const { getModelsDirForService } = require("../../src/helpers/modelDirUtils");
 const { getSafeTempDir, resetSafeTempDir } = require("../../src/helpers/safeTempDir");
@@ -353,6 +354,6 @@ test("production composition migrates with real config relocator inspectors coor
   assert.equal(dataRootConfig.load(), target);
   assert.equal(await composition.recoverActivation(), target);
   const targetRepository = new JarvisRepository(path.join(target, "jarvis.db"));
-  assert.equal(targetRepository.db.pragma("user_version", { simple: true }), 11);
+  assert.equal(targetRepository.db.pragma("user_version", { simple: true }), TARGET_VERSION);
   targetRepository.close();
 });

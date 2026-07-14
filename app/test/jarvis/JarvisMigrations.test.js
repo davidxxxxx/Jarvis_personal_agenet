@@ -694,3 +694,59 @@ test("upgrades v10 storage telemetry to signed deltas without losing existing wr
     db.close();
   }
 });
+
+test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE transcript_segments (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        person_id TEXT,
+        speaker_label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        is_stable INTEGER NOT NULL,
+        analysis_state TEXT NOT NULL DEFAULT 'pending'
+      );
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('s1', 10, 'completed', 10);
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence, is_stable
+      ) VALUES ('legacy', 's1', 10, 20, 'mic', 'legacy text', 0.5, 1);
+      PRAGMA user_version = 11;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: 11,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(
+      db.prepare(`
+        SELECT track_id, chunk_id, source_type, result_kind, version,
+               model_version, completed_at
+        FROM transcript_segments WHERE id = 'legacy'
+      `).get(),
+      {
+        track_id: null,
+        chunk_id: null,
+        source_type: "mic",
+        result_kind: "provisional",
+        version: 1,
+        model_version: null,
+        completed_at: null,
+      }
+    );
+  } finally {
+    db.close();
+  }
+});

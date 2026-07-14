@@ -83,6 +83,37 @@ const ALLOWED_MEETING_PROVIDERS = new Set([
 // streaming providers must be told the true PCM rate or they misread the audio.
 const MEETING_STREAM_SAMPLE_RATE = 24000;
 const MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES = 512 * 1024;
+const JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT = 1_024;
+
+function createJarvisTranscribeWavAdapter({
+  whisperManager,
+  model,
+  readFile = fs.promises.readFile,
+}) {
+  if (!whisperManager || typeof whisperManager.transcribeLocalWhisper !== "function") {
+    throw new TypeError("whisperManager.transcribeLocalWhisper must be a function");
+  }
+  if (typeof model !== "string" || !model.trim()) {
+    throw new TypeError("a configured Jarvis Whisper model is required");
+  }
+  if (typeof readFile !== "function") throw new TypeError("readFile must be a function");
+  const configuredModel = model.trim();
+  return async ({ path: verifiedWavPath, language = null, initialPrompt = "" }) => {
+    if (typeof verifiedWavPath !== "string" || !verifiedWavPath) {
+      throw new TypeError("verified WAV path is required");
+    }
+    if (language !== null) throw new TypeError("Jarvis final transcription uses auto language");
+    const boundedPrompt = Array.from(typeof initialPrompt === "string" ? initialPrompt : "")
+      .slice(-JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT)
+      .join("");
+    const wav = await readFile(verifiedWavPath);
+    return whisperManager.transcribeLocalWhisper(wav, {
+      model: configuredModel,
+      language: null,
+      initialPrompt: boundedPrompt || null,
+    });
+  };
+}
 
 function parseAttendees(raw) {
   if (!raw) return [];
@@ -396,6 +427,13 @@ class IPCHandlers {
         this.broadcastToWindows("cuda-fallback-notification", {});
       });
     }
+  }
+
+  createJarvisTranscribeWavAdapter({ model }) {
+    return createJarvisTranscribeWavAdapter({
+      whisperManager: this.whisperManager,
+      model,
+    });
   }
 
   _getWhisperVadSettings() {
@@ -9603,3 +9641,4 @@ class IPCHandlers {
 }
 
 module.exports = IPCHandlers;
+module.exports.createJarvisTranscribeWavAdapter = createJarvisTranscribeWavAdapter;

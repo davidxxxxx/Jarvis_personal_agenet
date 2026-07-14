@@ -1,4 +1,4 @@
-const TARGET_VERSION = 11;
+const TARGET_VERSION = 12;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -93,6 +93,14 @@ function addColumn(db, table, definition) {
   if (!columns(db, table).has(name)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
   }
+}
+
+function tableExists(db, table) {
+  return Boolean(
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table)
+  );
 }
 
 function rebuildLegacyProcessingJobs(db) {
@@ -198,6 +206,23 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "audio_chunks", "retired_path TEXT");
     addColumn(db, "audio_chunks", "retired_format TEXT");
     addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
+    // JarvisRepository creates the legacy transcript table after evidence migrations
+    // on a fresh database. Existing databases already have it, so migrate those rows
+    // here while the repository schema below supplies the same columns for new installs.
+    if (tableExists(db, "transcript_segments")) {
+      addColumn(db, "transcript_segments", "track_id TEXT");
+      addColumn(db, "transcript_segments", "chunk_id TEXT");
+      addColumn(db, "transcript_segments", "source_type TEXT NOT NULL DEFAULT 'mic'");
+      addColumn(db, "transcript_segments", "result_kind TEXT NOT NULL DEFAULT 'provisional'");
+      addColumn(db, "transcript_segments", "version INTEGER NOT NULL DEFAULT 1");
+      addColumn(db, "transcript_segments", "model_version TEXT");
+      addColumn(db, "transcript_segments", "completed_at INTEGER");
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
+        ON transcript_segments(chunk_id, model_version)
+        WHERE chunk_id IS NOT NULL AND result_kind = 'final';
+      `);
+    }
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS audio_tracks (

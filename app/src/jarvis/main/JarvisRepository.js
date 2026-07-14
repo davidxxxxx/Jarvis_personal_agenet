@@ -18,6 +18,8 @@ const DEFAULT_CLOUD_LIMIT_MICROUSD = 5_000_000;
 const MIN_CLOUD_LIMIT_MICROUSD = 5_000_000;
 const MAX_CLOUD_LIMIT_MICROUSD = 10_000_000;
 const CLOUD_RESERVATION_MICROUSD = 100_000;
+const TRANSCRIPT_PROMPT_CODE_POINT_LIMIT = 1_024;
+const TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT = 800;
 const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   recording: "active",
   finalizing: "active",
@@ -73,7 +75,14 @@ const SCHEMA = `
     text TEXT NOT NULL,
     confidence REAL NOT NULL,
     is_stable INTEGER NOT NULL,
-    analysis_state TEXT NOT NULL DEFAULT 'pending'
+    analysis_state TEXT NOT NULL DEFAULT 'pending',
+    track_id TEXT,
+    chunk_id TEXT,
+    source_type TEXT NOT NULL DEFAULT 'mic',
+    result_kind TEXT NOT NULL DEFAULT 'provisional',
+    version INTEGER NOT NULL DEFAULT 1,
+    model_version TEXT,
+    completed_at INTEGER
   );
   CREATE TABLE IF NOT EXISTS cloud_budget_settings (
     provider TEXT PRIMARY KEY,
@@ -193,6 +202,9 @@ const SCHEMA = `
   ) VALUES ('openai', 5000000, 0, 0);
   CREATE INDEX IF NOT EXISTS idx_segments_session_time
     ON transcript_segments(session_id, started_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
+    ON transcript_segments(chunk_id, model_version)
+    WHERE chunk_id IS NOT NULL AND result_kind = 'final';
   CREATE INDEX IF NOT EXISTS idx_audio_expiry ON audio_chunks(expires_at);
   CREATE INDEX IF NOT EXISTS idx_cloud_usage_month ON cloud_usage(month_utc, provider, status);
   CREATE INDEX IF NOT EXISTS idx_analysis_session ON analysis_runs(session_id, window_end);
@@ -240,6 +252,17 @@ function normalizedKey(value) {
 function derivedId(prefix, ...parts) {
   const digest = crypto.createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
   return `${prefix}_${digest}`;
+}
+
+function takeCodePointTail(value, limit) {
+  const points = Array.from(value);
+  return points.slice(Math.max(0, points.length - limit)).join("");
+}
+
+function codedError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
 }
 
 class JarvisRepository {
@@ -340,6 +363,35 @@ class JarvisRepository {
         SELECT * FROM transcript_segments
         WHERE session_id = ?
         ORDER BY started_at ASC, id ASC
+      `),
+      listTranscriptPromptSegments: this.db.prepare(`
+        SELECT text FROM transcript_segments
+        WHERE session_id = ? AND is_stable = 1 AND length(trim(text)) > 0
+        ORDER BY ended_at DESC, id DESC
+        LIMIT 16
+      `),
+      getChunkForTranscriptCommit: this.db.prepare(`
+        SELECT * FROM audio_chunks WHERE id = ?
+      `),
+      getFinalChunkTranscript: this.db.prepare(`
+        SELECT * FROM transcript_segments
+        WHERE chunk_id = ? AND result_kind = 'final' AND model_version = ?
+      `),
+      insertFinalChunkTranscript: this.db.prepare(`
+        INSERT OR IGNORE INTO transcript_segments (
+          id, session_id, started_at, ended_at, person_id, speaker_label,
+          text, confidence, is_stable, analysis_state, track_id, chunk_id,
+          source_type, result_kind, version, model_version, completed_at
+        ) VALUES (
+          @id, @sessionId, @startedAt, @endedAt, NULL, @speakerLabel,
+          @text, @confidence, 1, 'pending', @trackId, @chunkId,
+          @sourceType, 'final', 1, @modelVersion, @completedAt
+        )
+      `),
+      setChunkTranscriptionStatus: this.db.prepare(`
+        UPDATE audio_chunks
+        SET transcription_status = @status
+        WHERE id = @chunkId AND write_state = 'committed' AND deleted_at IS NULL
       `),
       clearSelf: this.db.prepare("UPDATE people SET is_self = 0 WHERE is_self <> 0"),
       renamePerson: this.db.prepare(`
@@ -602,6 +654,68 @@ class JarvisRepository {
       return openSessions.map((session) => this.statements.getSession.get(session.id));
     });
 
+    this._commitChunkTranscript = this.db.transaction(
+      ({ chunk, result, modelVersion, completedAt }) => {
+        const current = this.statements.getChunkForTranscriptCommit.get(chunk.id);
+        if (
+          !current ||
+          current.deleted_at !== null ||
+          current.write_state !== "committed" ||
+          !current.path ||
+          current.path.startsWith("tombstone:") ||
+          current.session_id !== chunk.session_id ||
+          current.track_id !== chunk.track_id ||
+          current.source_type !== chunk.source_type ||
+          current.sha256 !== chunk.sha256
+        ) {
+          throw codedError("AUDIO_UNAVAILABLE");
+        }
+
+        if (result.noSpeech === true) {
+          const updated = this.statements.setChunkTranscriptionStatus.run({
+            chunkId: current.id,
+            status: "no_speech",
+          });
+          if (updated.changes !== 1) throw codedError("AUDIO_UNAVAILABLE");
+          return null;
+        }
+
+        let segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
+        if (!segment) {
+          const id = derivedId(
+            "chunk_transcript",
+            current.session_id,
+            current.track_id ?? "",
+            current.id,
+            current.sha256,
+            modelVersion
+          );
+          this.statements.insertFinalChunkTranscript.run({
+            id,
+            sessionId: current.session_id,
+            startedAt: current.started_at,
+            endedAt: current.ended_at,
+            speakerLabel: current.source_type,
+            text: result.text,
+            confidence: result.confidence,
+            trackId: current.track_id,
+            chunkId: current.id,
+            sourceType: current.source_type,
+            modelVersion,
+            completedAt,
+          });
+          segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
+        }
+        if (!segment) throw codedError("TRANSCRIPT_COMMIT_FAILED");
+        const updated = this.statements.setChunkTranscriptionStatus.run({
+          chunkId: current.id,
+          status: "completed",
+        });
+        if (updated.changes !== 1) throw codedError("AUDIO_UNAVAILABLE");
+        return segment;
+      }
+    );
+
     this._backfillLegacyMicChunks = this.db.transaction(
       ({ sessionId, deterministicTrackId, chunkIds, createdAt }) => {
         const session = this.statements.getSession.get(sessionId);
@@ -776,6 +890,54 @@ class JarvisRepository {
 
   listTranscriptSegments(sessionId) {
     return this.statements.listSegments.all(assertId(sessionId, "sessionId"));
+  }
+
+  getTranscriptPrompt(sessionId) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const chronological = this.statements.listTranscriptPromptSegments
+      .all(safeSessionId)
+      .reverse()
+      .map((row) => row.text.replace(/\s+/gu, " ").trim())
+      .filter(Boolean)
+      .join(" ");
+    const context = takeCodePointTail(chronological, TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT);
+    const instruction =
+      "这是真实的中英双语对话。中文写中文，English terms stay in English; do not translate or invent names.";
+    return takeCodePointTail(
+      context ? `${instruction}\nRecent context: ${context}` : instruction,
+      TRANSCRIPT_PROMPT_CODE_POINT_LIMIT
+    );
+  }
+
+  commitChunkTranscript({ chunk, result, modelVersion, completedAt }) {
+    if (!chunk || typeof chunk !== "object") throw new TypeError("chunk is required");
+    assertId(chunk.id, "audioChunkId");
+    if (!result || typeof result !== "object") throw new TypeError("result is required");
+    if (result.noSpeech !== true) {
+      if (typeof result.text !== "string" || !result.text.trim()) {
+        throw new TypeError("transcript text is required");
+      }
+      if (
+        typeof result.confidence !== "number" ||
+        !Number.isFinite(result.confidence) ||
+        result.confidence < 0 ||
+        result.confidence > 1
+      ) {
+        throw new RangeError("transcript confidence must be between zero and one");
+      }
+    }
+    if (typeof modelVersion !== "string" || !modelVersion.trim() || modelVersion.length > 128) {
+      throw new TypeError("modelVersion must be a non-empty string of at most 128 characters");
+    }
+    assertInteger(completedAt, "completedAt");
+    return this._commitChunkTranscript({
+      chunk,
+      result: result.noSpeech === true
+        ? { noSpeech: true }
+        : { text: result.text.trim(), confidence: result.confidence },
+      modelVersion: modelVersion.trim(),
+      completedAt,
+    });
   }
 
   renamePerson(input) {
