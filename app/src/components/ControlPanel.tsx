@@ -296,7 +296,7 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
       if (useLocalWhisper && localTranscriptionProvider === "whisper") {
         try {
           const status = await window.electronAPI?.getCudaWhisperStatus?.();
-          if (status?.gpuInfo.hasNvidiaGpu && !status.downloaded) results.cuda = true;
+          if (status?.gpuInfo.hasNvidiaGpu && !status.verified) results.cuda = true;
         } catch {}
       }
       if (useCleanupModel) {

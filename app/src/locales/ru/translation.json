@@ -2558,6 +2558,7 @@
     "activating": "Активация GPU...",
     "activationFailed": "Не удалось активировать GPU",
     "retry": "Повторить",
+    "rollback": "Откатить",
     "remove": "Удалить",
     "dismiss": "Не сейчас",
     "cancel": "Отмена"

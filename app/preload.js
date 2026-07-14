@@ -356,6 +356,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   downloadCudaWhisperBinary: () => ipcRenderer.invoke("download-cuda-whisper-binary"),
   cancelCudaWhisperDownload: () => ipcRenderer.invoke("cancel-cuda-whisper-download"),
   deleteCudaWhisperBinary: () => ipcRenderer.invoke("delete-cuda-whisper-binary"),
+  rollbackCudaWhisperBinary: () => ipcRenderer.invoke("rollback-cuda-whisper-binary"),
   onCudaDownloadProgress: registerListener(
     "cuda-download-progress",
     (callback) => (_event, data) => callback(data)

@@ -2567,6 +2567,7 @@
     "activating": "正在激活 GPU...",
     "activationFailed": "无法激活 GPU",
     "retry": "重试",
+    "rollback": "回退",
     "remove": "移除",
     "dismiss": "暂不启用",
     "cancel": "取消"

@@ -16,11 +16,9 @@ const OpenAIRealtimeStreaming = require("./openaiRealtimeStreaming");
 const { getCortiToken } = require("./cortiAuth");
 const { createTinfoilRealtimeSocket } = require("./tinfoilSecureClient");
 const AudioStorageManager = require("./audioStorage");
-const {
-  createBoundedRecoveryBuffer,
-  createMeetingRecoveryLoop,
-} = require("./meetingRecoveryLoop");
+const { createBoundedRecoveryBuffer, createMeetingRecoveryLoop } = require("./meetingRecoveryLoop");
 const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
+const { activateVerifiedCudaRuntime } = require("../jarvis/main/CudaWhisperActivation");
 
 // Tinfoil's only realtime STT model — fallback when the renderer omits one.
 const TINFOIL_REALTIME_MODEL = "voxtral-mini-4b-realtime";
@@ -378,6 +376,7 @@ class IPCHandlers {
     this.textEditMonitor = managers.textEditMonitor;
     this.getTrayManager = managers.getTrayManager;
     this.whisperCudaManager = managers.whisperCudaManager;
+    this.whisperCudaVerifier = managers.whisperCudaVerifier;
     this.googleCalendarManager = managers.googleCalendarManager;
     this.meetingDetectionEngine = managers.meetingDetectionEngine;
     this.audioTapManager = managers.audioTapManager;
@@ -1895,7 +1894,7 @@ class IPCHandlers {
 
     ipcMain.handle("whisper-server-start", async (event, modelName) => {
       const useCuda =
-        process.env.WHISPER_CUDA_ENABLED === "true" && this.whisperCudaManager?.isDownloaded();
+        process.env.WHISPER_CUDA_ENABLED === "true" && this.whisperCudaManager?.isVerified();
       return this.whisperManager.startServer(modelName, { useCuda });
     });
 
@@ -1944,7 +1943,9 @@ class IPCHandlers {
             await this.whisperManager.stopServer();
             if (modelName) {
               await this.whisperManager.startServer(modelName, {
-                useCuda: !!process.env.WHISPER_CUDA_ENABLED,
+                useCuda:
+                  process.env.WHISPER_CUDA_ENABLED === "true" &&
+                  this.whisperCudaManager?.isVerified({ gpuUuid: uuid || null }),
               });
             }
           }
@@ -1987,12 +1988,19 @@ class IPCHandlers {
       const { detectNvidiaGpu } = require("../utils/gpuDetection");
       const gpuInfo = await detectNvidiaGpu();
       if (!this.whisperCudaManager) {
-        return { downloaded: false, downloading: false, path: null, gpuInfo };
+        return {
+          downloaded: false,
+          present: false,
+          downloading: false,
+          verified: false,
+          path: null,
+          version: null,
+          reason: "not_supported",
+          gpuInfo,
+        };
       }
       return {
-        downloaded: this.whisperCudaManager.isDownloaded(),
-        downloading: this.whisperCudaManager.isDownloading(),
-        path: this.whisperCudaManager.getCudaBinaryPath(),
+        ...this.whisperCudaManager.getStatus(),
         gpuInfo,
       };
     });
@@ -2002,20 +2010,66 @@ class IPCHandlers {
         return { success: false, error: "CUDA not supported on this platform" };
       }
       try {
-        await this.whisperCudaManager.download((progress) => {
-          if (progress.type === "progress" && !event.sender.isDestroyed()) {
-            event.sender.send("cuda-download-progress", {
-              downloadedBytes: progress.downloaded_bytes,
-              totalBytes: progress.total_bytes,
-              percentage: progress.percentage,
+        const modelName = process.env.LOCAL_WHISPER_MODEL;
+        if (!modelName) throw new Error("Install a local Whisper model before verifying CUDA");
+        const modelPath = this.whisperManager.getModelPath(modelName);
+        if (!fs.existsSync(modelPath))
+          throw new Error("The selected local Whisper model is not installed");
+        if (!this.whisperCudaVerifier) throw new Error("CUDA verifier is unavailable");
+        const { detectNvidiaGpu, listNvidiaGpus } = require("../utils/gpuDetection");
+        const [gpuInfo, gpuList] = await Promise.all([detectNvidiaGpu(), listNvidiaGpus()]);
+        const selectedUuid =
+          process.env.TRANSCRIPTION_GPU_UUID || gpuList.find((gpu) => gpu.uuid)?.uuid || null;
+        if (!selectedUuid) throw new Error("No NVIDIA GPU UUID is available for CUDA proof");
+        const verification = {
+          verify: (input) => this.whisperCudaVerifier.verify(input),
+          getMetadata: () => this.whisperCudaVerifier.getLastProofMetadata(),
+          modelPath,
+          gpuUuid: selectedUuid,
+          driver: gpuInfo.driverVersion || null,
+          modelId: modelName,
+        };
+        const currentStatus = this.whisperCudaManager.getStatus({ gpuUuid: selectedUuid });
+        const result = currentStatus.path
+          ? await this.whisperCudaManager.verifyInstalledCudaRuntime(verification)
+          : await this.whisperCudaManager.installPinnedCudaRuntime({
+              consent: true,
+              verification,
+              onProgress: (progress) => {
+                if (progress.type === "progress" && !event.sender.isDestroyed()) {
+                  event.sender.send("cuda-download-progress", {
+                    downloadedBytes: progress.downloaded_bytes,
+                    totalBytes: progress.total_bytes,
+                    percentage: progress.percentage,
+                  });
+                }
+              },
             });
-          }
+        const verified = currentStatus.path
+          ? result?.ok === true
+          : result?.verification?.ok === true;
+        if (!verified || !this.whisperCudaManager.isVerified({ gpuUuid: selectedUuid })) {
+          this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
+          return { success: false, error: result?.reason || "CUDA verification failed; using CPU" };
+        }
+        const activation = await activateVerifiedCudaRuntime({
+          whisperManager: this.whisperManager,
+          modelName,
+          gpuUuid: selectedUuid,
+          setEnabled: async (enabled) => {
+            if (enabled) this._syncStartupEnv({ WHISPER_CUDA_ENABLED: "true" });
+            else this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
+          },
         });
-        this._syncStartupEnv({ WHISPER_CUDA_ENABLED: "true" });
-        // Restart whisper-server so it picks up the CUDA binary
-        await this.whisperManager.stopServer().catch(() => {});
+        if (!activation.enabled) {
+          return {
+            success: false,
+            error: `${activation.error}; CUDA remains installed but CPU fallback is active`,
+          };
+        }
         return { success: true };
       } catch (error) {
+        this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
         debugLogger.error("CUDA binary download failed", {
           error: error.message,
           stack: error.stack,
@@ -2038,6 +2092,42 @@ class IPCHandlers {
         await this.whisperManager.stopServer().catch(() => {});
       }
       return result;
+    });
+
+    ipcMain.handle("rollback-cuda-whisper-binary", async () => {
+      if (!this.whisperCudaManager) return { success: false, error: "CUDA not supported" };
+      const result = await this.whisperCudaManager.rollback();
+      if (!result.success) return result;
+      const status = this.whisperCudaManager.getStatus();
+      const gpuUuid = process.env.TRANSCRIPTION_GPU_UUID || status.verification?.gpuUuid || null;
+      const eligible = this.whisperCudaManager.isVerified({ gpuUuid });
+      const modelName = process.env.LOCAL_WHISPER_MODEL;
+      if (!eligible) {
+        this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
+        await this.whisperManager.stopServer().catch(() => {});
+        if (modelName) {
+          await this.whisperManager.startServer(modelName, { useCuda: false }).catch(() => {});
+        }
+        return {
+          ...result,
+          enabled: false,
+          error: "Rolled-back runtime is not verified for this GPU",
+        };
+      }
+      const activation = await activateVerifiedCudaRuntime({
+        whisperManager: this.whisperManager,
+        modelName,
+        gpuUuid,
+        setEnabled: async (enabled) => {
+          if (enabled) this._syncStartupEnv({ WHISPER_CUDA_ENABLED: "true" });
+          else this._syncStartupEnv({}, ["WHISPER_CUDA_ENABLED"]);
+        },
+      });
+      return {
+        ...result,
+        enabled: activation.enabled,
+        ...(activation.error ? { error: activation.error } : {}),
+      };
     });
 
     ipcMain.handle("check-ffmpeg-availability", async (event) => {
@@ -4139,7 +4229,8 @@ class IPCHandlers {
       meetingLocalTranscript += `${meetingLocalTranscript ? " " : ""}${text}`;
       if (source === "mic" || source === "system") {
         const sourceTranscript = meetingLocalTranscriptBySource[source];
-        meetingLocalTranscriptBySource[source] = `${sourceTranscript ? `${sourceTranscript} ` : ""}${text}`;
+        meetingLocalTranscriptBySource[source] =
+          `${sourceTranscript ? `${sourceTranscript} ` : ""}${text}`;
       }
     };
 
@@ -4185,10 +4276,7 @@ class IPCHandlers {
       const fallbackStart = Math.min(safeEnd, Number.MAX_SAFE_INTEGER - 1);
       const safeStart = Number.isSafeInteger(startedAt) ? startedAt : fallbackStart;
       const intervalStart = Math.min(safeStart, Number.MAX_SAFE_INTEGER - 1);
-      const intervalEnd = Math.min(
-        Number.MAX_SAFE_INTEGER,
-        Math.max(intervalStart + 1, safeEnd)
-      );
+      const intervalEnd = Math.min(Number.MAX_SAFE_INTEGER, Math.max(intervalStart + 1, safeEnd));
 
       if (includeInLocalTranscript) {
         appendMeetingLocalTranscript(text, source);
@@ -4387,9 +4475,7 @@ class IPCHandlers {
         const segments = streaming.completedSegments;
         const latestSegment = segments.length > 0 ? segments[segments.length - 1] : text;
         const segmentEndedAt = Date.now();
-        const segmentStartedAt = Number.isSafeInteger(timestamp)
-          ? timestamp
-          : segmentEndedAt - 1;
+        const segmentStartedAt = Number.isSafeInteger(timestamp) ? timestamp : segmentEndedAt - 1;
         let micSuppression = null;
         if (source === "mic") {
           micSuppression = shouldSuppressMicTranscriptSegment(segmentStartedAt, segmentEndedAt);
@@ -6044,9 +6130,12 @@ class IPCHandlers {
           await startMeetingAec(systemAudioMode);
           assertMeetingTranscriptionStartCurrent();
 
-          meetingLocalTimer = setInterval(() => {
-            transcribeAllLocalBuffers();
-          }, activeJarvisSessionId ? JARVIS_STABLE_WINDOW_MS : 5000);
+          meetingLocalTimer = setInterval(
+            () => {
+              transcribeAllLocalBuffers();
+            },
+            activeJarvisSessionId ? JARVIS_STABLE_WINDOW_MS : 5000
+          );
 
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,
@@ -6302,11 +6391,7 @@ class IPCHandlers {
           return;
         }
         try {
-          await this.jarvisService.sourceInterrupted(
-            sessionId,
-            "system",
-            persistence.payload
-          );
+          await this.jarvisService.sourceInterrupted(sessionId, "system", persistence.payload);
         } catch (error) {
           if (!isCurrent()) {
             finish(false);
@@ -6319,10 +6404,7 @@ class IPCHandlers {
           );
           const delay =
             managedSystemInterruptionRetryDelaysMs[
-              Math.min(
-                persistence.attempt,
-                managedSystemInterruptionRetryDelaysMs.length - 1
-              )
+              Math.min(persistence.attempt, managedSystemInterruptionRetryDelaysMs.length - 1)
             ];
           persistence.attempt += 1;
           persistence.timer = setTimeout(() => {
@@ -6356,12 +6438,7 @@ class IPCHandlers {
       });
     };
 
-    const persistManagedSystemGapAfterRestoration = (
-      inputBinding,
-      producer,
-      sessionId,
-      reason
-    ) => {
+    const persistManagedSystemGapAfterRestoration = (inputBinding, producer, sessionId, reason) => {
       if (
         activeMeetingInputBinding !== inputBinding ||
         inputBinding.active !== true ||
@@ -6369,12 +6446,7 @@ class IPCHandlers {
       ) {
         return Promise.resolve(false);
       }
-      return persistManagedSystemInterruption(
-        inputBinding,
-        producer,
-        sessionId,
-        reason
-      ).settled;
+      return persistManagedSystemInterruption(inputBinding, producer, sessionId, reason).settled;
     };
 
     const getManagedSystemRecovery = (inputBinding, manager, warningLabel, sessionId) => {
@@ -6410,9 +6482,7 @@ class IPCHandlers {
             committed: false,
             failed: false,
             overflowed: false,
-            recoveryBuffer: createBoundedRecoveryBuffer(
-              MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES
-            ),
+            recoveryBuffer: createBoundedRecoveryBuffer(MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES),
           };
           recovery.inFlightProducer = producer;
           const rejectCandidate = () => rejectManagedMeetingSystemProducer(producer);
@@ -6636,12 +6706,7 @@ class IPCHandlers {
       );
       void persistence.settled.then((persisted) => {
         if (!persisted || manager !== this.windowsLoopbackAudioManager) return;
-        const recovery = getManagedSystemRecovery(
-          inputBinding,
-          manager,
-          warningLabel,
-          sessionId
-        );
+        const recovery = getManagedSystemRecovery(inputBinding, manager, warningLabel, sessionId);
         recovery.failedProducer = producer;
         void recovery.start();
       });
@@ -6874,8 +6939,7 @@ class IPCHandlers {
             diarizationSegments,
             diarizationStartedAt,
             diarizationLeaseRelease,
-          } =
-            await captureMeetingDiarizationState();
+          } = await captureMeetingDiarizationState();
           const transcript =
             diarizationSegments
               .map((segment) => segment.text)
@@ -6919,8 +6983,7 @@ class IPCHandlers {
           diarizationSegments,
           diarizationStartedAt,
           diarizationLeaseRelease,
-        } =
-          await captureMeetingDiarizationState();
+        } = await captureMeetingDiarizationState();
         const transcript =
           diarizationSegments
             .map((segment) => segment.text)

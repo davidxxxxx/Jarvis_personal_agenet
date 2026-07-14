@@ -567,6 +567,12 @@ export default function TranscriptionModelPicker({
     setCudaStatus(status || null);
   };
 
+  const handleCudaRollback = async () => {
+    await window.electronAPI?.rollbackCudaWhisperBinary?.();
+    const status = await window.electronAPI?.getCudaWhisperStatus?.();
+    setCudaStatus(status || null);
+  };
+
   const handleCudaCancel = async () => {
     await window.electronAPI?.cancelCudaWhisperDownload?.();
     setCudaDownloading(false);
@@ -1063,20 +1069,32 @@ export default function TranscriptionModelPicker({
             getCachedPlatform() !== "darwin" &&
             cudaStatus?.gpuInfo.hasNvidiaGpu && (
               <div className="rounded-md border border-border bg-surface-1 p-2.5">
-                {cudaStatus.downloaded ? (
+                {cudaStatus.verified ? (
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-1.5">
                       <Check size={13} className="text-success" />
                       <span className="text-xs font-medium text-foreground">{t("gpu.active")}</span>
                     </div>
-                    <Button
-                      onClick={handleCudaDelete}
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 px-2 text-xs text-muted-foreground hover:text-destructive"
-                    >
-                      {t("gpu.remove")}
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      {cudaStatus.canRollback && (
+                        <Button
+                          onClick={handleCudaRollback}
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-2 text-xs text-muted-foreground"
+                        >
+                          {t("gpu.rollback")}
+                        </Button>
+                      )}
+                      <Button
+                        onClick={handleCudaDelete}
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 px-2 text-xs text-muted-foreground hover:text-destructive"
+                      >
+                        {t("gpu.remove")}
+                      </Button>
+                    </div>
                   </div>
                 ) : (
                   <div className="flex items-start gap-2.5">
@@ -1085,6 +1103,11 @@ export default function TranscriptionModelPicker({
                       <p className="text-xs font-medium text-foreground">
                         {t("gpu.transcriptionBanner")}
                       </p>
+                      {cudaStatus.downloaded && (
+                        <p className="text-[11px] text-muted-foreground mt-0.5">
+                          {cudaStatus.reason}
+                        </p>
+                      )}
                       <div className="flex items-center gap-2 mt-1.5">
                         <Button
                           onClick={handleCudaDownload}
@@ -1092,8 +1115,28 @@ export default function TranscriptionModelPicker({
                           variant="default"
                           className="h-6 px-2.5 text-xs"
                         >
-                          {t("gpu.enableButton")}
+                          {cudaStatus.downloaded ? t("gpu.retry") : t("gpu.enableButton")}
                         </Button>
+                        {cudaStatus.downloaded && (
+                          <Button
+                            onClick={handleCudaDelete}
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-xs text-muted-foreground hover:text-destructive"
+                          >
+                            {t("gpu.remove")}
+                          </Button>
+                        )}
+                        {cudaStatus.canRollback && (
+                          <Button
+                            onClick={handleCudaRollback}
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-2 text-xs text-muted-foreground"
+                          >
+                            {t("gpu.rollback")}
+                          </Button>
+                        )}
                         <button
                           onClick={() => setCudaDismissed(true)}
                           className="text-xs text-muted-foreground hover:text-foreground transition-colors"

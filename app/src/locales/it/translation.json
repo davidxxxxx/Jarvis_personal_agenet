@@ -2554,6 +2554,7 @@
     "activating": "Attivazione GPU...",
     "activationFailed": "Impossibile attivare la GPU",
     "retry": "Riprova",
+    "rollback": "Ripristina",
     "remove": "Rimuovi",
     "dismiss": "Non ora",
     "cancel": "Annulla"

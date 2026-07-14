@@ -282,7 +282,22 @@ export interface GpuInfo {
 
 export interface CudaWhisperStatus {
   downloaded: boolean;
+  present: boolean;
+  downloading: boolean;
+  verified: boolean;
   path: string | null;
+  version: string | null;
+  reason: string;
+  declined?: boolean;
+  canRollback?: boolean;
+  actions?: Array<"retry" | "rollback" | "remove">;
+  verification?: {
+    ok: boolean;
+    backend: "cuda" | "cpu" | "unknown";
+    gpuUuid: string | null;
+    reason: string;
+    verifiedAt?: string;
+  } | null;
   gpuInfo: GpuInfo;
 }
 
@@ -916,6 +931,12 @@ declare global {
       downloadCudaWhisperBinary: () => Promise<{ success: boolean; error?: string }>;
       cancelCudaWhisperDownload: () => Promise<{ success: boolean }>;
       deleteCudaWhisperBinary: () => Promise<{ success: boolean }>;
+      rollbackCudaWhisperBinary: () => Promise<{
+        success: boolean;
+        enabled?: boolean;
+        path?: string | null;
+        error?: string;
+      }>;
       onCudaDownloadProgress: (
         callback: (data: {
           downloadedBytes: number;

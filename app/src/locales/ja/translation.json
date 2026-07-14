@@ -2554,6 +2554,7 @@
     "activating": "GPU を有効化中...",
     "activationFailed": "GPU を有効化できませんでした",
     "retry": "再試行",
+    "rollback": "ロールバック",
     "remove": "削除",
     "dismiss": "後で",
     "cancel": "キャンセル"

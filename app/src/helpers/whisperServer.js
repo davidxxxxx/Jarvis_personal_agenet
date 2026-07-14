@@ -160,10 +160,11 @@ function buildWhisperServerArgs({
 }
 
 class WhisperServerManager extends EventEmitter {
-  constructor({ spawnImpl = spawn } = {}) {
+  constructor({ spawnImpl = spawn, cudaBinaryResolver = null } = {}) {
     super();
     if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
     this.spawnImpl = spawnImpl;
+    this.cudaBinaryResolver = cudaBinaryResolver;
     this.process = null;
     this.hostname = "127.0.0.1";
     this.port = null;
@@ -176,6 +177,8 @@ class WhisperServerManager extends EventEmitter {
     this.cachedFFmpegPath = null;
     this.canConvert = false;
     this.useCuda = false;
+    this.selectedGpuUuid = null;
+    this.lastServerOutput = "";
     this.vadSignature = "vad:off";
     this.threadSignature = "threads:default";
     this.lastStartOptions = {};
@@ -274,10 +277,8 @@ class WhisperServerManager extends EventEmitter {
 
   getServerBinaryPath(options = {}) {
     if (options.preferCuda) {
-      const ext = process.platform === "win32" ? ".exe" : "";
-      const cudaBinary = `whisper-server-${process.platform}-${process.arch}-cuda${ext}`;
-      const cudaPath = path.join(app.getPath("userData"), "bin", cudaBinary);
-      if (fs.existsSync(cudaPath)) return cudaPath;
+      const cudaPath = this.cudaBinaryResolver?.() || null;
+      return cudaPath && fs.existsSync(cudaPath) ? cudaPath : null;
     }
 
     if (this.cachedServerBinaryPath) return this.cachedServerBinaryPath;
@@ -318,6 +319,13 @@ class WhisperServerManager extends EventEmitter {
     }
 
     return null;
+  }
+
+  setCudaBinaryResolver(resolver) {
+    if (resolver != null && typeof resolver !== "function") {
+      throw new TypeError("CUDA binary resolver must be a function");
+    }
+    this.cudaBinaryResolver = resolver;
   }
 
   isAvailable() {
@@ -388,7 +396,9 @@ class WhisperServerManager extends EventEmitter {
       this.modelPath === modelPath &&
       !this.isRemote &&
       this.vadSignature === nextVadSignature &&
-      this.threadSignature === nextThreadSignature
+      this.threadSignature === nextThreadSignature &&
+      this.useCuda === (options.useCuda === true) &&
+      !(options.requireCuda === true && this.getCudaProofEvidence().backend !== "cuda")
     ) {
       return;
     }
@@ -419,6 +429,10 @@ class WhisperServerManager extends EventEmitter {
     this.port = await this.findAvailablePort();
     this.modelPath = modelPath;
     this.useCuda = usingCuda;
+    this.selectedGpuUuid = usingCuda
+      ? options.gpuUuid || process.env.TRANSCRIPTION_GPU_UUID || null
+      : null;
+    this.lastServerOutput = "";
 
     // Check for FFmpeg first - only use --convert flag if FFmpeg is available
     const ffmpegPath = this.getFFmpegPath();
@@ -438,8 +452,8 @@ class WhisperServerManager extends EventEmitter {
     // Select GPU by UUID + PCI_BUS_ID order so the device is unambiguous. See #531.
     if (usingCuda) {
       spawnEnv.CUDA_DEVICE_ORDER = "PCI_BUS_ID";
-      if (process.env.TRANSCRIPTION_GPU_UUID) {
-        spawnEnv.CUDA_VISIBLE_DEVICES = process.env.TRANSCRIPTION_GPU_UUID;
+      if (this.selectedGpuUuid) {
+        spawnEnv.CUDA_VISIBLE_DEVICES = this.selectedGpuUuid;
       }
     }
 
@@ -473,9 +487,7 @@ class WhisperServerManager extends EventEmitter {
 
     const startTime = Date.now();
 
-    this.tempLifecycleRelease = processWriteGate.acquireWriteLease(
-      "whisper-native-temp-lifecycle"
-    );
+    this.tempLifecycleRelease = processWriteGate.acquireWriteLease("whisper-native-temp-lifecycle");
     try {
       this.process = this.spawnImpl(serverBinary, args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -495,12 +507,16 @@ class WhisperServerManager extends EventEmitter {
     let earlyExit = false;
 
     this.process.stdout.on("data", (data) => {
-      debugLogger.debug("whisper-server stdout", { data: data.toString().trim() });
+      const text = data.toString();
+      this._appendServerOutput(text);
+      debugLogger.debug("whisper-server stdout", { data: text.trim() });
     });
 
     this.process.stderr.on("data", (data) => {
-      stderrBuffer += data.toString();
-      debugLogger.debug("whisper-server stderr", { data: data.toString().trim() });
+      const text = data.toString();
+      stderrBuffer += text;
+      this._appendServerOutput(text);
+      debugLogger.debug("whisper-server stderr", { data: text.trim() });
     });
 
     this.process.on("error", (error) => {
@@ -522,7 +538,7 @@ class WhisperServerManager extends EventEmitter {
     try {
       await this.waitForReady(() => ({ stderr: stderrBuffer, exitCode }));
     } catch (err) {
-      if (usingCuda && earlyExit) {
+      if (usingCuda && earlyExit && options.requireCuda !== true) {
         debugLogger.warn("CUDA whisper-server failed, falling back to CPU", {
           exitCode,
           stderr: stderrBuffer.slice(0, 200),
@@ -662,12 +678,14 @@ class WhisperServerManager extends EventEmitter {
 
     const { language, initialPrompt } = options;
 
-    // Always convert to 16kHz mono WAV - whisper.cpp requires this exact format
+    // Ordinary inputs are converted; the CUDA proof supplies a generated 16 kHz mono WAV.
     let finalBuffer = audioBuffer;
-    if (!this.canConvert) {
-      throw new Error("FFmpeg not found - required for audio conversion");
+    if (options.preconvertedWav !== true) {
+      if (!this.canConvert) {
+        throw new Error("FFmpeg not found - required for audio conversion");
+      }
+      finalBuffer = await this._convertToWav(audioBuffer);
     }
-    finalBuffer = await this._convertToWav(audioBuffer);
 
     const boundary = `----WhisperBoundary${Date.now()}`;
     const parts = [];
@@ -829,7 +847,24 @@ class WhisperServerManager extends EventEmitter {
     this.tempLifecycleRelease = null;
   }
 
+  _appendServerOutput(text) {
+    this.lastServerOutput = `${this.lastServerOutput}${String(text || "")}`.slice(-65_536);
+  }
+
+  getCudaProofEvidence() {
+    const output = this.lastServerOutput || "";
+    const explicitlyCpu =
+      /CPU\s+only|use\s+gpu\s*=\s*0|CUDA[^\n]*(?:disabled|unavailable)|no\s+CUDA/i.test(output);
+    const hasCudaEvidence = /ggml_cuda|CUDA(?:\d+|\s+(?:backend|device|driver))|cuBLAS/i.test(
+      output
+    );
+    if (!this.useCuda || explicitlyCpu) return { backend: "cpu", gpuUuid: null };
+    if (!hasCudaEvidence) return { backend: "unknown", gpuUuid: null };
+    return { backend: "cuda", gpuUuid: this.selectedGpuUuid || null };
+  }
+
   getStatus() {
+    const proof = this.getCudaProofEvidence();
     return {
       available: this.isAvailable(),
       running: this.ready && (this.process !== null || this.isRemote),
@@ -838,6 +873,8 @@ class WhisperServerManager extends EventEmitter {
       isRemote: this.isRemote,
       modelPath: this.modelPath,
       modelName: this.modelPath ? path.basename(this.modelPath, ".bin").replace("ggml-", "") : null,
+      backend: proof.backend,
+      gpuUuid: proof.gpuUuid,
     };
   }
 }

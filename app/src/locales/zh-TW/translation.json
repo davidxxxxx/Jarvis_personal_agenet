@@ -2549,6 +2549,7 @@
     "activating": "正在啟動 GPU...",
     "activationFailed": "無法啟動 GPU",
     "retry": "重試",
+    "rollback": "回退",
     "remove": "移除",
     "dismiss": "暫時不要",
     "cancel": "取消"

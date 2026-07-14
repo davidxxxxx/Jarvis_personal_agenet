@@ -279,6 +279,9 @@ const WindowsKeyManager = require("./src/helpers/windowsKeyManager");
 const LinuxKeyManager = require("./src/helpers/linuxKeyManager");
 const TextEditMonitor = require("./src/helpers/textEditMonitor");
 const WhisperCudaManager = require("./src/helpers/whisperCudaManager");
+const CudaWhisperVerifier = require("./src/jarvis/main/CudaWhisperVerifier");
+const { maybeOfferCudaWhisper } = require("./src/jarvis/main/CudaWhisperFirstRun");
+const { activateVerifiedCudaRuntime } = require("./src/jarvis/main/CudaWhisperActivation");
 const GoogleCalendarManager = require("./src/helpers/googleCalendarManager");
 const MeetingProcessDetector = require("./src/helpers/meetingProcessDetector");
 const AudioActivityDetector = require("./src/helpers/audioActivityDetector");
@@ -321,9 +324,7 @@ const {
   GracefulShutdownCoordinator,
   RendererShutdownHandshake,
 } = require("./src/jarvis/main/GracefulShutdownCoordinator");
-const {
-  createJarvisProcessingRuntime,
-} = require("./src/jarvis/main/JarvisProcessingRuntime");
+const { createJarvisProcessingRuntime } = require("./src/jarvis/main/JarvisProcessingRuntime");
 const {
   JarvisProcessingLifecycle,
   createJarvisRuntimeMigrationParticipant,
@@ -346,6 +347,7 @@ let windowsKeyManager = null;
 let linuxKeyManager = null;
 let textEditMonitor = null;
 let whisperCudaManager = null;
+let whisperCudaVerifier = null;
 let googleCalendarManager = null;
 let meetingDetectionEngine = null;
 let audioTapManager = null;
@@ -694,6 +696,10 @@ async function initializeCoreManagers() {
   whisperManager = new WhisperManager();
   if (process.platform !== "darwin") {
     whisperCudaManager = new WhisperCudaManager();
+    whisperCudaVerifier = new CudaWhisperVerifier();
+    whisperManager.serverManager.setCudaBinaryResolver(() =>
+      whisperCudaManager.getCudaBinaryPath()
+    );
   }
   parakeetManager = new ParakeetManager();
   diarizationManager = new DiarizationManager();
@@ -740,6 +746,7 @@ async function initializeCoreManagers() {
     linuxKeyManager,
     textEditMonitor,
     whisperCudaManager,
+    whisperCudaVerifier,
     googleCalendarManager,
     meetingDetectionEngine,
     audioTapManager,
@@ -1256,6 +1263,37 @@ async function startApp() {
   // Phase 2: Initialize remaining managers after windows are visible
   initializeDeferredManagers();
 
+  if (whisperCudaManager && whisperCudaVerifier) {
+    const { detectNvidiaGpu, listNvidiaGpus } = require("./src/utils/gpuDetection");
+    void maybeOfferCudaWhisper({
+      manager: whisperCudaManager,
+      verifier: whisperCudaVerifier,
+      whisperManager,
+      modelName: process.env.LOCAL_WHISPER_MODEL || "",
+      detectGpu: detectNvidiaGpu,
+      listGpus: listNvidiaGpus,
+      showPrompt: (options) => {
+        const owner = windowManager?.controlPanelWindow;
+        return owner ? dialog.showMessageBox(owner, options) : dialog.showMessageBox(options);
+      },
+      persistEnabled: async (enabled) => {
+        if (enabled) process.env.WHISPER_CUDA_ENABLED = "true";
+        else delete process.env.WHISPER_CUDA_ENABLED;
+        await environmentManager.saveAllKeysToEnvFile();
+      },
+      activateCuda: async ({ modelName, gpuUuid }) => {
+        const activation = await activateVerifiedCudaRuntime({
+          whisperManager,
+          modelName,
+          gpuUuid,
+        });
+        if (!activation.enabled) throw new Error(activation.error);
+      },
+    }).catch((error) => {
+      debugLogger.debug("CUDA first-run offer failed (non-fatal)", { error: error.message });
+    });
+  }
+
   app.on("browser-window-focus", () => {
     if (googleCalendarManager) googleCalendarManager.syncOnFocus();
   });
@@ -1279,7 +1317,7 @@ async function startApp() {
   const whisperSettings = {
     localTranscriptionProvider: process.env.LOCAL_TRANSCRIPTION_PROVIDER || "",
     whisperModel: process.env.LOCAL_WHISPER_MODEL,
-    useCuda: process.env.WHISPER_CUDA_ENABLED === "true" && whisperCudaManager?.isDownloaded(),
+    useCuda: process.env.WHISPER_CUDA_ENABLED === "true" && whisperCudaManager?.isVerified(),
   };
   whisperManager.initializeAtStartup(whisperSettings).catch((err) => {
     debugLogger.debug("Whisper startup init error (non-fatal)", { error: err.message });
