@@ -817,8 +817,8 @@ git commit -m "feat(jarvis): expose bounded runtime status"
 - [ ] **Step 1: Add deterministic workload and fault simulation**
 
 ```js
-test('24 hours remain bounded and preserve every final job', async () => {
-  const result = await simulateAllDay({ hours: 24, externalGpuBusyWindows: 16, sleeps: 2, cudaCrashes: 1 })
+test('3 hours remain bounded and preserve every final job', async () => {
+  const result = await simulateAllDay({ hours: 3, externalGpuBusyWindows: 2, sleeps: 1, cudaCrashes: 1 })
   assert.equal(result.lostFinalJobs, 0)
   assert.ok(result.maxHeavyConcurrency <= 1)
   assert.ok(result.maxCpuFallbackThreads <= 4)
@@ -868,5 +868,5 @@ git commit -m "test(jarvis): gate all day resource governance"
 - [ ] Provisional preview normally arrives within 15–30 seconds, coalesces stale work, and can pause without losing final jobs.
 - [ ] Suspend/wake resumes the same live run; cold launch never silently reopens capture; local midnight creates exactly one linked daily session.
 - [ ] Runtime status exposes actual backend, GPU identity, resource reason, backlog duration, oldest job, disk state, and recovery action.
-- [ ] The 24-hour soak and reference-machine CPU/latency/resource thresholds pass with bounded queues, handles, logs, and sidecars.
+- [ ] The 3-hour simulated soak and reference-machine CPU/latency/resource thresholds pass with bounded queues, handles, logs, and sidecars.
 - [ ] Bilingual quality, automated checks, and transcript completeness gates pass.

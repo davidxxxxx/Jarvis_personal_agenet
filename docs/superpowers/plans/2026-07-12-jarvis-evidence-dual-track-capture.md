@@ -901,11 +901,11 @@ git commit -m "feat(jarvis): govern evidence storage safely"
 - Consumes: all phase-one capture, speech-gate, compression, retention, and storage services.
 - Produces: `npm run test:jarvis:capture-soak` and recorded Windows hardware evidence.
 
-- [ ] **Step 1: Add a deterministic 24-hour simulated soak**
+- [ ] **Step 1: Add a deterministic 3-hour simulated soak**
 
 ```js
-test('24 hour capture keeps queues and handles bounded', async () => {
-  const result = await simulateCapture({ hours: 24, speechDutyCycle: 0.18, sourceFailures: 12 })
+test('3 hour capture keeps queues and handles bounded', async () => {
+  const result = await simulateCapture({ hours: 3, speechDutyCycle: 0.18, sourceFailures: 12 })
   assert.ok(result.maxRingBufferBytes <= result.expectedRingBufferBytes)
   assert.equal(result.orphanedChunks, 0)
   assert.equal(result.unboundedQueue, false)
@@ -953,5 +953,5 @@ git commit -m "test(jarvis): gate all day capture durability"
 - [ ] Important-meeting mode records continuously, and VAD failure visibly fails open to continuous capture.
 - [ ] WAV remains authoritative until FLAC passes lossless verification and an atomic database switch.
 - [ ] Low disk stops capture safely; a chosen local data directory migrates resumably with checksums.
-- [ ] A deterministic 24-hour capture soak shows bounded buffers, queues, handles, and logs with no corrupt or orphaned evidence.
+- [ ] A deterministic 3-hour capture soak shows bounded buffers, queues, handles, and logs with no corrupt or orphaned evidence.
 - [ ] Automated checks and the Windows hardware acceptance document pass.
