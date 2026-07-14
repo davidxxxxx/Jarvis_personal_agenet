@@ -18,6 +18,7 @@ const {
 const FlacCompressionWorker = require("../../src/jarvis/main/FlacCompressionWorker");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
+const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const RetentionCleaner = require("../../src/jarvis/main/RetentionCleaner");
 const { getFFmpegPath } = require("../../src/helpers/ffmpegUtils");
 
@@ -86,6 +87,7 @@ class LosslessFixtureCodec {
 }
 
 function fixture(t, { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000 } = {}) {
+  const nowProvider = typeof now === "function" ? now : () => now;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-flac-"));
   const db = new Database(":memory:");
   t.after(() => {
@@ -101,7 +103,7 @@ function fixture(t, { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000 } = {}) {
       let id = 0;
       return (prefix) => `${prefix}-${++id}`;
     })(),
-    now: () => now,
+    now: nowProvider,
   });
   store.createTrack({
     id: "t1",
@@ -139,7 +141,7 @@ function fixture(t, { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000 } = {}) {
       recordingsRoot: root,
       encoder: codec,
       reader,
-      now: () => now,
+      now: nowProvider,
       ...overrides,
     });
   const worker = makeWorker();
@@ -194,6 +196,109 @@ test("completed compression replay is a no-op", async (t) => {
 
   assert.equal(replay.replayed, true);
   assert.deepEqual(replay.chunk, first.chunk);
+});
+
+test("governed replay completes a promoted FLAC exactly once after lease expiry", async (t) => {
+  let now = 100;
+  const { db, store, worker, job, wavPath } = fixture(t, { now: () => now });
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 50
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  const runner = new ProcessingJobRunner({
+    store,
+    owner: "worker-a",
+    now: () => now,
+    leaseMs: 10,
+  });
+  let expireAfterPromotion = true;
+  runner.register("compress_chunk", async (claimed) => {
+    const result = await worker.run(claimed, { owner: "worker-a" });
+    if (expireAfterPromotion) {
+      expireAfterPromotion = false;
+      now = 110;
+      assert.equal(store.recoverExpiredLeases(now), 1);
+    }
+    return { ...result, executionDevice: null };
+  });
+
+  await assert.rejects(runner.runOnce(100), { code: "JOB_LEASE_LOST" });
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(fs.existsSync(wavPath), false);
+  assert.equal(await runner.runOnce(110), 1);
+
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT state, attempt_count, completed_at, execution_device FROM processing_jobs WHERE id = ?"
+      )
+      .get(job.id),
+    { state: "completed", attempt_count: 2, completed_at: 110, execution_device: null }
+  );
+  assert.equal(
+    db.prepare("SELECT count(*) count FROM storage_usage_events WHERE kind = 'flac_written'").get()
+      .count,
+    1
+  );
+});
+
+test("governed replay retries a transient authoritative WAV unlink without rewriting FLAC", async (t) => {
+  let now = 100;
+  const { db, store, makeWorker, job, wavPath } = fixture(t, { now: () => now });
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 50
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  const busyFs = Object.create(fs.promises);
+  let refusedUnlinks = 0;
+  busyFs.unlink = async (candidate) => {
+    if (candidate === wavPath && refusedUnlinks === 0) {
+      refusedUnlinks += 1;
+      const error = new Error("simulated Windows sharing violation");
+      error.code = "EBUSY";
+      throw error;
+    }
+    return fs.promises.unlink(candidate);
+  };
+  let activeWorker = makeWorker({ fsImpl: busyFs });
+  const runner = new ProcessingJobRunner({
+    store,
+    owner: "worker-a",
+    now: () => now,
+    leaseMs: 100,
+    retryBaseMs: 1,
+    retryMaxMs: 1,
+  });
+  runner.register("compress_chunk", async (claimed) => {
+    const result = await activeWorker.run(claimed, { owner: "worker-a" });
+    return { ...result, executionDevice: null };
+  });
+
+  assert.equal(await runner.runOnce(100), 1);
+  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(fs.existsSync(wavPath), true);
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code FROM processing_jobs WHERE id = ?").get(job.id),
+    { state: "retry", error_code: "EBUSY" }
+  );
+
+  activeWorker = makeWorker();
+  now = 101;
+  assert.equal(await runner.runOnce(101), 1);
+  assert.equal(fs.existsSync(wavPath), false);
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, attempt_count, completed_at FROM processing_jobs WHERE id = ?")
+      .get(job.id),
+    { state: "completed", attempt_count: 2, completed_at: 101 }
+  );
+  assert.equal(
+    db.prepare("SELECT count(*) count FROM storage_usage_events WHERE kind = 'flac_written'").get()
+      .count,
+    1
+  );
 });
 
 for (const retired of ["expired", "tombstoned"]) {
@@ -455,16 +560,13 @@ test("FFmpeg decoder spawn errors preserve safe transient diagnostics", async ()
     },
   });
 
-  await assert.rejects(
-    decoder.decode("C:\\private\\meeting.flac", "flac"),
-    (error) => {
-      assert.equal(error.code, "EBUSY");
-      assert.equal(error.cause, original);
-      assert.equal(error.classification, "transient_io");
-      assert.equal(error.message.includes("C:\\private"), false);
-      return true;
-    }
-  );
+  await assert.rejects(decoder.decode("C:\\private\\meeting.flac", "flac"), (error) => {
+    assert.equal(error.code, "EBUSY");
+    assert.equal(error.cause, original);
+    assert.equal(error.classification, "transient_io");
+    assert.equal(error.message.includes("C:\\private"), false);
+    return true;
+  });
 });
 
 test("FFmpeg input-open resource failures are classified without exposing stderr", async () => {
@@ -483,16 +585,13 @@ test("FFmpeg input-open resource failures are classified without exposing stderr
     },
   });
 
-  await assert.rejects(
-    decoder.decode("C:\\private\\meeting.flac", "flac"),
-    (error) => {
-      assert.equal(error.code, "FFMPEG_INPUT_TRANSIENT");
-      assert.equal(error.exitCode, 1);
-      assert.equal(error.classification, "transient_io");
-      assert.equal(error.message.includes("C:\\private"), false);
-      return true;
-    }
-  );
+  await assert.rejects(decoder.decode("C:\\private\\meeting.flac", "flac"), (error) => {
+    assert.equal(error.code, "FFMPEG_INPUT_TRANSIENT");
+    assert.equal(error.exitCode, 1);
+    assert.equal(error.classification, "transient_io");
+    assert.equal(error.message.includes("C:\\private"), false);
+    return true;
+  });
 });
 
 test("transient I/O classification traverses causes and aggregate errors", () => {
@@ -558,9 +657,9 @@ test("retired cleanup cannot unlink a same-path authority promoted by concurrent
          retired_path = ?, retired_format = 'flac', retired_file_sha256 = ?
      WHERE id = 'c1'`
   ).run(wavPath, flacPath, flacHash);
-  db.prepare(
-    "UPDATE processing_jobs SET state = 'retry', completed_at = NULL WHERE id = ?"
-  ).run(job.id);
+  db.prepare("UPDATE processing_jobs SET state = 'retry', completed_at = NULL WHERE id = ?").run(
+    job.id
+  );
   const retried = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
 
   let releaseFirstUnlink;
@@ -655,9 +754,7 @@ test("retired cleanup revalidates locator and current authority after its hash r
     const bytes = await fs.promises.readFile(candidate, ...args);
     if (candidate === flacPath && !changedAuthority) {
       changedAuthority = true;
-      db.prepare("UPDATE audio_chunks SET path = ?, format = 'flac' WHERE id = 'c1'").run(
-        flacPath
-      );
+      db.prepare("UPDATE audio_chunks SET path = ?, format = 'flac' WHERE id = 'c1'").run(flacPath);
     }
     return bytes;
   };
@@ -700,17 +797,18 @@ test("a rejected authority operation does not poison the serial tail", async (t)
   assert.equal(store.getChunk("c1").format, "flac");
 });
 
-test("queued runPending and recoverStartup use non-reentrant private operations", async (t) => {
-  const { store, worker } = fixture(t);
+test("public runPending cannot encode or terminally complete ordinary compression", async (t) => {
+  const { db, store, worker } = fixture(t);
 
-  await Promise.race([
-    Promise.all([worker.runPending(), worker.recoverStartup()]),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("authority operation queue deadlocked")), 1_000)
-    ),
-  ]);
+  await assert.rejects(worker.runPending(), { code: "GOVERNED_RUNTIME_REQUIRED" });
 
-  assert.equal(store.getChunk("c1").format, "flac");
+  assert.equal(store.getChunk("c1").format, "wav");
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, completed_at FROM processing_jobs WHERE job_type = 'compress_chunk'")
+      .get(),
+    { state: "pending", completed_at: null }
+  );
 });
 
 test("maintenance preserves a locked legacy null-hash retired FLAC for retry", async (t) => {
@@ -728,16 +826,13 @@ test("maintenance preserves a locked legacy null-hash retired FLAC for retry", a
     return fs.promises.readFile(candidate, ...args);
   };
 
-  await assert.rejects(
-    makeWorker({ fsImpl }).cleanupRetiredChunk(store.getChunk("c1"), 100),
-    { code: "EBUSY" }
-  );
+  await assert.rejects(makeWorker({ fsImpl }).cleanupRetiredChunk(store.getChunk("c1"), 100), {
+    code: "EBUSY",
+  });
 
   assert.equal(fs.existsSync(compressed.chunk.path), true);
   assert.deepEqual(
-    db
-      .prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'")
-      .get(),
+    db.prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'").get(),
     { retired_path: compressed.chunk.path, retired_file_sha256: null }
   );
 });
@@ -751,9 +846,7 @@ test("maintenance clears a missing legacy null-hash retired locator", async (t) 
 
   assert.equal(await worker.cleanupRetiredChunk(store.getChunk("c1"), 100), 1);
   assert.deepEqual(
-    db
-      .prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'")
-      .get(),
+    db.prepare("SELECT retired_path, retired_file_sha256 FROM audio_chunks WHERE id = 'c1'").get(),
     { retired_path: null, retired_file_sha256: null }
   );
 });
@@ -826,10 +919,7 @@ test("retired provenance cleanup never deletes the current authoritative file", 
      WHERE id = 'c1'`
   ).run();
 
-  await makeWorker({ now: () => 100 }).cleanupRetiredChunk(
-    store.getChunkForMaintenance("c1"),
-    100
-  );
+  await makeWorker({ now: () => 100 }).cleanupRetiredChunk(store.getChunkForMaintenance("c1"), 100);
 
   assert.equal(fs.existsSync(wavPath), true);
 });
@@ -1178,13 +1268,10 @@ test("withVerifiedWav preserves audio_expired when deadline cleanup is locked", 
       },
     },
   });
-  const consuming = reader.withVerifiedWav(
-    store.getChunk("c1"),
-    async (_temporaryPath, signal) => {
-      signalReady(signal);
-      return new Promise(() => {});
-    }
-  );
+  const consuming = reader.withVerifiedWav(store.getChunk("c1"), async (_temporaryPath, signal) => {
+    signalReady(signal);
+    return new Promise(() => {});
+  });
   const signal = await ready;
   now = 1_200;
   deadlineCallback();
@@ -1396,7 +1483,7 @@ test("JarvisService commits production WAV metadata with a durable compression j
   assert.equal(jobs[0].model_version, ENCODER_VERSION);
 });
 
-test("JarvisService converts committed WAVs only after the capture callback returns", async (t) => {
+test("JarvisService leaves committed WAV compression queued for the governed runtime", async (t) => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-flac-background-"));
   const recordingsDir = path.join(userDataDir, "recordings");
   fs.mkdirSync(recordingsDir, { recursive: true });
@@ -1415,8 +1502,17 @@ test("JarvisService converts committed WAVs only after the capture callback retu
     reader,
     now: () => 100,
   });
+  let directRuns = 0;
+  flacCompressionWorker.runPending = async () => {
+    directRuns += 1;
+    return { completed: 1, failed: 0, skipped: 0 };
+  };
   const fsImpl = Object.create(fs);
-  fsImpl.statfsSync = () => ({ bsize: 1, blocks: 200 * 1024 ** 3, bavail: 20 * 1024 ** 3 });
+  fsImpl.statfsSync = () => ({
+    bsize: 1,
+    blocks: 200 * 1024 ** 3,
+    bavail: 100 * 1024 ** 3,
+  });
   let clock = 0;
   const service = new JarvisService({
     repository,
@@ -1437,9 +1533,16 @@ test("JarvisService converts committed WAVs only after the capture callback retu
 
   await service.waitForCompressionIdle();
 
-  const compressed = repository.db.prepare("SELECT format, path FROM audio_chunks").get();
-  assert.equal(compressed.format, "flac");
-  assert.equal(fs.existsSync(compressed.path), true);
+  const queued = repository.db.prepare("SELECT format, path FROM audio_chunks").get();
+  assert.equal(queued.format, "wav");
+  assert.equal(fs.existsSync(queued.path), true);
+  assert.equal(directRuns, 0);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT state, priority FROM processing_jobs WHERE job_type = 'compress_chunk'")
+      .get(),
+    { state: "pending", priority: 60 }
+  );
 });
 
 test("JarvisService starts and exposes asynchronous FLAC startup recovery", async (t) => {
@@ -1450,6 +1553,7 @@ test("JarvisService starts and exposes asynchronous FLAC startup recovery", asyn
     fs.rmSync(userDataDir, { recursive: true, force: true });
   });
   let release;
+  let directRuns = 0;
   const pending = new Promise((resolve) => {
     release = resolve;
   });
@@ -1457,6 +1561,10 @@ test("JarvisService starts and exposes asynchronous FLAC startup recovery", asyn
     async recoverStartup() {
       await pending;
       return { promoted: 1, deletedWavs: 0, removedInvalid: 0, rolledBack: 0 };
+    },
+    async runPending() {
+      directRuns += 1;
+      return { completed: 1, failed: 0, skipped: 0 };
     },
   };
   const service = new JarvisService({
@@ -1470,9 +1578,81 @@ test("JarvisService starts and exposes asynchronous FLAC startup recovery", asyn
   const recoveredSessions = service.recoverOpenSessions(100);
   release();
   const compression = await service.waitForCompressionRecovery();
+  await service.waitForCompressionIdle();
 
   assert.deepEqual(recoveredSessions, []);
   assert.equal(compression.promoted, 1);
+  assert.equal(directRuns, 0);
+});
+
+test("JarvisService promotes compression work for warning and stopped storage pressure", () => {
+  for (const storageState of ["warning", "stopped"]) {
+    const repository = new JarvisRepository(":memory:");
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `jarvis-${storageState}-`));
+    try {
+      repository.createSession({ id: "s1", startedAt: 0, micDeviceId: null });
+      repository.createTrack({
+        id: "t1",
+        sessionId: "s1",
+        sourceType: "system",
+        sampleRate: SAMPLE_RATE,
+        channels: CHANNELS,
+        startedAt: 0,
+      });
+      repository.commitChunk({
+        id: "c1",
+        sessionId: "s1",
+        trackId: "t1",
+        sourceType: "system",
+        sequenceNumber: 0,
+        path: path.join(userDataDir, "c1.wav"),
+        startedAt: 0,
+        endedAt: 100,
+        durationMs: 100,
+        sha256: "a".repeat(64),
+        expiresAt: 1_000,
+        format: "wav",
+        sampleRate: SAMPLE_RATE,
+        channels: CHANNELS,
+        encoderVersion: ENCODER_VERSION,
+      });
+      const fsImpl = Object.create(fs);
+      fsImpl.statfsSync = () => ({ bsize: 1, blocks: 1_000, bavail: 100 });
+      const service = new JarvisService({
+        repository,
+        userDataDir,
+        broadcast() {},
+        now: () => 200,
+        fsImpl,
+        storageGovernor: {
+          ensureReserve() {},
+          evaluate() {
+            return storageState;
+          },
+          inspect() {
+            return { state: storageState };
+          },
+        },
+      });
+
+      if (storageState === "stopped") {
+        assert.throws(() => service._assertSafeDiskSpace(), { code: "DISK_SPACE_LOW" });
+      } else {
+        service._assertSafeDiskSpace();
+      }
+      assert.deepEqual(
+        repository.db
+          .prepare(
+            "SELECT state, priority, next_retry_at FROM processing_jobs WHERE job_type = 'compress_chunk'"
+          )
+          .get(),
+        { state: "storage_recovery_compress", priority: 10, next_retry_at: 200 }
+      );
+    } finally {
+      repository.close();
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  }
 });
 
 test("JarvisService cleans stale verified WAV leases before FLAC startup recovery", async (t) => {

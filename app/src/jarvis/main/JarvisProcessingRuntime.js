@@ -33,6 +33,7 @@ class JarvisProcessingRuntime {
     log = () => {},
     governor = null,
     whisperController = null,
+    startupBarrier = null,
   } = {}) {
     if (
       !runner ||
@@ -60,6 +61,9 @@ class JarvisProcessingRuntime {
       throw new TypeError("interval functions are required");
     }
     if (typeof log !== "function") throw new TypeError("log must be a function");
+    if (startupBarrier !== null && typeof startupBarrier?.then !== "function") {
+      throw new TypeError("startupBarrier must be a promise or null");
+    }
     if (governor !== null && typeof governor.sample !== "function") {
       throw new TypeError("governor.sample must be a function");
     }
@@ -85,6 +89,7 @@ class JarvisProcessingRuntime {
     this.log = log;
     this.governor = governor;
     this.whisperController = whisperController;
+    this.startupBarrier = startupBarrier;
     this.restrictiveReleaseLatched = false;
     this.timer = null;
     this.inFlight = null;
@@ -100,6 +105,8 @@ class JarvisProcessingRuntime {
     if (this.startPromise) return this.startPromise;
     if (this.stopping) return Promise.resolve(0);
     this.startPromise = Promise.resolve().then(async () => {
+      if (this.stopping) return 0;
+      if (this.startupBarrier) await this.startupBarrier;
       if (this.stopping) return 0;
       try {
         this.runner.recoverExpiredLeases(this.now());
@@ -352,9 +359,11 @@ function createJarvisProcessingRuntime({
   });
   runner.register("transcribe_chunk", (job, context) => worker.handle(job, context));
   runner.register("compress_chunk", async (job) => {
-    await service.flacCompressionWorker.run(job);
+    await service.flacCompressionWorker.run(job, { owner });
     return { executionDevice: "cpu" };
   });
+  const startupBarrier =
+    runtimeOptions.startupBarrier ?? service.waitForCompressionRecovery?.() ?? null;
   return new JarvisProcessingRuntime({
     runner,
     repository,
@@ -365,6 +374,7 @@ function createJarvisProcessingRuntime({
     governor: effectiveGovernor,
     whisperController: effectiveWhisperController,
     ...runtimeOptions,
+    startupBarrier,
   });
 }
 

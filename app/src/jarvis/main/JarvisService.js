@@ -171,9 +171,12 @@ class JarvisService {
       typeof this.storageGovernor.evaluate !== "function" ||
       typeof this.storageGovernor.ensureReserve !== "function"
     ) {
-      throw new TypeError("storageGovernor must provide ensureReserve, evaluate, and inspect methods");
+      throw new TypeError(
+        "storageGovernor must provide ensureReserve, evaluate, and inspect methods"
+      );
     }
     this.emergencyCommit = false;
+    this.storagePressureState = "ok";
     this.migrationGate = migrationGate;
     this.vadClassifier = vadClassifier;
     this.maxVadQueueBytes = Math.round(
@@ -333,7 +336,10 @@ class JarvisService {
   }
 
   async prepareStorageMigration() {
-    if (this.writer || ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)) {
+    if (
+      this.writer ||
+      ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)
+    ) {
       throw new Error("capture must be inactive before storage migration");
     }
     await Promise.allSettled([this.compressionRecovery, this.compressionWork]);
@@ -343,7 +349,10 @@ class JarvisService {
   }
 
   reconfigureStorage({ recordingsDir }) {
-    if (this.writer || ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)) {
+    if (
+      this.writer ||
+      ["recording", "degraded", "paused", "finalizing"].includes(this.state.status)
+    ) {
       throw new Error("capture must be inactive before storage migration");
     }
     if (typeof recordingsDir !== "string" || !path.isAbsolute(recordingsDir)) {
@@ -792,15 +801,6 @@ class JarvisService {
         )
         .then(() => this.flacCompressionWorker.recoverStartup());
       this.compressionRecovery.catch(() => {});
-      this.compressionWork = this.compressionWork
-        .catch(() => {})
-        .then(async () => {
-          await this.compressionRecovery;
-          return typeof this.flacCompressionWorker.runPending === "function"
-            ? this.flacCompressionWorker.runPending()
-            : { completed: 0, failed: 0, skipped: 0 };
-        });
-      this.compressionWork.catch(() => {});
     }
     return this.repository.recoverOpenSessions(at);
   }
@@ -1321,23 +1321,16 @@ class JarvisService {
           channels: 1,
           encoderVersion: FLAC_ENCODER_VERSION,
         });
-        this._scheduleCompressionWork();
+        if (["warning", "stopped"].includes(this.storagePressureState)) {
+          this._promoteCompressionForStoragePressure(this.now());
+        }
         return committed;
       },
     });
   }
 
-  _scheduleCompressionWork() {
-    if (
-      !this.flacCompressionWorker ||
-      typeof this.flacCompressionWorker.runPending !== "function"
-    ) {
-      return;
-    }
-    this.compressionWork = this.compressionWork
-      .catch(() => {})
-      .then(() => this.flacCompressionWorker.runPending());
-    this.compressionWork.catch(() => {});
+  _promoteCompressionForStoragePressure(at) {
+    return this.repository.promoteCompressionJobsForStoragePressure?.(at) ?? 0;
   }
 
   _reconcileChunkRecoverySidecars() {
@@ -1749,6 +1742,10 @@ class JarvisService {
     } catch {
       throw new DiskSpaceError("DISK_SPACE_CHECK_FAILED");
     }
+    this.storagePressureState = inspection.state;
+    if (["warning", "stopped"].includes(inspection.state)) {
+      this._promoteCompressionForStoragePressure(this.now());
+    }
     if (inspection.state === "stopped") {
       throw new DiskSpaceError("DISK_SPACE_LOW");
     }
@@ -1907,12 +1904,20 @@ class JarvisService {
       throw error;
     }
     for (const name of names) {
-      if (!name.endsWith(".json") || !this._isDirectChild(recoveryDir, path.join(recoveryDir, name))) {
+      if (
+        !name.endsWith(".json") ||
+        !this._isDirectChild(recoveryDir, path.join(recoveryDir, name))
+      ) {
         throw new Error("low-disk recovery directory contains an unexpected entry");
       }
       const recordPath = path.join(recoveryDir, name);
       const stat = this.fs.lstatSync(recordPath);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > RECOVERY_SIDECAR_MAX_BYTES) {
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.size <= 0 ||
+        stat.size > RECOVERY_SIDECAR_MAX_BYTES
+      ) {
         throw new Error("low-disk recovery record is unsafe");
       }
       const record = JSON.parse(this.fs.readFileSync(recordPath, "utf8"));
@@ -1920,7 +1925,8 @@ class JarvisService {
         !record ||
         typeof record !== "object" ||
         Array.isArray(record) ||
-        JSON.stringify(Object.keys(record).sort()) !== JSON.stringify([...LOW_DISK_RECOVERY_KEYS]) ||
+        JSON.stringify(Object.keys(record).sort()) !==
+          JSON.stringify([...LOW_DISK_RECOVERY_KEYS]) ||
         record.version !== LOW_DISK_RECOVERY_VERSION ||
         !Number.isSafeInteger(record.at) ||
         !Array.isArray(record.sources)

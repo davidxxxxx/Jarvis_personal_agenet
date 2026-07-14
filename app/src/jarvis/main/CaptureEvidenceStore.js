@@ -201,6 +201,33 @@ class CaptureEvidenceStore {
           AND expires_at > @completedAt
           AND write_state = 'committed'
       `),
+      promoteLeasedChunkToFlac: db.prepare(`
+        UPDATE audio_chunks
+        SET path = @flacPath,
+            format = 'flac',
+            file_sha256 = @fileSha256,
+            sample_rate = @sampleRate,
+            channels = @channels
+        WHERE id = @chunkId
+          AND path = @wavPath
+          AND format = 'wav'
+          AND sha256 = @pcmSha256
+          AND deleted_at IS NULL
+          AND expires_at > @completedAt
+          AND write_state = 'committed'
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs
+            WHERE id = @jobId
+              AND job_type = 'compress_chunk'
+              AND chunk_id = @chunkId
+              AND input_hash = @pcmSha256
+              AND model_version = @encoderVersion
+              AND state = 'running'
+              AND completed_at IS NULL
+              AND lease_owner = @owner
+              AND lease_expires_at > @completedAt
+          )
+      `),
       completeCompressionJob: db.prepare(`
         UPDATE processing_jobs
         SET state = 'completed', completed_at = @completedAt,
@@ -345,18 +372,35 @@ class CaptureEvidenceStore {
             OR state IN ('pending', 'retry')
           )
       `),
+      promoteCompressionJobsForStoragePressure: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'storage_recovery_compress',
+            priority = 10,
+            next_retry_at = CASE
+              WHEN next_retry_at IS NULL OR next_retry_at > @at THEN @at
+              ELSE next_retry_at
+            END,
+            error_code = NULL,
+            blocked_reason = NULL
+        WHERE job_type = 'compress_chunk'
+          AND state IN ('pending', 'retry', 'storage_recovery_compress')
+          AND priority > 10
+          AND completed_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM audio_chunks
+            WHERE audio_chunks.id = processing_jobs.chunk_id
+              AND audio_chunks.format = 'wav'
+              AND audio_chunks.write_state = 'committed'
+              AND audio_chunks.deleted_at IS NULL
+              AND audio_chunks.expires_at > @at
+          )
+      `),
       listClaimableJobs: db.prepare(`
         SELECT * FROM processing_jobs
         WHERE state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
-        ORDER BY
-          CASE state
-            WHEN 'retention_urgent' THEN 0
-            WHEN 'storage_recovery_compress' THEN 1
-            ELSE 2
-          END ASC,
-          priority ASC,
+        ORDER BY priority ASC,
           created_at ASC,
           id ASC
         LIMIT @limit
@@ -587,6 +631,21 @@ class CaptureEvidenceStore {
       const completed = this.statements.completeCompressionJob.run(input);
       if (completed.changes !== 1)
         throw new Error("compression job does not match chunk authority");
+      if (input.fileBytes !== undefined) {
+        this._assertPositiveSafeInteger(input.fileBytes, "FLAC fileBytes");
+        this.statements.recordStorageUsage.run({
+          kind: "flac_written",
+          chunkId: input.chunkId,
+          bytes: input.fileBytes,
+          deltaBytes: input.fileBytes,
+          occurredAt: input.completedAt,
+        });
+      }
+      return this._chunkResult(this.statements.getChunk.get(input.chunkId));
+    });
+    this.promoteLeasedChunkToFlacTransaction = db.transaction((input) => {
+      const updated = this.statements.promoteLeasedChunkToFlac.run(input);
+      if (updated.changes !== 1) return null;
       if (input.fileBytes !== undefined) {
         this._assertPositiveSafeInteger(input.fileBytes, "FLAC fileBytes");
         this.statements.recordStorageUsage.run({
@@ -945,6 +1004,12 @@ class CaptureEvidenceStore {
     return this.promoteChunkToFlacTransaction(input);
   }
 
+  promoteLeasedChunkToFlac(input) {
+    this._assertIdentifier(input?.owner, "owner");
+    this._assertNonNegativeSafeInteger(input?.completedAt, "completedAt");
+    return this.promoteLeasedChunkToFlacTransaction(input);
+  }
+
   rollbackChunkToWav(input) {
     return this.rollbackChunkToWavTransaction(input);
   }
@@ -1006,6 +1071,11 @@ class CaptureEvidenceStore {
       throw new RangeError("retention urgency before must be greater than after");
     }
     return this.statements.promoteSoonExpiringAudioJobs.run({ after, before }).changes;
+  }
+
+  promoteCompressionJobsForStoragePressure(at) {
+    this._assertNonNegativeSafeInteger(at, "storage pressure at");
+    return this.statements.promoteCompressionJobsForStoragePressure.run({ at }).changes;
   }
 
   claimJobs({ owner, at, leaseMs, limit }) {

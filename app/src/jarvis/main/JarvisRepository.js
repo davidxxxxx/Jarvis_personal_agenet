@@ -816,14 +816,18 @@ class JarvisRepository {
     this._syncTranscriptSegments = this.db.transaction((sessionId, segments) => {
       writeTranscriptSegments(sessionId, segments);
       if (segments.length === 0) {
-        this.db.prepare(`
+        this.db
+          .prepare(
+            `
           DELETE FROM transcript_segments
           WHERE session_id = ?
             AND result_kind = 'provisional'
             AND chunk_id IS NULL
             AND model_version IS NULL
             AND superseded_by IS NULL
-        `).run(sessionId);
+        `
+          )
+          .run(sessionId);
         return;
       }
       const placeholders = segments.map(() => "?").join(",");
@@ -1080,8 +1084,7 @@ class JarvisRepository {
     };
 
     this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
-      const { session, complete, isFinalized } =
-        this._inspectSessionTranscriptReadiness(sessionId);
+      const { session, complete, isFinalized } = this._inspectSessionTranscriptReadiness(sessionId);
       const processingState = complete ? "ready" : isFinalized ? "processing" : "pending";
       const readyAt = complete ? (session.ready_at ?? at) : null;
       this.statements.setSessionReadiness.run({ sessionId, processingState, readyAt });
@@ -1116,8 +1119,7 @@ class JarvisRepository {
               left.ended_at - right.ended_at ||
               compareStableIds(left.id, right.id)
           );
-        let sequenceNumber =
-          this.statements.getLastTrackSequence.get(track.id).sequence_number + 1;
+        let sequenceNumber = this.statements.getLastTrackSequence.get(track.id).sequence_number + 1;
         let linked = 0;
         let jobsCreated = 0;
         for (const chunk of chunks) {
@@ -1277,10 +1279,7 @@ class JarvisRepository {
   }
 
   refreshSessionReadiness(sessionId, at = Date.now()) {
-    return this._refreshSessionReadiness(
-      assertId(sessionId, "sessionId"),
-      assertInteger(at, "at")
-    );
+    return this._refreshSessionReadiness(assertId(sessionId, "sessionId"), assertInteger(at, "at"));
   }
 
   upsertTranscriptSegments(sessionId, segments) {
@@ -1371,9 +1370,10 @@ class JarvisRepository {
     assertInteger(completedAt, "completedAt");
     return this._commitChunkTranscript({
       chunk,
-      result: result.noSpeech === true
-        ? { noSpeech: true }
-        : { text: result.text.trim(), confidence: result.confidence },
+      result:
+        result.noSpeech === true
+          ? { noSpeech: true }
+          : { text: result.text.trim(), confidence: result.confidence },
       modelVersion: modelVersion.trim(),
       completedAt,
     });
@@ -2098,6 +2098,12 @@ class JarvisRepository {
     );
   }
 
+  promoteCompressionJobsForStoragePressure(at = Date.now()) {
+    return this.captureEvidenceStore.promoteCompressionJobsForStoragePressure(
+      assertInteger(at, "at")
+    );
+  }
+
   enqueueChunkTranscription(chunk) {
     return this.captureEvidenceStore.enqueueChunkTranscription(chunk);
   }
@@ -2227,8 +2233,8 @@ class JarvisRepository {
         !path.isAbsolute(relative) &&
         relative !== ".." &&
         !relative.startsWith(`..${path.sep}`)
-          ? relative
-          : null;
+        ? relative
+        : null;
     };
     const relocate = (locator) => {
       if (locator === null || locator === undefined) return null;

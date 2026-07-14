@@ -329,6 +329,18 @@ class WhisperCudaManager {
     const rollbackPointer = this._readPointer("previous.json");
     const record = this._readVerificationRecord();
     const present = this._hasManagedArtifacts();
+    const recordMatchesPointer = Boolean(
+      pointer &&
+      record?.ok === true &&
+      record.backend === "cuda" &&
+      record.version === pointer.version &&
+      record.digest === pointer.sha256 &&
+      record.gpuUuid === pointer.verification?.gpuUuid
+    );
+    const peakVramMb =
+      recordMatchesPointer && Number.isFinite(record?.peakVramMb) && record.peakVramMb > 0
+        ? record.peakVramMb
+        : null;
     return {
       downloaded: present,
       present,
@@ -341,7 +353,7 @@ class WhisperCudaManager {
         pointer?.verification?.reason ||
         record?.reason ||
         (pointer ? "verification_required" : "not_installed"),
-      verification: pointer?.verification || null,
+      verification: pointer?.verification ? { ...pointer.verification, peakVramMb } : null,
       declined: this.hasDeclinedFirstRun(),
       canRollback: !!rollbackPointer,
       actions: [

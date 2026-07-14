@@ -1,7 +1,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
-const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
+const {
+  applyJarvisMigrations,
+  TARGET_VERSION,
+  transcriptSegmentsSchema,
+  TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
+} = require("../../src/jarvis/main/JarvisMigrations");
 
 function columnNames(db, table) {
   return db
@@ -1229,6 +1234,124 @@ test("v14 preserves v13 transcript lineage and dependent foreign keys exactly", 
     );
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
       { id: "link-v13", segment_id: "v13-preview" },
+    ]);
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v15 leaves every genuine v14 transcript row and schema relationship unchanged", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      CREATE TABLE people (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+      ${transcriptSegmentsSchema("transcript_segments")}
+      ${TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS}
+      CREATE TABLE segment_links (
+        id TEXT PRIMARY KEY,
+        segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE
+      );
+    `);
+    db.exec(`
+      ALTER TABLE processing_jobs DROP COLUMN execution_device;
+      ALTER TABLE processing_jobs DROP COLUMN blocked_reason;
+
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('v14-session', 10, 300, 'completed', 10);
+      INSERT INTO people (id, display_name, created_at, last_seen_at)
+      VALUES ('v14-person', 'Alice', 10, 300);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, ended_at, state
+      ) VALUES
+        ('v14-system-track', 'v14-session', 'system', 24000, 1, 10, 300, 'ended'),
+        ('v14-mic-track', 'v14-session', 'mic', 24000, 1, 10, 300, 'ended');
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, write_state, format, file_sha256, sample_rate, channels
+      ) VALUES
+        (
+          'v14-system-chunk', 'v14-session', 'v14-system-track', 'system', 0,
+          'v14-system.wav', 100, 200, 100, 'system-sha', 10000,
+          'completed', 'committed', 'wav', 'system-file', 24000, 1
+        ),
+        (
+          'v14-mic-chunk', 'v14-session', 'v14-mic-track', 'mic', 0,
+          'v14-mic.wav', 110, 190, 80, 'mic-sha', 10000,
+          'completed', 'committed', 'wav', 'mic-file', 24000, 1
+        );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text,
+        confidence, is_stable, analysis_state, track_id, chunk_id, source_type,
+        result_kind, version, model_version, completed_at, echo_score
+      ) VALUES (
+        'v14-system-final', 'v14-session', 100, 200, 'v14-person', 'System',
+        'system words', 0.91, 1, 'ready', 'v14-system-track', 'v14-system-chunk',
+        'system', 'final', 7, 'model-v7', 250, 0.25
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text,
+        confidence, is_stable, analysis_state, track_id, chunk_id, source_type,
+        result_kind, version, model_version, completed_at, echo_score, duplicate_of
+      ) VALUES (
+        'v14-mic-final', 'v14-session', 110, 190, 'v14-person', 'Alice',
+        'system words', 0.88, 1, 'ready', 'v14-mic-track', 'v14-mic-chunk',
+        'mic', 'final', 8, 'model-v8', 251, 0.95, 'v14-system-final'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, source_type, result_kind, version,
+        superseded_by, echo_score
+      ) VALUES (
+        'v14-preview', 'v14-session', 120, 180, 'Alice', 'preview words', 0.51,
+        0, 'pending', 'v14-mic-track', 'mic', 'provisional', 2,
+        'v14-mic-final', 0.75
+      );
+      INSERT INTO segment_links (id, segment_id) VALUES ('v14-link', 'v14-mic-final');
+      PRAGMA user_version = 14;
+    `);
+
+    const rowsBefore = db.prepare("SELECT * FROM transcript_segments ORDER BY id").all();
+    const schemaBefore = db
+      .prepare(
+        `SELECT type, name, tbl_name, sql FROM sqlite_master
+         WHERE tbl_name = 'transcript_segments' AND type IN ('table','index','trigger')
+         ORDER BY type, name`
+      )
+      .all();
+    const transcriptForeignKeysBefore = db.pragma("foreign_key_list(transcript_segments)");
+    const dependentForeignKeysBefore = db.pragma("foreign_key_list(segment_links)");
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 14,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(db.prepare("SELECT * FROM transcript_segments ORDER BY id").all(), rowsBefore);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT type, name, tbl_name, sql FROM sqlite_master
+           WHERE tbl_name = 'transcript_segments' AND type IN ('table','index','trigger')
+           ORDER BY type, name`
+        )
+        .all(),
+      schemaBefore
+    );
+    assert.deepEqual(
+      db.pragma("foreign_key_list(transcript_segments)"),
+      transcriptForeignKeysBefore
+    );
+    assert.deepEqual(db.pragma("foreign_key_list(segment_links)"), dependentForeignKeysBefore);
+    assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
+      { id: "v14-link", segment_id: "v14-mic-final" },
     ]);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {

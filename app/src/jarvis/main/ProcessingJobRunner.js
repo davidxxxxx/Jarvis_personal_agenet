@@ -122,11 +122,12 @@ class ProcessingJobRunner {
 
     const handler = this.handlers.get(job.job_type);
     if (!handler) {
-      this.store.blockJob(job.id, {
+      const blocked = this.store.blockJob(job.id, {
         owner: this.owner,
         at: this.now(),
         errorCode: "HANDLER_MISSING",
       });
+      if (!blocked) throw codedError("JOB_LEASE_LOST");
       return 1;
     }
 
@@ -143,11 +144,12 @@ class ProcessingJobRunner {
         admission = { action: "defer", reason: "telemetry_unavailable" };
       }
       if (["defer", "pause_preview"].includes(admission.action)) {
-        this.store.deferJob(job.id, {
+        const deferred = this.store.deferJob(job.id, {
           owner: this.owner,
           at: this.now(),
           reason: admission.reason,
         });
+        if (!deferred) throw codedError("JOB_LEASE_LOST");
         return 1;
       }
       const device = admission.action === "run_cuda" ? "cuda" : "cpu";
@@ -167,23 +169,26 @@ class ProcessingJobRunner {
       if (context && executionDevice !== context.device) {
         throw codedError("EXECUTION_DEVICE_MISMATCH");
       }
-      this.store.completeJob(job.id, {
+      const completed = this.store.completeJob(job.id, {
         owner: this.owner,
         at: this.now(),
         executionDevice,
       });
+      if (!completed) throw codedError("JOB_LEASE_LOST");
     } catch (error) {
+      if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
       const exponent = Math.max(0, Math.min(30, (job.attempt_count ?? 1) - 1));
       const retryDelay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** exponent);
       const nextRetryAt = Math.min(Number.MAX_SAFE_INTEGER, failedAt + retryDelay);
-      this.store.retryJob(job.id, {
+      const retried = this.store.retryJob(job.id, {
         owner: this.owner,
         at: failedAt,
         nextRetryAt,
         errorCode,
       });
+      if (!retried) throw codedError("JOB_LEASE_LOST");
     }
     return 1;
   }

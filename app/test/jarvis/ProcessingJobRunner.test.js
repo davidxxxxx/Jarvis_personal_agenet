@@ -447,3 +447,79 @@ test("exposes explicit expired-lease recovery", (t) => {
     }
   );
 });
+
+test("reports ownership loss when completion loses its lease instead of returning success", async (t) => {
+  let now = 2_000;
+  const { db, store, runner } = fixture(t, { now: () => now });
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    now = 2_100;
+    assert.equal(store.recoverExpiredLeases(now), 1);
+  });
+
+  await assert.rejects(runner.runOnce(2_000), { code: "JOB_LEASE_LOST" });
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT state, error_code, completed_at, lease_owner, lease_expires_at FROM processing_jobs WHERE id = 'j1'"
+      )
+      .get(),
+    {
+      state: "retry",
+      error_code: "LEASE_EXPIRED",
+      completed_at: null,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
+test("reports ownership loss when retry cannot transition the recovered lease", async (t) => {
+  let now = 2_000;
+  const { db, store, runner } = fixture(t, { now: () => now });
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    now = 2_100;
+    assert.equal(store.recoverExpiredLeases(now), 1);
+    const error = new Error("late backend failure");
+    error.code = "TRANSIENT";
+    throw error;
+  });
+
+  await assert.rejects(runner.runOnce(2_000), { code: "JOB_LEASE_LOST" });
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, error_code, next_retry_at FROM processing_jobs WHERE id = 'j1'")
+      .get(),
+    { state: "retry", error_code: "LEASE_EXPIRED", next_retry_at: 2_100 }
+  );
+});
+
+test("reports ownership loss when resource deferral cannot release the recovered lease", async (t) => {
+  let now = 2_000;
+  let durableStore;
+  const governor = {
+    sample: async () => {
+      now = 2_100;
+      assert.equal(durableStore.recoverExpiredLeases(now), 1);
+      return { state: "busy", selectedGpuUuid: "GPU-a" };
+    },
+    admit: () => ({ action: "defer", reason: "external_gpu_busy" }),
+  };
+  const { db, store, runner } = fixture(t, {
+    now: () => now,
+    governor,
+    heavyGate: new HeavyJobGate(),
+  });
+  durableStore = store;
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => assert.fail("deferred handler ran"));
+
+  await assert.rejects(runner.runOnce(2_000), { code: "JOB_LEASE_LOST" });
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, error_code, blocked_reason FROM processing_jobs WHERE id = 'j1'")
+      .get(),
+    { state: "retry", error_code: "LEASE_EXPIRED", blocked_reason: null }
+  );
+});

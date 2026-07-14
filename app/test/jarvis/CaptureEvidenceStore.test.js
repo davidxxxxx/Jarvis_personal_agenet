@@ -1345,6 +1345,201 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
   );
 });
 
+test("promotes live WAV compression jobs for storage recovery idempotently", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  for (let index = 0; index < 4; index += 1) {
+    store.commitChunk(
+      chunk({
+        id: `c${index}`,
+        sequenceNumber: index,
+        path: `c${index}.wav`,
+        startedAt: 10 + index * 10,
+        endedAt: 20 + index * 10,
+        sha256: `hash${index}`,
+        expiresAt: 1_000,
+        encoderVersion: "flac-v1",
+      })
+    );
+  }
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'retry', next_retry_at = 900, blocked_reason = 'resource_busy',
+         error_code = 'PRIOR_FAILURE'
+     WHERE chunk_id = 'c1' AND job_type = 'compress_chunk'`
+  ).run();
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', lease_owner = 'worker-a', lease_expires_at = 900
+     WHERE chunk_id = 'c2' AND job_type = 'compress_chunk'`
+  ).run();
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 90
+     WHERE chunk_id = 'c3' AND job_type = 'compress_chunk'`
+  ).run();
+
+  assert.equal(store.promoteCompressionJobsForStoragePressure(100), 2);
+  assert.equal(store.promoteCompressionJobsForStoragePressure(100), 0);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT chunk_id, state, priority, next_retry_at, blocked_reason, error_code
+         FROM processing_jobs
+         WHERE job_type = 'compress_chunk'
+         ORDER BY chunk_id`
+      )
+      .all(),
+    [
+      {
+        chunk_id: "c0",
+        state: "storage_recovery_compress",
+        priority: 10,
+        next_retry_at: 100,
+        blocked_reason: null,
+        error_code: null,
+      },
+      {
+        chunk_id: "c1",
+        state: "storage_recovery_compress",
+        priority: 10,
+        next_retry_at: 100,
+        blocked_reason: null,
+        error_code: null,
+      },
+      {
+        chunk_id: "c2",
+        state: "running",
+        priority: 60,
+        next_retry_at: null,
+        blocked_reason: null,
+        error_code: null,
+      },
+      {
+        chunk_id: "c3",
+        state: "completed",
+        priority: 60,
+        next_retry_at: null,
+        blocked_reason: null,
+        error_code: null,
+      },
+    ]
+  );
+});
+
+test("storage pressure preserves backoff after an already-promoted job is deferred", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(
+    chunk({
+      expiresAt: 1_000,
+      encoderVersion: "flac-v1",
+    })
+  );
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 50
+     WHERE chunk_id = 'c1' AND job_type = 'transcribe_chunk'`
+  ).run();
+
+  assert.equal(store.promoteCompressionJobsForStoragePressure(100), 1);
+  const [claimed] = store.claimJobs({ owner: "worker-a", at: 100, leaseMs: 100, limit: 1 });
+  assert.equal(claimed.job_type, "compress_chunk");
+  assert.equal(
+    store.deferJob(claimed.id, {
+      owner: "worker-a",
+      at: 101,
+      nextRetryAt: 116,
+      reason: "cpu_load_high",
+    }),
+    true
+  );
+
+  assert.equal(store.promoteCompressionJobsForStoragePressure(102), 0);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, priority, next_retry_at, blocked_reason, error_code
+         FROM processing_jobs WHERE id = ?`
+      )
+      .get(claimed.id),
+    {
+      state: "retry",
+      priority: 10,
+      next_retry_at: 116,
+      blocked_reason: "cpu_load_high",
+      error_code: null,
+    }
+  );
+});
+
+test("leased FLAC promotion rejects expiry and leaves terminal ownership to the runner", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, encoderVersion: "flac-v1" }));
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 50
+     WHERE chunk_id = 'c1' AND job_type = 'transcribe_chunk'`
+  ).run();
+  const compressionJob = db
+    .prepare("SELECT id FROM processing_jobs WHERE chunk_id = 'c1' AND job_type = 'compress_chunk'")
+    .get();
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 100, leaseMs: 100, limit: 1 })[0].id,
+    compressionJob.id
+  );
+  const promotion = {
+    chunkId: "c1",
+    jobId: compressionJob.id,
+    owner: "worker-a",
+    encoderVersion: "flac-v1",
+    pcmSha256: "abc",
+    wavPath: "c1.wav",
+    flacPath: "c1.flac",
+    fileSha256: "def",
+    fileBytes: 40,
+    sampleRate: 24_000,
+    channels: 1,
+  };
+
+  assert.equal(store.promoteLeasedChunkToFlac({ ...promotion, completedAt: 200 }), null);
+  assert.deepEqual(db.prepare("SELECT path, format FROM audio_chunks WHERE id = 'c1'").get(), {
+    path: "c1.wav",
+    format: "wav",
+  });
+
+  assert.equal(store.recoverExpiredLeases(200), 1);
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 200, leaseMs: 100, limit: 1 })[0].id,
+    compressionJob.id
+  );
+  const promoted = store.promoteLeasedChunkToFlac({ ...promotion, completedAt: 201 });
+  assert.equal(promoted.format, "flac");
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, lease_owner, completed_at FROM processing_jobs WHERE id = ?")
+      .get(compressionJob.id),
+    { state: "running", lease_owner: "worker-a", completed_at: null }
+  );
+  assert.equal(
+    store.completeJob(compressionJob.id, {
+      owner: "worker-a",
+      at: 202,
+      executionDevice: "cpu",
+    }),
+    true
+  );
+  assert.equal(
+    store.completeJob(compressionJob.id, {
+      owner: "worker-a",
+      at: 203,
+      executionDevice: "cpu",
+    }),
+    false
+  );
+});
+
 test("records idempotent signed storage growth and deletion telemetry in evidence transactions", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
@@ -1545,24 +1740,25 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
 
 test("claims eligible jobs atomically in deterministic order without stealing leases", (t) => {
   const { db, store } = fixture(t);
-  seedProcessingJob(db, { id: "job-b", priority: 5, createdAt: 100 });
+  seedProcessingJob(db, { id: "job-b", priority: 30, createdAt: 100 });
   seedProcessingJob(db, {
     id: "job-a",
-    priority: 1,
+    priority: 30,
     createdAt: 100,
     inputHash: "input-a",
   });
   seedProcessingJob(db, {
     id: "job-urgent",
     state: "retention_urgent",
-    priority: 99,
+    priority: 0,
     createdAt: 999,
     inputHash: "input-urgent",
   });
   seedProcessingJob(db, {
     id: "job-compress",
     jobType: "compress_chunk",
-    priority: 0,
+    state: "storage_recovery_compress",
+    priority: 10,
     createdAt: 50,
     inputHash: "input-compress",
   });
@@ -1605,6 +1801,30 @@ test("claims eligible jobs atomically in deterministic order without stealing le
       { id: "job-current", state: "running", lease_owner: "worker-a", lease_expires_at: 501 },
       { id: "job-later", state: "retry", lease_owner: null, lease_expires_at: null },
     ]
+  );
+});
+
+test("claims by durable priority even when a lower-priority state was deferred", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    id: "retention-first",
+    state: "retry",
+    priority: 0,
+    nextRetryAt: 500,
+    inputHash: "retention-input",
+  });
+  seedProcessingJob(db, {
+    id: "storage-second",
+    jobType: "compress_chunk",
+    state: "storage_recovery_compress",
+    priority: 10,
+    nextRetryAt: 500,
+    inputHash: "storage-input",
+  });
+
+  assert.deepEqual(
+    store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 2 }).map((job) => job.id),
+    ["retention-first", "storage-second"]
   );
 });
 

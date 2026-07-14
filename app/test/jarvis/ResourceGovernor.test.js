@@ -6,6 +6,8 @@ const {
   ADMISSION_ACTIONS,
   JOB_PRIORITY,
   orderJobs,
+  createWindowsCpuProvider,
+  createWindowsPowerProvider,
 } = require("../../src/jarvis/main/ResourceGovernor");
 const {
   parseNvidiaSmiTelemetry,
@@ -247,6 +249,7 @@ test("battery saver admits only storage rescue and pauses or defers AI work", ()
     batterySaver: true,
     previewEnabled: true,
     cpuLoadPct: 10,
+    powerTelemetryAvailable: true,
   };
 
   assert.deepEqual(governor.admit("preview", snapshot), {
@@ -261,6 +264,155 @@ test("battery saver admits only storage rescue and pauses or defers AI work", ()
     action: "run_cpu",
     reason: "storage_critical",
   });
+  assert.deepEqual(governor.admit("retention_urgent", snapshot), {
+    action: "defer",
+    reason: "battery_saver",
+  });
+});
+
+test("graphics-only load on the selected GPU constrains admission without a compute process", async () => {
+  const at = 1_000;
+  const governor = new ResourceGovernor({
+    now: () => at,
+    telemetryProvider: async () => {
+      const telemetry = healthyTelemetry();
+      telemetry.gpus[0].utilizationPct = 95;
+      return telemetry;
+    },
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 20 }),
+    powerProvider: async () => ({ onAcPower: true, batteryLevelPct: 100, batterySaver: false }),
+  });
+
+  const snapshot = await governor.sample();
+  assert.equal(snapshot.state, "constrained");
+  assert.equal(snapshot.reason, "gpu_utilization_high");
+  assert.equal(snapshot.gpuUtilizationPct, 95);
+  assert.equal(snapshot.externalGpuBusy, false);
+});
+
+test("high Windows CPU load constrains GPU admission", async () => {
+  const governor = new ResourceGovernor({
+    now: () => 1_000,
+    telemetryProvider: async () => healthyTelemetry(),
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 95 }),
+    powerProvider: async () => ({ onAcPower: true, batteryLevelPct: 100, batterySaver: false }),
+  });
+
+  const snapshot = await governor.sample();
+  assert.equal(snapshot.state, "constrained");
+  assert.equal(snapshot.reason, "cpu_load_high");
+  assert.deepEqual(governor.admit("storage_recovery_compress", snapshot), {
+    action: "defer",
+    reason: "cpu_load_high",
+  });
+});
+
+test("invalid CPU or missing power readings remain fail-closed after hysteresis", async (t) => {
+  for (const scenario of [
+    {
+      name: "invalid CPU",
+      cpu: { loadPct: null },
+      power: { onAcPower: true, batteryLevelPct: 100, batterySaver: false },
+    },
+    {
+      name: "missing power",
+      cpu: { loadPct: 20 },
+      power: { onAcPower: null, batteryLevelPct: null, batterySaver: false },
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      let at = 1_000;
+      const governor = new ResourceGovernor({
+        now: () => at,
+        telemetryProvider: async () => healthyTelemetry(),
+        cudaProvider: async () => cudaReady(),
+        cpuProvider: async () => scenario.cpu,
+        powerProvider: async () => scenario.power,
+      });
+      await governor.sample();
+      at += 15_000;
+      const second = await governor.sample();
+      assert.equal(second.state, "constrained");
+      assert.equal(second.reason, "telemetry_unavailable");
+      assert.deepEqual(governor.admit("storage_recovery_compress", second), {
+        action: "defer",
+        reason: "telemetry_unavailable",
+      });
+    });
+  }
+});
+
+test("Windows providers normalize CPU deltas and active battery saver status", async () => {
+  const snapshots = [
+    [{ times: { user: 100, nice: 0, sys: 50, idle: 850, irq: 0 } }],
+    [{ times: { user: 180, nice: 0, sys: 70, idle: 950, irq: 0 } }],
+  ];
+  const cpuProvider = createWindowsCpuProvider({ cpuTimesProvider: () => snapshots.shift() });
+  assert.deepEqual(await cpuProvider(), { loadPct: null, telemetryAvailable: false });
+  assert.deepEqual(await cpuProvider(), { loadPct: 50, telemetryAvailable: true });
+
+  const calls = [];
+  const powerProvider = createWindowsPowerProvider({
+    platform: "win32",
+    execFileImpl(file, args, options, callback) {
+      calls.push({ file, args, options });
+      callback(
+        null,
+        JSON.stringify({
+          onAcPower: false,
+          batteryPresent: true,
+          batteryLevelPct: 44,
+          batterySaver: true,
+        }),
+        ""
+      );
+    },
+  });
+  assert.deepEqual(await powerProvider(), {
+    onAcPower: false,
+    batteryPresent: true,
+    batteryLevelPct: 44,
+    batterySaver: true,
+    telemetryAvailable: true,
+  });
+  assert.equal(calls[0].file.toLowerCase(), "powershell.exe");
+  assert.equal(calls[0].options.windowsHide, true);
+});
+
+test("Windows power sampling coalesces concurrent calls and caches beyond governor cadence", async () => {
+  let at = 1_000;
+  let calls = 0;
+  const provider = createWindowsPowerProvider({
+    platform: "win32",
+    now: () => at,
+    execFileImpl(_file, _args, _options, callback) {
+      calls += 1;
+      process.nextTick(() =>
+        callback(
+          null,
+          JSON.stringify({
+            onAcPower: true,
+            batteryPresent: false,
+            batteryLevelPct: null,
+            batterySaver: false,
+          }),
+          ""
+        )
+      );
+    },
+  });
+
+  const [first, concurrent] = await Promise.all([provider(), provider()]);
+  assert.equal(first, concurrent);
+  assert.equal(calls, 1);
+  at += 59_999;
+  assert.equal(await provider(), first);
+  assert.equal(calls, 1);
+  at += 1;
+  assert.notEqual(await provider(), first);
+  assert.equal(calls, 2);
 });
 
 test("CUDA unavailable allows optional CPU preview but not ordinary final backlog", () => {

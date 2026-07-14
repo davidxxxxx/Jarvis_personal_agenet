@@ -6,6 +6,7 @@ const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const WhisperCudaManager = require("../../src/helpers/whisperCudaManager");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
@@ -17,6 +18,53 @@ function deferred() {
     resolve = next;
   });
   return { promise, resolve };
+}
+
+async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
+  const componentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-runtime-cuda-"));
+  t.after(() => fs.rmSync(componentRoot, { recursive: true, force: true }));
+  const manifest = {
+    repository: "example/runtime",
+    tag: "test-v1",
+    asset: "whisper-server-win32-x64-cuda.zip",
+    size: 4,
+    sha256: "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+  };
+  const manager = new WhisperCudaManager({
+    platform: "win32",
+    componentRoot,
+    manifest,
+    approvedManifests: [manifest],
+    extractedSizeEstimate: 8,
+    diskSafetyMargin: 0,
+    checkDiskSpace: async () => ({ ok: true, availableBytes: 10_000 }),
+    inspectArchive: async () => [
+      { path: "runtime/whisper-server-win32-x64-cuda.exe", type: "File" },
+    ],
+    downloadFile: async (_url, destination) => {
+      fs.writeFileSync(destination, Buffer.from([1, 2, 3, 4]));
+    },
+    extractArchive: async (_archive, destination) => {
+      fs.mkdirSync(destination, { recursive: true });
+      fs.writeFileSync(path.join(destination, "whisper-server-win32-x64-cuda.exe"), "exe");
+      fs.writeFileSync(path.join(destination, "cublas64_12.dll"), "dll");
+      fs.writeFileSync(path.join(destination, "cudart64_12.dll"), "dll");
+    },
+    verifyRuntime: async () => ({
+      ok: true,
+      backend: "cuda",
+      gpuUuid,
+      reason: "verified",
+    }),
+  });
+  await manager.installPinnedCudaRuntime({
+    consent: true,
+    verification: {
+      gpuUuid,
+      getMetadata: () => ({ peakVramMb }),
+    },
+  });
+  return manager;
 }
 
 function insertSession(
@@ -444,6 +492,7 @@ test("production composition binds transcribe and compression handlers to curren
     .run("chunk-mic".padEnd(64, "0").slice(0, 64));
 
   const calls = [];
+  const compressionContexts = [];
   const admissions = [];
   const governor = {
     sample: async () => ({
@@ -463,7 +512,10 @@ test("production composition binds transcribe and compression handlers to curren
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
     },
     flacCompressionWorker: {
-      run: async (job) => calls.push(`compress:${job.id}`),
+      run: async (job, context) => {
+        calls.push(`compress:${job.id}`);
+        compressionContexts.push(context);
+      },
     },
   };
   const ipcHandlers = {
@@ -489,6 +541,7 @@ test("production composition binds transcribe and compression handlers to curren
   assert.equal(await runtime.drainOnce(), 2);
   assert.deepEqual(calls, ["model:large-v3-turbo", "transcribe", "compress:compress-job"]);
   assert.deepEqual(admissions, ["final_transcription", "maintenance"]);
+  assert.deepEqual(compressionContexts, [{ owner: "production-worker" }]);
   assert.deepEqual(
     repository.db.prepare("SELECT id, execution_device FROM processing_jobs ORDER BY id").all(),
     [
@@ -497,6 +550,259 @@ test("production composition binds transcribe and compression handlers to curren
     ]
   );
   assert.equal(repository.getSession("s1").processing_state, "ready");
+});
+
+test("transcription and storage compression share one heavy-work concurrency permit", async () => {
+  const gate = new HeavyJobGate();
+  const releaseTranscription = deferred();
+  let active = 0;
+  let peak = 0;
+  const order = [];
+  const run = (kind, release = null) =>
+    gate.run(kind, async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      order.push(`${kind}:start`);
+      if (release) await release.promise;
+      order.push(`${kind}:end`);
+      active -= 1;
+    });
+
+  const transcription = run("final_transcription", releaseTranscription);
+  const compression = run("storage_recovery_compress");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(gate.getState(), { activeKind: "final_transcription", queueLength: 1 });
+  releaseTranscription.resolve();
+  await Promise.all([transcription, compression]);
+
+  assert.equal(peak, 1);
+  assert.deepEqual(order, [
+    "final_transcription:start",
+    "final_transcription:end",
+    "storage_recovery_compress:start",
+    "storage_recovery_compress:end",
+  ]);
+});
+
+test("two production drains serialize transcription and compression through the shared gate", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  insertChunk(repository);
+  insertJob(repository);
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state,
+        input_hash, input_version, model_version, priority, created_at
+      ) VALUES (
+        'compress-job', 's1', 'track-mic', 'chunk-mic', 'compress_chunk', 'pending',
+        ?, 1, 'flac-v1', 60, 101
+      )`
+    )
+    .run("chunk-mic".padEnd(64, "0").slice(0, 64));
+  const transcriptionStarted = deferred();
+  const releaseTranscription = deferred();
+  let active = 0;
+  let peak = 0;
+  const compressionContexts = [];
+  const service = {
+    audioEvidenceReader: {
+      withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
+    },
+    flacCompressionWorker: {
+      run: async (_job, context) => {
+        compressionContexts.push(context);
+        active += 1;
+        peak = Math.max(peak, active);
+        active -= 1;
+      },
+    },
+  };
+  const ipcHandlers = {
+    createJarvisTranscribeWavAdapter:
+      () =>
+      async ({ executionContext }) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        transcriptionStarted.resolve();
+        await releaseTranscription.promise;
+        active -= 1;
+        return { noSpeech: true, executionDevice: executionContext.device };
+      },
+  };
+  const governor = {
+    sample: async () => ({
+      state: "available",
+      selectedGpuUuid: "GPU-verified",
+      restrictiveForMs: 0,
+    }),
+    admit: (kind) =>
+      kind === "final_transcription"
+        ? { action: "run_cuda", reason: "resources_available" }
+        : { action: "run_cpu", reason: "resources_available" },
+  };
+  const gate = new HeavyJobGate();
+  const common = {
+    repository,
+    service,
+    ipcHandlers,
+    model: "large-v3-turbo",
+    now: () => 2_000,
+    governor,
+    heavyGate: gate,
+    maxJobsPerDrain: 1,
+  };
+  const transcriptionRuntime = createJarvisProcessingRuntime({
+    ...common,
+    owner: "transcription-worker",
+  });
+  const compressionRuntime = createJarvisProcessingRuntime({
+    ...common,
+    owner: "compression-worker",
+  });
+
+  const transcriptionDrain = transcriptionRuntime.drainOnce();
+  await transcriptionStarted.promise;
+  const compressionDrain = compressionRuntime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(gate.getState(), { activeKind: "final_transcription", queueLength: 1 });
+  assert.deepEqual(compressionContexts, []);
+  releaseTranscription.resolve();
+  assert.deepEqual(await Promise.all([transcriptionDrain, compressionDrain]), [1, 1]);
+
+  assert.equal(peak, 1);
+  assert.deepEqual(compressionContexts, [{ owner: "compression-worker" }]);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT id, state, attempt_count, completed_at FROM processing_jobs ORDER BY id")
+      .all(),
+    [
+      { id: "compress-job", state: "completed", attempt_count: 1, completed_at: 2_000 },
+      { id: "job-mic", state: "completed", attempt_count: 1, completed_at: 2_000 },
+    ]
+  );
+});
+
+test("production runtime startup waits for FLAC authority recovery before claiming jobs", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  insertChunk(repository);
+  insertJob(repository);
+  const recovery = deferred();
+  const calls = [];
+  const service = {
+    waitForCompressionRecovery: () => recovery.promise,
+    audioEvidenceReader: {
+      withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
+    },
+    flacCompressionWorker: { run: async () => {} },
+  };
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter:
+        () =>
+        async ({ executionContext }) => {
+          calls.push("transcribe");
+          return { noSpeech: true, executionDevice: executionContext.device };
+        },
+    },
+    model: "large-v3-turbo",
+    owner: "startup-worker",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        selectedGpuUuid: "GPU-verified",
+        restrictiveForMs: 0,
+      }),
+      admit: () => ({ action: "run_cuda", reason: "resources_available" }),
+    },
+    heavyGate: new HeavyJobGate(),
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  });
+
+  const startup = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, []);
+  assert.equal(
+    repository.db.prepare("SELECT state FROM processing_jobs WHERE id = 'job-mic'").get().state,
+    "pending"
+  );
+  recovery.resolve({ promoted: 1 });
+  assert.equal(await startup, 1);
+  assert.deepEqual(calls, ["transcribe"]);
+  await runtime.stop();
+});
+
+test("production admission uses the real CUDA status peak at the exact safety-margin boundary", async (t) => {
+  const gpuUuid = "GPU-equality";
+  const peakVramMb = 2_048;
+  const cudaManager = await makeVerifiedCudaManager(t, { peakVramMb, gpuUuid });
+  const previousEnabled = process.env.WHISPER_CUDA_ENABLED;
+  const previousUuid = process.env.TRANSCRIPTION_GPU_UUID;
+  process.env.WHISPER_CUDA_ENABLED = "true";
+  process.env.TRANSCRIPTION_GPU_UUID = gpuUuid;
+  t.after(() => {
+    if (previousEnabled == null) delete process.env.WHISPER_CUDA_ENABLED;
+    else process.env.WHISPER_CUDA_ENABLED = previousEnabled;
+    if (previousUuid == null) delete process.env.TRANSCRIPTION_GPU_UUID;
+    else process.env.TRANSCRIPTION_GPU_UUID = previousUuid;
+  });
+
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  let now = 1_000;
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: { withVerifiedWav: async () => ({}) },
+      flacCompressionWorker: { run: async () => ({}) },
+    },
+    ipcHandlers: {
+      whisperCudaManager: cudaManager,
+      createJarvisTranscribeWavAdapter: () => async () => ({ text: "unused" }),
+    },
+    model: "large-v3-turbo",
+    now: () => now,
+    telemetryProvider: async ({ ownedPids }) => ({
+      telemetryAvailable: true,
+      processTelemetryAvailable: true,
+      ownedPids,
+      gpus: [
+        {
+          uuid: gpuUuid,
+          totalVramMb: 8_192,
+          usedVramMb: 5_120,
+          freeVramMb: peakVramMb + 1_024,
+          utilizationPct: 0,
+        },
+      ],
+      processes: [],
+    }),
+    cpuProvider: async () => ({ loadPct: 10 }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryLevelPct: 100,
+      batterySaver: false,
+    }),
+  });
+
+  await runtime.governor.sample();
+  now += 15_000;
+  const recovered = await runtime.governor.sample();
+  assert.equal(cudaManager.getStatus({ gpuUuid }).verification.peakVramMb, peakVramMb);
+  assert.equal(recovered.freeVramMb, peakVramMb + 1_024);
+  assert.deepEqual(runtime.governor.admit("final_transcription", recovered), {
+    action: "run_cuda",
+    reason: "resources_available",
+  });
 });
 
 test("sustained restrictive state releases only an idle Whisper server once per episode", async () => {

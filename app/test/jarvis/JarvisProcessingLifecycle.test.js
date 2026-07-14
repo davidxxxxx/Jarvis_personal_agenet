@@ -4,9 +4,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
-const {
-  createJarvisProcessingRuntime,
-} = require("../../src/jarvis/main/JarvisProcessingRuntime");
+const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const { createJarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const {
   JarvisProcessingLifecycle,
   createJarvisRuntimeMigrationParticipant,
@@ -46,7 +45,12 @@ test("migration stops the old runtime and rebuilds production handlers from reco
     },
   };
   const ipcHandlers = {
-    createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    createJarvisTranscribeWavAdapter:
+      () =>
+      async ({ executionContext }) => ({
+        noSpeech: true,
+        executionDevice: executionContext.device,
+      }),
   };
   const builds = [];
   const lifecycle = new JarvisProcessingLifecycle({
@@ -63,6 +67,15 @@ test("migration stops the old runtime and rebuilds production handlers from reco
         model: "large-v3-turbo",
         owner: `migration-worker-${builds.length}`,
         now: () => 2_000,
+        governor: {
+          sample: async () => ({
+            state: "available",
+            selectedGpuUuid: null,
+            restrictiveForMs: 0,
+          }),
+          admit: () => ({ action: "run_cpu", reason: "test_resources_available" }),
+        },
+        heavyGate: new HeavyJobGate(),
         setIntervalImpl: () => ({ unref() {} }),
         clearIntervalImpl: () => {},
       });
@@ -109,13 +122,17 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   await participant.close();
   await participant.reopen(nextRoot);
   const newStore = repository.captureEvidenceStore;
-  repository.db.prepare(`
+  repository.db
+    .prepare(
+      `
     INSERT INTO sessions (
       id, started_at, ended_at, status, language, created_at,
       capture_mode, processing_state, finalized_at
     ) VALUES ('migrated-session', 100, 1000, 'completed', 'zh', 100,
       'mic', 'processing', 1000)
-  `).run();
+  `
+    )
+    .run();
   repository.createTrack({
     id: "migrated-track",
     sessionId: "migrated-session",

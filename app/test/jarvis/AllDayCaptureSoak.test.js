@@ -11,6 +11,8 @@ const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader")
 const DataDirectoryMigrator = require("../../src/jarvis/main/DataDirectoryMigrator");
 const DataRootRelocator = require("../../src/jarvis/main/DataRootRelocator");
 const FlacCompressionWorker = require("../../src/jarvis/main/FlacCompressionWorker");
+const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const { createJarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
 const RetentionCleaner = require("../../src/jarvis/main/RetentionCleaner");
@@ -61,10 +63,52 @@ function dualSources() {
 function withTimeout(promise, label, timeoutMs = OPERATION_TIMEOUT_MS) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs);
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs} ms`)),
+      timeoutMs
+    );
     timer.unref?.();
   });
   return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+function createGovernedSoakRuntime({ repository, service, now, owner = "soak-worker" }) {
+  return createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter:
+        () =>
+        async ({ executionContext }) => ({
+          noSpeech: true,
+          executionDevice: executionContext.device,
+        }),
+    },
+    model: "soak-model",
+    owner,
+    now,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        selectedGpuUuid: null,
+        restrictiveForMs: 0,
+      }),
+      admit: () => ({ action: "run_cpu", reason: "bounded_soak" }),
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 100,
+    maxDrainMs: 20_000,
+  });
+}
+
+async function drainGovernedSoakRuntime(runtime, label, maxDrains = 100) {
+  let processed = 0;
+  for (let drain = 0; drain < maxDrains; drain += 1) {
+    const count = await withTimeout(runtime.drainOnce(), `${label} drain ${drain + 1}`);
+    processed += count;
+    if (count === 0) return processed;
+  }
+  throw new Error(`${label} exceeded ${maxDrains} governed drains`);
 }
 
 function createVirtualClock(startedAt = 0) {
@@ -300,10 +344,14 @@ function createOwnedTimerTracker() {
           callback.toString().includes("VAD classification timed out");
         if (!taskOwned) return originalSetTimeout(callback, delay, ...args);
         let timer = null;
-        timer = originalSetTimeout((...callbackArgs) => {
-          active.delete(timer);
-          callback(...callbackArgs);
-        }, delay, ...args);
+        timer = originalSetTimeout(
+          (...callbackArgs) => {
+            active.delete(timer);
+            callback(...callbackArgs);
+          },
+          delay,
+          ...args
+        );
         active.add(timer);
         peak = Math.max(peak, active.size);
         return timer;
@@ -387,9 +435,11 @@ function durableDurationBySource(repository) {
        FROM audio_chunks GROUP BY source_type`
     )
     .all();
-  return Object.fromEntries(["mic", "system"].map((sourceType) => [sourceType, 0]).concat(
-    rows.map((row) => [row.sourceType, row.durationMs])
-  ));
+  return Object.fromEntries(
+    ["mic", "system"]
+      .map((sourceType) => [sourceType, 0])
+      .concat(rows.map((row) => [row.sourceType, row.durationMs]))
+  );
 }
 
 function scheduledSpeech(second) {
@@ -441,7 +491,9 @@ async function assertEvidenceIntegrity(repository, reader, recordingsRoot) {
   const orphaned = durableAudio.filter(
     (file) => !authoritative.has(path.resolve(file)) && !retired.has(path.resolve(file))
   );
-  const incomplete = files.filter((file) => /\.(?:partial|tmp)$/i.test(file) || file.endsWith(".recovery.json"));
+  const incomplete = files.filter(
+    (file) => /\.(?:partial|tmp)$/i.test(file) || file.endsWith(".recovery.json")
+  );
 
   assert.deepEqual(orphaned, []);
   assert.deepEqual(incomplete, []);
@@ -483,12 +535,9 @@ test("task-owned instrumentation cleanup preserves teardown errors and restores 
 
   await assert.rejects(
     () =>
-      teardownOwnedInstrumentation(
-        async () => {
-          throw teardownError;
-        },
-        [() => fileHandles.restore(), () => timerHandles.restore()]
-      ),
+      teardownOwnedInstrumentation(async () => {
+        throw teardownError;
+      }, [() => fileHandles.restore(), () => timerHandles.restore()]),
     (error) => error === teardownError
   );
   assert.equal(fs.openSync, originalOpenSync);
@@ -500,19 +549,16 @@ test("task-owned instrumentation cleanup preserves teardown errors and restores 
   let secondRestoreRan = false;
   await assert.rejects(
     () =>
-      teardownOwnedInstrumentation(
-        async () => {
-          throw teardownError;
+      teardownOwnedInstrumentation(async () => {
+        throw teardownError;
+      }, [
+        () => {
+          throw restoreError;
         },
-        [
-          () => {
-            throw restoreError;
-          },
-          () => {
-            secondRestoreRan = true;
-          },
-        ]
-      ),
+        () => {
+          secondRestoreRan = true;
+        },
+      ]),
     (error) =>
       error instanceof AggregateError &&
       error.cause === teardownError &&
@@ -520,6 +566,64 @@ test("task-owned instrumentation cleanup preserves teardown errors and restores 
       error.errors[1] === restoreError
   );
   assert.equal(secondRestoreRan, true);
+});
+
+test("bounded soak harness drains capture compression only through the governed runtime", async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-bounded-soak-"));
+  const recordingsRoot = path.join(root, "recordings");
+  const repository = new JarvisRepository(":memory:");
+  const clock = createVirtualClock(0);
+  const codec = new DeterministicLosslessCodec();
+  const reader = new AudioEvidenceReader({
+    decoder: codec,
+    recordingsRoot,
+    now: clock.now,
+  });
+  const compressionWorker = new FlacCompressionWorker({
+    store: repository.captureEvidenceStore,
+    recordingsRoot,
+    encoder: codec,
+    reader,
+    now: clock.now,
+  });
+  const { implementation: fsImpl } = createDiskBoundary();
+  const service = new JarvisService({
+    repository,
+    userDataDir: root,
+    recordingsDir: recordingsRoot,
+    broadcast() {},
+    now: clock.now,
+    fsImpl,
+    audioEvidenceReader: reader,
+    flacCompressionWorker: compressionWorker,
+  });
+  const runtime = createGovernedSoakRuntime({ repository, service, now: clock.now });
+  t.after(async () => {
+    await runtime.stop();
+    service.shutdown();
+    await compressionWorker.shutdown();
+    repository.close();
+    await fsp.rm(root, { recursive: true, force: true });
+  });
+  repository.createSession({ id: "bounded-soak", startedAt: 0, micDeviceId: null });
+
+  service.startCapture({ sessionId: "bounded-soak", startedAt: 0, micDeviceId: null });
+  assert.equal(service.appendMicPcm("bounded-soak", pcm(100, 1_000)), true);
+  clock.set(100);
+  service.finishCapture("bounded-soak", clock.now());
+  assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "wav");
+
+  assert.equal(await drainGovernedSoakRuntime(runtime, "bounded compression"), 2);
+  assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "flac");
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT job_type, state, attempt_count FROM processing_jobs ORDER BY job_type")
+      .all(),
+    [
+      { job_type: "compress_chunk", state: "completed", attempt_count: 1 },
+      { job_type: "transcribe_chunk", state: "completed", attempt_count: 1 },
+    ]
+  );
 });
 
 test(
@@ -542,38 +646,34 @@ test(
     let service = null;
     let retentionCleaner = null;
     let compressionWorker = null;
+    let processingRuntime = null;
     let reader = null;
 
     t.after(() =>
-      teardownOwnedInstrumentation(
-        async () => {
-          if (retentionCleaner) {
-            await withTimeout(retentionCleaner.stop(), "retention cleaner teardown", 5_000).catch(
-              () => {}
-            );
-          }
-          if (service) {
-            service.shutdown();
-            await withTimeout(service.whenRetentionIdle(), "retention teardown", 5_000).catch(
-              () => {}
-            );
-            await withTimeout(
-              service.waitForCompressionIdle(),
-              "compression teardown",
-              5_000
-            ).catch(() => {});
-          }
-          await withTimeout(
-            compressionWorker?.shutdown(),
-            "compression worker teardown",
-            5_000
-          ).catch(() => {});
-          if (repository?.db?.open) repository.close();
-          await settleEventLoop();
-          await fsp.rm(base, { recursive: true, force: true });
-        },
-        [() => fileHandles.restore(), () => timerHandles.restore()]
-      )
+      teardownOwnedInstrumentation(async () => {
+        if (retentionCleaner) {
+          await withTimeout(retentionCleaner.stop(), "retention cleaner teardown", 5_000).catch(
+            () => {}
+          );
+        }
+        await withTimeout(processingRuntime?.stop(), "processing runtime teardown", 5_000).catch(
+          () => {}
+        );
+        if (service) {
+          service.shutdown();
+          await withTimeout(service.whenRetentionIdle(), "retention teardown", 5_000).catch(
+            () => {}
+          );
+        }
+        await withTimeout(
+          compressionWorker?.shutdown(),
+          "compression worker teardown",
+          5_000
+        ).catch(() => {});
+        if (repository?.db?.open) repository.close();
+        await settleEventLoop();
+        await fsp.rm(base, { recursive: true, force: true });
+      }, [() => fileHandles.restore(), () => timerHandles.restore()])
     );
     fileHandles.install();
     timerHandles.install();
@@ -647,6 +747,11 @@ test(
       audioEvidenceReader: reader,
       flacCompressionWorker: compressionWorker,
       storageGovernor,
+    });
+    processingRuntime = createGovernedSoakRuntime({
+      repository,
+      service,
+      now: clock.now,
     });
     service.startCapture({
       sessionId,
@@ -739,7 +844,9 @@ test(
         assert.equal(speechTriggered.effectiveRetentionMode, "speech_triggered");
         const durationAfter = durableDurationBySource(repository);
         for (const sourceType of ["mic", "system"]) {
-          assert.ok(durationAfter[sourceType] - importantMeetingDurationBefore[sourceType] >= 10_000);
+          assert.ok(
+            durationAfter[sourceType] - importantMeetingDurationBefore[sourceType] >= 10_000
+          );
         }
       }
       if (second === 10_750) {
@@ -758,7 +865,10 @@ test(
         if (service.getState().sources[sourceType].state !== "active") continue;
         const finalContinuous = second >= 10_750;
         const importantMeeting = second >= 7_200 && second < 7_210;
-        const input = pcm(1_000, finalContinuous ? 1_000 : importantMeeting ? 0 : isSpeech ? 12_000 : 0);
+        const input = pcm(
+          1_000,
+          finalContinuous ? 1_000 : importantMeeting ? 0 : isSpeech ? 12_000 : 0
+        );
         const accepted = service.appendPcm(sessionId, sourceType, input);
         if (finalContinuous && (accepted || service.getState().status === "paused")) {
           finalContinuousSubmittedBytes[sourceType] += input.length;
@@ -781,7 +891,7 @@ test(
 
       if (second === 100) {
         const faultedCompressionWorker = compressionWorker;
-        await withTimeout(service.waitForCompressionIdle(), "interrupted compression attempt");
+        await drainGovernedSoakRuntime(processingRuntime, "interrupted compression attempt");
         assert.equal(crashInjected, true);
         interruptedFlac = repository.db
           .prepare(
@@ -807,6 +917,11 @@ test(
         assert.equal(fs.existsSync(interruptedFlac.path), false);
         service.flacCompressionWorker = compressionWorker;
         await withTimeout(faultedCompressionWorker.shutdown(), "faulted compression shutdown");
+      } else if (second > 100 && second % 30 === 0) {
+        await drainGovernedSoakRuntime(
+          processingRuntime,
+          `periodic governed processing at virtual second ${second}`
+        );
       }
 
       if (service.getState().status === "paused") break;
@@ -838,7 +953,7 @@ test(
     assert.equal(reserve.releaseCount, 1);
     assert.equal(service.appendPcm(sessionId, "system", pcm(1_000, 1_000)), false);
     await withTimeout(service.whenRetentionIdle(), "low-disk retention drain");
-    await withTimeout(service.waitForCompressionIdle(), "final compression drain");
+    await drainGovernedSoakRuntime(processingRuntime, "final compression drain");
     observeRuntimeBounds(service, metrics, fileHandles, timerHandles);
 
     const finalContinuousDurationAfter = durableDurationBySource(repository);
@@ -919,11 +1034,7 @@ test(
     service = null;
     await withTimeout(compressionWorker.shutdown(), "compression worker shutdown");
 
-    const preMigrationIntegrity = await assertEvidenceIntegrity(
-      repository,
-      reader,
-      recordingsRoot
-    );
+    const preMigrationIntegrity = await assertEvidenceIntegrity(repository, reader, recordingsRoot);
     assert.ok(preMigrationIntegrity.chunks.length > 0);
     const jobs = repository.db
       .prepare("SELECT chunk_id, job_type, state FROM processing_jobs ORDER BY chunk_id, job_type")
@@ -1067,7 +1178,10 @@ test(
       retentionCleaner.clean(latestExpiry),
       "seven-day retention cleanup"
     );
-    assert.equal(retentionResult.deleted + retentionResult.missing, preMigrationIntegrity.chunks.length);
+    assert.equal(
+      retentionResult.deleted + retentionResult.missing,
+      preMigrationIntegrity.chunks.length
+    );
     assert.equal(retentionResult.retry, 0);
     const tombstones = repository.db
       .prepare("SELECT path, deleted_at FROM audio_chunks ORDER BY id")
@@ -1083,7 +1197,11 @@ test(
         .get().count,
       0
     );
-    assert.equal((await evidenceFiles(migratedRecordingsRoot)).filter((file) => /\.(wav|flac)$/i.test(file)).length, 0);
+    assert.equal(
+      (await evidenceFiles(migratedRecordingsRoot)).filter((file) => /\.(wav|flac)$/i.test(file))
+        .length,
+      0
+    );
     assert.equal(retentionLogs.length, 2);
     retentionCleaner.stop();
     retentionCleaner = null;

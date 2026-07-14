@@ -602,7 +602,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 13) {
         rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
       }
-      rebuildTranscriptSegmentsV14(db);
+      if (fromVersion < 14) {
+        rebuildTranscriptSegmentsV14(db);
+      }
       addColumn(db, "audio_gaps", "restored_device_id TEXT");
       addColumn(db, "audio_gaps", "restored_device_label TEXT");
       addColumn(db, "audio_gaps", "restored_strategy TEXT");

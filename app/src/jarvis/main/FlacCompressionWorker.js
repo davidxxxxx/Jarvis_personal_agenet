@@ -125,14 +125,32 @@ class FlacCompressionWorker {
     return this.waitForIdle();
   }
 
-  run(job) {
-    return this._enqueueOperation(() => this._run(job));
+  run(job, leaseContext = null) {
+    return this._enqueueOperation(() => this._run(job, leaseContext));
   }
 
-  async _run(job) {
+  async _run(job, leaseContext = null) {
+    if (
+      leaseContext !== null &&
+      (typeof leaseContext !== "object" ||
+        typeof leaseContext.owner !== "string" ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(leaseContext.owner))
+    ) {
+      throw new TypeError("compression lease owner must be a safe identifier");
+    }
     let normalizedJob = this._job(job);
     const persistedJob = this.store.getCompressionJob?.(normalizedJob.id);
     if (persistedJob) normalizedJob = this._job(persistedJob);
+    const leaseJob = persistedJob ?? job;
+    if (
+      leaseContext &&
+      (leaseJob?.state !== "running" ||
+        leaseJob.lease_owner !== leaseContext.owner ||
+        !Number.isSafeInteger(leaseJob.lease_expires_at) ||
+        leaseJob.lease_expires_at <= this.now())
+    ) {
+      throw this._leaseLostError();
+    }
     const chunk = this.getMaintenanceChunk(normalizedJob.chunkId);
     if (!chunk) throw new Error(`chunk ${normalizedJob.chunkId} does not exist`);
     if (normalizedJob.state === "completed") {
@@ -141,6 +159,9 @@ class FlacCompressionWorker {
     if (chunk.deleted_at !== null) throw new Error("audio_deleted");
     if (chunk.expires_at <= this.now()) throw new Error("audio_expired");
     if (chunk.pcm_sha256 !== normalizedJob.inputHash) throw new Error("pcm_hash_mismatch");
+    if (chunk.format === "flac" && leaseContext) {
+      return this._replayPromotedFlac(chunk);
+    }
     if (chunk.format !== "wav") throw new Error("chunk_not_authoritative_wav");
 
     await this._cleanupRetiredArtifact(chunk.id);
@@ -188,7 +209,8 @@ class FlacCompressionWorker {
       if (crypto.createHash("sha256").update(promotedBytes).digest("hex") !== fileSha256) {
         throw new Error("audio evidence file hash changed before promotion");
       }
-      const promoted = this.store.promoteChunkToFlac({
+      const completedAt = this.now();
+      const promotion = {
         chunkId: chunk.id,
         jobId: normalizedJob.id,
         encoderVersion: normalizedJob.encoderVersion,
@@ -199,8 +221,23 @@ class FlacCompressionWorker {
         fileBytes: promotedBytes.length,
         sampleRate: chunk.sample_rate,
         channels: chunk.channels,
-        completedAt: this.now(),
-      });
+        completedAt,
+      };
+      let promoted;
+      if (leaseContext) {
+        if (typeof this.store.promoteLeasedChunkToFlac !== "function") {
+          throw new TypeError("store.promoteLeasedChunkToFlac must be a function");
+        }
+        promoted = this.store.promoteLeasedChunkToFlac({
+          ...promotion,
+          owner: leaseContext.owner,
+        });
+        if (!promoted) {
+          throw this._leaseLostError();
+        }
+      } else {
+        promoted = this.store.promoteChunkToFlac(promotion);
+      }
       promotedAuthority = true;
       await this._injectFault("before_wav_delete");
       await this._assertSafeExistingFile(wavPath);
@@ -221,6 +258,36 @@ class FlacCompressionWorker {
     }
   }
 
+  _leaseLostError() {
+    const error = new Error("compression job lease was lost before FLAC promotion");
+    error.code = "JOB_LEASE_LOST";
+    return error;
+  }
+
+  async _replayPromotedFlac(chunk) {
+    const flacPath = this._contained(chunk.path);
+    await this._assertSafeExistingFile(flacPath);
+    const flacBytes = await this.fs.readFile(flacPath);
+    const fileSha256 = crypto.createHash("sha256").update(flacBytes).digest("hex");
+    if (!chunk.file_sha256 || fileSha256 !== chunk.file_sha256) {
+      throw new Error("file_hash_mismatch");
+    }
+    const authoritativePcm = await this.reader.readVerifiedPcm(chunk);
+    this._assertMetadata(authoritativePcm, chunk);
+
+    const parsed = path.parse(flacPath);
+    const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
+    if (await this._exists(wavPath)) {
+      const wavPcm = await this.reader.readVerifiedPcm({ ...chunk, path: wavPath, format: "wav" });
+      this._assertMetadata(wavPcm, chunk);
+      if (Math.abs(wavPcm.sampleCount - authoritativePcm.sampleCount) > 1) {
+        throw new Error("duration_mismatch");
+      }
+      await this._safeUnlink(wavPath);
+    }
+    return { chunk: this.store.getChunk(chunk.id) ?? chunk, replayed: true };
+  }
+
   async _injectFault(point) {
     try {
       await this.faultInjector(point);
@@ -232,28 +299,9 @@ class FlacCompressionWorker {
   }
 
   runPending() {
-    return this._enqueueOperation(() => this._runPending());
-  }
-
-  async _runPending() {
-    if (typeof this.store.listCompressionRecoveryCandidates !== "function") {
-      throw new TypeError("store.listCompressionRecoveryCandidates must be a function");
-    }
-    const result = { completed: 0, failed: 0, skipped: 0 };
-    for (const { chunk, job } of this.store.listCompressionRecoveryCandidates()) {
-      if (!job || !["pending", "retry", "retention_urgent"].includes(job.state)) continue;
-      if (chunk.deleted_at !== null || chunk.expires_at <= this.now() || chunk.format !== "wav") {
-        result.skipped += 1;
-        continue;
-      }
-      try {
-        await this._run(job);
-        result.completed += 1;
-      } catch {
-        result.failed += 1;
-      }
-    }
-    return result;
+    const error = new Error("ordinary compression requires the governed processing runtime");
+    error.code = "GOVERNED_RUNTIME_REQUIRED";
+    return Promise.reject(error);
   }
 
   recoverStartup() {
@@ -456,9 +504,9 @@ class FlacCompressionWorker {
     const current = this.getMaintenanceChunk(identity.chunkId);
     return Boolean(
       current &&
-        current.retired_path === identity.retiredPath &&
-        current.retired_file_sha256 === identity.retiredFileSha256 &&
-        path.resolve(current.path) !== path.resolve(identity.retiredPath)
+      current.retired_path === identity.retiredPath &&
+      current.retired_file_sha256 === identity.retiredFileSha256 &&
+      path.resolve(current.path) !== path.resolve(identity.retiredPath)
     );
   }
 
@@ -496,10 +544,8 @@ class FlacCompressionWorker {
       if (recorded !== 1) return 0;
       identity = { ...identity, retiredFileSha256 };
     }
-    const removed = await this._safeUnlink(
-      retiredPath,
-      identity.retiredFileSha256,
-      () => this._retiredIdentityStillValid(identity)
+    const removed = await this._safeUnlink(retiredPath, identity.retiredFileSha256, () =>
+      this._retiredIdentityStillValid(identity)
     );
     if (!removed) return 0;
     this.store.clearRetiredArtifact({
@@ -599,13 +645,7 @@ class FlacCompressionWorker {
         this._markTemporarilyUnreadableFlac(chunk, job, flacPath);
         return;
       }
-      await this._recoverInvalidFlacAuthority(
-        chunk,
-        job,
-        flacPath,
-        actualFileSha256,
-        result
-      );
+      await this._recoverInvalidFlacAuthority(chunk, job, flacPath, actualFileSha256, result);
       return;
     }
 
@@ -649,13 +689,7 @@ class FlacCompressionWorker {
     });
   }
 
-  async _recoverInvalidFlacAuthority(
-    chunk,
-    job,
-    flacPath,
-    retiredFileSha256,
-    result
-  ) {
+  async _recoverInvalidFlacAuthority(chunk, job, flacPath, retiredFileSha256, result) {
     const parsed = path.parse(flacPath);
     const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
     let wavPcm;

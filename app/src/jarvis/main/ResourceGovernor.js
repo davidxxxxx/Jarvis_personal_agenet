@@ -1,4 +1,5 @@
 const os = require("os");
+const { execFile } = require("node:child_process");
 const { sampleNvidiaGpuTelemetry } = require("../../utils/gpuDetection");
 
 const RESOURCE_STATES = Object.freeze(["available", "busy", "constrained", "unavailable"]);
@@ -16,6 +17,184 @@ const DEFAULT_SAMPLING_INTERVAL_MS = 15_000;
 const DEFAULT_VRAM_SAFETY_MARGIN_MB = 1_024;
 const MAX_CPU_FALLBACK_THREADS = 4;
 const CPU_UNSAFE_LOAD_PCT = 90;
+const GPU_UNSAFE_UTILIZATION_PCT = 90;
+const WINDOWS_POWER_STATUS_SCRIPT = String.raw`
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class JarvisPowerStatus {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct SYSTEM_POWER_STATUS {
+    public byte ACLineStatus;
+    public byte BatteryFlag;
+    public byte BatteryLifePercent;
+    public byte SystemStatusFlag;
+    public uint BatteryLifeTime;
+    public uint BatteryFullLifeTime;
+  }
+  [DllImport("kernel32.dll", SetLastError = true)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
+}
+'@
+$status = New-Object JarvisPowerStatus+SYSTEM_POWER_STATUS
+if (-not [JarvisPowerStatus]::GetSystemPowerStatus([ref]$status)) { exit 2 }
+$onAcPower = if ($status.ACLineStatus -eq 1) { $true } elseif ($status.ACLineStatus -eq 0) { $false } else { $null }
+$batteryPresent = $status.BatteryFlag -ne 128 -and $status.BatteryFlag -ne 255
+$batteryLevelPct = if ($batteryPresent -and $status.BatteryLifePercent -ne 255) { [int]$status.BatteryLifePercent } else { $null }
+[pscustomobject]@{
+  onAcPower = $onAcPower
+  batteryPresent = $batteryPresent
+  batteryLevelPct = $batteryLevelPct
+  batterySaver = [bool]($status.SystemStatusFlag -eq 1)
+} | ConvertTo-Json -Compress
+`;
+
+function unknownCpuReading() {
+  return { loadPct: null, telemetryAvailable: false };
+}
+
+function summarizeCpuTimes(cpus) {
+  if (!Array.isArray(cpus) || cpus.length === 0) return null;
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    const times = cpu?.times;
+    if (
+      !times ||
+      ![times.user, times.nice, times.sys, times.idle, times.irq].every(Number.isFinite)
+    ) {
+      return null;
+    }
+    idle += times.idle;
+    total += times.user + times.nice + times.sys + times.idle + times.irq;
+  }
+  return { idle, total };
+}
+
+function createWindowsCpuProvider({ cpuTimesProvider = () => os.cpus() } = {}) {
+  if (typeof cpuTimesProvider !== "function") {
+    throw new TypeError("cpuTimesProvider must be a function");
+  }
+  let previous = null;
+  return async () => {
+    const current = summarizeCpuTimes(cpuTimesProvider());
+    if (!current) {
+      previous = null;
+      return unknownCpuReading();
+    }
+    if (!previous) {
+      previous = current;
+      return unknownCpuReading();
+    }
+    const totalDelta = current.total - previous.total;
+    const idleDelta = current.idle - previous.idle;
+    previous = current;
+    if (
+      !Number.isFinite(totalDelta) ||
+      totalDelta <= 0 ||
+      idleDelta < 0 ||
+      idleDelta > totalDelta
+    ) {
+      return unknownCpuReading();
+    }
+    const loadPct = Math.max(0, Math.min(100, ((totalDelta - idleDelta) / totalDelta) * 100));
+    return { loadPct, telemetryAvailable: true };
+  };
+}
+
+function unknownPowerReading() {
+  return {
+    onAcPower: null,
+    batteryPresent: null,
+    batteryLevelPct: null,
+    batterySaver: null,
+    telemetryAvailable: false,
+  };
+}
+
+function normalizePowerReading(reading) {
+  const batteryLevelPct = reading?.batteryLevelPct;
+  const batteryLevelKnown =
+    typeof batteryLevelPct === "number" &&
+    Number.isFinite(batteryLevelPct) &&
+    batteryLevelPct >= 0 &&
+    batteryLevelPct <= 100;
+  const batteryPresent =
+    typeof reading?.batteryPresent === "boolean"
+      ? reading.batteryPresent
+      : batteryLevelKnown
+        ? true
+        : null;
+  if (
+    reading?.telemetryAvailable === false ||
+    typeof reading?.onAcPower !== "boolean" ||
+    typeof reading?.batterySaver !== "boolean" ||
+    typeof batteryPresent !== "boolean" ||
+    (batteryPresent && !batteryLevelKnown)
+  ) {
+    return unknownPowerReading();
+  }
+  return {
+    onAcPower: reading.onAcPower,
+    batteryPresent,
+    batteryLevelPct: batteryPresent ? batteryLevelPct : null,
+    batterySaver: reading.batterySaver,
+    telemetryAvailable: true,
+  };
+}
+
+function createWindowsPowerProvider({
+  platform = process.platform,
+  execFileImpl = execFile,
+  now = Date.now,
+  cacheMs = 60_000,
+} = {}) {
+  if (typeof execFileImpl !== "function") throw new TypeError("execFileImpl must be a function");
+  if (typeof now !== "function") throw new TypeError("now must be a function");
+  if (!Number.isSafeInteger(cacheMs) || cacheMs <= 0) {
+    throw new RangeError("cacheMs must be a positive safe integer");
+  }
+  let latest = null;
+  let sampledAt = null;
+  let inFlight = null;
+  return async () => {
+    const at = now();
+    if (latest && sampledAt !== null && at - sampledAt >= 0 && at - sampledAt < cacheMs) {
+      return latest;
+    }
+    if (inFlight) return inFlight;
+    inFlight = new Promise((resolve) => {
+      if (platform !== "win32") {
+        resolve(unknownPowerReading());
+        return;
+      }
+      execFileImpl(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_POWER_STATUS_SCRIPT],
+        { timeout: 5_000, windowsHide: true, maxBuffer: 16 * 1024 },
+        (error, stdout) => {
+          if (error) {
+            resolve(unknownPowerReading());
+            return;
+          }
+          try {
+            resolve(normalizePowerReading(JSON.parse(String(stdout).trim())));
+          } catch {
+            resolve(unknownPowerReading());
+          }
+        }
+      );
+    });
+    try {
+      latest = await inFlight;
+      sampledAt = now();
+      return latest;
+    } finally {
+      inFlight = null;
+    }
+  };
+}
 
 function orderJobs(kinds) {
   return kinds
@@ -39,21 +218,21 @@ class ResourceGovernor {
       gpuUuid: null,
       peakVramMb: null,
     }),
-    cpuProvider = async () => ({
-      loadPct: Math.min(100, (os.loadavg()[0] / Math.max(1, os.cpus().length)) * 100),
-    }),
-    powerProvider = async () => ({ onAcPower: null, batteryLevelPct: null, batterySaver: false }),
+    cpuProvider = null,
+    powerProvider = null,
     ownedPidsProvider = () => [process.pid],
     previewEnabled = true,
     safetyMarginMb = DEFAULT_VRAM_SAFETY_MARGIN_MB,
     sampleIntervalMs = DEFAULT_SAMPLING_INTERVAL_MS,
   } = {}) {
     if (typeof now !== "function") throw new TypeError("now must be a function");
+    const effectiveCpuProvider = cpuProvider ?? createWindowsCpuProvider();
+    const effectivePowerProvider = powerProvider ?? createWindowsPowerProvider();
     for (const [name, provider] of Object.entries({
       telemetryProvider,
       cudaProvider,
-      cpuProvider,
-      powerProvider,
+      cpuProvider: effectiveCpuProvider,
+      powerProvider: effectivePowerProvider,
       ownedPidsProvider,
     })) {
       if (typeof provider !== "function") throw new TypeError(`${name} must be a function`);
@@ -67,8 +246,8 @@ class ResourceGovernor {
     this.now = now;
     this.telemetryProvider = telemetryProvider;
     this.cudaProvider = cudaProvider;
-    this.cpuProvider = cpuProvider;
-    this.powerProvider = powerProvider;
+    this.cpuProvider = effectiveCpuProvider;
+    this.powerProvider = effectivePowerProvider;
     this.ownedPidsProvider = ownedPidsProvider;
     this.previewEnabled = previewEnabled !== false;
     this.safetyMarginMb = safetyMarginMb;
@@ -113,11 +292,11 @@ class ResourceGovernor {
             gpuUuid: null,
             peakVramMb: null,
           };
-    const cpu = cpuResult.status === "fulfilled" ? cpuResult.value : { loadPct: null };
+    const cpu = cpuResult.status === "fulfilled" ? cpuResult.value : unknownCpuReading();
     const power =
       powerResult.status === "fulfilled"
-        ? powerResult.value
-        : { onAcPower: null, batteryLevelPct: null, batterySaver: false };
+        ? normalizePowerReading(powerResult.value)
+        : unknownPowerReading();
     const selectedGpuUuid = cuda?.gpuUuid || null;
     const gpu = telemetry?.gpus?.find((candidate) => candidate.uuid === selectedGpuUuid) ?? null;
     const selectedProcesses = (telemetry?.processes ?? []).filter(
@@ -125,6 +304,25 @@ class ResourceGovernor {
     );
     const owned = new Set(telemetry?.ownedPids ?? ownedPids ?? []);
     const externalGpuBusy = selectedProcesses.some((entry) => !owned.has(entry.pid));
+    const cpuLoadPct = cpu?.loadPct;
+    const cpuTelemetryAvailable =
+      cpu?.telemetryAvailable !== false &&
+      typeof cpuLoadPct === "number" &&
+      Number.isFinite(cpuLoadPct) &&
+      cpuLoadPct >= 0 &&
+      cpuLoadPct <= 100;
+    const gpuTelemetryValid = Boolean(
+      gpu &&
+      Number.isFinite(gpu.utilizationPct) &&
+      gpu.utilizationPct >= 0 &&
+      gpu.utilizationPct <= 100 &&
+      Number.isFinite(gpu.totalVramMb) &&
+      gpu.totalVramMb >= 0 &&
+      Number.isFinite(gpu.usedVramMb) &&
+      gpu.usedVramMb >= 0 &&
+      Number.isFinite(gpu.freeVramMb) &&
+      gpu.freeVramMb >= 0
+    );
 
     let candidateState = "available";
     let reason = "resources_available";
@@ -139,19 +337,25 @@ class ResourceGovernor {
     } else if (
       telemetry?.telemetryAvailable !== true ||
       telemetry?.processTelemetryAvailable !== true ||
-      !gpu
+      !gpuTelemetryValid
     ) {
       candidateState = "constrained";
       reason = "telemetry_unavailable";
     } else if (externalGpuBusy) {
       candidateState = "busy";
       reason = "external_gpu_busy";
-    } else if (power?.batterySaver === true) {
-      candidateState = "constrained";
-      reason = "battery_saver";
-    } else if (cpuResult.status !== "fulfilled" || powerResult.status !== "fulfilled") {
+    } else if (!cpuTelemetryAvailable || power.telemetryAvailable !== true) {
       candidateState = "constrained";
       reason = "telemetry_unavailable";
+    } else if (power.batterySaver === true) {
+      candidateState = "constrained";
+      reason = "battery_saver";
+    } else if (gpu.utilizationPct >= GPU_UNSAFE_UTILIZATION_PCT) {
+      candidateState = "constrained";
+      reason = "gpu_utilization_high";
+    } else if (cpuLoadPct >= CPU_UNSAFE_LOAD_PCT) {
+      candidateState = "constrained";
+      reason = "cpu_load_high";
     } else if (
       !Number.isFinite(cuda?.peakVramMb) ||
       gpu.freeVramMb < cuda.peakVramMb + this.safetyMarginMb
@@ -185,10 +389,13 @@ class ResourceGovernor {
       usedVramMb: gpu?.usedVramMb ?? null,
       freeVramMb: gpu?.freeVramMb ?? null,
       externalGpuBusy,
-      cpuLoadPct: Number.isFinite(cpu?.loadPct) ? cpu.loadPct : null,
-      onAcPower: typeof power?.onAcPower === "boolean" ? power.onAcPower : null,
-      batteryLevelPct: Number.isFinite(power?.batteryLevelPct) ? power.batteryLevelPct : null,
-      batterySaver: power?.batterySaver === true,
+      cpuLoadPct: cpuTelemetryAvailable ? cpuLoadPct : null,
+      cpuTelemetryAvailable,
+      onAcPower: power.onAcPower,
+      batteryPresent: power.batteryPresent,
+      batteryLevelPct: power.batteryLevelPct,
+      batterySaver: power.batterySaver,
+      powerTelemetryAvailable: power.telemetryAvailable,
       cudaInstalled: cuda?.installed === true,
       cudaVerified: cuda?.verified === true,
       cudaQuarantined: cuda?.quarantined === true,
@@ -211,8 +418,11 @@ class ResourceGovernor {
       throw new Error("resource snapshot is required");
     }
     const storageCritical = new Set(["retention_urgent", "storage_recovery_compress"]);
+    const cpuSafe =
+      Number.isFinite(snapshot.cpuLoadPct) && snapshot.cpuLoadPct < CPU_UNSAFE_LOAD_PCT;
+    const powerKnown = snapshot.powerTelemetryAvailable === true;
     if (snapshot.batterySaver === true) {
-      if (storageCritical.has(kind) && (snapshot.cpuLoadPct ?? 0) < CPU_UNSAFE_LOAD_PCT) {
+      if (kind === "storage_recovery_compress" && cpuSafe && powerKnown) {
         return { action: "run_cpu", reason: "storage_critical" };
       }
       return {
@@ -227,7 +437,7 @@ class ResourceGovernor {
       };
     }
     if (snapshot.state === "constrained") {
-      if (storageCritical.has(kind) && (snapshot.cpuLoadPct ?? 0) < CPU_UNSAFE_LOAD_PCT) {
+      if (storageCritical.has(kind) && cpuSafe && powerKnown) {
         return { action: "run_cpu", reason: "storage_critical" };
       }
       return {
@@ -236,7 +446,9 @@ class ResourceGovernor {
       };
     }
     if (snapshot.state === "unavailable") {
-      if (storageCritical.has(kind)) return { action: "run_cpu", reason: "storage_critical" };
+      if (storageCritical.has(kind) && cpuSafe && powerKnown) {
+        return { action: "run_cpu", reason: "storage_critical" };
+      }
       if (kind === "preview") {
         return snapshot.previewEnabled === false
           ? { action: "pause_preview", reason: "preview_disabled" }
@@ -265,3 +477,7 @@ module.exports.orderJobs = orderJobs;
 module.exports.DEFAULT_SAMPLING_INTERVAL_MS = DEFAULT_SAMPLING_INTERVAL_MS;
 module.exports.DEFAULT_VRAM_SAFETY_MARGIN_MB = DEFAULT_VRAM_SAFETY_MARGIN_MB;
 module.exports.MAX_CPU_FALLBACK_THREADS = MAX_CPU_FALLBACK_THREADS;
+module.exports.CPU_UNSAFE_LOAD_PCT = CPU_UNSAFE_LOAD_PCT;
+module.exports.GPU_UNSAFE_UTILIZATION_PCT = GPU_UNSAFE_UTILIZATION_PCT;
+module.exports.createWindowsCpuProvider = createWindowsCpuProvider;
+module.exports.createWindowsPowerProvider = createWindowsPowerProvider;
