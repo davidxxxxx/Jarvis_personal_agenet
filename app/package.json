@@ -76,6 +76,7 @@
     "test:main": "node --test",
     "test:renderer": "vitest run --config src/vitest.config.ts",
     "test:jarvis": "node --test \"test/jarvis/*.test.js\" && npm run test:renderer",
+    "test:jarvis:capture-soak": "node --test --test-timeout=120000 test/jarvis/AllDayCaptureSoak.test.js",
     "quality-check": "npm run format:check && npm run typecheck",
     "i18n:check": "node scripts/check-i18n.js",
     "preview": "cd src && vite preview",
