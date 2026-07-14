@@ -21,8 +21,15 @@ const WINDOWS_BINARY = "whisper-server-win32-x64-cuda.exe";
 const POINTER_FILE = "current.json";
 const DECLINE_FILE = "first-run-declined.json";
 const RECORD_FILE = "verification.json";
+const INTEGRITY_MODE = "all-regular-files-v1";
 const EXTRACTED_SIZE_LIMIT = 3_000_000_000;
 const DISK_SAFETY_MARGIN = 1_000_000_000;
+const TRANSIENT_VERIFICATION_REASONS = new Set([
+  "cuda_launch_failed",
+  "cuda_out_of_memory",
+  "cuda_driver_failure",
+  "verification_timeout",
+]);
 
 function cudaError(code, message) {
   return Object.assign(new Error(message), { code });
@@ -62,6 +69,22 @@ async function sha256File(filePath) {
   const hash = crypto.createHash("sha256");
   const stream = fs.createReadStream(filePath);
   for await (const chunk of stream) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function sha256FileSync(filePath) {
+  const hash = crypto.createHash("sha256");
+  const handle = fs.openSync(filePath, "r");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let bytesRead;
+    do {
+      bytesRead = fs.readSync(handle, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    fs.closeSync(handle);
+  }
   return hash.digest("hex");
 }
 
@@ -125,7 +148,6 @@ class WhisperCudaManager {
     this._activeDownload = null;
     this._quiesced = false;
     this._bootFailures = 0;
-    this._integrityCache = null;
     this._lastIntegrityReason = null;
   }
 
@@ -155,7 +177,6 @@ class WhisperCudaManager {
   resetDataRoot() {
     this._binDir = null;
     this._configuredRoot = null;
-    this._integrityCache = null;
     this._lastIntegrityReason = null;
   }
 
@@ -199,13 +220,19 @@ class WhisperCudaManager {
   }
 
   _validatePointerIntegrity(pointer, runtimeDir) {
+    if (pointer.schemaVersion !== 2 || pointer.integrityMode !== INTEGRITY_MODE) {
+      throw cudaError(
+        "CUDA_INTEGRITY_METADATA_MISSING",
+        "CUDA runtime complete-file integrity metadata is missing"
+      );
+    }
     if (!Array.isArray(pointer.files) || pointer.files.length < 3) {
       throw cudaError(
         "CUDA_INTEGRITY_METADATA_MISSING",
         "CUDA runtime integrity metadata is missing"
       );
     }
-    const signatures = [];
+    const expectedPaths = new Set();
     for (const file of pointer.files) {
       if (!isSafeArchivePath(file.path) || !/^[a-f0-9]{64}$/.test(file.sha256 || "")) {
         throw cudaError(
@@ -216,22 +243,54 @@ class WhisperCudaManager {
       const candidate = path.join(runtimeDir, file.path);
       if (!isWithin(runtimeDir, candidate))
         throw cudaError("CUDA_INTEGRITY_PATH", "CUDA integrity path escaped runtime");
+      if (expectedPaths.has(file.path)) {
+        throw cudaError("CUDA_INTEGRITY_METADATA_INVALID", "CUDA integrity path is duplicated");
+      }
+      expectedPaths.add(file.path);
       const stat = fs.lstatSync(candidate);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.size) {
         throw cudaError("CUDA_INTEGRITY_SIZE_MISMATCH", "CUDA runtime file size changed");
       }
-      signatures.push(`${file.path}:${stat.size}:${stat.mtimeMs}`);
     }
-    const cacheKey = `${runtimeDir}:${pointer.sha256}:${signatures.join("|")}`;
-    if (this._integrityCache?.key === cacheKey && this._integrityCache.ok) return true;
+    const actualPaths = this._listRuntimeFiles(runtimeDir);
+    if (
+      actualPaths.length !== expectedPaths.size ||
+      actualPaths.some((relativePath) => !expectedPaths.has(relativePath))
+    ) {
+      throw cudaError(
+        "CUDA_INTEGRITY_FILE_SET_MISMATCH",
+        "CUDA runtime file set does not match integrity metadata"
+      );
+    }
     for (const file of pointer.files) {
       const candidate = path.join(runtimeDir, file.path);
-      const digest = crypto.createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+      const digest = sha256FileSync(candidate);
       if (digest !== file.sha256)
         throw cudaError("CUDA_INTEGRITY_HASH_MISMATCH", "CUDA runtime file hash changed");
     }
-    this._integrityCache = { key: cacheKey, ok: true };
     return true;
+  }
+
+  _listRuntimeFiles(runtimeDir) {
+    const files = [];
+    const walk = (directory) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const candidate = path.join(directory, entry.name);
+        if (!isWithin(runtimeDir, candidate)) {
+          throw cudaError("CUDA_INTEGRITY_PATH", "CUDA runtime path escaped runtime");
+        }
+        const stat = fs.lstatSync(candidate);
+        if (stat.isSymbolicLink()) {
+          throw cudaError("CUDA_INTEGRITY_LINK", "CUDA runtime contains a link");
+        }
+        if (stat.isDirectory()) walk(candidate);
+        else if (stat.isFile()) {
+          files.push(path.relative(runtimeDir, candidate).replaceAll("\\", "/"));
+        }
+      }
+    };
+    walk(runtimeDir);
+    return files.sort();
   }
 
   getCudaBinaryPath() {
@@ -249,6 +308,19 @@ class WhisperCudaManager {
       return false;
     if (gpuUuid && pointer.verification.gpuUuid !== gpuUuid) return false;
     return true;
+  }
+
+  getVerifiedStartOptions({
+    enabled = process.env.WHISPER_CUDA_ENABLED === "true",
+    gpuUuid = process.env.TRANSCRIPTION_GPU_UUID || null,
+  } = {}) {
+    if (!enabled) return { useCuda: false, gpuUuid: null };
+    const pointer = this._readPointer();
+    const verifiedGpuUuid = gpuUuid || pointer?.verification?.gpuUuid || null;
+    if (!verifiedGpuUuid || !this.isVerified({ gpuUuid: verifiedGpuUuid })) {
+      return { useCuda: false, gpuUuid: null };
+    }
+    return { useCuda: true, gpuUuid: verifiedGpuUuid };
   }
 
   getStatus({ gpuUuid = process.env.TRANSCRIPTION_GPU_UUID || null } = {}) {
@@ -373,20 +445,17 @@ class WhisperCudaManager {
         gpuUuid: verification.gpuUuid || process.env.TRANSCRIPTION_GPU_UUID || null,
         signal: verification.signal,
       });
+      const verificationFailed = !verifyResult?.ok || verifyResult.backend !== "cuda";
+      const transient =
+        verificationFailed && TRANSIENT_VERIFICATION_REASONS.has(verifyResult?.reason);
+      this._bootFailures = verificationFailed ? (transient ? this._bootFailures + 1 : 0) : 0;
       await this._recordVerification({
         version: this.manifest.tag,
         digest: this.manifest.sha256,
         result: verifyResult,
         verification,
       });
-      if (!verifyResult?.ok || verifyResult.backend !== "cuda") {
-        this._bootFailures += 1;
-        const transient = new Set([
-          "cuda_launch_failed",
-          "cuda_out_of_memory",
-          "cuda_driver_failure",
-          "verification_timeout",
-        ]).has(verifyResult?.reason);
+      if (verificationFailed) {
         if (transient && this._bootFailures >= 3) {
           await fsyncJsonAtomic(
             path.join(this.getCudaBinaryDir(), "previous.json"),
@@ -397,7 +466,6 @@ class WhisperCudaManager {
             path.join(this.getCudaBinaryDir(), POINTER_FILE),
             path.join(this.getCudaBinaryDir(), `quarantined-current-${this.now()}.json`)
           );
-          this._integrityCache = null;
         }
         return (
           verifyResult || {
@@ -417,6 +485,7 @@ class WhisperCudaManager {
       };
       await fsyncJsonAtomic(path.join(this.getCudaBinaryDir(), POINTER_FILE), {
         schemaVersion: pointer.schemaVersion,
+        integrityMode: pointer.integrityMode,
         version: pointer.version,
         asset: pointer.asset,
         directory: pointer.directory,
@@ -425,7 +494,6 @@ class WhisperCudaManager {
         files: pointer.files,
         verification: boundedVerification,
       });
-      this._integrityCache = null;
       this._bootFailures = 0;
       return boundedVerification;
     });
@@ -502,11 +570,19 @@ class WhisperCudaManager {
       await fsPromises.mkdir(stagingDir, { recursive: false });
       await this.extractArchiveImpl(archivePath, stagingDir);
       const structure = await this._validateExtractedRuntime(stagingDir);
+      let binaryPath = path.join(versionDir, path.relative(stagingDir, structure.binaryPath));
+      let pointerBinary = path.relative(stagingDir, structure.binaryPath).replaceAll("\\", "/");
+      let pointerFiles = structure.criticalFiles.map((file) => ({
+        path: path.relative(stagingDir, file.path).replaceAll("\\", "/"),
+        size: file.size,
+        sha256: file.sha256,
+      }));
       this._throwIfAborted(signal);
 
       await fsPromises.mkdir(versionsRoot, { recursive: true });
       if (fs.existsSync(versionDir)) {
         const current = this._readPointer();
+        const previous = this._readPointer("previous.json");
         if (
           current?.runtimeDir === versionDir &&
           current.sha256 === this.manifest.sha256 &&
@@ -526,12 +602,21 @@ class WhisperCudaManager {
             "Refusing to replace the current CUDA runtime"
           );
         }
-        const quarantine = path.join(root, `${versionName}.quarantine-${operationId}`);
-        await fsPromises.rename(versionDir, quarantine);
+        if (previous?.runtimeDir === versionDir) {
+          binaryPath = previous.binaryPath;
+          pointerBinary = previous.binary;
+          pointerFiles = previous.files;
+          await fsPromises.rm(stagingDir, { recursive: true, force: true });
+        } else {
+          const quarantine = path.join(root, `${versionName}.quarantine-${operationId}`);
+          await fsPromises.rename(versionDir, quarantine);
+          await fsPromises.rename(stagingDir, versionDir);
+          promoted = true;
+        }
+      } else {
+        await fsPromises.rename(stagingDir, versionDir);
+        promoted = true;
       }
-      await fsPromises.rename(stagingDir, versionDir);
-      promoted = true;
-      const binaryPath = path.join(versionDir, path.relative(stagingDir, structure.binaryPath));
       const verify = verification.verify || this.verifyRuntime;
       const verifyResult = await verify({
         runtimeDir: versionDir,
@@ -542,7 +627,11 @@ class WhisperCudaManager {
         gpuUuid: verification.gpuUuid || process.env.TRANSCRIPTION_GPU_UUID || null,
         signal,
       });
-      if (!verifyResult?.ok || verifyResult.backend !== "cuda") {
+      const verificationFailed = !verifyResult?.ok || verifyResult.backend !== "cuda";
+      const transient =
+        verificationFailed && TRANSIENT_VERIFICATION_REASONS.has(verifyResult?.reason);
+      this._bootFailures = verificationFailed ? (transient ? this._bootFailures + 1 : 0) : 0;
+      if (verificationFailed) {
         await this._recordVerification({
           version: this.manifest.tag,
           digest: this.manifest.sha256,
@@ -554,13 +643,6 @@ class WhisperCudaManager {
           },
           verification,
         });
-        this._bootFailures += 1;
-        const transient = new Set([
-          "cuda_launch_failed",
-          "cuda_out_of_memory",
-          "cuda_driver_failure",
-          "verification_timeout",
-        ]).has(verifyResult?.reason);
         promotedDisposition = transient && this._bootFailures < 3 ? "failed" : "quarantine";
         throw cudaError(
           "CUDA_VERIFICATION_FAILED",
@@ -589,20 +671,16 @@ class WhisperCudaManager {
         );
       }
       await fsyncJsonAtomic(path.join(root, POINTER_FILE), {
-        schemaVersion: 1,
+        schemaVersion: 2,
+        integrityMode: INTEGRITY_MODE,
         version: this.manifest.tag,
         asset: this.manifest.asset,
         directory: path.relative(root, versionDir).replaceAll("\\", "/"),
         sha256: this.manifest.sha256,
-        binary: path.relative(stagingDir, structure.binaryPath).replaceAll("\\", "/"),
-        files: structure.criticalFiles.map((file) => ({
-          path: path.relative(stagingDir, file.path).replaceAll("\\", "/"),
-          size: file.size,
-          sha256: file.sha256,
-        })),
+        binary: pointerBinary,
+        files: pointerFiles,
         verification: boundedVerification,
       });
-      this._integrityCache = null;
       this._bootFailures = 0;
       onProgress?.({ type: "complete", percentage: 100 });
       debugLogger.info("Pinned CUDA runtime installed and verified", {
@@ -653,6 +731,7 @@ class WhisperCudaManager {
   _serializablePointer(pointer) {
     return {
       schemaVersion: pointer.schemaVersion,
+      integrityMode: pointer.integrityMode,
       version: pointer.version,
       asset: pointer.asset,
       directory: pointer.directory,
@@ -687,6 +766,7 @@ class WhisperCudaManager {
     let total = 0;
     let binaryPath = null;
     const libraries = [];
+    const runtimeFiles = [];
     const walk = async (directory) => {
       for (const entry of await fsPromises.readdir(directory, { withFileTypes: true })) {
         const candidate = path.join(directory, entry.name);
@@ -697,6 +777,7 @@ class WhisperCudaManager {
           throw cudaError("CUDA_EXTRACTED_LINK_REJECTED", "CUDA runtime contains a link");
         if (stat.isDirectory()) await walk(candidate);
         else if (stat.isFile()) {
+          runtimeFiles.push(candidate);
           total += stat.size;
           if (total > EXTRACTED_SIZE_LIMIT)
             throw cudaError("CUDA_ARCHIVE_EXPANDED_SIZE", "CUDA runtime exceeds the safety limit");
@@ -716,13 +797,8 @@ class WhisperCudaManager {
         "CUDA runtime companion libraries are incomplete"
       );
     }
-    const criticalPaths = [
-      binaryPath,
-      libraries.find((name) => /^cublas(?:lt)?64/i.test(name)),
-      libraries.find((name) => /^cudart64/i.test(name)),
-    ].map((item) => (path.isAbsolute(item) ? item : this._findByBasename(stagingDir, item)));
     const criticalFiles = [];
-    for (const filePath of criticalPaths) {
+    for (const filePath of runtimeFiles.sort()) {
       const stat = await fsPromises.stat(filePath);
       criticalFiles.push({ path: filePath, size: stat.size, sha256: await sha256File(filePath) });
     }
@@ -756,7 +832,7 @@ class WhisperCudaManager {
       ok: result.ok === true,
       backend: result.backend || "unknown",
       reason: result.reason || "verification_failed",
-      bootFailureCount: result.ok ? 0 : this._bootFailures + 1,
+      bootFailureCount: result.ok ? 0 : this._bootFailures,
     };
     await fsyncJsonAtomic(path.join(this.getCudaBinaryDir(), RECORD_FILE), record);
   }
@@ -872,7 +948,6 @@ class WhisperCudaManager {
           this._serializablePointer(current)
         );
       }
-      this._integrityCache = null;
       return { success: true, path: this.getCudaBinaryPath() };
     });
   }
@@ -918,7 +993,6 @@ class WhisperCudaManager {
         await fsPromises.unlink(path.join(root, entry.name)).catch(() => {});
       }
     }
-    this._integrityCache = null;
     return {
       success: hadManagedArtifacts,
       deleted_count:

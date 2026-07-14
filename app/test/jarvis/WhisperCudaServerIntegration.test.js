@@ -7,6 +7,7 @@ const { PassThrough } = require("node:stream");
 const test = require("node:test");
 
 const WhisperServerManager = require("../../src/helpers/whisperServer");
+const { processWriteGate } = require("../../src/jarvis/main/UnifiedRootWriteGate");
 
 test("CUDA binary resolution uses only the injected verified pointer", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-server-resolver-"));
@@ -63,6 +64,66 @@ test("proof mode never hides a CUDA launch failure behind CPU fallback", async (
   );
   assert.equal(spawnCount, 1);
   assert.equal(fallbackEvents, 0);
+});
+
+test("terminal startup failure clears process PID state and native temp lease", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-server-cleanup-"));
+  t.after(() => {
+    processWriteGate.open();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const binary = path.join(root, "cuda.exe");
+  const model = path.join(root, "model.bin");
+  fs.writeFileSync(binary, "binary");
+  fs.writeFileSync(model, "model");
+  const child = new EventEmitter();
+  child.pid = 999999996;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.killed = false;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => {
+    child.killed = true;
+    child.exitCode = 1;
+    child.emit("close", 1);
+    return true;
+  };
+  const pidEvents = [];
+  const manager = new WhisperServerManager({
+    cudaBinaryResolver: () => binary,
+    spawnImpl: () => child,
+    pidFile: {
+      write: (name, pid) => pidEvents.push(["write", name, pid]),
+      clear: (name) => pidEvents.push(["clear", name]),
+    },
+  });
+  manager.findAvailablePort = async () => 8178;
+  manager.getFFmpegPath = () => null;
+  manager.waitForReady = async () => {
+    throw new Error("health timeout");
+  };
+
+  await assert.rejects(
+    manager._doStart(model, { useCuda: true, requireCuda: true, threads: 1 }),
+    /health timeout/
+  );
+  processWriteGate.close();
+  const leaseReleased = await Promise.race([
+    processWriteGate.waitForIdle().then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 20)),
+  ]);
+  processWriteGate.open();
+  if (!child.killed) child.emit("close", 1);
+
+  assert.equal(child.killed, true);
+  assert.deepEqual(pidEvents, [
+    ["write", "whisper", child.pid],
+    ["clear", "whisper"],
+  ]);
+  assert.equal(manager.process, null);
+  assert.equal(manager.tempLifecycleRelease, null);
+  assert.equal(leaseReleased, true);
 });
 
 test("CUDA proof evidence requires positive CUDA logs and carries the selected UUID", () => {
@@ -122,6 +183,37 @@ test("a ready CPU server cannot satisfy a CUDA proof start", async () => {
     assert.equal(options.requireCuda, true);
   };
   await manager.start("model.bin", { useCuda: true, requireCuda: true });
+  assert.equal(stopped, 1);
+  assert.equal(started, 1);
+});
+
+test("a normal CUDA start restarts when the verified GPU UUID changes", async () => {
+  const manager = new WhisperServerManager();
+  manager.ready = true;
+  manager.process = {};
+  manager.modelPath = "model.bin";
+  manager.vadSignature = "vad:off";
+  manager.threadSignature = "threads:1";
+  manager.useCuda = true;
+  manager.selectedGpuUuid = "GPU-old";
+  let stopped = 0;
+  let started = 0;
+  manager.stop = async () => {
+    stopped += 1;
+    manager.process = null;
+    manager.ready = false;
+  };
+  manager._doStart = async (_model, options) => {
+    started += 1;
+    assert.equal(options.gpuUuid, "GPU-verified-pointer");
+  };
+
+  await manager.start("model.bin", {
+    useCuda: true,
+    gpuUuid: "GPU-verified-pointer",
+    threads: 1,
+  });
+
   assert.equal(stopped, 1);
   assert.equal(started, 1);
 });

@@ -18,7 +18,10 @@ const { createTinfoilRealtimeSocket } = require("./tinfoilSecureClient");
 const AudioStorageManager = require("./audioStorage");
 const { createBoundedRecoveryBuffer, createMeetingRecoveryLoop } = require("./meetingRecoveryLoop");
 const { processWriteGate } = require("../jarvis/main/UnifiedRootWriteGate");
-const { activateVerifiedCudaRuntime } = require("../jarvis/main/CudaWhisperActivation");
+const {
+  activateVerifiedCudaRuntime,
+  startWhisperServerWithVerifiedCuda,
+} = require("../jarvis/main/CudaWhisperActivation");
 
 // Tinfoil's only realtime STT model — fallback when the renderer omits one.
 const TINFOIL_REALTIME_MODEL = "voxtral-mini-4b-realtime";
@@ -1893,9 +1896,11 @@ class IPCHandlers {
     });
 
     ipcMain.handle("whisper-server-start", async (event, modelName) => {
-      const useCuda =
-        process.env.WHISPER_CUDA_ENABLED === "true" && this.whisperCudaManager?.isVerified();
-      return this.whisperManager.startServer(modelName, { useCuda });
+      return startWhisperServerWithVerifiedCuda({
+        whisperManager: this.whisperManager,
+        cudaManager: this.whisperCudaManager,
+        modelName,
+      });
     });
 
     ipcMain.handle("whisper-server-stop", async () => {
@@ -1942,10 +1947,11 @@ class IPCHandlers {
             const modelName = this.whisperManager.currentServerModel;
             await this.whisperManager.stopServer();
             if (modelName) {
-              await this.whisperManager.startServer(modelName, {
-                useCuda:
-                  process.env.WHISPER_CUDA_ENABLED === "true" &&
-                  this.whisperCudaManager?.isVerified({ gpuUuid: uuid || null }),
+              await startWhisperServerWithVerifiedCuda({
+                whisperManager: this.whisperManager,
+                cudaManager: this.whisperCudaManager,
+                modelName,
+                gpuUuid: uuid || null,
               });
             }
           }

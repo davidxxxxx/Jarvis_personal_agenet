@@ -3,6 +3,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
+const WhisperManager = require("../../src/helpers/whisper");
+
 const appRoot = path.join(__dirname, "..", "..");
 const read = (relative) => fs.readFileSync(path.join(appRoot, relative), "utf8");
 
@@ -13,11 +15,8 @@ test("startup and IPC gate CUDA on verification and inject the data-root resolve
     main,
     /setCudaBinaryResolver\(\(\)\s*=>\s*\n?\s*whisperCudaManager\.getCudaBinaryPath\(\)/
   );
-  assert.match(main, /WHISPER_CUDA_ENABLED === "true" && whisperCudaManager\?\.isVerified\(\)/);
-  assert.match(
-    ipc,
-    /WHISPER_CUDA_ENABLED === "true" && this\.whisperCudaManager\?\.isVerified\(\)/
-  );
+  assert.match(main, /whisperCudaManager\?\.getVerifiedStartOptions\(\)/);
+  assert.match(ipc, /startWhisperServerWithVerifiedCuda\(\{/);
   assert.doesNotMatch(
     ipc,
     /WHISPER_CUDA_ENABLED === "true" && this\.whisperCudaManager\?\.isDownloaded\(\)/
@@ -43,4 +42,48 @@ test("runtime installer has no latest-release executable selection", () => {
   const manager = read("src/helpers/whisperCudaManager.js");
   assert.doesNotMatch(manager, /releases\/latest|fetchJson/);
   assert.match(manager, /getWhisperCudaDownloadUrl\(this\.manifest\)/);
+});
+
+test("startup forwards the verified GPU UUID to whisper-server", async (t) => {
+  const model = path.join(__dirname, "startup-model.bin");
+  fs.writeFileSync(model, "model");
+  t.after(() => fs.rmSync(model, { force: true }));
+
+  const starts = [];
+  const manager = new WhisperManager();
+  manager.getModelPath = () => model;
+  manager.logDependencyStatus = async () => {};
+  manager.serverManager = {
+    isAvailable: () => true,
+    start: async (_modelPath, options) => starts.push(options),
+    ready: false,
+    port: 8178,
+  };
+
+  await manager.initializeAtStartup({
+    localTranscriptionProvider: "whisper",
+    whisperModel: "base",
+    useCuda: true,
+    gpuUuid: "GPU-verified-pointer",
+  });
+
+  assert.deepEqual(starts, [{ useCuda: true, gpuUuid: "GPU-verified-pointer" }]);
+});
+
+test("normal transcription restart retains the verified GPU UUID", async () => {
+  const starts = [];
+  const manager = new WhisperManager();
+  manager.getModelPath = () => "model.bin";
+  manager.serverManager = {
+    useCuda: true,
+    selectedGpuUuid: "GPU-verified-pointer",
+    lastStartOptions: { gpuUuid: "GPU-verified-pointer" },
+    start: async (_modelPath, options) => starts.push(options),
+    transcribe: async () => ({ text: "ok" }),
+  };
+
+  const result = await manager._runServerTranscription(Buffer.from("wav"), "base", "auto");
+
+  assert.equal(result.text, "ok");
+  assert.equal(starts[0].gpuUuid, "GPU-verified-pointer");
 });

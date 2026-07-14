@@ -54,10 +54,20 @@ function queryNvidiaTelemetry(pid, { execFileImpl = execFile } = {}) {
   });
 }
 
-async function createRealProbeServer({ binaryPath, modelPath, gpuUuid }) {
+async function createRealProbeServer(
+  { binaryPath, modelPath, gpuUuid },
+  { createManager = null } = {}
+) {
   const WhisperServerManager = require("../../helpers/whisperServer");
-  const manager = new WhisperServerManager({ cudaBinaryResolver: () => binaryPath });
-  await manager.start(modelPath, { useCuda: true, requireCuda: true, gpuUuid });
+  const manager = createManager
+    ? createManager({ cudaBinaryResolver: () => binaryPath })
+    : new WhisperServerManager({ cudaBinaryResolver: () => binaryPath });
+  try {
+    await manager.start(modelPath, { useCuda: true, requireCuda: true, gpuUuid });
+  } catch (error) {
+    await manager.stop().catch(() => {});
+    throw error;
+  }
   return {
     get pid() {
       return manager.process?.pid || null;
@@ -215,3 +225,4 @@ class CudaWhisperVerifier {
 module.exports = CudaWhisperVerifier;
 module.exports.createSilentProbeWav = createSilentProbeWav;
 module.exports.queryNvidiaTelemetry = queryNvidiaTelemetry;
+module.exports.createRealProbeServer = createRealProbeServer;

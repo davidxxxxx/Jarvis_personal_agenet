@@ -160,11 +160,12 @@ function buildWhisperServerArgs({
 }
 
 class WhisperServerManager extends EventEmitter {
-  constructor({ spawnImpl = spawn, cudaBinaryResolver = null } = {}) {
+  constructor({ spawnImpl = spawn, cudaBinaryResolver = null, pidFile = sidecarPidFile } = {}) {
     super();
     if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
     this.spawnImpl = spawnImpl;
     this.cudaBinaryResolver = cudaBinaryResolver;
+    this.pidFile = pidFile;
     this.process = null;
     this.hostname = "127.0.0.1";
     this.port = null;
@@ -391,6 +392,10 @@ class WhisperServerManager extends EventEmitter {
     const threadResolution = resolveWhisperThreads(options);
     const nextThreadSignature = getThreadSignature(threadResolution);
     const nextVadSignature = getVadSignature(options);
+    const nextGpuUuid =
+      options.useCuda === true
+        ? options.gpuUuid || process.env.TRANSCRIPTION_GPU_UUID || null
+        : null;
     if (
       this.ready &&
       this.modelPath === modelPath &&
@@ -398,6 +403,7 @@ class WhisperServerManager extends EventEmitter {
       this.vadSignature === nextVadSignature &&
       this.threadSignature === nextThreadSignature &&
       this.useCuda === (options.useCuda === true) &&
+      this.selectedGpuUuid === nextGpuUuid &&
       !(options.requireCuda === true && this.getCudaProofEvidence().backend !== "cuda")
     ) {
       return;
@@ -500,7 +506,7 @@ class WhisperServerManager extends EventEmitter {
       this._releaseTempLifecycle();
       throw error;
     }
-    sidecarPidFile.write("whisper", this.process.pid);
+    this.pidFile.write("whisper", this.process.pid);
 
     let stderrBuffer = "";
     let exitCode = null;
@@ -531,7 +537,7 @@ class WhisperServerManager extends EventEmitter {
       this.ready = false;
       this.process = null;
       this.stopHealthCheck();
-      sidecarPidFile.clear("whisper");
+      this.pidFile.clear("whisper");
       this._releaseTempLifecycle();
     });
 
@@ -564,6 +570,11 @@ class WhisperServerManager extends EventEmitter {
           threadResolution: defaultThreadResolution,
         });
       }
+      await this.stop().catch((cleanupError) => {
+        debugLogger.error("Failed to clean up whisper-server after startup failure", {
+          error: cleanupError.message,
+        });
+      });
       throw err;
     }
 
@@ -823,6 +834,7 @@ class WhisperServerManager extends EventEmitter {
 
     if (!this.process) {
       this.ready = false;
+      this.pidFile.clear("whisper");
       this._releaseTempLifecycle();
       return;
     }

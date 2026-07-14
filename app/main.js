@@ -1314,10 +1314,14 @@ async function startApp() {
   });
 
   // Non-blocking server pre-warming
+  const cudaStartOptions = whisperCudaManager?.getVerifiedStartOptions() || {
+    useCuda: false,
+    gpuUuid: null,
+  };
   const whisperSettings = {
     localTranscriptionProvider: process.env.LOCAL_TRANSCRIPTION_PROVIDER || "",
     whisperModel: process.env.LOCAL_WHISPER_MODEL,
-    useCuda: process.env.WHISPER_CUDA_ENABLED === "true" && whisperCudaManager?.isVerified(),
+    ...cudaStartOptions,
   };
   whisperManager.initializeAtStartup(whisperSettings).catch((err) => {
     debugLogger.debug("Whisper startup init error (non-fatal)", { error: err.message });

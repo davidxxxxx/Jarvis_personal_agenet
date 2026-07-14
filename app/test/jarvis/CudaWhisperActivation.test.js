@@ -1,7 +1,8 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { activateVerifiedCudaRuntime } = require("../../src/jarvis/main/CudaWhisperActivation");
+const activation = require("../../src/jarvis/main/CudaWhisperActivation");
+const { activateVerifiedCudaRuntime, startWhisperServerWithVerifiedCuda } = activation;
 
 test("persists enabled only after a requireCuda start proves the backend", async () => {
   const events = [];
@@ -45,4 +46,37 @@ test("a CUDA activation failure clears enablement and restores CPU", async () =>
     events.some((event) => Array.isArray(event) && event[0] === "enabled" && event[1]),
     false
   );
+});
+
+test("IPC-style server start forwards the verified pointer UUID without an environment UUID", async (t) => {
+  const previous = process.env.TRANSCRIPTION_GPU_UUID;
+  delete process.env.TRANSCRIPTION_GPU_UUID;
+  t.after(() => {
+    if (previous == null) delete process.env.TRANSCRIPTION_GPU_UUID;
+    else process.env.TRANSCRIPTION_GPU_UUID = previous;
+  });
+  const starts = [];
+  const whisperManager = {
+    startServer: async (modelName, options) => {
+      starts.push([modelName, options]);
+      return { success: true };
+    },
+  };
+  const cudaManager = {
+    getVerifiedStartOptions: () => ({
+      useCuda: true,
+      gpuUuid: "GPU-verified-pointer",
+    }),
+  };
+  assert.equal(typeof startWhisperServerWithVerifiedCuda, "function");
+
+  await startWhisperServerWithVerifiedCuda({
+    whisperManager,
+    cudaManager,
+    modelName: "large-v3-turbo",
+  });
+
+  assert.deepEqual(starts, [
+    ["large-v3-turbo", { useCuda: true, gpuUuid: "GPU-verified-pointer" }],
+  ]);
 });

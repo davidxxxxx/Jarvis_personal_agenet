@@ -28,4 +28,16 @@ async function activateVerifiedCudaRuntime({
   }
 }
 
-module.exports = { activateVerifiedCudaRuntime };
+async function startWhisperServerWithVerifiedCuda({
+  whisperManager,
+  cudaManager,
+  modelName,
+  gpuUuid,
+}) {
+  const startOptions = cudaManager?.getVerifiedStartOptions(
+    gpuUuid === undefined ? undefined : { gpuUuid: gpuUuid || null }
+  ) || { useCuda: false, gpuUuid: null };
+  return whisperManager.startServer(modelName, startOptions);
+}
+
+module.exports = { activateVerifiedCudaRuntime, startWhisperServerWithVerifiedCuda };

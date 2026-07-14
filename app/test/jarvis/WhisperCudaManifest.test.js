@@ -249,7 +249,8 @@ test("a failed same-tag reinstall cannot replace the current verified runtime", 
     };
   });
   const oldPointer = {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    integrityMode: "all-regular-files-v1",
     version: manager.manifest.tag,
     asset: manager.manifest.asset,
     directory: "old-runtime",
@@ -287,6 +288,53 @@ test("runtime tampering invalidates a previously verified pointer", async (t) =>
   assert.equal((await manager.delete()).success, true);
   assert.equal(fs.readFileSync(path.join(root, "keep.txt"), "utf8"), "not managed by CUDA");
   assert.equal(manager.getStatus().present, false);
+});
+
+test("tampering with any extracted runtime DLL invalidates the verified pointer", async (t) => {
+  const { root, manager } = makeManager(t, {
+    extractArchive: async (_archive, destination) => {
+      fs.mkdirSync(destination, { recursive: true });
+      fs.writeFileSync(path.join(destination, "whisper-server-win32-x64-cuda.exe"), "exe");
+      fs.writeFileSync(path.join(destination, "cublas64_12.dll"), "dll");
+      fs.writeFileSync(path.join(destination, "cudart64_12.dll"), "dll");
+      fs.writeFileSync(path.join(destination, "ggml-cuda.dll"), "trusted-extra-dll");
+    },
+  });
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const pointer = JSON.parse(fs.readFileSync(path.join(root, "current.json"), "utf8"));
+  const extra = path.join(root, pointer.directory, "ggml-cuda.dll");
+
+  fs.writeFileSync(extra, "tampered-extra-dll");
+
+  assert.equal(manager.getCudaBinaryPath(), null);
+  assert.equal(manager.getStatus().reason, "CUDA_INTEGRITY_SIZE_MISMATCH");
+});
+
+test("same-size content replacement cannot reuse an integrity cache after mtime restoration", async (t) => {
+  const { manager } = makeManager(t);
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const binary = manager.getCudaBinaryPath();
+  const fixedTime = new Date("2025-01-02T03:04:05.000Z");
+  fs.utimesSync(binary, fixedTime, fixedTime);
+  assert.equal(manager.getCudaBinaryPath(), binary);
+
+  fs.writeFileSync(binary, "BAD");
+  fs.utimesSync(binary, fixedTime, fixedTime);
+
+  assert.equal(manager.getCudaBinaryPath(), null);
+  assert.equal(manager.getStatus().reason, "CUDA_INTEGRITY_HASH_MISMATCH");
+});
+
+test("rejects legacy partial integrity metadata without the complete file-set marker", async (t) => {
+  const { root, manager } = makeManager(t);
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const pointerPath = path.join(root, "current.json");
+  const pointer = JSON.parse(fs.readFileSync(pointerPath, "utf8"));
+  delete pointer.integrityMode;
+  fs.writeFileSync(pointerPath, `${JSON.stringify(pointer, null, 2)}\n`);
+
+  assert.equal(manager.getCudaBinaryPath(), null);
+  assert.equal(manager.getStatus().reason, "CUDA_INTEGRITY_METADATA_MISSING");
 });
 
 test("a nested official archive layout resolves after a fresh process", async (t) => {
@@ -335,6 +383,23 @@ test("an installed runtime can be re-verified for a newly selected GPU without d
   assert.equal(calls.download, downloadCount);
 });
 
+test("normal CUDA starts bind the verified pointer GPU when no environment UUID is selected", async (t) => {
+  const { manager } = makeManager(t);
+  const previous = process.env.TRANSCRIPTION_GPU_UUID;
+  delete process.env.TRANSCRIPTION_GPU_UUID;
+  t.after(() => {
+    if (previous == null) delete process.env.TRANSCRIPTION_GPU_UUID;
+    else process.env.TRANSCRIPTION_GPU_UUID = previous;
+  });
+  await manager.installPinnedCudaRuntime({ consent: true });
+
+  assert.equal(typeof manager.getVerifiedStartOptions, "function");
+  assert.deepEqual(manager.getVerifiedStartOptions({ enabled: true }), {
+    useCuda: true,
+    gpuUuid: "GPU-test",
+  });
+});
+
 test("transient CUDA verification failures quarantine only on the third boot attempt", async (t) => {
   const { root, manager } = makeManager(t, {
     verifyRuntime: async () => ({
@@ -378,6 +443,57 @@ test("three transient re-verification failures safe-disable the pointer but pres
   assert.equal(manager.getStatus().canRollback, true);
   assert.equal(fs.readFileSync(trustedPath).equals(trustedBytes), true);
   assert.equal((await manager.rollback()).success, true);
+  assert.equal(manager.getCudaBinaryPath(), trustedPath);
+});
+
+test("only consecutive transient re-verification failures count toward quarantine", async (t) => {
+  const { manager } = makeManager(t);
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const trustedPath = manager.getCudaBinaryPath();
+  const verifyReason = (reason) => ({
+    verify: async () => ({
+      ok: false,
+      backend: reason === "cuda_not_active" ? "cpu" : "unknown",
+      gpuUuid: null,
+      reason,
+    }),
+  });
+
+  await manager.verifyInstalledCudaRuntime(verifyReason("cuda_not_active"));
+  await manager.verifyInstalledCudaRuntime(verifyReason("invalid_inference_response"));
+  await manager.verifyInstalledCudaRuntime(verifyReason("cuda_driver_failure"));
+  assert.equal(manager.getCudaBinaryPath(), trustedPath);
+  await manager.verifyInstalledCudaRuntime(verifyReason("cuda_driver_failure"));
+  assert.equal(manager.getCudaBinaryPath(), trustedPath);
+  await manager.verifyInstalledCudaRuntime(verifyReason("cuda_driver_failure"));
+  assert.equal(manager.getCudaBinaryPath(), null);
+});
+
+test("successful re-verification resets the consecutive transient failure count", async (t) => {
+  const { manager } = makeManager(t);
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const trustedPath = manager.getCudaBinaryPath();
+  const transient = {
+    verify: async () => ({
+      ok: false,
+      backend: "unknown",
+      gpuUuid: null,
+      reason: "cuda_driver_failure",
+    }),
+  };
+  await manager.verifyInstalledCudaRuntime(transient);
+  await manager.verifyInstalledCudaRuntime(transient);
+  await manager.verifyInstalledCudaRuntime({
+    verify: async () => ({
+      ok: true,
+      backend: "cuda",
+      gpuUuid: "GPU-test",
+      reason: "verified",
+    }),
+  });
+  await manager.verifyInstalledCudaRuntime(transient);
+  await manager.verifyInstalledCudaRuntime(transient);
+
   assert.equal(manager.getCudaBinaryPath(), trustedPath);
 });
 
@@ -428,6 +544,59 @@ test("rollback accepts a previously verified older manifest pointer and resolves
   assert.equal(rolledBack.success, true);
   assert.match(rolledBack.path, /rollback-v1/);
   assert.equal(manager.isVerified({ gpuUuid: "GPU-old" }), true);
+});
+
+test("failed reinstall preserves a target runtime referenced by approved rollback history", async (t) => {
+  const oldManifest = {
+    repository: "OpenWhispr/whisper.cpp",
+    tag: "0.0.6",
+    asset: "whisper-server-win32-x64-cuda-v1.zip",
+    size: 4,
+    sha256: "1".repeat(64),
+  };
+  let failVerification = false;
+  const { root, manager } = makeManager(t, {
+    approvedManifests: [
+      {
+        ...PINNED,
+        size: 4,
+        sha256: "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+      },
+      oldManifest,
+    ],
+    verifyRuntime: async () =>
+      failVerification
+        ? { ok: false, backend: "unknown", gpuUuid: null, reason: "cuda_driver_failure" }
+        : { ok: true, backend: "cuda", gpuUuid: "GPU-test", reason: "verified" },
+  });
+  await manager.installPinnedCudaRuntime({ consent: true });
+  const targetPointer = JSON.parse(fs.readFileSync(path.join(root, "current.json"), "utf8"));
+  const targetDir = path.join(root, targetPointer.directory);
+  const targetBinary = path.join(targetDir, targetPointer.binary);
+  const targetBytes = fs.readFileSync(targetBinary);
+  const oldDir = path.join(root, "versions", "approved-old-current");
+  fs.cpSync(targetDir, oldDir, { recursive: true });
+  const oldPointer = {
+    ...targetPointer,
+    version: oldManifest.tag,
+    asset: oldManifest.asset,
+    directory: path.relative(root, oldDir).replaceAll("\\", "/"),
+    sha256: oldManifest.sha256,
+    verification: { ...targetPointer.verification, gpuUuid: "GPU-old" },
+  };
+  fs.writeFileSync(path.join(root, "current.json"), `${JSON.stringify(oldPointer, null, 2)}\n`);
+  fs.writeFileSync(path.join(root, "previous.json"), `${JSON.stringify(targetPointer, null, 2)}\n`);
+  failVerification = true;
+
+  await assert.rejects(
+    manager.installPinnedCudaRuntime({ consent: true }),
+    (error) => error?.code === "CUDA_VERIFICATION_FAILED"
+  );
+
+  assert.equal(fs.readFileSync(targetBinary).equals(targetBytes), true);
+  const rolledBack = await manager.rollback();
+  assert.equal(rolledBack.success, true);
+  assert.equal(rolledBack.path, targetBinary);
 });
 
 test("rollback rejects an unknown manifest even when the pointer self-claims verification", async (t) => {

@@ -96,7 +96,7 @@ class WhisperManager {
       await cleanupStaleDownloads(this.getModelsDir());
 
       // Pre-warm whisper-server if local mode enabled (eliminates 2-5s cold-start delay)
-      const { localTranscriptionProvider, whisperModel, useCuda } = settings;
+      const { localTranscriptionProvider, whisperModel, useCuda, gpuUuid } = settings;
 
       if (
         localTranscriptionProvider === "whisper" &&
@@ -114,7 +114,10 @@ class WhisperManager {
 
           try {
             const serverStartTime = Date.now();
-            await this.serverManager.start(modelPath, { useCuda: !!useCuda });
+            await this.serverManager.start(modelPath, {
+              useCuda: !!useCuda,
+              gpuUuid: useCuda ? gpuUuid || null : null,
+            });
             this.currentServerModel = whisperModel;
 
             debugLogger.info("whisper-server pre-warmed successfully", {
@@ -351,6 +354,9 @@ class WhisperManager {
 
     await this.serverManager.start(modelPath, {
       useCuda: this.serverManager.useCuda,
+      gpuUuid: this.serverManager.useCuda
+        ? this.serverManager.selectedGpuUuid || this.serverManager.lastStartOptions?.gpuUuid || null
+        : null,
       vadEnabled,
       vadModelPath,
       vadConfig: options.vadConfig || null,

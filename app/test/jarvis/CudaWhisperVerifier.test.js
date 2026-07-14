@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const CudaWhisperVerifier = require("../../src/jarvis/main/CudaWhisperVerifier");
+const { createRealProbeServer } = CudaWhisperVerifier;
 
 function verifierFor({ inference, evidence, telemetry, launchError } = {}) {
   let stopped = 0;
@@ -96,6 +97,31 @@ test("maps OOM and launch failures to bounded safe reasons", async () => {
     gpuUuid: null,
     reason: "cuda_out_of_memory",
   });
+});
+
+test("real probe startup failure stops manager state created before rejection", async () => {
+  let stopped = 0;
+  const manager = {
+    process: { pid: 41 },
+    start: async () => {
+      throw new Error("health timeout after spawn");
+    },
+    stop: async () => {
+      stopped += 1;
+      manager.process = null;
+    },
+  };
+  assert.equal(typeof createRealProbeServer, "function");
+
+  await assert.rejects(
+    createRealProbeServer(
+      { binaryPath: "cuda.exe", modelPath: "model.bin", gpuUuid: "GPU-a" },
+      { createManager: () => manager }
+    ),
+    /health timeout/
+  );
+  assert.equal(stopped, 1);
+  assert.equal(manager.process, null);
 });
 
 test("stops a probe that resolves only after the verification timeout", async () => {
