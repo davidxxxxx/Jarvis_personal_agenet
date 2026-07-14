@@ -229,12 +229,106 @@ function currentChildren() {
   );
 }
 
+function createOwnedFileHandleTracker(root) {
+  const ownedRoot = path.resolve(root);
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const active = new Set();
+  let peak = 0;
+
+  fs.openSync = function trackedOpenSync(candidate, ...args) {
+    const descriptor = originalOpenSync.call(fs, candidate, ...args);
+    if (typeof candidate === "string") {
+      const resolved = path.resolve(candidate);
+      const relative = path.relative(ownedRoot, resolved);
+      if (
+        relative.length === 0 ||
+        (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+      ) {
+        active.add(descriptor);
+        peak = Math.max(peak, active.size);
+      }
+    }
+    return descriptor;
+  };
+  fs.closeSync = function trackedCloseSync(descriptor) {
+    const result = originalCloseSync.call(fs, descriptor);
+    active.delete(descriptor);
+    return result;
+  };
+
+  return {
+    active,
+    get peak() {
+      return peak;
+    },
+    restore() {
+      fs.openSync = originalOpenSync;
+      fs.closeSync = originalCloseSync;
+    },
+  };
+}
+
+function createOwnedTimerTracker() {
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const active = new Set();
+  let peak = 0;
+  let installed = false;
+  return {
+    active,
+    get peak() {
+      return peak;
+    },
+    install() {
+      assert.equal(installed, false);
+      installed = true;
+      global.setTimeout = function trackedSetTimeout(callback, delay, ...args) {
+        const taskOwned =
+          delay === 1_000 &&
+          typeof callback === "function" &&
+          callback.toString().includes("VAD classification timed out");
+        if (!taskOwned) return originalSetTimeout(callback, delay, ...args);
+        let timer = null;
+        timer = originalSetTimeout((...callbackArgs) => {
+          active.delete(timer);
+          callback(...callbackArgs);
+        }, delay, ...args);
+        active.add(timer);
+        peak = Math.max(peak, active.size);
+        return timer;
+      };
+      global.clearTimeout = function trackedClearTimeout(timer) {
+        active.delete(timer);
+        return originalClearTimeout(timer);
+      };
+    },
+    restore() {
+      if (!installed) return;
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+      installed = false;
+    },
+  };
+}
+
 async function settleEventLoop() {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
 }
 
-function observeRuntimeBounds(service, metrics) {
+function taskOwnedResourceSnapshot(service, fileHandles, timerHandles) {
+  const sources = Object.values(service.state.sources);
+  return {
+    writerHandles: service.writer?.writers?.size ?? 0,
+    fileHandles: fileHandles.active.size,
+    timerHandles: timerHandles.active.size,
+    vadWorkers: sources.filter((source) => source.vadProcessing || source.vadInFlight).length,
+    retentionWork: service.retentionWork.size,
+  };
+}
+
+function observeRuntimeBounds(service, metrics, fileHandles, timerHandles) {
   let totalRingBufferBytes = 0;
   for (const source of Object.values(service.state.sources)) {
     metrics.maxVadQueueBytes = Math.max(metrics.maxVadQueueBytes, source.vadQueueBytes);
@@ -243,6 +337,9 @@ function observeRuntimeBounds(service, metrics) {
   }
   metrics.maxRingBufferBytes = Math.max(metrics.maxRingBufferBytes, totalRingBufferBytes);
   metrics.maxRetentionWork = Math.max(metrics.maxRetentionWork, service.retentionWork.size);
+  const resources = taskOwnedResourceSnapshot(service, fileHandles, timerHandles);
+  metrics.maxWriterHandles = Math.max(metrics.maxWriterHandles, resources.writerHandles);
+  metrics.maxVadWorkers = Math.max(metrics.maxVadWorkers, resources.vadWorkers);
 }
 
 function durableDurationBySource(repository) {
@@ -339,6 +436,9 @@ test(
     const sessionId = "all-day-soak";
     const clock = createVirtualClock(0);
     const helperTracker = createHelperTracker();
+    const fileHandles = createOwnedFileHandleTracker(base);
+    const timerHandles = createOwnedTimerTracker();
+    timerHandles.install();
     let repository = null;
     let service = null;
     let retentionCleaner = null;
@@ -363,6 +463,8 @@ test(
       );
       if (repository?.db?.open) repository.close();
       await settleEventLoop();
+      fileHandles.restore();
+      timerHandles.restore();
       await fsp.rm(base, { recursive: true, force: true });
     });
 
@@ -415,6 +517,8 @@ test(
       maxRetentionWork: 0,
       maxVadQueueBytes: 0,
       maxVadQueueEntries: 0,
+      maxWriterHandles: 0,
+      maxVadWorkers: 0,
     };
     let broadcastCount = 0;
 
@@ -441,6 +545,7 @@ test(
       retentionMode: "speech_triggered",
       sources: dualSources(),
     });
+    const resourceBaseline = taskOwnedResourceSnapshot(service, fileHandles, timerHandles);
 
     const failureSchedule = new Map(
       Array.from({ length: 12 }, (_, index) => [
@@ -462,6 +567,7 @@ test(
       ).length * 2;
     let interruptedFlac = null;
     let lowDiskStopSecond = null;
+    let completedCaptureSeconds = 0;
 
     for (let second = 0; second < THREE_HOURS_MS / 1_000; second += 1) {
       clock.set(second * 1_000);
@@ -526,7 +632,7 @@ test(
           assert.ok(durationAfter[sourceType] - importantMeetingDurationBefore[sourceType] >= 10_000);
         }
       }
-      if (second === 10_680) {
+      if (second === 10_750) {
         const continuous = service.setRetentionMode(sessionId, "continuous", clock.now());
         assert.equal(continuous.effectiveRetentionMode, "continuous");
         finalContinuousDurationBefore = durableDurationBySource(repository);
@@ -537,19 +643,17 @@ test(
           ])
         );
       }
-      if (second === 10_740) disk.freeBytes = 1024 ** 3;
-
       const isSpeech = scheduledSpeech(second);
       for (const sourceType of ["mic", "system"]) {
         if (service.getState().sources[sourceType].state !== "active") continue;
-        const finalContinuous = second >= 10_680;
+        const finalContinuous = second >= 10_750;
         const importantMeeting = second >= 7_200 && second < 7_210;
         const input = pcm(1_000, finalContinuous ? 1_000 : importantMeeting ? 0 : isSpeech ? 12_000 : 0);
         const accepted = service.appendPcm(sessionId, sourceType, input);
         if (finalContinuous && (accepted || service.getState().status === "paused")) {
           finalContinuousSubmittedBytes[sourceType] += input.length;
         }
-        observeRuntimeBounds(service, metrics);
+        observeRuntimeBounds(service, metrics, fileHandles, timerHandles);
         if (!accepted && service.getState().status === "paused") {
           lowDiskStopSecond = second;
           break;
@@ -557,7 +661,7 @@ test(
         assert.equal(accepted, true);
       }
       await withTimeout(service.whenRetentionIdle(), `VAD drain at virtual second ${second}`);
-      observeRuntimeBounds(service, metrics);
+      observeRuntimeBounds(service, metrics, fileHandles, timerHandles);
 
       if (second === 6_000) {
         assert.equal(service.getState().retentionMode, "speech_triggered");
@@ -596,13 +700,28 @@ test(
       }
 
       if (service.getState().status === "paused") break;
+      completedCaptureSeconds += 1;
     }
 
     clock.set(THREE_HOURS_MS);
     assert.equal(clock.now(), THREE_HOURS_MS);
+    assert.equal(completedCaptureSeconds, THREE_HOURS_MS / 1_000);
     assert.equal(speechFrames / scheduledFrames, 0.18);
     assert.equal(sourceFailureCount, 12);
-    assert.ok(lowDiskStopSecond >= 10_740 && lowDiskStopSecond < 10_800);
+    assert.equal(service.getState().status, "recording");
+
+    disk.freeBytes = 1024 ** 3;
+    const micWriter = service.writer.writers.get("mic");
+    const lowDiskInput = Buffer.alloc(micWriter.chunkBytes - micWriter.pendingBytes);
+    const lowDiskInjectedAt = clock.now();
+    const lowDiskAccepted = service.appendPcm(sessionId, "mic", lowDiskInput);
+    if (lowDiskAccepted || service.getState().status === "paused") {
+      finalContinuousSubmittedBytes.mic += lowDiskInput.length;
+    }
+    lowDiskStopSecond = lowDiskInjectedAt / 1_000;
+    clock.set(lowDiskInjectedAt + (lowDiskInput.length * 1_000) / BYTES_PER_SECOND);
+    assert.equal(lowDiskAccepted, false);
+    assert.equal(lowDiskStopSecond, THREE_HOURS_MS / 1_000);
     assert.equal(service.getState().status, "paused");
     assert.equal(service.getState().errorCode, "capture_stopped_low_disk");
     assert.equal(reserve.ensureCount, 1);
@@ -610,7 +729,7 @@ test(
     assert.equal(service.appendPcm(sessionId, "system", pcm(1_000, 1_000)), false);
     await withTimeout(service.whenRetentionIdle(), "low-disk retention drain");
     await withTimeout(service.waitForCompressionIdle(), "final compression drain");
-    observeRuntimeBounds(service, metrics);
+    observeRuntimeBounds(service, metrics, fileHandles, timerHandles);
 
     const finalContinuousDurationAfter = durableDurationBySource(repository);
     for (const sourceType of ["mic", "system"]) {
@@ -666,8 +785,27 @@ test(
       0
     );
     assert.ok(metrics.maxRetentionWork <= 2);
+    assert.deepEqual(resourceBaseline, {
+      writerHandles: 0,
+      fileHandles: 0,
+      timerHandles: 0,
+      vadWorkers: 0,
+      retentionWork: 0,
+    });
+    assert.ok(metrics.maxWriterHandles > 0 && metrics.maxWriterHandles <= 2);
+    assert.ok(fileHandles.peak > 0 && fileHandles.peak <= 2);
+    assert.ok(timerHandles.peak > 0 && timerHandles.peak <= 2);
+    assert.ok(metrics.maxVadWorkers > 0 && metrics.maxVadWorkers <= 2);
 
     service.shutdown();
+    const resourceFinal = taskOwnedResourceSnapshot(service, fileHandles, timerHandles);
+    assert.deepEqual(resourceFinal, {
+      writerHandles: 0,
+      fileHandles: 0,
+      timerHandles: 0,
+      vadWorkers: 0,
+      retentionWork: 0,
+    });
     service = null;
     await withTimeout(compressionWorker.shutdown(), "compression worker shutdown");
 
@@ -854,7 +992,8 @@ test(
 
     t.diagnostic(
       JSON.stringify({
-        virtualHours: clock.now() / VIRTUAL_HOUR_MS,
+        virtualHours: completedCaptureSeconds / (VIRTUAL_HOUR_MS / 1_000),
+        postSoakFaultSeconds: (clock.now() - THREE_HOURS_MS) / 1_000,
         speechDutyCycle: speechFrames / scheduledFrames,
         sourceFailures: sourceFailureCount,
         chunks: preMigrationIntegrity.chunks.length,
@@ -862,6 +1001,13 @@ test(
         expectedRingBufferBytes: 2 * 2 * SAMPLE_RATE * 2,
         maxVadQueueBytes: metrics.maxVadQueueBytes,
         maxVadQueueEntries: metrics.maxVadQueueEntries,
+        resourceBaseline,
+        peakWriterHandles: metrics.maxWriterHandles,
+        peakOwnedFileHandles: fileHandles.peak,
+        peakOwnedTimerHandles: timerHandles.peak,
+        peakVadWorkers: metrics.maxVadWorkers,
+        peakRetentionWork: metrics.maxRetentionWork,
+        resourceFinal,
         processingJobs: jobs.length,
         orphanedChunks: preMigrationIntegrity.orphanedChunks,
         corruptChunks: preMigrationIntegrity.corruptChunks,
