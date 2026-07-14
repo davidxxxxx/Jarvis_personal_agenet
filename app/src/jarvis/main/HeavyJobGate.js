@@ -1,10 +1,12 @@
 const { JOB_PRIORITY } = require("./ResourceGovernor");
 
 class HeavyJobGate {
+  #activePermit = null;
+
+  #runningWithinPermit = false;
+
   constructor() {
     this.activeKind = null;
-    this.activePermit = null;
-    this.runningWithinPermit = false;
     this.queue = [];
   }
 
@@ -22,7 +24,7 @@ class HeavyJobGate {
   }
 
   assertActivePermit(permit) {
-    if (permit === null || typeof permit !== "object" || permit !== this.activePermit) {
+    if (permit === null || typeof permit !== "object" || permit !== this.#activePermit) {
       throw new Error("heavy-job permit is not active");
     }
     return permit;
@@ -35,19 +37,19 @@ class HeavyJobGate {
     const outerKind = this.activeKind;
     const outerPriority = JOB_PRIORITY[outerKind] ?? Number.MAX_SAFE_INTEGER;
     const innerPriority = JOB_PRIORITY[kind] ?? Number.MAX_SAFE_INTEGER;
-    if (this.runningWithinPermit) {
+    if (this.#runningWithinPermit) {
       throw new Error("heavy-job permit work is already running");
     }
     if (innerPriority >= outerPriority) {
       throw new Error("work inside a heavy-job permit must have higher priority");
     }
-    this.runningWithinPermit = true;
+    this.#runningWithinPermit = true;
     this.activeKind = kind;
     try {
       return await fn();
     } finally {
       this.activeKind = outerKind;
-      this.runningWithinPermit = false;
+      this.#runningWithinPermit = false;
       this.assertActivePermit(permit);
     }
   }
@@ -64,7 +66,7 @@ class HeavyJobGate {
     if (!next) return;
     this.activeKind = next.kind;
     const permit = Object.freeze({});
-    this.activePermit = permit;
+    this.#activePermit = permit;
     void (async () => {
       let result;
       let failure;
@@ -77,7 +79,7 @@ class HeavyJobGate {
       } catch (error) {
         failure = error;
       } finally {
-        this.activePermit = null;
+        this.#activePermit = null;
         this.activeKind = null;
         this._drain();
       }

@@ -238,19 +238,75 @@ test("rejects a forged or expired heavy-job permit", async () => {
   assert.throws(() => gate.assertActivePermit(expiredPermit), /permit/i);
 });
 
+test("code holding only the gate instance cannot reflect or steal the active permit", async () => {
+  const gate = new HeavyJobGate();
+  const previewStarted = deferred();
+  const releasePreview = deferred();
+  let concurrent = 0;
+  let maxConcurrent = 0;
+
+  const preview = gate.run("preview", async () => {
+    concurrent += 1;
+    maxConcurrent = Math.max(maxConcurrent, concurrent);
+    previewStarted.resolve();
+    await releasePreview.promise;
+    concurrent -= 1;
+  });
+  await previewStarted.promise;
+
+  let stolenPermit = null;
+  for (const key of Reflect.ownKeys(gate)) {
+    const descriptor = Object.getOwnPropertyDescriptor(gate, key);
+    if (!descriptor || !("value" in descriptor)) continue;
+    try {
+      gate.assertActivePermit(descriptor.value);
+      stolenPermit = descriptor.value;
+      break;
+    } catch {
+      // A gate instance exposes ordinary state, but no usable capability token.
+    }
+  }
+
+  if (stolenPermit) {
+    await gate.runWithinPermit(stolenPermit, "retention_urgent", async () => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      concurrent -= 1;
+    });
+  }
+  releasePreview.resolve();
+  await preview;
+
+  assert.equal(stolenPermit, null);
+  assert.equal(maxConcurrent, 1);
+  assert.deepEqual(
+    Reflect.ownKeys(gate).filter((key) => /permit/i.test(String(key))),
+    []
+  );
+});
+
 test("permit work stays single-concurrency and accepts only higher-priority kinds", async () => {
   const gate = new HeavyJobGate();
   const innerStarted = deferred();
   const releaseInner = deferred();
+  let concurrent = 0;
+  let maxConcurrent = 0;
 
   await gate.run("preview", async (permit) => {
     const storage = gate.runWithinPermit(permit, "storage_recovery_compress", async () => {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
       innerStarted.resolve();
       await releaseInner.promise;
+      concurrent -= 1;
     });
     await innerStarted.promise;
     await assert.rejects(
-      gate.runWithinPermit(permit, "retention_urgent", () => undefined),
+      gate.runWithinPermit(permit, "retention_urgent", () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        concurrent -= 1;
+      }),
       /already running/i
     );
     releaseInner.resolve();
@@ -261,5 +317,6 @@ test("permit work stays single-concurrency and accepts only higher-priority kind
     );
   });
 
+  assert.equal(maxConcurrent, 1);
   assert.deepEqual(gate.getState(), { activeKind: null, queueLength: 0 });
 });
