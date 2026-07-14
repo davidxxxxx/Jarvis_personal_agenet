@@ -321,6 +321,9 @@ const {
   GracefulShutdownCoordinator,
   RendererShutdownHandshake,
 } = require("./src/jarvis/main/GracefulShutdownCoordinator");
+const {
+  createJarvisProcessingRuntime,
+} = require("./src/jarvis/main/JarvisProcessingRuntime");
 
 // Manager instances - initialized after app.whenReady()
 let debugLogger = null;
@@ -356,8 +359,45 @@ let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
 let openAiCorrectionService = null;
 let jarvisAnalysisScheduler = null;
+let jarvisProcessingRuntime = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
+
+function buildJarvisProcessingRuntime() {
+  const model = process.env.LOCAL_WHISPER_MODEL?.trim() || "base";
+  return createJarvisProcessingRuntime({
+    repository: jarvisRepository,
+    service: jarvisService,
+    ipcHandlers,
+    model,
+    log: ({ phase, sessionId, error }) =>
+      debugLogger?.warn(
+        "Jarvis background processing failed",
+        { phase, sessionId: sessionId ?? null, error: error?.message ?? String(error) },
+        "jarvis"
+      ),
+  });
+}
+
+function startJarvisProcessingRuntime() {
+  if (jarvisProcessingRuntime) return jarvisProcessingRuntime;
+  const runtime = buildJarvisProcessingRuntime();
+  jarvisProcessingRuntime = runtime;
+  void runtime.start().catch((error) => {
+    debugLogger?.warn(
+      "Jarvis processing startup recovery failed",
+      { error: error?.message ?? String(error) },
+      "jarvis"
+    );
+  });
+  return runtime;
+}
+
+async function stopJarvisProcessingRuntime() {
+  const runtime = jarvisProcessingRuntime;
+  jarvisProcessingRuntime = null;
+  await runtime?.stop();
+}
 let gracefulShutdownCoordinator = null;
 let jarvisStorageManager = null;
 let jarvisDataRootConfig = null;
@@ -534,6 +574,7 @@ async function initializeCoreManagers() {
   migrationCoordinator.register({
     name: "jarvis-runtime",
     async quiesce() {
+      await stopJarvisProcessingRuntime();
       await jarvisService.prepareStorageMigration();
       await retentionCleaner.stop();
       await jarvisAnalysisScheduler.quiesce();
@@ -547,6 +588,7 @@ async function initializeCoreManagers() {
     async resume() {
       jarvisAnalysisScheduler.resume();
       retentionCleaner.start();
+      startJarvisProcessingRuntime();
     },
   });
   storageComposition.registerWriterProvider();
@@ -1047,6 +1089,7 @@ async function startApp() {
   // Phase 1: Core managers + IPC handlers before windows
   await initializeCoreManagers();
   await environmentManager.init();
+  startJarvisProcessingRuntime();
   registerSidecars();
   startAuthBridgeServer();
 
@@ -1916,6 +1959,7 @@ function performGracefulTeardown() {
       () => sidecarRegistry.shutdownAll(),
     ],
     stopRuntime: [
+      stopJarvisProcessingRuntime,
       () => {
         if (wakeRewarmTimer) clearTimeout(wakeRewarmTimer);
         wakeRewarmTimer = null;

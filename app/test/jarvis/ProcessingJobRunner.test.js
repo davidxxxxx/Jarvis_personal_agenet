@@ -140,7 +140,7 @@ test("visibly blocks a claimed job when its handler is missing", async (t) => {
   );
 });
 
-test("records handler failure as retry without losing durable input metadata", async (t) => {
+test("records handler failure with backoff without losing durable input metadata", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db);
   runner.register("transcribe_chunk", async () => {
@@ -162,7 +162,7 @@ test("records handler failure as retry without losing durable input metadata", a
       input_version: 3,
       model_version: "model-v2",
       attempt_count: 1,
-      next_retry_at: 2_000,
+      next_retry_at: 3_000,
       error_code: "TRANSIENT",
       completed_at: null,
       lease_owner: null,
@@ -204,13 +204,47 @@ test("normalizes malformed handler error codes without stranding the lease", asy
         {
           state: "retry",
           error_code: "JOB_FAILED",
-          next_retry_at: 2_000,
+          next_retry_at: 3_000,
           lease_owner: null,
           lease_expires_at: null,
         }
       );
     });
   }
+});
+
+test("persistent failure backs off so an independent due job is not starved", async (t) => {
+  let now = 2_000;
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    retryBaseMs: 100,
+    retryMaxMs: 1_000,
+  });
+  seedJob(db, { id: "job-a-fails", inputHash: "fails" });
+  seedJob(db, { id: "job-b-works", inputHash: "works" });
+  const calls = [];
+  runner.register("transcribe_chunk", async (job) => {
+    calls.push(job.id);
+    if (job.id === "job-a-fails") throw new Error("still unavailable");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.equal(
+    db.prepare("SELECT next_retry_at FROM processing_jobs WHERE id = 'job-a-fails'").get()
+      .next_retry_at,
+    2_100
+  );
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(calls, ["job-a-fails", "job-b-works"]);
+  assert.equal(await runner.runOnce(), 0);
+
+  now = 2_100;
+  assert.equal(await runner.runOnce(), 1);
+  assert.equal(
+    db.prepare("SELECT next_retry_at FROM processing_jobs WHERE id = 'job-a-fails'").get()
+      .next_retry_at,
+    2_300
+  );
 });
 
 test("exposes explicit expired-lease recovery", (t) => {

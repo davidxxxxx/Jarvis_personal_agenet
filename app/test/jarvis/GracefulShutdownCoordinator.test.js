@@ -109,3 +109,28 @@ test("rejections and bounded upstream timeouts still close writer and repository
   await coordinator.shutdown();
   assert.deepEqual(order, ["begin-close", "stuck-upstream", "runtime", "writer", "repository"]);
 });
+
+test("runtime shutdown is never timed out before writer and repository closure", async () => {
+  const order = [];
+  const runtime = deferred();
+  const coordinator = new GracefulShutdownCoordinator({
+    requestRendererFlush: async () => {},
+    beginClose: async () => {},
+    stopUpstream: [],
+    stopRuntime: [async () => {
+      order.push("runtime");
+      await runtime.promise;
+      order.push("runtime-stopped");
+    }],
+    closeWriter: async () => order.push("writer"),
+    closeRepository: async () => order.push("repository"),
+    phaseTimeoutMs: 5,
+  });
+
+  const stopping = coordinator.shutdown();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.deepEqual(order, ["runtime"]);
+  runtime.resolve();
+  await stopping;
+  assert.deepEqual(order, ["runtime", "runtime-stopped", "writer", "repository"]);
+});

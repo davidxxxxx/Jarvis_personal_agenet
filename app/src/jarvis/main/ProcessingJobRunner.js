@@ -11,7 +11,14 @@ function normalizeErrorCode(error) {
 }
 
 class ProcessingJobRunner {
-  constructor({ store, owner, now = Date.now, leaseMs = 60_000 } = {}) {
+  constructor({
+    store,
+    owner,
+    now = Date.now,
+    leaseMs = 60_000,
+    retryBaseMs = 1_000,
+    retryMaxMs = 60_000,
+  } = {}) {
     const requiredMethods = [
       "claimJobs",
       "recoverExpiredLeases",
@@ -29,11 +36,19 @@ class ProcessingJobRunner {
     if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) {
       throw new RangeError("leaseMs must be a positive safe integer");
     }
+    if (!Number.isSafeInteger(retryBaseMs) || retryBaseMs <= 0) {
+      throw new RangeError("retryBaseMs must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(retryMaxMs) || retryMaxMs < retryBaseMs) {
+      throw new RangeError("retryMaxMs must be a safe integer at least retryBaseMs");
+    }
 
     this.store = store;
     this.owner = owner;
     this.now = now;
     this.leaseMs = leaseMs;
+    this.retryBaseMs = retryBaseMs;
+    this.retryMaxMs = retryMaxMs;
     this.handlers = new Map();
   }
 
@@ -76,10 +91,13 @@ class ProcessingJobRunner {
     } catch (error) {
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
+      const exponent = Math.max(0, Math.min(30, (job.attempt_count ?? 1) - 1));
+      const retryDelay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** exponent);
+      const nextRetryAt = Math.min(Number.MAX_SAFE_INTEGER, failedAt + retryDelay);
       this.store.retryJob(job.id, {
         owner: this.owner,
         at: failedAt,
-        nextRetryAt: failedAt,
+        nextRetryAt,
         errorCode,
       });
     }

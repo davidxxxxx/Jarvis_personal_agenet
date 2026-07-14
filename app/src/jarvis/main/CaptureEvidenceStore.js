@@ -77,7 +77,9 @@ class CaptureEvidenceStore {
       finalizeSession: db.prepare(`
         UPDATE sessions
         SET status = @sessionStatus, ended_at = @at,
-            stop_reason = NULL, durable_boundary_at = NULL
+            stop_reason = NULL, durable_boundary_at = NULL,
+            processing_state = 'processing', finalized_at = @at, ready_at = NULL,
+            timeline_version = timeline_version + 1
         WHERE id = @sessionId
       `),
       transitionSession: db.prepare(`

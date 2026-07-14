@@ -317,6 +317,93 @@ class JarvisRepository {
         ORDER BY started_at DESC, id DESC
         LIMIT @limit
       `),
+      listProcessingSessions: this.db.prepare(`
+        SELECT * FROM sessions
+        WHERE status IN ('completed', 'recovered')
+          AND ended_at IS NOT NULL
+          AND (
+            processing_state <> 'ready'
+            OR EXISTS (
+              SELECT 1 FROM audio_chunks AS chunk
+              WHERE chunk.session_id = sessions.id
+                AND chunk.write_state = 'committed'
+                AND chunk.deleted_at IS NULL
+                AND (
+                  chunk.track_id IS NULL
+                  OR chunk.transcription_status NOT IN ('completed', 'no_speech')
+                  OR NOT EXISTS (
+                    SELECT 1 FROM audio_tracks AS track
+                    WHERE track.id = chunk.track_id
+                      AND track.session_id = chunk.session_id
+                      AND track.source_type = chunk.source_type
+                  )
+                  OR NOT EXISTS (
+                    SELECT 1 FROM processing_jobs AS job
+                    WHERE job.chunk_id = chunk.id
+                      AND job.job_type = 'transcribe_chunk'
+                      AND job.state = 'completed'
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM processing_jobs AS job
+                    WHERE job.chunk_id = chunk.id
+                      AND job.job_type = 'transcribe_chunk'
+                      AND job.state <> 'completed'
+                  )
+                  OR (
+                    chunk.transcription_status = 'completed'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM transcript_segments AS segment
+                      WHERE segment.chunk_id = chunk.id
+                        AND segment.result_kind = 'final'
+                        AND segment.started_at <= chunk.started_at
+                        AND segment.ended_at >= chunk.ended_at
+                    )
+                  )
+                )
+            )
+          )
+        ORDER BY COALESCE(finalized_at, ended_at) ASC, id ASC
+      `),
+      listPendingJobs: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE session_id = ? AND state <> 'completed'
+        ORDER BY created_at ASC, id ASC
+      `),
+      listSessionReadinessTracks: this.db.prepare(`
+        SELECT * FROM audio_tracks WHERE session_id = ? ORDER BY source_type, id
+      `),
+      listSessionReadinessChunks: this.db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE session_id = ? AND write_state = 'committed' AND deleted_at IS NULL
+        ORDER BY track_id, sequence_number, started_at, id
+      `),
+      listSessionTranscriptionJobs: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE session_id = ? AND job_type = 'transcribe_chunk'
+        ORDER BY created_at, id
+      `),
+      listSessionFinalCoverage: this.db.prepare(`
+        SELECT * FROM transcript_segments
+        WHERE session_id = ? AND result_kind = 'final'
+        ORDER BY started_at, id
+      `),
+      markSessionProcessing: this.db.prepare(`
+        UPDATE sessions
+        SET processing_state = 'processing', ready_at = NULL,
+            timeline_version = timeline_version + 1
+        WHERE id = ?
+          AND status IN ('completed', 'recovered')
+          AND ended_at IS NOT NULL
+          AND (processing_state <> 'processing' OR ready_at IS NOT NULL)
+      `),
+      setSessionReadiness: this.db.prepare(`
+        UPDATE sessions
+        SET processing_state = @processingState,
+            ready_at = @readyAt,
+            timeline_version = timeline_version + 1
+        WHERE id = @sessionId
+          AND (processing_state <> @processingState OR ready_at IS NOT @readyAt)
+      `),
       insertPerson: this.db.prepare(`
         INSERT OR IGNORE INTO people (
           id, display_name, is_self, created_at, last_seen_at
@@ -902,6 +989,61 @@ class JarvisRepository {
       }
     );
 
+    this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
+      const session = this.statements.getSession.get(sessionId);
+      if (!session) throw new Error(`session ${sessionId} does not exist`);
+      const isFinalized =
+        (session.status === "completed" || session.status === "recovered") &&
+        Number.isSafeInteger(session.ended_at);
+      const tracks = this.statements.listSessionReadinessTracks.all(sessionId);
+      const chunks = this.statements.listSessionReadinessChunks.all(sessionId);
+      const jobs = this.statements.listSessionTranscriptionJobs.all(sessionId);
+      const coverage = this.statements.listSessionFinalCoverage.all(sessionId);
+      const tracksById = new Map(tracks.map((track) => [track.id, track]));
+      const jobsByChunk = new Map();
+      for (const job of jobs) {
+        const rows = jobsByChunk.get(job.chunk_id) ?? [];
+        rows.push(job);
+        jobsByChunk.set(job.chunk_id, rows);
+      }
+      const coverageByChunk = new Map();
+      for (const segment of coverage) {
+        const rows = coverageByChunk.get(segment.chunk_id) ?? [];
+        rows.push(segment);
+        coverageByChunk.set(segment.chunk_id, rows);
+      }
+
+      const complete =
+        isFinalized &&
+        chunks.every((chunk) => {
+          const track = tracksById.get(chunk.track_id);
+          if (
+            !track ||
+            track.session_id !== sessionId ||
+            track.source_type !== chunk.source_type ||
+            !["completed", "no_speech"].includes(chunk.transcription_status)
+          ) {
+            return false;
+          }
+          const chunkJobs = jobsByChunk.get(chunk.id) ?? [];
+          if (chunkJobs.length === 0 || chunkJobs.some((job) => job.state !== "completed")) {
+            return false;
+          }
+          if (chunk.transcription_status === "no_speech") return true;
+          return (coverageByChunk.get(chunk.id) ?? []).some(
+            (segment) =>
+              segment.track_id === chunk.track_id &&
+              segment.source_type === chunk.source_type &&
+              segment.started_at <= chunk.started_at &&
+              segment.ended_at >= chunk.ended_at
+          );
+        });
+      const processingState = complete ? "ready" : isFinalized ? "processing" : "pending";
+      const readyAt = complete ? (session.ready_at ?? at) : null;
+      this.statements.setSessionReadiness.run({ sessionId, processingState, readyAt });
+      return this.statements.getSession.get(sessionId);
+    });
+
     this._backfillLegacyMicChunks = this.db.transaction(
       ({ sessionId, deterministicTrackId, chunkIds, createdAt }) => {
         const session = this.statements.getSession.get(sessionId);
@@ -1058,6 +1200,27 @@ class JarvisRepository {
     if (from > to) throw new RangeError("from must not be greater than to");
     if (limit < 1 || limit > 1000) throw new RangeError("limit must be between 1 and 1000");
     return this.statements.listSessions.all({ from, to, limit });
+  }
+
+  listProcessingSessions() {
+    return this.statements.listProcessingSessions.all();
+  }
+
+  listPendingJobs(sessionId) {
+    return this.statements.listPendingJobs.all(assertId(sessionId, "sessionId"));
+  }
+
+  markSessionProcessing(sessionId) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    this.statements.markSessionProcessing.run(safeSessionId);
+    return this.getSession(safeSessionId);
+  }
+
+  refreshSessionReadiness(sessionId, at = Date.now()) {
+    return this._refreshSessionReadiness(
+      assertId(sessionId, "sessionId"),
+      assertInteger(at, "at")
+    );
   }
 
   upsertTranscriptSegments(sessionId, segments) {

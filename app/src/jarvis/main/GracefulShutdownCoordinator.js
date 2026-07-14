@@ -100,11 +100,15 @@ class GracefulShutdownCoordinator {
     return settleWithin(tasks, this.phaseTimeoutMs, this.setTimeout, this.clearTimeout);
   }
 
+  async _runtimePhase() {
+    return Promise.allSettled(this.stopRuntime.map((task) => Promise.resolve().then(task)));
+  }
+
   async _shutdown() {
     await this._phase([this.requestRendererFlush]);
     await this._phase([this.beginClose]);
     await this._phase(this.stopUpstream);
-    await this._phase(this.stopRuntime);
+    await this._runtimePhase();
     await this._phase([this.closeWriter]);
     await this._phase([this.closeRepository]);
   }
