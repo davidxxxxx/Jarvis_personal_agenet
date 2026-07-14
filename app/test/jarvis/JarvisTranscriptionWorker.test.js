@@ -51,14 +51,12 @@ function seedChunk(t, { format = "wav", sourceType = "system", id = "chunk-1" } 
 
 function workerFixture(repository, transcribeWav, { reader } = {}) {
   const calls = [];
-  const audioEvidenceReader =
-    reader ??
-    {
-      async withVerifiedWav(chunk, consume) {
-        calls.push(chunk);
-        return consume(`verified-${chunk.format}.wav`, new AbortController().signal);
-      },
-    };
+  const audioEvidenceReader = reader ?? {
+    async withVerifiedWav(chunk, consume) {
+      calls.push(chunk);
+      return consume(`verified-${chunk.format}.wav`, new AbortController().signal);
+    },
+  };
   const worker = new JarvisTranscriptionWorker({
     repository,
     audioEvidenceReader,
@@ -178,7 +176,9 @@ test("rejects missing, tombstoned, and uncommitted evidence before transcription
     .run(100, "tombstone:chunk-1", "chunk-1");
   await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), { code: "AUDIO_UNAVAILABLE" });
   repository.db
-    .prepare("UPDATE audio_chunks SET deleted_at = NULL, path = ?, write_state = 'writing' WHERE id = ?")
+    .prepare(
+      "UPDATE audio_chunks SET deleted_at = NULL, path = ?, write_state = 'writing' WHERE id = ?"
+    )
     .run("chunk-1.wav", "chunk-1");
   await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), { code: "AUDIO_UNAVAILABLE" });
   assert.equal(transcribeCalls, 0);
@@ -188,7 +188,11 @@ test("maps expired or unreadable verified evidence to a stable unavailable code"
   const repository = seedChunk(t);
   const expired = Object.assign(new Error("audio_expired"), { code: "audio_expired" });
   const { worker } = workerFixture(repository, async () => ({ text: "must not run" }), {
-    reader: { async withVerifiedWav() { throw expired; } },
+    reader: {
+      async withVerifiedWav() {
+        throw expired;
+      },
+    },
   });
 
   await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), {
@@ -212,6 +216,37 @@ test("rejects malformed and non-silence Whisper failures without committing a se
     code: "TRANSCRIPTION_FAILED",
   });
   assert.equal(repository.listTranscriptSegments("session-1").length, 0);
+});
+
+test("passes admission context through verified evidence and returns only the proven device", async (t) => {
+  const repository = seedChunk(t);
+  const context = {
+    action: "run_cpu",
+    device: "cpu",
+    cpuThreads: 4,
+    lowPriority: true,
+    selectedGpuUuid: null,
+  };
+  let input;
+  const { worker } = workerFixture(repository, async (value) => {
+    input = value;
+    return { text: "local CPU result", confidence: 0.8, executionDevice: "cpu" };
+  });
+
+  assert.deepEqual(await worker.handle({ chunk_id: "chunk-1" }, context), {
+    executionDevice: "cpu",
+  });
+  assert.deepEqual(input.executionContext, context);
+
+  const secondRepository = seedChunk(t, { id: "chunk-2" });
+  const mismatched = workerFixture(secondRepository, async () => ({
+    text: "must not commit",
+    executionDevice: "cuda",
+  })).worker;
+  await assert.rejects(mismatched.handle({ chunk_id: "chunk-2" }, context), {
+    code: "EXECUTION_DEVICE_MISMATCH",
+  });
+  assert.equal(secondRepository.listTranscriptSegments("session-1").length, 0);
 });
 
 test("the IPC adapter keeps verified WAV bytes local and uses auto language", async () => {
@@ -266,6 +301,70 @@ test("the IPC adapter keeps verified WAV bytes local and uses auto language", as
         language: null,
         initialPrompt: "中英 context",
       },
+    },
+  ]);
+});
+
+test("the IPC adapter maps CPU admission to explicit bounded Whisper options", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return { success: true, text: "local only", executionDevice: "cpu" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => Buffer.from("verified-local-wav"),
+  });
+
+  const result = await adapter({
+    path: "verified.wav",
+    language: null,
+    initialPrompt: "context",
+    executionContext: {
+      action: "run_cpu",
+      device: "cpu",
+      cpuThreads: 4,
+      lowPriority: true,
+      selectedGpuUuid: null,
+    },
+  });
+
+  assert.equal(result.executionDevice, "cpu");
+  assert.deepEqual(calls, [
+    {
+      model: MODEL_VERSION,
+      language: null,
+      initialPrompt: "context",
+      useCuda: false,
+      requireCuda: false,
+      gpuUuid: null,
+      threads: 4,
+      lowPriority: true,
     },
   ]);
 });

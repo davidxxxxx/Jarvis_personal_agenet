@@ -2,6 +2,8 @@ const ProcessingJobRunner = require("./ProcessingJobRunner");
 const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
+const ResourceGovernor = require("./ResourceGovernor");
+const HeavyJobGate = require("./HeavyJobGate");
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
@@ -29,6 +31,8 @@ class JarvisProcessingRuntime {
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
     log = () => {},
+    governor = null,
+    whisperController = null,
   } = {}) {
     if (
       !runner ||
@@ -56,6 +60,16 @@ class JarvisProcessingRuntime {
       throw new TypeError("interval functions are required");
     }
     if (typeof log !== "function") throw new TypeError("log must be a function");
+    if (governor !== null && typeof governor.sample !== "function") {
+      throw new TypeError("governor.sample must be a function");
+    }
+    if (
+      whisperController !== null &&
+      (typeof whisperController.isIdle !== "function" ||
+        typeof whisperController.stop !== "function")
+    ) {
+      throw new TypeError("whisperController must implement isIdle and stop");
+    }
 
     this.runner = runner;
     this.repository = repository;
@@ -65,13 +79,13 @@ class JarvisProcessingRuntime {
     this.pollIntervalMs = positiveSafeInteger(pollIntervalMs, "pollIntervalMs");
     this.maxJobsPerDrain = positiveSafeInteger(maxJobsPerDrain, "maxJobsPerDrain");
     this.maxDrainMs = positiveSafeInteger(maxDrainMs, "maxDrainMs");
-    this.maxSessionsPerDrain = positiveSafeInteger(
-      maxSessionsPerDrain,
-      "maxSessionsPerDrain"
-    );
+    this.maxSessionsPerDrain = positiveSafeInteger(maxSessionsPerDrain, "maxSessionsPerDrain");
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
     this.log = log;
+    this.governor = governor;
+    this.whisperController = whisperController;
+    this.restrictiveReleaseLatched = false;
     this.timer = null;
     this.inFlight = null;
     this.startPromise = null;
@@ -115,11 +129,7 @@ class JarvisProcessingRuntime {
   }
 
   _hasDrainBudget(startedAt) {
-    return (
-      !this.stopping &&
-      this.running &&
-      this.now() - startedAt < this.maxDrainMs
-    );
+    return !this.stopping && this.running && this.now() - startedAt < this.maxDrainMs;
   }
 
   _sessionCursorFor(session) {
@@ -161,6 +171,29 @@ class JarvisProcessingRuntime {
     return processed;
   }
 
+  async _releaseIdleWhisperUnderPressure() {
+    if (!this.governor) return;
+    try {
+      const snapshot = await this.governor.sample();
+      if (snapshot?.state === "available") {
+        this.restrictiveReleaseLatched = false;
+        return;
+      }
+      if (
+        this.restrictiveReleaseLatched ||
+        !this.whisperController ||
+        (snapshot?.restrictiveForMs ?? 0) < 60_000 ||
+        !(await this.whisperController.isIdle())
+      ) {
+        return;
+      }
+      await this.whisperController.stop();
+      this.restrictiveReleaseLatched = true;
+    } catch (error) {
+      this.log({ phase: "resource_release", error });
+    }
+  }
+
   async _runSessionPhase(sessions, startedAt, limit, visited) {
     let inspected = 0;
     for (const session of sessions) {
@@ -188,6 +221,7 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    await this._releaseIdleWhisperUnderPressure();
     const sessionsFirst = this.sessionPhaseFirst;
     this.sessionPhaseFirst = !this.sessionPhaseFirst;
     const candidatesBefore = this._listProcessingWindow(this.maxSessionsPerDrain);
@@ -210,12 +244,8 @@ class JarvisProcessingRuntime {
       return processed;
     }
 
-    const candidatesAfter = this._listProcessingWindow(
-      this.maxSessionsPerDrain - inspected
-    );
-    const candidates = sessionsFirst
-      ? candidatesAfter
-      : [...candidatesBefore, ...candidatesAfter];
+    const candidatesAfter = this._listProcessingWindow(this.maxSessionsPerDrain - inspected);
+    const candidates = sessionsFirst ? candidatesAfter : [...candidatesBefore, ...candidatesAfter];
     await this._runSessionPhase(
       candidates,
       startedAt,
@@ -246,6 +276,13 @@ function createJarvisProcessingRuntime({
   owner = `jarvis-${process.pid}`,
   now = Date.now,
   log = () => {},
+  governor = null,
+  heavyGate = null,
+  telemetryProvider,
+  cpuProvider,
+  powerProvider,
+  previewEnabled = true,
+  whisperController = null,
   ...runtimeOptions
 } = {}) {
   if (!repository?.captureEvidenceStore) {
@@ -261,6 +298,44 @@ function createJarvisProcessingRuntime({
     throw new TypeError("configured Jarvis Whisper model is required");
   }
   const configuredModel = model.trim();
+  const whisperManager = ipcHandlers.whisperManager || null;
+  const cudaManager = ipcHandlers.whisperCudaManager || null;
+  const effectiveGovernor =
+    governor ??
+    new ResourceGovernor({
+      now,
+      ...(telemetryProvider ? { telemetryProvider } : {}),
+      ...(cpuProvider ? { cpuProvider } : {}),
+      ...(powerProvider ? { powerProvider } : {}),
+      previewEnabled,
+      ownedPidsProvider: () =>
+        [process.pid, whisperManager?.serverManager?.process?.pid].filter(
+          (pid) => Number.isSafeInteger(pid) && pid > 0
+        ),
+      cudaProvider: async () => {
+        const startOptions = cudaManager?.getVerifiedStartOptions?.() ?? {
+          useCuda: false,
+          gpuUuid: null,
+        };
+        const status = cudaManager?.getStatus?.({ gpuUuid: startOptions.gpuUuid }) ?? null;
+        return {
+          installed: status?.present === true || status?.downloaded === true,
+          verified: startOptions.useCuda === true && status?.verified === true,
+          quarantined: /quarantin/iu.test(status?.reason || ""),
+          gpuUuid: startOptions.useCuda ? startOptions.gpuUuid : null,
+          peakVramMb: status?.verification?.peakVramMb ?? null,
+        };
+      },
+    });
+  const effectiveGate = heavyGate ?? new HeavyJobGate();
+  const effectiveWhisperController =
+    whisperController ??
+    (whisperManager
+      ? {
+          isIdle: () => whisperManager._transcribing !== true,
+          stop: () => whisperManager.stopServer(),
+        }
+      : null);
   const worker = new JarvisTranscriptionWorker({
     repository,
     audioEvidenceReader: service.audioEvidenceReader,
@@ -272,9 +347,14 @@ function createJarvisProcessingRuntime({
     store: repository.captureEvidenceStore,
     owner,
     now,
+    governor: effectiveGovernor,
+    heavyGate: effectiveGate,
   });
-  runner.register("transcribe_chunk", (job) => worker.handle(job));
-  runner.register("compress_chunk", (job) => service.flacCompressionWorker.run(job));
+  runner.register("transcribe_chunk", (job, context) => worker.handle(job, context));
+  runner.register("compress_chunk", async (job) => {
+    await service.flacCompressionWorker.run(job);
+    return { executionDevice: "cpu" };
+  });
   return new JarvisProcessingRuntime({
     runner,
     repository,
@@ -282,6 +362,8 @@ function createJarvisProcessingRuntime({
     deduper: new DualTrackTranscriptDeduper({ repository }),
     now,
     log,
+    governor: effectiveGovernor,
+    whisperController: effectiveWhisperController,
     ...runtimeOptions,
   });
 }

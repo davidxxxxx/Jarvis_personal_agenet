@@ -1,8 +1,12 @@
-const TARGET_VERSION = 14;
+const TARGET_VERSION = 15;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
-  if (!new Set(["transcript_segments", "transcript_segments_v13", "transcript_segments_v14"]).has(tableName)) {
+  if (
+    !new Set(["transcript_segments", "transcript_segments_v13", "transcript_segments_v14"]).has(
+      tableName
+    )
+  ) {
     throw new TypeError("unsupported transcript segment table name");
   }
   return `
@@ -257,6 +261,10 @@ const PROCESSING_JOBS_SCHEMA = `
     lease_owner TEXT,
     lease_expires_at INTEGER,
     error_code TEXT,
+    blocked_reason TEXT,
+    execution_device TEXT CHECK(
+      execution_device IS NULL OR execution_device IN ('cuda','cpu','cloud')
+    ),
     created_at INTEGER NOT NULL,
     completed_at INTEGER
   );
@@ -336,9 +344,7 @@ function addColumn(db, table, definition) {
 
 function tableExists(db, table) {
   return Boolean(
-    db
-      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-      .get(table)
+    db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
   );
 }
 
@@ -537,34 +543,34 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       const migratedAt = now();
       db.exec(MIGRATION_BASE_SCHEMA);
 
-    addColumn(db, "sessions", "capture_mode TEXT NOT NULL DEFAULT 'mic'");
-    // Existing sessions were captured continuously. Keep that historical meaning while
-    // repository-created sessions explicitly opt into the new speech-triggered default.
-    addColumn(db, "sessions", "retention_mode TEXT NOT NULL DEFAULT 'continuous'");
-    addColumn(
-      db,
-      "sessions",
-      `capture_policy_json TEXT NOT NULL DEFAULT '{"schemaVersion":1,"preRollMs":2000,"postRollMs":3000,"mergeGapMs":3000}'`
-    );
-    addColumn(db, "sessions", "processing_state TEXT NOT NULL DEFAULT 'pending'");
-    addColumn(db, "sessions", "timeline_version INTEGER NOT NULL DEFAULT 1");
-    addColumn(db, "sessions", "finalized_at INTEGER");
-    addColumn(db, "sessions", "ready_at INTEGER");
-    addColumn(db, "sessions", "stop_reason TEXT");
-    addColumn(db, "sessions", "durable_boundary_at INTEGER");
-    addColumn(db, "audio_chunks", "track_id TEXT");
-    addColumn(db, "audio_chunks", "source_type TEXT NOT NULL DEFAULT 'mic'");
-    addColumn(db, "audio_chunks", "sequence_number INTEGER NOT NULL DEFAULT 0");
-    addColumn(db, "audio_chunks", "write_state TEXT NOT NULL DEFAULT 'committed'");
-    addColumn(db, "audio_chunks", "deleted_at INTEGER");
-    addColumn(db, "audio_chunks", "format TEXT NOT NULL DEFAULT 'wav'");
-    addColumn(db, "audio_chunks", "file_sha256 TEXT");
-    addColumn(db, "audio_chunks", "sample_rate INTEGER NOT NULL DEFAULT 24000");
-    addColumn(db, "audio_chunks", "channels INTEGER NOT NULL DEFAULT 1");
-    addColumn(db, "audio_chunks", "retired_path TEXT");
-    addColumn(db, "audio_chunks", "retired_format TEXT");
-    addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
-    db.exec(`
+      addColumn(db, "sessions", "capture_mode TEXT NOT NULL DEFAULT 'mic'");
+      // Existing sessions were captured continuously. Keep that historical meaning while
+      // repository-created sessions explicitly opt into the new speech-triggered default.
+      addColumn(db, "sessions", "retention_mode TEXT NOT NULL DEFAULT 'continuous'");
+      addColumn(
+        db,
+        "sessions",
+        `capture_policy_json TEXT NOT NULL DEFAULT '{"schemaVersion":1,"preRollMs":2000,"postRollMs":3000,"mergeGapMs":3000}'`
+      );
+      addColumn(db, "sessions", "processing_state TEXT NOT NULL DEFAULT 'pending'");
+      addColumn(db, "sessions", "timeline_version INTEGER NOT NULL DEFAULT 1");
+      addColumn(db, "sessions", "finalized_at INTEGER");
+      addColumn(db, "sessions", "ready_at INTEGER");
+      addColumn(db, "sessions", "stop_reason TEXT");
+      addColumn(db, "sessions", "durable_boundary_at INTEGER");
+      addColumn(db, "audio_chunks", "track_id TEXT");
+      addColumn(db, "audio_chunks", "source_type TEXT NOT NULL DEFAULT 'mic'");
+      addColumn(db, "audio_chunks", "sequence_number INTEGER NOT NULL DEFAULT 0");
+      addColumn(db, "audio_chunks", "write_state TEXT NOT NULL DEFAULT 'committed'");
+      addColumn(db, "audio_chunks", "deleted_at INTEGER");
+      addColumn(db, "audio_chunks", "format TEXT NOT NULL DEFAULT 'wav'");
+      addColumn(db, "audio_chunks", "file_sha256 TEXT");
+      addColumn(db, "audio_chunks", "sample_rate INTEGER NOT NULL DEFAULT 24000");
+      addColumn(db, "audio_chunks", "channels INTEGER NOT NULL DEFAULT 1");
+      addColumn(db, "audio_chunks", "retired_path TEXT");
+      addColumn(db, "audio_chunks", "retired_format TEXT");
+      addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
+      db.exec(`
       CREATE TABLE IF NOT EXISTS audio_tracks (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -593,31 +599,51 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
-    if (fromVersion < 13) {
-      rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
-    }
-    rebuildTranscriptSegmentsV14(db);
-    addColumn(db, "audio_gaps", "restored_device_id TEXT");
-    addColumn(db, "audio_gaps", "restored_device_label TEXT");
-    addColumn(db, "audio_gaps", "restored_strategy TEXT");
-    addColumn(db, "audio_gaps", "average_level REAL");
-    addColumn(db, "audio_gaps", "peak_level REAL");
-    db.exec(PROCESSING_JOBS_SCHEMA);
-    rebuildLegacyProcessingJobs(db);
-    deduplicateCompressionJobs(db);
-    db.exec(`
+      if (fromVersion < 13) {
+        rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
+      }
+      rebuildTranscriptSegmentsV14(db);
+      addColumn(db, "audio_gaps", "restored_device_id TEXT");
+      addColumn(db, "audio_gaps", "restored_device_label TEXT");
+      addColumn(db, "audio_gaps", "restored_strategy TEXT");
+      addColumn(db, "audio_gaps", "average_level REAL");
+      addColumn(db, "audio_gaps", "peak_level REAL");
+      db.exec(PROCESSING_JOBS_SCHEMA);
+      rebuildLegacyProcessingJobs(db);
+      deduplicateCompressionJobs(db);
+      addColumn(db, "processing_jobs", "blocked_reason TEXT");
+      addColumn(
+        db,
+        "processing_jobs",
+        "execution_device TEXT CHECK(execution_device IS NULL OR execution_device IN ('cuda','cpu','cloud'))"
+      );
+      if (fromVersion < 15) {
+        db.exec(`
+        UPDATE processing_jobs
+        SET priority = CASE
+          WHEN state = 'retention_urgent' THEN 0
+          WHEN state = 'storage_recovery_compress' THEN 10
+          WHEN job_type = 'preview_transcription' THEN 20
+          WHEN job_type = 'transcribe_chunk' THEN 30
+          WHEN job_type = 'speaker' THEN 40
+          WHEN job_type = 'analyze_session' THEN 50
+          ELSE 60
+        END;
+      `);
+      }
+      db.exec(`
       DROP INDEX IF EXISTS idx_processing_jobs_chunk_input;
       DROP INDEX IF EXISTS idx_processing_jobs_compress_identity;
     `);
-    db.exec(PROCESSING_JOBS_INDEXES);
-    db.prepare(
-      `INSERT OR IGNORE INTO processing_jobs (
-        id, session_id, track_id, chunk_id, job_type, state,
+      db.exec(PROCESSING_JOBS_INDEXES);
+      db.prepare(
+        `INSERT OR IGNORE INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
         input_hash, input_version, model_version, created_at
       )
       SELECT
         'job_compress_' || lower(hex(randomblob(16))),
-        session_id, track_id, id, 'compress_chunk', 'pending',
+        session_id, track_id, id, 'compress_chunk', 'pending', 60,
         sha256, 1, ?, ?
       FROM audio_chunks
       WHERE deleted_at IS NULL
@@ -630,14 +656,14 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         AND duration_ms > 0
         AND sample_rate = 24000
         AND channels = 1`
-    ).run(FLAC_ENCODER_VERSION, migratedAt, migratedAt);
-    if (fromVersion === 10) {
-      db.exec(`
+      ).run(FLAC_ENCODER_VERSION, migratedAt, migratedAt);
+      if (fromVersion === 10) {
+        db.exec(`
         DROP INDEX IF EXISTS idx_storage_usage_events_time;
         ALTER TABLE storage_usage_events RENAME TO storage_usage_events_v10;
       `);
-    }
-    db.exec(`
+      }
+      db.exec(`
       CREATE TABLE IF NOT EXISTS storage_usage_events (
         kind TEXT NOT NULL CHECK(kind IN (
           'wav_written','flac_written','retired_deleted','retention_deleted'
@@ -653,15 +679,15 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         PRIMARY KEY(kind, chunk_id)
       );
     `);
-    if (fromVersion === 10) {
-      db.exec(`
+      if (fromVersion === 10) {
+        db.exec(`
         INSERT INTO storage_usage_events (kind, chunk_id, bytes, delta_bytes, occurred_at)
         SELECT kind, chunk_id, bytes, bytes, occurred_at
         FROM storage_usage_events_v10;
         DROP TABLE storage_usage_events_v10;
       `);
-    }
-    db.exec(`
+      }
+      db.exec(`
       CREATE INDEX IF NOT EXISTS idx_storage_usage_events_time
       ON storage_usage_events(occurred_at, kind);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_chunks_track_sequence

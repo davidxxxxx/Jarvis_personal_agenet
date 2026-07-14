@@ -1,5 +1,6 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
+const os = require("os");
 const path = require("path");
 const debugLogger = require("./debugLogger");
 const {
@@ -38,14 +39,24 @@ function shouldRewarmOnWake({ isRemote, useCuda, modelName, transcribing, rewarm
   return !isRemote && !!useCuda && !!modelName && !transcribing && !rewarmInFlight;
 }
 
+function executionDeviceError() {
+  const error = new Error("EXECUTION_DEVICE_MISMATCH");
+  error.code = "EXECUTION_DEVICE_MISMATCH";
+  return error;
+}
+
 class WhisperManager {
-  constructor() {
+  constructor({
+    serverManager = new WhisperServerManager(),
+    setProcessPriority = os.setPriority,
+  } = {}) {
     this.cachedFFmpegPath = null;
     this.currentDownloadProcess = null;
     this.ffmpegAvailabilityCache = { result: null, expiresAt: 0 };
     this.isInitialized = false;
     // Server manager for HTTP-based transcription
-    this.serverManager = new WhisperServerManager();
+    this.serverManager = serverManager;
+    this.setProcessPriority = setProcessPriority;
     this.currentServerModel = null;
     this.cachedVadModelPath = undefined;
     this._transcribing = false;
@@ -329,6 +340,11 @@ class WhisperManager {
     return await this.transcribeViaServer(audioBlob, model, language, initialPrompt, {
       vadEnabled,
       vadConfig,
+      ...(typeof options.useCuda === "boolean" ? { useCuda: options.useCuda } : {}),
+      ...(options.gpuUuid !== undefined ? { gpuUuid: options.gpuUuid } : {}),
+      ...(options.requireCuda !== undefined ? { requireCuda: options.requireCuda } : {}),
+      ...(options.threads !== undefined ? { threads: options.threads } : {}),
+      ...(options.lowPriority !== undefined ? { lowPriority: options.lowPriority } : {}),
     });
   }
 
@@ -352,15 +368,39 @@ class WhisperManager {
       debugLogger.warn("VAD requested but ggml-silero model not found; running without VAD");
     }
 
+    const governedDevice = typeof options.useCuda === "boolean";
+    const useCuda = governedDevice ? options.useCuda : this.serverManager.useCuda === true;
+    const gpuUuid = useCuda
+      ? (options.gpuUuid ??
+        this.serverManager.selectedGpuUuid ??
+        this.serverManager.lastStartOptions?.gpuUuid ??
+        null)
+      : null;
     await this.serverManager.start(modelPath, {
-      useCuda: this.serverManager.useCuda,
-      gpuUuid: this.serverManager.useCuda
-        ? this.serverManager.selectedGpuUuid || this.serverManager.lastStartOptions?.gpuUuid || null
-        : null,
+      useCuda,
+      gpuUuid,
+      requireCuda: options.requireCuda === true,
+      ...(options.threads !== undefined ? { threads: options.threads } : {}),
       vadEnabled,
       vadModelPath,
       vadConfig: options.vadConfig || null,
     });
+    if (!useCuda && options.lowPriority === true) {
+      const pid = this.serverManager.process?.pid;
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw executionDeviceError();
+      this.setProcessPriority(pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
+    }
+    let executionDevice = null;
+    if (governedDevice) {
+      const proof = this.serverManager.getCudaProofEvidence?.();
+      if (
+        (useCuda && (proof?.backend !== "cuda" || proof?.gpuUuid !== gpuUuid)) ||
+        (!useCuda && proof?.backend !== "cpu")
+      ) {
+        throw executionDeviceError();
+      }
+      executionDevice = useCuda ? "cuda" : "cpu";
+    }
     this.currentServerModel = model;
 
     // Convert audioBlob to Buffer if needed
@@ -399,7 +439,8 @@ class WhisperManager {
       resultKeys: Object.keys(result),
     });
 
-    return this.parseWhisperResult(result);
+    const parsed = this.parseWhisperResult(result);
+    return executionDevice ? { ...parsed, executionDevice } : parsed;
   }
 
   async transcribeViaLan(audioBlob, url, options = {}) {

@@ -10,6 +10,33 @@ function normalizeErrorCode(error) {
   return typeof code === "string" && ERROR_CODE_PATTERN.test(code) ? code : "JOB_FAILED";
 }
 
+function codedError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function defaultJobKind(job) {
+  const queuedState = job.claimed_from_state ?? job.state;
+  if (
+    queuedState === "retention_urgent" ||
+    (job.job_type === "transcribe_chunk" && job.priority === 0)
+  ) {
+    return "retention_urgent";
+  }
+  if (
+    queuedState === "storage_recovery_compress" ||
+    (job.job_type === "compress_chunk" && job.priority === 10)
+  ) {
+    return "storage_recovery_compress";
+  }
+  if (job.job_type === "transcribe_chunk") return "final_transcription";
+  if (job.job_type === "preview_transcription") return "preview";
+  if (job.job_type === "speaker") return "speaker";
+  if (job.job_type === "analyze_session") return "analysis";
+  return "maintenance";
+}
+
 class ProcessingJobRunner {
   constructor({
     store,
@@ -18,6 +45,9 @@ class ProcessingJobRunner {
     leaseMs = 60_000,
     retryBaseMs = 1_000,
     retryMaxMs = 60_000,
+    governor = null,
+    heavyGate = null,
+    classifyJob = defaultJobKind,
   } = {}) {
     const requiredMethods = [
       "claimJobs",
@@ -42,6 +72,18 @@ class ProcessingJobRunner {
     if (!Number.isSafeInteger(retryMaxMs) || retryMaxMs < retryBaseMs) {
       throw new RangeError("retryMaxMs must be a safe integer at least retryBaseMs");
     }
+    if (governor !== null) {
+      if (typeof governor.sample !== "function" || typeof governor.admit !== "function") {
+        throw new TypeError("governor must implement sample and admit");
+      }
+      if (typeof store.deferJob !== "function") {
+        throw new TypeError("store.deferJob is required with resource governance");
+      }
+      if (!heavyGate || typeof heavyGate.run !== "function") {
+        throw new TypeError("heavyGate.run is required with resource governance");
+      }
+    }
+    if (typeof classifyJob !== "function") throw new TypeError("classifyJob must be a function");
 
     this.store = store;
     this.owner = owner;
@@ -49,6 +91,9 @@ class ProcessingJobRunner {
     this.leaseMs = leaseMs;
     this.retryBaseMs = retryBaseMs;
     this.retryMaxMs = retryMaxMs;
+    this.governor = governor;
+    this.heavyGate = heavyGate;
+    this.classifyJob = classifyJob;
     this.handlers = new Map();
   }
 
@@ -85,9 +130,48 @@ class ProcessingJobRunner {
       return 1;
     }
 
+    let context = null;
+    let kind = null;
+    if (this.governor) {
+      kind = this.classifyJob(job);
+      let snapshot;
+      let admission;
+      try {
+        snapshot = await this.governor.sample();
+        admission = this.governor.admit(kind, snapshot);
+      } catch {
+        admission = { action: "defer", reason: "telemetry_unavailable" };
+      }
+      if (["defer", "pause_preview"].includes(admission.action)) {
+        this.store.deferJob(job.id, {
+          owner: this.owner,
+          at: this.now(),
+          reason: admission.reason,
+        });
+        return 1;
+      }
+      const device = admission.action === "run_cuda" ? "cuda" : "cpu";
+      context = {
+        action: admission.action,
+        device,
+        cpuThreads: device === "cpu" ? 4 : null,
+        lowPriority: device === "cpu",
+        selectedGpuUuid: device === "cuda" ? snapshot.selectedGpuUuid : null,
+      };
+    }
+
     try {
-      await handler(job);
-      this.store.completeJob(job.id, { owner: this.owner, at: this.now() });
+      const invoke = () => handler(job, context);
+      const result = this.heavyGate ? await this.heavyGate.run(kind, invoke) : await invoke();
+      const executionDevice = context ? result?.executionDevice : null;
+      if (context && executionDevice !== context.device) {
+        throw codedError("EXECUTION_DEVICE_MISMATCH");
+      }
+      this.store.completeJob(job.id, {
+        owner: this.owner,
+        at: this.now(),
+        executionDevice,
+      });
     } catch (error) {
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();

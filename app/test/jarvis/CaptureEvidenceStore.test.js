@@ -54,7 +54,8 @@ function chunk(overrides = {}) {
 }
 
 function seedProcessingJob(db, overrides = {}) {
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO processing_jobs (
       id, session_id, job_type, state, priority,
       input_hash, input_version, model_version, attempt_count,
@@ -66,7 +67,8 @@ function seedProcessingJob(db, overrides = {}) {
       @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
       @createdAt, @completedAt
     )
-  `).run({
+  `
+  ).run({
     id: "lease-job",
     jobType: "transcribe_chunk",
     state: "pending",
@@ -178,7 +180,10 @@ test("rolls back gap closure when restoration track is missing", (t) => {
     /track missing/i
   );
   assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
-  assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "recovering");
+  assert.equal(
+    db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state,
+    "recovering"
+  );
 });
 
 test("interrupt transition rolls back track and gap when its session status write fails", (t) => {
@@ -353,7 +358,10 @@ test("rejects invalid and stale interruption evidence without mutation", (t) => 
     /active/i
   );
   assert.equal(db.prepare("SELECT count(*) count FROM audio_gaps").get().count, 1);
-  assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "recovering");
+  assert.equal(
+    db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state,
+    "recovering"
+  );
 });
 
 test("rejects invalid and stale restoration evidence without mutation", (t) => {
@@ -384,7 +392,10 @@ test("rejects invalid and stale restoration evidence without mutation", (t) => {
     );
   }
   assert.equal(db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, null);
-  assert.equal(db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state, "recovering");
+  assert.equal(
+    db.prepare("SELECT state FROM audio_tracks WHERE id='t1'").get().state,
+    "recovering"
+  );
 
   store.restoreTrack({ trackId: "t1", gapId: "g1", endedAt: 30, recoveryAttempts: 1 });
   assert.throws(
@@ -433,21 +444,15 @@ test("restoration target state defaults active and accepts only active or paused
 
   assert.equal(active.targetState, "active");
   assert.equal(paused.targetState, "paused");
-  assert.deepEqual(
-    db.prepare("SELECT id, state, ended_at FROM audio_tracks ORDER BY id").all(),
-    [
-      { id: "t1", state: "recovering", ended_at: 32 },
-      { id: "t2", state: "paused", ended_at: 31 },
-    ]
-  );
-  assert.deepEqual(
-    db.prepare("SELECT id, ended_at FROM audio_gaps ORDER BY id").all(),
-    [
-      { id: "g1", ended_at: 30 },
-      { id: "g2", ended_at: 31 },
-      { id: "g3", ended_at: null },
-    ]
-  );
+  assert.deepEqual(db.prepare("SELECT id, state, ended_at FROM audio_tracks ORDER BY id").all(), [
+    { id: "t1", state: "recovering", ended_at: 32 },
+    { id: "t2", state: "paused", ended_at: 31 },
+  ]);
+  assert.deepEqual(db.prepare("SELECT id, ended_at FROM audio_gaps ORDER BY id").all(), [
+    { id: "g1", ended_at: 30 },
+    { id: "g2", ended_at: 31 },
+    { id: "g3", ended_at: null },
+  ]);
 });
 
 test("finalizes gaps tracks and session atomically", (t) => {
@@ -508,13 +513,10 @@ test("finalization requires every session track and derives every open gap", (t)
     /every session track/i
   );
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
-  assert.deepEqual(
-    db.prepare("SELECT id, state FROM audio_tracks ORDER BY id").all(),
-    [
-      { id: "t1", state: "recovering" },
-      { id: "t2", state: "active" },
-    ]
-  );
+  assert.deepEqual(db.prepare("SELECT id, state FROM audio_tracks ORDER BY id").all(), [
+    { id: "t1", state: "recovering" },
+    { id: "t2", state: "active" },
+  ]);
 
   store.finalizeCapture({
     sessionId: "s1",
@@ -526,8 +528,13 @@ test("finalization requires every session track and derives every open gap", (t)
     sessionStatus: "failed",
     at: 30,
   });
-  assert.equal(db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get().count, 0);
-  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "failed" }]);
+  assert.equal(
+    db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get().count,
+    0
+  );
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
+    { state: "failed" },
+  ]);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "failed");
 });
 
@@ -556,7 +563,9 @@ test("pauses every active track and the session atomically", (t) => {
       }),
     /second track pause blocked/i
   );
-  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "active" }]);
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
+    { state: "active" },
+  ]);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
 });
 
@@ -598,7 +607,9 @@ test("pause requires exact ownership coverage chronology and current states", (t
       }),
     /session startedAt/i
   );
-  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "active" }]);
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
+    { state: "active" },
+  ]);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
 });
 
@@ -635,7 +646,9 @@ test("resume rolls back all track activations when session persistence fails", (
       }),
     /session resume blocked/i
   );
-  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [{ state: "paused" }]);
+  assert.deepEqual(db.prepare("SELECT DISTINCT state FROM audio_tracks").all(), [
+    { state: "paused" },
+  ]);
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "paused");
 });
 
@@ -954,7 +967,7 @@ test("commits a chunk and one transcription job atomically", (t) => {
   assert.deepEqual(
     db
       .prepare(
-        "SELECT session_id, track_id, chunk_id, job_type, state, input_hash, created_at FROM processing_jobs"
+        "SELECT session_id, track_id, chunk_id, job_type, state, priority, input_hash, created_at FROM processing_jobs"
       )
       .get(),
     {
@@ -963,6 +976,7 @@ test("commits a chunk and one transcription job atomically", (t) => {
       chunk_id: "c1",
       job_type: "transcribe_chunk",
       state: "pending",
+      priority: 30,
       input_hash: "abc",
       created_at: 100,
     }
@@ -1120,10 +1134,7 @@ test("rejects a chunk that starts before its persisted track or session", (t) =>
   createTrack(store);
 
   assert.throws(
-    () =>
-      store.commitChunk(
-        chunk({ startedAt: 9, endedAt: 19, durationMs: 10, expiresAt: 30 })
-      ),
+    () => store.commitChunk(chunk({ startedAt: 9, endedAt: 19, durationMs: 10, expiresAt: 30 })),
     /before.*track or session/i
   );
   assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
@@ -1137,10 +1148,7 @@ test("rejects a chunk that ends after its persisted track or session", (t) => {
   db.prepare("UPDATE sessions SET status='completed', ended_at=20 WHERE id='s1'").run();
 
   assert.throws(
-    () =>
-      store.commitChunk(
-        chunk({ startedAt: 20, endedAt: 21, durationMs: 1, expiresAt: 30 })
-      ),
+    () => store.commitChunk(chunk({ startedAt: 20, endedAt: 21, durationMs: 1, expiresAt: 30 })),
     /after.*track or session/i
   );
   assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
@@ -1172,10 +1180,7 @@ test("rejects invalid chunk duration and retention deadlines", (t) => {
   createTrack(store);
   const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
 
-  assert.throws(
-    () => store.commitChunk(chunk({ endedAt: 10, durationMs: 0 })),
-    /positive/i
-  );
+  assert.throws(() => store.commitChunk(chunk({ endedAt: 10, durationMs: 0 })), /positive/i);
   assert.throws(
     () =>
       store.commitChunk(
@@ -1183,10 +1188,7 @@ test("rejects invalid chunk duration and retention deadlines", (t) => {
       ),
     /60000/i
   );
-  assert.throws(
-    () => store.commitChunk(chunk({ expiresAt: 20 + sevenDaysMs + 1 })),
-    /seven days/i
-  );
+  assert.throws(() => store.commitChunk(chunk({ expiresAt: 20 + sevenDaysMs + 1 })), /seven days/i);
   assert.equal(db.prepare("SELECT count(*) count FROM audio_chunks").get().count, 0);
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 0);
 });
@@ -1222,9 +1224,7 @@ test("tombstones multiple chunks once while retaining evidence metadata", (t) =>
   const { store, db } = fixture(t);
   createTrack(store);
   store.commitChunk(chunk());
-  store.commitChunk(
-    chunk({ id: "c2", sequenceNumber: 1, path: "c2.wav", sha256: "def" })
-  );
+  store.commitChunk(chunk({ id: "c2", sequenceNumber: 1, path: "c2.wav", sha256: "def" }));
 
   assert.equal(store.tombstoneChunk("c1", 200).changes, 1);
   assert.equal(store.tombstoneChunk("c2", 201).changes, 1);
@@ -1285,7 +1285,9 @@ test("tombstoning atomically expires unfinished chunk jobs without rewriting ter
        FROM processing_jobs ORDER BY chunk_id`
     )
     .all();
-  for (const row of jobs.filter((job) => ["c-pending", "c-retry", "c-running"].includes(job.chunk_id))) {
+  for (const row of jobs.filter((job) =>
+    ["c-pending", "c-retry", "c-running"].includes(job.chunk_id)
+  )) {
     assert.equal(row.state, "audio_expired_before_processing");
     assert.equal(row.error_code, "audio_expired_before_processing");
     assert.equal(row.completed_at, 200);
@@ -1326,17 +1328,19 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
       })
     );
   });
-  db.prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 50 WHERE chunk_id = 'c2'").run();
+  db.prepare(
+    "UPDATE processing_jobs SET state = 'completed', completed_at = 50 WHERE chunk_id = 'c2'"
+  ).run();
 
   assert.equal(store.promoteSoonExpiringAudioJobs(100, 200), 1);
   assert.equal(store.promoteSoonExpiringAudioJobs(100, 200), 0);
   assert.deepEqual(
     db.prepare("SELECT chunk_id, state, priority FROM processing_jobs ORDER BY chunk_id").all(),
     [
-      { chunk_id: "c0", state: "pending", priority: 0 },
+      { chunk_id: "c0", state: "pending", priority: 30 },
       { chunk_id: "c1", state: "retention_urgent", priority: 0 },
-      { chunk_id: "c2", state: "completed", priority: 0 },
-      { chunk_id: "c3", state: "pending", priority: 0 },
+      { chunk_id: "c2", state: "completed", priority: 30 },
+      { chunk_id: "c3", state: "pending", priority: 30 },
     ]
   );
 });
@@ -1354,6 +1358,20 @@ test("records idempotent signed storage growth and deletion telemetry in evidenc
   const job = db
     .prepare("SELECT id FROM processing_jobs WHERE chunk_id = 'c1' AND job_type = 'compress_chunk'")
     .get();
+  assert.deepEqual(
+    db
+      .prepare(
+        `
+      SELECT job_type, priority
+      FROM processing_jobs WHERE chunk_id = 'c1' ORDER BY job_type
+    `
+      )
+      .all(),
+    [
+      { job_type: "compress_chunk", priority: 60 },
+      { job_type: "transcribe_chunk", priority: 30 },
+    ]
+  );
 
   store.promoteChunkToFlac({
     chunkId: "c1",
@@ -1368,12 +1386,30 @@ test("records idempotent signed storage growth and deletion telemetry in evidenc
     channels: 1,
     completedAt: 200,
   });
-  db.prepare(`
+  assert.deepEqual(
+    db
+      .prepare(
+        `
+      SELECT state, blocked_reason, error_code, execution_device
+      FROM processing_jobs WHERE id = ?
+    `
+      )
+      .get(job.id),
+    {
+      state: "completed",
+      blocked_reason: null,
+      error_code: null,
+      execution_device: "cpu",
+    }
+  );
+  db.prepare(
+    `
     UPDATE audio_chunks
     SET retired_path = 'c1.wav', retired_format = 'wav',
         retired_file_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     WHERE id = 'c1'
-  `).run();
+  `
+  ).run();
   const retiredIdentity = {
     chunkId: "c1",
     retiredPath: "c1.wav",
@@ -1386,10 +1422,14 @@ test("records idempotent signed storage growth and deletion telemetry in evidenc
   assert.equal(store.tombstoneChunk("c1", 203, { storageDeleted: true }).changes, 0);
 
   assert.deepEqual(
-    db.prepare(`
+    db
+      .prepare(
+        `
       SELECT kind, chunk_id, bytes, delta_bytes, occurred_at
       FROM storage_usage_events ORDER BY occurred_at
-    `).all(),
+    `
+      )
+      .all(),
     [
       { kind: "wav_written", chunk_id: "c1", bytes: 144, delta_bytes: 144, occurred_at: 20 },
       { kind: "flac_written", chunk_id: "c1", bytes: 40, delta_bytes: 40, occurred_at: 200 },
@@ -1428,7 +1468,10 @@ test("rolls back a tombstone when unfinished job termination fails", (t) => {
     path: "c1.wav",
     deleted_at: null,
   });
-  assert.equal(db.prepare("SELECT state FROM processing_jobs WHERE chunk_id = 'c1'").get().state, "pending");
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE chunk_id = 'c1'").get().state,
+    "pending"
+  );
 });
 
 test("JarvisRepository delegates the complete capture evidence interface", () => {
@@ -1539,12 +1582,10 @@ test("claims eligible jobs atomically in deterministic order without stealing le
 
   const claimed = store.claimJobs({ owner: "worker-b", at: 500, leaseMs: 100, limit: 4 });
 
-  assert.deepEqual(claimed.map((job) => job.id), [
-    "job-urgent",
-    "job-compress",
-    "job-a",
-    "job-b",
-  ]);
+  assert.deepEqual(
+    claimed.map((job) => job.id),
+    ["job-urgent", "job-compress", "job-a", "job-b"]
+  );
   for (const job of claimed) {
     assert.equal(job.state, "running");
     assert.equal(job.attempt_count, 1);
@@ -1552,10 +1593,14 @@ test("claims eligible jobs atomically in deterministic order without stealing le
     assert.equal(job.lease_expires_at, 600);
   }
   assert.deepEqual(
-    db.prepare(`
+    db
+      .prepare(
+        `
       SELECT id, state, lease_owner, lease_expires_at
       FROM processing_jobs WHERE id IN ('job-current', 'job-later') ORDER BY id
-    `).all(),
+    `
+      )
+      .all(),
     [
       { id: "job-current", state: "running", lease_owner: "worker-a", lease_expires_at: 501 },
       { id: "job-later", state: "retry", lease_owner: null, lease_expires_at: null },
@@ -1581,10 +1626,14 @@ test("rolls back every claim when a later lease update fails", (t) => {
     /second claim rejected/i
   );
   assert.deepEqual(
-    db.prepare(`
+    db
+      .prepare(
+        `
       SELECT id, state, attempt_count, lease_owner, lease_expires_at
       FROM processing_jobs ORDER BY id
-    `).all(),
+    `
+      )
+      .all(),
     [
       {
         id: "job-a",
@@ -1649,10 +1698,14 @@ test("rejects stale lease owners and keeps terminal transitions idempotent", (t)
     false
   );
   assert.deepEqual(
-    db.prepare(`
+    db
+      .prepare(
+        `
       SELECT state, completed_at, lease_owner, lease_expires_at, error_code
       FROM processing_jobs WHERE id = 'lease-job'
-    `).get(),
+    `
+      )
+      .get(),
     {
       state: "completed",
       completed_at: 230,
@@ -1660,6 +1713,63 @@ test("rejects stale lease owners and keeps terminal transitions idempotent", (t)
       lease_expires_at: null,
       error_code: null,
     }
+  );
+});
+
+test("resource deferral releases the lease without consuming an attempt or retaining an error", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    state: "retry",
+    attemptCount: 2,
+    nextRetryAt: 400,
+    errorCode: "PRIOR_FAILURE",
+  });
+  const before = db
+    .prepare(
+      `SELECT input_hash, input_version, model_version, priority FROM processing_jobs WHERE id = ?`
+    )
+    .get("lease-job");
+  const [claimed] = store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 1 });
+  assert.equal(claimed.attempt_count, 3);
+
+  assert.equal(
+    store.deferJob("lease-job", {
+      owner: "worker-a",
+      at: 510,
+      reason: "external_gpu_busy",
+    }),
+    true
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `
+      SELECT state, attempt_count, next_retry_at, blocked_reason, error_code,
+             lease_owner, lease_expires_at, completed_at,
+             input_hash, input_version, model_version, priority
+      FROM processing_jobs WHERE id = 'lease-job'
+    `
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 2,
+      next_retry_at: 15_510,
+      blocked_reason: "external_gpu_busy",
+      error_code: null,
+      lease_owner: null,
+      lease_expires_at: null,
+      completed_at: null,
+      ...before,
+    }
+  );
+  assert.equal(
+    store.deferJob("lease-job", {
+      owner: "worker-a",
+      at: 511,
+      reason: "external_gpu_busy",
+    }),
+    false
   );
 });
 

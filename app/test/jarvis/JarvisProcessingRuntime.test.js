@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
+const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
@@ -18,92 +19,115 @@ function deferred() {
   return { promise, resolve };
 }
 
-function insertSession(repository, {
-  id = "s1",
-  status = "completed",
-  processingState = "processing",
-  captureMode = "mic",
-  endedAt = 1_000,
-} = {}) {
-  repository.db.prepare(`
+function insertSession(
+  repository,
+  {
+    id = "s1",
+    status = "completed",
+    processingState = "processing",
+    captureMode = "mic",
+    endedAt = 1_000,
+  } = {}
+) {
+  repository.db
+    .prepare(
+      `
     INSERT INTO sessions (
       id, started_at, ended_at, status, language, created_at,
       capture_mode, processing_state, finalized_at
     ) VALUES (?, 100, ?, ?, 'zh', 100, ?, ?, ?)
-  `).run(id, endedAt, status, captureMode, processingState, endedAt);
+  `
+    )
+    .run(id, endedAt, status, captureMode, processingState, endedAt);
 }
 
-function insertTrack(repository, {
-  id = "track-mic",
-  sessionId = "s1",
-  sourceType = "mic",
-  endedAt = 1_000,
-} = {}) {
-  repository.db.prepare(`
+function insertTrack(
+  repository,
+  { id = "track-mic", sessionId = "s1", sourceType = "mic", endedAt = 1_000 } = {}
+) {
+  repository.db
+    .prepare(
+      `
     INSERT INTO audio_tracks (
       id, session_id, source_type, sample_rate, channels,
       started_at, ended_at, state
     ) VALUES (?, ?, ?, 24000, 1, 100, ?, 'completed')
-  `).run(id, sessionId, sourceType, endedAt);
+  `
+    )
+    .run(id, sessionId, sourceType, endedAt);
 }
 
-function insertChunk(repository, {
-  id = "chunk-mic",
-  sessionId = "s1",
-  trackId = "track-mic",
-  sourceType = "mic",
-  startedAt = 100,
-  endedAt = 500,
-  transcriptionStatus = "pending",
-} = {}) {
-  repository.db.prepare(`
+function insertChunk(
+  repository,
+  {
+    id = "chunk-mic",
+    sessionId = "s1",
+    trackId = "track-mic",
+    sourceType = "mic",
+    startedAt = 100,
+    endedAt = 500,
+    transcriptionStatus = "pending",
+  } = {}
+) {
+  repository.db
+    .prepare(
+      `
     INSERT INTO audio_chunks (
       id, session_id, track_id, source_type, sequence_number, path,
       started_at, ended_at, duration_ms, sha256, expires_at,
       transcription_status, write_state, format, sample_rate, channels
     ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 999999,
       ?, 'committed', 'wav', 24000, 1)
-  `).run(
-    id,
-    sessionId,
-    trackId,
-    sourceType,
-    `${sessionId}-${id}.wav`,
-    startedAt,
-    endedAt,
-    endedAt - startedAt,
-    id.padEnd(64, "0").slice(0, 64),
-    transcriptionStatus
-  );
+  `
+    )
+    .run(
+      id,
+      sessionId,
+      trackId,
+      sourceType,
+      `${sessionId}-${id}.wav`,
+      startedAt,
+      endedAt,
+      endedAt - startedAt,
+      id.padEnd(64, "0").slice(0, 64),
+      transcriptionStatus
+    );
 }
 
-function insertJob(repository, {
-  id = "job-mic",
-  sessionId = "s1",
-  trackId = "track-mic",
-  chunkId = "chunk-mic",
-  state = "pending",
-  completedAt = null,
-  leaseOwner = null,
-  leaseExpiresAt = null,
-} = {}) {
-  repository.db.prepare(`
+function insertJob(
+  repository,
+  {
+    id = "job-mic",
+    sessionId = "s1",
+    trackId = "track-mic",
+    chunkId = "chunk-mic",
+    state = "pending",
+    completedAt = null,
+    leaseOwner = null,
+    leaseExpiresAt = null,
+  } = {}
+) {
+  repository.db
+    .prepare(
+      `
     INSERT INTO processing_jobs (
       id, session_id, track_id, chunk_id, job_type, state,
-      input_hash, input_version, model_version, attempt_count,
+      priority, input_hash, input_version, model_version, attempt_count,
       lease_owner, lease_expires_at, created_at, completed_at
-    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, ?, 1, '', 0, ?, ?, 100, ?)
-  `).run(
-    id,
-    sessionId,
-    trackId,
-    chunkId,
-    state,
-    chunkId.padEnd(64, "0").slice(0, 64),
-    leaseOwner,
-    leaseExpiresAt,
-    completedAt
-  );
+    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, 30, ?, 1, '', 0, ?, ?, 100, ?)
+  `
+    )
+    .run(
+      id,
+      sessionId,
+      trackId,
+      chunkId,
+      state,
+      chunkId.padEnd(64, "0").slice(0, 64),
+      leaseOwner,
+      leaseExpiresAt,
+      completedAt
+    );
 }
 
 function insertFinalCoverage(repository, chunkId, completedAt = 700) {
@@ -189,12 +213,20 @@ test("open sessions and every incomplete transcription job state stay non-ready"
       leaseOwner: state === "running" ? "old-worker" : null,
       leaseExpiresAt: state === "running" ? 9_000 : null,
     });
-    assert.equal(repository.refreshSessionReadiness(`s-${state}`, 2_000).processing_state, "processing");
+    assert.equal(
+      repository.refreshSessionReadiness(`s-${state}`, 2_000).processing_state,
+      "processing"
+    );
     repository.close();
   }
 
   const open = new JarvisRepository(":memory:");
-  insertSession(open, { id: "open", status: "recording", endedAt: null, processingState: "pending" });
+  insertSession(open, {
+    id: "open",
+    status: "recording",
+    endedAt: null,
+    processingState: "pending",
+  });
   assert.notEqual(open.refreshSessionReadiness("open", 2_000).processing_state, "ready");
   open.close();
 });
@@ -245,8 +277,14 @@ test("dual-track readiness waits for terminal coverage on both sources", (t) => 
   });
 
   assert.equal(repository.refreshSessionReadiness("s1", 700).processing_state, "processing");
-  repository.db.prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'chunk-system'").run();
-  repository.db.prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 701 WHERE id = 'job-system'").run();
+  repository.db
+    .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'chunk-system'")
+    .run();
+  repository.db
+    .prepare(
+      "UPDATE processing_jobs SET state = 'completed', completed_at = 701 WHERE id = 'job-system'"
+    )
+    .run();
   assert.equal(repository.refreshSessionReadiness("s1", 701).processing_state, "ready");
 });
 
@@ -391,17 +429,35 @@ test("production composition binds transcribe and compression handlers to curren
   insertTrack(repository);
   insertChunk(repository);
   insertJob(repository);
-  repository.db.prepare(`
+  repository.db
+    .prepare(
+      `
     INSERT INTO processing_jobs (
       id, session_id, track_id, chunk_id, job_type, state,
-      input_hash, input_version, model_version, created_at
+      input_hash, input_version, model_version, priority, created_at
     ) VALUES (
       'compress-job', 's1', 'track-mic', 'chunk-mic', 'compress_chunk', 'pending',
-      ?, 1, 'flac-v1', 101
+      ?, 1, 'flac-v1', 60, 101
     )
-  `).run("chunk-mic".padEnd(64, "0").slice(0, 64));
+  `
+    )
+    .run("chunk-mic".padEnd(64, "0").slice(0, 64));
 
   const calls = [];
+  const admissions = [];
+  const governor = {
+    sample: async () => ({
+      state: "available",
+      selectedGpuUuid: "GPU-verified",
+      restrictiveForMs: 0,
+    }),
+    admit: (kind) => {
+      admissions.push(kind);
+      return kind === "final_transcription"
+        ? { action: "run_cuda", reason: "resources_available" }
+        : { action: "run_cpu", reason: "resources_available" };
+    },
+  };
   const service = {
     audioEvidenceReader: {
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
@@ -413,9 +469,9 @@ test("production composition binds transcribe and compression handlers to curren
   const ipcHandlers = {
     createJarvisTranscribeWavAdapter: ({ model }) => {
       calls.push(`model:${model}`);
-      return async () => {
+      return async ({ executionContext }) => {
         calls.push("transcribe");
-        return { noSpeech: true };
+        return { noSpeech: true, executionDevice: executionContext.device };
       };
     },
   };
@@ -426,11 +482,62 @@ test("production composition binds transcribe and compression handlers to curren
     model: "large-v3-turbo",
     owner: "production-worker",
     now: () => 2_000,
+    governor,
+    heavyGate: new HeavyJobGate(),
   });
 
   assert.equal(await runtime.drainOnce(), 2);
   assert.deepEqual(calls, ["model:large-v3-turbo", "transcribe", "compress:compress-job"]);
+  assert.deepEqual(admissions, ["final_transcription", "maintenance"]);
+  assert.deepEqual(
+    repository.db.prepare("SELECT id, execution_device FROM processing_jobs ORDER BY id").all(),
+    [
+      { id: "compress-job", execution_device: "cpu" },
+      { id: "job-mic", execution_device: "cuda" },
+    ]
+  );
   assert.equal(repository.getSession("s1").processing_state, "ready");
+});
+
+test("sustained restrictive state releases only an idle Whisper server once per episode", async () => {
+  let snapshot = { state: "constrained", restrictiveForMs: 59_999 };
+  let idle = true;
+  let stops = 0;
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: { dedupe: () => {} },
+    governor: { sample: async () => snapshot },
+    whisperController: {
+      isIdle: () => idle,
+      stop: async () => {
+        stops += 1;
+      },
+    },
+  });
+
+  await runtime.drainOnce();
+  assert.equal(stops, 0);
+  snapshot = { state: "constrained", restrictiveForMs: 60_000 };
+  idle = false;
+  await runtime.drainOnce();
+  assert.equal(stops, 0);
+  idle = true;
+  await runtime.drainOnce();
+  assert.equal(stops, 1);
+  snapshot = { state: "busy", restrictiveForMs: 75_000 };
+  await runtime.drainOnce();
+  assert.equal(stops, 1);
+  snapshot = { state: "available", restrictiveForMs: 0 };
+  await runtime.drainOnce();
+  snapshot = { state: "constrained", restrictiveForMs: 60_000 };
+  await runtime.drainOnce();
+  assert.equal(stops, 2);
 });
 
 test("stop reached during the first handler prevents every later claim in the same drain", async () => {
@@ -571,9 +678,8 @@ test("post-processing shares the drain deadline and does not start another sessi
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository: {
       listProcessingSessions: ({ after = null, limit = sessions.length } = {}) => {
-        const start = after === null
-          ? 0
-          : sessions.findIndex((session) => session.id === after.id) + 1;
+        const start =
+          after === null ? 0 : sessions.findIndex((session) => session.id === after.id) + 1;
         return sessions.slice(start, start + limit);
       },
       isSessionReadyForPostProcessing: () => true,
@@ -603,9 +709,8 @@ test("session post-processing cap rotates a stable backlog without starvation", 
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository: {
       listProcessingSessions: ({ after = null, limit = sessions.length } = {}) => {
-        const start = after === null
-          ? 0
-          : sessions.findIndex((session) => session.id === after.id) + 1;
+        const start =
+          after === null ? 0 : sessions.findIndex((session) => session.id === after.id) + 1;
         return sessions.slice(start, start + limit);
       },
       isSessionReadyForPostProcessing: () => true,
@@ -764,7 +869,9 @@ test("bounded processing-session pages rotate past blocked backlog to an eligibl
     state: "completed",
     completedAt: 700,
   });
-  repository.db.prepare(`
+  repository.db
+    .prepare(
+      `
     INSERT INTO processing_jobs (
       id, session_id, track_id, chunk_id, job_type, state,
       input_hash, input_version, model_version, created_at
@@ -772,7 +879,9 @@ test("bounded processing-session pages rotate past blocked backlog to an eligibl
       'compress-eligible', 's99-eligible', 'track-eligible', 'chunk-eligible',
       'compress_chunk', 'retry', ?, 1, 'flac-v1', 101
     )
-  `).run("chunk-eligible".padEnd(64, "0").slice(0, 64));
+  `
+    )
+    .run("chunk-eligible".padEnd(64, "0").slice(0, 64));
 
   const queries = [];
   const listProcessingSessions = repository.listProcessingSessions.bind(repository);

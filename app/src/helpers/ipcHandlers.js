@@ -99,7 +99,12 @@ function createJarvisTranscribeWavAdapter({
   }
   if (typeof readFile !== "function") throw new TypeError("readFile must be a function");
   const configuredModel = model.trim();
-  return async ({ path: verifiedWavPath, language = null, initialPrompt = "" }) => {
+  return async ({
+    path: verifiedWavPath,
+    language = null,
+    initialPrompt = "",
+    executionContext = null,
+  }) => {
     if (typeof verifiedWavPath !== "string" || !verifiedWavPath) {
       throw new TypeError("verified WAV path is required");
     }
@@ -108,10 +113,21 @@ function createJarvisTranscribeWavAdapter({
       .slice(-JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT)
       .join("");
     const wav = await readFile(verifiedWavPath);
+    const resourceOptions = executionContext
+      ? {
+          useCuda: executionContext.device === "cuda",
+          requireCuda: executionContext.device === "cuda",
+          gpuUuid:
+            executionContext.device === "cuda" ? executionContext.selectedGpuUuid || null : null,
+          threads: executionContext.device === "cpu" ? 4 : undefined,
+          lowPriority: executionContext.device === "cpu",
+        }
+      : {};
     return whisperManager.transcribeLocalWhisper(wav, {
       model: configuredModel,
       language: null,
       initialPrompt: boundedPrompt || null,
+      ...resourceOptions,
     });
   };
 }

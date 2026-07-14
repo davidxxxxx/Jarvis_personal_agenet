@@ -109,6 +109,60 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
   }
 });
 
+test("v15 adds nullable resource deferral and execution device metadata without rewriting jobs", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('s1', 10, 'recording', 10);
+      INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash, input_version,
+        model_version, attempt_count, created_at
+      ) VALUES ('j1', 's1', 'transcribe_chunk', 'retry', 30, 'hash', 2, 'model', 3, 20);
+      ALTER TABLE processing_jobs DROP COLUMN blocked_reason;
+      ALTER TABLE processing_jobs DROP COLUMN execution_device;
+      PRAGMA user_version = 14;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 200 }), {
+      fromVersion: 14,
+      toVersion: TARGET_VERSION,
+    });
+    assert.equal(TARGET_VERSION, 15);
+    assert.ok(columnNames(db, "processing_jobs").includes("blocked_reason"));
+    assert.ok(columnNames(db, "processing_jobs").includes("execution_device"));
+    assert.deepEqual(
+      db
+        .prepare(
+          `
+        SELECT id, state, priority, input_hash, input_version, model_version,
+               attempt_count, blocked_reason, execution_device
+        FROM processing_jobs WHERE id = 'j1'
+      `
+        )
+        .get(),
+      {
+        id: "j1",
+        state: "retry",
+        priority: 30,
+        input_hash: "hash",
+        input_version: 2,
+        model_version: "model",
+        attempt_count: 3,
+        blocked_reason: null,
+        execution_device: null,
+      }
+    );
+    db.prepare("UPDATE processing_jobs SET execution_device = 'cuda' WHERE id = 'j1'").run();
+    assert.throws(() =>
+      db.prepare("UPDATE processing_jobs SET execution_device = 'metal' WHERE id = 'j1'").run()
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("preserves legacy sessions and chunks while backfilling evidence defaults", () => {
   const db = new Database(":memory:");
 
@@ -672,10 +726,14 @@ test("upgrades v10 storage telemetry to signed deltas without losing existing wr
       toVersion: TARGET_VERSION,
     });
     assert.deepEqual(
-      db.prepare(`
+      db
+        .prepare(
+          `
         SELECT kind, bytes, delta_bytes, occurred_at
         FROM storage_usage_events ORDER BY occurred_at
-      `).all(),
+      `
+        )
+        .all(),
       [
         { kind: "wav_written", bytes: 144, delta_bytes: 144, occurred_at: 20 },
         { kind: "flac_written", bytes: 40, delta_bytes: 40, occurred_at: 30 },
@@ -683,11 +741,15 @@ test("upgrades v10 storage telemetry to signed deltas without losing existing wr
     );
     assert.throws(
       () =>
-        db.prepare(`
+        db
+          .prepare(
+            `
           INSERT INTO storage_usage_events
             (kind, chunk_id, bytes, delta_bytes, occurred_at)
           VALUES ('retention_deleted', 'c1', 40, 40, 40)
-        `).run(),
+        `
+          )
+          .run(),
       /check constraint/i
     );
   } finally {
@@ -741,11 +803,15 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
       toVersion: TARGET_VERSION,
     });
     assert.deepEqual(
-      db.prepare(`
+      db
+        .prepare(
+          `
         SELECT track_id, chunk_id, source_type, result_kind, version,
                model_version, completed_at, superseded_by
         FROM transcript_segments WHERE id = 'legacy'
-      `).get(),
+      `
+        )
+        .get(),
       {
         track_id: null,
         chunk_id: null,
@@ -766,9 +832,11 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
         )
     );
     assert.deepEqual(
-      db.prepare(
-        "SELECT confidence, is_stable, result_kind FROM transcript_segments WHERE id = 'legacy-invalid'"
-      ).get(),
+      db
+        .prepare(
+          "SELECT confidence, is_stable, result_kind FROM transcript_segments WHERE id = 'legacy-invalid'"
+        )
+        .get(),
       { confidence: null, is_stable: 0, result_kind: "provisional" }
     );
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
@@ -778,12 +846,15 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
       db.prepare("SELECT sql FROM sqlite_master WHERE name = 'segment_links'").get().sql,
       /transcript_segments_v11/
     );
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO audio_tracks (
         id, session_id, source_type, sample_rate, channels, started_at, state
       ) VALUES ('lineage-track', 's1', 'system', 24000, 1, 10, 'ended')
-    `).run();
-    db.prepare(`
+    `
+    ).run();
+    db.prepare(
+      `
       INSERT INTO audio_chunks (
         id, session_id, track_id, source_type, sequence_number, path,
         started_at, ended_at, duration_ms, sha256, expires_at
@@ -791,9 +862,12 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
         'lineage-chunk', 's1', 'lineage-track', 'system', 0, 'lineage.wav',
         10, 20, 10, 'pcm-hash', 100
       )
-    `).run();
+    `
+    ).run();
     const insert = (overrides = {}) =>
-      db.prepare(`
+      db
+        .prepare(
+          `
         INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, speaker_label, text,
           confidence, is_stable, track_id, chunk_id, source_type,
@@ -803,19 +877,21 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
           @trackId, @chunkId, @sourceType, @resultKind, @version,
           @modelVersion, @completedAt
         )
-      `).run({
-        id: "migrated-row",
-        confidence: 0.5,
-        isStable: 1,
-        trackId: "lineage-track",
-        chunkId: "lineage-chunk",
-        sourceType: "system",
-        resultKind: "final",
-        version: 1,
-        modelVersion: "large-v3-turbo",
-        completedAt: 30,
-        ...overrides,
-      });
+      `
+        )
+        .run({
+          id: "migrated-row",
+          confidence: 0.5,
+          isStable: 1,
+          trackId: "lineage-track",
+          chunkId: "lineage-chunk",
+          sourceType: "system",
+          resultKind: "final",
+          version: 1,
+          modelVersion: "large-v3-turbo",
+          completedAt: 30,
+          ...overrides,
+        });
 
     for (const [name, overrides] of [
       ["source", { sourceType: "cloud" }],
@@ -960,34 +1036,38 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
     `);
 
     assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 12, toVersion: TARGET_VERSION });
-    assert.deepEqual(db.prepare("SELECT * FROM transcript_segments WHERE id = ?").get("v12-final"), {
-      id: "v12-final",
-      session_id: "v12-session",
-      started_at: 100,
-      ended_at: 200,
-      person_id: "person-1",
-      speaker_label: "Alice",
-      text: "preserve exact final",
-      confidence: 0.87,
-      is_stable: 1,
-      analysis_state: "ready",
-      track_id: "v12-track",
-      chunk_id: "v12-chunk",
-      source_type: "system",
-      result_kind: "final",
-      version: 7,
-      model_version: "large-v3-turbo-v7",
-      completed_at: 250,
-      superseded_by: null,
-      echo_score: null,
-      duplicate_of: null,
-    });
+    assert.deepEqual(
+      db.prepare("SELECT * FROM transcript_segments WHERE id = ?").get("v12-final"),
+      {
+        id: "v12-final",
+        session_id: "v12-session",
+        started_at: 100,
+        ended_at: 200,
+        person_id: "person-1",
+        speaker_label: "Alice",
+        text: "preserve exact final",
+        confidence: 0.87,
+        is_stable: 1,
+        analysis_state: "ready",
+        track_id: "v12-track",
+        chunk_id: "v12-chunk",
+        source_type: "system",
+        result_kind: "final",
+        version: 7,
+        model_version: "large-v3-turbo-v7",
+        completed_at: 250,
+        superseded_by: null,
+        echo_score: null,
+        duplicate_of: null,
+      }
+    );
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
       { id: "evidence-1", segment_id: "v12-final" },
     ]);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
 
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO transcript_segments (
         id, session_id, started_at, ended_at, speaker_label, text,
         confidence, is_stable, track_id, source_type, superseded_by
@@ -995,7 +1075,8 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
         'migrated-preview', 'v12-session', 120, 180, 'system', 'preview',
         0.5, 1, 'v12-track', 'system', 'v12-final'
       )
-    `).run();
+    `
+    ).run();
     assert.throws(
       () =>
         db
@@ -1128,10 +1209,14 @@ test("v14 preserves v13 transcript lineage and dependent foreign keys exactly", 
 
     assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 13, toVersion: TARGET_VERSION });
     assert.deepEqual(
-      db.prepare(`
+      db
+        .prepare(
+          `
         SELECT id, superseded_by, echo_score, duplicate_of
         FROM transcript_segments ORDER BY id
-      `).all(),
+      `
+        )
+        .all(),
       [
         { id: "v13-final", superseded_by: null, echo_score: null, duplicate_of: null },
         {

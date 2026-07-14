@@ -67,7 +67,7 @@ class JarvisTranscriptionWorker {
     this.now = now;
   }
 
-  async handle(job) {
+  async handle(job, executionContext = null) {
     const chunkId = job?.chunk_id;
     let chunk;
     try {
@@ -98,6 +98,7 @@ class JarvisTranscriptionWorker {
           path: verifiedPath,
           language: null,
           initialPrompt,
+          executionContext,
         });
       });
     } catch (error) {
@@ -106,13 +107,17 @@ class JarvisTranscriptionWorker {
       }
       if (
         error?.code === "TRANSCRIPTION_FAILED" ||
-        error?.code === "TRANSCRIPTION_INVALID_RESULT"
+        error?.code === "TRANSCRIPTION_INVALID_RESULT" ||
+        error?.code === "EXECUTION_DEVICE_MISMATCH"
       ) {
         throw error;
       }
       throw codedError("TRANSCRIPTION_FAILED");
     }
 
+    if (executionContext && rawResult?.executionDevice !== executionContext.device) {
+      throw codedError("EXECUTION_DEVICE_MISMATCH");
+    }
     const result = normalizeResult(rawResult);
     this.repository.commitChunkTranscript({
       chunk,
@@ -120,6 +125,7 @@ class JarvisTranscriptionWorker {
       modelVersion: this.modelVersion,
       completedAt: this.now(),
     });
+    return executionContext ? { executionDevice: rawResult.executionDevice } : undefined;
   }
 }
 

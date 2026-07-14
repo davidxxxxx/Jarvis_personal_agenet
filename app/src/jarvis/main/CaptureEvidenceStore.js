@@ -133,10 +133,10 @@ class CaptureEvidenceStore {
       insertTranscriptionJob: db.prepare(`
         INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
-          input_hash, input_version, model_version, created_at
+          priority, input_hash, input_version, model_version, created_at
         ) VALUES (
           @id, @sessionId, @trackId, @chunkId,
-          'transcribe_chunk', 'pending', @inputHash, @inputVersion, @modelVersion, @createdAt
+          'transcribe_chunk', 'pending', 30, @inputHash, @inputVersion, @modelVersion, @createdAt
         )
       `),
       getTranscriptionJobByInput: db.prepare(`
@@ -150,10 +150,10 @@ class CaptureEvidenceStore {
       insertCompressionJob: db.prepare(`
         INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
-          input_hash, input_version, model_version, created_at
+          priority, input_hash, input_version, model_version, created_at
         ) VALUES (
           @id, @sessionId, @trackId, @chunkId,
-          'compress_chunk', 'pending', @inputHash, 1, @modelVersion, @createdAt
+          'compress_chunk', 'pending', 60, @inputHash, 1, @modelVersion, @createdAt
         )
       `),
       getCompressionJobByInput: db.prepare(`
@@ -205,7 +205,7 @@ class CaptureEvidenceStore {
         UPDATE processing_jobs
         SET state = 'completed', completed_at = @completedAt,
             next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
-            error_code = NULL
+            error_code = NULL, blocked_reason = NULL, execution_device = 'cpu'
         WHERE id = @jobId
           AND job_type = 'compress_chunk'
           AND chunk_id = @chunkId
@@ -347,11 +347,15 @@ class CaptureEvidenceStore {
       `),
       listClaimableJobs: db.prepare(`
         SELECT * FROM processing_jobs
-        WHERE state IN ('pending', 'retry', 'retention_urgent')
+        WHERE state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
         ORDER BY
-          CASE state WHEN 'retention_urgent' THEN 0 ELSE 1 END ASC,
+          CASE state
+            WHEN 'retention_urgent' THEN 0
+            WHEN 'storage_recovery_compress' THEN 1
+            ELSE 2
+          END ASC,
           priority ASC,
           created_at ASC,
           id ASC
@@ -364,7 +368,7 @@ class CaptureEvidenceStore {
             lease_owner = @owner,
             lease_expires_at = @leaseExpiresAt
         WHERE id = @id
-          AND state IN ('pending', 'retry', 'retention_urgent')
+          AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
       `),
@@ -376,6 +380,8 @@ class CaptureEvidenceStore {
             lease_owner = NULL,
             lease_expires_at = NULL,
             error_code = 'LEASE_EXPIRED',
+            blocked_reason = NULL,
+            execution_device = NULL,
             completed_at = NULL
         WHERE state = 'running'
           AND completed_at IS NULL
@@ -389,7 +395,9 @@ class CaptureEvidenceStore {
             next_retry_at = NULL,
             lease_owner = NULL,
             lease_expires_at = NULL,
-            error_code = NULL
+            error_code = NULL,
+            blocked_reason = NULL,
+            execution_device = @executionDevice
         WHERE id = @id
           AND state = 'running'
           AND completed_at IS NULL
@@ -403,7 +411,26 @@ class CaptureEvidenceStore {
             next_retry_at = @nextRetryAt,
             lease_owner = NULL,
             lease_expires_at = NULL,
-            error_code = @errorCode
+            error_code = @errorCode,
+            blocked_reason = NULL,
+            execution_device = NULL
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
+      deferLeasedJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
+            completed_at = NULL,
+            next_retry_at = @nextRetryAt,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = NULL,
+            blocked_reason = @reason,
+            execution_device = NULL
         WHERE id = @id
           AND state = 'running'
           AND completed_at IS NULL
@@ -417,7 +444,9 @@ class CaptureEvidenceStore {
             next_retry_at = NULL,
             lease_owner = NULL,
             lease_expires_at = NULL,
-            error_code = @errorCode
+            error_code = @errorCode,
+            blocked_reason = NULL,
+            execution_device = NULL
         WHERE id = @id
           AND state = 'running'
           AND completed_at IS NULL
@@ -469,7 +498,10 @@ class CaptureEvidenceStore {
           leaseExpiresAt,
         });
         if (result.changes === 1) {
-          claimed.push(this.statements.getProcessingJob.get(candidate.id));
+          claimed.push({
+            ...this.statements.getProcessingJob.get(candidate.id),
+            claimed_from_state: candidate.state,
+          });
         }
       }
       return claimed;
@@ -994,9 +1026,12 @@ class CaptureEvidenceStore {
     return this.statements.recoverExpiredJobLeases.run({ at }).changes;
   }
 
-  completeJob(id, { owner, at }) {
+  completeJob(id, { owner, at, executionDevice = null }) {
     const input = this._assertJobLeaseTransition(id, { owner, at });
-    return this.statements.completeLeasedJob.run(input).changes === 1;
+    if (executionDevice !== null && !["cuda", "cpu", "cloud"].includes(executionDevice)) {
+      throw new TypeError("executionDevice must be cuda, cpu, cloud, or null");
+    }
+    return this.statements.completeLeasedJob.run({ ...input, executionDevice }).changes === 1;
   }
 
   retryJob(id, { owner, at, nextRetryAt = at, errorCode }) {
@@ -1005,6 +1040,14 @@ class CaptureEvidenceStore {
     this._assertNonNegativeSafeInteger(nextRetryAt, "nextRetryAt");
     if (nextRetryAt < at) throw new RangeError("nextRetryAt must not be before at");
     return this.statements.retryLeasedJob.run({ ...input, nextRetryAt, errorCode }).changes === 1;
+  }
+
+  deferJob(id, { owner, at, nextRetryAt = at + 15_000, reason }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    this._assertIdentifier(reason, "reason");
+    this._assertNonNegativeSafeInteger(nextRetryAt, "nextRetryAt");
+    if (nextRetryAt < at) throw new RangeError("nextRetryAt must not be before at");
+    return this.statements.deferLeasedJob.run({ ...input, nextRetryAt, reason }).changes === 1;
   }
 
   blockJob(id, { owner, at, errorCode }) {
