@@ -34,6 +34,12 @@
       "progress": "已複製 {{completed}} / {{total}} 個檔案",
       "error": "無法完成儲存資訊讀取或移轉。"
     },
+    "transcriptRecovery": {
+      "completed": "Transcript recovery completed",
+      "blocked": "Transcript recovery is blocked",
+      "pending": "Transcript recovery is pending",
+      "missingEvidence": "Verified audio evidence is missing"
+    },
     "today": "Today",
     "people": "People",
     "topics": "Topics",

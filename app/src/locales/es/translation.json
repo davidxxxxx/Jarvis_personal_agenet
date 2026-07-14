@@ -34,6 +34,12 @@
       "progress": "Copied {{completed}} of {{total}} files",
       "error": "Storage information or migration could not be completed."
     },
+    "transcriptRecovery": {
+      "completed": "Transcript recovery completed",
+      "blocked": "Transcript recovery is blocked",
+      "pending": "Transcript recovery is pending",
+      "missingEvidence": "Verified audio evidence is missing"
+    },
     "today": "Today",
     "people": "People",
     "topics": "Topics",

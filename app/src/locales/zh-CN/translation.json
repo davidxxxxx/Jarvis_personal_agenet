@@ -34,6 +34,12 @@
       "progress": "已复制 {{completed}} / {{total}} 个文件",
       "error": "无法完成存储信息读取或迁移。"
     },
+    "transcriptRecovery": {
+      "completed": "转写恢复完成",
+      "blocked": "转写恢复被阻止",
+      "pending": "等待转写恢复",
+      "missingEvidence": "找不到可验证的音频证据"
+    },
     "today": "今天",
     "people": "人物",
     "topics": "主题",
