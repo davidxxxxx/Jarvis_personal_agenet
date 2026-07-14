@@ -698,7 +698,9 @@ test("upgrades v10 storage telemetry to signed deltas without losing existing wr
 test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
   const db = new Database(":memory:");
   try {
+    db.pragma("foreign_keys = ON");
     db.exec(`
+      CREATE TABLE people (id TEXT PRIMARY KEY);
       CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
         started_at INTEGER NOT NULL,
@@ -723,6 +725,14 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
       INSERT INTO transcript_segments (
         id, session_id, started_at, ended_at, speaker_label, text, confidence, is_stable
       ) VALUES ('legacy', 's1', 10, 20, 'mic', 'legacy text', 0.5, 1);
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence, is_stable
+      ) VALUES ('legacy-invalid', 's1', 20, 30, 'mic', 'preserve safely', 2, 7);
+      CREATE TABLE segment_links (
+        id TEXT PRIMARY KEY,
+        segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE
+      );
+      INSERT INTO segment_links (id, segment_id) VALUES ('link-1', 'legacy');
       PRAGMA user_version = 11;
     `);
 
@@ -746,6 +756,83 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
         completed_at: null,
       }
     );
+    assert.deepEqual(
+      db.prepare(
+        "SELECT confidence, is_stable, result_kind FROM transcript_segments WHERE id = 'legacy-invalid'"
+      ).get(),
+      { confidence: null, is_stable: 0, result_kind: "provisional" }
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
+      { id: "link-1", segment_id: "legacy" },
+    ]);
+    assert.doesNotMatch(
+      db.prepare("SELECT sql FROM sqlite_master WHERE name = 'segment_links'").get().sql,
+      /transcript_segments_v11/
+    );
+    db.prepare(`
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, state
+      ) VALUES ('lineage-track', 's1', 'system', 24000, 1, 10, 'ended')
+    `).run();
+    db.prepare(`
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at
+      ) VALUES (
+        'lineage-chunk', 's1', 'lineage-track', 'system', 0, 'lineage.wav',
+        10, 20, 10, 'pcm-hash', 100
+      )
+    `).run();
+    const insert = (overrides = {}) =>
+      db.prepare(`
+        INSERT INTO transcript_segments (
+          id, session_id, started_at, ended_at, speaker_label, text,
+          confidence, is_stable, track_id, chunk_id, source_type,
+          result_kind, version, model_version, completed_at
+        ) VALUES (
+          @id, 's1', 10, 20, 'system', 'text', @confidence, @isStable,
+          @trackId, @chunkId, @sourceType, @resultKind, @version,
+          @modelVersion, @completedAt
+        )
+      `).run({
+        id: "migrated-row",
+        confidence: 0.5,
+        isStable: 1,
+        trackId: "lineage-track",
+        chunkId: "lineage-chunk",
+        sourceType: "system",
+        resultKind: "final",
+        version: 1,
+        modelVersion: "large-v3-turbo",
+        completedAt: 30,
+        ...overrides,
+      });
+
+    for (const [name, overrides] of [
+      ["source", { sourceType: "cloud" }],
+      ["kind", { resultKind: "draft" }],
+      ["version", { version: 0 }],
+      ["confidence", { confidence: -0.1 }],
+      ["stability", { isStable: 2 }],
+      ["track foreign key", { trackId: "missing" }],
+      ["chunk foreign key", { chunkId: "missing" }],
+      ["final completeness", { modelVersion: null }],
+    ]) {
+      assert.throws(() => insert({ id: `bad-${name}`, ...overrides }), undefined, name);
+    }
+    insert({
+      id: "migrated-provisional",
+      confidence: null,
+      isStable: 0,
+      trackId: null,
+      chunkId: null,
+      sourceType: "mic",
+      resultKind: "provisional",
+      modelVersion: null,
+      completedAt: null,
+    });
+    insert({ id: "migrated-final" });
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
     db.close();
   }

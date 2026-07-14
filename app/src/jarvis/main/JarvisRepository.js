@@ -8,7 +8,11 @@ const {
   normalizeCapturePolicy,
 } = require("../shared/captureModes");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
-const { applyJarvisMigrations } = require("./JarvisMigrations");
+const {
+  applyJarvisMigrations,
+  transcriptSegmentsSchema,
+  TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
+} = require("./JarvisMigrations");
 const { toPublicAudioChunk } = require("./AudioChunkPublicView");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
@@ -65,25 +69,7 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS transcript_segments (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER NOT NULL,
-    person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
-    speaker_label TEXT NOT NULL,
-    text TEXT NOT NULL,
-    confidence REAL NOT NULL,
-    is_stable INTEGER NOT NULL,
-    analysis_state TEXT NOT NULL DEFAULT 'pending',
-    track_id TEXT,
-    chunk_id TEXT,
-    source_type TEXT NOT NULL DEFAULT 'mic',
-    result_kind TEXT NOT NULL DEFAULT 'provisional',
-    version INTEGER NOT NULL DEFAULT 1,
-    model_version TEXT,
-    completed_at INTEGER
-  );
+  ${transcriptSegmentsSchema("transcript_segments", { ifNotExists: true })}
   CREATE TABLE IF NOT EXISTS cloud_budget_settings (
     provider TEXT PRIMARY KEY,
     monthly_limit_microusd INTEGER NOT NULL
@@ -200,11 +186,7 @@ const SCHEMA = `
   INSERT OR IGNORE INTO cloud_budget_settings (
     provider, monthly_limit_microusd, enabled, updated_at
   ) VALUES ('openai', 5000000, 0, 0);
-  CREATE INDEX IF NOT EXISTS idx_segments_session_time
-    ON transcript_segments(session_id, started_at);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
-    ON transcript_segments(chunk_id, model_version)
-    WHERE chunk_id IS NOT NULL AND result_kind = 'final';
+  ${TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS}
   CREATE INDEX IF NOT EXISTS idx_audio_expiry ON audio_chunks(expires_at);
   CREATE INDEX IF NOT EXISTS idx_cloud_usage_month ON cloud_usage(month_utc, provider, status);
   CREATE INDEX IF NOT EXISTS idx_analysis_session ON analysis_runs(session_id, window_end);
@@ -282,10 +264,11 @@ class JarvisRepository {
       if (dbPath !== ":memory:") {
         this.db.pragma("journal_mode = WAL");
       }
-      this.db.transaction(() => {
-        applyJarvisMigrations(this.db);
-        this.db.exec(SCHEMA);
-      })();
+      // Evidence migrations are independently transactional and may need to suspend
+      // FK enforcement before their transaction for SQLite's documented table-rebuild
+      // procedure. Keep repository-only schema initialization atomic in its own step.
+      applyJarvisMigrations(this.db);
+      this.db.transaction(() => this.db.exec(SCHEMA))();
       this._prepareStatements();
       this.captureEvidenceStore = new CaptureEvidenceStore(this.db, {
         createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,

@@ -6,6 +6,37 @@ const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds.ts");
 
+function insertTranscriptLineageRow(db, overrides = {}) {
+  db.prepare(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at
+    ) VALUES (
+      @id, @sessionId, @startedAt, @endedAt, NULL, @speakerLabel,
+      @text, @confidence, @isStable, 'pending', @trackId, @chunkId,
+      @sourceType, @resultKind, @version, @modelVersion, @completedAt
+    )
+  `).run({
+    id: "lineage-row",
+    sessionId: "lineage-session",
+    startedAt: 2_000,
+    endedAt: 3_000,
+    speakerLabel: "system",
+    text: "valid transcript",
+    confidence: 0.5,
+    isStable: 1,
+    trackId: "lineage-track",
+    chunkId: "lineage-chunk",
+    sourceType: "system",
+    resultKind: "final",
+    version: 1,
+    modelVersion: "large-v3-turbo",
+    completedAt: 4_000,
+    ...overrides,
+  });
+}
+
 test("persists the selected capture mode on session creation", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -802,6 +833,101 @@ test("analysis evidence must belong to the target session and rolls back as a un
   assert.equal(repo.getSessionDetail("s-analysis").summary, null);
   assert.equal(repo.listMemories().length, 0);
   repo.close();
+});
+
+test("fresh schema rejects hostile final transcript lineage at the SQL boundary", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "lineage-session",
+    startedAt: 1_000,
+    micDeviceId: null,
+    captureMode: "system",
+  });
+  repo.createTrack({
+    id: "lineage-track",
+    sessionId: "lineage-session",
+    sourceType: "system",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  repo.commitChunk({
+    id: "lineage-chunk",
+    sessionId: "lineage-session",
+    trackId: "lineage-track",
+    sourceType: "system",
+    sequenceNumber: 0,
+    path: "lineage.wav",
+    startedAt: 2_000,
+    endedAt: 3_000,
+    durationMs: 1_000,
+    sha256: "a".repeat(64),
+    expiresAt: 10_000,
+  });
+  repo.createSession({
+    id: "other-session",
+    startedAt: 1_000,
+    micDeviceId: null,
+    captureMode: "system",
+  });
+  repo.createTrack({
+    id: "other-track",
+    sessionId: "other-session",
+    sourceType: "system",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  repo.commitChunk({
+    id: "other-chunk",
+    sessionId: "other-session",
+    trackId: "other-track",
+    sourceType: "system",
+    sequenceNumber: 0,
+    path: "other.wav",
+    startedAt: 2_000,
+    endedAt: 3_000,
+    durationMs: 1_000,
+    sha256: "b".repeat(64),
+    expiresAt: 10_000,
+  });
+
+  for (const [name, overrides] of [
+    ["source type", { sourceType: "cloud" }],
+    ["result kind", { resultKind: "draft" }],
+    ["version", { version: 0 }],
+    ["confidence", { confidence: 1.1 }],
+    ["stable flag", { isStable: 2 }],
+    ["missing track", { trackId: null }],
+    ["unknown track", { trackId: "missing-track" }],
+    ["missing chunk", { chunkId: null }],
+    ["unknown chunk", { chunkId: "missing-chunk" }],
+    ["missing model", { modelVersion: null }],
+    ["missing completion", { completedAt: null }],
+    ["cross-session lineage", { trackId: "other-track", chunkId: "other-chunk" }],
+    ["mismatched chunk time", { startedAt: 2_001 }],
+  ]) {
+    assert.throws(
+      () => insertTranscriptLineageRow(repo.db, { id: `invalid-${name}`, ...overrides }),
+      undefined,
+      name
+    );
+  }
+
+  insertTranscriptLineageRow(repo.db, {
+    id: "valid-provisional",
+    confidence: null,
+    isStable: 0,
+    trackId: null,
+    chunkId: null,
+    sourceType: "mic",
+    resultKind: "provisional",
+    modelVersion: null,
+    completedAt: null,
+  });
+  insertTranscriptLineageRow(repo.db, { id: "valid-final" });
+  assert.equal(repo.db.prepare("SELECT count(*) count FROM transcript_segments").get().count, 2);
 });
 
 test("reopens the same repository object against a verified migrated database", (t) => {

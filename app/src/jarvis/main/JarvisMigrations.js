@@ -1,6 +1,103 @@
 const TARGET_VERSION = 12;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
+function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
+  if (!new Set(["transcript_segments", "transcript_segments_v12"]).has(tableName)) {
+    throw new TypeError("unsupported transcript segment table name");
+  }
+  return `
+    CREATE TABLE ${ifNotExists ? "IF NOT EXISTS " : ""}${tableName} (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER NOT NULL,
+      person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+      speaker_label TEXT NOT NULL,
+      text TEXT NOT NULL,
+      confidence REAL CHECK(
+        confidence IS NULL OR (
+          typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+        )
+      ),
+      is_stable INTEGER NOT NULL CHECK(
+        typeof(is_stable) = 'integer' AND is_stable IN (0,1)
+      ),
+      analysis_state TEXT NOT NULL DEFAULT 'pending',
+      track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+      chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL DEFAULT 'mic' CHECK(source_type IN ('mic','system')),
+      result_kind TEXT NOT NULL DEFAULT 'provisional'
+        CHECK(result_kind IN ('provisional','final')),
+      version INTEGER NOT NULL DEFAULT 1 CHECK(
+        typeof(version) = 'integer' AND version >= 1
+      ),
+      model_version TEXT,
+      completed_at INTEGER,
+      CHECK(
+        result_kind <> 'final' OR (
+          track_id IS NOT NULL AND
+          chunk_id IS NOT NULL AND
+          model_version IS NOT NULL AND
+          length(trim(model_version)) BETWEEN 1 AND 128 AND
+          typeof(completed_at) = 'integer' AND
+          is_stable = 1
+        )
+      )
+    );
+  `;
+}
+
+const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
+  CREATE INDEX IF NOT EXISTS idx_segments_session_time
+    ON transcript_segments(session_id, started_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
+    ON transcript_segments(chunk_id, model_version)
+    WHERE chunk_id IS NOT NULL AND result_kind = 'final';
+  CREATE TRIGGER IF NOT EXISTS validate_final_transcript_lineage_insert
+  BEFORE INSERT ON transcript_segments
+  WHEN NEW.result_kind = 'final'
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid final transcript lineage')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM audio_chunks AS chunk
+      JOIN audio_tracks AS track ON track.id = chunk.track_id
+      WHERE chunk.id = NEW.chunk_id
+        AND chunk.session_id = NEW.session_id
+        AND chunk.track_id = NEW.track_id
+        AND chunk.source_type = NEW.source_type
+        AND chunk.started_at = NEW.started_at
+        AND chunk.ended_at = NEW.ended_at
+        AND chunk.write_state = 'committed'
+        AND chunk.deleted_at IS NULL
+        AND track.session_id = NEW.session_id
+        AND track.source_type = NEW.source_type
+    );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_final_transcript_lineage_update
+  BEFORE UPDATE OF session_id, started_at, ended_at, track_id, chunk_id, source_type, result_kind
+  ON transcript_segments
+  WHEN NEW.result_kind = 'final'
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid final transcript lineage')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM audio_chunks AS chunk
+      JOIN audio_tracks AS track ON track.id = chunk.track_id
+      WHERE chunk.id = NEW.chunk_id
+        AND chunk.session_id = NEW.session_id
+        AND chunk.track_id = NEW.track_id
+        AND chunk.source_type = NEW.source_type
+        AND chunk.started_at = NEW.started_at
+        AND chunk.ended_at = NEW.ended_at
+        AND chunk.write_state = 'committed'
+        AND chunk.deleted_at IS NULL
+        AND track.session_id = NEW.session_id
+        AND track.source_type = NEW.source_type
+    );
+  END;
+`;
+
 const PROCESSING_JOBS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS processing_jobs (
     id TEXT PRIMARY KEY,
@@ -103,6 +200,52 @@ function tableExists(db, table) {
   );
 }
 
+function rebuildTranscriptSegmentsV12(db) {
+  if (!tableExists(db, "transcript_segments")) return;
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.exec(transcriptSegmentsSchema("transcript_segments_v12"));
+  db.exec(`
+    INSERT INTO transcript_segments_v12 (
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at
+    )
+    SELECT
+      id, session_id, started_at, ended_at,
+      CASE
+        WHEN person_id IS NULL OR EXISTS (SELECT 1 FROM people WHERE people.id = person_id)
+          THEN person_id
+        ELSE NULL
+      END,
+      speaker_label, text,
+      CASE
+        WHEN typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+          THEN confidence
+        ELSE NULL
+      END,
+      CASE WHEN typeof(is_stable) = 'integer' AND is_stable IN (0,1) THEN is_stable ELSE 0 END,
+      analysis_state, NULL, NULL, 'mic', 'provisional', 1, NULL, NULL
+    FROM transcript_segments;
+  `);
+  db.exec(`
+    DROP INDEX IF EXISTS idx_segments_session_time;
+    DROP INDEX IF EXISTS idx_transcript_chunk_model_final;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_insert;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_update;
+  `);
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      ALTER TABLE transcript_segments RENAME TO transcript_segments_v11;
+      ALTER TABLE transcript_segments_v12 RENAME TO transcript_segments;
+      DROP TABLE transcript_segments_v11;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
+}
+
 function rebuildLegacyProcessingJobs(db) {
   const sql = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs'")
@@ -175,9 +318,19 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     return { fromVersion, toVersion: fromVersion };
   }
 
-  db.transaction(() => {
-    const migratedAt = now();
-    db.exec(MIGRATION_BASE_SCHEMA);
+  const rebuildsTranscriptSegments = tableExists(db, "transcript_segments");
+  const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
+  if (rebuildsTranscriptSegments && db.inTransaction) {
+    throw new Error("transcript schema migration must own the outer transaction");
+  }
+  if (rebuildsTranscriptSegments && foreignKeysWereEnabled) {
+    db.pragma("foreign_keys = OFF");
+  }
+
+  try {
+    db.transaction(() => {
+      const migratedAt = now();
+      db.exec(MIGRATION_BASE_SCHEMA);
 
     addColumn(db, "sessions", "capture_mode TEXT NOT NULL DEFAULT 'mic'");
     // Existing sessions were captured continuously. Keep that historical meaning while
@@ -206,24 +359,6 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     addColumn(db, "audio_chunks", "retired_path TEXT");
     addColumn(db, "audio_chunks", "retired_format TEXT");
     addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
-    // JarvisRepository creates the legacy transcript table after evidence migrations
-    // on a fresh database. Existing databases already have it, so migrate those rows
-    // here while the repository schema below supplies the same columns for new installs.
-    if (tableExists(db, "transcript_segments")) {
-      addColumn(db, "transcript_segments", "track_id TEXT");
-      addColumn(db, "transcript_segments", "chunk_id TEXT");
-      addColumn(db, "transcript_segments", "source_type TEXT NOT NULL DEFAULT 'mic'");
-      addColumn(db, "transcript_segments", "result_kind TEXT NOT NULL DEFAULT 'provisional'");
-      addColumn(db, "transcript_segments", "version INTEGER NOT NULL DEFAULT 1");
-      addColumn(db, "transcript_segments", "model_version TEXT");
-      addColumn(db, "transcript_segments", "completed_at INTEGER");
-      db.exec(`
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
-        ON transcript_segments(chunk_id, model_version)
-        WHERE chunk_id IS NOT NULL AND result_kind = 'final';
-      `);
-    }
-
     db.exec(`
       CREATE TABLE IF NOT EXISTS audio_tracks (
         id TEXT PRIMARY KEY,
@@ -253,6 +388,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
+    rebuildTranscriptSegmentsV12(db);
     addColumn(db, "audio_gaps", "restored_device_id TEXT");
     addColumn(db, "audio_gaps", "restored_device_label TEXT");
     addColumn(db, "audio_gaps", "restored_strategy TEXT");
@@ -326,10 +462,27 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       ON audio_gaps(track_id, ended_at, started_at);
     `);
 
-    db.pragma(`user_version = ${TARGET_VERSION}`);
-  })();
+      if (rebuildsTranscriptSegments) {
+        const violations = db.pragma("foreign_key_check");
+        if (violations.length > 0) {
+          throw new Error("transcript schema migration would violate foreign keys");
+        }
+      }
+      db.pragma(`user_version = ${TARGET_VERSION}`);
+    })();
+  } finally {
+    if (rebuildsTranscriptSegments && foreignKeysWereEnabled) {
+      db.pragma("foreign_keys = ON");
+    }
+  }
 
   return { fromVersion, toVersion: TARGET_VERSION };
 }
 
-module.exports = { applyJarvisMigrations, TARGET_VERSION, FLAC_ENCODER_VERSION };
+module.exports = {
+  applyJarvisMigrations,
+  TARGET_VERSION,
+  FLAC_ENCODER_VERSION,
+  transcriptSegmentsSchema,
+  TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
+};
