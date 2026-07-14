@@ -674,9 +674,10 @@ describe("Jarvis recording controller", () => {
       {
         id: "s1__seg-1",
         startedAt: 1_250,
-        endedAt: 1_250,
+        endedAt: 1_251,
         personId: "self",
         speakerLabel: "Me",
+        sourceType: "mic",
         text: "Ship the capture foundation",
         confidence: 0.5,
         isStable: true,

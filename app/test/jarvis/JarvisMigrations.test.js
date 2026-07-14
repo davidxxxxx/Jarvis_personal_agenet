@@ -743,7 +743,7 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
     assert.deepEqual(
       db.prepare(`
         SELECT track_id, chunk_id, source_type, result_kind, version,
-               model_version, completed_at
+               model_version, completed_at, superseded_by
         FROM transcript_segments WHERE id = 'legacy'
       `).get(),
       {
@@ -754,7 +754,16 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
         version: 1,
         model_version: null,
         completed_at: null,
+        superseded_by: null,
       }
+    );
+    assert.ok(
+      db
+        .pragma("foreign_key_list(transcript_segments)")
+        .some(
+          (foreignKey) =>
+            foreignKey.from === "superseded_by" && foreignKey.table === "transcript_segments"
+        )
     );
     assert.deepEqual(
       db.prepare(

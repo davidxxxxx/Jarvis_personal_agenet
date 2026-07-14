@@ -98,6 +98,7 @@ export interface JarvisTranscriptSegmentInput {
   endedAt: number;
   personId: string | null;
   speakerLabel: string;
+  sourceType?: "mic" | "system";
   text: string;
   confidence: number;
   isStable: boolean;
@@ -114,6 +115,14 @@ export interface JarvisTranscriptSegment {
   confidence: number;
   is_stable: number;
   analysis_state: string;
+  track_id?: string | null;
+  chunk_id?: string | null;
+  source_type?: "mic" | "system";
+  result_kind?: "provisional" | "final";
+  version?: number;
+  model_version?: string | null;
+  completed_at?: number | null;
+  superseded_by?: string | null;
 }
 
 export interface JarvisRenamePersonInput {

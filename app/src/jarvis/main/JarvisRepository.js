@@ -324,14 +324,17 @@ class JarvisRepository {
           @id, @displayName, 0, @createdAt, @lastSeenAt
         )
       `),
-      getSegmentSession: this.db.prepare("SELECT session_id FROM transcript_segments WHERE id = ?"),
+      getSegmentSession: this.db.prepare(`
+        SELECT session_id, result_kind, chunk_id, model_version, superseded_by
+        FROM transcript_segments WHERE id = ?
+      `),
       upsertSegment: this.db.prepare(`
         INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, person_id, speaker_label,
-          text, confidence, is_stable
+          text, confidence, is_stable, track_id, source_type, result_kind, version
         ) VALUES (
           @id, @sessionId, @startedAt, @endedAt, @personId, @speakerLabel,
-          @text, @confidence, @isStable
+          @text, @confidence, @isStable, @trackId, @sourceType, 'provisional', 1
         )
         ON CONFLICT(id) DO UPDATE SET
           started_at = excluded.started_at,
@@ -340,18 +343,42 @@ class JarvisRepository {
           speaker_label = excluded.speaker_label,
           text = excluded.text,
           confidence = excluded.confidence,
-          is_stable = excluded.is_stable
+          is_stable = excluded.is_stable,
+          track_id = excluded.track_id,
+          source_type = excluded.source_type
+        WHERE transcript_segments.session_id = excluded.session_id
+          AND transcript_segments.result_kind = 'provisional'
+          AND transcript_segments.chunk_id IS NULL
+          AND transcript_segments.model_version IS NULL
+          AND transcript_segments.superseded_by IS NULL
       `),
       listSegments: this.db.prepare(`
+        SELECT * FROM transcript_segments
+        WHERE session_id = ? AND superseded_by IS NULL
+        ORDER BY started_at ASC, id ASC
+      `),
+      listTranscriptHistory: this.db.prepare(`
         SELECT * FROM transcript_segments
         WHERE session_id = ?
         ORDER BY started_at ASC, id ASC
       `),
+      getTranscriptSegment: this.db.prepare("SELECT * FROM transcript_segments WHERE id = ?"),
       listTranscriptPromptSegments: this.db.prepare(`
         SELECT text FROM transcript_segments
-        WHERE session_id = ? AND is_stable = 1 AND length(trim(text)) > 0
+        WHERE session_id = ?
+          AND superseded_by IS NULL
+          AND is_stable = 1
+          AND length(trim(text)) > 0
         ORDER BY ended_at DESC, id DESC
         LIMIT 16
+      `),
+      supersedeTranscriptSegment: this.db.prepare(`
+        UPDATE transcript_segments
+        SET superseded_by = @finalId
+        WHERE id = @provisionalId
+          AND session_id = @sessionId
+          AND result_kind = 'provisional'
+          AND superseded_by IS NULL
       `),
       getChunkForTranscriptCommit: this.db.prepare(`
         SELECT * FROM audio_chunks WHERE id = ?
@@ -565,6 +592,19 @@ class JarvisRepository {
         if (existing && existing.session_id !== sessionId) {
           throw new Error(SEGMENT_SESSION_MISMATCH_MESSAGE);
         }
+        const mutableSnapshotRow =
+          !existing ||
+          (existing.result_kind === "provisional" &&
+            existing.chunk_id === null &&
+            existing.model_version === null &&
+            existing.superseded_by === null);
+        if (!mutableSnapshotRow) continue;
+
+        const sourceType = segment.sourceType ?? "mic";
+        if (sourceType !== "mic" && sourceType !== "system") {
+          throw new TypeError("segment sourceType must be mic or system");
+        }
+        const sourceTrack = this.statements.getSessionSourceTrack.get(sessionId, sourceType);
 
         if (segment.personId !== null && segment.personId !== undefined) {
           const personId = assertId(segment.personId, "personId");
@@ -586,6 +626,8 @@ class JarvisRepository {
           text: segment.text,
           confidence: segment.confidence,
           isStable: segment.isStable ? 1 : 0,
+          trackId: sourceTrack?.id ?? null,
+          sourceType,
         });
       }
     };
@@ -597,16 +639,77 @@ class JarvisRepository {
     this._syncTranscriptSegments = this.db.transaction((sessionId, segments) => {
       writeTranscriptSegments(sessionId, segments);
       if (segments.length === 0) {
-        this.db.prepare("DELETE FROM transcript_segments WHERE session_id = ?").run(sessionId);
+        this.db.prepare(`
+          DELETE FROM transcript_segments
+          WHERE session_id = ?
+            AND result_kind = 'provisional'
+            AND chunk_id IS NULL
+            AND model_version IS NULL
+            AND superseded_by IS NULL
+        `).run(sessionId);
         return;
       }
       const placeholders = segments.map(() => "?").join(",");
       this.db
         .prepare(
-          `DELETE FROM transcript_segments WHERE session_id = ? AND id NOT IN (${placeholders})`
+          `DELETE FROM transcript_segments
+           WHERE session_id = ?
+             AND result_kind = 'provisional'
+             AND chunk_id IS NULL
+             AND model_version IS NULL
+             AND superseded_by IS NULL
+             AND id NOT IN (${placeholders})`
         )
         .run(sessionId, ...segments.map((segment) => segment.id));
     });
+
+    this._reconcileTranscript = this.db.transaction((sessionId, reconcile) => {
+      const history = this.statements.listTranscriptHistory.all(sessionId);
+      const provisional = history.filter((row) => row.result_kind === "provisional");
+      const final = history.filter((row) => row.result_kind === "final");
+      const assignments = reconcile({ provisional, final });
+      if (!Array.isArray(assignments)) {
+        throw new TypeError("transcript reconciliation must return an array");
+      }
+
+      const rowsById = new Map(history.map((row) => [row.id, row]));
+      const assigned = new Set();
+      let superseded = 0;
+      for (const assignment of assignments) {
+        const provisionalId = assertId(assignment?.provisionalId, "provisionalSegmentId");
+        const finalId = assertId(assignment?.finalId, "finalSegmentId");
+        if (assigned.has(provisionalId)) {
+          throw new Error("provisional segment has multiple supersession assignments");
+        }
+        assigned.add(provisionalId);
+        const provisionalRow = rowsById.get(provisionalId);
+        const finalRow = rowsById.get(finalId);
+        if (
+          !provisionalRow ||
+          provisionalRow.result_kind !== "provisional" ||
+          provisionalRow.superseded_by !== null ||
+          !finalRow ||
+          finalRow.result_kind !== "final" ||
+          provisionalRow.session_id !== finalRow.session_id ||
+          provisionalRow.track_id !== finalRow.track_id ||
+          !(provisionalRow.started_at < finalRow.ended_at) ||
+          !(finalRow.started_at < provisionalRow.ended_at)
+        ) {
+          throw new Error("invalid transcript supersession assignment");
+        }
+        superseded += this.statements.supersedeTranscriptSegment.run({
+          sessionId,
+          provisionalId,
+          finalId,
+        }).changes;
+      }
+      return {
+        inserted: 0,
+        superseded,
+        unchanged: provisional.length - superseded,
+      };
+    });
+    this._reconcileTranscript = this._reconcileTranscript.immediate;
 
     this._renamePerson = this.db.transaction((input) => {
       if (input.isSelf) this.statements.clearSelf.run();
@@ -873,6 +976,24 @@ class JarvisRepository {
 
   listTranscriptSegments(sessionId) {
     return this.statements.listSegments.all(assertId(sessionId, "sessionId"));
+  }
+
+  getVisibleTranscript(sessionId) {
+    return this.listTranscriptSegments(sessionId);
+  }
+
+  listTranscriptHistory(sessionId) {
+    return this.statements.listTranscriptHistory.all(assertId(sessionId, "sessionId"));
+  }
+
+  getTranscriptSegment(segmentId) {
+    return this.statements.getTranscriptSegment.get(assertId(segmentId, "segmentId")) ?? null;
+  }
+
+  reconcileTranscriptTransaction(sessionId, reconcile) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (typeof reconcile !== "function") throw new TypeError("reconcile must be a function");
+    return this._reconcileTranscript(safeSessionId, reconcile);
   }
 
   getTranscriptPrompt(sessionId) {

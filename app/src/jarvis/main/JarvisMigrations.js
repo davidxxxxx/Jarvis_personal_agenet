@@ -1,8 +1,8 @@
-const TARGET_VERSION = 12;
+const TARGET_VERSION = 13;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
-  if (!new Set(["transcript_segments", "transcript_segments_v12"]).has(tableName)) {
+  if (!new Set(["transcript_segments", "transcript_segments_v13"]).has(tableName)) {
     throw new TypeError("unsupported transcript segment table name");
   }
   return `
@@ -33,6 +33,8 @@ function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
       ),
       model_version TEXT,
       completed_at INTEGER,
+      superseded_by TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+      CHECK(superseded_by IS NULL OR result_kind = 'provisional'),
       CHECK(
         result_kind <> 'final' OR (
           track_id IS NOT NULL AND
@@ -50,6 +52,9 @@ function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
 const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
   CREATE INDEX IF NOT EXISTS idx_segments_session_time
     ON transcript_segments(session_id, started_at);
+  CREATE INDEX IF NOT EXISTS idx_segments_superseded_by
+    ON transcript_segments(superseded_by)
+    WHERE superseded_by IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
     ON transcript_segments(chunk_id, model_version)
     WHERE chunk_id IS NOT NULL AND result_kind = 'final';
@@ -94,6 +99,39 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
         AND chunk.deleted_at IS NULL
         AND track.session_id = NEW.session_id
         AND track.source_type = NEW.source_type
+    );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_supersession_insert
+  BEFORE INSERT ON transcript_segments
+  WHEN NEW.superseded_by IS NOT NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript supersession')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM transcript_segments AS final
+      WHERE final.id = NEW.superseded_by
+        AND final.result_kind = 'final'
+        AND final.session_id = NEW.session_id
+        AND final.track_id = NEW.track_id
+        AND NEW.started_at < final.ended_at
+        AND final.started_at < NEW.ended_at
+    );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_supersession_update
+  BEFORE UPDATE OF superseded_by, session_id, track_id, started_at, ended_at, result_kind
+  ON transcript_segments
+  WHEN NEW.superseded_by IS NOT NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript supersession')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM transcript_segments AS final
+      WHERE final.id = NEW.superseded_by
+        AND final.result_kind = 'final'
+        AND final.session_id = NEW.session_id
+        AND final.track_id = NEW.track_id
+        AND NEW.started_at < final.ended_at
+        AND final.started_at < NEW.ended_at
     );
   END;
 `;
@@ -200,12 +238,12 @@ function tableExists(db, table) {
   );
 }
 
-function rebuildTranscriptSegmentsV12(db) {
+function rebuildTranscriptSegmentsV13(db) {
   if (!tableExists(db, "transcript_segments")) return;
   const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
-  db.exec(transcriptSegmentsSchema("transcript_segments_v12"));
+  db.exec(transcriptSegmentsSchema("transcript_segments_v13"));
   db.exec(`
-    INSERT INTO transcript_segments_v12 (
+    INSERT INTO transcript_segments_v13 (
       id, session_id, started_at, ended_at, person_id, speaker_label,
       text, confidence, is_stable, analysis_state, track_id, chunk_id,
       source_type, result_kind, version, model_version, completed_at
@@ -229,16 +267,19 @@ function rebuildTranscriptSegmentsV12(db) {
   `);
   db.exec(`
     DROP INDEX IF EXISTS idx_segments_session_time;
+    DROP INDEX IF EXISTS idx_segments_superseded_by;
     DROP INDEX IF EXISTS idx_transcript_chunk_model_final;
     DROP TRIGGER IF EXISTS validate_final_transcript_lineage_insert;
     DROP TRIGGER IF EXISTS validate_final_transcript_lineage_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_insert;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_update;
   `);
   try {
     db.pragma("legacy_alter_table = ON");
     db.exec(`
-      ALTER TABLE transcript_segments RENAME TO transcript_segments_v11;
-      ALTER TABLE transcript_segments_v12 RENAME TO transcript_segments;
-      DROP TABLE transcript_segments_v11;
+      ALTER TABLE transcript_segments RENAME TO transcript_segments_v12;
+      ALTER TABLE transcript_segments_v13 RENAME TO transcript_segments;
+      DROP TABLE transcript_segments_v12;
     `);
   } finally {
     db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
@@ -388,7 +429,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
-    rebuildTranscriptSegmentsV12(db);
+    rebuildTranscriptSegmentsV13(db);
     addColumn(db, "audio_gaps", "restored_device_id TEXT");
     addColumn(db, "audio_gaps", "restored_device_label TEXT");
     addColumn(db, "audio_gaps", "restored_strategy TEXT");

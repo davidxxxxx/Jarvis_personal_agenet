@@ -197,9 +197,10 @@ export function mapStableSegments(
     return {
       id: createStableSegmentId(sessionId, segment.id),
       startedAt: timestamp,
-      endedAt: timestamp,
+      endedAt: timestamp < Number.MAX_SAFE_INTEGER ? timestamp + 1 : timestamp,
       personId,
       speakerLabel: segment.speakerName ?? segment.speaker ?? segment.source,
+      sourceType: segment.source,
       text: segment.text,
       confidence:
         typeof segment.confidence === "number" && Number.isFinite(segment.confidence)

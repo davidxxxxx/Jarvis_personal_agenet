@@ -930,6 +930,53 @@ test("fresh schema rejects hostile final transcript lineage at the SQL boundary"
   assert.equal(repo.db.prepare("SELECT count(*) count FROM transcript_segments").get().count, 2);
 });
 
+test("an empty renderer snapshot never deletes a durable final transcript", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "snapshot-final-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "mic",
+  });
+  repo.createTrack({
+    id: "snapshot-final-track",
+    sessionId: "snapshot-final-session",
+    sourceType: "mic",
+    deviceId: "physical-mic",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  const chunk = {
+    id: "snapshot-final-chunk",
+    sessionId: "snapshot-final-session",
+    trackId: "snapshot-final-track",
+    sourceType: "mic",
+    sequenceNumber: 0,
+    path: "snapshot-final.wav",
+    startedAt: 2_000,
+    endedAt: 3_000,
+    durationMs: 1_000,
+    sha256: "c".repeat(64),
+    expiresAt: 10_000,
+  };
+  repo.commitChunk(chunk);
+  const finalSegment = repo.commitChunkTranscript({
+    chunk: repo.getAudioChunk(chunk.id),
+    result: { text: "durable final", confidence: 0.95 },
+    modelVersion: "large-v3-turbo",
+    completedAt: 4_000,
+  });
+
+  repo.syncTranscriptSegments("snapshot-final-session", []);
+
+  assert.deepEqual(
+    repo.listTranscriptSegments("snapshot-final-session").map((segment) => segment.id),
+    [finalSegment.id]
+  );
+});
+
 test("reopens the same repository object against a verified migrated database", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reopen-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
