@@ -157,7 +157,13 @@ class DataDirectoryMigrator {
           const creationLeases = [];
           try {
             await this._assertLeaseCurrent(sourceLease);
+            parentLease = await this.directoryLeaseProvider.acquire(targetVolume.anchorPath);
+            await this._assertLeaseCurrent(parentLease);
             await this._assertDirectoryIdentity(targetVolume.anchor);
+            if (targetVolume.targetExists) {
+              if (targetVolume.anchorPath !== target) throw new Error("destination is unsafe");
+              targetLease = parentLease;
+            }
             this._throwIfAborted(signal);
 
             const entries = await this._scanSource(source, signal);
@@ -178,11 +184,8 @@ class DataDirectoryMigrator {
               phase: "copying",
               files: entries.map((entry) => ({ ...entry, copied: false })),
             };
-            const targetExists = await this._exists(target);
             let markedTargetIdentity = null;
-            if (!targetExists) {
-              parentLease = await this.directoryLeaseProvider.acquire(targetVolume.anchorPath);
-              await this._assertLeaseCurrent(parentLease);
+            if (!targetVolume.targetExists) {
               await this._createMissingTarget(
                 targetVolume.anchorPath,
                 target,
@@ -190,8 +193,6 @@ class DataDirectoryMigrator {
                 creationLeases
               );
               targetLease = creationLeases.at(-1);
-            } else {
-              targetLease = await this.directoryLeaseProvider.acquire(target);
             }
             await this._assertLeaseCurrent(targetLease);
             if (manifest === null) {
@@ -565,6 +566,7 @@ class DataDirectoryMigrator {
     }
     return {
       ...inspected,
+      targetExists: targetStat !== null,
       anchorPath,
       anchor: await this.directoryIdentityProvider(anchorPath),
     };

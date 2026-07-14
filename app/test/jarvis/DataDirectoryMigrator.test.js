@@ -690,6 +690,90 @@ test("rejects an ancestor swap when the preflight and postflight directory ident
   assert.equal(fs.existsSync(to), false);
 });
 
+test("leases and revalidates the destination anchor before scanning the source", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows anchor lease ordering test");
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-anchor-prescan-race-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const anchor = path.join(base, "safe-parent");
+  const to = path.join(anchor, "nested", "new-root");
+  const displaced = path.join(base, "displaced-safe-parent");
+  const replacement = path.join(base, "replacement-parent");
+  await writeTree(from);
+  await fsp.writeFile(path.join(from, "private.bin"), "private-data");
+  await fsp.mkdir(anchor);
+  await fsp.mkdir(replacement);
+
+  let scanned = false;
+  let copied = false;
+  const leasedFs = Object.create(fsp);
+  leasedFs.readdir = async (candidate, options) => {
+    if (path.resolve(candidate) === path.resolve(from)) scanned = true;
+    return fsp.readdir(candidate, options);
+  };
+  leasedFs.copyFile = async (...args) => {
+    copied = true;
+    return fsp.copyFile(...args);
+  };
+
+  const realProvider = new DirectoryLeaseProvider();
+  const activeLeases = new Set();
+  let swapped = false;
+  const track = (lease) => {
+    const key = {};
+    activeLeases.add(key);
+    return {
+      ...lease,
+      async release() {
+        try {
+          return await lease.release();
+        } finally {
+          activeLeases.delete(key);
+        }
+      },
+    };
+  };
+  const directoryLeaseProvider = {
+    async acquire(candidate) {
+      if (!swapped && path.resolve(candidate) === path.resolve(anchor)) {
+        swapped = true;
+        await fsp.rename(anchor, displaced);
+        await fsp.rename(replacement, anchor);
+      }
+      return track(await realProvider.acquire(candidate));
+    },
+    async createAndAcquire(candidate) {
+      return track(await realProvider.createAndAcquire(candidate));
+    },
+  };
+  const directoryIdentityProvider = async (candidate) => {
+    const stat = await fsp.lstat(candidate);
+    return {
+      path: path.resolve(candidate),
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      finalPath: path.resolve(candidate),
+      volumeIdentity: "fixed-volume",
+    };
+  };
+
+  await assert.rejects(
+    createMigrator([], {
+      fsImpl: leasedFs,
+      directoryLeaseProvider,
+      directoryIdentityProvider,
+      relocateTarget: async () => {},
+    }).migrate({ from, to }),
+    /destination directory identity changed/
+  );
+
+  assert.equal(swapped, true);
+  assert.equal(scanned, false);
+  assert.equal(copied, false);
+  assert.equal(activeLeases.size, 0);
+  assert.equal(fs.existsSync(path.join(to, "private.bin")), false);
+});
+
 test("rejects a created staging handle whose final volume identity changed", async (t) => {
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-volume-identity-"));
   t.after(() => fsp.rm(base, { recursive: true, force: true }));
