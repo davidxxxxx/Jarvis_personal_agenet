@@ -224,10 +224,7 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
   await fsp.rm(oldRoot, { recursive: true, force: true });
 
   assert.deepEqual(result, { databaseLocators: 1, recoverySidecars: 1 });
-  const workDatabase = path.join(
-    newRoot,
-    `.jarvis-relocate-${migrationId}-${token}.db`
-  );
+  const workDatabase = path.join(newRoot, `.jarvis-relocate-${migrationId}-${token}.db`);
   assert.equal(fs.existsSync(workDatabase), false);
   assert.equal(fs.existsSync(`${workDatabase}-wal`), false);
   assert.equal(fs.existsSync(`${workDatabase}-shm`), false);
@@ -248,10 +245,16 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
     reader,
     now: () => 2_000,
   });
-  const compressionJob = migrated.db
-    .prepare("SELECT * FROM processing_jobs WHERE chunk_id = ? AND job_type = 'compress_chunk'")
-    .get("c1");
-  await worker.run(compressionJob);
+  const compressionJob = migrated.captureEvidenceStore
+    .claimJobs({
+      owner: "relocation-worker",
+      at: 2_000,
+      leaseMs: 1_000,
+      limit: 2,
+    })
+    .find((job) => job.job_type === "compress_chunk");
+  assert.equal(compressionJob.job_type, "compress_chunk");
+  await worker.run(compressionJob, { owner: "relocation-worker" });
   const compressed = migrated.getAudioChunk("c1");
   assert.equal(compressed.format, "flac");
   assert.equal(compressed.path.startsWith(path.join(newRoot, "recordings")), true);
@@ -286,7 +289,10 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
     now: () => 3_000,
   });
   const recovered = service.recoverOpenSessions(3_000);
-  assert.deepEqual(recovered.map((session) => session.id), ["s1"]);
+  assert.deepEqual(
+    recovered.map((session) => session.id),
+    ["s1"]
+  );
   assert.equal(migrated.getAudioChunk("chunk-recovery").path, newRecoveryWav);
   assert.equal(fs.existsSync(`${newRecoveryWav}.recovery.json`), false);
   service.shutdown();
@@ -468,10 +474,16 @@ test("adopts default userData recordings through the production coordinator", as
     reader,
     now: () => 2_000,
   });
-  const compressionJob = migrated.db
-    .prepare("SELECT * FROM processing_jobs WHERE chunk_id = ? AND job_type = 'compress_chunk'")
-    .get("c1");
-  await worker.run(compressionJob);
+  const compressionJob = migrated.captureEvidenceStore
+    .claimJobs({
+      owner: "adoption-worker",
+      at: 2_000,
+      leaseMs: 1_000,
+      limit: 2,
+    })
+    .find((job) => job.job_type === "compress_chunk");
+  assert.equal(compressionJob.job_type, "compress_chunk");
+  await worker.run(compressionJob, { owner: "adoption-worker" });
   const compressed = migrated.captureEvidenceStore.getChunkForMaintenance("c1");
   assert.equal(compressed.format, "flac");
   assert.equal(compressed.path.startsWith(unifiedRecordings), true);
@@ -490,7 +502,10 @@ test("adopts default userData recordings through the production coordinator", as
     broadcast() {},
     now: () => 3_000,
   });
-  assert.deepEqual(service.recoverOpenSessions(3_000).map((session) => session.id), ["s1"]);
+  assert.deepEqual(
+    service.recoverOpenSessions(3_000).map((session) => session.id),
+    ["s1"]
+  );
   assert.equal(migrated.getAudioChunk("chunk-recovery").path, sidecar.path);
   assert.equal(fs.existsSync(`${sidecar.path}.recovery.json`), false);
   const cleaner = new RetentionCleaner({

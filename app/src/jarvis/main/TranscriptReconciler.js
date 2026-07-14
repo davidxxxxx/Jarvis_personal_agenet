@@ -21,25 +21,21 @@ class TranscriptReconciler {
   }
 
   reconcileSession(sessionId) {
-    return this.repository.reconcileTranscriptTransaction(
-      sessionId,
-      ({ provisional, final }) => {
-        const assignments = [];
-        for (const preview of provisional) {
-          if (preview.superseded_by !== null) continue;
-          const winner = final
-            .filter(
-              (candidate) =>
-                preview.track_id === candidate.track_id && strictlyOverlaps(preview, candidate)
-            )
-            .sort(compareFinalWinner)[0];
-          if (winner) {
-            assignments.push({ provisionalId: preview.id, finalId: winner.id });
-          }
+    return this.repository.reconcileTranscriptTransaction(sessionId, ({ provisional, final }) => {
+      const assignments = [];
+      for (const preview of provisional) {
+        const winner = final
+          .filter(
+            (candidate) =>
+              preview.track_id === candidate.track_id && strictlyOverlaps(preview, candidate)
+          )
+          .sort(compareFinalWinner)[0];
+        if (winner && (preview.superseded_by === null || preview.superseded_by === winner.id)) {
+          assignments.push({ provisionalId: preview.id, finalId: winner.id });
         }
-        return assignments;
       }
-    );
+      return assignments;
+    });
   }
 }
 

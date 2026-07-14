@@ -120,7 +120,13 @@ function previewPolicy(snapshot) {
 }
 
 class PreviewTranscriptionScheduler {
-  constructor({ executePreview, persistProvisional, heavyGate, now = Date.now } = {}) {
+  constructor({
+    executePreview,
+    persistProvisional,
+    heavyGate,
+    beforePreviewStart = async () => 0,
+    now = Date.now,
+  } = {}) {
     if (typeof executePreview !== "function") {
       throw new TypeError("executePreview must be a function");
     }
@@ -130,10 +136,14 @@ class PreviewTranscriptionScheduler {
     if (!heavyGate || typeof heavyGate.run !== "function") {
       throw new TypeError("heavyGate.run must be a function");
     }
+    if (typeof beforePreviewStart !== "function") {
+      throw new TypeError("beforePreviewStart must be a function");
+    }
     if (typeof now !== "function") throw new TypeError("now must be a function");
     this.executePreview = executePreview;
     this.persistProvisional = persistProvisional;
     this.heavyGate = heavyGate;
+    this.beforePreviewStart = beforePreviewStart;
     this.now = now;
     this.entries = new Map();
     this.active = null;
@@ -147,6 +157,11 @@ class PreviewTranscriptionScheduler {
       reason: "waiting_for_telemetry",
     };
     this.lastError = null;
+    this.stopped = false;
+  }
+
+  stop() {
+    this.stopped = true;
   }
 
   request({ sessionId, trackId, throughMs } = {}) {
@@ -202,6 +217,7 @@ class PreviewTranscriptionScheduler {
   }
 
   tick(resourceSnapshot) {
+    if (this.stopped) return Promise.resolve(0);
     this.currentPolicy = previewPolicy(resourceSnapshot);
     if (this.currentPolicy.mode === "paused") return Promise.resolve(0);
     if (this.active) return this.active;
@@ -235,7 +251,14 @@ class PreviewTranscriptionScheduler {
       lowPriority: this.currentPolicy.device === "cpu",
     };
     const operation = this.heavyGate
-      .run("preview", async () => {
+      .run("preview", async (permit) => {
+        await this.beforePreviewStart(permit);
+        if (this.stopped) {
+          if (!entry.pending || entry.pending.throughMs < request.throughMs) {
+            entry.pending = request;
+          }
+          return 0;
+        }
         this.lastStartedAt = this.now();
         const result = await this.executePreview(execution);
         const segments = result?.segments;

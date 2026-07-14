@@ -59,7 +59,12 @@ class PreviewAudioRing {
     this.fsPromises = fsImpl.promises;
     this.entries = new Map();
     this.activeFiles = new Set();
-    this.ready = this.fsPromises
+    this.activeOperations = new Set();
+    this.ready = this._prepareRoot();
+  }
+
+  _prepareRoot() {
+    return this.fsPromises
       .mkdir(this.rootDir, { recursive: true })
       .then(() => this._cleanupPreviewArtifacts(this.rootDir, 0, { remaining: 1_024 }))
       .catch(() => 0);
@@ -107,7 +112,17 @@ class PreviewAudioRing {
     return watermarks;
   }
 
-  async withPreviewWav({ sessionId, trackId, fromMs, throughMs } = {}, callback) {
+  withPreviewWav(input = {}, callback) {
+    let tracked;
+    const operation = this._withPreviewWav(input, callback);
+    tracked = Promise.resolve(operation).finally(() => {
+      this.activeOperations.delete(tracked);
+    });
+    this.activeOperations.add(tracked);
+    return tracked;
+  }
+
+  async _withPreviewWav({ sessionId, trackId, fromMs, throughMs } = {}, callback) {
     const safeSessionId = assertId(sessionId, "sessionId");
     const safeTrackId = assertId(trackId, "trackId");
     const range = boundedRange(fromMs, throughMs);
@@ -146,6 +161,10 @@ class PreviewAudioRing {
       .digest("hex");
     const finalPath = path.join(directory, `${digest}.preview.wav`);
     const temporaryPath = `${finalPath}.${crypto.randomUUID()}.tmp`;
+    const resolvedFinalPath = path.resolve(finalPath);
+    const resolvedTemporaryPath = path.resolve(temporaryPath);
+    this.activeFiles.add(resolvedFinalPath);
+    this.activeFiles.add(resolvedTemporaryPath);
     let handle = null;
     try {
       await this.fsPromises.mkdir(directory, { recursive: true });
@@ -155,7 +174,6 @@ class PreviewAudioRing {
       await handle.close();
       handle = null;
       await this.fsPromises.rename(temporaryPath, finalPath);
-      this.activeFiles.add(path.resolve(finalPath));
       return await callback({
         path: finalPath,
         sourceType: entry.sourceType,
@@ -164,7 +182,6 @@ class PreviewAudioRing {
         sha256: digest,
       });
     } finally {
-      this.activeFiles.delete(path.resolve(finalPath));
       if (handle !== null) {
         try {
           await handle.close();
@@ -175,6 +192,8 @@ class PreviewAudioRing {
           await this.fsPromises.unlink(candidate);
         } catch {}
       }
+      this.activeFiles.delete(resolvedTemporaryPath);
+      this.activeFiles.delete(resolvedFinalPath);
     }
   }
 
@@ -182,11 +201,30 @@ class PreviewAudioRing {
     return this.ready;
   }
 
+  async waitForIdle() {
+    while (this.activeOperations.size > 0) {
+      await Promise.allSettled([...this.activeOperations]);
+    }
+  }
+
+  reconfigureRoot(rootDir) {
+    if (typeof rootDir !== "string" || !path.isAbsolute(rootDir)) {
+      throw new TypeError("rootDir must be an absolute path");
+    }
+    if (this.activeOperations.size > 0 || this.activeFiles.size > 0 || this.entries.size > 0) {
+      throw new Error("preview audio ring must be idle and empty before reconfiguration");
+    }
+    this.rootDir = path.resolve(rootDir);
+    this.ready = this._prepareRoot();
+    return this.rootDir;
+  }
+
   async clearSession(sessionId) {
     const safeSessionId = assertId(sessionId, "sessionId");
     for (const [key, entry] of this.entries) {
       if (entry.sessionId === safeSessionId) this.entries.delete(key);
     }
+    await this.waitForIdle();
     await this.ready;
     return this._cleanupPreviewArtifacts(path.join(this.rootDir, safeSessionId), 1, {
       remaining: 1_024,
@@ -195,6 +233,7 @@ class PreviewAudioRing {
 
   async clear() {
     this.entries.clear();
+    await this.waitForIdle();
     await this.ready;
     return this._cleanupPreviewArtifacts(this.rootDir, 0, { remaining: 1_024 });
   }

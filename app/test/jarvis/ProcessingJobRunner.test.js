@@ -4,7 +4,18 @@ const Database = require("better-sqlite3");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
 
 function fixture(t, runnerOptions = {}) {
   const db = new Database(":memory:");
@@ -144,6 +155,191 @@ test("leaves ordinary final work unclaimed when draining above the preview prior
   assert.equal(
     db.prepare("SELECT state FROM processing_jobs WHERE id = 'final-only'").get().state,
     "pending"
+  );
+});
+
+test("drains late durable urgency inside the preview permit without nesting the heavy gate", async (t) => {
+  const gate = new HeavyJobGate();
+  const governor = {
+    sample: async () => ({ state: "constrained", selectedGpuUuid: null }),
+    admit: () => ({ action: "run_cpu", reason: "storage_critical" }),
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: gate });
+  const blockerStarted = deferred();
+  const releaseBlocker = deferred();
+  const order = [];
+  runner.register("transcribe_chunk", async (job) => {
+    assert.equal(gate.getState().activeKind, "retention_urgent");
+    order.push(job.id);
+    return { executionDevice: "cpu" };
+  });
+  runner.register("compress_chunk", async (job) => {
+    assert.equal(gate.getState().activeKind, "storage_recovery_compress");
+    order.push(job.id);
+    return { executionDevice: "cpu" };
+  });
+
+  const blocker = gate.run("maintenance", async () => {
+    blockerStarted.resolve();
+    await releaseBlocker.promise;
+  });
+  await blockerStarted.promise;
+  const scheduler = new PreviewTranscriptionScheduler({
+    heavyGate: gate,
+    now: () => 2_000,
+    beforePreviewStart: (permit) =>
+      runner.drainHigherPriorityWithinPermit(permit, { priorityBefore: 20, at: 2_000 }),
+    executePreview: async () => {
+      order.push("preview");
+      return { segments: [] };
+    },
+    persistProvisional() {},
+  });
+  scheduler.request({ sessionId: "s1", trackId: "track-mic", throughMs: 15_000 });
+  const preview = scheduler.tick({
+    state: "available",
+    reason: "resources_available",
+    previewEnabled: true,
+  });
+  const final = gate.run("final_transcription", () => order.push("final"));
+
+  seedJob(db, {
+    id: "retention-late",
+    state: "retention_urgent",
+    priority: 0,
+    inputHash: "retention-late",
+  });
+  seedJob(db, {
+    id: "storage-late",
+    jobType: "compress_chunk",
+    state: "storage_recovery_compress",
+    priority: 10,
+    inputHash: "storage-late",
+  });
+  seedJob(db, {
+    id: "final-durable",
+    priority: 30,
+    inputHash: "final-durable",
+  });
+  releaseBlocker.resolve();
+  await Promise.all([blocker, preview, final]);
+
+  assert.deepEqual(order, ["retention-late", "storage-late", "preview", "final"]);
+  assert.deepEqual(
+    db
+      .prepare("SELECT id, state FROM processing_jobs WHERE id IN (?, ?, ?) ORDER BY priority, id")
+      .all("retention-late", "storage-late", "final-durable"),
+    [
+      { id: "retention-late", state: "completed" },
+      { id: "storage-late", state: "completed" },
+      { id: "final-durable", state: "pending" },
+    ]
+  );
+});
+
+test("rejects a forged preview permit before claiming a durable lease", async (t) => {
+  const gate = new HeavyJobGate();
+  const { db, runner } = fixture(t, { heavyGate: gate });
+  seedJob(db, { id: "urgent-safe", state: "retention_urgent", priority: 0 });
+
+  await assert.rejects(
+    runner.drainHigherPriorityWithinPermit({}, { priorityBefore: 20, at: 2_000 }),
+    /permit/i
+  );
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, lease_owner, lease_expires_at FROM processing_jobs WHERE id = ?")
+      .get("urgent-safe"),
+    { state: "retention_urgent", lease_owner: null, lease_expires_at: null }
+  );
+});
+
+test("permit draining preserves durable retry and resource deferral transitions", async (t) => {
+  const gate = new HeavyJobGate();
+  const governor = {
+    sample: async () => ({ state: "constrained", selectedGpuUuid: null }),
+    admit: (kind) =>
+      kind === "storage_recovery_compress"
+        ? { action: "defer", reason: "storage_pressure" }
+        : { action: "run_cpu", reason: "retention_urgent" },
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: gate });
+  seedJob(db, {
+    id: "retention-retry",
+    state: "retention_urgent",
+    priority: 0,
+    inputHash: "retention-retry",
+  });
+  seedJob(db, {
+    id: "storage-defer",
+    jobType: "compress_chunk",
+    state: "storage_recovery_compress",
+    priority: 10,
+    inputHash: "storage-defer",
+  });
+  seedJob(db, {
+    id: "final-stays-pending",
+    priority: 30,
+    inputHash: "final-stays-pending",
+  });
+  runner.register("transcribe_chunk", async () => {
+    const error = new Error("temporary retention failure");
+    error.code = "TRANSIENT";
+    throw error;
+  });
+  runner.register("compress_chunk", async () =>
+    assert.fail("resource-deferred storage handler ran")
+  );
+
+  const processed = await gate.run("preview", (permit) =>
+    runner.drainHigherPriorityWithinPermit(permit, { priorityBefore: 20, at: 2_000 })
+  );
+
+  assert.equal(processed, 2);
+  assert.deepEqual(
+    db
+      .prepare(
+        `
+        SELECT id, state, attempt_count, next_retry_at, error_code, blocked_reason,
+               lease_owner, lease_expires_at
+        FROM processing_jobs
+        WHERE id IN ('retention-retry', 'storage-defer', 'final-stays-pending')
+        ORDER BY priority, id
+      `
+      )
+      .all(),
+    [
+      {
+        id: "retention-retry",
+        state: "retry",
+        attempt_count: 1,
+        next_retry_at: 3_000,
+        error_code: "TRANSIENT",
+        blocked_reason: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "storage-defer",
+        state: "retry",
+        attempt_count: 0,
+        next_retry_at: 17_000,
+        error_code: null,
+        blocked_reason: "storage_pressure",
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "final-stays-pending",
+        state: "pending",
+        attempt_count: 0,
+        next_retry_at: null,
+        error_code: null,
+        blocked_reason: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+    ]
   );
 });
 

@@ -7,6 +7,16 @@ const JarvisService = require("../../src/jarvis/main/JarvisService");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
 function createRepository() {
   const sessions = new Map([
     [
@@ -608,7 +618,7 @@ test("terminal capture clears its disposable live preview ring without touching 
   }
 });
 
-test("reconfigures every evidence holder only while capture is inactive", () => {
+test("reconfigures every evidence holder and preview ring only after old preview cleanup", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reconfigure-"));
   const nextRoot = path.join(userDataDir, "next-recordings");
   const repository = createRepository();
@@ -620,9 +630,72 @@ test("reconfigures every evidence holder only while capture is inactive", () => 
     fsImpl: createSafeFs(),
   });
   try {
+    const oldRing = service.previewAudioRing;
+    const oldRoot = oldRing.rootDir;
+    oldRing.append({
+      sessionId: "preview-old-root",
+      trackId: "track-mic",
+      sourceType: "mic",
+      fromMs: 0,
+      throughMs: 1,
+      pcm: Buffer.alloc(48),
+    });
+    const snapshotStarted = deferred();
+    const releaseSnapshot = deferred();
+    const snapshot = oldRing.withPreviewWav(
+      {
+        sessionId: "preview-old-root",
+        trackId: "track-mic",
+        fromMs: 0,
+        throughMs: 1,
+      },
+      async () => {
+        snapshotStarted.resolve();
+        await releaseSnapshot.promise;
+      }
+    );
+    await snapshotStarted.promise;
+
+    let migrationPrepared = false;
+    const preparation = service.prepareStorageMigration().then(() => {
+      migrationPrepared = true;
+    });
+    await Promise.resolve();
+    assert.equal(migrationPrepared, false);
+    assert.equal(service.previewAudioRing, oldRing);
+    assert.equal(service.recordingsDir, path.join(userDataDir, "recordings"));
+
+    releaseSnapshot.resolve();
+    await Promise.all([snapshot, preparation]);
+    assert.equal(oldRing.entries.size, 0);
+
     service.reconfigureStorage({ recordingsDir: nextRoot });
     assert.equal(service.recordingsDir, nextRoot);
     assert.equal(service.audioEvidenceReader.recordingsRoot, nextRoot);
+    assert.equal(service.previewAudioRing, oldRing);
+    assert.equal(service.previewAudioRing.rootDir, path.join(nextRoot, ".preview"));
+
+    fs.rmSync(oldRoot, { recursive: true, force: true });
+    service.previewAudioRing.append({
+      sessionId: "preview-new-root",
+      trackId: "track-mic",
+      sourceType: "mic",
+      fromMs: 0,
+      throughMs: 1,
+      pcm: Buffer.alloc(48),
+    });
+    await service.previewAudioRing.withPreviewWav(
+      {
+        sessionId: "preview-new-root",
+        trackId: "track-mic",
+        fromMs: 0,
+        throughMs: 1,
+      },
+      ({ path: previewPath }) => {
+        assert.equal(previewPath.startsWith(path.join(nextRoot, ".preview")), true);
+        assert.equal(fs.existsSync(oldRoot), false);
+      }
+    );
 
     service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
     assert.throws(
@@ -631,6 +704,51 @@ test("reconfigures every evidence holder only while capture is inactive", () => 
     );
   } finally {
     service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("migration and shutdown both join scheduled terminal preview cleanup", async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-cleanup-join-"));
+  const repository = createRepository();
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 2_000,
+    fsImpl: createSafeFs(),
+  });
+  const cleanupStarted = deferred();
+  const releaseCleanup = deferred();
+  const originalClearSession = service.previewAudioRing.clearSession.bind(service.previewAudioRing);
+  service.previewAudioRing.clearSession = async (sessionId) => {
+    cleanupStarted.resolve();
+    await releaseCleanup.promise;
+    return originalClearSession(sessionId);
+  };
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.finishCapture("s1", 2_000);
+    await cleanupStarted.promise;
+
+    let prepared = false;
+    const preparation = service.prepareStorageMigration().then(() => {
+      prepared = true;
+    });
+    const shutdown = service.shutdown();
+    assert.equal(shutdown, service.shutdown());
+    await Promise.resolve();
+    assert.equal(prepared, false);
+
+    releaseCleanup.resolve();
+    await Promise.all([preparation, shutdown]);
+    assert.equal(prepared, true);
+    assert.equal(service.previewAudioRing.entries.size, 0);
+    assert.equal(service.previewAudioRing.activeOperations.size, 0);
+  } finally {
+    releaseCleanup.resolve();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

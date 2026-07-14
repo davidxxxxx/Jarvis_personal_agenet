@@ -918,7 +918,7 @@ class JarvisRepository {
         if (
           !provisionalRow ||
           provisionalRow.result_kind !== "provisional" ||
-          provisionalRow.superseded_by !== null ||
+          (provisionalRow.superseded_by !== null && provisionalRow.superseded_by !== finalId) ||
           !finalRow ||
           finalRow.result_kind !== "final" ||
           provisionalRow.session_id !== finalRow.session_id ||
@@ -934,11 +934,13 @@ class JarvisRepository {
             echoScore: provisionalRow.echo_score,
           });
         }
-        superseded += this.statements.supersedeTranscriptSegment.run({
-          sessionId,
-          provisionalId,
-          finalId,
-        }).changes;
+        if (provisionalRow.superseded_by === null) {
+          superseded += this.statements.supersedeTranscriptSegment.run({
+            sessionId,
+            provisionalId,
+            finalId,
+          }).changes;
+        }
       }
       return {
         inserted: 0,

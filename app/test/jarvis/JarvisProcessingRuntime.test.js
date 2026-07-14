@@ -1471,6 +1471,56 @@ test("stop during governor sampling prevents a late preview from escaping the sh
   assert.equal(runtime.previewInFlight, null);
 });
 
+test("stop during atomic preview arbitration joins durable work without starting preview", async () => {
+  const gate = new HeavyJobGate();
+  const arbitrationStarted = deferred();
+  const releaseArbitration = deferred();
+  let previewExecutions = 0;
+  const previewScheduler = new PreviewTranscriptionScheduler({
+    heavyGate: gate,
+    now: () => 0,
+    beforePreviewStart: async () => {
+      arbitrationStarted.resolve();
+      await releaseArbitration.promise;
+    },
+    executePreview: async () => {
+      previewExecutions += 1;
+      return { segments: [] };
+    },
+    persistProvisional() {},
+  });
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    governor: {
+      sample: async () => ({
+        state: "available",
+        reason: "resources_available",
+        previewEnabled: true,
+      }),
+    },
+    previewScheduler,
+    now: () => 0,
+  });
+  runtime.requestPreview({ sessionId: "s1", trackId: "track-mic", throughMs: 15_000 });
+
+  const drain = runtime.drainOnce();
+  await arbitrationStarted.promise;
+  const stopped = runtime.stop();
+  releaseArbitration.resolve();
+  await Promise.all([drain, stopped]);
+
+  assert.equal(previewExecutions, 0);
+  assert.equal(runtime.previewInFlight, null);
+  assert.equal(gate.getState().activeKind, null);
+});
+
 test("delayed sampling and a slow session phase cannot move preview ahead of urgent durable work", async () => {
   const sampled = deferred();
   const releaseReconcile = deferred();

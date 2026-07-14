@@ -145,9 +145,12 @@ class JarvisService {
       !previewAudioRing ||
       typeof previewAudioRing.append !== "function" ||
       typeof previewAudioRing.withPreviewWav !== "function" ||
-      typeof previewAudioRing.clearSession !== "function"
+      typeof previewAudioRing.clearSession !== "function" ||
+      typeof previewAudioRing.clear !== "function" ||
+      typeof previewAudioRing.waitForIdle !== "function" ||
+      typeof previewAudioRing.reconfigureRoot !== "function"
     ) {
-      throw new TypeError("previewAudioRing must provide append, withPreviewWav, and clearSession");
+      throw new TypeError("previewAudioRing must provide preview lifecycle and storage APIs");
     }
     if (audioEvidenceReader === undefined) {
       audioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: this.recordingsDir });
@@ -178,6 +181,8 @@ class JarvisService {
     this.broadcast = broadcast;
     this.onChunkCommitted = onChunkCommitted;
     this.previewAudioRing = previewAudioRing;
+    this.previewCleanupWork = Promise.resolve();
+    this.shutdownPromise = null;
     this.onPreviewWatermark = onPreviewWatermark;
     this.now = now;
     this.fs = fsImpl;
@@ -372,6 +377,9 @@ class JarvisService {
     if (this.retentionWork.size > 0) {
       await Promise.allSettled([...this.retentionWork]);
     }
+    await this.previewCleanupWork;
+    await this.previewAudioRing.waitForIdle();
+    await this.previewAudioRing.clear();
   }
 
   reconfigureStorage({ recordingsDir }) {
@@ -384,16 +392,20 @@ class JarvisService {
     if (typeof recordingsDir !== "string" || !path.isAbsolute(recordingsDir)) {
       throw new TypeError("recordingsDir must be absolute");
     }
-    this.recordingsDir = path.resolve(recordingsDir);
-    this.fs.mkdirSync(this.recordingsDir, { recursive: true });
-    this.audioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: this.recordingsDir });
-    this.flacCompressionWorker = this.repository.captureEvidenceStore
+    const nextRecordingsDir = path.resolve(recordingsDir);
+    this.fs.mkdirSync(nextRecordingsDir, { recursive: true });
+    const nextAudioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: nextRecordingsDir });
+    const nextFlacCompressionWorker = this.repository.captureEvidenceStore
       ? new FlacCompressionWorker({
           store: this.repository.captureEvidenceStore,
-          recordingsRoot: this.recordingsDir,
-          reader: this.audioEvidenceReader,
+          recordingsRoot: nextRecordingsDir,
+          reader: nextAudioEvidenceReader,
         })
       : null;
+    this.previewAudioRing.reconfigureRoot(path.join(nextRecordingsDir, ".preview"));
+    this.recordingsDir = nextRecordingsDir;
+    this.audioEvidenceReader = nextAudioEvidenceReader;
+    this.flacCompressionWorker = nextFlacCompressionWorker;
     return this.recordingsDir;
   }
 
@@ -848,51 +860,60 @@ class JarvisService {
   }
 
   shutdown() {
-    if (this.closed) return;
+    if (this.closed) return this.shutdownPromise;
     this.beginShutdown();
     try {
-      const at = this.now();
-      if (this.writer) {
-        let flushFailed = false;
-        if (["recording", "degraded", "paused"].includes(this.state.status)) {
-          flushFailed = !this._flushRetentionBoundary(at);
-          if (!this.writer) return;
-        }
-        try {
-          this.writer.closeAll(at);
-          for (const source of Object.values(this.state.sources)) source.writerOpen = false;
-        } catch (error) {
-          this.writer.abortAll?.();
-          this.writer = null;
-          if (["recording", "degraded", "paused"].includes(this.state.status)) {
-            const diskError = this._findDiskSpaceError(error);
-            this._finalizeCapture(at, {
-              trackState: "failed",
-              sessionStatus: "failed",
-              errorCode: diskError?.code ?? "AUDIO_WRITE_FAILED",
-            });
-          }
-          return;
-        }
+      this._closeCaptureForShutdown();
+    } finally {
+      this.closed = true;
+      this.shutdownPromise = Promise.resolve(this.previewCleanupWork)
+        .then(() => this.previewAudioRing.waitForIdle())
+        .then(() => this.previewAudioRing.clear())
+        .catch(() => undefined);
+    }
+    return this.shutdownPromise;
+  }
+
+  _closeCaptureForShutdown() {
+    const at = this.now();
+    if (this.writer) {
+      let flushFailed = false;
+      if (["recording", "degraded", "paused"].includes(this.state.status)) {
+        flushFailed = !this._flushRetentionBoundary(at);
+        if (!this.writer) return;
+      }
+      try {
+        this.writer.closeAll(at);
+        for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+      } catch (error) {
+        this.writer.abortAll?.();
         this.writer = null;
-        if (flushFailed && ["recording", "degraded", "paused"].includes(this.state.status)) {
+        if (["recording", "degraded", "paused"].includes(this.state.status)) {
+          const diskError = this._findDiskSpaceError(error);
           this._finalizeCapture(at, {
             trackState: "failed",
             sessionStatus: "failed",
-            errorCode: "AUDIO_WRITE_FAILED",
+            errorCode: diskError?.code ?? "AUDIO_WRITE_FAILED",
           });
-          return;
         }
+        return;
       }
-      if (["recording", "degraded", "paused"].includes(this.state.status)) {
+      this.writer = null;
+      if (flushFailed && ["recording", "degraded", "paused"].includes(this.state.status)) {
         this._finalizeCapture(at, {
-          trackState: "recovered",
-          sessionStatus: "recovered",
-          errorCode: null,
+          trackState: "failed",
+          sessionStatus: "failed",
+          errorCode: "AUDIO_WRITE_FAILED",
         });
+        return;
       }
-    } finally {
-      this.closed = true;
+    }
+    if (["recording", "degraded", "paused"].includes(this.state.status)) {
+      this._finalizeCapture(at, {
+        trackState: "recovered",
+        sessionStatus: "recovered",
+        errorCode: null,
+      });
     }
   }
 
@@ -2062,9 +2083,22 @@ class JarvisService {
       } catch {}
       throw error;
     } finally {
-      Promise.resolve(this.previewAudioRing.clearSession(sessionId)).catch(() => {});
+      this._schedulePreviewCleanup(sessionId);
     }
     return this._publish(at);
+  }
+
+  _schedulePreviewCleanup(sessionId) {
+    let cleanup;
+    try {
+      cleanup = Promise.resolve(this.previewAudioRing.clearSession(sessionId));
+    } catch (error) {
+      cleanup = Promise.reject(error);
+    }
+    cleanup.catch(() => {});
+    this.previewCleanupWork = Promise.allSettled([this.previewCleanupWork, cleanup]).then(
+      () => undefined
+    );
   }
 
   _assertSourceSession(sessionId, sourceType, expectedStatuses) {

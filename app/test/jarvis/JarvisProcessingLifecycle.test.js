@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
 const { createJarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const {
   JarvisProcessingLifecycle,
@@ -35,13 +36,17 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   const service = {
     audioEvidenceReader: makeReader("old-reader"),
     flacCompressionWorker: makeCompressionWorker("old-flac"),
+    previewAudioRing: new PreviewAudioRing({ rootDir: path.join(oldRoot, ".preview") }),
     async prepareStorageMigration() {
       events.push("service-prepare");
+      await this.previewAudioRing.waitForIdle();
+      await this.previewAudioRing.clear();
     },
-    reconfigureStorage() {
+    reconfigureStorage(dataRoot) {
       events.push("service-reconfigure");
       this.audioEvidenceReader = makeReader("new-reader");
       this.flacCompressionWorker = makeCompressionWorker("new-flac");
+      this.previewAudioRing.reconfigureRoot(path.join(dataRoot, "recordings", ".preview"));
     },
   };
   const ipcHandlers = {
@@ -59,6 +64,7 @@ test("migration stops the old runtime and rebuilds production handlers from reco
         store: repository.captureEvidenceStore,
         reader: service.audioEvidenceReader,
         flac: service.flacCompressionWorker,
+        previewRing: service.previewAudioRing,
       };
       const runtime = createJarvisProcessingRuntime({
         repository,
@@ -112,7 +118,7 @@ test("migration stops the old runtime and rebuilds production handlers from reco
     reconfigureStorageHolders: async (dataRoot) => {
       events.push("repository-reopen");
       repository.reopen(path.join(dataRoot, "jarvis.db"));
-      service.reconfigureStorage();
+      service.reconfigureStorage(dataRoot);
     },
     resumeAnalysis: () => events.push("analysis-resume"),
     startRetention: () => events.push("retention-start"),
@@ -177,6 +183,8 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   assert.equal(builds[1].store, newStore);
   assert.equal(builds[1].reader, service.audioEvidenceReader);
   assert.equal(builds[1].flac, service.flacCompressionWorker);
+  assert.equal(builds[1].previewRing, service.previewAudioRing);
+  assert.equal(service.previewAudioRing.rootDir, path.join(nextRoot, "recordings", ".preview"));
   assert.deepEqual(readerCalls, ["new-reader"]);
   assert.deepEqual(compressionCalls, ["new-flac"]);
   assert.equal(repository.getSession("migrated-session").processing_state, "ready");

@@ -196,6 +196,64 @@ test("measures cadence from the actual heavy-gate callback start after a long wa
   assert.equal(scheduler.status().pending, 1);
 });
 
+test("runs atomic durable arbitration inside the preview permit before transcription", async () => {
+  const gate = new HeavyJobGate();
+  const blockerStarted = deferred();
+  const releaseBlocker = deferred();
+  const order = [];
+  let urgentClaimable = false;
+  const blocker = gate.run("maintenance", async () => {
+    blockerStarted.resolve();
+    await releaseBlocker.promise;
+  });
+  await blockerStarted.promise;
+  const scheduler = createScheduler({
+    heavyGate: gate,
+    beforePreviewStart: (permit) => {
+      gate.assertActivePermit(permit);
+      if (urgentClaimable) order.push("retention_urgent");
+    },
+    executePreview: async () => {
+      order.push("preview");
+      return { segments: [] };
+    },
+  });
+  scheduler.request({ sessionId: "s1", trackId: "mic", throughMs: 15_000 });
+  const preview = scheduler.tick(availableSnapshot());
+  const final = gate.run("final_transcription", () => order.push("final_transcription"));
+
+  urgentClaimable = true;
+  releaseBlocker.resolve();
+  await Promise.all([blocker, preview, final]);
+
+  assert.deepEqual(order, ["retention_urgent", "preview", "final_transcription"]);
+});
+
+test("stop during durable arbitration restores the pending preview without starting transcription", async () => {
+  const arbitrationStarted = deferred();
+  const releaseArbitration = deferred();
+  let executions = 0;
+  const scheduler = createScheduler({
+    beforePreviewStart: async () => {
+      arbitrationStarted.resolve();
+      await releaseArbitration.promise;
+    },
+    executePreview: async () => {
+      executions += 1;
+      return { segments: [] };
+    },
+  });
+  scheduler.request({ sessionId: "s1", trackId: "mic", throughMs: 15_000 });
+  const preview = scheduler.tick(availableSnapshot());
+  await arbitrationStarted.promise;
+
+  scheduler.stop();
+  releaseArbitration.resolve();
+  assert.equal(await preview, 0);
+  assert.equal(executions, 0);
+  assert.deepEqual(scheduler.pending(), [{ sessionId: "s1", trackId: "mic", throughMs: 15_000 }]);
+});
+
 test("bounds preview context to the newest 120 seconds and advances uncovered coverage", async () => {
   let now = 0;
   const executions = [];

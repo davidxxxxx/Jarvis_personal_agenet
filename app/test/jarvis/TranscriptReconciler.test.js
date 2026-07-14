@@ -32,14 +32,10 @@ function fixture(t, { sources = ["mic"] } = {}) {
   };
 }
 
-function provisional(repository, {
-  id,
-  startedAt,
-  endedAt,
-  sourceType = "mic",
-  text = id,
-  echoScore = null,
-}) {
+function provisional(
+  repository,
+  { id, startedAt, endedAt, sourceType = "mic", text = id, echoScore = null }
+) {
   repository.upsertTranscriptSegments("session-1", [
     {
       id,
@@ -57,16 +53,19 @@ function provisional(repository, {
   return repository.getTranscriptSegment(id);
 }
 
-function final(repository, {
-  chunkId,
-  startedAt,
-  endedAt,
-  sourceType = "mic",
-  modelVersion = "large-v3-turbo",
-  completedAt = endedAt + 1_000,
-  sequenceNumber = 0,
-  text = chunkId,
-}) {
+function final(
+  repository,
+  {
+    chunkId,
+    startedAt,
+    endedAt,
+    sourceType = "mic",
+    modelVersion = "large-v3-turbo",
+    completedAt = endedAt + 1_000,
+    sequenceNumber = 0,
+    text = chunkId,
+  }
+) {
   const chunk = {
     id: chunkId,
     sessionId: "session-1",
@@ -99,10 +98,12 @@ test("final transcript supersedes all same-track strict overlaps without deletin
     endedAt: 160,
   });
 
+  assert.equal(repository.getTranscriptSegment("p1").superseded_by, finalSegment.id);
+  assert.equal(repository.getTranscriptSegment("p2").superseded_by, finalSegment.id);
   assert.deepEqual(reconciler.reconcileSession("session-1"), {
     inserted: 0,
-    superseded: 2,
-    unchanged: 0,
+    superseded: 0,
+    unchanged: 2,
   });
   assert.deepEqual(
     repository.getVisibleTranscript("session-1").map((row) => row.id),
@@ -158,7 +159,7 @@ test("same time windows on another track are never superseded", (t) => {
   assert.equal(repository.getTranscriptSegment("system-provisional").superseded_by, null);
 });
 
-test("repeat reconciliation is idempotent", (t) => {
+test("repairs legacy unsuperseded overlap once and remains idempotent", (t) => {
   const { repository, reconciler } = fixture(t);
   provisional(repository, { id: "repeat", startedAt: 100, endedAt: 200 });
   const finalSegment = final(repository, {
@@ -167,6 +168,10 @@ test("repeat reconciliation is idempotent", (t) => {
     endedAt: 200,
   });
 
+  repository.db
+    .prepare("UPDATE transcript_segments SET superseded_by = NULL WHERE id = ?")
+    .run("repeat");
+  assert.equal(repository.getTranscriptSegment("repeat").superseded_by, null);
   assert.equal(reconciler.reconcileSession("session-1").superseded, 1);
   assert.deepEqual(reconciler.reconcileSession("session-1"), {
     inserted: 0,
@@ -196,7 +201,11 @@ test("final reconciliation preserves the strongest durable acoustic echo evidenc
     endedAt: 200,
   });
 
-  assert.equal(reconciler.reconcileSession("session-1").superseded, 2);
+  assert.deepEqual(reconciler.reconcileSession("session-1"), {
+    inserted: 0,
+    superseded: 0,
+    unchanged: 2,
+  });
   assert.equal(repository.getTranscriptSegment(finalSegment.id).echo_score, 0.92);
 });
 
@@ -218,17 +227,19 @@ test("a deterministic newest final wins regardless of insertion order", (t) => {
       channels: 1,
       startedAt: 0,
     });
-    repository.upsertTranscriptSegments(`session-${suffix}`, [{
-      id: `provisional-${suffix}`,
-      startedAt: 100,
-      endedAt: 200,
-      personId: null,
-      speakerLabel: "mic",
-      sourceType: "mic",
-      text: "preview",
-      confidence: 0.5,
-      isStable: true,
-    }]);
+    repository.upsertTranscriptSegments(`session-${suffix}`, [
+      {
+        id: `provisional-${suffix}`,
+        startedAt: 100,
+        endedAt: 200,
+        personId: null,
+        speakerLabel: "mic",
+        sourceType: "mic",
+        text: "preview",
+        confidence: 0.5,
+        isStable: true,
+      },
+    ]);
     const chunk = {
       id: `chunk-${suffix}`,
       sessionId: `session-${suffix}`,
@@ -245,12 +256,15 @@ test("a deterministic newest final wins regardless of insertion order", (t) => {
     repository.commitChunk(chunk);
     const finals = new Map();
     for (const version of order) {
-      finals.set(version, repository.commitChunkTranscript({
-        chunk: repository.getAudioChunk(chunk.id),
-        result: { text: version, confidence: 0.9 },
-        modelVersion: version,
-        completedAt: version === "older" ? 300 : 400,
-      }));
+      finals.set(
+        version,
+        repository.commitChunkTranscript({
+          chunk: repository.getAudioChunk(chunk.id),
+          result: { text: version, confidence: 0.9 },
+          modelVersion: version,
+          completedAt: version === "older" ? 300 : 400,
+        })
+      );
     }
     new TranscriptReconciler({ repository }).reconcileSession(`session-${suffix}`);
     return {
@@ -275,17 +289,19 @@ test("renderer snapshots cannot overwrite a colliding final id or delete stale f
     text: "authoritative final",
   });
 
-  repository.syncTranscriptSegments("session-1", [{
-    id: finalSegment.id,
-    startedAt: 300,
-    endedAt: 301,
-    personId: null,
-    speakerLabel: "mic",
-    sourceType: "mic",
-    text: "hostile stale preview",
-    confidence: 0.1,
-    isStable: true,
-  }]);
+  repository.syncTranscriptSegments("session-1", [
+    {
+      id: finalSegment.id,
+      startedAt: 300,
+      endedAt: 301,
+      personId: null,
+      speakerLabel: "mic",
+      sourceType: "mic",
+      text: "hostile stale preview",
+      confidence: 0.1,
+      isStable: true,
+    },
+  ]);
 
   assert.deepEqual(repository.getTranscriptSegment(finalSegment.id), finalSegment);
   assert.equal(repository.getTranscriptSegment("stale"), null);
@@ -315,10 +331,7 @@ test("inbound supersession lineage rejects target semantic mutation but permits 
   assert.equal(repository.getTranscriptSegment(finalSegment.id).text, "safe corrected text");
 
   for (const [name, sql] of [
-    [
-      "non-final target",
-      "UPDATE transcript_segments SET result_kind = 'provisional' WHERE id = ?",
-    ],
+    ["non-final target", "UPDATE transcript_segments SET result_kind = 'provisional' WHERE id = ?"],
     [
       "cross-track target",
       "UPDATE transcript_segments SET result_kind = 'provisional', track_id = 'track-system' WHERE id = ?",

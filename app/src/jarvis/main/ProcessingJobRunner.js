@@ -110,17 +110,7 @@ class ProcessingJobRunner {
     return this.store.recoverExpiredLeases(at);
   }
 
-  async runOnce(at = this.now(), { priorityBefore = Number.MAX_SAFE_INTEGER } = {}) {
-    this.recoverExpiredLeases(at);
-    const [job] = this.store.claimJobs({
-      owner: this.owner,
-      at,
-      leaseMs: this.leaseMs,
-      limit: 1,
-      priorityBefore,
-    });
-    if (!job) return 0;
-
+  async _executeClaimedJob(job, { permit = null } = {}) {
     const handler = this.handlers.get(job.job_type);
     if (!handler) {
       const blocked = this.store.blockJob(job.id, {
@@ -133,9 +123,8 @@ class ProcessingJobRunner {
     }
 
     let context = null;
-    let kind = null;
+    const kind = this.classifyJob(job);
     if (this.governor) {
-      kind = this.classifyJob(job);
       let snapshot;
       let admission;
       try {
@@ -165,7 +154,12 @@ class ProcessingJobRunner {
 
     try {
       const invoke = () => handler(job, context);
-      const result = this.heavyGate ? await this.heavyGate.run(kind, invoke) : await invoke();
+      let result;
+      if (permit !== null) {
+        result = await this.heavyGate.runWithinPermit(permit, kind, invoke);
+      } else {
+        result = this.heavyGate ? await this.heavyGate.run(kind, invoke) : await invoke();
+      }
       const executionDevice = context ? result?.executionDevice : null;
       if (context && executionDevice !== context.device) {
         throw codedError("EXECUTION_DEVICE_MISMATCH");
@@ -192,6 +186,47 @@ class ProcessingJobRunner {
       if (!retried) throw codedError("JOB_LEASE_LOST");
     }
     return 1;
+  }
+
+  async runOnce(at = this.now(), { priorityBefore = Number.MAX_SAFE_INTEGER } = {}) {
+    this.recoverExpiredLeases(at);
+    const [job] = this.store.claimJobs({
+      owner: this.owner,
+      at,
+      leaseMs: this.leaseMs,
+      limit: 1,
+      priorityBefore,
+    });
+    if (!job) return 0;
+    return this._executeClaimedJob(job);
+  }
+
+  async drainHigherPriorityWithinPermit(permit, { priorityBefore, at = this.now() } = {}) {
+    if (!this.heavyGate || typeof this.heavyGate.assertActivePermit !== "function") {
+      throw new Error("an active heavy-job gate is required");
+    }
+    if (!Number.isSafeInteger(priorityBefore) || priorityBefore <= 0) {
+      throw new RangeError("priorityBefore must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(at) || at < 0) {
+      throw new RangeError("at must be a non-negative safe integer");
+    }
+    this.heavyGate.assertActivePermit(permit);
+    this.recoverExpiredLeases(at);
+    let processed = 0;
+    for (;;) {
+      this.heavyGate.assertActivePermit(permit);
+      const claimAt = this.now();
+      const [job] = this.store.claimJobs({
+        owner: this.owner,
+        at: claimAt,
+        leaseMs: this.leaseMs,
+        limit: 1,
+        priorityBefore,
+      });
+      if (!job) return processed;
+      processed += await this._executeClaimedJob(job, { permit });
+    }
   }
 }
 

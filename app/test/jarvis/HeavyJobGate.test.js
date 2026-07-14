@@ -2,6 +2,16 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
 test("serializes heavy jobs with maximum concurrency one", async () => {
   const gate = new HeavyJobGate();
   let concurrent = 0;
@@ -146,4 +156,110 @@ test("preserves FIFO order among waiting jobs with the same priority", async () 
   await Promise.all([blocker, first, second]);
 
   assert.deepEqual(order, ["first", "second"]);
+});
+
+for (const kind of ["retention_urgent", "storage_recovery_compress"]) {
+  test(`lets preview drain late ${kind} inside its permit before preview and final`, async () => {
+    const gate = new HeavyJobGate();
+    const blockerStarted = deferred();
+    const releaseBlocker = deferred();
+    const order = [];
+    let urgentClaimable = false;
+
+    const blocker = gate.run("maintenance", async () => {
+      blockerStarted.resolve();
+      await releaseBlocker.promise;
+    });
+    await blockerStarted.promise;
+
+    const preview = gate.run("preview", async (permit) => {
+      gate.assertActivePermit(permit);
+      if (urgentClaimable) {
+        order.push(kind);
+        urgentClaimable = false;
+      }
+      gate.assertActivePermit(permit);
+      if (!urgentClaimable) {
+        order.push("preview");
+      }
+    });
+    const final = gate.run("final_transcription", () => order.push("final_transcription"));
+
+    urgentClaimable = true;
+    releaseBlocker.resolve();
+    await Promise.all([blocker, preview, final]);
+    assert.deepEqual(order, [kind, "preview", "final_transcription"]);
+  });
+}
+
+test("a durable job inserted after successful preview arbitration does not preempt active preview", async () => {
+  const gate = new HeavyJobGate();
+  const previewStarted = deferred();
+  const releasePreview = deferred();
+  const order = [];
+  let admissionChecks = 0;
+
+  const preview = gate.run("preview", async (permit) => {
+    gate.assertActivePermit(permit);
+    admissionChecks += 1;
+    if (admissionChecks === 1) {
+      order.push("preview:start");
+      previewStarted.resolve();
+      await releasePreview.promise;
+      order.push("preview:end");
+    }
+  });
+  await previewStarted.promise;
+  const urgent = gate.run("retention_urgent", () => order.push("retention_urgent"));
+  const final = gate.run("final_transcription", () => order.push("final_transcription"));
+
+  assert.deepEqual(order, ["preview:start"]);
+  releasePreview.resolve();
+  await Promise.all([preview, urgent, final]);
+
+  assert.equal(admissionChecks, 1);
+  assert.deepEqual(order, [
+    "preview:start",
+    "preview:end",
+    "retention_urgent",
+    "final_transcription",
+  ]);
+});
+
+test("rejects a forged or expired heavy-job permit", async () => {
+  const gate = new HeavyJobGate();
+  let expiredPermit;
+
+  assert.throws(() => gate.assertActivePermit({}), /permit/i);
+  await gate.run("preview", (permit) => {
+    expiredPermit = permit;
+    assert.doesNotThrow(() => gate.assertActivePermit(permit));
+  });
+  assert.throws(() => gate.assertActivePermit(expiredPermit), /permit/i);
+});
+
+test("permit work stays single-concurrency and accepts only higher-priority kinds", async () => {
+  const gate = new HeavyJobGate();
+  const innerStarted = deferred();
+  const releaseInner = deferred();
+
+  await gate.run("preview", async (permit) => {
+    const storage = gate.runWithinPermit(permit, "storage_recovery_compress", async () => {
+      innerStarted.resolve();
+      await releaseInner.promise;
+    });
+    await innerStarted.promise;
+    await assert.rejects(
+      gate.runWithinPermit(permit, "retention_urgent", () => undefined),
+      /already running/i
+    );
+    releaseInner.resolve();
+    await storage;
+    await assert.rejects(
+      gate.runWithinPermit(permit, "final_transcription", () => undefined),
+      /higher priority/i
+    );
+  });
+
+  assert.deepEqual(gate.getState(), { activeKind: null, queueLength: 0 });
 });

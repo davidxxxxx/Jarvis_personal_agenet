@@ -7,6 +7,16 @@ const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
 
 const BYTES_PER_MS = (24_000 * 2) / 1_000;
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
 function pcm(durationMs, value) {
   return Buffer.alloc(durationMs * BYTES_PER_MS, value);
 }
@@ -125,6 +135,53 @@ test("publishes only an atomically renamed preview WAV and removes it after fail
     /transcriber failed/
   );
 
+  assert.deepEqual(
+    fs.readdirSync(rootDir, { recursive: true }).filter((name) => /\.wav|\.tmp$/.test(name)),
+    []
+  );
+});
+
+test("clearSession waits across temporary publication and cannot race the atomic rename", async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-clear-race-"));
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+  const renameStarted = deferred();
+  const releaseRename = deferred();
+  const fsImpl = Object.create(fs);
+  const promises = Object.create(fs.promises);
+  promises.rename = async (...args) => {
+    renameStarted.resolve();
+    await releaseRename.promise;
+    return fs.promises.rename(...args);
+  };
+  Object.defineProperty(fsImpl, "promises", { value: promises });
+  const ring = new PreviewAudioRing({ rootDir, fsImpl });
+  ring.append({
+    sessionId: "s1",
+    trackId: "track-mic",
+    sourceType: "mic",
+    fromMs: 0,
+    throughMs: 1_000,
+    pcm: pcm(1_000, 3),
+  });
+
+  const snapshot = ring.withPreviewWav(
+    { sessionId: "s1", trackId: "track-mic", fromMs: 0, throughMs: 1_000 },
+    () => undefined
+  );
+  await renameStarted.promise;
+  let cleared = false;
+  const cleanup = ring.clearSession("s1").then(() => {
+    cleared = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(cleared, false);
+  assert.equal(
+    [...ring.activeFiles].some((candidate) => candidate.endsWith(".tmp")),
+    true
+  );
+  releaseRename.resolve();
+  await Promise.all([snapshot, cleanup]);
   assert.deepEqual(
     fs.readdirSync(rootDir, { recursive: true }).filter((name) => /\.wav|\.tmp$/.test(name)),
     []

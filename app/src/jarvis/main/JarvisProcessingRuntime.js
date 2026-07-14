@@ -432,6 +432,7 @@ class JarvisProcessingRuntime {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
     this.running = false;
+    this.previewScheduler?.stop?.();
     if (this.timer !== null) {
       this.clearInterval(this.timer);
       this.timer = null;
@@ -513,6 +514,13 @@ function createJarvisProcessingRuntime({
     throw new TypeError("previewPersist must be a function or null");
   }
   const transcribeWav = ipcHandlers.createJarvisTranscribeWavAdapter({ model: configuredModel });
+  const runner = new ProcessingJobRunner({
+    store: repository.captureEvidenceStore,
+    owner,
+    now,
+    governor: effectiveGovernor,
+    heavyGate: effectiveGate,
+  });
   const effectivePreviewScheduler =
     previewScheduler ??
     new PreviewTranscriptionScheduler({
@@ -527,6 +535,10 @@ function createJarvisProcessingRuntime({
         previewPersist ??
         (({ sessionId, segments }) => repository.upsertTranscriptSegments(sessionId, segments)),
       heavyGate: effectiveGate,
+      beforePreviewStart: (permit) =>
+        runner.drainHigherPriorityWithinPermit(permit, {
+          priorityBefore: JOB_PRIORITY.preview,
+        }),
       now,
     });
   const effectiveWhisperController =
@@ -543,13 +555,6 @@ function createJarvisProcessingRuntime({
     transcribeWav,
     modelVersion: configuredModel,
     now,
-  });
-  const runner = new ProcessingJobRunner({
-    store: repository.captureEvidenceStore,
-    owner,
-    now,
-    governor: effectiveGovernor,
-    heavyGate: effectiveGate,
   });
   runner.register("transcribe_chunk", (job, context) => worker.handle(job, context));
   runner.register("compress_chunk", async (job) => {
