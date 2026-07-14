@@ -193,11 +193,12 @@ export function mapStableSegments(
 ): JarvisTranscriptSegmentInput[] {
   return segments.map((segment) => {
     const timestamp = safeTimestamp(segment.timestamp, fallbackTimestamp);
+    const startedAt = Math.min(timestamp, Number.MAX_SAFE_INTEGER - 1);
     const personId = safePersonId(segment.speaker);
     return {
       id: createStableSegmentId(sessionId, segment.id),
-      startedAt: timestamp,
-      endedAt: timestamp < Number.MAX_SAFE_INTEGER ? timestamp + 1 : timestamp,
+      startedAt,
+      endedAt: startedAt + 1,
       personId,
       speakerLabel: segment.speakerName ?? segment.speaker ?? segment.source,
       sourceType: segment.source,

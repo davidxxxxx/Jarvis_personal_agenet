@@ -134,6 +134,28 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
         AND final.started_at < NEW.ended_at
     );
   END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_supersession_target_update
+  BEFORE UPDATE OF session_id, track_id, started_at, ended_at, result_kind
+  ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1 FROM transcript_segments AS source
+    WHERE source.superseded_by = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript supersession target')
+    WHERE NEW.result_kind <> 'final'
+      OR EXISTS (
+        SELECT 1
+        FROM transcript_segments AS source
+        WHERE source.superseded_by = OLD.id
+          AND (
+            source.session_id <> NEW.session_id
+            OR source.track_id IS NOT NEW.track_id
+            OR source.started_at >= NEW.ended_at
+            OR NEW.started_at >= source.ended_at
+          )
+      );
+  END;
 `;
 
 const PROCESSING_JOBS_SCHEMA = `
@@ -238,33 +260,48 @@ function tableExists(db, table) {
   );
 }
 
-function rebuildTranscriptSegmentsV13(db) {
+function rebuildTranscriptSegmentsV13(db, { preserveLineage = false } = {}) {
   if (!tableExists(db, "transcript_segments")) return;
   const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
   db.exec(transcriptSegmentsSchema("transcript_segments_v13"));
-  db.exec(`
-    INSERT INTO transcript_segments_v13 (
-      id, session_id, started_at, ended_at, person_id, speaker_label,
-      text, confidence, is_stable, analysis_state, track_id, chunk_id,
-      source_type, result_kind, version, model_version, completed_at
-    )
-    SELECT
-      id, session_id, started_at, ended_at,
-      CASE
-        WHEN person_id IS NULL OR EXISTS (SELECT 1 FROM people WHERE people.id = person_id)
-          THEN person_id
-        ELSE NULL
-      END,
-      speaker_label, text,
-      CASE
-        WHEN typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
-          THEN confidence
-        ELSE NULL
-      END,
-      CASE WHEN typeof(is_stable) = 'integer' AND is_stable IN (0,1) THEN is_stable ELSE 0 END,
-      analysis_state, NULL, NULL, 'mic', 'provisional', 1, NULL, NULL
-    FROM transcript_segments;
-  `);
+  if (preserveLineage) {
+    db.exec(`
+      INSERT INTO transcript_segments_v13 (
+        id, session_id, started_at, ended_at, person_id, speaker_label,
+        text, confidence, is_stable, analysis_state, track_id, chunk_id,
+        source_type, result_kind, version, model_version, completed_at, superseded_by
+      )
+      SELECT
+        id, session_id, started_at, ended_at, person_id, speaker_label,
+        text, confidence, is_stable, analysis_state, track_id, chunk_id,
+        source_type, result_kind, version, model_version, completed_at, NULL
+      FROM transcript_segments;
+    `);
+  } else {
+    db.exec(`
+      INSERT INTO transcript_segments_v13 (
+        id, session_id, started_at, ended_at, person_id, speaker_label,
+        text, confidence, is_stable, analysis_state, track_id, chunk_id,
+        source_type, result_kind, version, model_version, completed_at
+      )
+      SELECT
+        id, session_id, started_at, ended_at,
+        CASE
+          WHEN person_id IS NULL OR EXISTS (SELECT 1 FROM people WHERE people.id = person_id)
+            THEN person_id
+          ELSE NULL
+        END,
+        speaker_label, text,
+        CASE
+          WHEN typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+            THEN confidence
+          ELSE NULL
+        END,
+        CASE WHEN typeof(is_stable) = 'integer' AND is_stable IN (0,1) THEN is_stable ELSE 0 END,
+        analysis_state, NULL, NULL, 'mic', 'provisional', 1, NULL, NULL
+      FROM transcript_segments;
+    `);
+  }
   db.exec(`
     DROP INDEX IF EXISTS idx_segments_session_time;
     DROP INDEX IF EXISTS idx_segments_superseded_by;
@@ -273,6 +310,7 @@ function rebuildTranscriptSegmentsV13(db) {
     DROP TRIGGER IF EXISTS validate_final_transcript_lineage_update;
     DROP TRIGGER IF EXISTS validate_transcript_supersession_insert;
     DROP TRIGGER IF EXISTS validate_transcript_supersession_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_target_update;
   `);
   try {
     db.pragma("legacy_alter_table = ON");
@@ -429,7 +467,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
-    rebuildTranscriptSegmentsV13(db);
+    rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
     addColumn(db, "audio_gaps", "restored_device_id TEXT");
     addColumn(db, "audio_gaps", "restored_device_label TEXT");
     addColumn(db, "audio_gaps", "restored_strategy TEXT");

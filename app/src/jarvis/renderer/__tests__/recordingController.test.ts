@@ -9,6 +9,7 @@ import type { SessionState, SessionStatus } from "../sessionMachine";
 import {
   createRecordingController,
   applyRecordingRetentionMode,
+  mapStableSegments,
   recordingArgs,
   resolveJarvisWhisperModel,
   routeJarvisControl,
@@ -48,6 +49,22 @@ describe("Jarvis capture argument mapping", () => {
       });
     }
   );
+});
+
+describe("Jarvis provisional transcript intervals", () => {
+  it("keeps a one millisecond safe-integer interval at the maximum timestamp", () => {
+    expect(
+      mapStableSegments(
+        "session-1",
+        [{ id: "max", text: "tail", source: "mic", timestamp: Number.MAX_SAFE_INTEGER }],
+        0
+      )[0]
+    ).toMatchObject({
+      startedAt: Number.MAX_SAFE_INTEGER - 1,
+      endedAt: Number.MAX_SAFE_INTEGER,
+      sourceType: "mic",
+    });
+  });
 });
 
 const stableSegment: TranscriptSegment = {

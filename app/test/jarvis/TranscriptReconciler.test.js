@@ -266,3 +266,77 @@ test("renderer snapshots cannot overwrite a colliding final id or delete stale f
   repository.syncTranscriptSegments("session-1", []);
   assert.deepEqual(repository.getTranscriptSegment(finalSegment.id), finalSegment);
 });
+
+test("inbound supersession lineage rejects target semantic mutation but permits safe updates", (t) => {
+  const { repository, reconciler } = fixture(t, { sources: ["mic", "system"] });
+  provisional(repository, { id: "guarded-preview", startedAt: 100, endedAt: 200 });
+  const finalSegment = final(repository, {
+    chunkId: "guarded-final",
+    startedAt: 100,
+    endedAt: 200,
+  });
+  reconciler.reconcileSession("session-1");
+  repository.createSession({
+    id: "session-other",
+    startedAt: 0,
+    micDeviceId: null,
+    captureMode: "system",
+  });
+
+  repository.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("safe corrected text", finalSegment.id);
+  assert.equal(repository.getTranscriptSegment(finalSegment.id).text, "safe corrected text");
+
+  for (const [name, sql] of [
+    [
+      "non-final target",
+      "UPDATE transcript_segments SET result_kind = 'provisional' WHERE id = ?",
+    ],
+    [
+      "cross-track target",
+      "UPDATE transcript_segments SET result_kind = 'provisional', track_id = 'track-system' WHERE id = ?",
+    ],
+    [
+      "cross-session target",
+      "UPDATE transcript_segments SET result_kind = 'provisional', session_id = 'session-other' WHERE id = ?",
+    ],
+    [
+      "non-overlapping target",
+      "UPDATE transcript_segments SET result_kind = 'provisional', started_at = 300, ended_at = 400 WHERE id = ?",
+    ],
+  ]) {
+    assert.throws(
+      () => repository.db.prepare(sql).run(finalSegment.id),
+      /invalid transcript supersession target/,
+      name
+    );
+  }
+  assert.throws(
+    () =>
+      repository.db
+        .prepare("UPDATE transcript_segments SET track_id = 'track-system' WHERE id = ?")
+        .run("guarded-preview"),
+    /invalid transcript supersession/,
+    "source-row guard remains active"
+  );
+});
+
+test("deleting a final target clears the self-FK and makes preserved preview history visible", (t) => {
+  const { repository, reconciler } = fixture(t);
+  provisional(repository, { id: "delete-preview", startedAt: 100, endedAt: 200 });
+  const finalSegment = final(repository, {
+    chunkId: "delete-final",
+    startedAt: 100,
+    endedAt: 200,
+  });
+  reconciler.reconcileSession("session-1");
+
+  repository.db.prepare("DELETE FROM transcript_segments WHERE id = ?").run(finalSegment.id);
+
+  assert.equal(repository.getTranscriptSegment("delete-preview").superseded_by, null);
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    ["delete-preview"]
+  );
+});

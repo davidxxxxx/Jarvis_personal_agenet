@@ -846,3 +846,162 @@ test("upgrades v11 transcript rows with final-evidence lineage columns", () => {
     db.close();
   }
 });
+
+test("v13 preserves every valid v12 final field, dependent evidence, and semantic guards", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE people (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        is_self INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE audio_tracks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL,
+        device_id TEXT,
+        device_label TEXT,
+        strategy TEXT,
+        sample_rate INTEGER NOT NULL,
+        channels INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        state TEXT NOT NULL,
+        UNIQUE(session_id, source_type)
+      );
+      CREATE TABLE audio_chunks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        path TEXT NOT NULL UNIQUE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        transcription_status TEXT NOT NULL DEFAULT 'pending',
+        track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL DEFAULT 'mic',
+        sequence_number INTEGER NOT NULL DEFAULT 0,
+        write_state TEXT NOT NULL DEFAULT 'committed',
+        deleted_at INTEGER,
+        format TEXT NOT NULL DEFAULT 'wav',
+        file_sha256 TEXT,
+        sample_rate INTEGER NOT NULL DEFAULT 24000,
+        channels INTEGER NOT NULL DEFAULT 1,
+        retired_path TEXT,
+        retired_format TEXT,
+        retired_file_sha256 TEXT
+      );
+      CREATE TABLE transcript_segments (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+        speaker_label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL,
+        is_stable INTEGER NOT NULL,
+        analysis_state TEXT NOT NULL DEFAULT 'pending',
+        track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL DEFAULT 'mic',
+        result_kind TEXT NOT NULL DEFAULT 'provisional',
+        version INTEGER NOT NULL DEFAULT 1,
+        model_version TEXT,
+        completed_at INTEGER
+      );
+      CREATE TABLE segment_links (
+        id TEXT PRIMARY KEY,
+        segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE
+      );
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('v12-session', 10, 300, 'completed', 10);
+      INSERT INTO people (id, display_name, created_at, last_seen_at)
+      VALUES ('person-1', 'Alice', 10, 200);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, device_label, strategy,
+        sample_rate, channels, started_at, ended_at, state
+      ) VALUES (
+        'v12-track', 'v12-session', 'system', 'PC audio', 'wasapi-loopback',
+        24000, 1, 10, 300, 'ended'
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, write_state, format, file_sha256, sample_rate, channels
+      ) VALUES (
+        'v12-chunk', 'v12-session', 'v12-track', 'system', 4, 'v12.wav',
+        100, 200, 100, 'pcm-v12', 1000,
+        'completed', 'committed', 'wav', 'file-v12', 24000, 1
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label,
+        text, confidence, is_stable, analysis_state, track_id, chunk_id,
+        source_type, result_kind, version, model_version, completed_at
+      ) VALUES (
+        'v12-final', 'v12-session', 100, 200, 'person-1', 'Alice',
+        'preserve exact final', 0.87, 1, 'ready', 'v12-track', 'v12-chunk',
+        'system', 'final', 7, 'large-v3-turbo-v7', 250
+      );
+      INSERT INTO segment_links (id, segment_id) VALUES ('evidence-1', 'v12-final');
+      PRAGMA user_version = 12;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 12, toVersion: TARGET_VERSION });
+    assert.deepEqual(db.prepare("SELECT * FROM transcript_segments WHERE id = ?").get("v12-final"), {
+      id: "v12-final",
+      session_id: "v12-session",
+      started_at: 100,
+      ended_at: 200,
+      person_id: "person-1",
+      speaker_label: "Alice",
+      text: "preserve exact final",
+      confidence: 0.87,
+      is_stable: 1,
+      analysis_state: "ready",
+      track_id: "v12-track",
+      chunk_id: "v12-chunk",
+      source_type: "system",
+      result_kind: "final",
+      version: 7,
+      model_version: "large-v3-turbo-v7",
+      completed_at: 250,
+      superseded_by: null,
+    });
+    assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
+      { id: "evidence-1", segment_id: "v12-final" },
+    ]);
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+
+    db.prepare(`
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text,
+        confidence, is_stable, track_id, source_type, superseded_by
+      ) VALUES (
+        'migrated-preview', 'v12-session', 120, 180, 'system', 'preview',
+        0.5, 1, 'v12-track', 'system', 'v12-final'
+      )
+    `).run();
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE transcript_segments SET result_kind = 'provisional' WHERE id = ?")
+          .run("v12-final"),
+      /invalid transcript supersession target/
+    );
+  } finally {
+    db.close();
+  }
+});
