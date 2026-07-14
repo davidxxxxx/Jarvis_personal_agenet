@@ -210,6 +210,7 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
   const handlers = new Map();
   const timeline = {
     session_id: "s1",
+    status: "recording",
     tracks: [],
     gaps: [],
     chunks: [
@@ -232,6 +233,20 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
     service: createService(),
     voiceEnrollmentService: createVoiceEnrollmentService(),
     environmentManager: { getOpenAIKey: () => null },
+    processingLifecycle: {
+      runtime: {
+        previewStatus: () => ({
+          mode: "degraded",
+          cadenceMs: 60_000,
+          pending: 1,
+          running: 0,
+          pausedReason: null,
+          executionDevice: "cuda",
+          lastError: null,
+          recordingContinues: true,
+        }),
+      },
+    },
   });
 
   const result = handlers.get(CHANNELS.getSessionTimeline)(null, "s1");
@@ -240,6 +255,61 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
   assert.equal(Object.hasOwn(result.chunks[0], "retired_path"), false);
   assert.equal(Object.hasOwn(result.chunks[0], "retired_format"), false);
   assert.equal(Object.hasOwn(result.chunks[0], "retired_file_sha256"), false);
+  assert.equal(result.preview_status.mode, "degraded");
+  assert.equal(result.preview_status.cadenceMs, 60_000);
+});
+
+test("session timeline IPC does not leak live preview status into paused or historical sessions", () => {
+  const handlers = new Map();
+  const timeline = (sessionId, status, processingState = "processing") => ({
+    session_id: sessionId,
+    status,
+    processing_state: processingState,
+    tracks: [],
+    gaps: [],
+    chunks: [],
+    segments: [],
+    processing_counts: {
+      pending: 0,
+      leased: 0,
+      retry: 0,
+      blocked: 0,
+      completed: 1,
+      total: 1,
+    },
+  });
+  const timelines = new Map([
+    ["s1", timeline("s1", "recording")],
+    ["s2", timeline("s2", "paused")],
+    ["s3", timeline("s3", "completed", "ready")],
+  ]);
+
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({ getSessionTimeline: (sessionId) => timelines.get(sessionId) }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    processingLifecycle: {
+      runtime: {
+        previewStatus: () => ({
+          mode: "normal",
+          cadenceMs: 30_000,
+          pending: 1,
+          running: 0,
+          pausedReason: null,
+          executionDevice: "cuda",
+          lastError: null,
+          recordingContinues: true,
+        }),
+      },
+    },
+  });
+
+  const getTimeline = handlers.get(CHANNELS.getSessionTimeline);
+  assert.equal(getTimeline(null, "s1").preview_status.mode, "normal");
+  assert.equal(getTimeline(null, "s2").preview_status, null);
+  assert.equal(getTimeline(null, "s3").preview_status, null);
 });
 
 test("retired provenance is private at audio IPC boundaries", () => {

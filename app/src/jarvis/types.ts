@@ -209,6 +209,19 @@ export interface JarvisProcessingJobCounts {
   total: number;
 }
 
+export type JarvisPreviewMode = "normal" | "degraded" | "paused";
+
+export interface JarvisPreviewStatus {
+  mode: JarvisPreviewMode;
+  cadenceMs: number | null;
+  pending: number;
+  running: number;
+  pausedReason: string | null;
+  executionDevice: "cuda" | "cpu" | null;
+  lastError: string | null;
+  recordingContinues: true;
+}
+
 export interface JarvisSessionTimeline {
   session_id: string;
   started_at: number;
@@ -223,6 +236,7 @@ export interface JarvisSessionTimeline {
   chunks: JarvisAudioChunk[];
   segments: JarvisTranscriptSegment[];
   processing_counts: JarvisProcessingJobCounts;
+  preview_status?: JarvisPreviewStatus | null;
 }
 
 export interface JarvisSessionSummary {
@@ -363,14 +377,7 @@ export interface JarvisCloudBudgetInput {
 export type JarvisStorageState = "ok" | "warning" | "stopped";
 
 export interface JarvisStorageProgress {
-  state:
-    | "starting"
-    | "copying"
-    | "verifying"
-    | "activating"
-    | "rollback"
-    | "complete"
-    | "failed";
+  state: "starting" | "copying" | "verifying" | "activating" | "rollback" | "complete" | "failed";
   completedFiles: number;
   totalFiles: number;
 }

@@ -43,9 +43,7 @@ describe("ProcessingStatus", () => {
 
   it("shows only persisted ready as complete", () => {
     render(
-      <ProcessingStatus
-        timeline={timeline({ processing_state: "ready", ready_at: 2_500 })}
-      />
+      <ProcessingStatus timeline={timeline({ processing_state: "ready", ready_at: 2_500 })} />
     );
 
     expect(screen.getByText("处理完成")).toBeInTheDocument();
@@ -121,6 +119,66 @@ describe("ProcessingStatus", () => {
       expect(screen.getByRole("status")).toBeInTheDocument();
       expect(screen.getByRole("alert")).toHaveTextContent("2");
       expect(screen.queryByText("处理完成")).not.toBeInTheDocument();
+    }
+  );
+
+  it.each([
+    ["normal", 30_000, null, /实时预览每 30 秒更新，录音继续/],
+    ["degraded", 60_000, null, /实时预览已降频.*每 60 秒.*录音继续/],
+    ["paused", null, "gpu_busy", /实时预览已暂停，录音继续/],
+  ] as const)(
+    "shows typed %s preview status separately from final job counts",
+    (mode, cadenceMs, pausedReason, label) => {
+      render(
+        <ProcessingStatus
+          timeline={timeline({
+            status: "recording",
+            preview_status: {
+              mode,
+              cadenceMs,
+              pending: 1,
+              running: 0,
+              pausedReason,
+              executionDevice: mode === "paused" ? null : "cuda",
+              lastError: null,
+              recordingContinues: true,
+            },
+          })}
+        />
+      );
+
+      expect(screen.getByText(label)).toBeInTheDocument();
+    }
+  );
+
+  it.each([
+    ["paused", "processing"],
+    ["finalizing", "processing"],
+    ["completed", "ready"],
+  ] as const)(
+    "does not claim recording continues for a %s session in %s processing state",
+    (status, processingState) => {
+      render(
+        <ProcessingStatus
+          timeline={timeline({
+            status,
+            processing_state: processingState,
+            ready_at: processingState === "ready" ? 2_500 : null,
+            preview_status: {
+              mode: "normal",
+              cadenceMs: 30_000,
+              pending: 1,
+              running: 0,
+              pausedReason: null,
+              executionDevice: "cuda",
+              lastError: null,
+              recordingContinues: true,
+            },
+          })}
+        />
+      );
+
+      expect(screen.queryByText(/录音继续/)).not.toBeInTheDocument();
     }
   );
 });

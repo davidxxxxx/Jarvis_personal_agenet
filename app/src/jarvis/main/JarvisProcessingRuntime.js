@@ -4,6 +4,8 @@ const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const ResourceGovernor = require("./ResourceGovernor");
 const HeavyJobGate = require("./HeavyJobGate");
+const PreviewTranscriptionScheduler = require("./PreviewTranscriptionScheduler");
+const { createHash } = require("node:crypto");
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
@@ -15,6 +17,115 @@ function positiveSafeInteger(value, name) {
     throw new RangeError(`${name} must be a positive safe integer`);
   }
   return value;
+}
+
+function createCommittedAudioPreviewExecutor({ repository, audioEvidenceReader, transcribeWav }) {
+  if (
+    typeof repository?.getSession !== "function" ||
+    typeof repository?.listAudioChunks !== "function" ||
+    typeof repository?.listTranscriptHistory !== "function"
+  ) {
+    throw new TypeError("repository preview audio APIs are required");
+  }
+  if (!audioEvidenceReader || typeof audioEvidenceReader.withVerifiedWav !== "function") {
+    throw new TypeError("audioEvidenceReader.withVerifiedWav must be a function");
+  }
+  if (typeof transcribeWav !== "function") throw new TypeError("transcribeWav must be a function");
+  return async ({
+    sessionId,
+    trackId,
+    fromMs,
+    throughMs,
+    executionDevice,
+    selectedGpuUuid,
+    cpuThreads,
+    lowPriority,
+  }) => {
+    const session = repository.getSession(sessionId);
+    if (!session) throw new Error("preview session is unavailable");
+    const absoluteFrom = session.started_at + fromMs;
+    const absoluteThrough = session.started_at + throughMs;
+    const prompt = repository
+      .listTranscriptHistory(sessionId)
+      .filter(
+        (segment) =>
+          segment.track_id === trackId &&
+          segment.superseded_by === null &&
+          segment.duplicate_of === null &&
+          segment.ended_at > absoluteFrom &&
+          segment.started_at < absoluteThrough &&
+          typeof segment.text === "string" &&
+          segment.text.trim()
+      )
+      .map((segment) => segment.text.trim())
+      .join(" ");
+    const chunks = repository
+      .listAudioChunks(sessionId)
+      .filter((chunk) => {
+        const chunkTrackId = chunk.track_id ?? chunk.trackId;
+        const startedAt = chunk.started_at ?? chunk.startedAt;
+        const endedAt = chunk.ended_at ?? chunk.endedAt;
+        return (
+          chunkTrackId === trackId &&
+          chunk.deleted_at == null &&
+          (chunk.write_state ?? "committed") === "committed" &&
+          startedAt >= absoluteFrom &&
+          endedAt <= absoluteThrough &&
+          endedAt > startedAt
+        );
+      })
+      .sort(
+        (left, right) => (left.started_at ?? left.startedAt) - (right.started_at ?? right.startedAt)
+      );
+    const segments = [];
+    for (const chunk of chunks) {
+      const raw = await audioEvidenceReader.withVerifiedWav(chunk, (verifiedPath) =>
+        transcribeWav({
+          path: verifiedPath,
+          language: null,
+          initialPrompt: prompt,
+          executionContext: {
+            device: executionDevice,
+            selectedGpuUuid: executionDevice === "cuda" ? selectedGpuUuid : null,
+            cpuThreads,
+            lowPriority,
+          },
+        })
+      );
+      if (raw?.executionDevice !== executionDevice) {
+        throw new Error("EXECUTION_DEVICE_MISMATCH");
+      }
+      if (raw?.noSpeech === true) continue;
+      if (raw?.success === false || typeof raw?.text !== "string") {
+        throw new Error("TRANSCRIPTION_INVALID_RESULT");
+      }
+      const text = raw.text.replace(/\s+/gu, " ").trim();
+      if (!text) continue;
+      const confidence = raw.confidence ?? 0;
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        throw new Error("TRANSCRIPTION_INVALID_RESULT");
+      }
+      const startedAt = chunk.started_at ?? chunk.startedAt;
+      const endedAt = chunk.ended_at ?? chunk.endedAt;
+      const sourceType = chunk.source_type ?? chunk.sourceType ?? "mic";
+      const id = `preview_${createHash("sha256")
+        .update(`${sessionId}\u0000${trackId}\u0000${chunk.id}\u0000${throughMs}`)
+        .digest("hex")
+        .slice(0, 32)}`;
+      segments.push({
+        id,
+        startedAt,
+        endedAt,
+        personId: null,
+        speakerLabel: sourceType,
+        sourceType,
+        text,
+        confidence,
+        isStable: false,
+      });
+    }
+    return { segments };
+  };
 }
 
 class JarvisProcessingRuntime {
@@ -34,6 +145,7 @@ class JarvisProcessingRuntime {
     governor = null,
     whisperController = null,
     startupBarrier = null,
+    previewScheduler = null,
   } = {}) {
     if (
       !runner ||
@@ -74,6 +186,14 @@ class JarvisProcessingRuntime {
     ) {
       throw new TypeError("whisperController must implement isIdle and stop");
     }
+    if (
+      previewScheduler !== null &&
+      (typeof previewScheduler.request !== "function" ||
+        typeof previewScheduler.tick !== "function" ||
+        typeof previewScheduler.status !== "function")
+    ) {
+      throw new TypeError("previewScheduler must implement request, tick, and status");
+    }
 
     this.runner = runner;
     this.repository = repository;
@@ -90,11 +210,13 @@ class JarvisProcessingRuntime {
     this.governor = governor;
     this.whisperController = whisperController;
     this.startupBarrier = startupBarrier;
+    this.previewScheduler = previewScheduler;
     this.restrictiveReleaseLatched = false;
     this.timer = null;
     this.inFlight = null;
     this.startPromise = null;
     this.stopPromise = null;
+    this.previewInFlight = null;
     this.stopping = false;
     this.running = true;
     this.sessionCursor = null;
@@ -133,6 +255,15 @@ class JarvisProcessingRuntime {
     });
     const wrapped = this.inFlight;
     return wrapped;
+  }
+
+  requestPreview(input) {
+    if (!this.previewScheduler) throw new Error("preview scheduler is not configured");
+    return this.previewScheduler.request(input);
+  }
+
+  previewStatus() {
+    return this.previewScheduler?.status() ?? null;
   }
 
   _hasDrainBudget(startedAt) {
@@ -179,12 +310,12 @@ class JarvisProcessingRuntime {
   }
 
   async _releaseIdleWhisperUnderPressure() {
-    if (!this.governor) return;
+    if (!this.governor) return null;
     try {
       const snapshot = await this.governor.sample();
       if (snapshot?.state === "available") {
         this.restrictiveReleaseLatched = false;
-        return;
+        return snapshot;
       }
       if (
         this.restrictiveReleaseLatched ||
@@ -192,13 +323,29 @@ class JarvisProcessingRuntime {
         (snapshot?.restrictiveForMs ?? 0) < 60_000 ||
         !(await this.whisperController.isIdle())
       ) {
-        return;
+        return snapshot;
       }
       await this.whisperController.stop();
       this.restrictiveReleaseLatched = true;
+      return snapshot;
     } catch (error) {
       this.log({ phase: "resource_release", error });
+      return null;
     }
+  }
+
+  _tickPreview(resourceSnapshot) {
+    if (!this.previewScheduler || this.previewInFlight) return;
+    const operation = Promise.resolve(this.previewScheduler.tick(resourceSnapshot)).catch(
+      (error) => {
+        this.log({ phase: "preview", error });
+        return 0;
+      }
+    );
+    const wrapped = operation.finally(() => {
+      if (this.previewInFlight === wrapped) this.previewInFlight = null;
+    });
+    this.previewInFlight = wrapped;
   }
 
   async _runSessionPhase(sessions, startedAt, limit, visited) {
@@ -228,7 +375,8 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
-    await this._releaseIdleWhisperUnderPressure();
+    const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
+    this._tickPreview(resourceSnapshot);
     const sessionsFirst = this.sessionPhaseFirst;
     this.sessionPhaseFirst = !this.sessionPhaseFirst;
     const candidatesBefore = this._listProcessingWindow(this.maxSessionsPerDrain);
@@ -270,7 +418,10 @@ class JarvisProcessingRuntime {
       this.clearInterval(this.timer);
       this.timer = null;
     }
-    this.stopPromise = Promise.resolve(this.inFlight).then(() => undefined);
+    this.stopPromise = Promise.all([
+      Promise.resolve(this.inFlight),
+      Promise.resolve(this.previewInFlight),
+    ]).then(() => undefined);
     return this.stopPromise;
   }
 }
@@ -289,6 +440,9 @@ function createJarvisProcessingRuntime({
   cpuProvider,
   powerProvider,
   previewEnabled = true,
+  previewExecutor = null,
+  previewPersist = null,
+  previewScheduler = null,
   whisperController = null,
   ...runtimeOptions
 } = {}) {
@@ -335,6 +489,29 @@ function createJarvisProcessingRuntime({
       },
     });
   const effectiveGate = heavyGate ?? new HeavyJobGate();
+  if (previewExecutor !== null && typeof previewExecutor !== "function") {
+    throw new TypeError("previewExecutor must be a function or null");
+  }
+  if (previewPersist !== null && typeof previewPersist !== "function") {
+    throw new TypeError("previewPersist must be a function or null");
+  }
+  const transcribeWav = ipcHandlers.createJarvisTranscribeWavAdapter({ model: configuredModel });
+  const effectivePreviewScheduler =
+    previewScheduler ??
+    new PreviewTranscriptionScheduler({
+      executePreview:
+        previewExecutor ??
+        createCommittedAudioPreviewExecutor({
+          repository,
+          audioEvidenceReader: service.audioEvidenceReader,
+          transcribeWav,
+        }),
+      persistProvisional:
+        previewPersist ??
+        (({ sessionId, segments }) => repository.upsertTranscriptSegments(sessionId, segments)),
+      heavyGate: effectiveGate,
+      now,
+    });
   const effectiveWhisperController =
     whisperController ??
     (whisperManager
@@ -346,7 +523,7 @@ function createJarvisProcessingRuntime({
   const worker = new JarvisTranscriptionWorker({
     repository,
     audioEvidenceReader: service.audioEvidenceReader,
-    transcribeWav: ipcHandlers.createJarvisTranscribeWavAdapter({ model: configuredModel }),
+    transcribeWav,
     modelVersion: configuredModel,
     now,
   });
@@ -373,6 +550,7 @@ function createJarvisProcessingRuntime({
     log,
     governor: effectiveGovernor,
     whisperController: effectiveWhisperController,
+    previewScheduler: effectivePreviewScheduler,
     ...runtimeOptions,
     startupBarrier,
   });
@@ -381,4 +559,5 @@ function createJarvisProcessingRuntime({
 module.exports = {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
+  createCommittedAudioPreviewExecutor,
 };

@@ -99,6 +99,7 @@ function registerJarvisIpc({
   audioEvidenceReader,
   storageManager,
   pickStorageDirectory,
+  processingLifecycle = null,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -191,7 +192,15 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId) => {
     const timeline = repository.getSessionTimeline(assertId(sessionId, "sessionId"));
     if (!timeline) return null;
-    return { ...timeline, chunks: timeline.chunks.map(toPublicAudioChunk) };
+    const previewStatus =
+      timeline.status === "recording"
+        ? (processingLifecycle?.runtime?.previewStatus?.() ?? null)
+        : null;
+    return {
+      ...timeline,
+      chunks: timeline.chunks.map(toPublicAudioChunk),
+      preview_status: previewStatus,
+    };
   });
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
     if (typeof query !== "string") throw new TypeError("query must be a string");

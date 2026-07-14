@@ -435,6 +435,32 @@ test("an explicit recordings directory controls disk checks and audio paths", ()
   }
 });
 
+test("committed capture audio notifies the preview requester after durable commit", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-request-"));
+  const repository = createRepository();
+  const notifications = [];
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_100,
+    fsImpl: createSafeFs(),
+    onChunkCommitted: (chunk) => notifications.push(chunk),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(4_800, 1));
+    service.finishCapture("s1", 1_100);
+
+    assert.equal(repository.chunks.length, 1);
+    assert.deepEqual(notifications, [repository.chunks[0]]);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
 test("reconfigures every evidence holder only while capture is inactive", () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reconfigure-"));
   const nextRoot = path.join(userDataDir, "next-recordings");
@@ -731,7 +757,10 @@ test("persists a low-disk pause record when the emergency chunk commit and pause
     assert.equal(repository.sessions.get("s1").status, "paused");
     assert.equal(repository.sessions.get("s1").stop_reason, "capture_stopped_low_disk");
     assert.equal(repository.sessions.get("s1").durable_boundary_at, 1_100);
-    assert.equal(repository.tracks.every((track) => ["paused", "recovering"].includes(track.state)), true);
+    assert.equal(
+      repository.tracks.every((track) => ["paused", "recovering"].includes(track.state)),
+      true
+    );
     assert.deepEqual(fs.readdirSync(recoveryDir), []);
   } finally {
     service.shutdown();
@@ -1865,9 +1894,7 @@ test("disk failure while interrupting safe-stops with a recoverable open gap", (
       1
     );
     assert.deepEqual(
-      repository.db
-        .prepare("SELECT DISTINCT state FROM audio_tracks ORDER BY state")
-        .all(),
+      repository.db.prepare("SELECT DISTINCT state FROM audio_tracks ORDER BY state").all(),
       [{ state: "paused" }, { state: "recovering" }]
     );
   } finally {

@@ -542,6 +542,28 @@ async function initializeCoreManagers() {
     vadClassifier: speechVadClassifier,
     storageGovernor,
     migrationGate: migrationCoordinator,
+    onChunkCommitted: (chunk) => {
+      const runtime = jarvisProcessingLifecycle.runtime;
+      if (!runtime) return;
+      const sessionId = chunk.session_id ?? chunk.sessionId;
+      const trackId = chunk.track_id ?? chunk.trackId;
+      const endedAt = chunk.ended_at ?? chunk.endedAt;
+      try {
+        const session = jarvisRepository.getSession(sessionId);
+        if (!session || !Number.isSafeInteger(endedAt)) return;
+        runtime.requestPreview({
+          sessionId,
+          trackId,
+          throughMs: Math.max(0, endedAt - session.started_at),
+        });
+      } catch (error) {
+        debugLogger?.warn(
+          "Jarvis preview request was skipped",
+          { sessionId, trackId, error: error?.message ?? String(error) },
+          "jarvis"
+        );
+      }
+    },
     broadcast: (state) => {
       windowManager?.sendToControlPanel("jarvis:state-changed", state);
       trayManager?.setJarvisState(state);
@@ -646,6 +668,7 @@ async function initializeCoreManagers() {
       });
       return result.canceled ? null : (result.filePaths[0] ?? null);
     },
+    processingLifecycle: jarvisProcessingLifecycle,
   });
 
   const uiLanguage = environmentManager.getUiLanguage();

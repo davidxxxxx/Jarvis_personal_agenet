@@ -1225,3 +1225,124 @@ test("bounded processing-session pages rotate past blocked backlog to an eligibl
     true
   );
 });
+
+test("production runtime ticks an injected preview through the shared heavy gate", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { status: "recording", processingState: "pending", endedAt: null });
+  insertTrack(repository, { endedAt: null });
+  const gate = new HeavyJobGate();
+  const releaseHeavy = deferred();
+  const heavyStarted = deferred();
+  const previewCalls = [];
+  const persisted = [];
+  const governor = {
+    sample: async () => ({
+      state: "available",
+      reason: "resources_available",
+      selectedGpuUuid: "GPU-verified",
+      restrictiveForMs: 0,
+      previewEnabled: true,
+      cpuTelemetryAvailable: true,
+      cpuLoadPct: 10,
+      powerTelemetryAvailable: true,
+      batterySaver: false,
+    }),
+    admit: () => ({ action: "run_cuda", reason: "resources_available" }),
+  };
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: { withVerifiedWav: async () => ({}) },
+      flacCompressionWorker: { run: async () => {} },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    now: () => 0,
+    governor,
+    heavyGate: gate,
+    previewExecutor: async (input) => {
+      previewCalls.push(input);
+      return { segments: [] };
+    },
+    previewPersist: (input) => persisted.push(input),
+  });
+
+  const heavy = gate.run("final_transcription", async () => {
+    heavyStarted.resolve();
+    await releaseHeavy.promise;
+  });
+  await heavyStarted.promise;
+  runtime.requestPreview({ sessionId: "s1", trackId: "track-mic", throughMs: 30_000 });
+  const drain = runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(previewCalls, []);
+  assert.deepEqual(gate.getState(), { activeKind: "final_transcription", queueLength: 1 });
+  assert.equal(runtime.previewStatus().pending, 0);
+  assert.equal(runtime.previewStatus().running, 1);
+
+  releaseHeavy.resolve();
+  await Promise.all([heavy, drain]);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(previewCalls.length, 1);
+  assert.equal(previewCalls[0].executionDevice, "cuda");
+  assert.equal(persisted.length, 1);
+  assert.equal(runtime.previewStatus().mode, "normal");
+});
+
+test("production default preview path transcribes bounded committed audio as provisional", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { status: "recording", processingState: "pending", endedAt: null });
+  insertTrack(repository, { endedAt: null });
+  insertChunk(repository, { transcriptionStatus: "pending" });
+  const adapterCalls = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: {
+        withVerifiedWav: async (chunk, callback) => callback(`verified-${chunk.id}.wav`),
+      },
+      flacCompressionWorker: { run: async () => {} },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async (input) => {
+        adapterCalls.push(input);
+        return { text: "preview text", confidence: 0.8, executionDevice: "cuda" };
+      },
+    },
+    model: "large-v3-turbo",
+    now: () => 1_000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        reason: "resources_available",
+        restrictiveForMs: 0,
+        selectedGpuUuid: "GPU-verified",
+        previewEnabled: true,
+      }),
+      admit: () => ({ action: "run_cuda", reason: "resources_available" }),
+    },
+    heavyGate: new HeavyJobGate(),
+  });
+
+  runtime.requestPreview({ sessionId: "s1", trackId: "track-mic", throughMs: 1_000 });
+  await runtime.drainOnce();
+  await runtime.previewInFlight;
+
+  assert.equal(adapterCalls.length, 1);
+  assert.deepEqual(
+    repository.listTranscriptHistory("s1").map((row) => ({
+      text: row.text,
+      resultKind: row.result_kind,
+      trackId: row.track_id,
+    })),
+    [{ text: "preview text", resultKind: "provisional", trackId: "track-mic" }]
+  );
+  assert.equal(runtime.previewStatus().lastError, null);
+  assert.equal(repository.getSession("s1").processing_state, "pending");
+});

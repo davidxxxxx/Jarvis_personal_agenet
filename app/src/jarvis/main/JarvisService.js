@@ -66,6 +66,7 @@ class JarvisService {
     audioEvidenceReader = undefined,
     storageGovernor = undefined,
     migrationGate = null,
+    onChunkCommitted = () => {},
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -97,6 +98,9 @@ class JarvisService {
       throw new TypeError("userDataDir is required");
     }
     if (typeof broadcast !== "function") throw new TypeError("broadcast must be a function");
+    if (typeof onChunkCommitted !== "function") {
+      throw new TypeError("onChunkCommitted must be a function");
+    }
     if (typeof now !== "function") throw new TypeError("now must be a function");
     if (!fsImpl || typeof fsImpl.mkdirSync !== "function") {
       throw new TypeError("fsImpl.mkdirSync must be a function");
@@ -153,6 +157,7 @@ class JarvisService {
     });
     this.compressionWork = Promise.resolve({ completed: 0, failed: 0, skipped: 0 });
     this.broadcast = broadcast;
+    this.onChunkCommitted = onChunkCommitted;
     this.now = now;
     this.fs = fsImpl;
     this.storageGovernor =
@@ -1321,6 +1326,11 @@ class JarvisService {
           channels: 1,
           encoderVersion: FLAC_ENCODER_VERSION,
         });
+        try {
+          this.onChunkCommitted(committed);
+        } catch {
+          // A disposable preview request can never invalidate durable capture evidence.
+        }
         if (["warning", "stopped"].includes(this.storagePressureState)) {
           this._promoteCompressionForStoragePressure(this.now());
         }
