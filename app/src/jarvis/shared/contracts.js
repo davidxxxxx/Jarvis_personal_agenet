@@ -11,6 +11,7 @@ const CHANNELS = Object.freeze({
   listAudioChunks: "jarvis:audio:list",
   readAudioChunk: "jarvis:audio:read",
   getSessionDetail: "jarvis:memory:session-detail",
+  getSessionTimeline: "jarvis:memory:session-timeline",
   searchMemory: "jarvis:memory:search",
   listPeopleOverview: "jarvis:memory:people",
   getPersonDetail: "jarvis:memory:person-detail",

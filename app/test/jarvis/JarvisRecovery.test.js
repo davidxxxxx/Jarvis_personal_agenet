@@ -94,17 +94,23 @@ test("model download wiring reports VAD recovery only after verified initializat
 
 test("main registers runtime and production composition providers without optional gaps", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
-  const providerStart = mainSource.indexOf('name: "jarvis-runtime"');
+  const providerStart = mainSource.indexOf("createJarvisRuntimeMigrationParticipant({");
   const providerEnd = mainSource.indexOf("storageComposition.registerWriterProvider()", providerStart);
   const provider = mainSource.slice(providerStart, providerEnd);
   const compositionStart = mainSource.indexOf("createProductionStorageComposition({");
   const compositionEnd = mainSource.indexOf("const hasSavedDataRoot", compositionStart);
   const composition = mainSource.slice(compositionStart, compositionEnd);
 
-  assert.match(provider, /await retentionCleaner\.stop\(\)/);
-  assert.match(provider, /await jarvisAnalysisScheduler\.quiesce\(\)/);
-  assert.match(provider, /jarvisAnalysisScheduler\.resume\(\)/);
-  assert.doesNotMatch(provider, /quiesce\?\.|resume\?\./);
+  assert.match(provider, /processingLifecycle: jarvisProcessingLifecycle/);
+  assert.match(provider, /prepareStorageMigration: \(\) => jarvisService\.prepareStorageMigration\(\)/);
+  assert.match(provider, /stopRetention: \(\) => retentionCleaner\.stop\(\)/);
+  assert.match(provider, /quiesceAnalysis: \(\) => jarvisAnalysisScheduler\.quiesce\(\)/);
+  assert.match(provider, /jarvisRepository\.checkpointForMigration\(\)/);
+  assert.match(provider, /jarvisRepository\.close\(\)/);
+  assert.match(provider, /reconfigureStorageHolders/);
+  assert.match(provider, /resumeAnalysis: \(\) => jarvisAnalysisScheduler\.resume\(\)/);
+  assert.match(provider, /startRetention: \(\) => retentionCleaner\.start\(\)/);
+  assert.doesNotMatch(provider, /quiesce\?\.|resume\?\.|stop\?\.|start\?\./);
   assert.match(composition, /whisperCudaManager/);
   assert.match(composition, /whisperManager/);
   assert.match(composition, /parakeetManager/);

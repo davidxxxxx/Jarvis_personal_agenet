@@ -8,7 +8,6 @@ const {
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const { toPublicAudioChunk, toPublicSessionDetail } = require("./AudioChunkPublicView");
-const fs = require("node:fs/promises");
 const path = require("node:path");
 
 const REQUIRED_REPOSITORY_METHODS = [
@@ -22,6 +21,7 @@ const REQUIRED_REPOSITORY_METHODS = [
   "renamePerson",
   "listPeople",
   "listAudioChunks",
+  "getSessionTimeline",
   "getCloudBudgetStatus",
   "setCloudBudgetSettings",
 ];
@@ -173,11 +173,13 @@ function registerJarvisIpc({
   );
   ipcMain.handle(CHANNELS.readAudioChunk, async (_event, audioChunkId) => {
     const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
-    if (!chunk) return null;
+    if (!chunk || chunk.deleted_at != null) return null;
     try {
       const currentReader = service.audioEvidenceReader ?? audioEvidenceReader;
-      if (currentReader) return await currentReader.readPlayableWav(chunk);
-      return await fs.readFile(chunk.path);
+      if (!currentReader || typeof currentReader.readPlayableWav !== "function") {
+        throw new Error("verified audio reader is unavailable");
+      }
+      return await currentReader.readPlayableWav(chunk);
     } catch (error) {
       if (error?.code === "ENOENT") return null;
       throw error;
@@ -186,6 +188,11 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
     toPublicSessionDetail(repository.getSessionDetail(assertId(sessionId, "sessionId")))
   );
+  ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId) => {
+    const timeline = repository.getSessionTimeline(assertId(sessionId, "sessionId"));
+    if (!timeline) return null;
+    return { ...timeline, chunks: timeline.chunks.map(toPublicAudioChunk) };
+  });
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
     if (typeof query !== "string") throw new TypeError("query must be a string");
     return query.trim()

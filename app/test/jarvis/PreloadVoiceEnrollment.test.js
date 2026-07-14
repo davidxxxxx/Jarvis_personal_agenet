@@ -147,6 +147,13 @@ test("preload exposes narrow authoritative capture failure IPC", async () => {
   ]);
 });
 
+test("preload exposes the session timeline request to the renderer", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  assert.equal(await api.getSessionTimeline("session-1"), "invoked");
+  assert.deepEqual(invokes, [["jarvis:memory:session-timeline", "session-1"]]);
+});
+
 test("preload exposes source interruption and restoration request-response IPC", async () => {
   const { api, invokes } = loadPreloadApi();
   const interruption = { at: 1_100, reason: "mic-track-ended" };

@@ -84,6 +84,10 @@ export interface JarvisSession {
   capture_mode: JarvisCaptureMode;
   retention_mode?: JarvisRetentionMode;
   capture_policy_json?: string;
+  processing_state?: "pending" | "processing" | "ready";
+  timeline_version?: number;
+  finalized_at?: number | null;
+  ready_at?: number | null;
 }
 
 export interface JarvisSessionQuery {
@@ -155,6 +159,70 @@ export interface JarvisAudioChunk {
   sha256: string;
   expires_at: number;
   transcription_status: string;
+  pcm_sha256?: string;
+  track_id?: string | null;
+  source_type?: "mic" | "system";
+  sequence_number?: number;
+  write_state?: string;
+  deleted_at?: number | null;
+  format?: "wav" | "flac";
+  file_sha256?: string | null;
+  sample_rate?: number;
+  channels?: number;
+}
+
+export interface JarvisAudioGap {
+  id: string;
+  track_id: string;
+  started_at: number;
+  ended_at: number | null;
+  reason: string;
+  recovery_attempts: number;
+  restored_device_id?: string | null;
+  restored_device_label?: string | null;
+  restored_strategy?: string | null;
+  average_level?: number | null;
+  peak_level?: number | null;
+}
+
+export interface JarvisAudioTrack {
+  id: string;
+  session_id: string;
+  source_type: "mic" | "system";
+  device_id: string | null;
+  device_label: string | null;
+  strategy: string | null;
+  sample_rate: number;
+  channels: number;
+  started_at: number;
+  ended_at: number | null;
+  state: string;
+  gaps: JarvisAudioGap[];
+}
+
+export interface JarvisProcessingJobCounts {
+  pending: number;
+  leased: number;
+  retry: number;
+  blocked: number;
+  completed: number;
+  total: number;
+}
+
+export interface JarvisSessionTimeline {
+  session_id: string;
+  started_at: number;
+  ended_at: number | null;
+  status: JarvisSessionStatus;
+  processing_state: "pending" | "processing" | "ready";
+  timeline_version: number;
+  finalized_at: number | null;
+  ready_at: number | null;
+  tracks: JarvisAudioTrack[];
+  gaps: JarvisAudioGap[];
+  chunks: JarvisAudioChunk[];
+  segments: JarvisTranscriptSegment[];
+  processing_counts: JarvisProcessingJobCounts;
 }
 
 export interface JarvisSessionSummary {

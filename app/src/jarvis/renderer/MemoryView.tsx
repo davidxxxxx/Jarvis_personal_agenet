@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Clock3, FileAudio, Search } from "lucide-react";
-import type { JarvisSession, JarvisSessionDetail } from "../types";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Clock3, Search } from "lucide-react";
+import type { JarvisSession, JarvisSessionDetail, JarvisSessionTimeline } from "../types";
 import { useJarvisStore } from "./jarvisStore";
+import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
+import ProcessingStatus from "./ProcessingStatus";
 
 function duration(session: JarvisSession): string {
   const ms = Math.max(0, (session.ended_at ?? Date.now()) - session.started_at);
@@ -23,45 +25,35 @@ export default function MemoryView() {
   const [sessions, setSessions] = useState(storedSessions);
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<JarvisSessionDetail | null>(null);
+  const [timeline, setTimeline] = useState<JarvisSessionTimeline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [playingId, setPlayingId] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioUrlRef = useRef<string | null>(null);
 
   useEffect(() => setSessions(storedSessions), [storedSessions]);
-  useEffect(
-    () => () => {
-      audioRef.current?.pause();
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    },
-    []
-  );
 
-  const playAudio = async (chunkId: string) => {
-    audioRef.current?.pause();
-    if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    if (playingId === chunkId) {
-      setPlayingId(null);
-      return;
-    }
-    try {
-      const bytes = await window.electronAPI.jarvis.readAudioChunk(chunkId);
-      if (!bytes) throw new Error("missing");
-      const copy = new Uint8Array(bytes.byteLength);
-      copy.set(bytes);
-      const url = URL.createObjectURL(new Blob([copy], { type: "audio/wav" }));
-      const audio = new Audio(url);
-      audioRef.current = audio;
-      audioUrlRef.current = url;
-      setPlayingId(chunkId);
-      audio.onended = () => setPlayingId(null);
-      await audio.play();
-    } catch {
-      setPlayingId(null);
-      setError("音频文件已过期或暂时无法播放。");
-    }
-  };
+  useEffect(() => {
+    const sessionId = detail?.session.id;
+    if (!sessionId || !timeline || timeline.processing_state === "ready") return;
+    let cancelled = false;
+    let requestInFlight = false;
+    const refresh = async () => {
+      if (requestInFlight || cancelled) return;
+      requestInFlight = true;
+      try {
+        const next = await window.electronAPI.jarvis.getSessionTimeline(sessionId);
+        if (!cancelled) setTimeline(next);
+      } catch {
+        // A transient IPC failure must not stop the next scheduled refresh.
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void refresh(), 2_500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [detail?.session.id, timeline]);
 
   const groups = useMemo(() => {
     const map = new Map<string, JarvisSession[]>();
@@ -88,7 +80,12 @@ export default function MemoryView() {
     setLoading(true);
     setError(null);
     try {
-      setDetail(await window.electronAPI.jarvis.getSessionDetail(sessionId));
+      const [nextDetail, nextTimeline] = await Promise.all([
+        window.electronAPI.jarvis.getSessionDetail(sessionId),
+        window.electronAPI.jarvis.getSessionTimeline(sessionId),
+      ]);
+      setDetail(nextDetail);
+      setTimeline(nextTimeline);
     } catch {
       setError("无法读取这次录音。");
     } finally {
@@ -102,7 +99,12 @@ export default function MemoryView() {
     setError(null);
     try {
       await window.electronAPI.jarvis.analyzeSession(detail.session.id, "final");
-      setDetail(await window.electronAPI.jarvis.getSessionDetail(detail.session.id));
+      const [nextDetail, nextTimeline] = await Promise.all([
+        window.electronAPI.jarvis.getSessionDetail(detail.session.id),
+        window.electronAPI.jarvis.getSessionTimeline(detail.session.id),
+      ]);
+      setDetail(nextDetail);
+      setTimeline(nextTimeline);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "分析失败，请检查 MiniMax 设置。");
     } finally {
@@ -124,7 +126,10 @@ export default function MemoryView() {
       <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
         <button
           type="button"
-          onClick={() => setDetail(null)}
+          onClick={() => {
+            setDetail(null);
+            setTimeline(null);
+          }}
           className="mb-5 flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeft className="size-4" />
@@ -152,6 +157,11 @@ export default function MemoryView() {
         </div>
         {error && (
           <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
+        )}
+        {timeline && (
+          <div className="mt-4 rounded-xl border border-border/50 bg-card p-4">
+            <ProcessingStatus timeline={timeline} />
+          </div>
         )}
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
           <h2 className="font-semibold">完整总结</h2>
@@ -216,55 +226,17 @@ export default function MemoryView() {
           </section>
         </div>
         <section className="mt-4 rounded-xl border border-border/50 bg-card p-5">
-          <h2 className="flex items-center gap-2 font-semibold">
-            <FileAudio className="size-4" />
-            本地音频
-          </h2>
-          <div className="mt-3 space-y-2">
-            {detail.audioChunks.length ? (
-              detail.audioChunks.map((chunk) => (
-                <div
-                  key={chunk.id}
-                  className="flex items-center justify-between gap-3 rounded-lg bg-muted/40 px-3 py-2 text-xs"
-                >
-                  <span>{Math.round(chunk.duration_ms / 1000)} 秒音频</span>
-                  <span className="ml-auto text-muted-foreground">
-                    {chunk.expires_at > Date.now()
-                      ? `${new Date(chunk.expires_at).toLocaleDateString("zh-CN")} 自动删除`
-                      : "已到期"}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={chunk.expires_at <= Date.now()}
-                    onClick={() => void playAudio(chunk.id)}
-                    className="rounded bg-background px-2 py-1 text-foreground disabled:opacity-40"
-                  >
-                    {playingId === chunk.id ? "停止" : "播放"}
-                  </button>
-                </div>
-              ))
-            ) : (
-              <p className="text-sm text-muted-foreground">音频已过期或本次没有写入音频。</p>
-            )}
-          </div>
-        </section>
-        <section className="mt-4 rounded-xl border border-border/50 bg-card p-5">
-          <h2 className="font-semibold">完整转写</h2>
-          <div className="mt-4 space-y-3">
-            {detail.segments.length ? (
-              detail.segments.map((segment) => (
-                <article key={segment.id} className="rounded-lg bg-muted/30 p-3">
-                  <div className="mb-1 text-xs font-medium text-primary">
-                    {segment.speaker_label} ·{" "}
-                    {new Date(segment.started_at).toLocaleTimeString("zh-CN")}
-                  </div>
-                  <p className="text-sm leading-6">{segment.text}</p>
-                </article>
-              ))
-            ) : (
-              <p className="text-sm text-muted-foreground">没有可用转写。</p>
-            )}
-          </div>
+          <h2 className="font-semibold">连续会话</h2>
+          {timeline ? (
+            <div className="mt-4">
+              <ContinuousSessionPlayer
+                timeline={timeline}
+                readChunk={window.electronAPI.jarvis.readAudioChunk}
+              />
+            </div>
+          ) : (
+            <p className="mt-3 text-sm text-muted-foreground">正在读取音频时间线…</p>
+          )}
         </section>
       </main>
     );

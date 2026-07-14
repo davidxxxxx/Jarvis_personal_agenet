@@ -52,6 +52,184 @@ test("persists the selected capture mode on session creation", (t) => {
   assert.equal(repo.getSession("dual-session").capture_mode, "dual");
 });
 
+test("session timeline returns deterministic source evidence, visible text, and job counts", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "timeline-session",
+    startedAt: 1_000,
+    micDeviceId: "mic-1",
+    captureMode: "dual",
+  });
+  repo.createTracks([
+    {
+      id: "track-system",
+      sessionId: "timeline-session",
+      sourceType: "system",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_000,
+    },
+    {
+      id: "track-mic",
+      sessionId: "timeline-session",
+      sourceType: "mic",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_000,
+    },
+  ]);
+  repo.openGap({
+    id: "gap-late",
+    trackId: "track-system",
+    startedAt: 3_600,
+    reason: "device_interrupted",
+  });
+  repo.closeGap("gap-late", 3_900, 2);
+  repo.openGap({
+    id: "gap-early",
+    trackId: "track-mic",
+    startedAt: 1_800,
+    reason: "device_interrupted",
+  });
+  repo.closeGap("gap-early", 1_900, 1);
+
+  const chunks = [
+    ["chunk-pending", "track-mic", "mic", 0, 1_100],
+    ["chunk-running", "track-system", "system", 0, 1_300],
+    ["chunk-retry", "track-mic", "mic", 1, 2_100],
+    ["chunk-blocked", "track-system", "system", 1, 2_300],
+    ["chunk-completed", "track-system", "system", 2, 3_100],
+  ];
+  for (const [id, trackId, sourceType, sequenceNumber, startedAt] of chunks) {
+    repo.commitChunk({
+      id,
+      sessionId: "timeline-session",
+      trackId,
+      sourceType,
+      sequenceNumber,
+      path: `${id}.wav`,
+      startedAt,
+      endedAt: startedAt + 100,
+      durationMs: 100,
+      sha256: id.padEnd(64, "a"),
+      expiresAt: startedAt + 10_000,
+    });
+  }
+  for (const [chunkId, state] of [
+    ["chunk-running", "running"],
+    ["chunk-retry", "retry"],
+    ["chunk-blocked", "blocked"],
+    ["chunk-completed", "completed"],
+  ]) {
+    repo.db.prepare("UPDATE processing_jobs SET state = ? WHERE chunk_id = ?").run(state, chunkId);
+  }
+  repo.db.prepare("UPDATE audio_chunks SET deleted_at = 5_000 WHERE id = 'chunk-retry'").run();
+
+  const final = repo.commitChunkTranscript({
+    chunk: repo.getAudioChunk("chunk-completed"),
+    result: { text: "visible system text", confidence: 0.9, noSpeech: false },
+    modelVersion: "large-v3-turbo",
+    completedAt: 4_000,
+  });
+  repo.db
+    .prepare(
+      `INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, source_type, result_kind, superseded_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisional', ?)`
+    )
+    .run(
+      "hidden-superseded",
+      "timeline-session",
+      3_100,
+      3_200,
+      "system",
+      "old system text",
+      0.4,
+      0,
+      "track-system",
+      "system",
+      final.id
+    );
+  repo.db
+    .prepare(
+      `INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, source_type, result_kind, echo_score, duplicate_of
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisional', ?, ?)`
+    )
+    .run(
+      "hidden-duplicate",
+      "timeline-session",
+      3_100,
+      3_200,
+      "mic",
+      "echoed system text",
+      0.4,
+      0,
+      "track-mic",
+      "mic",
+      0.92,
+      final.id
+    );
+  repo.upsertTranscriptSegments("timeline-session", [
+    {
+      id: "visible-mic",
+      startedAt: 1_600,
+      endedAt: 1_700,
+      personId: null,
+      speakerLabel: "我",
+      sourceType: "mic",
+      text: "visible mic text",
+      confidence: 0.8,
+      isStable: true,
+    },
+  ]);
+  repo.db
+    .prepare(
+      `UPDATE sessions SET status = 'completed', ended_at = 4_500,
+       processing_state = 'processing', timeline_version = 7, finalized_at = 4_500
+       WHERE id = 'timeline-session'`
+    )
+    .run();
+
+  const timeline = repo.getSessionTimeline("timeline-session");
+
+  assert.deepEqual(timeline.tracks.map((track) => track.source_type), ["mic", "system"]);
+  assert.deepEqual(timeline.gaps.map((gap) => gap.id), ["gap-early", "gap-late"]);
+  assert.deepEqual(timeline.tracks[0].gaps.map((gap) => gap.id), ["gap-early"]);
+  assert.deepEqual(timeline.chunks.map((chunk) => chunk.id), chunks.map((chunk) => chunk[0]));
+  assert.equal(timeline.chunks[2].deleted_at, 5_000);
+  assert.deepEqual(timeline.segments.map((segment) => segment.id), ["visible-mic", final.id]);
+  assert.deepEqual(timeline.processing_counts, {
+    pending: 1,
+    leased: 1,
+    retry: 1,
+    blocked: 1,
+    completed: 1,
+    total: 5,
+  });
+  assert.deepEqual(
+    {
+      session_id: timeline.session_id,
+      status: timeline.status,
+      processing_state: timeline.processing_state,
+      timeline_version: timeline.timeline_version,
+      finalized_at: timeline.finalized_at,
+      ready_at: timeline.ready_at,
+    },
+    {
+      session_id: "timeline-session",
+      status: "completed",
+      processing_state: "processing",
+      timeline_version: 7,
+      finalized_at: 4_500,
+      ready_at: null,
+    }
+  );
+});
+
 test("system-only session persistence cannot retain a microphone device id", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());

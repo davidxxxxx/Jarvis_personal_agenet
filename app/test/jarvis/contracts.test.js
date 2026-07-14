@@ -23,6 +23,7 @@ function createRepository(overrides = {}) {
     listPeople: () => [],
     listAudioChunks: () => [],
     getAudioChunk: () => null,
+    getSessionTimeline: () => null,
     getSessionDetail: () => ({ session: { id: "s1" } }),
     searchMemory: () => [],
     listPeopleOverview: () => [],
@@ -170,6 +171,75 @@ test("audio read IPC returns a verified playable WAV for authoritative FLAC", as
 
   assert.equal(result, playable);
   assert.deepEqual(calls, [chunk]);
+});
+
+test("audio read IPC returns null for missing evidence and never returns unverified raw bytes", async () => {
+  const missingHandlers = new Map();
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => missingHandlers.set(channel, handler) },
+    repository: createRepository({
+      getAudioChunk: () => ({ id: "c1", path: __filename, format: "wav" }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    audioEvidenceReader: { readPlayableWav: async () => Promise.reject(missing) },
+  });
+
+  assert.equal(await missingHandlers.get(CHANNELS.readAudioChunk)(null, "c1"), null);
+
+  const unsafeHandlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => unsafeHandlers.set(channel, handler) },
+    repository: createRepository({
+      getAudioChunk: () => ({ id: "c1", path: __filename, format: "wav" }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  await assert.rejects(
+    unsafeHandlers.get(CHANNELS.readAudioChunk)(null, "c1"),
+    /verified audio reader is unavailable/
+  );
+});
+
+test("session timeline IPC is reachable and keeps retired provenance private", () => {
+  const handlers = new Map();
+  const timeline = {
+    session_id: "s1",
+    tracks: [],
+    gaps: [],
+    chunks: [
+      {
+        id: "c1",
+        session_id: "s1",
+        path: "speech.flac",
+        format: "flac",
+        retired_path: "private.wav",
+        retired_format: "wav",
+        retired_file_sha256: "f".repeat(64),
+      },
+    ],
+    segments: [],
+    processing_counts: { pending: 0, leased: 0, retry: 0, blocked: 0, completed: 1, total: 1 },
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({ getSessionTimeline: () => timeline }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const result = handlers.get(CHANNELS.getSessionTimeline)(null, "s1");
+  assert.equal(result.session_id, "s1");
+  assert.equal(result.chunks[0].format, "flac");
+  assert.equal(Object.hasOwn(result.chunks[0], "retired_path"), false);
+  assert.equal(Object.hasOwn(result.chunks[0], "retired_format"), false);
+  assert.equal(Object.hasOwn(result.chunks[0], "retired_file_sha256"), false);
 });
 
 test("retired provenance is private at audio IPC boundaries", () => {
@@ -360,6 +430,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "getPersonDetail",
       "getSession",
       "getSessionDetail",
+      "getSessionTimeline",
       "getStorageStatus",
       "getTodayInsights",
       "getTopicDetail",
@@ -429,6 +500,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.getCloudBudget,
       CHANNELS.setCloudBudget,
       CHANNELS.getSessionDetail,
+      CHANNELS.getSessionTimeline,
       CHANNELS.searchMemory,
       CHANNELS.listPeopleOverview,
       CHANNELS.getPersonDetail,
@@ -609,6 +681,7 @@ test("IPC registration rejects invalid IPC and missing handler capabilities", ()
     "renamePerson",
     "listPeople",
     "listAudioChunks",
+    "getSessionTimeline",
     "getCloudBudgetStatus",
     "setCloudBudgetSettings",
   ];

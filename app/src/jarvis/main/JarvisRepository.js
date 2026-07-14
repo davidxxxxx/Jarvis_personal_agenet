@@ -570,6 +570,35 @@ class JarvisRepository {
         WHERE session_id = ?
         ORDER BY started_at ASC, id ASC
       `),
+      listSessionTimelineTracks: this.db.prepare(`
+        SELECT * FROM audio_tracks
+        WHERE session_id = ?
+        ORDER BY CASE source_type WHEN 'mic' THEN 0 ELSE 1 END, started_at ASC, id ASC
+      `),
+      listSessionTimelineGaps: this.db.prepare(`
+        SELECT gap.* FROM audio_gaps AS gap
+        JOIN audio_tracks AS track ON track.id = gap.track_id
+        WHERE track.session_id = ?
+        ORDER BY gap.started_at ASC, gap.id ASC
+      `),
+      listSessionTimelineChunks: this.db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE session_id = ? AND write_state = 'committed'
+        ORDER BY started_at ASC,
+          CASE source_type WHEN 'mic' THEN 0 ELSE 1 END,
+          sequence_number ASC, id ASC
+      `),
+      getSessionProcessingCounts: this.db.prepare(`
+        SELECT
+          COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+          COALESCE(SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END), 0) AS leased,
+          COALESCE(SUM(CASE WHEN state = 'retry' THEN 1 ELSE 0 END), 0) AS retry,
+          COALESCE(SUM(CASE WHEN state = 'blocked' THEN 1 ELSE 0 END), 0) AS blocked,
+          COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
+          COUNT(*) AS total
+        FROM processing_jobs
+        WHERE session_id = ?
+      `),
       listExpiredAudioChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
         WHERE expires_at <= ? AND deleted_at IS NULL
@@ -2139,6 +2168,37 @@ class JarvisRepository {
       writtenBytes24h: row.written_bytes,
       compressedBytes24h: row.compressed_bytes,
       netGrowthBytes24h: row.net_growth_bytes,
+    };
+  }
+
+  getSessionTimeline(id) {
+    const sessionId = assertId(id, "sessionId");
+    const session = this.getSession(sessionId);
+    if (!session) return null;
+    const gaps = this.statements.listSessionTimelineGaps.all(sessionId);
+    const gapsByTrack = new Map();
+    for (const gap of gaps) {
+      const trackGaps = gapsByTrack.get(gap.track_id) ?? [];
+      trackGaps.push(gap);
+      gapsByTrack.set(gap.track_id, trackGaps);
+    }
+    const tracks = this.statements.listSessionTimelineTracks
+      .all(sessionId)
+      .map((track) => ({ ...track, gaps: gapsByTrack.get(track.id) ?? [] }));
+    return {
+      session_id: session.id,
+      started_at: session.started_at,
+      ended_at: session.ended_at,
+      status: session.status,
+      processing_state: session.processing_state,
+      timeline_version: session.timeline_version,
+      finalized_at: session.finalized_at,
+      ready_at: session.ready_at,
+      tracks,
+      gaps,
+      chunks: this.statements.listSessionTimelineChunks.all(sessionId).map(toPublicAudioChunk),
+      segments: this.listTranscriptSegments(sessionId),
+      processing_counts: this.statements.getSessionProcessingCounts.get(sessionId),
     };
   }
 
