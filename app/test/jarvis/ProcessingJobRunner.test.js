@@ -90,7 +90,6 @@ test("reclaims an expired job and completes it exactly once", async (t) => {
   assert.equal(await runner.runOnce(2_001), 0);
   assert.deepEqual(calls, ["j1"]);
 });
-
 test("does not steal a current lease", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, {
@@ -195,4 +194,3 @@ test("exposes explicit expired-lease recovery", (t) => {
     }
   );
 });
-
