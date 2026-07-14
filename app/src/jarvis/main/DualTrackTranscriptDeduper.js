@@ -1,5 +1,6 @@
 const ECHO_SCORE_THRESHOLD = 0.8;
 const TEXT_SIMILARITY_THRESHOLD = 0.85;
+const MAX_LCS_CODE_POINTS = 4096;
 
 function normalizeTranscriptText(value) {
   if (typeof value !== "string") return "";
@@ -38,7 +39,11 @@ function normalizedSimilarity(leftValue, rightValue) {
   const right = normalizeTranscriptText(rightValue);
   if (!left || !right) return 0;
   if (left === right) return 1;
-  const longest = Math.max(Array.from(left).length, Array.from(right).length);
+  const leftLength = Array.from(left).length;
+  const rightLength = Array.from(right).length;
+  const longest = Math.max(leftLength, rightLength);
+  if (longest > MAX_LCS_CODE_POINTS) return 0;
+  if (Math.min(leftLength, rightLength) / longest < TEXT_SIMILARITY_THRESHOLD) return 0;
   return longestCommonSubsequenceLength(left, right) / longest;
 }
 

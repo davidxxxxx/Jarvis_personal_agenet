@@ -35,6 +35,14 @@ async function waitForTimed(predicate, description = "timed condition", timeoutM
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+function createPcm16(sampleCount, sampleAt) {
+  const pcm = Buffer.alloc(sampleCount * 2);
+  for (let sample = 0; sample < sampleCount; sample += 1) {
+    pcm.writeInt16LE(sampleAt(sample), sample * 2);
+  }
+  return pcm;
+}
+
 function createFixture({
   appendPcm = () => true,
   sourceInterrupted = () => {},
@@ -1926,6 +1934,76 @@ test("Jarvis carries real PCM echo evidence into retained MIC and SYSTEM transcr
   assert.equal(Number.isSafeInteger(mic.endedAt), true);
   assert.ok(mic.startedAt < mic.endedAt);
   assert.ok(system.startedAt < system.endedAt);
+});
+
+test("Jarvis retains low-amplitude correlated MIC evidence below the system-dominant gate", async (t) => {
+  const fixture = createFixture({
+    systemAvailable: true,
+    transcribeLocalWhisper: async () => ({ success: true, text: "release Friday" }),
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const correlatedPcm = createPcm16(12_000, (sample) =>
+    Math.round(500 * Math.sin((2 * Math.PI * sample) / 61))
+  );
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-low-amplitude-echo" }
+  );
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, correlatedPcm, "system", started.inputGeneration);
+  }
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, correlatedPcm, "mic", started.inputGeneration);
+  }
+
+  const stopped = await stop({ sender: fixture.sender });
+  const mic = stopped.finalSegments.find((segment) => segment.source === "mic");
+
+  assert.ok(mic, "low-amplitude non-silent MIC evidence must reach Jarvis transcription");
+  assert.equal(mic.echoScore, 1);
+  assert.equal(fixture.whisperCalls.length, 2);
+});
+
+test("Jarvis retains low-amplitude double-talk without inventing echo evidence", async (t) => {
+  const fixture = createFixture({
+    systemAvailable: true,
+    transcribeLocalWhisper: async () => ({ success: true, text: "local response" }),
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const systemPcm = createPcm16(12_000, (sample) =>
+    Math.round(300 * Math.sin((2 * Math.PI * sample) / 61))
+  );
+  const doubleTalkPcm = createPcm16(12_000, (sample) =>
+    Math.round(
+      300 * Math.sin((2 * Math.PI * sample) / 61) +
+        300 * Math.sin((2 * Math.PI * sample) / 37)
+    )
+  );
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-low-amplitude-double-talk" }
+  );
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, systemPcm, "system", started.inputGeneration);
+  }
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, doubleTalkPcm, "mic", started.inputGeneration);
+  }
+
+  const stopped = await stop({ sender: fixture.sender });
+  const mic = stopped.finalSegments.find((segment) => segment.source === "mic");
+
+  assert.ok(mic, "low-amplitude double-talk must not be dropped with system-dominant audio");
+  assert.equal(mic.echoScore, undefined);
+  assert.equal(fixture.whisperCalls.length, 2);
 });
 
 test("normal stop waits for an active periodic transcription and drains its tail", async (t) => {

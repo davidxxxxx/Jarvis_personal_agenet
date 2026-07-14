@@ -209,6 +209,14 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
           AND target.started_at < NEW.ended_at
       );
   END;
+  CREATE TRIGGER IF NOT EXISTS invalidate_transcript_duplicates_on_target_text_update
+  BEFORE UPDATE OF text ON transcript_segments
+  WHEN OLD.source_type = 'system' AND NEW.text IS NOT OLD.text
+  BEGIN
+    UPDATE transcript_segments
+    SET duplicate_of = NULL
+    WHERE duplicate_of = OLD.id;
+  END;
   CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_target_update
   BEFORE UPDATE OF id, session_id, source_type, started_at, ended_at
   ON transcript_segments
@@ -427,6 +435,7 @@ function rebuildTranscriptSegmentsV14(db) {
     DROP TRIGGER IF EXISTS validate_transcript_supersession_target_update;
     DROP TRIGGER IF EXISTS validate_transcript_duplicate_insert;
     DROP TRIGGER IF EXISTS validate_transcript_duplicate_update;
+    DROP TRIGGER IF EXISTS invalidate_transcript_duplicates_on_target_text_update;
     DROP TRIGGER IF EXISTS validate_transcript_duplicate_target_update;
   `);
   try {

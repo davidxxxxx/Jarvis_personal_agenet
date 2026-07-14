@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const DualTrackTranscriptDeduper = require("../../src/jarvis/main/DualTrackTranscriptDeduper");
+const { normalizedSimilarity } = DualTrackTranscriptDeduper;
 
 function fixture(t, { sessionId = "session-1" } = {}) {
   const repository = new JarvisRepository(":memory:");
@@ -215,6 +216,72 @@ test("chooses a deterministic SYSTEM winner and repeated runs are idempotent", (
   assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
   assert.equal(repository.getTranscriptSegment("mic").duplicate_of, "system-a");
   assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+});
+
+test("invalidates inbound duplicate relations when SYSTEM text changes through either write path", (t) => {
+  const { repository, deduper } = fixture(t);
+  const systemInput = {
+    id: "system",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "release Friday",
+  };
+  segment(repository, systemInput);
+  segment(repository, {
+    id: "mic",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "release Friday",
+    echoScore: 0.9,
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  segment(repository, { ...systemInput, text: "unrelated lunch plans" });
+  assert.equal(repository.getTranscriptSegment("mic").duplicate_of, null);
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    ["system", "mic"]
+  );
+
+  segment(repository, systemInput);
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  repository.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("direct SQL changed the subject", "system");
+  assert.equal(repository.getTranscriptSegment("mic").duplicate_of, null);
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    ["system", "mic"]
+  );
+
+  repository.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run(systemInput.text, "system");
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mic").duplicate_of, "system");
+
+  assert.throws(
+    () =>
+      repository.db
+        .prepare("UPDATE transcript_segments SET text = ?, source_type = ? WHERE id = ?")
+        .run("must roll back", "invalid", "system"),
+    /invalid transcript duplicate target|CHECK constraint failed/
+  );
+  assert.equal(repository.getTranscriptSegment("system").text, systemInput.text);
+  assert.equal(repository.getTranscriptSegment("mic").duplicate_of, "system");
+});
+
+test("bounds pathological LCS work while preserving normal Chinese-English similarity", () => {
+  assert.equal(
+    normalizedSimilarity("今天 release ＡＰＩ v2，周五交付", "今天 RELEASE API V2 周五交付。"),
+    1
+  );
+  assert.equal(
+    normalizedSimilarity(`${"甲".repeat(4096)}A`, `${"甲".repeat(4096)}B`),
+    0
+  );
 });
 
 test("schema rejects invalid echo scores and invalid MIC-to-SYSTEM relations", (t) => {

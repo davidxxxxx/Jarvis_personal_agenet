@@ -5194,6 +5194,7 @@ class IPCHandlers {
       }
 
       if (
+        !activeJarvisSessionId &&
         source === "mic" &&
         rms < MEETING_MIC_BLEED_RMS_CEILING &&
         peak < MEETING_MIC_BLEED_PEAK_CEILING &&
