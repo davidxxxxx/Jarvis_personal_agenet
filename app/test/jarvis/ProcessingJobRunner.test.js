@@ -171,6 +171,48 @@ test("records handler failure as retry without losing durable input metadata", a
   );
 });
 
+test("normalizes malformed handler error codes without stranding the lease", async (t) => {
+  const cases = [
+    ["numeric", { code: 503 }],
+    ["object", { code: { status: 503 } }],
+    ["unsafe string", { code: "not safe!" }],
+    ["symbol", { code: Symbol("offline") }],
+    [
+      "throwing getter",
+      Object.defineProperty({}, "code", {
+        get() {
+          throw new Error("code getter failed");
+        },
+      }),
+    ],
+  ];
+
+  for (const [name, thrown] of cases) {
+    await t.test(name, async (t) => {
+      const { db, runner } = fixture(t);
+      seedJob(db);
+      runner.register("transcribe_chunk", async () => {
+        throw thrown;
+      });
+
+      assert.equal(await runner.runOnce(), 1);
+      assert.deepEqual(
+        db.prepare(`
+          SELECT state, error_code, next_retry_at, lease_owner, lease_expires_at
+          FROM processing_jobs WHERE id = 'j1'
+        `).get(),
+        {
+          state: "retry",
+          error_code: "JOB_FAILED",
+          next_retry_at: 2_000,
+          lease_owner: null,
+          lease_expires_at: null,
+        }
+      );
+    });
+  }
+});
+
 test("exposes explicit expired-lease recovery", (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, {

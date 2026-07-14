@@ -341,7 +341,11 @@ class CaptureEvidenceStore {
         WHERE state IN ('pending', 'retry', 'retention_urgent')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
-        ORDER BY priority ASC, created_at ASC, id ASC
+        ORDER BY
+          CASE state WHEN 'retention_urgent' THEN 0 ELSE 1 END ASC,
+          priority ASC,
+          created_at ASC,
+          id ASC
         LIMIT @limit
       `),
       claimJob: db.prepare(`
@@ -983,15 +987,17 @@ class CaptureEvidenceStore {
   }
 
   retryJob(id, { owner, at, nextRetryAt = at, errorCode }) {
-    const input = this._assertJobLeaseTransition(id, { owner, at, errorCode });
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    this._assertIdentifier(errorCode, "errorCode");
     this._assertNonNegativeSafeInteger(nextRetryAt, "nextRetryAt");
     if (nextRetryAt < at) throw new RangeError("nextRetryAt must not be before at");
-    return this.statements.retryLeasedJob.run({ ...input, nextRetryAt }).changes === 1;
+    return this.statements.retryLeasedJob.run({ ...input, nextRetryAt, errorCode }).changes === 1;
   }
 
   blockJob(id, { owner, at, errorCode }) {
-    const input = this._assertJobLeaseTransition(id, { owner, at, errorCode });
-    return this.statements.blockLeasedJob.run(input).changes === 1;
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    this._assertIdentifier(errorCode, "errorCode");
+    return this.statements.blockLeasedJob.run({ ...input, errorCode }).changes === 1;
   }
 
   enqueueChunkTranscription(chunk) {
@@ -1079,12 +1085,11 @@ class CaptureEvidenceStore {
     if (value <= 0) throw new RangeError(`${name} must be positive`);
   }
 
-  _assertJobLeaseTransition(id, { owner, at, errorCode = undefined } = {}) {
+  _assertJobLeaseTransition(id, { owner, at } = {}) {
     this._assertIdentifier(id, "jobId");
     this._assertIdentifier(owner, "owner");
     this._assertNonNegativeSafeInteger(at, "at");
-    if (errorCode !== undefined) this._assertIdentifier(errorCode, "errorCode");
-    return { id, owner, at, errorCode };
+    return { id, owner, at };
   }
 
   _assertLifecycleTransition({ sessionId, sources, at, sessionState, sourceStates }) {

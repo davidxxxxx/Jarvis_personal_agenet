@@ -1502,8 +1502,27 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
 
 test("claims eligible jobs atomically in deterministic order without stealing leases", (t) => {
   const { db, store } = fixture(t);
-  seedProcessingJob(db, { id: "job-b", createdAt: 100 });
-  seedProcessingJob(db, { id: "job-a", createdAt: 100, inputHash: "input-a" });
+  seedProcessingJob(db, { id: "job-b", priority: 5, createdAt: 100 });
+  seedProcessingJob(db, {
+    id: "job-a",
+    priority: 1,
+    createdAt: 100,
+    inputHash: "input-a",
+  });
+  seedProcessingJob(db, {
+    id: "job-urgent",
+    state: "retention_urgent",
+    priority: 99,
+    createdAt: 999,
+    inputHash: "input-urgent",
+  });
+  seedProcessingJob(db, {
+    id: "job-compress",
+    jobType: "compress_chunk",
+    priority: 0,
+    createdAt: 50,
+    inputHash: "input-compress",
+  });
   seedProcessingJob(db, {
     id: "job-current",
     state: "running",
@@ -1518,9 +1537,14 @@ test("claims eligible jobs atomically in deterministic order without stealing le
     nextRetryAt: 501,
   });
 
-  const claimed = store.claimJobs({ owner: "worker-b", at: 500, leaseMs: 100, limit: 2 });
+  const claimed = store.claimJobs({ owner: "worker-b", at: 500, leaseMs: 100, limit: 4 });
 
-  assert.deepEqual(claimed.map((job) => job.id), ["job-a", "job-b"]);
+  assert.deepEqual(claimed.map((job) => job.id), [
+    "job-urgent",
+    "job-compress",
+    "job-a",
+    "job-b",
+  ]);
   for (const job of claimed) {
     assert.equal(job.state, "running");
     assert.equal(job.attempt_count, 1);
@@ -1535,6 +1559,47 @@ test("claims eligible jobs atomically in deterministic order without stealing le
     [
       { id: "job-current", state: "running", lease_owner: "worker-a", lease_expires_at: 501 },
       { id: "job-later", state: "retry", lease_owner: null, lease_expires_at: null },
+    ]
+  );
+});
+
+test("rolls back every claim when a later lease update fails", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, { id: "job-a", inputHash: "input-a" });
+  seedProcessingJob(db, { id: "job-b", inputHash: "input-b" });
+  db.exec(`
+    CREATE TRIGGER reject_second_job_claim
+    BEFORE UPDATE OF state ON processing_jobs
+    WHEN OLD.id = 'job-b' AND NEW.state = 'running'
+    BEGIN
+      SELECT RAISE(ABORT, 'second claim rejected');
+    END;
+  `);
+
+  assert.throws(
+    () => store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 2 }),
+    /second claim rejected/i
+  );
+  assert.deepEqual(
+    db.prepare(`
+      SELECT id, state, attempt_count, lease_owner, lease_expires_at
+      FROM processing_jobs ORDER BY id
+    `).all(),
+    [
+      {
+        id: "job-a",
+        state: "pending",
+        attempt_count: 0,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "job-b",
+        state: "pending",
+        attempt_count: 0,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
     ]
   );
 });
@@ -1627,6 +1692,10 @@ test("validates processing-job lease boundaries before touching durable state", 
         errorCode: "FAILED",
       }),
     /nextRetryAt.*before/i
+  );
+  assert.throws(
+    () => store.retryJob("lease-job", { owner: "worker", at: 100 }),
+    /errorCode.*safe identifier/i
   );
   assert.deepEqual(
     db.prepare("SELECT state, attempt_count FROM processing_jobs WHERE id = 'lease-job'").get(),

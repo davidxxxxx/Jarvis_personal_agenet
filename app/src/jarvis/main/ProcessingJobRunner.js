@@ -1,5 +1,15 @@
 const ERROR_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
+function normalizeErrorCode(error) {
+  let code;
+  try {
+    code = error?.code;
+  } catch {
+    return "JOB_FAILED";
+  }
+  return typeof code === "string" && ERROR_CODE_PATTERN.test(code) ? code : "JOB_FAILED";
+}
+
 class ProcessingJobRunner {
   constructor({ store, owner, now = Date.now, leaseMs = 60_000 } = {}) {
     const requiredMethods = [
@@ -64,7 +74,7 @@ class ProcessingJobRunner {
       await handler(job);
       this.store.completeJob(job.id, { owner: this.owner, at: this.now() });
     } catch (error) {
-      const errorCode = ERROR_CODE_PATTERN.test(error?.code) ? error.code : "JOB_FAILED";
+      const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
       this.store.retryJob(job.id, {
         owner: this.owner,
