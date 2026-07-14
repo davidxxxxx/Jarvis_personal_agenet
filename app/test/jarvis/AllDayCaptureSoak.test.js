@@ -235,8 +235,9 @@ function createOwnedFileHandleTracker(root) {
   const originalCloseSync = fs.closeSync;
   const active = new Set();
   let peak = 0;
+  let installed = false;
 
-  fs.openSync = function trackedOpenSync(candidate, ...args) {
+  function trackedOpenSync(candidate, ...args) {
     const descriptor = originalOpenSync.call(fs, candidate, ...args);
     if (typeof candidate === "string") {
       const resolved = path.resolve(candidate);
@@ -250,21 +251,30 @@ function createOwnedFileHandleTracker(root) {
       }
     }
     return descriptor;
-  };
-  fs.closeSync = function trackedCloseSync(descriptor) {
+  }
+
+  function trackedCloseSync(descriptor) {
     const result = originalCloseSync.call(fs, descriptor);
     active.delete(descriptor);
     return result;
-  };
+  }
 
   return {
     active,
     get peak() {
       return peak;
     },
+    install() {
+      assert.equal(installed, false);
+      installed = true;
+      fs.openSync = trackedOpenSync;
+      fs.closeSync = trackedCloseSync;
+    },
     restore() {
+      if (!installed) return;
       fs.openSync = originalOpenSync;
       fs.closeSync = originalCloseSync;
+      installed = false;
     },
   };
 }
@@ -310,6 +320,34 @@ function createOwnedTimerTracker() {
       installed = false;
     },
   };
+}
+
+async function teardownOwnedInstrumentation(teardown, restorers) {
+  let teardownError = null;
+  const restoreErrors = [];
+  try {
+    await teardown();
+  } catch (error) {
+    teardownError = error;
+  } finally {
+    for (const restore of restorers) {
+      try {
+        restore();
+      } catch (error) {
+        restoreErrors.push(error);
+      }
+    }
+  }
+
+  if (teardownError && restoreErrors.length === 0) throw teardownError;
+  if (!teardownError && restoreErrors.length === 1) throw restoreErrors[0];
+  if (teardownError || restoreErrors.length > 0) {
+    throw new AggregateError(
+      [...(teardownError ? [teardownError] : []), ...restoreErrors],
+      "instrumentation teardown failed",
+      teardownError ? { cause: teardownError } : undefined
+    );
+  }
 }
 
 async function settleEventLoop() {
@@ -422,6 +460,68 @@ async function nonDatabaseFileHashes(root) {
   return rows.sort((left, right) => left[0].localeCompare(right[0]));
 }
 
+test("task-owned instrumentation cleanup preserves teardown errors and restores globals", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-soak-cleanup-"));
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  let fileHandles = null;
+  let timerHandles = null;
+  t.after(() =>
+    teardownOwnedInstrumentation(
+      () => fsp.rm(base, { recursive: true, force: true }),
+      [() => fileHandles?.restore(), () => timerHandles?.restore()]
+    )
+  );
+
+  fileHandles = createOwnedFileHandleTracker(base);
+  timerHandles = createOwnedTimerTracker();
+  fileHandles.install();
+  timerHandles.install();
+  const teardownError = new Error("forced instrumentation teardown failure");
+
+  await assert.rejects(
+    () =>
+      teardownOwnedInstrumentation(
+        async () => {
+          throw teardownError;
+        },
+        [() => fileHandles.restore(), () => timerHandles.restore()]
+      ),
+    (error) => error === teardownError
+  );
+  assert.equal(fs.openSync, originalOpenSync);
+  assert.equal(fs.closeSync, originalCloseSync);
+  assert.equal(global.setTimeout, originalSetTimeout);
+  assert.equal(global.clearTimeout, originalClearTimeout);
+
+  const restoreError = new Error("forced restore failure");
+  let secondRestoreRan = false;
+  await assert.rejects(
+    () =>
+      teardownOwnedInstrumentation(
+        async () => {
+          throw teardownError;
+        },
+        [
+          () => {
+            throw restoreError;
+          },
+          () => {
+            secondRestoreRan = true;
+          },
+        ]
+      ),
+    (error) =>
+      error instanceof AggregateError &&
+      error.cause === teardownError &&
+      error.errors[0] === teardownError &&
+      error.errors[1] === restoreError
+  );
+  assert.equal(secondRestoreRan, true);
+});
+
 test(
   "three virtual hours keep production capture and evidence boundaries bounded and recoverable",
   { timeout: TEST_TIMEOUT_MS },
@@ -438,35 +538,45 @@ test(
     const helperTracker = createHelperTracker();
     const fileHandles = createOwnedFileHandleTracker(base);
     const timerHandles = createOwnedTimerTracker();
-    timerHandles.install();
     let repository = null;
     let service = null;
     let retentionCleaner = null;
     let compressionWorker = null;
     let reader = null;
 
-    t.after(async () => {
-      if (retentionCleaner) {
-        await withTimeout(retentionCleaner.stop(), "retention cleaner teardown", 5_000).catch(
-          () => {}
-        );
-      }
-      if (service) {
-        service.shutdown();
-        await withTimeout(service.whenRetentionIdle(), "retention teardown", 5_000).catch(() => {});
-        await withTimeout(service.waitForCompressionIdle(), "compression teardown", 5_000).catch(
-          () => {}
-        );
-      }
-      await withTimeout(compressionWorker?.shutdown(), "compression worker teardown", 5_000).catch(
-        () => {}
-      );
-      if (repository?.db?.open) repository.close();
-      await settleEventLoop();
-      fileHandles.restore();
-      timerHandles.restore();
-      await fsp.rm(base, { recursive: true, force: true });
-    });
+    t.after(() =>
+      teardownOwnedInstrumentation(
+        async () => {
+          if (retentionCleaner) {
+            await withTimeout(retentionCleaner.stop(), "retention cleaner teardown", 5_000).catch(
+              () => {}
+            );
+          }
+          if (service) {
+            service.shutdown();
+            await withTimeout(service.whenRetentionIdle(), "retention teardown", 5_000).catch(
+              () => {}
+            );
+            await withTimeout(
+              service.waitForCompressionIdle(),
+              "compression teardown",
+              5_000
+            ).catch(() => {});
+          }
+          await withTimeout(
+            compressionWorker?.shutdown(),
+            "compression worker teardown",
+            5_000
+          ).catch(() => {});
+          if (repository?.db?.open) repository.close();
+          await settleEventLoop();
+          await fsp.rm(base, { recursive: true, force: true });
+        },
+        [() => fileHandles.restore(), () => timerHandles.restore()]
+      )
+    );
+    fileHandles.install();
+    timerHandles.install();
 
     await fsp.mkdir(oldRoot, { recursive: true });
     repository = new JarvisRepository(dbPath);
