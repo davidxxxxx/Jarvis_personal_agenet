@@ -6,6 +6,7 @@ const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
 const DEFAULT_MAX_DRAIN_MS = 5_000;
+const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
 
 function positiveSafeInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -24,6 +25,7 @@ class JarvisProcessingRuntime {
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     maxJobsPerDrain = DEFAULT_MAX_JOBS_PER_DRAIN,
     maxDrainMs = DEFAULT_MAX_DRAIN_MS,
+    maxSessionsPerDrain = DEFAULT_MAX_SESSIONS_PER_DRAIN,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
     log = () => {},
@@ -38,6 +40,7 @@ class JarvisProcessingRuntime {
     if (
       !repository ||
       typeof repository.listProcessingSessions !== "function" ||
+      typeof repository.isSessionReadyForPostProcessing !== "function" ||
       typeof repository.refreshSessionReadiness !== "function"
     ) {
       throw new TypeError("repository processing APIs are required");
@@ -62,6 +65,10 @@ class JarvisProcessingRuntime {
     this.pollIntervalMs = positiveSafeInteger(pollIntervalMs, "pollIntervalMs");
     this.maxJobsPerDrain = positiveSafeInteger(maxJobsPerDrain, "maxJobsPerDrain");
     this.maxDrainMs = positiveSafeInteger(maxDrainMs, "maxDrainMs");
+    this.maxSessionsPerDrain = positiveSafeInteger(
+      maxSessionsPerDrain,
+      "maxSessionsPerDrain"
+    );
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
     this.log = log;
@@ -70,6 +77,8 @@ class JarvisProcessingRuntime {
     this.startPromise = null;
     this.stopPromise = null;
     this.stopping = false;
+    this.running = true;
+    this.sessionCursor = null;
   }
 
   start() {
@@ -106,23 +115,46 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    const candidatesBefore = this.repository.listProcessingSessions();
     let processed = 0;
     while (processed < this.maxJobsPerDrain) {
+      if (this.stopping || !this.running) break;
       if (this.now() - startedAt >= this.maxDrainMs) break;
       const count = await this.runner.runOnce(this.now());
       if (count === 0) break;
       processed += count;
     }
 
-    const sessions = this.repository.listProcessingSessions();
-    for (const session of sessions) {
+    const candidatesAfter =
+      this.stopping || !this.running ? [] : this.repository.listProcessingSessions();
+    const candidateMap = new Map();
+    for (const session of [...candidatesBefore, ...candidatesAfter]) {
+      if (session?.id && !candidateMap.has(session.id)) candidateMap.set(session.id, session);
+    }
+    const sessions = [...candidateMap.values()];
+    let startIndex = 0;
+    if (this.sessionCursor !== null && sessions.length > 0) {
+      const cursorIndex = sessions.findIndex((session) => session.id === this.sessionCursor);
+      if (cursorIndex >= 0) startIndex = (cursorIndex + 1) % sessions.length;
+    }
+    const batchSize = Math.min(this.maxSessionsPerDrain, sessions.length);
+    for (let offset = 0; offset < batchSize; offset += 1) {
+      if (this.stopping || !this.running) break;
+      if (this.now() - startedAt >= this.maxDrainMs) break;
+      const session = sessions[(startIndex + offset) % sessions.length];
       try {
+        if (!this.repository.isSessionReadyForPostProcessing(session.id)) {
+          this.repository.markSessionProcessing?.(session.id);
+          continue;
+        }
         this.repository.markSessionProcessing?.(session.id);
         await this.reconciler.reconcileSession(session.id);
         await this.deduper.dedupe(session.id);
         this.repository.refreshSessionReadiness(session.id, this.now());
       } catch (error) {
         this.log({ phase: "post_process", sessionId: session.id, error });
+      } finally {
+        this.sessionCursor = session.id;
       }
     }
     return processed;
@@ -131,6 +163,7 @@ class JarvisProcessingRuntime {
   stop() {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
+    this.running = false;
     if (this.timer !== null) {
       this.clearInterval(this.timer);
       this.timer = null;

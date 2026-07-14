@@ -266,6 +266,7 @@ test("concurrent drains coalesce and stop waits for the in-flight handler", asyn
     },
     repository: {
       listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
       refreshSessionReadiness: () => {},
     },
     reconciler: { reconcileSession: () => {} },
@@ -294,6 +295,7 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository: {
       listProcessingSessions: () => [{ id: "bad" }, { id: "good" }],
+      isSessionReadyForPostProcessing: () => true,
       markSessionProcessing: (id) => order.push(`processing:${id}`),
       refreshSessionReadiness: (id) => order.push(`ready:${id}`),
     },
@@ -329,6 +331,7 @@ test("start recovers expired leases immediately and owns an unref polling timer"
     },
     repository: {
       listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
       refreshSessionReadiness: () => {},
     },
     reconciler: { reconcileSession: () => {} },
@@ -366,6 +369,7 @@ test("startup recovery errors are surfaced without disabling immediate drain or 
     },
     repository: {
       listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
       refreshSessionReadiness: () => {},
     },
     reconciler: { reconcileSession: () => {} },
@@ -427,4 +431,248 @@ test("production composition binds transcribe and compression handlers to curren
   assert.equal(await runtime.drainOnce(), 2);
   assert.deepEqual(calls, ["model:large-v3-turbo", "transcribe", "compress:compress-job"]);
   assert.equal(repository.getSession("s1").processing_state, "ready");
+});
+
+test("stop reached during the first handler prevents every later claim in the same drain", async () => {
+  const entered = deferred();
+  const release = deferred();
+  let claims = 0;
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        claims += 1;
+        if (claims === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+        return 1;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: { dedupe: () => {} },
+    maxJobsPerDrain: 3,
+  });
+
+  const draining = runtime.drainOnce();
+  await entered.promise;
+  const stopping = runtime.stop();
+  release.resolve();
+  await Promise.all([draining, stopping]);
+
+  assert.equal(claims, 1);
+});
+
+test("committing required evidence invalidates ready atomically and same drain post-processes it", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { processingState: "processing" });
+  insertTrack(repository);
+  const initiallyReady = repository.refreshSessionReadiness("s1", 1_500);
+  assert.equal(initiallyReady.processing_state, "ready");
+  const previousTimeline = initiallyReady.timeline_version;
+
+  repository.commitChunk({
+    id: "chunk-late",
+    sessionId: "s1",
+    trackId: "track-mic",
+    sourceType: "mic",
+    sequenceNumber: 0,
+    path: "chunk-late.wav",
+    startedAt: 500,
+    endedAt: 900,
+    durationMs: 400,
+    sha256: "f".repeat(64),
+    expiresAt: 999_999,
+  });
+
+  const invalidated = repository.getSession("s1");
+  assert.equal(invalidated.processing_state, "processing");
+  assert.equal(invalidated.ready_at, null);
+  assert.equal(invalidated.timeline_version, previousTimeline + 1);
+
+  const order = [];
+  const runner = new ProcessingJobRunner({
+    store: repository.captureEvidenceStore,
+    owner: "same-drain-worker",
+    now: () => 2_000,
+  });
+  runner.register("transcribe_chunk", async (job) => {
+    repository.commitChunkTranscript({
+      chunk: repository.getAudioChunk(job.chunk_id),
+      result: { noSpeech: true },
+      modelVersion: "large-v3-turbo",
+      completedAt: 2_000,
+    });
+  });
+  const runtime = new JarvisProcessingRuntime({
+    runner,
+    repository,
+    reconciler: { reconcileSession: (id) => order.push(`reconcile:${id}`) },
+    deduper: { dedupe: (id) => order.push(`dedupe:${id}`) },
+    now: () => 2_000,
+  });
+  const originalRefresh = repository.refreshSessionReadiness.bind(repository);
+  repository.refreshSessionReadiness = (id, at) => {
+    order.push(`ready:${id}`);
+    return originalRefresh(id, at);
+  };
+
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(order, ["reconcile:s1", "dedupe:s1", "ready:s1"]);
+  const readyAgain = repository.getSession("s1");
+  assert.equal(readyAgain.processing_state, "ready");
+  assert.equal(readyAgain.ready_at, 2_000);
+  assert.equal(readyAgain.timeline_version, previousTimeline + 2);
+});
+
+test("enqueueing a new transcription version invalidates ready in the job transaction", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { processingState: "processing" });
+  insertTrack(repository);
+  insertChunk(repository, { transcriptionStatus: "no_speech" });
+  insertJob(repository, { state: "completed", completedAt: 700 });
+  const ready = repository.refreshSessionReadiness("s1", 1_500);
+  assert.equal(ready.processing_state, "ready");
+
+  repository.captureEvidenceStore.enqueueChunkTranscription({
+    id: "chunk-mic",
+    sessionId: "s1",
+    trackId: "track-mic",
+    sourceType: "mic",
+    sequenceNumber: 0,
+    path: "s1-chunk-mic.wav",
+    startedAt: 100,
+    endedAt: 500,
+    durationMs: 400,
+    sha256: "chunk-mic".padEnd(64, "0").slice(0, 64),
+    expiresAt: 999_999,
+    inputVersion: 2,
+    modelVersion: "replacement-model",
+  });
+
+  const invalidated = repository.getSession("s1");
+  assert.equal(invalidated.processing_state, "processing");
+  assert.equal(invalidated.ready_at, null);
+  assert.equal(invalidated.timeline_version, ready.timeline_version + 1);
+});
+
+test("post-processing shares the drain deadline and does not start another session after expiry", async () => {
+  let now = 0;
+  const order = [];
+  const sessions = [{ id: "s1" }, { id: "s2" }, { id: "s3" }];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => sessions,
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: () => {},
+      refreshSessionReadiness: (id) => order.push(`ready:${id}`),
+    },
+    reconciler: {
+      reconcileSession: (id) => {
+        order.push(`reconcile:${id}`);
+        now = 11;
+      },
+    },
+    deduper: { dedupe: (id) => order.push(`dedupe:${id}`) },
+    now: () => now,
+    maxDrainMs: 10,
+    maxSessionsPerDrain: 3,
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(order, ["reconcile:s1", "dedupe:s1", "ready:s1"]);
+});
+
+test("session post-processing cap rotates a stable backlog without starvation", async () => {
+  const order = [];
+  const sessions = ["s1", "s2", "s3", "s4", "s5"].map((id) => ({ id }));
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => sessions,
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: () => {},
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: (id) => order.push(id) },
+    deduper: { dedupe: () => {} },
+    maxSessionsPerDrain: 2,
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(order, ["s1", "s2"]);
+  await runtime.drainOnce();
+  assert.deepEqual(order, ["s1", "s2", "s3", "s4"]);
+  await runtime.drainOnce();
+  assert.deepEqual(order, ["s1", "s2", "s3", "s4", "s5", "s1"]);
+});
+
+test("pre-drain and post-drain processing candidates are unioned in one bounded pass", async () => {
+  let lists = 0;
+  const order = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => {
+        lists += 1;
+        return lists === 1 ? [{ id: "before" }] : [{ id: "after" }];
+      },
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: () => {},
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: (id) => order.push(`reconcile:${id}`) },
+    deduper: { dedupe: () => {} },
+    maxSessionsPerDrain: 2,
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(order, ["reconcile:before", "reconcile:after"]);
+});
+
+test("blocked and retry transcription sessions stay processing without heavy post-processing", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  for (const state of ["blocked", "retry"]) {
+    const sessionId = `s-${state}`;
+    const trackId = `track-${state}`;
+    const chunkId = `chunk-${state}`;
+    insertSession(repository, { id: sessionId });
+    insertTrack(repository, { id: trackId, sessionId });
+    insertChunk(repository, {
+      id: chunkId,
+      sessionId,
+      trackId,
+      transcriptionStatus: "no_speech",
+    });
+    insertJob(repository, {
+      id: `job-${state}`,
+      sessionId,
+      trackId,
+      chunkId,
+      state,
+      completedAt: state === "blocked" ? 600 : null,
+    });
+  }
+  const heavy = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository,
+    reconciler: { reconcileSession: (id) => heavy.push(`reconcile:${id}`) },
+    deduper: { dedupe: (id) => heavy.push(`dedupe:${id}`) },
+    maxSessionsPerDrain: 2,
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(heavy, []);
+  assert.equal(repository.getSession("s-blocked").processing_state, "processing");
+  assert.equal(repository.getSession("s-retry").processing_state, "processing");
 });

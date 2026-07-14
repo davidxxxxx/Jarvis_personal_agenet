@@ -67,6 +67,13 @@ class CaptureEvidenceStore {
       getTrack: db.prepare("SELECT * FROM audio_tracks WHERE id = ?"),
       getGap: db.prepare("SELECT * FROM audio_gaps WHERE id = ?"),
       getSession: db.prepare("SELECT * FROM sessions WHERE id = ?"),
+      invalidateSessionReadiness: db.prepare(`
+        UPDATE sessions
+        SET processing_state = 'processing', ready_at = NULL,
+            timeline_version = timeline_version + 1
+        WHERE id = @sessionId
+          AND (processing_state = 'ready' OR ready_at IS NOT NULL)
+      `),
       listTracksForSession: db.prepare("SELECT * FROM audio_tracks WHERE session_id = ?"),
       getOpenGapForTrack: db.prepare(
         "SELECT * FROM audio_gaps WHERE track_id = ? AND ended_at IS NULL"
@@ -445,6 +452,7 @@ class CaptureEvidenceStore {
       }
       const transcription = this._insertChunkTranscription(chunk);
       if (chunk.encoderVersion !== undefined) this._insertChunkCompression(chunk);
+      this.statements.invalidateSessionReadiness.run({ sessionId: chunk.sessionId });
       return transcription;
     });
     this.createTracksTransaction = db.transaction((tracks) =>
@@ -530,7 +538,10 @@ class CaptureEvidenceStore {
 
       const input = this._transcriptionInput(chunk);
       const existing = this.statements.getTranscriptionJobByInput.get(input);
-      return existing ?? this._insertChunkTranscription(chunk);
+      if (existing) return existing;
+      const inserted = this._insertChunkTranscription(chunk);
+      this.statements.invalidateSessionReadiness.run({ sessionId: chunk.sessionId });
+      return inserted;
     });
     this.promoteChunkToFlacTransaction = db.transaction((input) => {
       const chunk = this.statements.getChunk.get(input.chunkId);

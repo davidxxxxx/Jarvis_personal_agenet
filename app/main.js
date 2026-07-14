@@ -324,6 +324,10 @@ const {
 const {
   createJarvisProcessingRuntime,
 } = require("./src/jarvis/main/JarvisProcessingRuntime");
+const {
+  JarvisProcessingLifecycle,
+  createJarvisRuntimeMigrationParticipant,
+} = require("./src/jarvis/main/JarvisProcessingLifecycle");
 
 // Manager instances - initialized after app.whenReady()
 let debugLogger = null;
@@ -359,7 +363,6 @@ let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
 let openAiCorrectionService = null;
 let jarvisAnalysisScheduler = null;
-let jarvisProcessingRuntime = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
 
@@ -379,24 +382,23 @@ function buildJarvisProcessingRuntime() {
   });
 }
 
-function startJarvisProcessingRuntime() {
-  if (jarvisProcessingRuntime) return jarvisProcessingRuntime;
-  const runtime = buildJarvisProcessingRuntime();
-  jarvisProcessingRuntime = runtime;
-  void runtime.start().catch((error) => {
+const jarvisProcessingLifecycle = new JarvisProcessingLifecycle({
+  buildRuntime: buildJarvisProcessingRuntime,
+  log: ({ error }) => {
     debugLogger?.warn(
       "Jarvis processing startup recovery failed",
       { error: error?.message ?? String(error) },
       "jarvis"
     );
-  });
-  return runtime;
+  },
+});
+
+function startJarvisProcessingRuntime() {
+  return jarvisProcessingLifecycle.start();
 }
 
 async function stopJarvisProcessingRuntime() {
-  const runtime = jarvisProcessingRuntime;
-  jarvisProcessingRuntime = null;
-  await runtime?.stop();
+  await jarvisProcessingLifecycle.stop();
 }
 let gracefulShutdownCoordinator = null;
 let jarvisStorageManager = null;
@@ -571,26 +573,21 @@ async function initializeCoreManagers() {
     whisperCudaManager?.resetDataRoot?.();
     require("./src/helpers/safeTempDir").resetSafeTempDir();
   };
-  migrationCoordinator.register({
-    name: "jarvis-runtime",
-    async quiesce() {
-      await stopJarvisProcessingRuntime();
-      await jarvisService.prepareStorageMigration();
-      await retentionCleaner.stop();
-      await jarvisAnalysisScheduler.quiesce();
-    },
-    async close() {
-      jarvisRepository.checkpointForMigration();
-      jarvisRepository.close();
-    },
-    reopen: reconfigureStorageHolders,
-    rollback: reconfigureStorageHolders,
-    async resume() {
-      jarvisAnalysisScheduler.resume();
-      retentionCleaner.start();
-      startJarvisProcessingRuntime();
-    },
-  });
+  migrationCoordinator.register(
+    createJarvisRuntimeMigrationParticipant({
+      processingLifecycle: jarvisProcessingLifecycle,
+      prepareStorageMigration: () => jarvisService.prepareStorageMigration(),
+      stopRetention: () => retentionCleaner.stop(),
+      quiesceAnalysis: () => jarvisAnalysisScheduler.quiesce(),
+      checkpointAndCloseRepository: () => {
+        jarvisRepository.checkpointForMigration();
+        jarvisRepository.close();
+      },
+      reconfigureStorageHolders,
+      resumeAnalysis: () => jarvisAnalysisScheduler.resume(),
+      startRetention: () => retentionCleaner.start(),
+    })
+  );
   storageComposition.registerWriterProvider();
   const dataDirectoryMigrator = storageComposition.dataDirectoryMigrator;
   jarvisStorageManager = storageManagerRef = new JarvisStorageManager({

@@ -989,7 +989,7 @@ class JarvisRepository {
       }
     );
 
-    this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
+    this._inspectSessionTranscriptReadiness = (sessionId) => {
       const session = this.statements.getSession.get(sessionId);
       if (!session) throw new Error(`session ${sessionId} does not exist`);
       const isFinalized =
@@ -1038,6 +1038,12 @@ class JarvisRepository {
               segment.ended_at >= chunk.ended_at
           );
         });
+      return { session, complete, isFinalized };
+    };
+
+    this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
+      const { session, complete, isFinalized } =
+        this._inspectSessionTranscriptReadiness(sessionId);
       const processingState = complete ? "ready" : isFinalized ? "processing" : "pending";
       const readyAt = complete ? (session.ready_at ?? at) : null;
       this.statements.setSessionReadiness.run({ sessionId, processingState, readyAt });
@@ -1208,6 +1214,10 @@ class JarvisRepository {
 
   listPendingJobs(sessionId) {
     return this.statements.listPendingJobs.all(assertId(sessionId, "sessionId"));
+  }
+
+  isSessionReadyForPostProcessing(sessionId) {
+    return this._inspectSessionTranscriptReadiness(assertId(sessionId, "sessionId")).complete;
   }
 
   markSessionProcessing(sessionId) {
