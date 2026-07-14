@@ -1,6 +1,11 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { JarvisSessionTimeline } from "../../types";
+import type {
+  JarvisSession,
+  JarvisSessionDetail,
+  JarvisSessionTimeline,
+  JarvisTranscriptSegment,
+} from "../../types";
 import MemoryView from "../MemoryView";
 import { useJarvisStore } from "../jarvisStore";
 
@@ -37,6 +42,45 @@ const timeline: JarvisSessionTimeline = {
     total: 1,
   },
 };
+
+const visibleSegment: JarvisTranscriptSegment = {
+  id: "segment-1",
+  session_id: session.id,
+  started_at: 1_200,
+  ended_at: 1_500,
+  person_id: null,
+  speaker_label: "其他说话人",
+  text: "轮询后出现的最终转写",
+  confidence: 0.9,
+  is_stable: 1,
+  analysis_state: "pending",
+  track_id: null,
+  chunk_id: null,
+  source_type: "mic",
+  result_kind: "final",
+};
+
+function detailFor(value: JarvisSession): JarvisSessionDetail {
+  return {
+    session: value,
+    summary: null,
+    segments: [],
+    audioChunks: [],
+    topics: [],
+    todos: [],
+    memories: [],
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("MemoryView processing timeline", () => {
   let poll: (() => void) | null;
@@ -149,5 +193,101 @@ describe("MemoryView processing timeline", () => {
 
     await waitFor(() => expect(getSessionTimeline).toHaveBeenCalledTimes(3));
     expect(await screen.findByText("处理完成")).toBeInTheDocument();
+  });
+
+  it("offers summary generation when polling publishes visible transcript segments", async () => {
+    const readyTimeline = {
+      ...timeline,
+      processing_state: "ready" as const,
+      ready_at: 3_000,
+      segments: [visibleSegment],
+      processing_counts: {
+        pending: 0,
+        leased: 0,
+        retry: 0,
+        blocked: 0,
+        completed: 1,
+        total: 1,
+      },
+    };
+    const getSessionTimeline = vi
+      .fn()
+      .mockResolvedValueOnce(timeline)
+      .mockResolvedValueOnce(readyTimeline);
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => detailFor(session)),
+          getSessionTimeline,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("正在处理")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "生成总结" })).not.toBeInTheDocument();
+
+    act(() => poll?.());
+
+    expect(await screen.findByRole("button", { name: "生成总结" })).toBeInTheDocument();
+  });
+
+  it("keeps the latest session when an earlier detail request resolves last", async () => {
+    const sessionB: JarvisSession = {
+      ...session,
+      id: "session-2",
+      started_at: 2_000_000,
+      ended_at: 2_001_000,
+    };
+    const detailA = deferred<JarvisSessionDetail>();
+    const detailB = deferred<JarvisSessionDetail>();
+    const timelineA = deferred<JarvisSessionTimeline>();
+    const timelineB = deferred<JarvisSessionTimeline>();
+    useJarvisStore.setState({ sessions: [session, sessionB] });
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn((sessionId: string) =>
+            sessionId === session.id ? detailA.promise : detailB.promise
+          ),
+          getSessionTimeline: vi.fn((sessionId: string) =>
+            sessionId === session.id ? timelineA.promise : timelineB.promise
+          ),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    const recordingButtons = screen
+      .getAllByRole("button")
+      .filter((button) => button.textContent?.includes("的录音"));
+    fireEvent.click(recordingButtons[0]);
+    fireEvent.click(recordingButtons[1]);
+
+    await act(async () => {
+      detailB.resolve(detailFor(sessionB));
+      timelineB.resolve({ ...timeline, session_id: sessionB.id, started_at: sessionB.started_at });
+      await Promise.resolve();
+    });
+    const sessionBHeading = new Date(sessionB.started_at).toLocaleString("zh-CN");
+    expect(await screen.findByRole("heading", { name: sessionBHeading })).toBeInTheDocument();
+
+    await act(async () => {
+      detailA.resolve(detailFor(session));
+      timelineA.resolve(timeline);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("heading", { name: sessionBHeading })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: new Date(session.started_at).toLocaleString("zh-CN") })
+    ).not.toBeInTheDocument();
   });
 });

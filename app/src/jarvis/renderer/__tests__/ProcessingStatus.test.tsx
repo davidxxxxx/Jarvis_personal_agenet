@@ -96,4 +96,31 @@ describe("ProcessingStatus", () => {
     expect(screen.getByText(/检查本地模型或存储/)).toBeInTheDocument();
     expect(screen.queryByText("处理完成")).not.toBeInTheDocument();
   });
+
+  it.each(["recording", "paused", "finalizing"] as const)(
+    "keeps the %s capture state visible while also surfacing blocked work",
+    (status) => {
+      render(
+        <ProcessingStatus
+          timeline={timeline({
+            status,
+            processing_state: "ready",
+            ready_at: 2_500,
+            processing_counts: {
+              pending: 0,
+              leased: 0,
+              retry: 0,
+              blocked: 2,
+              completed: 4,
+              total: 6,
+            },
+          })}
+        />
+      );
+
+      expect(screen.getByRole("status")).toBeInTheDocument();
+      expect(screen.getByRole("alert")).toHaveTextContent("2");
+      expect(screen.queryByText("处理完成")).not.toBeInTheDocument();
+    }
+  );
 });

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Clock3, Search } from "lucide-react";
 import type { JarvisSession, JarvisSessionDetail, JarvisSessionTimeline } from "../types";
 import { useJarvisStore } from "./jarvisStore";
@@ -28,8 +28,16 @@ export default function MemoryView() {
   const [timeline, setTimeline] = useState<JarvisSessionTimeline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const detailRequestGeneration = useRef(0);
 
   useEffect(() => setSessions(storedSessions), [storedSessions]);
+
+  useEffect(
+    () => () => {
+      detailRequestGeneration.current += 1;
+    },
+    []
+  );
 
   useEffect(() => {
     const sessionId = detail?.session.id;
@@ -77,6 +85,7 @@ export default function MemoryView() {
   };
 
   const open = async (sessionId: string) => {
+    const generation = ++detailRequestGeneration.current;
     setLoading(true);
     setError(null);
     try {
@@ -84,12 +93,14 @@ export default function MemoryView() {
         window.electronAPI.jarvis.getSessionDetail(sessionId),
         window.electronAPI.jarvis.getSessionTimeline(sessionId),
       ]);
+      if (generation !== detailRequestGeneration.current) return;
       setDetail(nextDetail);
       setTimeline(nextTimeline);
     } catch {
+      if (generation !== detailRequestGeneration.current) return;
       setError("无法读取这次录音。");
     } finally {
-      setLoading(false);
+      if (generation === detailRequestGeneration.current) setLoading(false);
     }
   };
 
@@ -127,6 +138,8 @@ export default function MemoryView() {
         <button
           type="button"
           onClick={() => {
+            detailRequestGeneration.current += 1;
+            setLoading(false);
             setDetail(null);
             setTimeline(null);
           }}
@@ -144,7 +157,8 @@ export default function MemoryView() {
               时长 {duration(detail.session)} · {detail.session.status}
             </p>
           </div>
-          {!detail.summary && detail.segments.length > 0 && (
+          {!detail.summary &&
+            (detail.segments.length > 0 || (timeline?.segments.length ?? 0) > 0) && (
             <button
               type="button"
               onClick={() => void analyze()}
