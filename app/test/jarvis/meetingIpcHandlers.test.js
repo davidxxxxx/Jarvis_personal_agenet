@@ -1866,6 +1866,68 @@ test("normal stop preserves Jarvis identity through the final local transcriptio
   assert.equal(stopped.transcript, "corrected bilingual transcript");
 });
 
+test("Jarvis carries real PCM echo evidence into retained MIC and SYSTEM transcript rows", async (t) => {
+  const fixture = createFixture({
+    systemAvailable: true,
+    transcribeLocalWhisper: async () => ({ success: true, text: "release the API Friday" }),
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const pcm = Buffer.alloc(12_000 * 2);
+  for (let sample = 0; sample < 12_000; sample += 1) {
+    pcm.writeInt16LE(sample % 2 === 0 ? 12_000 : -9_000, sample * 2);
+  }
+
+  const started = await start(
+    { sender: fixture.sender },
+    {
+      provider: "local",
+      jarvisSessionId: "jarvis-real-echo-evidence",
+    }
+  );
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, pcm, "system", started.inputGeneration);
+  }
+  for (let index = 0; index < 3; index += 1) {
+    send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  }
+
+  const stopped = await stop({ sender: fixture.sender });
+  const system = stopped.finalSegments.find((segment) => segment.source === "system");
+  const mic = stopped.finalSegments.find((segment) => segment.source === "mic");
+  const rendererMic = fixture.sent
+    .filter(
+      ([channel, payload]) =>
+        channel === "meeting-transcription-segment" &&
+        payload.type === "final" &&
+        payload.source === "mic"
+    )
+    .map(([, payload]) => payload)
+    .at(-1);
+
+  assert.equal(started.success, true);
+  assert.ok(system, "SYSTEM source row must remain available");
+  assert.ok(
+    mic,
+    `MIC source row must remain available for derived dedupe: ${JSON.stringify({
+      finalSegments: stopped.finalSegments,
+      whisperCallCount: fixture.whisperCalls.length,
+      rendererFinals: fixture.sent.filter(
+        ([channel, payload]) =>
+          channel === "meeting-transcription-segment" && payload.type === "final"
+      ),
+    })}`
+  );
+  assert.equal(mic.echoScore, 1);
+  assert.equal(rendererMic.echoScore, 1);
+  assert.equal(Number.isSafeInteger(mic.startedAt), true);
+  assert.equal(Number.isSafeInteger(mic.endedAt), true);
+  assert.ok(mic.startedAt < mic.endedAt);
+  assert.ok(system.startedAt < system.endedAt);
+});
+
 test("normal stop waits for an active periodic transcription and drains its tail", async (t) => {
   const periodicTranscriptionDeferred = createDeferred();
   const originalSetInterval = global.setInterval;

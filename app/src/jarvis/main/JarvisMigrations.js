@@ -1,8 +1,8 @@
-const TARGET_VERSION = 13;
+const TARGET_VERSION = 14;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
-  if (!new Set(["transcript_segments", "transcript_segments_v13"]).has(tableName)) {
+  if (!new Set(["transcript_segments", "transcript_segments_v13", "transcript_segments_v14"]).has(tableName)) {
     throw new TypeError("unsupported transcript segment table name");
   }
   return `
@@ -34,7 +34,18 @@ function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
       model_version TEXT,
       completed_at INTEGER,
       superseded_by TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+      echo_score REAL CHECK(
+        echo_score IS NULL OR (
+          typeof(echo_score) IN ('integer','real') AND echo_score BETWEEN 0 AND 1
+        )
+      ),
+      duplicate_of TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
       CHECK(superseded_by IS NULL OR result_kind = 'provisional'),
+      CHECK(
+        duplicate_of IS NULL OR (
+          source_type = 'mic' AND echo_score >= 0.8 AND duplicate_of <> id
+        )
+      ),
       CHECK(
         result_kind <> 'final' OR (
           track_id IS NOT NULL AND
@@ -55,6 +66,9 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
   CREATE INDEX IF NOT EXISTS idx_segments_superseded_by
     ON transcript_segments(superseded_by)
     WHERE superseded_by IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_segments_duplicate_of
+    ON transcript_segments(duplicate_of)
+    WHERE duplicate_of IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
     ON transcript_segments(chunk_id, model_version)
     WHERE chunk_id IS NOT NULL AND result_kind = 'final';
@@ -151,6 +165,66 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
           AND (
             source.session_id <> NEW.session_id
             OR source.track_id IS NOT NEW.track_id
+            OR source.started_at >= NEW.ended_at
+            OR NEW.started_at >= source.ended_at
+          )
+      );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_insert
+  BEFORE INSERT ON transcript_segments
+  WHEN NEW.duplicate_of IS NOT NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript duplicate')
+    WHERE NEW.source_type <> 'mic'
+      OR NEW.echo_score IS NULL
+      OR NEW.echo_score < 0.8
+      OR NEW.id = NEW.duplicate_of
+      OR NOT EXISTS (
+        SELECT 1
+        FROM transcript_segments AS target
+        WHERE target.id = NEW.duplicate_of
+          AND target.session_id = NEW.session_id
+          AND target.source_type = 'system'
+          AND NEW.started_at < target.ended_at
+          AND target.started_at < NEW.ended_at
+      );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_update
+  BEFORE UPDATE OF duplicate_of, session_id, source_type, started_at, ended_at, echo_score
+  ON transcript_segments
+  WHEN NEW.duplicate_of IS NOT NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript duplicate')
+    WHERE NEW.source_type <> 'mic'
+      OR NEW.echo_score IS NULL
+      OR NEW.echo_score < 0.8
+      OR NEW.id = NEW.duplicate_of
+      OR NOT EXISTS (
+        SELECT 1
+        FROM transcript_segments AS target
+        WHERE target.id = NEW.duplicate_of
+          AND target.session_id = NEW.session_id
+          AND target.source_type = 'system'
+          AND NEW.started_at < target.ended_at
+          AND target.started_at < NEW.ended_at
+      );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_target_update
+  BEFORE UPDATE OF id, session_id, source_type, started_at, ended_at
+  ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1 FROM transcript_segments AS source
+    WHERE source.duplicate_of = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid transcript duplicate target')
+    WHERE NEW.source_type <> 'system'
+      OR EXISTS (
+        SELECT 1
+        FROM transcript_segments AS source
+        WHERE source.duplicate_of = OLD.id
+          AND (
+            source.session_id <> NEW.session_id
             OR source.started_at >= NEW.ended_at
             OR NEW.started_at >= source.ended_at
           )
@@ -325,6 +399,49 @@ function rebuildTranscriptSegmentsV13(db, { preserveLineage = false } = {}) {
   db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
 }
 
+function rebuildTranscriptSegmentsV14(db) {
+  if (!tableExists(db, "transcript_segments")) return;
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.exec(transcriptSegmentsSchema("transcript_segments_v14"));
+  db.exec(`
+    INSERT INTO transcript_segments_v14 (
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at, superseded_by,
+      echo_score, duplicate_of
+    )
+    SELECT
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at, superseded_by,
+      NULL, NULL
+    FROM transcript_segments;
+    DROP INDEX IF EXISTS idx_segments_session_time;
+    DROP INDEX IF EXISTS idx_segments_superseded_by;
+    DROP INDEX IF EXISTS idx_segments_duplicate_of;
+    DROP INDEX IF EXISTS idx_transcript_chunk_model_final;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_insert;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_insert;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_target_update;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_insert;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_update;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_target_update;
+  `);
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      ALTER TABLE transcript_segments RENAME TO transcript_segments_v13;
+      ALTER TABLE transcript_segments_v14 RENAME TO transcript_segments;
+      DROP TABLE transcript_segments_v13;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
+}
+
 function rebuildLegacyProcessingJobs(db) {
   const sql = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs'")
@@ -467,7 +584,10 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
-    rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
+    if (fromVersion < 13) {
+      rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
+    }
+    rebuildTranscriptSegmentsV14(db);
     addColumn(db, "audio_gaps", "restored_device_id TEXT");
     addColumn(db, "audio_gaps", "restored_device_label TEXT");
     addColumn(db, "audio_gaps", "restored_strategy TEXT");

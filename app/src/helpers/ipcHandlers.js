@@ -4030,6 +4030,11 @@ class IPCHandlers {
     const DUPLICATE_TRANSCRIPT_MERGE_LIMIT = 3;
     const STREAMING_RISKY_MIC_SEGMENT_HOLDBACK_MS = 3000;
     const LOCAL_RISKY_MIC_SEGMENT_HOLDBACK_MS = 4500;
+    const echoScoreFromMicSuppression = (suppression) => {
+      if (suppression?.likelyRenderBleed) return 1;
+      if (suppression?.hasBleedEvidence) return 0.8;
+      return null;
+    };
 
     const buildNearbyTranscriptCandidates = (
       targetSource,
@@ -4129,23 +4134,33 @@ class IPCHandlers {
       return removed;
     };
 
-    const appendMeetingLocalTranscript = (text) => {
+    const appendMeetingLocalTranscript = (text, source) => {
       if (!text) return;
       meetingLocalTranscript += `${meetingLocalTranscript ? " " : ""}${text}`;
+      if (source === "mic" || source === "system") {
+        const sourceTranscript = meetingLocalTranscriptBySource[source];
+        meetingLocalTranscriptBySource[source] = `${sourceTranscript ? `${sourceTranscript} ` : ""}${text}`;
+      }
     };
 
     const storeMeetingDiarizationSegment = (
       text,
       source,
       timestamp,
+      startedAt,
+      endedAt,
       micSuppression = null,
       confidence = null
     ) => {
+      const echoScore = source === "mic" ? echoScoreFromMicSuppression(micSuppression) : null;
       const segment = {
         text,
         source,
         timestamp,
+        startedAt,
+        endedAt,
         ...(confidence == null ? {} : { confidence }),
+        ...(echoScore == null ? {} : { echoScore }),
         suppressionReason: source === "mic" ? micSuppression?.reason || null : null,
         hasBleedEvidence: source === "mic" ? !!micSuppression?.hasBleedEvidence : false,
         likelyRenderBleed: source === "mic" ? !!micSuppression?.likelyRenderBleed : false,
@@ -4158,19 +4173,33 @@ class IPCHandlers {
       text,
       source,
       timestamp,
+      startedAt = null,
+      endedAt = null,
       confidence = null,
       micSuppression = null,
       send = null,
       includeInLocalTranscript = false,
     }) => {
+      const fallbackEnd = Number.isSafeInteger(timestamp) ? timestamp : Date.now();
+      const safeEnd = Number.isSafeInteger(endedAt) ? endedAt : fallbackEnd;
+      const fallbackStart = Math.min(safeEnd, Number.MAX_SAFE_INTEGER - 1);
+      const safeStart = Number.isSafeInteger(startedAt) ? startedAt : fallbackStart;
+      const intervalStart = Math.min(safeStart, Number.MAX_SAFE_INTEGER - 1);
+      const intervalEnd = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(intervalStart + 1, safeEnd)
+      );
+
       if (includeInLocalTranscript) {
-        appendMeetingLocalTranscript(text);
+        appendMeetingLocalTranscript(text, source);
       }
 
       const authoritativeSegment = storeMeetingDiarizationSegment(
         text,
         source,
         timestamp,
+        intervalStart,
+        intervalEnd,
         micSuppression,
         confidence
       );
@@ -4181,7 +4210,12 @@ class IPCHandlers {
           source,
           type: "final",
           timestamp,
+          startedAt: intervalStart,
+          endedAt: intervalEnd,
           ...(confidence == null ? {} : { confidence }),
+          ...(authoritativeSegment.echoScore == null
+            ? {}
+            : { echoScore: authoritativeSegment.echoScore }),
         });
       }
       return authoritativeSegment;
@@ -4207,6 +4241,7 @@ class IPCHandlers {
         }
 
         if (
+          !activeJarvisSessionId &&
           shouldSkipDuplicateMicSegment(pending.text, pending.timestamp, pending.micSuppression)
         ) {
           debugLogger.debug(
@@ -4226,7 +4261,7 @@ class IPCHandlers {
       schedulePendingMicFinalFlush();
 
       for (const pending of ready) {
-        if (pending.micSuppression?.hasBleedEvidence) {
+        if (!activeJarvisSessionId && pending.micSuppression?.hasBleedEvidence) {
           debugLogger.debug("Dropping flagged-bleed mic segment after holdback", {
             holdbackMs: pending.holdbackMs,
             averageCorrelation: pending.micSuppression?.averageCorrelation?.toFixed(3),
@@ -4351,10 +4386,14 @@ class IPCHandlers {
       streaming.onFinalTranscript = (text, timestamp) => {
         const segments = streaming.completedSegments;
         const latestSegment = segments.length > 0 ? segments[segments.length - 1] : text;
+        const segmentEndedAt = Date.now();
+        const segmentStartedAt = Number.isSafeInteger(timestamp)
+          ? timestamp
+          : segmentEndedAt - 1;
         let micSuppression = null;
         if (source === "mic") {
-          micSuppression = shouldSuppressMicTranscriptSegment(timestamp, Date.now());
-          if (micSuppression.suppress) {
+          micSuppression = shouldSuppressMicTranscriptSegment(segmentStartedAt, segmentEndedAt);
+          if (micSuppression.suppress && !activeJarvisSessionId) {
             debugLogger.debug("Suppressing contaminated mic segment", {
               reason: micSuppression.reason,
               averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
@@ -4364,7 +4403,10 @@ class IPCHandlers {
             return;
           }
 
-          if (shouldSkipDuplicateMicSegment(latestSegment, timestamp, micSuppression)) {
+          if (
+            !activeJarvisSessionId &&
+            shouldSkipDuplicateMicSegment(latestSegment, timestamp, micSuppression)
+          ) {
             debugLogger.debug("Skipping duplicate mic segment that matches recent system audio", {
               averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
               averageResidual: micSuppression.averageResidual?.toFixed(3),
@@ -4374,7 +4416,7 @@ class IPCHandlers {
           }
         }
 
-        if (source === "system") {
+        if (source === "system" && !activeJarvisSessionId) {
           const pending = removePendingMicFinalsFor(latestSegment, timestamp);
           if (pending.length > 0) {
             debugLogger.debug("Dropping buffered mic segments after system transcript arrived", {
@@ -4419,6 +4461,8 @@ class IPCHandlers {
                 text: latestSegment,
                 source,
                 timestamp,
+                startedAt: segmentStartedAt,
+                endedAt: segmentEndedAt,
                 micSuppression,
                 send,
               }),
@@ -4430,6 +4474,8 @@ class IPCHandlers {
           text: latestSegment,
           source,
           timestamp,
+          startedAt: segmentStartedAt,
+          endedAt: segmentEndedAt,
           micSuppression,
           send,
         });
@@ -4722,6 +4768,7 @@ class IPCHandlers {
     let meetingLocalTimer = null;
     let meetingLocalWin = null;
     let meetingLocalTranscript = "";
+    let meetingLocalTranscriptBySource = { mic: "", system: "" };
     let meetingLocalProvider = null;
     let meetingLocalModel = null;
     let meetingLocalLanguage = null;
@@ -4964,7 +5011,7 @@ class IPCHandlers {
         if (next.analysisOnly) {
           continue;
         }
-        if (analysis?.shouldMute && !meetingAecEnabled) {
+        if (analysis?.shouldMute && !meetingAecEnabled && !activeJarvisSessionId) {
           if (!meetingLocalMode) {
             dispatchMeetingAudioBuffer(Buffer.alloc(next.buffer.length), "mic");
           }
@@ -5185,7 +5232,7 @@ class IPCHandlers {
         if (result?.success && result.text?.trim()) {
           let text = result.text.trim();
           if (activeJarvisSessionId) {
-            text = mergeOverlappingTranscript(meetingLocalTranscript, text);
+            text = mergeOverlappingTranscript(meetingLocalTranscriptBySource[source], text);
           }
           if (!text) return;
           const quality = classifyTranscriptQuality(text);
@@ -5194,6 +5241,7 @@ class IPCHandlers {
           const correctionGeneration = transcriptionGeneration;
           const correctionContext = meetingLocalTranscript;
           const correctionAudioMs = Math.round((pcm24k.length / 2 / 24_000) * 1_000);
+          const segmentStartedAt = segTimestamp - Math.max(1, correctionAudioMs);
           let micSuppression = null;
           if (source === "mic") {
             const chunkDurationMs = (pcm24k.length / 2 / 24000) * 1000;
@@ -5210,7 +5258,7 @@ class IPCHandlers {
               averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
               averageResidual: micSuppression.averageResidual?.toFixed(3),
             });
-            if (micSuppression.suppress) {
+            if (micSuppression.suppress && !activeJarvisSessionId) {
               debugLogger.debug("Suppressing contaminated local mic segment", {
                 reason: micSuppression.reason,
                 averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
@@ -5219,7 +5267,10 @@ class IPCHandlers {
               return;
             }
 
-            if (shouldSkipDuplicateMicSegment(text, segTimestamp, micSuppression)) {
+            if (
+              !activeJarvisSessionId &&
+              shouldSkipDuplicateMicSegment(text, segTimestamp, micSuppression)
+            ) {
               debugLogger.debug("Skipping duplicate local mic segment that matches system audio", {
                 averageCorrelation: micSuppression.averageCorrelation?.toFixed(3),
                 averageResidual: micSuppression.averageResidual?.toFixed(3),
@@ -5232,7 +5283,7 @@ class IPCHandlers {
             });
           }
 
-          if (source === "system") {
+          if (source === "system" && !activeJarvisSessionId) {
             const pending = removePendingMicFinalsFor(text, segTimestamp);
             if (pending.length > 0) {
               debugLogger.debug(
@@ -5344,6 +5395,8 @@ class IPCHandlers {
               text,
               source,
               timestamp: segTimestamp,
+              startedAt: segmentStartedAt,
+              endedAt: segTimestamp,
               confidence: quality.suspicious ? 0.25 : 0.8,
               micSuppression,
               send: sendLocalSegment,
@@ -5447,6 +5500,7 @@ class IPCHandlers {
       meetingDiarizationSegments = [];
       meetingLocalWin = null;
       meetingLocalTranscript = "";
+      meetingLocalTranscriptBySource = { mic: "", system: "" };
       meetingLocalProvider = null;
       meetingLocalModel = null;
       meetingLocalLanguage = null;
@@ -5978,6 +6032,7 @@ class IPCHandlers {
           meetingLocalWin = BrowserWindow.fromWebContents(event.sender);
           meetingLocalBuffers = { mic: [], system: [] };
           meetingLocalTranscript = "";
+          meetingLocalTranscriptBySource = { mic: "", system: "" };
 
           await startLiveSpeakerIdentification(
             meetingLocalWin,
@@ -6117,7 +6172,7 @@ class IPCHandlers {
 
             if (!hasNativeMeetingSystemAudio()) {
               const analysis = meetingEchoLeakDetector.analyzeMicChunk(derivedBuffer);
-              if (analysis?.shouldMute && !meetingAecEnabled) {
+              if (analysis?.shouldMute && !meetingAecEnabled && !activeJarvisSessionId) {
                 if (!meetingLocalMode) {
                   dispatchMeetingAudioBuffer(Buffer.alloc(derivedBuffer.length), "mic");
                 }
@@ -6844,11 +6899,14 @@ class IPCHandlers {
           );
 
           const finalSegments = diarizationSegments.map(
-            ({ text, source, timestamp, confidence }) => ({
+            ({ text, source, timestamp, startedAt, endedAt, confidence, echoScore }) => ({
               text,
               source,
               timestamp,
+              startedAt,
+              endedAt,
               ...(confidence == null ? {} : { confidence }),
+              ...(echoScore == null ? {} : { echoScore }),
             })
           );
           return { success: true, transcript, diarizationSessionId, finalSegments };
@@ -6886,11 +6944,14 @@ class IPCHandlers {
         );
 
         const finalSegments = diarizationSegments.map(
-          ({ text, source, timestamp, confidence }) => ({
+          ({ text, source, timestamp, startedAt, endedAt, confidence, echoScore }) => ({
             text,
             source,
             timestamp,
+            startedAt,
+            endedAt,
             ...(confidence == null ? {} : { confidence }),
+            ...(echoScore == null ? {} : { echoScore }),
           })
         );
         return { success: true, transcript, diarizationSessionId, finalSegments };

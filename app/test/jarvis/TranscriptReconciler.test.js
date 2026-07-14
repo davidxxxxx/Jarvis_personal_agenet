@@ -38,6 +38,7 @@ function provisional(repository, {
   endedAt,
   sourceType = "mic",
   text = id,
+  echoScore = null,
 }) {
   repository.upsertTranscriptSegments("session-1", [
     {
@@ -50,6 +51,7 @@ function provisional(repository, {
       text,
       confidence: 0.6,
       isStable: true,
+      echoScore,
     },
   ]);
   return repository.getTranscriptSegment(id);
@@ -172,6 +174,30 @@ test("repeat reconciliation is idempotent", (t) => {
     unchanged: 1,
   });
   assert.equal(repository.getTranscriptSegment("repeat").superseded_by, finalSegment.id);
+});
+
+test("final reconciliation preserves the strongest durable acoustic echo evidence", (t) => {
+  const { repository, reconciler } = fixture(t);
+  provisional(repository, {
+    id: "weak-preview",
+    startedAt: 100,
+    endedAt: 160,
+    echoScore: 0.8,
+  });
+  provisional(repository, {
+    id: "strong-preview",
+    startedAt: 140,
+    endedAt: 200,
+    echoScore: 0.92,
+  });
+  const finalSegment = final(repository, {
+    chunkId: "echo-final",
+    startedAt: 100,
+    endedAt: 200,
+  });
+
+  assert.equal(reconciler.reconcileSession("session-1").superseded, 2);
+  assert.equal(repository.getTranscriptSegment(finalSegment.id).echo_score, 0.92);
 });
 
 test("a deterministic newest final wins regardless of insertion order", (t) => {

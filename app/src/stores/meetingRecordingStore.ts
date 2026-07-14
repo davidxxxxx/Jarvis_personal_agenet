@@ -45,7 +45,10 @@ export interface TranscriptSegment {
   text: string;
   source: "mic" | "system";
   timestamp?: number;
+  startedAt?: number;
+  endedAt?: number;
   confidence?: number;
+  echoScore?: number | null;
   speaker?: string;
   speakerName?: string;
   speakerIsPlaceholder?: boolean;
@@ -62,7 +65,10 @@ export interface MeetingFinalSegment {
   text: string;
   source: "mic" | "system";
   timestamp?: number;
+  startedAt?: number;
+  endedAt?: number;
   confidence?: number;
+  echoScore?: number | null;
 }
 
 export const SIDE_PANEL_BREAKPOINT_PX = 1024;
@@ -719,7 +725,10 @@ function commitFinalSegment(data: MeetingFinalSegment): void {
     text: data.text,
     source: data.source,
     timestamp: data.timestamp,
+    startedAt: data.startedAt,
+    endedAt: data.endedAt,
     confidence: data.confidence,
+    echoScore: data.echoScore,
   });
 
   for (let index = speakerIdentifications.length - 1; index >= 0; index -= 1) {
@@ -1574,7 +1583,10 @@ export async function startRecording(args: StartRecordingArgs): Promise<void> {
         type: "partial" | "final" | "retract" | "correction";
         originalText?: string;
         timestamp?: number;
+        startedAt?: number;
+        endedAt?: number;
         confidence?: number;
+        echoScore?: number | null;
       }) => {
         if (data.type === "correction") {
           const current = useMeetingRecordingStore.getState().segments;

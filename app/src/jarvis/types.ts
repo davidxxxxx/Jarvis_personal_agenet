@@ -102,6 +102,7 @@ export interface JarvisTranscriptSegmentInput {
   text: string;
   confidence: number;
   isStable: boolean;
+  echoScore?: number | null;
 }
 
 export interface JarvisTranscriptSegment {
@@ -123,6 +124,8 @@ export interface JarvisTranscriptSegment {
   model_version?: string | null;
   completed_at?: number | null;
   superseded_by?: string | null;
+  echo_score?: number | null;
+  duplicate_of?: string | null;
 }
 
 export interface JarvisRenamePersonInput {

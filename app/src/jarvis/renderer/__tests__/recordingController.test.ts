@@ -65,6 +65,31 @@ describe("Jarvis provisional transcript intervals", () => {
       sourceType: "mic",
     });
   });
+
+  it("preserves live acoustic echo evidence and the measured speech interval", () => {
+    expect(
+      mapStableSegments(
+        "session-1",
+        [
+          {
+            id: "echo",
+            text: "周五交付",
+            source: "mic",
+            timestamp: 2_000,
+            startedAt: 1_200,
+            endedAt: 2_000,
+            echoScore: 0.8,
+          },
+        ],
+        0
+      )[0]
+    ).toMatchObject({
+      startedAt: 1_200,
+      endedAt: 2_000,
+      sourceType: "mic",
+      echoScore: 0.8,
+    });
+  });
 });
 
 const stableSegment: TranscriptSegment = {

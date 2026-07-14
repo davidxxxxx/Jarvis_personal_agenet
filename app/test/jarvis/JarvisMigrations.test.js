@@ -979,6 +979,8 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
       model_version: "large-v3-turbo-v7",
       completed_at: 250,
       superseded_by: null,
+      echo_score: null,
+      duplicate_of: null,
     });
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
       { id: "evidence-1", segment_id: "v12-final" },
@@ -1001,6 +1003,149 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
           .run("v12-final"),
       /invalid transcript supersession target/
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("v14 preserves v13 transcript lineage and dependent foreign keys exactly", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE people (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        is_self INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+      );
+      CREATE TABLE audio_tracks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL,
+        device_id TEXT,
+        device_label TEXT,
+        strategy TEXT,
+        sample_rate INTEGER NOT NULL,
+        channels INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        state TEXT NOT NULL,
+        UNIQUE(session_id, source_type)
+      );
+      CREATE TABLE audio_chunks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        path TEXT NOT NULL UNIQUE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        transcription_status TEXT NOT NULL DEFAULT 'pending',
+        track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL DEFAULT 'mic',
+        sequence_number INTEGER NOT NULL DEFAULT 0,
+        write_state TEXT NOT NULL DEFAULT 'committed',
+        deleted_at INTEGER,
+        format TEXT NOT NULL DEFAULT 'wav',
+        file_sha256 TEXT,
+        sample_rate INTEGER NOT NULL DEFAULT 24000,
+        channels INTEGER NOT NULL DEFAULT 1,
+        retired_path TEXT,
+        retired_format TEXT,
+        retired_file_sha256 TEXT
+      );
+      CREATE TABLE transcript_segments (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL,
+        person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+        speaker_label TEXT NOT NULL,
+        text TEXT NOT NULL,
+        confidence REAL,
+        is_stable INTEGER NOT NULL,
+        analysis_state TEXT NOT NULL DEFAULT 'pending',
+        track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        source_type TEXT NOT NULL DEFAULT 'mic',
+        result_kind TEXT NOT NULL DEFAULT 'provisional',
+        version INTEGER NOT NULL DEFAULT 1,
+        model_version TEXT,
+        completed_at INTEGER,
+        superseded_by TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL
+      );
+      CREATE TABLE segment_links (
+        id TEXT PRIMARY KEY,
+        segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE
+      );
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('v13-session', 10, 300, 'completed', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, device_label, strategy,
+        sample_rate, channels, started_at, ended_at, state
+      ) VALUES (
+        'v13-track', 'v13-session', 'mic', 'Mic', 'web-audio',
+        24000, 1, 10, 300, 'ended'
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, track_id, source_type, sequence_number, path,
+        started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, write_state, format, file_sha256, sample_rate, channels
+      ) VALUES (
+        'v13-chunk', 'v13-session', 'v13-track', 'mic', 0, 'v13.wav',
+        100, 200, 100, 'pcm-v13', 1000,
+        'completed', 'committed', 'wav', 'file-v13', 24000, 1
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text,
+        confidence, is_stable, analysis_state, track_id, chunk_id,
+        source_type, result_kind, version, model_version, completed_at
+      ) VALUES (
+        'v13-final', 'v13-session', 100, 200, 'mic', 'final text',
+        0.9, 1, 'ready', 'v13-track', 'v13-chunk',
+        'mic', 'final', 3, 'model-v3', 250
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text,
+        confidence, is_stable, track_id, source_type, result_kind, superseded_by
+      ) VALUES (
+        'v13-preview', 'v13-session', 110, 190, 'mic', 'preview text',
+        0.6, 1, 'v13-track', 'mic', 'provisional', 'v13-final'
+      );
+      INSERT INTO segment_links (id, segment_id) VALUES ('link-v13', 'v13-preview');
+      PRAGMA user_version = 13;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 13, toVersion: TARGET_VERSION });
+    assert.deepEqual(
+      db.prepare(`
+        SELECT id, superseded_by, echo_score, duplicate_of
+        FROM transcript_segments ORDER BY id
+      `).all(),
+      [
+        { id: "v13-final", superseded_by: null, echo_score: null, duplicate_of: null },
+        {
+          id: "v13-preview",
+          superseded_by: "v13-final",
+          echo_score: null,
+          duplicate_of: null,
+        },
+      ]
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
+      { id: "link-v13", segment_id: "v13-preview" },
+    ]);
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
     db.close();
   }

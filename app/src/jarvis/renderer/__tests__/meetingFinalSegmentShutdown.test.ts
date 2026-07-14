@@ -130,7 +130,10 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         type: "partial" | "final" | "retract" | "correction";
         originalText?: string;
         timestamp?: number;
+        startedAt?: number;
+        endedAt?: number;
         confidence?: number;
+        echoScore?: number | null;
       }) => void)
     | null;
   let segmentListenerDetached: boolean;
@@ -3351,7 +3354,10 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       text: "Production final words",
       source: "mic" as const,
       timestamp: 1_900,
+      startedAt: 1_100,
+      endedAt: 1_900,
       confidence: 0.92,
+      echoScore: 1,
     };
     window.electronAPI.meetingTranscriptionStop = vi.fn(async () => {
       expect(track.stop).toHaveBeenCalledTimes(1);
@@ -3422,7 +3428,12 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     expect(useMeetingRecordingStore.getState().segments[0]).toMatchObject(finalSegment);
     expect(syncSegments).toHaveBeenCalledTimes(1);
     expect(syncSegments.mock.calls[0][1]).toHaveLength(1);
-    expect(syncSegments.mock.calls[0][1][0]).toMatchObject({ text: finalSegment.text });
+    expect(syncSegments.mock.calls[0][1][0]).toMatchObject({
+      text: finalSegment.text,
+      startedAt: finalSegment.startedAt,
+      endedAt: finalSegment.endedAt,
+      echoScore: finalSegment.echoScore,
+    });
     expect(lifecycle).toEqual(["sync", "ack"]);
   });
 });

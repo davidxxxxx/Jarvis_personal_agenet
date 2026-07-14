@@ -1,0 +1,291 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const DualTrackTranscriptDeduper = require("../../src/jarvis/main/DualTrackTranscriptDeduper");
+
+function fixture(t, { sessionId = "session-1" } = {}) {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  repository.createSession({
+    id: sessionId,
+    startedAt: 0,
+    micDeviceId: "physical-mic",
+    captureMode: "dual",
+  });
+  for (const sourceType of ["mic", "system"]) {
+    repository.createTrack({
+      id: `${sessionId}-track-${sourceType}`,
+      sessionId,
+      sourceType,
+      deviceId: sourceType === "mic" ? "physical-mic" : null,
+      deviceLabel: sourceType === "mic" ? "Desk microphone" : "PC audio",
+      strategy: sourceType === "mic" ? "web-audio" : "wasapi-loopback",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 0,
+    });
+  }
+  return {
+    repository,
+    deduper: new DualTrackTranscriptDeduper({ repository }),
+    sessionId,
+  };
+}
+
+function segment(repository, {
+  id,
+  sessionId = "session-1",
+  sourceType,
+  startedAt,
+  endedAt,
+  text,
+  echoScore = null,
+}) {
+  repository.upsertTranscriptSegments(sessionId, [{
+    id,
+    startedAt,
+    endedAt,
+    personId: null,
+    speakerLabel: sourceType,
+    sourceType,
+    text,
+    confidence: 0.9,
+    isStable: true,
+    echoScore,
+  }]);
+  return repository.getTranscriptSegment(id);
+}
+
+function rawChunk(repository, { id, sourceType, sequenceNumber }) {
+  const sessionId = "session-1";
+  repository.commitChunk({
+    id,
+    sessionId,
+    trackId: `${sessionId}-track-${sourceType}`,
+    sourceType,
+    sequenceNumber,
+    path: `${id}.wav`,
+    startedAt: 100,
+    endedAt: 200,
+    durationMs: 100,
+    sha256: crypto.createHash("sha256").update(id).digest("hex"),
+    expiresAt: 1_000_000,
+  });
+  return repository.getAudioChunk(id);
+}
+
+test("marks an acoustically proven MIC echo while retaining both rows and raw evidence", (t) => {
+  const { repository, deduper } = fixture(t);
+  const micChunkBefore = rawChunk(repository, {
+    id: "mic-raw",
+    sourceType: "mic",
+    sequenceNumber: 0,
+  });
+  const systemChunkBefore = rawChunk(repository, {
+    id: "system-raw",
+    sourceType: "system",
+    sequenceNumber: 0,
+  });
+  segment(repository, {
+    id: "system-segment",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "周五交付 API v2",
+  });
+  segment(repository, {
+    id: "mic-segment",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "周五交付，API V2。",
+    echoScore: 0.92,
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mic-segment").duplicate_of, "system-segment");
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    ["system-segment"]
+  );
+  assert.deepEqual(
+    repository.listAllTranscriptSegments("session-1").map((row) => [row.id, row.duplicate_of]),
+    [
+      ["system-segment", null],
+      ["mic-segment", "system-segment"],
+    ]
+  );
+  assert.deepEqual(repository.getAudioChunk("mic-raw"), micChunkBefore);
+  assert.deepEqual(repository.getAudioChunk("system-raw"), systemChunkBefore);
+});
+
+test("requires every conservative predicate independently", async (t) => {
+  const cases = [
+    {
+      name: "strict half-open overlap",
+      mic: { startedAt: 200, endedAt: 300, text: "same", echoScore: 1 },
+      system: { startedAt: 100, endedAt: 200, text: "same" },
+    },
+    {
+      name: "durable acoustic evidence",
+      mic: { startedAt: 110, endedAt: 190, text: "same", echoScore: 0.79 },
+      system: { startedAt: 100, endedAt: 200, text: "same" },
+    },
+    {
+      name: "normalized text similarity",
+      mic: { startedAt: 110, endedAt: 190, text: "local answer", echoScore: 1 },
+      system: { startedAt: 100, endedAt: 200, text: "remote question" },
+    },
+    {
+      name: "non-empty normalized text",
+      mic: { startedAt: 110, endedAt: 190, text: "...", echoScore: 1 },
+      system: { startedAt: 100, endedAt: 200, text: "！！！" },
+    },
+  ];
+
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.name, (subtest) => {
+      const sessionId = `negative-${index}`;
+      const { repository, deduper } = fixture(subtest, { sessionId });
+      segment(repository, {
+        id: `system-${index}`,
+        sessionId,
+        sourceType: "system",
+        ...entry.system,
+      });
+      segment(repository, {
+        id: `mic-${index}`,
+        sessionId,
+        sourceType: "mic",
+        ...entry.mic,
+      });
+
+      assert.deepEqual(deduper.dedupe(sessionId), { duplicatesMarked: 0 });
+      assert.equal(repository.getVisibleTranscript(sessionId).length, 2);
+    });
+  }
+});
+
+test("ordinary overlap and double-talk without explicit acoustic evidence stay visible", (t) => {
+  const { repository, deduper } = fixture(t);
+  segment(repository, {
+    id: "system",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "yes ship it",
+  });
+  segment(repository, {
+    id: "mic",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "yes ship it",
+    echoScore: null,
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    ["system", "mic"]
+  );
+});
+
+test("chooses a deterministic SYSTEM winner and repeated runs are idempotent", (t) => {
+  const { repository, deduper } = fixture(t);
+  for (const id of ["system-z", "system-a"]) {
+    segment(repository, {
+      id,
+      sourceType: "system",
+      startedAt: 100,
+      endedAt: 200,
+      text: "release Friday",
+    });
+  }
+  segment(repository, {
+    id: "mic",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "release Friday",
+    echoScore: 0.8,
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mic").duplicate_of, "system-a");
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+});
+
+test("schema rejects invalid echo scores and invalid MIC-to-SYSTEM relations", (t) => {
+  const { repository, deduper } = fixture(t);
+  segment(repository, {
+    id: "system",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "same",
+  });
+  segment(repository, {
+    id: "mic",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "same",
+    echoScore: 0.9,
+  });
+  segment(repository, {
+    id: "mic-other",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "same",
+    echoScore: 0.9,
+  });
+  repository.createSession({
+    id: "other-session",
+    startedAt: 0,
+    micDeviceId: null,
+    captureMode: "system",
+  });
+  repository.createTrack({
+    id: "other-session-track-system",
+    sessionId: "other-session",
+    sourceType: "system",
+    deviceLabel: "Other PC audio",
+    strategy: "wasapi-loopback",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 0,
+  });
+  segment(repository, {
+    id: "other-system",
+    sessionId: "other-session",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "same",
+  });
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 2 });
+
+  assert.throws(
+    () => repository.db.prepare("UPDATE transcript_segments SET echo_score = 1.1 WHERE id = 'mic'").run(),
+    /CHECK constraint failed/
+  );
+  assert.throws(
+    () => repository.db.prepare("UPDATE transcript_segments SET duplicate_of = 'mic-other' WHERE id = 'mic'").run(),
+    /invalid transcript duplicate/
+  );
+  assert.throws(
+    () => repository.db.prepare("UPDATE transcript_segments SET duplicate_of = 'mic' WHERE id = 'system'").run(),
+    /invalid transcript duplicate/
+  );
+  assert.throws(
+    () => repository.db.prepare("UPDATE transcript_segments SET duplicate_of = 'other-system' WHERE id = 'mic'").run(),
+    /invalid transcript duplicate/
+  );
+  assert.throws(
+    () => repository.db.prepare("UPDATE transcript_segments SET started_at = 200 WHERE id = 'system'").run(),
+    /invalid transcript duplicate target/
+  );
+});

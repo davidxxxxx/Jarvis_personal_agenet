@@ -193,12 +193,25 @@ export function mapStableSegments(
 ): JarvisTranscriptSegmentInput[] {
   return segments.map((segment) => {
     const timestamp = safeTimestamp(segment.timestamp, fallbackTimestamp);
-    const startedAt = Math.min(timestamp, Number.MAX_SAFE_INTEGER - 1);
+    const requestedStart = safeTimestamp(segment.startedAt, timestamp);
+    const startedAt = Math.min(requestedStart, Number.MAX_SAFE_INTEGER - 1);
+    const requestedEnd = safeTimestamp(segment.endedAt, startedAt + 1);
+    const endedAt = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(startedAt + 1, requestedEnd)
+    );
     const personId = safePersonId(segment.speaker);
+    const echoScore =
+      typeof segment.echoScore === "number" &&
+      Number.isFinite(segment.echoScore) &&
+      segment.echoScore >= 0 &&
+      segment.echoScore <= 1
+        ? segment.echoScore
+        : null;
     return {
       id: createStableSegmentId(sessionId, segment.id),
       startedAt,
-      endedAt: startedAt + 1,
+      endedAt,
       personId,
       speakerLabel: segment.speakerName ?? segment.speaker ?? segment.source,
       sourceType: segment.source,
@@ -208,6 +221,7 @@ export function mapStableSegments(
           ? segment.confidence
           : DEFAULT_CONFIDENCE,
       isStable: true,
+      ...(echoScore === null ? {} : { echoScore }),
     };
   });
 }

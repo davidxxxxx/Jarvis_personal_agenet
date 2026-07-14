@@ -325,16 +325,18 @@ class JarvisRepository {
         )
       `),
       getSegmentSession: this.db.prepare(`
-        SELECT session_id, result_kind, chunk_id, model_version, superseded_by
+        SELECT session_id, result_kind, chunk_id, model_version, superseded_by, duplicate_of
         FROM transcript_segments WHERE id = ?
       `),
       upsertSegment: this.db.prepare(`
         INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, person_id, speaker_label,
-          text, confidence, is_stable, track_id, source_type, result_kind, version
+          text, confidence, is_stable, track_id, source_type, result_kind, version,
+          echo_score
         ) VALUES (
           @id, @sessionId, @startedAt, @endedAt, @personId, @speakerLabel,
-          @text, @confidence, @isStable, @trackId, @sourceType, 'provisional', 1
+          @text, @confidence, @isStable, @trackId, @sourceType, 'provisional', 1,
+          @echoScore
         )
         ON CONFLICT(id) DO UPDATE SET
           started_at = excluded.started_at,
@@ -345,7 +347,20 @@ class JarvisRepository {
           confidence = excluded.confidence,
           is_stable = excluded.is_stable,
           track_id = excluded.track_id,
-          source_type = excluded.source_type
+          source_type = excluded.source_type,
+          echo_score = CASE
+            WHEN excluded.echo_score IS NULL THEN transcript_segments.echo_score
+            WHEN transcript_segments.echo_score IS NULL THEN excluded.echo_score
+            ELSE MAX(transcript_segments.echo_score, excluded.echo_score)
+          END,
+          duplicate_of = CASE
+            WHEN transcript_segments.started_at <> excluded.started_at
+              OR transcript_segments.ended_at <> excluded.ended_at
+              OR transcript_segments.source_type <> excluded.source_type
+              OR transcript_segments.text <> excluded.text
+            THEN NULL
+            ELSE transcript_segments.duplicate_of
+          END
         WHERE transcript_segments.session_id = excluded.session_id
           AND transcript_segments.result_kind = 'provisional'
           AND transcript_segments.chunk_id IS NULL
@@ -354,7 +369,7 @@ class JarvisRepository {
       `),
       listSegments: this.db.prepare(`
         SELECT * FROM transcript_segments
-        WHERE session_id = ? AND superseded_by IS NULL
+        WHERE session_id = ? AND superseded_by IS NULL AND duplicate_of IS NULL
         ORDER BY started_at ASC, id ASC
       `),
       listTranscriptHistory: this.db.prepare(`
@@ -367,6 +382,7 @@ class JarvisRepository {
         SELECT text FROM transcript_segments
         WHERE session_id = ?
           AND superseded_by IS NULL
+          AND duplicate_of IS NULL
           AND is_stable = 1
           AND length(trim(text)) > 0
         ORDER BY ended_at DESC, id DESC
@@ -379,6 +395,28 @@ class JarvisRepository {
           AND session_id = @sessionId
           AND result_kind = 'provisional'
           AND superseded_by IS NULL
+      `),
+      mergeTranscriptEchoScore: this.db.prepare(`
+        UPDATE transcript_segments
+        SET echo_score = CASE
+          WHEN echo_score IS NULL THEN @echoScore
+          ELSE MAX(echo_score, @echoScore)
+        END
+        WHERE id = @finalId AND result_kind = 'final'
+      `),
+      listTranscriptDedupeCandidates: this.db.prepare(`
+        SELECT * FROM transcript_segments
+        WHERE session_id = ? AND superseded_by IS NULL AND duplicate_of IS NULL
+        ORDER BY started_at ASC, id ASC
+      `),
+      markTranscriptDuplicate: this.db.prepare(`
+        UPDATE transcript_segments
+        SET duplicate_of = @systemId
+        WHERE id = @micId
+          AND session_id = @sessionId
+          AND source_type = 'mic'
+          AND superseded_by IS NULL
+          AND duplicate_of IS NULL
       `),
       getChunkForTranscriptCommit: this.db.prepare(`
         SELECT * FROM audio_chunks WHERE id = ?
@@ -604,6 +642,19 @@ class JarvisRepository {
         if (sourceType !== "mic" && sourceType !== "system") {
           throw new TypeError("segment sourceType must be mic or system");
         }
+        const echoScore = segment.echoScore ?? null;
+        if (
+          echoScore !== null &&
+          (typeof echoScore !== "number" ||
+            !Number.isFinite(echoScore) ||
+            echoScore < 0 ||
+            echoScore > 1)
+        ) {
+          throw new RangeError("segment echoScore must be null or between zero and one");
+        }
+        if (sourceType !== "mic" && echoScore !== null) {
+          throw new TypeError("segment echoScore is only valid for mic evidence");
+        }
         const sourceTrack = this.statements.getSessionSourceTrack.get(sessionId, sourceType);
 
         if (segment.personId !== null && segment.personId !== undefined) {
@@ -628,6 +679,7 @@ class JarvisRepository {
           isStable: segment.isStable ? 1 : 0,
           trackId: sourceTrack?.id ?? null,
           sourceType,
+          echoScore,
         });
       }
     };
@@ -697,6 +749,12 @@ class JarvisRepository {
         ) {
           throw new Error("invalid transcript supersession assignment");
         }
+        if (provisionalRow.echo_score !== null) {
+          this.statements.mergeTranscriptEchoScore.run({
+            finalId,
+            echoScore: provisionalRow.echo_score,
+          });
+        }
         superseded += this.statements.supersedeTranscriptSegment.run({
           sessionId,
           provisionalId,
@@ -710,6 +768,48 @@ class JarvisRepository {
       };
     });
     this._reconcileTranscript = this._reconcileTranscript.immediate;
+
+    this._dedupeTranscript = this.db.transaction((sessionId, selectDuplicates) => {
+      const rows = this.statements.listTranscriptDedupeCandidates.all(sessionId);
+      const assignments = selectDuplicates(rows);
+      if (!Array.isArray(assignments)) {
+        throw new TypeError("transcript dedupe must return an array");
+      }
+
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
+      const assigned = new Set();
+      let duplicatesMarked = 0;
+      for (const assignment of assignments) {
+        const micId = assertId(assignment?.micId, "micSegmentId");
+        const systemId = assertId(assignment?.systemId, "systemSegmentId");
+        if (assigned.has(micId)) {
+          throw new Error("mic segment has multiple duplicate assignments");
+        }
+        assigned.add(micId);
+        const mic = rowsById.get(micId);
+        const system = rowsById.get(systemId);
+        if (
+          !mic ||
+          !system ||
+          mic.source_type !== "mic" ||
+          system.source_type !== "system" ||
+          mic.session_id !== system.session_id ||
+          mic.echo_score === null ||
+          mic.echo_score < 0.8 ||
+          !(mic.started_at < system.ended_at) ||
+          !(system.started_at < mic.ended_at)
+        ) {
+          throw new Error("invalid transcript duplicate assignment");
+        }
+        duplicatesMarked += this.statements.markTranscriptDuplicate.run({
+          sessionId,
+          micId,
+          systemId,
+        }).changes;
+      }
+      return { duplicatesMarked };
+    });
+    this._dedupeTranscript = this._dedupeTranscript.immediate;
 
     this._renamePerson = this.db.transaction((input) => {
       if (input.isSelf) this.statements.clearSelf.run();
@@ -986,6 +1086,10 @@ class JarvisRepository {
     return this.statements.listTranscriptHistory.all(assertId(sessionId, "sessionId"));
   }
 
+  listAllTranscriptSegments(sessionId) {
+    return this.listTranscriptHistory(sessionId);
+  }
+
   getTranscriptSegment(segmentId) {
     return this.statements.getTranscriptSegment.get(assertId(segmentId, "segmentId")) ?? null;
   }
@@ -994,6 +1098,14 @@ class JarvisRepository {
     const safeSessionId = assertId(sessionId, "sessionId");
     if (typeof reconcile !== "function") throw new TypeError("reconcile must be a function");
     return this._reconcileTranscript(safeSessionId, reconcile);
+  }
+
+  dedupeTranscriptTransaction(sessionId, selectDuplicates) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (typeof selectDuplicates !== "function") {
+      throw new TypeError("selectDuplicates must be a function");
+    }
+    return this._dedupeTranscript(safeSessionId, selectDuplicates);
   }
 
   getTranscriptPrompt(sessionId) {

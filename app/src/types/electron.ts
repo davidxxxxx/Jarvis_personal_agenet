@@ -1797,7 +1797,10 @@ declare global {
           text: string;
           source: "mic" | "system";
           timestamp?: number;
+          startedAt?: number;
+          endedAt?: number;
           confidence?: number;
+          echoScore?: number | null;
         }>;
       }>;
       meetingTranscriptionCancel?: () => Promise<{
@@ -1811,7 +1814,10 @@ declare global {
           type: "partial" | "final" | "retract" | "correction";
           originalText?: string;
           timestamp?: number;
+          startedAt?: number;
+          endedAt?: number;
           confidence?: number;
+          echoScore?: number | null;
         }) => void
       ) => () => void;
       onMeetingSpeakerIdentified?: (
