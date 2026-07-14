@@ -29,7 +29,11 @@ async function hashTree(root) {
       if (entry.isDirectory()) await walk(absolute, relative);
       else {
         const bytes = await fsp.readFile(absolute);
-        rows.push([relative, bytes.length, crypto.createHash("sha256").update(bytes).digest("hex")]);
+        rows.push([
+          relative,
+          bytes.length,
+          crypto.createHash("sha256").update(bytes).digest("hex"),
+        ]);
       }
     }
   }
@@ -61,10 +65,7 @@ test("resumes copied files and switches the root only after every file verifies"
   const events = [];
   const migrator = createMigrator(events);
 
-  await assert.rejects(
-    migrator.migrate({ from, to, failAfterFiles: 2 }),
-    /migration interrupted/
-  );
+  await assert.rejects(migrator.migrate({ from, to, failAfterFiles: 2 }), /migration interrupted/);
   assert.deepEqual(events, ["close", "reopen:old-root"]);
 
   const result = await migrator.migrate({ from, to });
@@ -91,16 +92,10 @@ test("rejects a source changed between resumptions before activation", async (t)
   const events = [];
   const migrator = createMigrator(events);
 
-  await assert.rejects(
-    migrator.migrate({ from, to, failAfterFiles: 1 }),
-    /migration interrupted/
-  );
+  await assert.rejects(migrator.migrate({ from, to, failAfterFiles: 1 }), /migration interrupted/);
   await fsp.writeFile(path.join(from, "models", "whisper", "base.bin"), "changed-model");
 
-  await assert.rejects(
-    migrator.migrate({ from, to }),
-    /migration source changed/
-  );
+  await assert.rejects(migrator.migrate({ from, to }), /migration source changed/);
   assert.equal(fs.existsSync(to), true);
   assert.equal(fs.existsSync(path.join(to, ".jarvis-migration-owner")), true);
   assert.deepEqual(events, ["close", "reopen:old-root", "close", "reopen:old-root"]);
@@ -201,8 +196,7 @@ test("rejects roots, nested paths, network and removable destinations without le
     const destination = path.join(base, `${kind}-private-user-name`);
     await assert.rejects(
       migrator.migrate({ from, to: destination }),
-      (error) =>
-        error.message === "destination is unsafe" && !error.message.includes(destination)
+      (error) => error.message === "destination is unsafe" && !error.message.includes(destination)
     );
   }
 });
@@ -323,12 +317,7 @@ test("relocates copied root-dependent metadata before persisting the target root
 
   await migrator.migrate({ from, to });
 
-  assert.deepEqual(events, [
-    "close",
-    "relocate",
-    "persist:new-root",
-    "reopen:new-root",
-  ]);
+  assert.deepEqual(events, ["close", "relocate", "persist:new-root", "reopen:new-root"]);
 });
 
 test("crash-resumes relocation from verified source bytes without accepting forged target state", async (t) => {
@@ -362,7 +351,10 @@ test("crash-resumes relocation from verified source bytes without accepting forg
   const manifestName = (await fsp.readdir(journalRoot))[0];
   const manifest = JSON.parse(await fsp.readFile(path.join(journalRoot, manifestName), "utf8"));
   assert.equal(manifest.phase, "activated");
-  assert.match(manifest.files.find((entry) => entry.relative === "jarvis.db").targetSha256, /^[a-f0-9]{64}$/);
+  assert.match(
+    manifest.files.find((entry) => entry.relative === "jarvis.db").targetSha256,
+    /^[a-f0-9]{64}$/
+  );
 });
 
 test("rejects forged relocation temp and SQLite residue names", async (t) => {
@@ -374,7 +366,10 @@ test("rejects forged relocation temp and SQLite residue names", async (t) => {
     const journalRoot = path.join(base, "journal");
     await writeTree(from);
     const sidecar = path.join(from, "recordings", "orphan.wav.recovery.json");
-    await fsp.writeFile(sidecar, JSON.stringify({ path: path.join(from, "recordings", "orphan.wav") }));
+    await fsp.writeFile(
+      sidecar,
+      JSON.stringify({ path: path.join(from, "recordings", "orphan.wav") })
+    );
     const migrator = createMigrator([], { journalRoot });
     await assert.rejects(
       migrator.migrate({ from, to, failAfterRelocation: true }),
@@ -395,10 +390,7 @@ test("rejects forged relocation temp and SQLite residue names", async (t) => {
     } else {
       await fsp.writeFile(path.join(to, "unexpected.bin"), "forged-extra");
     }
-    await assert.rejects(
-      migrator.migrate({ from, to }),
-      /migration staging tree is invalid/
-    );
+    await assert.rejects(migrator.migrate({ from, to }), /migration staging tree is invalid/);
     if (residue === "wal") {
       assert.equal(fs.existsSync(path.join(to, "jarvis.db-wal")), true);
     }
@@ -441,7 +433,10 @@ test("streams migration hashes with a bounded fixed buffer for large files", asy
 
   assert.equal(streamedReads > 0, true);
   assert.equal(peakRead, 64 * 1024);
-  assert.equal((await fsp.stat(path.join(to, "models", "whisper", "large.bin"))).size, 8 * 1024 * 1024);
+  assert.equal(
+    (await fsp.stat(path.join(to, "models", "whisper", "large.bin"))).size,
+    8 * 1024 * 1024
+  );
 });
 
 test("persists every activation journal boundary before switching holders", async (t) => {
@@ -502,20 +497,27 @@ test("keeps the committed target authoritative and the write gate closed when le
   const events = [];
   const realProvider = new DirectoryLeaseProvider();
   let injected = false;
+  const injectTargetReleaseFailure = (candidate, heldLease) => {
+    if (path.resolve(candidate) !== path.resolve(to)) return heldLease;
+    return {
+      ...heldLease,
+      async release() {
+        await heldLease.release();
+        if (!injected) {
+          injected = true;
+          throw new Error("injected target lease release failure");
+        }
+      },
+    };
+  };
   const directoryLeaseProvider = {
     async acquire(candidate) {
       const heldLease = await realProvider.acquire(candidate);
-      if (path.resolve(candidate) !== path.resolve(to)) return heldLease;
-      return {
-        ...heldLease,
-        async release() {
-          await heldLease.release();
-          if (!injected) {
-            injected = true;
-            throw new Error("injected target lease release failure");
-          }
-        },
-      };
+      return injectTargetReleaseFailure(candidate, heldLease);
+    },
+    async createAndAcquire(candidate) {
+      const heldLease = await realProvider.createAndAcquire(candidate);
+      return injectTargetReleaseFailure(candidate, heldLease);
     },
   };
   const migrator = createMigrator(events, { directoryLeaseProvider });
@@ -568,10 +570,7 @@ test("startup activation validation rejects damaged targets and accepts an exact
       if (damage === "recording") {
         await fsp.rm(path.join(to, "recordings", "a.wav"));
       } else if (damage === "sidecar") {
-        await fsp.writeFile(
-          path.join(to, "recordings", "recovery.wav.recovery.json"),
-          "tampered"
-        );
+        await fsp.writeFile(path.join(to, "recordings", "recovery.wav.recovery.json"), "tampered");
       } else if (damage === "model") {
         await fsp.writeFile(path.join(to, "models", "whisper", "base.bin"), "tampered");
       } else if (damage === "identity") {
@@ -595,10 +594,7 @@ test("uses a protected journal and leased in-place target while rejecting forged
   await writeTree(from);
   const migrator = createMigrator([], { journalRoot });
 
-  await assert.rejects(
-    migrator.migrate({ from, to, failAfterFiles: 1 }),
-    /migration interrupted/
-  );
+  await assert.rejects(migrator.migrate({ from, to, failAfterFiles: 1 }), /migration interrupted/);
   assert.equal(fs.existsSync(`${to}.jarvis-migration-staging`), false);
   assert.equal(fs.existsSync(`${to}.jarvis-migration-manifest.json`), false);
   const journalNames = await fsp.readdir(journalRoot);
@@ -623,7 +619,10 @@ test("rejects injected reparse ancestors and accepts only an existing empty targ
   await fsp.mkdir(nonemptyTarget);
   await fsp.writeFile(path.join(nonemptyTarget, "foreign.txt"), "foreign");
 
-  await assert.rejects(createMigrator([]).migrate({ from, to: nonemptyTarget }), /destination is unsafe/);
+  await assert.rejects(
+    createMigrator([]).migrate({ from, to: nonemptyTarget }),
+    /destination is unsafe/
+  );
   await createMigrator([]).migrate({ from, to: emptyTarget });
   assert.equal(fs.existsSync(path.join(emptyTarget, "jarvis.db")), true);
 
@@ -687,10 +686,7 @@ test("rejects an ancestor swap when the preflight and postflight directory ident
     }),
   });
 
-  await assert.rejects(
-    migrator.migrate({ from, to }),
-    /destination directory identity changed/
-  );
+  await assert.rejects(migrator.migrate({ from, to }), /destination directory identity changed/);
   assert.equal(fs.existsSync(to), false);
 });
 
@@ -731,9 +727,8 @@ test("holds the destination object while copying so a swap-back attacker receive
     if (!attempted) {
       attempted = true;
       assert.equal(path.resolve(targetFile).startsWith(`${path.resolve(to)}${path.sep}`), true);
-      await assert.rejects(
-        fsp.rename(safeParent, displaced),
-        (error) => ["EPERM", "EACCES", "EBUSY"].includes(error?.code)
+      await assert.rejects(fsp.rename(safeParent, displaced), (error) =>
+        ["EPERM", "EACCES", "EBUSY"].includes(error?.code)
       );
     }
     return fsp.copyFile(sourceFile, targetFile, flags);
@@ -749,7 +744,152 @@ test("holds the destination object while copying so a swap-back attacker receive
   assert.equal(fs.existsSync(displaced), false);
 });
 
-test("rejects a target replaced after ownership creation but before target lease acquisition", async (t) => {
+test("atomically leases every newly created destination component before it can be moved", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows atomic directory creation test");
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-component-lease-race-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const firstMissing = path.join(base, "safe-parent");
+  const nested = path.join(firstMissing, "nested");
+  const to = path.join(nested, "new-root");
+  const displaced = path.join(base, "displaced-safe-parent");
+  const attacker = path.join(base, "attacker-root");
+  const attackerAfterSwapBack = path.join(base, "attacker-after-swap-back");
+  await writeTree(from);
+  await fsp.writeFile(path.join(from, "private.bin"), "private-data");
+  await fsp.mkdir(attacker);
+
+  let legacySwapAttempted = false;
+  let attackerInstalled = false;
+  const leasedFs = Object.create(fsp);
+  leasedFs.mkdir = async (candidate, options) => {
+    const result = await fsp.mkdir(candidate, options);
+    if (!legacySwapAttempted && path.resolve(candidate) === path.resolve(firstMissing)) {
+      legacySwapAttempted = true;
+      await fsp.rename(firstMissing, displaced);
+      await fsp.rename(attacker, firstMissing);
+      attackerInstalled = true;
+    }
+    return result;
+  };
+
+  const realProvider = new DirectoryLeaseProvider();
+  const componentAttempts = [];
+  const directoryLeaseProvider = {
+    acquire(candidate) {
+      return realProvider.acquire(candidate);
+    },
+    async createAndAcquire(candidate) {
+      const lease = await realProvider.createAndAcquire(candidate);
+      componentAttempts.push(path.resolve(candidate));
+      await assert.rejects(fsp.rename(candidate, `${candidate}.displaced`), (error) =>
+        ["EPERM", "EACCES", "EBUSY"].includes(error?.code)
+      );
+      return lease;
+    },
+  };
+
+  await createMigrator([], {
+    fsImpl: leasedFs,
+    directoryLeaseProvider,
+    relocateTarget: async () => {},
+  }).migrate({ from, to });
+
+  if (attackerInstalled) {
+    await fsp.rename(firstMissing, attackerAfterSwapBack);
+    await fsp.rename(displaced, firstMissing);
+  }
+  assert.deepEqual(
+    componentAttempts,
+    [firstMissing, nested, to].map((candidate) => path.resolve(candidate))
+  );
+  assert.equal(legacySwapAttempted, false);
+  assert.equal(attackerInstalled, false);
+  assert.deepEqual(await fsp.readdir(attacker), []);
+  assert.equal(
+    fs.existsSync(path.join(attackerAfterSwapBack, "nested", "new-root", "private.bin")),
+    false
+  );
+  assert.equal(await fsp.readFile(path.join(to, "private.bin"), "utf8"), "private-data");
+  const releasedParent = path.join(base, "released-safe-parent");
+  await fsp.rename(firstMissing, releasedParent);
+  await fsp.rename(releasedParent, firstMissing);
+});
+
+test("releases the complete component lease chain after success, validation failure, and abort", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows component lease lifecycle test");
+  for (const outcome of ["success", "validation-failure", "abort"]) {
+    const base = await fsp.mkdtemp(path.join(os.tmpdir(), `jarvis-component-release-${outcome}-`));
+    t.after(() => fsp.rm(base, { recursive: true, force: true }));
+    const from = path.join(base, "old-root");
+    const firstMissing = path.join(base, "safe-parent");
+    const nested = path.join(firstMissing, "nested");
+    const to = path.join(nested, "new-root");
+    const moved = path.join(base, "released-safe-parent");
+    await writeTree(from);
+
+    const realProvider = new DirectoryLeaseProvider();
+    const activeLeases = new Set();
+    const track = (lease) => {
+      const key = {};
+      activeLeases.add(key);
+      return {
+        ...lease,
+        async release() {
+          try {
+            return await lease.release();
+          } finally {
+            activeLeases.delete(key);
+          }
+        },
+      };
+    };
+    const directoryLeaseProvider = {
+      async acquire(candidate) {
+        return track(await realProvider.acquire(candidate));
+      },
+      async createAndAcquire(candidate) {
+        return track(await realProvider.createAndAcquire(candidate));
+      },
+    };
+    const controller = new AbortController();
+    const migrator = createMigrator([], {
+      directoryLeaseProvider,
+      pathInspector: {
+        async inspect(candidate) {
+          if (
+            outcome === "validation-failure" &&
+            path.resolve(candidate) === path.resolve(nested)
+          ) {
+            throw new Error("injected component validation failure");
+          }
+          return { reparse: false, mountPoint: false };
+        },
+      },
+      onProgress(progress) {
+        if (outcome === "abort" && progress.state === "copying" && progress.completedFiles === 1) {
+          controller.abort();
+        }
+      },
+      relocateTarget: async () => {},
+    });
+
+    if (outcome === "success") {
+      await migrator.migrate({ from, to, signal: controller.signal });
+    } else {
+      await assert.rejects(
+        migrator.migrate({ from, to, signal: controller.signal }),
+        outcome === "abort" ? /migration interrupted/ : /injected component validation failure/
+      );
+    }
+
+    assert.equal(activeLeases.size, 0, `${outcome} leaked a directory lease`);
+    await fsp.rename(firstMissing, moved);
+    await fsp.rename(moved, firstMissing);
+  }
+});
+
+test("holds an existing target before creating its ownership marker", async (t) => {
   if (process.platform !== "win32") return t.skip("Windows child-replacement lease test");
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-target-prelease-race-"));
   t.after(() => fsp.rm(base, { recursive: true, force: true }));
@@ -757,28 +897,28 @@ test("rejects a target replaced after ownership creation but before target lease
   const to = path.join(base, "new-root");
   const displaced = path.join(base, "marked-target");
   await writeTree(from);
+  await fsp.mkdir(to);
   const realProvider = new DirectoryLeaseProvider();
-  let replaced = false;
+  let attempted = false;
   const directoryLeaseProvider = {
     async acquire(candidate) {
-      if (!replaced && path.resolve(candidate) === path.resolve(to)) {
-        replaced = true;
-        await fsp.rename(to, displaced);
-        await fsp.mkdir(to);
+      const heldLease = await realProvider.acquire(candidate);
+      if (!attempted && path.resolve(candidate) === path.resolve(to)) {
+        attempted = true;
+        await assert.rejects(fsp.rename(to, displaced), (error) =>
+          ["EPERM", "EACCES", "EBUSY"].includes(error?.code)
+        );
       }
-      return realProvider.acquire(candidate);
+      return heldLease;
     },
   };
 
-  await assert.rejects(
-    createMigrator([], { directoryLeaseProvider }).migrate({ from, to }),
-    /destination directory identity changed|migration ownership marker is invalid/
-  );
+  await createMigrator([], { directoryLeaseProvider }).migrate({ from, to });
 
-  assert.equal(replaced, true);
-  assert.deepEqual(await fsp.readdir(to), []);
-  assert.equal(fs.existsSync(path.join(displaced, ".jarvis-migration-owner")), true);
-  assert.equal(fs.existsSync(path.join(to, "jarvis.db")), false);
+  assert.equal(attempted, true);
+  assert.equal(fs.existsSync(displaced), false);
+  assert.equal(fs.existsSync(path.join(to, ".jarvis-migration-owner")), false);
+  assert.equal(fs.existsSync(path.join(to, "jarvis.db")), true);
 });
 
 test("resumes after a crash between verified manifest persistence and marker release", async (t) => {
@@ -814,14 +954,8 @@ test("rejects a partial copying tree whose ownership marker disappeared", async 
   const to = path.join(base, "new-root");
   await writeTree(from);
   const migrator = createMigrator([]);
-  await assert.rejects(
-    migrator.migrate({ from, to, failAfterFiles: 1 }),
-    /migration interrupted/
-  );
+  await assert.rejects(migrator.migrate({ from, to, failAfterFiles: 1 }), /migration interrupted/);
   await fsp.rm(path.join(to, ".jarvis-migration-owner"));
 
-  await assert.rejects(
-    migrator.migrate({ from, to }),
-    /migration ownership marker is invalid/
-  );
+  await assert.rejects(migrator.migrate({ from, to }), /migration ownership marker is invalid/);
 });

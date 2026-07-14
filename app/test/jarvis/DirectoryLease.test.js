@@ -66,6 +66,31 @@ test("holds a production directory object until explicit release", async (t) => 
   await fsp.rename(leasedPath, movedPath);
 });
 
+test("creates and leases a Windows directory in one atomic operation", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows atomic directory creation test");
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-directory-create-lease-"));
+  const created = path.join(base, "created");
+  const moved = path.join(base, "moved");
+  const baseline = windowsHelperCount();
+  let lease = null;
+  t.after(async () => {
+    await lease?.release().catch(() => {});
+    await waitForHelperCount(baseline).catch(() => {});
+    await fsp.rm(base, { recursive: true, force: true });
+  });
+  const provider = new DirectoryLeaseProvider();
+
+  lease = await provider.createAndAcquire(created);
+  assert.equal((await fsp.lstat(created)).isDirectory(), true);
+  await assert.rejects(fsp.rename(created, moved), (error) =>
+    ["EPERM", "EACCES", "EBUSY"].includes(error?.code)
+  );
+  await lease.release();
+  lease = null;
+  await fsp.rename(created, moved);
+  await waitForHelperCount(baseline);
+});
+
 test("platform-injected POSIX lease serializes real dev and ino identity", async (t) => {
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-posix-directory-lease-"));
   let lease = null;

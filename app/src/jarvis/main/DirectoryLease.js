@@ -62,8 +62,24 @@ class DirectoryLeaseProvider {
     }
     try {
       return this.platform === "win32"
-        ? await this._acquireWindows(path.resolve(candidate))
+        ? await this._acquireWindows(path.resolve(candidate), "--open")
         : await this._acquirePosix(path.resolve(candidate));
+    } catch {
+      throw new Error("directory lease acquisition failed");
+    }
+  }
+
+  async createAndAcquire(candidate) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) {
+      throw new TypeError("directory lease path must be absolute");
+    }
+    const resolved = path.resolve(candidate);
+    try {
+      if (this.platform === "win32") {
+        return await this._acquireWindows(resolved, "--create");
+      }
+      await this.fs.mkdir(resolved, { recursive: false, mode: 0o700 });
+      return await this._acquirePosix(resolved);
     } catch {
       throw new Error("directory lease acquisition failed");
     }
@@ -108,13 +124,13 @@ class DirectoryLeaseProvider {
     }
   }
 
-  async _acquireWindows(candidate) {
+  async _acquireWindows(candidate, mode) {
     const timeoutMs = this.timeoutMs;
     let child;
     try {
       child = this.spawn(
         "powershell.exe",
-        ["-NoProfile", "-NonInteractive", "-File", WINDOWS_HELPER_PATH, candidate],
+        ["-NoProfile", "-NonInteractive", "-File", WINDOWS_HELPER_PATH, mode, candidate],
         { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
       );
     } catch (error) {

@@ -6,10 +6,7 @@ const path = require("node:path");
 const MigrationCoordinator = require("./MigrationCoordinator");
 const { DirectoryLeaseProvider } = require("./DirectoryLease");
 const { releaseReserve } = require("./SafeReserveFile");
-const {
-  DefaultPathInspector,
-  DefaultVolumeInspector,
-} = require("./StoragePathInspector");
+const { DefaultPathInspector, DefaultVolumeInspector } = require("./StoragePathInspector");
 
 const MANIFEST_VERSION = 3;
 const OWNERSHIP_MARKER = ".jarvis-migration-owner";
@@ -93,7 +90,10 @@ class DataDirectoryMigrator {
         async finalize() {},
         async rollback() {},
       });
-    if (journalRoot !== null && (typeof journalRoot !== "string" || !path.isAbsolute(journalRoot))) {
+    if (
+      journalRoot !== null &&
+      (typeof journalRoot !== "string" || !path.isAbsolute(journalRoot))
+    ) {
       throw new TypeError("journalRoot must be absolute");
     }
     if (!pathInspector || typeof pathInspector.inspect !== "function") {
@@ -112,7 +112,8 @@ class DataDirectoryMigrator {
       throw new TypeError("directoryLeaseProvider.acquire is required");
     }
     this.directoryLeaseProvider = directoryLeaseProvider;
-    if (typeof faultInjector !== "function") throw new TypeError("faultInjector must be a function");
+    if (typeof faultInjector !== "function")
+      throw new TypeError("faultInjector must be a function");
     this.faultInjector = faultInjector;
     if (
       migrationCoordinator !== null &&
@@ -120,7 +121,9 @@ class DataDirectoryMigrator {
         typeof migrationCoordinator.runExclusive !== "function" ||
         typeof migrationCoordinator.assertProducerAllowed !== "function")
     ) {
-      throw new TypeError("migrationCoordinator must provide runExclusive and assertProducerAllowed");
+      throw new TypeError(
+        "migrationCoordinator must provide runExclusive and assertProducerAllowed"
+      );
     }
     this.migrationCoordinator =
       migrationCoordinator ??
@@ -145,289 +148,310 @@ class DataDirectoryMigrator {
     try {
       const source = this._safeAbsolute(from, "source");
       const target = this._safeAbsolute(to, "destination");
-      return await this.migrationCoordinator.runExclusive(async (lease) => {
-      const targetVolume = await this._validateRoots(source, target);
-      const sourceLease = await this.directoryLeaseProvider.acquire(source);
-      let targetLease = null;
-      let parentLease = null;
-      try {
-      await this._assertLeaseCurrent(sourceLease);
-      await this._assertDirectoryIdentity(targetVolume.anchor);
-      this._throwIfAborted(signal);
+      return await this.migrationCoordinator.runExclusive(
+        async (lease) => {
+          const targetVolume = await this._validateRoots(source, target);
+          const sourceLease = await this.directoryLeaseProvider.acquire(source);
+          let targetLease = null;
+          let parentLease = null;
+          const creationLeases = [];
+          try {
+            await this._assertLeaseCurrent(sourceLease);
+            await this._assertDirectoryIdentity(targetVolume.anchor);
+            this._throwIfAborted(signal);
 
-      const entries = await this._scanSource(source, signal);
-      await this._ensureJournalRoot();
-      const migrationKey = crypto
-        .createHash("sha256")
-        .update(`${source}\0${target}`)
-        .digest("hex");
-      const manifestPath = path.join(this.journalRoot, `${migrationKey}.json`);
-      let manifest = await this._loadManifest(manifestPath);
-      const pendingManifest =
-        manifest ??
-        {
-          version: MANIFEST_VERSION,
-          migrationId: `migration_${crypto.randomUUID().replaceAll("-", "")}`,
-          token: crypto.randomBytes(32).toString("hex"),
-          sourceIdentity: sourceLease.identity,
-          targetIdentity: null,
-          targetVolumeIdentity: targetVolume.identity ?? null,
-          phase: "copying",
-          files: entries.map((entry) => ({ ...entry, copied: false })),
-        };
-      const targetExists = await this._exists(target);
-      let markedTargetIdentity = null;
-      if (!targetExists) {
-        parentLease = await this.directoryLeaseProvider.acquire(targetVolume.anchorPath);
-        await this._assertLeaseCurrent(parentLease);
-        await this._createMissingTarget(targetVolume.anchorPath, target);
-      }
-      if (manifest === null) {
-        if (!(await this._isEmptyDirectory(target))) throw new Error("destination is unsafe");
-        await this._ensureOwnershipMarker(target, pendingManifest, { allowCreate: true });
-        markedTargetIdentity = await this.directoryIdentityProvider(target);
-      }
-      targetLease = await this.directoryLeaseProvider.acquire(target);
-      await this._assertLeaseCurrent(targetLease);
-      if (markedTargetIdentity !== null) {
-        await this._assertDirectoryIdentity(markedTargetIdentity);
-      }
-      await this._assertSameVolume(target, targetVolume);
-      if (manifest) {
-        this._validateManifest(
-          manifest,
-          source,
-          target,
-          entries,
-          targetVolume,
-          sourceLease,
-          targetLease
-        );
-      } else {
-        manifest = {
-          ...pendingManifest,
-          targetIdentity: targetLease.identity,
-        };
-        await this._ensureOwnershipMarker(target, manifest);
-        await this._writeManifest(manifestPath, manifest);
-      }
-      if (manifest.phase === "copying") {
-        await this._ensureOwnershipMarker(target, manifest);
-        await this._assertExactTree(
-          target,
-          manifest.files.filter((entry) => entry.copied),
-          new Set([OWNERSHIP_MARKER])
-        );
-      } else {
-        await this._removeOwnershipMarker(target, manifest, { required: false });
-      }
-      await parentLease?.release();
-      parentLease = null;
+            const entries = await this._scanSource(source, signal);
+            await this._ensureJournalRoot();
+            const migrationKey = crypto
+              .createHash("sha256")
+              .update(`${source}\0${target}`)
+              .digest("hex");
+            const manifestPath = path.join(this.journalRoot, `${migrationKey}.json`);
+            let manifest = await this._loadManifest(manifestPath);
+            const pendingManifest = manifest ?? {
+              version: MANIFEST_VERSION,
+              migrationId: `migration_${crypto.randomUUID().replaceAll("-", "")}`,
+              token: crypto.randomBytes(32).toString("hex"),
+              sourceIdentity: sourceLease.identity,
+              targetIdentity: null,
+              targetVolumeIdentity: targetVolume.identity ?? null,
+              phase: "copying",
+              files: entries.map((entry) => ({ ...entry, copied: false })),
+            };
+            const targetExists = await this._exists(target);
+            let markedTargetIdentity = null;
+            if (!targetExists) {
+              parentLease = await this.directoryLeaseProvider.acquire(targetVolume.anchorPath);
+              await this._assertLeaseCurrent(parentLease);
+              await this._createMissingTarget(
+                targetVolume.anchorPath,
+                target,
+                parentLease,
+                creationLeases
+              );
+              targetLease = creationLeases.at(-1);
+            } else {
+              targetLease = await this.directoryLeaseProvider.acquire(target);
+            }
+            await this._assertLeaseCurrent(targetLease);
+            if (manifest === null) {
+              if (!(await this._isEmptyDirectory(target))) throw new Error("destination is unsafe");
+              await this._ensureOwnershipMarker(target, pendingManifest, { allowCreate: true });
+              markedTargetIdentity = await this.directoryIdentityProvider(target);
+            }
+            if (markedTargetIdentity !== null) {
+              await this._assertDirectoryIdentity(markedTargetIdentity);
+            }
+            await this._assertSameVolume(target, targetVolume);
+            if (manifest) {
+              this._validateManifest(
+                manifest,
+                source,
+                target,
+                entries,
+                targetVolume,
+                sourceLease,
+                targetLease
+              );
+            } else {
+              manifest = {
+                ...pendingManifest,
+                targetIdentity: targetLease.identity,
+              };
+              await this._ensureOwnershipMarker(target, manifest);
+              await this._writeManifest(manifestPath, manifest);
+            }
+            if (manifest.phase === "copying") {
+              await this._ensureOwnershipMarker(target, manifest);
+              await this._assertExactTree(
+                target,
+                manifest.files.filter((entry) => entry.copied),
+                new Set([OWNERSHIP_MARKER])
+              );
+            } else {
+              await this._removeOwnershipMarker(target, manifest, { required: false });
+            }
+            if (manifest.phase === "copying") {
+              let copiedThisRun = 0;
+              for (const entry of manifest.files) {
+                this._throwIfAborted(signal);
+                await this._assertLeaseCurrent(sourceLease);
+                await this._assertLeaseCurrent(targetLease);
+                const sourceFile = this._inside(source, entry.relative);
+                const stagedFile = this._inside(target, entry.relative);
+                if (entry.copied && (await this._verifiedFile(stagedFile, entry))) continue;
+                await this.fs.mkdir(path.dirname(stagedFile), { recursive: true });
+                await this.fs
+                  .copyFile(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL)
+                  .catch(async (error) => {
+                    if (error?.code !== "EEXIST") throw error;
+                    await this.fs.rm(stagedFile, { force: true });
+                    await this.fs.copyFile(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL);
+                  });
+                await this._fsyncFile(stagedFile);
+                if (!(await this._verifiedFile(stagedFile, entry))) {
+                  await this.fs.rm(stagedFile, { force: true });
+                  throw new Error("migration verification failed");
+                }
+                entry.copied = true;
+                copiedThisRun += 1;
+                await this._writeManifest(manifestPath, manifest);
+                this.onProgress({
+                  state: "copying",
+                  completedFiles: manifest.files.filter((file) => file.copied).length,
+                  totalFiles: manifest.files.length,
+                });
+                if (Number.isSafeInteger(failAfterFiles) && copiedThisRun >= failAfterFiles) {
+                  throw new Error("migration interrupted");
+                }
+              }
 
-      if (manifest.phase === "copying") {
-        let copiedThisRun = 0;
-        for (const entry of manifest.files) {
-          this._throwIfAborted(signal);
-          await this._assertLeaseCurrent(sourceLease);
-          await this._assertLeaseCurrent(targetLease);
-          const sourceFile = this._inside(source, entry.relative);
-          const stagedFile = this._inside(target, entry.relative);
-          if (entry.copied && (await this._verifiedFile(stagedFile, entry))) continue;
-          await this.fs.mkdir(path.dirname(stagedFile), { recursive: true });
-          await this.fs
-            .copyFile(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL)
-            .catch(async (error) => {
-              if (error?.code !== "EEXIST") throw error;
-              await this.fs.rm(stagedFile, { force: true });
-              await this.fs.copyFile(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL);
+              this.onProgress({
+                state: "verifying",
+                completedFiles: 0,
+                totalFiles: manifest.files.length,
+              });
+              for (const [index, entry] of manifest.files.entries()) {
+                if (!(await this._verifiedFile(this._inside(target, entry.relative), entry))) {
+                  throw new Error("migration verification failed");
+                }
+                this.onProgress({
+                  state: "verifying",
+                  completedFiles: index + 1,
+                  totalFiles: manifest.files.length,
+                });
+              }
+              manifest.phase = "verified";
+              await this._writeManifest(manifestPath, manifest);
+              await this.faultInjector("copy-verified-before-marker-release", {
+                source,
+                target,
+                migrationId: manifest.migrationId,
+                token: manifest.token,
+              });
+              await this._removeOwnershipMarker(target, manifest);
+              await this._assertExactTree(target, manifest.files);
+              await this._assertLeaseCurrent(targetLease);
+              await this._assertDirectoryIdentity(targetVolume.anchor);
+              await this._assertSameVolume(target, targetVolume);
+            } else {
+              if (!["verified", "relocating", "relocated", "activated"].includes(manifest.phase)) {
+                throw new Error("destination is unsafe");
+              }
+              if (manifest.phase === "relocating") {
+                await this._assertNoUnexpectedTree(target, manifest.files, manifest);
+              } else {
+                await this._assertExactTree(target, manifest.files);
+                this.onProgress({
+                  state: "verifying",
+                  completedFiles: 0,
+                  totalFiles: manifest.files.length,
+                });
+                for (const [index, entry] of manifest.files.entries()) {
+                  const verified = ["relocated", "activated"].includes(manifest.phase)
+                    ? await this._verifiedTargetFile(this._inside(target, entry.relative), entry)
+                    : await this._verifiedFile(this._inside(target, entry.relative), entry);
+                  if (!verified) throw new Error("migration verification failed");
+                  this.onProgress({
+                    state: "verifying",
+                    completedFiles: index + 1,
+                    totalFiles: manifest.files.length,
+                  });
+                }
+              }
+            }
+
+            if (manifest.phase === "activated") {
+              return {
+                switched: true,
+                canDeleteOldRoot: true,
+                oldRoot: source,
+                currentRoot: target,
+                recoveryAction:
+                  "After verifying Jarvis data, delete the old data directory manually.",
+              };
+            }
+            if (manifest.phase === "verified") {
+              manifest.phase = "relocating";
+              await this._writeManifest(manifestPath, manifest);
+            }
+            if (manifest.phase === "relocating") {
+              await this._assertLeaseCurrent(sourceLease);
+              await this._assertLeaseCurrent(targetLease);
+              await this._restoreTargetFromSource(source, target, manifest);
+              await this.relocateTarget({
+                oldRoot: source,
+                newRoot: target,
+                migrationId: manifest.migrationId,
+                token: manifest.token,
+              });
+              if (failAfterRelocation) throw new Error("migration interrupted");
+              await this._recordTargetHashes(target, manifest.files);
+              manifest.phase = "relocated";
+              await this._writeManifest(manifestPath, manifest);
+            }
+            if (manifest.phase !== "relocated") throw new Error("migration manifest is invalid");
+            await this._assertLeaseCurrent(sourceLease);
+            await this._assertLeaseCurrent(targetLease);
+            const activationProof = {
+              previous: source,
+              target,
+              migrationId: manifest.migrationId,
+              token: manifest.token,
+              sourceIdentity: sourceLease.identity,
+              targetIdentity: targetLease.identity,
+              manifestPath,
+              manifestSha256: await sha256(manifestPath, this.fs),
+            };
+            await this.activationJournal.begin({
+              ...activationProof,
             });
-          await this._fsyncFile(stagedFile);
-          if (!(await this._verifiedFile(stagedFile, entry))) {
-            await this.fs.rm(stagedFile, { force: true });
-            throw new Error("migration verification failed");
-          }
-          entry.copied = true;
-          copiedThisRun += 1;
-          await this._writeManifest(manifestPath, manifest);
-          this.onProgress({
-            state: "copying",
-            completedFiles: manifest.files.filter((file) => file.copied).length,
-            totalFiles: manifest.files.length,
-          });
-          if (Number.isSafeInteger(failAfterFiles) && copiedThisRun >= failAfterFiles) {
-            throw new Error("migration interrupted");
-          }
-        }
-
-        this.onProgress({
-          state: "verifying",
-          completedFiles: 0,
-          totalFiles: manifest.files.length,
-        });
-        for (const [index, entry] of manifest.files.entries()) {
-          if (!(await this._verifiedFile(this._inside(target, entry.relative), entry))) {
-            throw new Error("migration verification failed");
-          }
-          this.onProgress({
-            state: "verifying",
-            completedFiles: index + 1,
-            totalFiles: manifest.files.length,
-          });
-        }
-        manifest.phase = "verified";
-        await this._writeManifest(manifestPath, manifest);
-        await this.faultInjector("copy-verified-before-marker-release", {
-          source,
-          target,
-          migrationId: manifest.migrationId,
-          token: manifest.token,
-        });
-        await this._removeOwnershipMarker(target, manifest);
-        await this._assertExactTree(target, manifest.files);
-        await this._assertLeaseCurrent(targetLease);
-        await this._assertDirectoryIdentity(targetVolume.anchor);
-        await this._assertSameVolume(target, targetVolume);
-      } else {
-        if (!['verified', 'relocating', 'relocated', 'activated'].includes(manifest.phase)) {
-          throw new Error("destination is unsafe");
-        }
-        if (manifest.phase === 'relocating') {
-          await this._assertNoUnexpectedTree(target, manifest.files, manifest);
-        } else {
-          await this._assertExactTree(target, manifest.files);
-          this.onProgress({
-            state: "verifying",
-            completedFiles: 0,
-            totalFiles: manifest.files.length,
-          });
-          for (const [index, entry] of manifest.files.entries()) {
-            const verified = ['relocated', 'activated'].includes(manifest.phase)
-              ? await this._verifiedTargetFile(this._inside(target, entry.relative), entry)
-              : await this._verifiedFile(this._inside(target, entry.relative), entry);
-            if (!verified) throw new Error("migration verification failed");
+            this._throwIfAborted(signal);
             this.onProgress({
-              state: "verifying",
-              completedFiles: index + 1,
-              totalFiles: manifest.files.length,
+              state: "activating",
+              completedFiles: entries.length,
+              totalFiles: entries.length,
             });
+            await this.activationJournal.mark("activating");
+            try {
+              await this.persistRoot(target);
+              await this.activationJournal.mark("persisted");
+              await this.activationJournal.mark("reopening");
+              await lease.reopen(target, source);
+              await this._releaseEmergencyReserve(source);
+              await this.activationJournal.finalize(target);
+              lease.commit(target);
+            } catch {
+              try {
+                this.onProgress({
+                  state: "rollback",
+                  completedFiles: 0,
+                  totalFiles: entries.length,
+                });
+                await this.activationJournal.mark("rollback");
+                await this.persistRoot(source);
+                await lease.rollback(source);
+                await this._releaseEmergencyReserve(target);
+                await this.activationJournal.rollback(source);
+                this.onProgress({
+                  state: "rollback",
+                  completedFiles: entries.length,
+                  totalFiles: entries.length,
+                });
+              } catch {
+                throw new Error(
+                  "migration rollback failed; restart Jarvis and select the previous data directory"
+                );
+              }
+              throw new Error(
+                "migration activation failed; the previous data directory was restored"
+              );
+            }
+            manifest.phase = "activated";
+            await this._writeManifest(manifestPath, manifest);
+            this.onProgress({
+              state: "complete",
+              completedFiles: entries.length,
+              totalFiles: entries.length,
+            });
+            return {
+              switched: true,
+              canDeleteOldRoot: true,
+              oldRoot: source,
+              currentRoot: target,
+              recoveryAction:
+                "After verifying Jarvis data, delete the old data directory manually.",
+            };
+          } finally {
+            const seen = new Set();
+            const heldLeases = [
+              ...[...creationLeases].reverse(),
+              parentLease,
+              targetLease,
+              sourceLease,
+            ].filter((heldLease) => {
+              if (!heldLease || seen.has(heldLease)) return false;
+              seen.add(heldLease);
+              return true;
+            });
+            const failures = [];
+            for (const heldLease of heldLeases) {
+              try {
+                await heldLease.release();
+              } catch (error) {
+                failures.push(error);
+              }
+            }
+            if (failures.length > 0) {
+              // A leaked authoritative handle is more dangerous than preserving a pending return.
+              lease.failClosed();
+              // eslint-disable-next-line no-unsafe-finally
+              throw new AggregateError(failures, "directory lease release failed");
+            }
           }
-        }
-      }
-
-      if (manifest.phase === "activated") {
-        return {
-          switched: true,
-          canDeleteOldRoot: true,
-          oldRoot: source,
-          currentRoot: target,
-          recoveryAction: "After verifying Jarvis data, delete the old data directory manually.",
-        };
-      }
-      if (manifest.phase === "verified") {
-        manifest.phase = "relocating";
-        await this._writeManifest(manifestPath, manifest);
-      }
-      if (manifest.phase === "relocating") {
-        await this._assertLeaseCurrent(sourceLease);
-        await this._assertLeaseCurrent(targetLease);
-        await this._restoreTargetFromSource(source, target, manifest);
-        await this.relocateTarget({
-          oldRoot: source,
-          newRoot: target,
-          migrationId: manifest.migrationId,
-          token: manifest.token,
-        });
-        if (failAfterRelocation) throw new Error("migration interrupted");
-        await this._recordTargetHashes(target, manifest.files);
-        manifest.phase = "relocated";
-        await this._writeManifest(manifestPath, manifest);
-      }
-      if (manifest.phase !== "relocated") throw new Error("migration manifest is invalid");
-      await this._assertLeaseCurrent(sourceLease);
-      await this._assertLeaseCurrent(targetLease);
-      const activationProof = {
-        previous: source,
-        target,
-        migrationId: manifest.migrationId,
-        token: manifest.token,
-        sourceIdentity: sourceLease.identity,
-        targetIdentity: targetLease.identity,
-        manifestPath,
-        manifestSha256: await sha256(manifestPath, this.fs),
-      };
-      await this.activationJournal.begin({
-        ...activationProof,
-      });
-      this._throwIfAborted(signal);
-      this.onProgress({
-        state: "activating",
-        completedFiles: entries.length,
-        totalFiles: entries.length,
-      });
-      await this.activationJournal.mark("activating");
-      try {
-        await this.persistRoot(target);
-        await this.activationJournal.mark("persisted");
-        await this.activationJournal.mark("reopening");
-        await lease.reopen(target, source);
-        await this._releaseEmergencyReserve(source);
-        await this.activationJournal.finalize(target);
-        lease.commit(target);
-      } catch {
-        try {
-          this.onProgress({
-            state: "rollback",
-            completedFiles: 0,
-            totalFiles: entries.length,
-          });
-          await this.activationJournal.mark("rollback");
-          await this.persistRoot(source);
-          await lease.rollback(source);
-          await this._releaseEmergencyReserve(target);
-          await this.activationJournal.rollback(source);
-          this.onProgress({
-            state: "rollback",
-            completedFiles: entries.length,
-            totalFiles: entries.length,
-          });
-        } catch {
-          throw new Error(
-            "migration rollback failed; restart Jarvis and select the previous data directory"
-          );
-        }
-        throw new Error("migration activation failed; the previous data directory was restored");
-      }
-      manifest.phase = "activated";
-      await this._writeManifest(manifestPath, manifest);
-      this.onProgress({
-        state: "complete",
-        completedFiles: entries.length,
-        totalFiles: entries.length,
-      });
-      return {
-        switched: true,
-        canDeleteOldRoot: true,
-        oldRoot: source,
-        currentRoot: target,
-        recoveryAction: "After verifying Jarvis data, delete the old data directory manually.",
-      };
-      } finally {
-        const releases = [parentLease, targetLease, sourceLease]
-          .filter(Boolean)
-          .map(async (heldLease) => heldLease.release());
-        const results = await Promise.allSettled(releases);
-        const failures = results.filter((result) => result.status === "rejected");
-        if (failures.length > 0) {
-          // A leaked authoritative handle is more dangerous than preserving a pending return.
-          lease.failClosed();
-          // eslint-disable-next-line no-unsafe-finally
-          throw new AggregateError(
-            failures.map((result) => result.reason),
-            "directory lease release failed"
-          );
-        }
-      }
-      }, { previousRoot: source });
+        },
+        { previousRoot: source }
+      );
     } finally {
       this.inProgress = false;
     }
@@ -597,15 +621,7 @@ class DataDirectoryMigrator {
     }
   }
 
-  _validateManifest(
-    manifest,
-    source,
-    target,
-    entries,
-    targetVolume,
-    sourceLease,
-    targetLease
-  ) {
+  _validateManifest(manifest, source, target, entries, targetVolume, sourceLease, targetLease) {
     if (
       manifest?.version !== MANIFEST_VERSION ||
       typeof manifest.migrationId !== "string" ||
@@ -647,11 +663,7 @@ class DataDirectoryMigrator {
 
   async _verifiedTargetFile(filePath, expected) {
     const stat = await this.fs.lstat(filePath).catch(() => null);
-    if (
-      !stat?.isFile() ||
-      stat.isSymbolicLink() ||
-      stat.size !== expected.targetSize
-    ) {
+    if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== expected.targetSize) {
       return false;
     }
     return (await sha256(filePath, this.fs)) === expected.targetSha256;
@@ -761,15 +773,23 @@ class DataDirectoryMigrator {
     else throw new Error("directory lease validation unavailable");
   }
 
-  async _createMissingTarget(anchor, target) {
+  async _createMissingTarget(anchor, target, parentLease, creationLeases) {
     const relative = path.relative(anchor, target);
     if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) {
       throw new Error("destination is unsafe");
     }
+    if (typeof this.directoryLeaseProvider.createAndAcquire !== "function") {
+      throw new Error("atomic destination directory creation is unavailable");
+    }
     let cursor = anchor;
+    let heldParent = parentLease;
     for (const component of relative.split(path.sep)) {
+      await this._assertLeaseCurrent(heldParent);
       cursor = path.join(cursor, component);
-      await this.fs.mkdir(cursor, { recursive: false, mode: 0o700 });
+      const createdLease = await this.directoryLeaseProvider.createAndAcquire(cursor);
+      creationLeases.push(createdLease);
+      await this._assertLeaseCurrent(createdLease);
+      await this._assertLeaseCurrent(heldParent);
       const stat = await this.fs.lstat(cursor);
       const inspected = await this.pathInspector.inspect(cursor, stat);
       if (
@@ -780,6 +800,9 @@ class DataDirectoryMigrator {
       ) {
         throw new Error("destination is unsafe");
       }
+      await this._assertLeaseCurrent(createdLease);
+      await this._assertLeaseCurrent(heldParent);
+      heldParent = createdLease;
     }
   }
 
@@ -899,18 +922,13 @@ class DataDirectoryMigrator {
       }
     };
     await walk(root);
-    if (
-      actual.size !== expected.size ||
-      [...actual].some((relative) => !expected.has(relative))
-    ) {
+    if (actual.size !== expected.size || [...actual].some((relative) => !expected.has(relative))) {
       throw new Error("migration staging tree is invalid");
     }
   }
 
   async _assertNoUnexpectedTree(root, expectedFiles, manifest = null) {
-    const expected = new Map(
-      expectedFiles.map((entry) => [path.normalize(entry.relative), entry])
-    );
+    const expected = new Map(expectedFiles.map((entry) => [path.normalize(entry.relative), entry]));
     const walk = async (directory, prefix = "") => {
       const entries = await this.fs.readdir(directory, { withFileTypes: true });
       for (const entry of entries) {
