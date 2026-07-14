@@ -25,6 +25,8 @@ const { getFFmpegPath } = require("../../src/helpers/ffmpegUtils");
 const SAMPLE_RATE = 24_000;
 const CHANNELS = 1;
 const ENCODER_VERSION = "ffmpeg-flac-v1";
+const FIXTURE_LEASE_OWNER = "fixture-worker";
+const FIXTURE_LEASE_CONTEXT = Object.freeze({ owner: FIXTURE_LEASE_OWNER });
 
 function wavFor(pcm) {
   const header = Buffer.alloc(44);
@@ -86,7 +88,10 @@ class LosslessFixtureCodec {
   }
 }
 
-function fixture(t, { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000 } = {}) {
+function fixture(
+  t,
+  { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000, leaseCompression = true } = {}
+) {
   const nowProvider = typeof now === "function" ? now : () => now;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-flac-"));
   const db = new Database(":memory:");
@@ -145,14 +150,52 @@ function fixture(t, { now = 100, expiresAt = 7 * 24 * 60 * 60 * 1_000 } = {}) {
       ...overrides,
     });
   const worker = makeWorker();
-  const job = db.prepare("SELECT * FROM processing_jobs WHERE job_type = 'compress_chunk'").get();
+  let job = db.prepare("SELECT * FROM processing_jobs WHERE job_type = 'compress_chunk'").get();
+  if (leaseCompression) {
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'running', lease_owner = ?, lease_expires_at = ?, attempt_count = 1
+       WHERE id = ?`
+    ).run(FIXTURE_LEASE_OWNER, Number.MAX_SAFE_INTEGER, job.id);
+    job = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
+  }
   return { root, db, store, pcm, wavPath, codec, reader, worker, makeWorker, job };
 }
+
+test("ordinary compression rejects a missing lease before any mutation", async (t) => {
+  const { db, store, wavPath, codec, makeWorker, job } = fixture(t);
+  let encodeCalls = 0;
+  const worker = makeWorker({
+    encoder: {
+      encode(...args) {
+        encodeCalls += 1;
+        return codec.encode(...args);
+      },
+    },
+  });
+  const wavBefore = fs.readFileSync(wavPath);
+  const chunkBefore = store.getChunk("c1");
+  const jobBefore = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
+  const eventsBefore = db.prepare("SELECT count(*) count FROM storage_usage_events").get().count;
+
+  await assert.rejects(worker.run(job), { code: "JOB_LEASE_LOST" });
+
+  assert.equal(encodeCalls, 0);
+  assert.deepEqual(fs.readFileSync(wavPath), wavBefore);
+  assert.equal(fs.existsSync(wavPath.replace(/\.wav$/, ".flac")), false);
+  assert.equal(fs.existsSync(wavPath.replace(/\.wav$/, ".flac.partial")), false);
+  assert.deepEqual(store.getChunk("c1"), chunkBefore);
+  assert.deepEqual(db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id), jobBefore);
+  assert.equal(
+    db.prepare("SELECT count(*) count FROM storage_usage_events").get().count,
+    eventsBefore
+  );
+});
 
 test("switches authority only after decoded PCM verification", async (t) => {
   const { store, pcm, wavPath, worker, job } = fixture(t);
 
-  const result = await worker.run(job);
+  const result = await worker.run(job, FIXTURE_LEASE_CONTEXT);
 
   assert.equal(result.chunk.format, "flac");
   assert.equal(result.chunk.pcm_sha256, crypto.createHash("sha256").update(pcm).digest("hex"));
@@ -167,7 +210,7 @@ test("keeps WAV authoritative when FLAC verification fails", async (t) => {
     decoded.bytes[0] ^= 0xff;
   };
 
-  await assert.rejects(worker.run(job), /pcm_hash_mismatch/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /pcm_hash_mismatch/);
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(wavPath), true);
@@ -188,11 +231,11 @@ test("keeps transcription and compression jobs independently idempotent", (t) =>
   assert.equal(job.model_version, ENCODER_VERSION);
 });
 
-test("completed compression replay is a no-op", async (t) => {
+test("leased promoted FLAC replay is a no-op", async (t) => {
   const { worker, job } = fixture(t);
-  const first = await worker.run(job);
+  const first = await worker.run(job, FIXTURE_LEASE_CONTEXT);
 
-  const replay = await worker.run(job);
+  const replay = await worker.run(job, FIXTURE_LEASE_CONTEXT);
 
   assert.equal(replay.replayed, true);
   assert.deepEqual(replay.chunk, first.chunk);
@@ -200,7 +243,10 @@ test("completed compression replay is a no-op", async (t) => {
 
 test("governed replay completes a promoted FLAC exactly once after lease expiry", async (t) => {
   let now = 100;
-  const { db, store, worker, job, wavPath } = fixture(t, { now: () => now });
+  const { db, store, worker, job, wavPath } = fixture(t, {
+    now: () => now,
+    leaseCompression: false,
+  });
   db.prepare(
     `UPDATE processing_jobs
      SET state = 'completed', completed_at = 50
@@ -245,7 +291,10 @@ test("governed replay completes a promoted FLAC exactly once after lease expiry"
 
 test("governed replay retries a transient authoritative WAV unlink without rewriting FLAC", async (t) => {
   let now = 100;
-  const { db, store, makeWorker, job, wavPath } = fixture(t, { now: () => now });
+  const { db, store, makeWorker, job, wavPath } = fixture(t, {
+    now: () => now,
+    leaseCompression: false,
+  });
   db.prepare(
     `UPDATE processing_jobs
      SET state = 'completed', completed_at = 50
@@ -302,19 +351,19 @@ test("governed replay retries a transient authoritative WAV unlink without rewri
 });
 
 for (const retired of ["expired", "tombstoned"]) {
-  test(`completed compression replay is an immediate no-op when audio is ${retired}`, async (t) => {
+  test(`leased FLAC replay rejects audio that is ${retired}`, async (t) => {
     const { db, store, worker, job } = fixture(t);
-    const first = await worker.run(job);
+    await worker.run(job, FIXTURE_LEASE_CONTEXT);
     if (retired === "expired") {
       db.prepare("UPDATE audio_chunks SET expires_at = 100 WHERE id = 'c1'").run();
     } else {
       store.tombstoneChunk("c1", 100);
     }
 
-    const replay = await worker.run(job);
-
-    assert.equal(replay.replayed, true);
-    assert.equal(replay.chunk.id, first.chunk.id);
+    await assert.rejects(
+      worker.run(job, FIXTURE_LEASE_CONTEXT),
+      retired === "expired" ? /audio_expired/ : { code: "JOB_LEASE_LOST" }
+    );
   });
 }
 
@@ -326,7 +375,7 @@ test("startup completes a verified partial left by a crash before rename", async
     },
   });
 
-  await assert.rejects(worker.run(job), /simulated crash before rename/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /simulated crash before rename/);
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(wavPath), true);
@@ -347,7 +396,7 @@ test("startup completes a verified double-file state after rename crash", async 
       if (point === "after_rename") throw new Error("simulated crash after rename");
     },
   });
-  await assert.rejects(crashing.run(job), /simulated crash after rename/);
+  await assert.rejects(crashing.run(job, FIXTURE_LEASE_CONTEXT), /simulated crash after rename/);
   const flacPath = wavPath.replace(/\.wav$/, ".flac");
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(flacPath), true);
@@ -367,7 +416,10 @@ test("startup finishes WAV cleanup after authority transaction crash", async (t)
       if (point === "before_wav_delete") throw new Error("simulated crash before WAV delete");
     },
   });
-  await assert.rejects(crashing.run(job), /simulated crash before WAV delete/);
+  await assert.rejects(
+    crashing.run(job, FIXTURE_LEASE_CONTEXT),
+    /simulated crash before WAV delete/
+  );
   assert.equal(store.getChunk("c1").format, "flac");
   assert.equal(fs.existsSync(wavPath), true);
 
@@ -381,7 +433,7 @@ test("startup finishes WAV cleanup after authority transaction crash", async (t)
 for (const damage of ["missing", "corrupt"]) {
   test(`startup rolls ${damage} authoritative FLAC back to a verified WAV and retries`, async (t) => {
     const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-    const compressed = await worker.run(job);
+    const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
     fs.writeFileSync(wavPath, wavFor(pcm));
     if (damage === "missing") fs.unlinkSync(compressed.chunk.path);
     else fs.writeFileSync(compressed.chunk.path, "corrupt-flac");
@@ -405,13 +457,18 @@ for (const damage of ["missing", "corrupt"]) {
 
 test("corrupt FLAC rollback deletes its proven retired file before immediate retry", async (t) => {
   const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(wavPath, wavFor(pcm));
   fs.writeFileSync(compressed.chunk.path, "corrupt-flac-for-retry");
 
   await makeWorker().recoverStartup();
   const retried = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
-  const result = await makeWorker().run(retried);
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', lease_owner = ?, lease_expires_at = ?
+     WHERE id = ?`
+  ).run(FIXTURE_LEASE_OWNER, Number.MAX_SAFE_INTEGER, job.id);
+  const result = await makeWorker().run(retried, FIXTURE_LEASE_CONTEXT);
 
   assert.equal(result.chunk.format, "flac");
   assert.equal(fs.existsSync(wavPath), false);
@@ -420,7 +477,7 @@ test("corrupt FLAC rollback deletes its proven retired file before immediate ret
 
 test("failed corrupt-FLAC deletion persists exact provenance for expiry startup retry", async (t) => {
   const { db, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(wavPath, wavFor(pcm));
   fs.writeFileSync(compressed.chunk.path, "corrupt-flac-held-open");
   const actualFileSha256 = crypto
@@ -469,7 +526,7 @@ test("failed corrupt-FLAC deletion persists exact provenance for expiry startup 
 
 test("transiently locked authoritative FLAC stays authoritative until maintenance verifies it", async (t) => {
   const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(wavPath, wavFor(pcm));
   let locked = true;
   const fsImpl = Object.create(fs.promises);
@@ -508,7 +565,7 @@ test("transiently locked authoritative FLAC stays authoritative until maintenanc
 for (const code of ["EBUSY", "EPERM", "EMFILE"]) {
   test(`a ${code} decoder second-read keeps FLAC authoritative until maintenance retries`, async (t) => {
     const { db, store, pcm, wavPath, reader, worker, makeWorker, job } = fixture(t);
-    const compressed = await worker.run(job);
+    const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
     fs.writeFileSync(wavPath, wavFor(pcm));
     let locked = true;
     const transientReader = {
@@ -605,7 +662,7 @@ test("transient I/O classification traverses causes and aggregate errors", () =>
 
 test("a non-transient decoder PCM hash mismatch still rolls FLAC authority back", async (t) => {
   const { db, store, pcm, wavPath, reader, worker, makeWorker, job } = fixture(t);
-  await worker.run(job);
+  await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(wavPath, wavFor(pcm));
   const mismatchingReader = {
     async readVerifiedPcm(chunk) {
@@ -627,7 +684,7 @@ test("a non-transient decoder PCM hash mismatch still rolls FLAC authority back"
 
 test("maintenance hashes and removes a readable legacy null-hash retired FLAC", async (t) => {
   const { db, store, worker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   store.tombstoneChunk("c1", 100);
   db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
 
@@ -647,7 +704,7 @@ test("maintenance hashes and removes a readable legacy null-hash retired FLAC", 
 
 test("retired cleanup cannot unlink a same-path authority promoted by concurrent run", async (t) => {
   const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   const flacPath = compressed.chunk.path;
   const flacHash = compressed.chunk.file_sha256;
   fs.writeFileSync(wavPath, wavFor(pcm));
@@ -661,6 +718,11 @@ test("retired cleanup cannot unlink a same-path authority promoted by concurrent
     job.id
   );
   const retried = db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(job.id);
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', lease_owner = ?, lease_expires_at = ?
+     WHERE id = ?`
+  ).run(FIXTURE_LEASE_OWNER, Number.MAX_SAFE_INTEGER, job.id);
 
   let releaseFirstUnlink;
   const firstUnlinkReleased = new Promise((resolve) => {
@@ -684,8 +746,8 @@ test("retired cleanup cannot unlink a same-path authority promoted by concurrent
   const promoted = new Promise((resolve) => {
     markPromoted = resolve;
   });
-  const originalPromote = store.promoteChunkToFlac.bind(store);
-  store.promoteChunkToFlac = (input) => {
+  const originalPromote = store.promoteLeasedChunkToFlac.bind(store);
+  store.promoteLeasedChunkToFlac = (input) => {
     const result = originalPromote(input);
     markPromoted();
     return result;
@@ -694,7 +756,7 @@ test("retired cleanup cannot unlink a same-path authority promoted by concurrent
 
   const cleaning = maintenanceWorker.cleanupRetiredBacklog();
   await firstUnlinkStarted;
-  const running = maintenanceWorker.run(retried);
+  const running = maintenanceWorker.run(retried, FIXTURE_LEASE_CONTEXT);
   const prematurePromotion = await Promise.race([
     promoted.then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 30)),
@@ -725,7 +787,7 @@ test("retired cleanup waits while a run is between rename and promotion", async 
     },
   });
 
-  const running = worker.run(job);
+  const running = worker.run(job, FIXTURE_LEASE_CONTEXT);
   await renamed;
   let cleanupSettled = false;
   const cleaning = worker.cleanupRetiredBacklog().finally(() => {
@@ -742,7 +804,7 @@ test("retired cleanup waits while a run is between rename and promotion", async 
 
 test("retired cleanup revalidates locator and current authority after its hash read", async (t) => {
   const { db, store, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   const flacPath = compressed.chunk.path;
   store.tombstoneChunk("c1", 100);
   db.prepare(
@@ -768,7 +830,7 @@ test("retired cleanup revalidates locator and current authority after its hash r
 
 test("retired locator clear is conditional on chunk path and hash, not format metadata", async (t) => {
   const { db, store, worker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   store.tombstoneChunk("c1", 100);
   db.prepare("UPDATE audio_chunks SET retired_format = 'wav' WHERE id = 'c1'").run();
 
@@ -787,10 +849,10 @@ test("a rejected authority operation does not poison the serial tail", async (t)
   const { store, worker, job } = fixture(t);
 
   await assert.rejects(
-    worker.run({ ...job, id: "missing-job", chunk_id: "missing" }),
-    /does not exist/
+    worker.run({ ...job, id: "missing-job", chunk_id: "missing" }, FIXTURE_LEASE_CONTEXT),
+    { code: "JOB_LEASE_LOST" }
   );
-  const result = await worker.run(job);
+  const result = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   await worker.waitForIdle();
 
   assert.equal(result.chunk.format, "flac");
@@ -798,7 +860,7 @@ test("a rejected authority operation does not poison the serial tail", async (t)
 });
 
 test("public runPending cannot encode or terminally complete ordinary compression", async (t) => {
-  const { db, store, worker } = fixture(t);
+  const { db, store, worker } = fixture(t, { leaseCompression: false });
 
   await assert.rejects(worker.runPending(), { code: "GOVERNED_RUNTIME_REQUIRED" });
 
@@ -813,7 +875,7 @@ test("public runPending cannot encode or terminally complete ordinary compressio
 
 test("maintenance preserves a locked legacy null-hash retired FLAC for retry", async (t) => {
   const { db, store, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   store.tombstoneChunk("c1", 100);
   db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
   const fsImpl = Object.create(fs.promises);
@@ -839,7 +901,7 @@ test("maintenance preserves a locked legacy null-hash retired FLAC for retry", a
 
 test("maintenance clears a missing legacy null-hash retired locator", async (t) => {
   const { db, store, worker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   store.tombstoneChunk("c1", 100);
   db.prepare("UPDATE audio_chunks SET retired_file_sha256 = NULL WHERE id = 'c1'").run();
   fs.unlinkSync(compressed.chunk.path);
@@ -853,7 +915,7 @@ test("maintenance clears a missing legacy null-hash retired locator", async (t) 
 
 test("online maintenance retries a tombstoned retired FLAC in the next cycle", async (t) => {
   const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(wavPath, wavFor(pcm));
   db.prepare(
     `UPDATE audio_chunks
@@ -952,7 +1014,7 @@ test("retired provenance is private to the maintenance chunk API", (t) => {
 
 test("startup records a diagnostic failure when neither FLAC nor sibling WAV is valid", async (t) => {
   const { db, store, worker, makeWorker, job } = fixture(t);
-  const compressed = await worker.run(job);
+  const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(compressed.chunk.path, "corrupt-flac");
 
   await makeWorker().recoverStartup();
@@ -999,7 +1061,10 @@ test("promotion rejection after retention wins removes the renamed non-authorita
     },
   });
 
-  await assert.rejects(worker.run(job), /audio is deleted|authority changed|audio_expired|ENOENT/);
+  await assert.rejects(
+    worker.run(job, FIXTURE_LEASE_CONTEXT),
+    /audio is deleted|authority changed|audio_expired|JOB_LEASE_LOST|lease was lost|ENOENT/
+  );
   await retentionCleanup;
 
   assert.equal(store.getChunk("c1").deleted_at, 200);
@@ -1013,7 +1078,7 @@ test("startup removes a verified orphan final FLAC after a rename crash later ex
       if (point === "after_rename") throw new Error("simulated rename crash");
     },
   });
-  await assert.rejects(crashing.run(job), /simulated rename crash/);
+  await assert.rejects(crashing.run(job, FIXTURE_LEASE_CONTEXT), /simulated rename crash/);
   const flacPath = wavPath.replace(/\.wav$/, ".flac");
   db.prepare("UPDATE audio_chunks SET expires_at = 200 WHERE id = 'c1'").run();
 
@@ -1032,7 +1097,7 @@ test("startup uses retired database authority to clean a tombstoned rename-crash
       if (point === "after_rename") throw new Error("simulated rename crash");
     },
   });
-  await assert.rejects(crashing.run(job), /simulated rename crash/);
+  await assert.rejects(crashing.run(job, FIXTURE_LEASE_CONTEXT), /simulated rename crash/);
   const flacPath = wavPath.replace(/\.wav$/, ".flac");
   store.tombstoneChunk("c1", 200);
   fs.rmSync(wavPath, { force: true });
@@ -1064,7 +1129,7 @@ test("startup rolls back a conflicting FLAC double-file state", async (t) => {
       if (point === "after_rename") throw new Error("simulated crash after rename");
     },
   });
-  await assert.rejects(crashing.run(job));
+  await assert.rejects(crashing.run(job, FIXTURE_LEASE_CONTEXT));
   const flacPath = wavPath.replace(/\.wav$/, ".flac");
   const corrupt = fs.readFileSync(flacPath);
   corrupt[corrupt.length - 1] ^= 0xff;
@@ -1157,7 +1222,7 @@ test("a leased transcription reads a verified temporary WAV across authority swi
   });
   await ready;
 
-  await worker.run(job);
+  await worker.run(job, FIXTURE_LEASE_CONTEXT);
 
   assert.equal(fs.existsSync(wavPath), false);
   assert.equal(fs.existsSync(leasedPath), true);
@@ -1376,7 +1441,7 @@ test("never compresses tombstoned audio", async (t) => {
   const { store, wavPath, worker, job } = fixture(t);
   store.tombstoneChunk("c1", 200);
 
-  await assert.rejects(worker.run(job), /audio_deleted/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), { code: "JOB_LEASE_LOST" });
 
   assert.equal(fs.existsSync(wavPath.replace(/\.wav$/, ".flac")), false);
 });
@@ -1384,7 +1449,7 @@ test("never compresses tombstoned audio", async (t) => {
 test("never compresses audio at its retention deadline", async (t) => {
   const { store, wavPath, worker, job } = fixture(t, { now: 1_000, expiresAt: 1_000 });
 
-  await assert.rejects(worker.run(job), /audio_expired/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /audio_expired/);
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(wavPath), true);
@@ -1398,7 +1463,7 @@ test("rejects authoritative paths outside the controlled recordings root", async
   t.after(() => fs.rmSync(outside, { force: true }));
   db.prepare("UPDATE audio_chunks SET path = ? WHERE id = 'c1'").run(outside);
 
-  await assert.rejects(worker.run(job), /escapes recordings root/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /escapes recordings root/);
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(outside), true);
@@ -1413,7 +1478,7 @@ for (const [name, mutate, expected] of [
     const { store, wavPath, codec, worker, job } = fixture(t);
     codec.decodeMutation = mutate;
 
-    await assert.rejects(worker.run(job), expected);
+    await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), expected);
 
     assert.equal(store.getChunk("c1").format, "wav");
     assert.equal(fs.existsSync(wavPath), true);
@@ -1433,7 +1498,7 @@ test(
       now: () => 100,
     });
 
-    const result = await worker.run(job);
+    const result = await worker.run(job, FIXTURE_LEASE_CONTEXT);
     const decoded = await reader.readVerifiedPcm(result.chunk);
 
     assert.deepEqual(decoded.bytes, pcm);
@@ -1726,7 +1791,7 @@ test("rejects a chunk whose stored duration disagrees with decoded WAV samples",
   const { db, store, wavPath, worker, job } = fixture(t);
   db.prepare("UPDATE audio_chunks SET duration_ms = 999 WHERE id = 'c1'").run();
 
-  await assert.rejects(worker.run(job), /duration_mismatch/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /duration_mismatch/);
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(wavPath), true);
@@ -1751,7 +1816,10 @@ test("rejects a junction that redirects an authoritative path outside recordings
     path.join(junction, "speech.wav")
   );
 
-  await assert.rejects(worker.run(job), /escapes recordings root|symbolic link/);
+  await assert.rejects(
+    worker.run(job, FIXTURE_LEASE_CONTEXT),
+    /escapes recordings root|symbolic link/
+  );
 
   assert.equal(store.getChunk("c1").format, "wav");
   assert.equal(fs.existsSync(path.join(outsideDir, "speech.wav")), true);
@@ -1799,7 +1867,7 @@ test("rejects a hard-linked authoritative WAV", async (t) => {
     return;
   }
 
-  await assert.rejects(worker.run(job), /single-link|hard link/);
+  await assert.rejects(worker.run(job, FIXTURE_LEASE_CONTEXT), /single-link|hard link/);
 
   assert.equal(fs.existsSync(outside), true);
 });
@@ -1848,7 +1916,10 @@ test("refuses a pre-existing partial hard link instead of overwriting external e
   t.after(() => fs.rmSync(outside, { force: true }));
   fs.linkSync(outside, partialPath);
 
-  await assert.rejects(worker.run(job), /partial_already_exists|single-link/);
+  await assert.rejects(
+    worker.run(job, FIXTURE_LEASE_CONTEXT),
+    /partial_already_exists|single-link/
+  );
 
   assert.equal(fs.readFileSync(outside, "utf8"), "preserve-me");
 });

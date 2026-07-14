@@ -423,6 +423,8 @@ test("CUDA unavailable allows optional CPU preview but not ordinary final backlo
     batterySaver: false,
     previewEnabled: true,
     cpuLoadPct: 20,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
   };
 
   assert.deepEqual(governor.admit("preview", unavailable), {
@@ -437,6 +439,59 @@ test("CUDA unavailable allows optional CPU preview but not ordinary final backlo
     action: "pause_preview",
     reason: "preview_disabled",
   });
+});
+
+test("CUDA-unavailable preview fails closed on unsafe CPU or unknown power", () => {
+  const governor = new ResourceGovernor();
+  const baseline = {
+    state: "unavailable",
+    reason: "cuda_unavailable",
+    batterySaver: false,
+    previewEnabled: true,
+    cpuLoadPct: 20,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
+  };
+  const cases = [
+    {
+      name: "missing CPU telemetry",
+      snapshot: { ...baseline, cpuLoadPct: null, cpuTelemetryAvailable: false },
+      reason: "telemetry_unavailable",
+    },
+    {
+      name: "invalid CPU telemetry",
+      snapshot: { ...baseline, cpuLoadPct: -1 },
+      reason: "telemetry_unavailable",
+    },
+    {
+      name: "high CPU load",
+      snapshot: { ...baseline, cpuLoadPct: 95 },
+      reason: "cpu_load_high",
+    },
+    {
+      name: "unknown power state",
+      snapshot: { ...baseline, powerTelemetryAvailable: false },
+      reason: "telemetry_unavailable",
+    },
+    {
+      name: "unknown battery-saver state",
+      snapshot: { ...baseline, batterySaver: null },
+      reason: "telemetry_unavailable",
+    },
+    {
+      name: "battery saver",
+      snapshot: { ...baseline, batterySaver: true },
+      reason: "battery_saver",
+    },
+  ];
+
+  for (const entry of cases) {
+    assert.deepEqual(
+      governor.admit("preview", entry.snapshot),
+      { action: "pause_preview", reason: entry.reason },
+      entry.name
+    );
+  }
 });
 
 test("parses live NVIDIA telemetry and distinguishes Jarvis-owned from external PIDs", () => {

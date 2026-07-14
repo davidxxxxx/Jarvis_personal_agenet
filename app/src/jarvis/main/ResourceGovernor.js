@@ -418,8 +418,12 @@ class ResourceGovernor {
       throw new Error("resource snapshot is required");
     }
     const storageCritical = new Set(["retention_urgent", "storage_recovery_compress"]);
-    const cpuSafe =
-      Number.isFinite(snapshot.cpuLoadPct) && snapshot.cpuLoadPct < CPU_UNSAFE_LOAD_PCT;
+    const cpuReadingValid =
+      Number.isFinite(snapshot.cpuLoadPct) &&
+      snapshot.cpuLoadPct >= 0 &&
+      snapshot.cpuLoadPct <= 100;
+    const cpuTelemetryKnown = snapshot.cpuTelemetryAvailable === true && cpuReadingValid;
+    const cpuSafe = cpuReadingValid && snapshot.cpuLoadPct < CPU_UNSAFE_LOAD_PCT;
     const powerKnown = snapshot.powerTelemetryAvailable === true;
     if (snapshot.batterySaver === true) {
       if (kind === "storage_recovery_compress" && cpuSafe && powerKnown) {
@@ -450,9 +454,14 @@ class ResourceGovernor {
         return { action: "run_cpu", reason: "storage_critical" };
       }
       if (kind === "preview") {
-        return snapshot.previewEnabled === false
-          ? { action: "pause_preview", reason: "preview_disabled" }
-          : { action: "run_cpu", reason: "cuda_unavailable" };
+        if (snapshot.previewEnabled === false) {
+          return { action: "pause_preview", reason: "preview_disabled" };
+        }
+        if (!cpuTelemetryKnown || !powerKnown || snapshot.batterySaver !== false) {
+          return { action: "pause_preview", reason: "telemetry_unavailable" };
+        }
+        if (!cpuSafe) return { action: "pause_preview", reason: "cpu_load_high" };
+        return { action: "run_cpu", reason: "cuda_unavailable" };
       }
       return { action: "defer", reason: "cuda_unavailable" };
     }

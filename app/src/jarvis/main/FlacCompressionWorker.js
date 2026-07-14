@@ -125,41 +125,45 @@ class FlacCompressionWorker {
     return this.waitForIdle();
   }
 
-  run(job, leaseContext = null) {
+  run(job, leaseContext) {
     return this._enqueueOperation(() => this._run(job, leaseContext));
   }
 
-  async _run(job, leaseContext = null) {
+  async _run(job, leaseContext) {
+    if (leaseContext === null || leaseContext === undefined) {
+      throw this._leaseLostError();
+    }
     if (
-      leaseContext !== null &&
-      (typeof leaseContext !== "object" ||
-        typeof leaseContext.owner !== "string" ||
-        !/^[A-Za-z0-9_-]{1,128}$/.test(leaseContext.owner))
+      typeof leaseContext !== "object" ||
+      typeof leaseContext.owner !== "string" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(leaseContext.owner)
     ) {
       throw new TypeError("compression lease owner must be a safe identifier");
     }
-    let normalizedJob = this._job(job);
-    const persistedJob = this.store.getCompressionJob?.(normalizedJob.id);
-    if (persistedJob) normalizedJob = this._job(persistedJob);
-    const leaseJob = persistedJob ?? job;
+    if (typeof this.store.getCompressionJob !== "function") {
+      throw new TypeError("store.getCompressionJob must be a function");
+    }
+    if (typeof this.store.promoteLeasedChunkToFlac !== "function") {
+      throw new TypeError("store.promoteLeasedChunkToFlac must be a function");
+    }
+    const requestedJob = this._job(job);
+    const persistedJob = this.store.getCompressionJob(requestedJob.id);
     if (
-      leaseContext &&
-      (leaseJob?.state !== "running" ||
-        leaseJob.lease_owner !== leaseContext.owner ||
-        !Number.isSafeInteger(leaseJob.lease_expires_at) ||
-        leaseJob.lease_expires_at <= this.now())
+      !persistedJob ||
+      persistedJob.state !== "running" ||
+      persistedJob.lease_owner !== leaseContext.owner ||
+      !Number.isSafeInteger(persistedJob.lease_expires_at) ||
+      persistedJob.lease_expires_at <= this.now()
     ) {
       throw this._leaseLostError();
     }
+    const normalizedJob = this._job(persistedJob);
     const chunk = this.getMaintenanceChunk(normalizedJob.chunkId);
     if (!chunk) throw new Error(`chunk ${normalizedJob.chunkId} does not exist`);
-    if (normalizedJob.state === "completed") {
-      return { chunk: this.store.getChunk(normalizedJob.chunkId) ?? chunk, replayed: true };
-    }
     if (chunk.deleted_at !== null) throw new Error("audio_deleted");
     if (chunk.expires_at <= this.now()) throw new Error("audio_expired");
     if (chunk.pcm_sha256 !== normalizedJob.inputHash) throw new Error("pcm_hash_mismatch");
-    if (chunk.format === "flac" && leaseContext) {
+    if (chunk.format === "flac") {
       return this._replayPromotedFlac(chunk);
     }
     if (chunk.format !== "wav") throw new Error("chunk_not_authoritative_wav");
@@ -223,20 +227,12 @@ class FlacCompressionWorker {
         channels: chunk.channels,
         completedAt,
       };
-      let promoted;
-      if (leaseContext) {
-        if (typeof this.store.promoteLeasedChunkToFlac !== "function") {
-          throw new TypeError("store.promoteLeasedChunkToFlac must be a function");
-        }
-        promoted = this.store.promoteLeasedChunkToFlac({
-          ...promotion,
-          owner: leaseContext.owner,
-        });
-        if (!promoted) {
-          throw this._leaseLostError();
-        }
-      } else {
-        promoted = this.store.promoteChunkToFlac(promotion);
+      const promoted = this.store.promoteLeasedChunkToFlac({
+        ...promotion,
+        owner: leaseContext.owner,
+      });
+      if (!promoted) {
+        throw this._leaseLostError();
       }
       promotedAuthority = true;
       await this._injectFault("before_wav_delete");
