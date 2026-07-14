@@ -192,8 +192,13 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId) => {
     const timeline = repository.getSessionTimeline(assertId(sessionId, "sessionId"));
     if (!timeline) return null;
+    const activeCapture = typeof service.getState === "function" ? service.getState() : null;
+    const activelyRecording =
+      activeCapture?.status === "recording" || activeCapture?.status === "degraded";
     const previewStatus =
-      timeline.status === "recording"
+      timeline.status === "recording" &&
+      activelyRecording &&
+      activeCapture.sessionId === timeline.session_id
         ? (processingLifecycle?.runtime?.previewStatus?.() ?? null)
         : null;
     return {

@@ -3,6 +3,7 @@ const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const ResourceGovernor = require("./ResourceGovernor");
+const { JOB_PRIORITY } = ResourceGovernor;
 const HeavyJobGate = require("./HeavyJobGate");
 const PreviewTranscriptionScheduler = require("./PreviewTranscriptionScheduler");
 const { createHash } = require("node:crypto");
@@ -11,6 +12,8 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
 const DEFAULT_MAX_DRAIN_MS = 5_000;
 const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
+const PREVIEW_CONTEXT_ROW_LIMIT = 16;
+const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
 
 function positiveSafeInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -19,16 +22,33 @@ function positiveSafeInteger(value, name) {
   return value;
 }
 
-function createCommittedAudioPreviewExecutor({ repository, audioEvidenceReader, transcribeWav }) {
+function previewBoundary(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function safeTimestampAdd(base, relative, name) {
+  const result = base + relative;
+  if (!Number.isSafeInteger(result)) throw new RangeError(`${name} safe integer overflow`);
+  return result;
+}
+
+function takeCodePointTail(value, limit) {
+  const points = Array.from(value);
+  return points.slice(Math.max(0, points.length - limit)).join("");
+}
+
+function createCommittedAudioPreviewExecutor({ repository, previewAudioRing, transcribeWav }) {
   if (
     typeof repository?.getSession !== "function" ||
-    typeof repository?.listAudioChunks !== "function" ||
-    typeof repository?.listTranscriptHistory !== "function"
+    typeof repository?.listPreviewTranscriptContext !== "function"
   ) {
-    throw new TypeError("repository preview audio APIs are required");
+    throw new TypeError("repository preview context APIs are required");
   }
-  if (!audioEvidenceReader || typeof audioEvidenceReader.withVerifiedWav !== "function") {
-    throw new TypeError("audioEvidenceReader.withVerifiedWav must be a function");
+  if (!previewAudioRing || typeof previewAudioRing.withPreviewWav !== "function") {
+    throw new TypeError("previewAudioRing.withPreviewWav must be a function");
   }
   if (typeof transcribeWav !== "function") throw new TypeError("transcribeWav must be a function");
   return async ({
@@ -41,47 +61,37 @@ function createCommittedAudioPreviewExecutor({ repository, audioEvidenceReader, 
     cpuThreads,
     lowPriority,
   }) => {
+    const safeFromMs = previewBoundary(fromMs, "fromMs");
+    const safeThroughMs = previewBoundary(throughMs, "throughMs");
+    if (safeThroughMs <= safeFromMs) throw new RangeError("preview requires fromMs < throughMs");
     const session = repository.getSession(sessionId);
     if (!session) throw new Error("preview session is unavailable");
-    const absoluteFrom = session.started_at + fromMs;
-    const absoluteThrough = session.started_at + throughMs;
-    const prompt = repository
-      .listTranscriptHistory(sessionId)
-      .filter(
-        (segment) =>
-          segment.track_id === trackId &&
-          segment.superseded_by === null &&
-          segment.duplicate_of === null &&
-          segment.ended_at > absoluteFrom &&
-          segment.started_at < absoluteThrough &&
-          typeof segment.text === "string" &&
-          segment.text.trim()
-      )
-      .map((segment) => segment.text.trim())
-      .join(" ");
-    const chunks = repository
-      .listAudioChunks(sessionId)
-      .filter((chunk) => {
-        const chunkTrackId = chunk.track_id ?? chunk.trackId;
-        const startedAt = chunk.started_at ?? chunk.startedAt;
-        const endedAt = chunk.ended_at ?? chunk.endedAt;
-        return (
-          chunkTrackId === trackId &&
-          chunk.deleted_at == null &&
-          (chunk.write_state ?? "committed") === "committed" &&
-          startedAt >= absoluteFrom &&
-          endedAt <= absoluteThrough &&
-          endedAt > startedAt
-        );
-      })
-      .sort(
-        (left, right) => (left.started_at ?? left.startedAt) - (right.started_at ?? right.startedAt)
-      );
-    const segments = [];
-    for (const chunk of chunks) {
-      const raw = await audioEvidenceReader.withVerifiedWav(chunk, (verifiedPath) =>
-        transcribeWav({
-          path: verifiedPath,
+    const sessionStartedAt = previewBoundary(session.started_at, "session.started_at");
+    const absoluteFrom = safeTimestampAdd(sessionStartedAt, safeFromMs, "preview from");
+    const absoluteThrough = safeTimestampAdd(sessionStartedAt, safeThroughMs, "preview through");
+    const contextRows = repository.listPreviewTranscriptContext({
+      sessionId,
+      trackId,
+      from: absoluteFrom,
+      to: absoluteThrough,
+      limit: PREVIEW_CONTEXT_ROW_LIMIT,
+    });
+    if (!Array.isArray(contextRows)) throw new TypeError("preview context rows must be an array");
+    const prompt = takeCodePointTail(
+      contextRows
+        .slice(-PREVIEW_CONTEXT_ROW_LIMIT)
+        .map((segment) =>
+          typeof segment?.text === "string" ? segment.text.replace(/\s+/gu, " ").trim() : ""
+        )
+        .filter(Boolean)
+        .join(" "),
+      PREVIEW_PROMPT_CODE_POINT_LIMIT
+    );
+    const segment = await previewAudioRing.withPreviewWav(
+      { sessionId, trackId, fromMs: safeFromMs, throughMs: safeThroughMs },
+      async (snapshot) => {
+        const raw = await transcribeWav({
+          path: snapshot.path,
           language: null,
           initialPrompt: prompt,
           executionContext: {
@@ -90,41 +100,40 @@ function createCommittedAudioPreviewExecutor({ repository, audioEvidenceReader, 
             cpuThreads,
             lowPriority,
           },
-        })
-      );
-      if (raw?.executionDevice !== executionDevice) {
-        throw new Error("EXECUTION_DEVICE_MISMATCH");
+        });
+        if (raw?.executionDevice !== executionDevice) {
+          throw new Error("EXECUTION_DEVICE_MISMATCH");
+        }
+        if (raw?.noSpeech === true) return null;
+        if (raw?.success === false || typeof raw?.text !== "string") {
+          throw new Error("TRANSCRIPTION_INVALID_RESULT");
+        }
+        const text = raw.text.replace(/\s+/gu, " ").trim();
+        if (!text) return null;
+        const confidence = raw.confidence ?? 0;
+        if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+          throw new Error("TRANSCRIPTION_INVALID_RESULT");
+        }
+        const startedAt = session.started_at + snapshot.fromMs;
+        const endedAt = session.started_at + snapshot.throughMs;
+        const id = `preview_${createHash("sha256")
+          .update(`${sessionId}\u0000${trackId}\u0000${snapshot.sha256}\u0000${throughMs}`)
+          .digest("hex")
+          .slice(0, 32)}`;
+        return {
+          id,
+          startedAt,
+          endedAt,
+          personId: null,
+          speakerLabel: snapshot.sourceType,
+          sourceType: snapshot.sourceType,
+          text,
+          confidence,
+          isStable: false,
+        };
       }
-      if (raw?.noSpeech === true) continue;
-      if (raw?.success === false || typeof raw?.text !== "string") {
-        throw new Error("TRANSCRIPTION_INVALID_RESULT");
-      }
-      const text = raw.text.replace(/\s+/gu, " ").trim();
-      if (!text) continue;
-      const confidence = raw.confidence ?? 0;
-      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-        throw new Error("TRANSCRIPTION_INVALID_RESULT");
-      }
-      const startedAt = chunk.started_at ?? chunk.startedAt;
-      const endedAt = chunk.ended_at ?? chunk.endedAt;
-      const sourceType = chunk.source_type ?? chunk.sourceType ?? "mic";
-      const id = `preview_${createHash("sha256")
-        .update(`${sessionId}\u0000${trackId}\u0000${chunk.id}\u0000${throughMs}`)
-        .digest("hex")
-        .slice(0, 32)}`;
-      segments.push({
-        id,
-        startedAt,
-        endedAt,
-        personId: null,
-        speakerLabel: sourceType,
-        sourceType,
-        text,
-        confidence,
-        isStable: false,
-      });
-    }
-    return { segments };
+    );
+    return { segments: segment ? [segment] : [] };
   };
 }
 
@@ -298,11 +307,14 @@ class JarvisProcessingRuntime {
     return rows;
   }
 
-  async _runJobPhase(startedAt) {
+  async _runJobPhase(
+    startedAt,
+    { limit = this.maxJobsPerDrain, priorityBefore = Number.MAX_SAFE_INTEGER } = {}
+  ) {
     let processed = 0;
-    while (processed < this.maxJobsPerDrain) {
+    while (processed < limit) {
       if (!this._hasDrainBudget(startedAt)) break;
-      const count = await this.runner.runOnce(this.now());
+      const count = await this.runner.runOnce(this.now(), { priorityBefore });
       if (count === 0) break;
       processed += count;
     }
@@ -376,13 +388,17 @@ class JarvisProcessingRuntime {
   async _drain() {
     const startedAt = this.now();
     const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
+    if (this.stopping || !this.running) return 0;
+    let processed = await this._runJobPhase(startedAt, {
+      priorityBefore: JOB_PRIORITY.preview,
+    });
+    if (processed >= this.maxJobsPerDrain || !this._hasDrainBudget(startedAt)) return processed;
     this._tickPreview(resourceSnapshot);
     const sessionsFirst = this.sessionPhaseFirst;
     this.sessionPhaseFirst = !this.sessionPhaseFirst;
     const candidatesBefore = this._listProcessingWindow(this.maxSessionsPerDrain);
     const visited = new Set();
     let inspected = 0;
-    let processed = 0;
 
     if (sessionsFirst) {
       inspected += await this._runSessionPhase(
@@ -393,7 +409,9 @@ class JarvisProcessingRuntime {
       );
     }
     if (this._hasDrainBudget(startedAt)) {
-      processed = await this._runJobPhase(startedAt);
+      processed += await this._runJobPhase(startedAt, {
+        limit: this.maxJobsPerDrain - processed,
+      });
     }
     if (inspected >= this.maxSessionsPerDrain || !this._hasDrainBudget(startedAt)) {
       return processed;
@@ -418,10 +436,9 @@ class JarvisProcessingRuntime {
       this.clearInterval(this.timer);
       this.timer = null;
     }
-    this.stopPromise = Promise.all([
-      Promise.resolve(this.inFlight),
-      Promise.resolve(this.previewInFlight),
-    ]).then(() => undefined);
+    this.stopPromise = Promise.resolve(this.inFlight)
+      .then(() => Promise.resolve(this.previewInFlight))
+      .then(() => undefined);
     return this.stopPromise;
   }
 }
@@ -503,7 +520,7 @@ function createJarvisProcessingRuntime({
         previewExecutor ??
         createCommittedAudioPreviewExecutor({
           repository,
-          audioEvidenceReader: service.audioEvidenceReader,
+          previewAudioRing: service.previewAudioRing,
           transcribeWav,
         }),
       persistProvisional:

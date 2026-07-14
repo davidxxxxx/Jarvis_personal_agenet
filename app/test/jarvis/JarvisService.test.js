@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
 
 function createRepository() {
   const sessions = new Map([
@@ -455,6 +456,152 @@ test("committed capture audio notifies the preview requester after durable commi
 
     assert.equal(repository.chunks.length, 1);
     assert.deepEqual(notifications, [repository.chunks[0]]);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("an async committed-chunk callback rejection cannot escape durable capture", async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-chunk-callback-rejection-"));
+  const repository = createRepository();
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.prependListener("unhandledRejection", onUnhandled);
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 1_100,
+    fsImpl: createSafeFs(),
+    onChunkCommitted: async () => {
+      throw new Error("chunk callback rejected");
+    },
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(4_800, 1));
+    service.finishCapture("s1", 1_100);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(unhandled, []);
+    assert.equal(repository.chunks.length, 1);
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("continuous capture emits 15-second live preview watermarks while final chunks remain 60 seconds", () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-watermark-"));
+  const repository = createRepository();
+  const watermarks = [];
+  const previewAudioRing = new PreviewAudioRing({
+    rootDir: path.join(userDataDir, "recordings", ".preview"),
+  });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 61_000,
+    fsImpl: createSafeFs(),
+    previewAudioRing,
+    onPreviewWatermark: (watermark) => watermarks.push(watermark),
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    for (let second = 0; second < 60; second += 1) {
+      assert.equal(service.appendMicPcm("s1", Buffer.alloc(24_000 * 2, second)), true);
+    }
+
+    assert.deepEqual(
+      watermarks.map(({ sessionId, trackId, sourceType, throughMs }) => ({
+        sessionId,
+        trackId,
+        sourceType,
+        throughMs,
+      })),
+      [15_000, 30_000, 45_000, 60_000].map((throughMs) => ({
+        sessionId: "s1",
+        trackId: watermarks[0].trackId,
+        sourceType: "mic",
+        throughMs,
+      }))
+    );
+    assert.equal(repository.chunks.length, 1);
+    assert.equal(repository.chunks[0].durationMs, 60_000);
+  } finally {
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("an async preview watermark rejection is contained outside the capture path", async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-rejection-"));
+  const repository = createRepository();
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.prependListener("unhandledRejection", onUnhandled);
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 16_000,
+    fsImpl: createSafeFs(),
+    onPreviewWatermark: async () => {
+      throw new Error("preview request rejected");
+    },
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    assert.equal(service.appendMicPcm("s1", Buffer.alloc(24_000 * 2 * 15, 1)), true);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(unhandled, []);
+    assert.equal(service.getState().status, "recording");
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    service.shutdown();
+    fs.rmSync(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test("terminal capture clears its disposable live preview ring without touching final chunks", async () => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-terminal-cleanup-"));
+  const repository = createRepository();
+  const previewAudioRing = new PreviewAudioRing({
+    rootDir: path.join(userDataDir, "recordings", ".preview"),
+  });
+  const service = new JarvisService({
+    repository,
+    userDataDir,
+    broadcast() {},
+    now: () => 61_000,
+    fsImpl: createSafeFs(),
+    previewAudioRing,
+  });
+
+  try {
+    service.startCapture({ sessionId: "s1", startedAt: 1_000, micDeviceId: null });
+    service.appendMicPcm("s1", Buffer.alloc(24_000 * 2 * 60, 1));
+    const trackId = repository.tracks[0].id;
+    service.finishCapture("s1", 61_000);
+
+    assert.equal(
+      await previewAudioRing.withPreviewWav(
+        { sessionId: "s1", trackId, fromMs: 0, throughMs: 60_000 },
+        () => assert.fail("terminal preview audio remained readable")
+      ),
+      null
+    );
+    assert.equal(repository.chunks.length, 1);
+    assert.equal(repository.chunks[0].durationMs, 60_000);
   } finally {
     service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });

@@ -135,6 +135,18 @@ test("claims and executes only one deterministic job per iteration", async (t) =
   );
 });
 
+test("leaves ordinary final work unclaimed when draining above the preview priority ceiling", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, { id: "final-only", priority: 30 });
+  runner.register("transcribe_chunk", async () => assert.fail("final work crossed the ceiling"));
+
+  assert.equal(await runner.runOnce(2_000, { priorityBefore: 20 }), 0);
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE id = 'final-only'").get().state,
+    "pending"
+  );
+});
+
 test("visibly blocks a claimed job when its handler is missing", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, { jobType: "unknown_job" });

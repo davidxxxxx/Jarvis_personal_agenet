@@ -3,13 +3,16 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const JarvisService = require("../../src/jarvis/main/JarvisService");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
 const WhisperCudaManager = require("../../src/helpers/whisperCudaManager");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
+  createCommittedAudioPreviewExecutor,
 } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 
 function deferred() {
@@ -448,7 +451,8 @@ test("startup recovery errors are surfaced without disabling immediate drain or 
         calls.push("recover");
         throw new Error("temporary database contention");
       },
-      runOnce: async () => {
+      runOnce: async (_at, { priorityBefore } = {}) => {
+        if (priorityBefore === 20) return 0;
         calls.push("drain");
         return 0;
       },
@@ -517,6 +521,7 @@ test("production composition binds transcribe and compression handlers to curren
         compressionContexts.push(context);
       },
     },
+    previewAudioRing: { withPreviewWav: async () => null },
   };
   const ipcHandlers = {
     createJarvisTranscribeWavAdapter: ({ model }) => {
@@ -619,6 +624,7 @@ test("two production drains serialize transcription and compression through the 
         active -= 1;
       },
     },
+    previewAudioRing: { withPreviewWav: async () => null },
   };
   const ipcHandlers = {
     createJarvisTranscribeWavAdapter:
@@ -700,6 +706,7 @@ test("production runtime startup waits for FLAC authority recovery before claimi
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
     },
     flacCompressionWorker: { run: async () => {} },
+    previewAudioRing: { withPreviewWav: async () => null },
   };
   const runtime = createJarvisProcessingRuntime({
     repository,
@@ -764,6 +771,7 @@ test("production admission uses the real CUDA status peak at the exact safety-ma
     service: {
       audioEvidenceReader: { withVerifiedWav: async () => ({}) },
       flacCompressionWorker: { run: async () => ({}) },
+      previewAudioRing: { withPreviewWav: async () => null },
     },
     ipcHandlers: {
       whisperCudaManager: cudaManager,
@@ -853,7 +861,8 @@ test("stop reached during the first handler prevents every later claim in the sa
   const runtime = new JarvisProcessingRuntime({
     runner: {
       recoverExpiredLeases: () => 0,
-      runOnce: async () => {
+      runOnce: async (_at, { priorityBefore } = {}) => {
+        if (priorityBefore === 20) return 0;
         claims += 1;
         if (claims === 1) {
           entered.resolve();
@@ -1105,7 +1114,8 @@ test("long jobs cannot permanently starve eligible session post-processing acros
   const runtime = new JarvisProcessingRuntime({
     runner: {
       recoverExpiredLeases: () => 0,
-      runOnce: async () => {
+      runOnce: async (_at, { priorityBefore } = {}) => {
+        if (priorityBefore === 20) return 0;
         claims += 1;
         now += 6;
         return 1;
@@ -1299,15 +1309,27 @@ test("production default preview path transcribes bounded committed audio as pro
   t.after(() => repository.close());
   insertSession(repository, { status: "recording", processingState: "pending", endedAt: null });
   insertTrack(repository, { endedAt: null });
-  insertChunk(repository, { transcriptionStatus: "pending" });
   const adapterCalls = [];
+  const ringCalls = [];
   const runtime = createJarvisProcessingRuntime({
     repository,
     service: {
       audioEvidenceReader: {
-        withVerifiedWav: async (chunk, callback) => callback(`verified-${chunk.id}.wav`),
+        withVerifiedWav: async () => assert.fail("live preview read durable final evidence"),
       },
       flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: {
+        withPreviewWav: async (input, callback) => {
+          ringCalls.push(input);
+          return callback({
+            path: "live-preview.preview.wav",
+            sourceType: "mic",
+            fromMs: input.fromMs,
+            throughMs: input.throughMs,
+            sha256: "a".repeat(64),
+          });
+        },
+      },
     },
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async (input) => {
@@ -1335,6 +1357,9 @@ test("production default preview path transcribes bounded committed audio as pro
   await runtime.previewInFlight;
 
   assert.equal(adapterCalls.length, 1);
+  assert.deepEqual(ringCalls, [
+    { sessionId: "s1", trackId: "track-mic", fromMs: 0, throughMs: 1_000 },
+  ]);
   assert.deepEqual(
     repository.listTranscriptHistory("s1").map((row) => ({
       text: row.text,
@@ -1346,3 +1371,463 @@ test("production default preview path transcribes bounded committed audio as pro
   assert.equal(runtime.previewStatus().lastError, null);
   assert.equal(repository.getSession("s1").processing_state, "pending");
 });
+
+test("idle runtime admits claimable retention and storage before preview, then final", async () => {
+  const gate = new HeavyJobGate();
+  const order = [];
+  const durableKinds = ["retention_urgent", "storage_recovery_compress", "final_transcription"];
+  const runner = {
+    recoverExpiredLeases() {},
+    async runOnce(_at, { priorityBefore = Number.MAX_SAFE_INTEGER } = {}) {
+      const priority = {
+        retention_urgent: 0,
+        storage_recovery_compress: 10,
+        final_transcription: 30,
+      };
+      const index = durableKinds.findIndex((kind) => priority[kind] < priorityBefore);
+      if (index < 0) return 0;
+      const [kind] = durableKinds.splice(index, 1);
+      await gate.run(kind, () => {
+        order.push(kind);
+      });
+      return 1;
+    },
+  };
+  const previewScheduler = new PreviewTranscriptionScheduler({
+    heavyGate: gate,
+    now: () => 0,
+    executePreview: async () => {
+      order.push("preview");
+      return { segments: [] };
+    },
+    persistProvisional() {},
+  });
+  const runtime = new JarvisProcessingRuntime({
+    runner,
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    governor: {
+      sample: async () => ({
+        state: "available",
+        reason: "resources_available",
+        selectedGpuUuid: "GPU-verified",
+        restrictiveForMs: 0,
+        previewEnabled: true,
+      }),
+    },
+    previewScheduler,
+    now: () => 0,
+  });
+  runtime.requestPreview({ sessionId: "s1", trackId: "track-mic", throughMs: 30_000 });
+
+  await runtime.drainOnce();
+  await runtime.previewInFlight;
+
+  assert.deepEqual(order, [
+    "retention_urgent",
+    "storage_recovery_compress",
+    "preview",
+    "final_transcription",
+  ]);
+});
+
+test("stop during governor sampling prevents a late preview from escaping the shutdown join", async () => {
+  const sampled = deferred();
+  let previewTicks = 0;
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    governor: { sample: () => sampled.promise },
+    previewScheduler: {
+      request() {},
+      status: () => ({ mode: "paused" }),
+      tick: async () => {
+        previewTicks += 1;
+      },
+    },
+  });
+
+  const drain = runtime.drainOnce();
+  const stopped = runtime.stop();
+  sampled.resolve({
+    state: "available",
+    reason: "resources_available",
+    previewEnabled: true,
+  });
+  await Promise.all([drain, stopped]);
+
+  assert.equal(previewTicks, 0);
+  assert.equal(runtime.previewInFlight, null);
+});
+
+test("delayed sampling and a slow session phase cannot move preview ahead of urgent durable work", async () => {
+  const sampled = deferred();
+  const releaseReconcile = deferred();
+  const order = [];
+  let urgentPending = true;
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases() {},
+      async runOnce(_at, options = {}) {
+        if (!urgentPending) return 0;
+        if (options.priorityBefore !== 20) return 0;
+        urgentPending = false;
+        order.push("retention_urgent");
+        return 1;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [{ id: "s1", ended_at: 100 }],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness() {},
+    },
+    reconciler: {
+      async reconcileSession() {
+        order.push("reconcile");
+        await releaseReconcile.promise;
+      },
+    },
+    deduper: { dedupe() {} },
+    governor: { sample: () => sampled.promise },
+    previewScheduler: {
+      request() {},
+      status: () => ({ mode: "normal" }),
+      tick: async () => order.push("preview"),
+    },
+    now: () => 0,
+  });
+  runtime.sessionPhaseFirst = true;
+
+  const drain = runtime.drainOnce();
+  sampled.resolve({
+    state: "available",
+    reason: "resources_available",
+    previewEnabled: true,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(order.slice(0, 3), ["retention_urgent", "preview", "reconcile"]);
+  releaseReconcile.resolve();
+  await drain;
+});
+
+test("production live preview persists PCM coverage within a 30-second p95 at a five-second poll", async () => {
+  const pollWaits = [0, 1_000, 2_500, 4_000, 4_999];
+  const latencies = [];
+  const observedPollWaits = [];
+
+  for (const pollWaitMs of pollWaits) {
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-preview-p95-"));
+    const repository = new JarvisRepository(":memory:");
+    const safeFs = Object.create(fs);
+    safeFs.statfsSync = () => ({
+      bsize: 1,
+      blocks: 200 * 1024 ** 3,
+      bavail: 20 * 1024 ** 3,
+    });
+    let wallNow = 0;
+    let requestedAt = null;
+    let persistedAt = null;
+    let inferenceDuration = null;
+    let runtime = null;
+    const service = new JarvisService({
+      repository,
+      userDataDir,
+      fsImpl: safeFs,
+      now: () => wallNow,
+      broadcast() {},
+      flacCompressionWorker: {
+        recoverStartup: async () => ({ promoted: 0, deletedWavs: 0, removedInvalid: 0 }),
+        run: async () => {},
+      },
+      onPreviewWatermark: (request) => {
+        requestedAt = wallNow;
+        runtime.requestPreview(request);
+      },
+    });
+    try {
+      repository.createSession({
+        id: "preview-latency",
+        startedAt: 0,
+        micDeviceId: null,
+        captureMode: "mic",
+        retentionMode: "continuous",
+      });
+      runtime = createJarvisProcessingRuntime({
+        repository,
+        service,
+        ipcHandlers: {
+          createJarvisTranscribeWavAdapter:
+            () =>
+            async ({ executionContext }) => {
+              const inferenceStartedAt = wallNow;
+              wallNow += 9_000;
+              inferenceDuration = wallNow - inferenceStartedAt;
+              return {
+                text: "preview coverage",
+                confidence: 0.9,
+                executionDevice: executionContext.device,
+              };
+            },
+        },
+        model: "large-v3-turbo",
+        now: () => wallNow,
+        governor: {
+          sample: async () => ({
+            state: "available",
+            reason: "resources_available",
+            selectedGpuUuid: "GPU-preview",
+            restrictiveForMs: 0,
+            previewEnabled: true,
+          }),
+          admit: () => ({ action: "run_cuda", reason: "resources_available" }),
+        },
+        heavyGate: new HeavyJobGate(),
+        pollIntervalMs: 5_000,
+        previewPersist: ({ sessionId, segments }) => {
+          persistedAt = wallNow;
+          return repository.upsertTranscriptSegments(sessionId, segments);
+        },
+      });
+      service.startCapture({
+        sessionId: "preview-latency",
+        startedAt: 0,
+        micDeviceId: null,
+        retentionMode: "continuous",
+      });
+      for (let second = 1; second <= 15; second += 1) {
+        wallNow = second * 1_000;
+        service.appendPcm("preview-latency", "mic", Buffer.alloc(48_000, second));
+      }
+      assert.equal(requestedAt, 15_000);
+      assert.equal(repository.listAudioChunks("preview-latency").length, 0);
+      wallNow += pollWaitMs;
+      observedPollWaits.push(wallNow - requestedAt);
+      await runtime.drainOnce();
+      await runtime.previewInFlight;
+      assert.equal(inferenceDuration, 9_000);
+      assert.equal(repository.listAudioChunks("preview-latency").length, 0);
+      assert.equal(repository.listTranscriptHistory("preview-latency").length, 1);
+      latencies.push(persistedAt - 1_000);
+
+      for (let second = 16; second <= 60; second += 1) {
+        wallNow += 1_000;
+        service.appendPcm("preview-latency", "mic", Buffer.alloc(48_000, second));
+      }
+      assert.deepEqual(
+        repository.listAudioChunks("preview-latency").map((chunk) => chunk.duration_ms),
+        [60_000]
+      );
+      service.finishCapture("preview-latency", wallNow);
+    } finally {
+      await runtime?.stop();
+      await service.previewAudioRing.clear();
+      repository.close();
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    }
+  }
+
+  latencies.sort((left, right) => left - right);
+  const p95 = latencies[Math.ceil(latencies.length * 0.95) - 1];
+  assert.ok(Math.max(...observedPollWaits) >= 4_900);
+  assert.ok(p95 <= 30_000, `preview PCM-to-provisional p95 was ${p95}ms`);
+});
+
+test("preview context uses one bounded track range query and a finite Unicode prompt", async () => {
+  const contextCalls = [];
+  let prompt = null;
+  const executor = createCommittedAudioPreviewExecutor({
+    repository: {
+      getSession: () => ({ started_at: 1_000 }),
+      listTranscriptHistory: () => assert.fail("preview scanned all-day transcript history"),
+      listPreviewTranscriptContext: (input) => {
+        contextCalls.push(input);
+        return Array.from({ length: 40 }, (_, index) => ({
+          text: `${index.toString().padStart(2, "0")}:${"🙂".repeat(100)}`,
+        }));
+      },
+    },
+    previewAudioRing: {
+      withPreviewWav: async (input, callback) =>
+        callback({
+          ...input,
+          path: "bounded.preview.wav",
+          sourceType: "mic",
+          sha256: "b".repeat(64),
+        }),
+    },
+    transcribeWav: async (input) => {
+      prompt = input.initialPrompt;
+      return { noSpeech: true, executionDevice: "cuda" };
+    },
+  });
+
+  await executor({
+    sessionId: "s1",
+    trackId: "track-mic",
+    fromMs: 100,
+    throughMs: 900,
+    executionDevice: "cuda",
+    selectedGpuUuid: "GPU-preview",
+    cpuThreads: null,
+    lowPriority: false,
+  });
+
+  assert.deepEqual(contextCalls, [
+    { sessionId: "s1", trackId: "track-mic", from: 1_100, to: 1_900, limit: 16 },
+  ]);
+  assert.ok(Array.from(prompt).length <= 1_024);
+  assert.match(prompt, /39:/u);
+});
+
+test("preview context SQL bounds active lineage by track, strict overlap, and row count", () => {
+  const repository = new JarvisRepository(":memory:");
+  try {
+    insertSession(repository, { status: "recording", processingState: "pending", endedAt: null });
+    insertTrack(repository, { endedAt: null });
+    insertTrack(repository, {
+      id: "track-system",
+      sourceType: "system",
+      endedAt: null,
+    });
+    repository.upsertTranscriptSegments("s1", [
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: `mic-${index}`,
+        startedAt: 150 + index * 40,
+        endedAt: 190 + index * 40,
+        personId: null,
+        speakerLabel: "mic",
+        sourceType: "mic",
+        text: `mic ${index}`,
+        confidence: 0.8,
+        isStable: false,
+      })),
+      {
+        id: "system-overlap",
+        startedAt: 250,
+        endedAt: 300,
+        personId: null,
+        speakerLabel: "system",
+        sourceType: "system",
+        text: "wrong track",
+        confidence: 0.8,
+        isStable: false,
+      },
+    ]);
+    repository.db
+      .prepare(
+        "UPDATE transcript_segments SET echo_score = 0.9, duplicate_of = 'system-overlap' WHERE id = 'mic-2'"
+      )
+      .run();
+
+    const rows = repository.listPreviewTranscriptContext({
+      sessionId: "s1",
+      trackId: "track-mic",
+      from: 200,
+      to: 400,
+      limit: 3,
+    });
+
+    assert.deepEqual(
+      rows.map((row) => row.id),
+      ["mic-4", "mic-5", "mic-6"]
+    );
+    assert.ok(rows.every((row) => row.track_id === "track-mic"));
+    assert.ok(rows.every((row) => row.ended_at > 200 && row.started_at < 400));
+  } finally {
+    repository.close();
+  }
+});
+
+test("preview executor rejects unsafe absolute time overflow before audio or SQL access", async () => {
+  let touched = false;
+  const executor = createCommittedAudioPreviewExecutor({
+    repository: {
+      getSession: () => ({ started_at: Number.MAX_SAFE_INTEGER - 10 }),
+      listPreviewTranscriptContext: () => {
+        touched = true;
+        return [];
+      },
+    },
+    previewAudioRing: {
+      withPreviewWav: async () => {
+        touched = true;
+      },
+    },
+    transcribeWav: async () => ({ noSpeech: true, executionDevice: "cuda" }),
+  });
+
+  await assert.rejects(
+    executor({
+      sessionId: "s1",
+      trackId: "track-mic",
+      fromMs: 0,
+      throughMs: 11,
+      executionDevice: "cuda",
+    }),
+    /safe integer|overflow/u
+  );
+  assert.equal(touched, false);
+});
+
+for (const order of ["provisional-first", "final-first"]) {
+  test(`overlapping final and provisional stay atomic with history preserved: ${order}`, () => {
+    const repository = new JarvisRepository(":memory:");
+    try {
+      insertSession(repository, { status: "recording", processingState: "pending", endedAt: null });
+      insertTrack(repository, { endedAt: null });
+      insertChunk(repository, { transcriptionStatus: "pending" });
+      const provisional = {
+        id: `preview-${order}`,
+        startedAt: 150,
+        endedAt: 250,
+        personId: null,
+        speakerLabel: "mic",
+        sourceType: "mic",
+        text: "temporary preview",
+        confidence: 0.7,
+        isStable: false,
+      };
+      const commitFinal = () =>
+        repository.commitChunkTranscript({
+          chunk: repository.getAudioChunk("chunk-mic"),
+          result: { text: "durable final", confidence: 0.95 },
+          modelVersion: "large-v3-turbo",
+          completedAt: 900,
+        });
+      let final;
+      if (order === "provisional-first") {
+        repository.upsertTranscriptSegments("s1", [provisional]);
+        final = commitFinal();
+      } else {
+        final = commitFinal();
+        repository.upsertTranscriptSegments("s1", [provisional]);
+      }
+
+      assert.deepEqual(
+        repository.listTranscriptSegments("s1").map((segment) => segment.id),
+        [final.id]
+      );
+      const history = repository.listTranscriptHistory("s1");
+      assert.equal(history.length, 2);
+      assert.equal(
+        history.find((segment) => segment.id === provisional.id).superseded_by,
+        final.id
+      );
+      assert.equal(history.find((segment) => segment.id === final.id).result_kind, "final");
+    } finally {
+      repository.close();
+    }
+  });
+}

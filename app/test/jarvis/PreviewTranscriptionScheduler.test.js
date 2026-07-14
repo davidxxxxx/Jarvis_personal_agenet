@@ -117,8 +117,7 @@ test("available cadence keeps simulated p95 preview latency within 30 seconds", 
   const p95 = latencies[Math.ceil(latencies.length * 0.95) - 1];
   assert.ok(latencies.length >= 100);
   assert.ok(p95 <= 30_000, `expected p95 <= 30000, received ${p95}`);
-  assert.ok(scheduler.status().cadenceMs >= 15_000);
-  assert.ok(scheduler.status().cadenceMs <= 30_000);
+  assert.equal(scheduler.status().cadenceMs, 15_000);
 });
 
 test("uses approved degraded and CPU cadences and pauses unsafe preview", async () => {
@@ -149,6 +148,52 @@ test("uses approved degraded and CPU cadences and pauses unsafe preview", async 
     assert.ok(scheduler.status().pausedReason);
     assert.equal(scheduler.status().recordingContinues, true);
   }
+});
+
+test("pauses an unknown constrained reason instead of failing open to CUDA", async () => {
+  const scheduler = createScheduler();
+
+  await scheduler.tick({
+    ...availableSnapshot(),
+    state: "constrained",
+    reason: "future_resource_reason",
+  });
+
+  assert.equal(scheduler.status().mode, "paused");
+  assert.equal(scheduler.status().pausedReason, "future_resource_reason");
+  assert.equal(scheduler.status().executionDevice, null);
+});
+
+test("measures cadence from the actual heavy-gate callback start after a long wait", async () => {
+  let now = 0;
+  let releaseBlocker;
+  const blocker = new Promise((resolve) => {
+    releaseBlocker = resolve;
+  });
+  const gate = new HeavyJobGate();
+  const active = gate.run("retention_urgent", () => blocker);
+  const starts = [];
+  const scheduler = createScheduler({
+    heavyGate: gate,
+    now: () => now,
+    executePreview: async () => {
+      starts.push(now);
+      return { segments: [] };
+    },
+  });
+  scheduler.request({ sessionId: "s1", trackId: "mic", throughMs: 15_000 });
+  const first = scheduler.tick(availableSnapshot());
+  await new Promise((resolve) => setImmediate(resolve));
+
+  now = 120_000;
+  releaseBlocker();
+  await Promise.all([active, first]);
+  scheduler.request({ sessionId: "s1", trackId: "mic", throughMs: 30_000 });
+  await scheduler.tick(availableSnapshot());
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(starts, [120_000]);
+  assert.equal(scheduler.status().pending, 1);
 });
 
 test("bounds preview context to the newest 120 seconds and advances uncovered coverage", async () => {

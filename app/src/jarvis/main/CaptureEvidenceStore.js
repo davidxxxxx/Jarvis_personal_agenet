@@ -400,6 +400,7 @@ class CaptureEvidenceStore {
         WHERE state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
+          AND priority < @priorityBefore
         ORDER BY priority ASC,
           created_at ASC,
           id ASC
@@ -415,6 +416,7 @@ class CaptureEvidenceStore {
           AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
+          AND priority < @priorityBefore
       `),
       getProcessingJob: db.prepare("SELECT * FROM processing_jobs WHERE id = ?"),
       recoverExpiredJobLeases: db.prepare(`
@@ -531,25 +533,28 @@ class CaptureEvidenceStore {
     this.createTracksTransaction = db.transaction((tracks) =>
       tracks.map((track) => this.createTrack(track))
     );
-    this.claimJobsTransaction = db.transaction(({ owner, at, leaseExpiresAt, limit }) => {
-      const candidates = this.statements.listClaimableJobs.all({ at, limit });
-      const claimed = [];
-      for (const candidate of candidates) {
-        const result = this.statements.claimJob.run({
-          id: candidate.id,
-          owner,
-          at,
-          leaseExpiresAt,
-        });
-        if (result.changes === 1) {
-          claimed.push({
-            ...this.statements.getProcessingJob.get(candidate.id),
-            claimed_from_state: candidate.state,
+    this.claimJobsTransaction = db.transaction(
+      ({ owner, at, leaseExpiresAt, limit, priorityBefore }) => {
+        const candidates = this.statements.listClaimableJobs.all({ at, limit, priorityBefore });
+        const claimed = [];
+        for (const candidate of candidates) {
+          const result = this.statements.claimJob.run({
+            id: candidate.id,
+            owner,
+            at,
+            leaseExpiresAt,
+            priorityBefore,
           });
+          if (result.changes === 1) {
+            claimed.push({
+              ...this.statements.getProcessingJob.get(candidate.id),
+              claimed_from_state: candidate.state,
+            });
+          }
         }
+        return claimed;
       }
-      return claimed;
-    });
+    );
     this.clearRetiredArtifactTransaction = db.transaction((input) => {
       this._assertSafeInteger(input.occurredAt, "retired artifact occurredAt");
       let fileBytes = input.fileBytes;
@@ -1078,17 +1083,18 @@ class CaptureEvidenceStore {
     return this.statements.promoteCompressionJobsForStoragePressure.run({ at }).changes;
   }
 
-  claimJobs({ owner, at, leaseMs, limit }) {
+  claimJobs({ owner, at, leaseMs, limit, priorityBefore = Number.MAX_SAFE_INTEGER }) {
     this._assertIdentifier(owner, "owner");
     this._assertNonNegativeSafeInteger(at, "at");
     this._assertPositiveSafeInteger(leaseMs, "leaseMs");
     this._assertPositiveSafeInteger(limit, "limit");
+    this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
     if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
     const leaseExpiresAt = at + leaseMs;
     if (!Number.isSafeInteger(leaseExpiresAt)) {
       throw new RangeError("lease expiry must be a safe integer");
     }
-    return this.claimJobsTransaction({ owner, at, leaseExpiresAt, limit });
+    return this.claimJobsTransaction({ owner, at, leaseExpiresAt, limit, priorityBefore });
   }
 
   recoverExpiredLeases(at) {

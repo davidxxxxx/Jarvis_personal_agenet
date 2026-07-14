@@ -7,6 +7,7 @@ const FlacCompressionWorker = require("./FlacCompressionWorker");
 const { FLAC_ENCODER_VERSION } = require("./JarvisMigrations");
 const SpeechTriggeredCaptureGate = require("./SpeechTriggeredCaptureGate");
 const StorageGovernor = require("./StorageGovernor");
+const PreviewAudioRing = require("./PreviewAudioRing");
 const { assertId } = require("../shared/contracts");
 const {
   assertSourceType,
@@ -67,6 +68,8 @@ class JarvisService {
     storageGovernor = undefined,
     migrationGate = null,
     onChunkCommitted = () => {},
+    previewAudioRing = undefined,
+    onPreviewWatermark = () => {},
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -101,6 +104,9 @@ class JarvisService {
     if (typeof onChunkCommitted !== "function") {
       throw new TypeError("onChunkCommitted must be a function");
     }
+    if (typeof onPreviewWatermark !== "function") {
+      throw new TypeError("onPreviewWatermark must be a function");
+    }
     if (typeof now !== "function") throw new TypeError("now must be a function");
     if (!fsImpl || typeof fsImpl.mkdirSync !== "function") {
       throw new TypeError("fsImpl.mkdirSync must be a function");
@@ -130,6 +136,19 @@ class JarvisService {
     this.recordingsDir = recordingsDir
       ? path.resolve(recordingsDir)
       : path.join(userDataDir, "recordings");
+    if (previewAudioRing === undefined) {
+      previewAudioRing = new PreviewAudioRing({
+        rootDir: path.join(this.recordingsDir, ".preview"),
+      });
+    }
+    if (
+      !previewAudioRing ||
+      typeof previewAudioRing.append !== "function" ||
+      typeof previewAudioRing.withPreviewWav !== "function" ||
+      typeof previewAudioRing.clearSession !== "function"
+    ) {
+      throw new TypeError("previewAudioRing must provide append, withPreviewWav, and clearSession");
+    }
     if (audioEvidenceReader === undefined) {
       audioEvidenceReader = new AudioEvidenceReader({ recordingsRoot: this.recordingsDir });
     }
@@ -158,6 +177,8 @@ class JarvisService {
     this.compressionWork = Promise.resolve({ completed: 0, failed: 0, skipped: 0 });
     this.broadcast = broadcast;
     this.onChunkCommitted = onChunkCommitted;
+    this.previewAudioRing = previewAudioRing;
+    this.onPreviewWatermark = onPreviewWatermark;
     this.now = now;
     this.fs = fsImpl;
     this.storageGovernor =
@@ -1171,6 +1192,7 @@ class JarvisService {
         source.writerOpen = true;
       }
       this.writer.append(source.sourceType, frame.pcm);
+      this._bufferPreviewPcm(source, frame);
       return true;
     } catch (error) {
       const durableEvidenceEnd = this._findEvidenceEndedAt(error);
@@ -1182,6 +1204,31 @@ class JarvisService {
         error,
         Math.max(source.timelineAnchorAt, evidenceEndedAt)
       );
+    }
+  }
+
+  _bufferPreviewPcm(source, frame) {
+    try {
+      const watermarks = this.previewAudioRing.append({
+        sessionId: this.state.sessionId,
+        trackId: source.trackId,
+        sourceType: source.sourceType,
+        fromMs: frame.startedAt - this.state.startedAt,
+        throughMs: frame.endedAt - this.state.startedAt,
+        pcm: frame.pcm,
+      });
+      for (const throughMs of watermarks) {
+        Promise.resolve(
+          this.onPreviewWatermark({
+            sessionId: this.state.sessionId,
+            trackId: source.trackId,
+            sourceType: source.sourceType,
+            throughMs,
+          })
+        ).catch(() => {});
+      }
+    } catch {
+      // Disposable live preview must never invalidate retained or final capture evidence.
     }
   }
 
@@ -1327,7 +1374,7 @@ class JarvisService {
           encoderVersion: FLAC_ENCODER_VERSION,
         });
         try {
-          this.onChunkCommitted(committed);
+          Promise.resolve(this.onChunkCommitted(committed)).catch(() => {});
         } catch {
           // A disposable preview request can never invalidate durable capture evidence.
         }
@@ -1983,7 +2030,8 @@ class JarvisService {
 
   _finalizeCapture(at, { trackState, sessionStatus, errorCode, durableSources = null }) {
     this._cancelAllVadWork();
-    this._resetVadSessionOnce(this.state.sessionId);
+    const sessionId = this.state.sessionId;
+    this._resetVadSessionOnce(sessionId);
     const sources = Object.values(this.state.sources);
     const evidenceSources =
       durableSources ?? sources.map((source) => ({ trackId: source.trackId, gapId: source.gapId }));
@@ -1997,7 +2045,7 @@ class JarvisService {
 
     try {
       this.repository.finalizeCapture({
-        sessionId: this.state.sessionId,
+        sessionId,
         sources: evidenceSources,
         trackState,
         sessionStatus,
@@ -2013,6 +2061,8 @@ class JarvisService {
         this._publish(at);
       } catch {}
       throw error;
+    } finally {
+      Promise.resolve(this.previewAudioRing.clearSession(sessionId)).catch(() => {});
     }
     return this._publish(at);
   }

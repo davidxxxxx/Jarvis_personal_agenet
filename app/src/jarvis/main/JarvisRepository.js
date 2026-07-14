@@ -473,6 +473,21 @@ class JarvisRepository {
         WHERE session_id = ?
         ORDER BY started_at ASC, id ASC
       `),
+      listPreviewTranscriptContext: this.db.prepare(`
+        SELECT * FROM (
+          SELECT * FROM transcript_segments
+          WHERE session_id = @sessionId
+            AND track_id = @trackId
+            AND superseded_by IS NULL
+            AND duplicate_of IS NULL
+            AND ended_at > @from
+            AND started_at < @to
+            AND length(trim(text)) > 0
+          ORDER BY started_at DESC, id DESC
+          LIMIT @limit
+        )
+        ORDER BY started_at ASC, id ASC
+      `),
       getTranscriptSegment: this.db.prepare("SELECT * FROM transcript_segments WHERE id = ?"),
       listTranscriptPromptSegments: this.db.prepare(`
         SELECT text FROM transcript_segments
@@ -491,6 +506,26 @@ class JarvisRepository {
           AND session_id = @sessionId
           AND result_kind = 'provisional'
           AND superseded_by IS NULL
+      `),
+      findFinalWinnerForRange: this.db.prepare(`
+        SELECT id FROM transcript_segments
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND result_kind = 'final'
+          AND started_at < @endedAt
+          AND @startedAt < ended_at
+        ORDER BY version DESC, completed_at DESC, id ASC
+        LIMIT 1
+      `),
+      supersedeOverlappingProvisionals: this.db.prepare(`
+        UPDATE transcript_segments
+        SET superseded_by = @finalId
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND result_kind = 'provisional'
+          AND started_at < @endedAt
+          AND @startedAt < ended_at
+          AND superseded_by IS NOT @finalId
       `),
       mergeTranscriptEchoScore: this.db.prepare(`
         UPDATE transcript_segments
@@ -806,6 +841,21 @@ class JarvisRepository {
           sourceType,
           echoScore,
         });
+        const finalWinner = sourceTrack
+          ? this.statements.findFinalWinnerForRange.get({
+              sessionId,
+              trackId: sourceTrack.id,
+              startedAt: segment.startedAt,
+              endedAt: segment.endedAt,
+            })
+          : null;
+        if (finalWinner) {
+          this.statements.supersedeTranscriptSegment.run({
+            sessionId,
+            provisionalId: segmentId,
+            finalId: finalWinner.id,
+          });
+        }
       }
     };
 
@@ -1022,6 +1072,20 @@ class JarvisRepository {
           segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
         }
         if (!segment) throw codedError("TRANSCRIPT_COMMIT_FAILED");
+        const finalWinner = this.statements.findFinalWinnerForRange.get({
+          sessionId: current.session_id,
+          trackId: current.track_id,
+          startedAt: current.started_at,
+          endedAt: current.ended_at,
+        });
+        if (!finalWinner) throw codedError("TRANSCRIPT_COMMIT_FAILED");
+        this.statements.supersedeOverlappingProvisionals.run({
+          sessionId: current.session_id,
+          trackId: current.track_id,
+          startedAt: current.started_at,
+          endedAt: current.ended_at,
+          finalId: finalWinner.id,
+        });
         const updated = this.statements.setChunkTranscriptionStatus.run({
           chunkId: current.id,
           status: "completed",
@@ -1306,6 +1370,23 @@ class JarvisRepository {
 
   listTranscriptHistory(sessionId) {
     return this.statements.listTranscriptHistory.all(assertId(sessionId, "sessionId"));
+  }
+
+  listPreviewTranscriptContext({ sessionId, trackId, from, to, limit = 16 } = {}) {
+    const safeFrom = assertNonNegativeInteger(from, "from");
+    const safeTo = assertNonNegativeInteger(to, "to");
+    const safeLimit = assertNonNegativeInteger(limit, "limit");
+    if (safeTo <= safeFrom) throw new RangeError("preview context requires from < to");
+    if (safeLimit < 1 || safeLimit > 64) {
+      throw new RangeError("preview context limit must be between 1 and 64");
+    }
+    return this.statements.listPreviewTranscriptContext.all({
+      sessionId: assertId(sessionId, "sessionId"),
+      trackId: assertId(trackId, "trackId"),
+      from: safeFrom,
+      to: safeTo,
+      limit: safeLimit,
+    });
   }
 
   listAllTranscriptSegments(sessionId) {

@@ -1,18 +1,11 @@
 const MAX_CONTEXT_MS = 120_000;
-const NORMAL_CADENCE_MS = 30_000;
+const NORMAL_CADENCE_MS = 15_000;
 const CONSTRAINED_CADENCE_MS = 60_000;
 const CPU_CADENCE_MS = 75_000;
 const CPU_UNSAFE_LOAD_PCT = 90;
 
 const RESOURCE_STATES = new Set(["available", "busy", "constrained", "unavailable"]);
-const PAUSED_CONSTRAINED_REASONS = new Set([
-  "battery_saver",
-  "cpu_load_high",
-  "gpu_utilization_high",
-  "telemetry_unavailable",
-  "external_gpu_busy",
-  "insufficient_vram",
-]);
+const SAFE_CONSTRAINED_REASONS = new Set(["recovery_hysteresis"]);
 
 function identifier(value, name) {
   if (typeof value !== "string" || !value.trim()) {
@@ -85,7 +78,7 @@ function previewPolicy(snapshot) {
   }
   if (snapshot.state === "constrained") {
     const reason = snapshot.reason || "resources_constrained";
-    if (PAUSED_CONSTRAINED_REASONS.has(reason)) {
+    if (!SAFE_CONSTRAINED_REASONS.has(reason)) {
       return {
         mode: "paused",
         cadenceMs: null,
@@ -232,7 +225,6 @@ class PreviewTranscriptionScheduler {
     const request = entry.pending;
     entry.pending = null;
     entry.running = request;
-    this.lastStartedAt = now;
     const fromMs = Math.max(entry.coveredThroughMs, request.throughMs - MAX_CONTEXT_MS, 0);
     const execution = {
       ...request,
@@ -244,6 +236,7 @@ class PreviewTranscriptionScheduler {
     };
     const operation = this.heavyGate
       .run("preview", async () => {
+        this.lastStartedAt = this.now();
         const result = await this.executePreview(execution);
         const segments = result?.segments;
         if (!Array.isArray(segments)) {

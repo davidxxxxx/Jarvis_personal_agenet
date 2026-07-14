@@ -110,13 +110,14 @@ class ProcessingJobRunner {
     return this.store.recoverExpiredLeases(at);
   }
 
-  async runOnce(at = this.now()) {
+  async runOnce(at = this.now(), { priorityBefore = Number.MAX_SAFE_INTEGER } = {}) {
     this.recoverExpiredLeases(at);
     const [job] = this.store.claimJobs({
       owner: this.owner,
       at,
       leaseMs: this.leaseMs,
       limit: 1,
+      priorityBefore,
     });
     if (!job) return 0;
 

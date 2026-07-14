@@ -12,13 +12,13 @@ test("serializes heavy jobs with maximum concurrency one", async () => {
   });
   const order = [];
 
-  const first = gate.run("whisper", async () => {
-    order.push("whisper:start");
+  const first = gate.run("final_transcription", async () => {
+    order.push("final_transcription:start");
     concurrent += 1;
     maxConcurrent = Math.max(maxConcurrent, concurrent);
     await firstReleased;
     concurrent -= 1;
-    order.push("whisper:end");
+    order.push("final_transcription:end");
   });
   const second = gate.run("speaker", async () => {
     order.push("speaker:start");
@@ -29,12 +29,17 @@ test("serializes heavy jobs with maximum concurrency one", async () => {
   });
 
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(gate.getState(), { activeKind: "whisper", queueLength: 1 });
+  assert.deepEqual(gate.getState(), { activeKind: "final_transcription", queueLength: 1 });
   releaseFirst();
   await Promise.all([first, second]);
 
   assert.equal(maxConcurrent, 1);
-  assert.deepEqual(order, ["whisper:start", "whisper:end", "speaker:start", "speaker:end"]);
+  assert.deepEqual(order, [
+    "final_transcription:start",
+    "final_transcription:end",
+    "speaker:start",
+    "speaker:end",
+  ]);
   assert.deepEqual(gate.getState(), { activeKind: null, queueLength: 0 });
 });
 
@@ -73,7 +78,7 @@ test("does not start a queued callback after its signal is aborted", async () =>
   });
   let cancelledRan = false;
 
-  const first = gate.run("whisper", () => blocked);
+  const first = gate.run("final_transcription", () => blocked);
   const cancelled = gate.run(
     "speaker",
     () => {
@@ -88,4 +93,57 @@ test("does not start a queued callback after its signal is aborted", async () =>
   await assert.rejects(cancelled, { name: "AbortError" });
   assert.equal(cancelledRan, false);
   assert.deepEqual(gate.getState(), { activeKind: null, queueLength: 0 });
+});
+
+test("selects globally ordered Jarvis work when durable and preview jobs wait together", async () => {
+  const gate = new HeavyJobGate();
+  let releaseBlocker;
+  const blocker = new Promise((resolve) => {
+    releaseBlocker = resolve;
+  });
+  const order = [];
+  const active = gate.run("maintenance", () => blocker);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const waiting = [
+    "final_transcription",
+    "preview",
+    "storage_recovery_compress",
+    "retention_urgent",
+  ].map((kind) =>
+    gate.run(kind, () => {
+      order.push(kind);
+    })
+  );
+
+  releaseBlocker();
+  await Promise.all([active, ...waiting]);
+
+  assert.deepEqual(order, [
+    "retention_urgent",
+    "storage_recovery_compress",
+    "preview",
+    "final_transcription",
+  ]);
+});
+
+test("preserves FIFO order among waiting jobs with the same priority", async () => {
+  const gate = new HeavyJobGate();
+  let releaseBlocker;
+  const blocker = gate.run(
+    "retention_urgent",
+    () =>
+      new Promise((resolve) => {
+        releaseBlocker = resolve;
+      })
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  const order = [];
+  const first = gate.run("preview", () => order.push("first"));
+  const second = gate.run("preview", () => order.push("second"));
+
+  releaseBlocker();
+  await Promise.all([blocker, first, second]);
+
+  assert.deepEqual(order, ["first", "second"]);
 });

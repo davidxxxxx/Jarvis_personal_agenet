@@ -1828,6 +1828,45 @@ test("claims by durable priority even when a lower-priority state was deferred",
   );
 });
 
+test("atomically claims only durable jobs above the preview priority ceiling", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    id: "retention-first",
+    state: "retention_urgent",
+    priority: 0,
+    inputHash: "retention-ceiling",
+  });
+  seedProcessingJob(db, {
+    id: "storage-second",
+    jobType: "compress_chunk",
+    state: "storage_recovery_compress",
+    priority: 10,
+    inputHash: "storage-ceiling",
+  });
+  seedProcessingJob(db, {
+    id: "final-later",
+    priority: 30,
+    inputHash: "final-ceiling",
+  });
+
+  const claimed = store.claimJobs({
+    owner: "worker-a",
+    at: 500,
+    leaseMs: 100,
+    limit: 10,
+    priorityBefore: 20,
+  });
+
+  assert.deepEqual(
+    claimed.map((job) => job.id),
+    ["retention-first", "storage-second"]
+  );
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE id = 'final-later'").get().state,
+    "pending"
+  );
+});
+
 test("rolls back every claim when a later lease update fails", (t) => {
   const { db, store } = fixture(t);
   seedProcessingJob(db, { id: "job-a", inputHash: "input-a" });

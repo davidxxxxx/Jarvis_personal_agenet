@@ -1,3 +1,5 @@
+const { JOB_PRIORITY } = require("./ResourceGovernor");
+
 class HeavyJobGate {
   constructor() {
     this.activeKind = null;
@@ -19,7 +21,13 @@ class HeavyJobGate {
 
   _drain() {
     if (this.activeKind !== null) return;
-    const next = this.queue.shift();
+    let nextIndex = 0;
+    for (let index = 1; index < this.queue.length; index += 1) {
+      const nextPriority = JOB_PRIORITY[this.queue[index].kind] ?? Number.MAX_SAFE_INTEGER;
+      const selectedPriority = JOB_PRIORITY[this.queue[nextIndex].kind] ?? Number.MAX_SAFE_INTEGER;
+      if (nextPriority < selectedPriority) nextIndex = index;
+    }
+    const [next] = this.queue.splice(nextIndex, 1);
     if (!next) return;
     this.activeKind = next.kind;
     void (async () => {

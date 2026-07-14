@@ -230,7 +230,7 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
   registerJarvisIpc({
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     repository: createRepository({ getSessionTimeline: () => timeline }),
-    service: createService(),
+    service: createService({ getState: () => ({ sessionId: "s1", status: "recording" }) }),
     voiceEnrollmentService: createVoiceEnrollmentService(),
     environmentManager: { getOpenAIKey: () => null },
     processingLifecycle: {
@@ -259,7 +259,7 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
   assert.equal(result.preview_status.cadenceMs, 60_000);
 });
 
-test("session timeline IPC does not leak live preview status into paused or historical sessions", () => {
+test("session timeline IPC scopes live preview to the authoritative active capture session", () => {
   const handlers = new Map();
   const timeline = (sessionId, status, processingState = "processing") => ({
     session_id: sessionId,
@@ -280,14 +280,14 @@ test("session timeline IPC does not leak live preview status into paused or hist
   });
   const timelines = new Map([
     ["s1", timeline("s1", "recording")],
-    ["s2", timeline("s2", "paused")],
+    ["s2", timeline("s2", "recording")],
     ["s3", timeline("s3", "completed", "ready")],
   ]);
 
   registerJarvisIpc({
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     repository: createRepository({ getSessionTimeline: (sessionId) => timelines.get(sessionId) }),
-    service: createService(),
+    service: createService({ getState: () => ({ sessionId: "s1", status: "recording" }) }),
     voiceEnrollmentService: createVoiceEnrollmentService(),
     environmentManager: { getOpenAIKey: () => null },
     processingLifecycle: {

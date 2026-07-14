@@ -542,6 +542,23 @@ async function initializeCoreManagers() {
     vadClassifier: speechVadClassifier,
     storageGovernor,
     migrationGate: migrationCoordinator,
+    onPreviewWatermark: (request) => {
+      const runtime = jarvisProcessingLifecycle.runtime;
+      if (!runtime) return;
+      try {
+        runtime.requestPreview(request);
+      } catch (error) {
+        debugLogger?.warn(
+          "Jarvis live preview request was skipped",
+          {
+            sessionId: request.sessionId,
+            trackId: request.trackId,
+            error: error?.message ?? String(error),
+          },
+          "jarvis"
+        );
+      }
+    },
     onChunkCommitted: (chunk) => {
       const runtime = jarvisProcessingLifecycle.runtime;
       if (!runtime) return;
