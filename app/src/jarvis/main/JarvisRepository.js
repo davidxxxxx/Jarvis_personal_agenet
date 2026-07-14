@@ -322,6 +322,14 @@ class JarvisRepository {
         WHERE status IN ('completed', 'recovered')
           AND ended_at IS NOT NULL
           AND (
+            @afterSortAt IS NULL
+            OR COALESCE(finalized_at, ended_at) > @afterSortAt
+            OR (
+              COALESCE(finalized_at, ended_at) = @afterSortAt
+              AND id > @afterId
+            )
+          )
+          AND (
             processing_state <> 'ready'
             OR EXISTS (
               SELECT 1 FROM audio_chunks AS chunk
@@ -363,6 +371,7 @@ class JarvisRepository {
             )
           )
         ORDER BY COALESCE(finalized_at, ended_at) ASC, id ASC
+        LIMIT @limit
       `),
       listPendingJobs: this.db.prepare(`
         SELECT * FROM processing_jobs
@@ -1208,8 +1217,20 @@ class JarvisRepository {
     return this.statements.listSessions.all({ from, to, limit });
   }
 
-  listProcessingSessions() {
-    return this.statements.listProcessingSessions.all();
+  listProcessingSessions({ after = null, limit = 100 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 1_000) {
+      throw new RangeError("processing session limit must be between 1 and 1000");
+    }
+    let afterSortAt = null;
+    let afterId = null;
+    if (after !== null) {
+      if (!after || typeof after !== "object" || Array.isArray(after)) {
+        throw new TypeError("processing session cursor must be an object or null");
+      }
+      afterSortAt = assertInteger(after.sortAt, "processing session cursor sortAt");
+      afterId = assertId(after.id, "processing session cursor id");
+    }
+    return this.statements.listProcessingSessions.all({ afterSortAt, afterId, limit });
   }
 
   listPendingJobs(sessionId) {

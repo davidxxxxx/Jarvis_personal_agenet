@@ -79,6 +79,7 @@ class JarvisProcessingRuntime {
     this.stopping = false;
     this.running = true;
     this.sessionCursor = null;
+    this.sessionPhaseFirst = false;
   }
 
   start() {
@@ -113,35 +114,59 @@ class JarvisProcessingRuntime {
     return wrapped;
   }
 
-  async _drain() {
-    const startedAt = this.now();
-    const candidatesBefore = this.repository.listProcessingSessions();
+  _hasDrainBudget(startedAt) {
+    return (
+      !this.stopping &&
+      this.running &&
+      this.now() - startedAt < this.maxDrainMs
+    );
+  }
+
+  _sessionCursorFor(session) {
+    return {
+      sortAt: session.finalized_at ?? session.ended_at ?? 0,
+      id: session.id,
+    };
+  }
+
+  _listProcessingWindow(limit) {
+    if (limit <= 0) return [];
+    const rows = this.repository
+      .listProcessingSessions({ after: this.sessionCursor, limit })
+      .slice(0, limit);
+    if (this.sessionCursor === null || rows.length >= limit) return rows;
+    const seen = new Set(rows.map((session) => session.id));
+    const wrapped = this.repository.listProcessingSessions({
+      after: null,
+      limit: limit - rows.length,
+    });
+    for (const session of wrapped) {
+      if (rows.length >= limit) break;
+      if (!seen.has(session.id)) {
+        rows.push(session);
+        seen.add(session.id);
+      }
+    }
+    return rows;
+  }
+
+  async _runJobPhase(startedAt) {
     let processed = 0;
     while (processed < this.maxJobsPerDrain) {
-      if (this.stopping || !this.running) break;
-      if (this.now() - startedAt >= this.maxDrainMs) break;
+      if (!this._hasDrainBudget(startedAt)) break;
       const count = await this.runner.runOnce(this.now());
       if (count === 0) break;
       processed += count;
     }
+    return processed;
+  }
 
-    const candidatesAfter =
-      this.stopping || !this.running ? [] : this.repository.listProcessingSessions();
-    const candidateMap = new Map();
-    for (const session of [...candidatesBefore, ...candidatesAfter]) {
-      if (session?.id && !candidateMap.has(session.id)) candidateMap.set(session.id, session);
-    }
-    const sessions = [...candidateMap.values()];
-    let startIndex = 0;
-    if (this.sessionCursor !== null && sessions.length > 0) {
-      const cursorIndex = sessions.findIndex((session) => session.id === this.sessionCursor);
-      if (cursorIndex >= 0) startIndex = (cursorIndex + 1) % sessions.length;
-    }
-    const batchSize = Math.min(this.maxSessionsPerDrain, sessions.length);
-    for (let offset = 0; offset < batchSize; offset += 1) {
-      if (this.stopping || !this.running) break;
-      if (this.now() - startedAt >= this.maxDrainMs) break;
-      const session = sessions[(startIndex + offset) % sessions.length];
+  async _runSessionPhase(sessions, startedAt, limit, visited) {
+    let inspected = 0;
+    for (const session of sessions) {
+      if (inspected >= limit || !this._hasDrainBudget(startedAt)) break;
+      if (!session?.id || visited.has(session.id)) continue;
+      visited.add(session.id);
       try {
         if (!this.repository.isSessionReadyForPostProcessing(session.id)) {
           this.repository.markSessionProcessing?.(session.id);
@@ -154,9 +179,49 @@ class JarvisProcessingRuntime {
       } catch (error) {
         this.log({ phase: "post_process", sessionId: session.id, error });
       } finally {
-        this.sessionCursor = session.id;
+        this.sessionCursor = this._sessionCursorFor(session);
+        inspected += 1;
       }
     }
+    return inspected;
+  }
+
+  async _drain() {
+    const startedAt = this.now();
+    const sessionsFirst = this.sessionPhaseFirst;
+    this.sessionPhaseFirst = !this.sessionPhaseFirst;
+    const candidatesBefore = this._listProcessingWindow(this.maxSessionsPerDrain);
+    const visited = new Set();
+    let inspected = 0;
+    let processed = 0;
+
+    if (sessionsFirst) {
+      inspected += await this._runSessionPhase(
+        candidatesBefore,
+        startedAt,
+        this.maxSessionsPerDrain,
+        visited
+      );
+    }
+    if (this._hasDrainBudget(startedAt)) {
+      processed = await this._runJobPhase(startedAt);
+    }
+    if (inspected >= this.maxSessionsPerDrain || !this._hasDrainBudget(startedAt)) {
+      return processed;
+    }
+
+    const candidatesAfter = this._listProcessingWindow(
+      this.maxSessionsPerDrain - inspected
+    );
+    const candidates = sessionsFirst
+      ? candidatesAfter
+      : [...candidatesBefore, ...candidatesAfter];
+    await this._runSessionPhase(
+      candidates,
+      startedAt,
+      this.maxSessionsPerDrain - inspected,
+      visited
+    );
     return processed;
   }
 

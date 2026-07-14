@@ -570,7 +570,12 @@ test("post-processing shares the drain deadline and does not start another sessi
   const runtime = new JarvisProcessingRuntime({
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository: {
-      listProcessingSessions: () => sessions,
+      listProcessingSessions: ({ after = null, limit = sessions.length } = {}) => {
+        const start = after === null
+          ? 0
+          : sessions.findIndex((session) => session.id === after.id) + 1;
+        return sessions.slice(start, start + limit);
+      },
       isSessionReadyForPostProcessing: () => true,
       markSessionProcessing: () => {},
       refreshSessionReadiness: (id) => order.push(`ready:${id}`),
@@ -597,7 +602,12 @@ test("session post-processing cap rotates a stable backlog without starvation", 
   const runtime = new JarvisProcessingRuntime({
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository: {
-      listProcessingSessions: () => sessions,
+      listProcessingSessions: ({ after = null, limit = sessions.length } = {}) => {
+        const start = after === null
+          ? 0
+          : sessions.findIndex((session) => session.id === after.id) + 1;
+        return sessions.slice(start, start + limit);
+      },
       isSessionReadyForPostProcessing: () => true,
       markSessionProcessing: () => {},
       refreshSessionReadiness: () => {},
@@ -675,4 +685,128 @@ test("blocked and retry transcription sessions stay processing without heavy pos
   assert.deepEqual(heavy, []);
   assert.equal(repository.getSession("s-blocked").processing_state, "processing");
   assert.equal(repository.getSession("s-retry").processing_state, "processing");
+});
+
+test("long jobs cannot permanently starve eligible session post-processing across drains", async () => {
+  let now = 0;
+  let claims = 0;
+  const post = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        claims += 1;
+        now += 6;
+        return 1;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [{ id: "eligible", finalized_at: 1, ended_at: 1 }],
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: () => {},
+      refreshSessionReadiness: (id) => post.push(`ready:${id}`),
+    },
+    reconciler: { reconcileSession: (id) => post.push(`reconcile:${id}`) },
+    deduper: { dedupe: (id) => post.push(`dedupe:${id}`) },
+    now: () => now,
+    maxJobsPerDrain: 1,
+    maxSessionsPerDrain: 1,
+    maxDrainMs: 5,
+  });
+
+  await runtime.drainOnce();
+  await runtime.drainOnce();
+  await runtime.drainOnce();
+
+  assert.equal(claims, 3);
+  assert.deepEqual(post, ["reconcile:eligible", "dedupe:eligible", "ready:eligible"]);
+});
+
+test("bounded processing-session pages rotate past blocked backlog to an eligible session", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  for (let index = 1; index <= 6; index += 1) {
+    const suffix = String(index).padStart(2, "0");
+    const sessionId = `s${suffix}`;
+    const trackId = `track-${suffix}`;
+    const chunkId = `chunk-${suffix}`;
+    const state = index % 2 === 0 ? "retry" : "blocked";
+    insertSession(repository, { id: sessionId });
+    insertTrack(repository, { id: trackId, sessionId });
+    insertChunk(repository, {
+      id: chunkId,
+      sessionId,
+      trackId,
+      transcriptionStatus: "no_speech",
+    });
+    insertJob(repository, {
+      id: `job-${suffix}`,
+      sessionId,
+      trackId,
+      chunkId,
+      state,
+      completedAt: state === "blocked" ? 600 : null,
+    });
+  }
+  insertSession(repository, { id: "s99-eligible" });
+  insertTrack(repository, { id: "track-eligible", sessionId: "s99-eligible" });
+  insertChunk(repository, {
+    id: "chunk-eligible",
+    sessionId: "s99-eligible",
+    trackId: "track-eligible",
+    transcriptionStatus: "no_speech",
+  });
+  insertJob(repository, {
+    id: "job-eligible",
+    sessionId: "s99-eligible",
+    trackId: "track-eligible",
+    chunkId: "chunk-eligible",
+    state: "completed",
+    completedAt: 700,
+  });
+  repository.db.prepare(`
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'compress-eligible', 's99-eligible', 'track-eligible', 'chunk-eligible',
+      'compress_chunk', 'retry', ?, 1, 'flac-v1', 101
+    )
+  `).run("chunk-eligible".padEnd(64, "0").slice(0, 64));
+
+  const queries = [];
+  const listProcessingSessions = repository.listProcessingSessions.bind(repository);
+  repository.listProcessingSessions = (options) => {
+    const rows = listProcessingSessions(options);
+    queries.push({ options, count: rows.length });
+    return rows;
+  };
+  const heavy = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository,
+    reconciler: { reconcileSession: (id) => heavy.push(`reconcile:${id}`) },
+    deduper: { dedupe: (id) => heavy.push(`dedupe:${id}`) },
+    now: () => 2_000,
+    maxSessionsPerDrain: 2,
+  });
+
+  for (let drain = 0; drain < 4; drain += 1) await runtime.drainOnce();
+
+  assert.ok(queries.length >= 4);
+  assert.ok(
+    queries.every(
+      ({ options, count }) =>
+        Number.isSafeInteger(options?.limit) &&
+        options.limit > 0 &&
+        options.limit <= 2 &&
+        count <= options.limit
+    )
+  );
+  assert.deepEqual(heavy, ["reconcile:s99-eligible", "dedupe:s99-eligible"]);
+  assert.equal(repository.getSession("s99-eligible").processing_state, "ready");
+  assert.equal(
+    repository.listPendingJobs("s99-eligible").some((job) => job.job_type === "compress_chunk"),
+    true
+  );
 });
