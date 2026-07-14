@@ -336,6 +336,81 @@ class CaptureEvidenceStore {
             OR state IN ('pending', 'retry')
           )
       `),
+      listClaimableJobs: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE state IN ('pending', 'retry', 'retention_urgent')
+          AND completed_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at <= @at)
+        ORDER BY priority ASC, created_at ASC, id ASC
+        LIMIT @limit
+      `),
+      claimJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'running',
+            attempt_count = attempt_count + 1,
+            lease_owner = @owner,
+            lease_expires_at = @leaseExpiresAt
+        WHERE id = @id
+          AND state IN ('pending', 'retry', 'retention_urgent')
+          AND completed_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at <= @at)
+      `),
+      getProcessingJob: db.prepare("SELECT * FROM processing_jobs WHERE id = ?"),
+      recoverExpiredJobLeases: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            next_retry_at = @at,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'LEASE_EXPIRED',
+            completed_at = NULL
+        WHERE state = 'running'
+          AND completed_at IS NULL
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= @at
+      `),
+      completeLeasedJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'completed',
+            completed_at = @at,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = NULL
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
+      retryLeasedJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            completed_at = NULL,
+            next_retry_at = @nextRetryAt,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = @errorCode
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
+      blockLeasedJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'blocked',
+            completed_at = @at,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = @errorCode
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
     };
 
     this.commitChunkTransaction = db.transaction((chunk) => {
@@ -369,6 +444,22 @@ class CaptureEvidenceStore {
     this.createTracksTransaction = db.transaction((tracks) =>
       tracks.map((track) => this.createTrack(track))
     );
+    this.claimJobsTransaction = db.transaction(({ owner, at, leaseExpiresAt, limit }) => {
+      const candidates = this.statements.listClaimableJobs.all({ at, limit });
+      const claimed = [];
+      for (const candidate of candidates) {
+        const result = this.statements.claimJob.run({
+          id: candidate.id,
+          owner,
+          at,
+          leaseExpiresAt,
+        });
+        if (result.changes === 1) {
+          claimed.push(this.statements.getProcessingJob.get(candidate.id));
+        }
+      }
+      return claimed;
+    });
     this.clearRetiredArtifactTransaction = db.transaction((input) => {
       this._assertSafeInteger(input.occurredAt, "retired artifact occurredAt");
       let fileBytes = input.fileBytes;
@@ -868,6 +959,41 @@ class CaptureEvidenceStore {
     return this.statements.promoteSoonExpiringAudioJobs.run({ after, before }).changes;
   }
 
+  claimJobs({ owner, at, leaseMs, limit }) {
+    this._assertIdentifier(owner, "owner");
+    this._assertNonNegativeSafeInteger(at, "at");
+    this._assertPositiveSafeInteger(leaseMs, "leaseMs");
+    this._assertPositiveSafeInteger(limit, "limit");
+    if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
+    const leaseExpiresAt = at + leaseMs;
+    if (!Number.isSafeInteger(leaseExpiresAt)) {
+      throw new RangeError("lease expiry must be a safe integer");
+    }
+    return this.claimJobsTransaction({ owner, at, leaseExpiresAt, limit });
+  }
+
+  recoverExpiredLeases(at) {
+    this._assertNonNegativeSafeInteger(at, "at");
+    return this.statements.recoverExpiredJobLeases.run({ at }).changes;
+  }
+
+  completeJob(id, { owner, at }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    return this.statements.completeLeasedJob.run(input).changes === 1;
+  }
+
+  retryJob(id, { owner, at, nextRetryAt = at, errorCode }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at, errorCode });
+    this._assertNonNegativeSafeInteger(nextRetryAt, "nextRetryAt");
+    if (nextRetryAt < at) throw new RangeError("nextRetryAt must not be before at");
+    return this.statements.retryLeasedJob.run({ ...input, nextRetryAt }).changes === 1;
+  }
+
+  blockJob(id, { owner, at, errorCode }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at, errorCode });
+    return this.statements.blockLeasedJob.run(input).changes === 1;
+  }
+
   enqueueChunkTranscription(chunk) {
     return this.enqueueChunkTranscriptionTransaction(chunk);
   }
@@ -951,6 +1077,14 @@ class CaptureEvidenceStore {
   _assertPositiveSafeInteger(value, name) {
     this._assertSafeInteger(value, name);
     if (value <= 0) throw new RangeError(`${name} must be positive`);
+  }
+
+  _assertJobLeaseTransition(id, { owner, at, errorCode = undefined } = {}) {
+    this._assertIdentifier(id, "jobId");
+    this._assertIdentifier(owner, "owner");
+    this._assertNonNegativeSafeInteger(at, "at");
+    if (errorCode !== undefined) this._assertIdentifier(errorCode, "errorCode");
+    return { id, owner, at, errorCode };
   }
 
   _assertLifecycleTransition({ sessionId, sources, at, sessionState, sourceStates }) {

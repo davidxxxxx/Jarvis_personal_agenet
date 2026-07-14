@@ -53,6 +53,38 @@ function chunk(overrides = {}) {
   };
 }
 
+function seedProcessingJob(db, overrides = {}) {
+  db.prepare(`
+    INSERT INTO processing_jobs (
+      id, session_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count,
+      next_retry_at, lease_owner, lease_expires_at, error_code,
+      created_at, completed_at
+    ) VALUES (
+      @id, 's1', @jobType, @state, @priority,
+      @inputHash, @inputVersion, @modelVersion, @attemptCount,
+      @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
+      @createdAt, @completedAt
+    )
+  `).run({
+    id: "lease-job",
+    jobType: "transcribe_chunk",
+    state: "pending",
+    priority: 0,
+    inputHash: "lease-input",
+    inputVersion: 1,
+    modelVersion: "model-v1",
+    attemptCount: 0,
+    nextRetryAt: null,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    errorCode: null,
+    createdAt: 100,
+    completedAt: null,
+    ...overrides,
+  });
+}
+
 test("stores track state and gap lifecycle evidence", (t) => {
   const { db, store } = fixture(t);
 
@@ -1466,4 +1498,138 @@ test("JarvisRepository delegates the complete capture evidence interface", () =>
   } finally {
     repository.close();
   }
+});
+
+test("claims eligible jobs atomically in deterministic order without stealing leases", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, { id: "job-b", createdAt: 100 });
+  seedProcessingJob(db, { id: "job-a", createdAt: 100, inputHash: "input-a" });
+  seedProcessingJob(db, {
+    id: "job-current",
+    state: "running",
+    inputHash: "input-current",
+    leaseOwner: "worker-a",
+    leaseExpiresAt: 501,
+  });
+  seedProcessingJob(db, {
+    id: "job-later",
+    state: "retry",
+    inputHash: "input-later",
+    nextRetryAt: 501,
+  });
+
+  const claimed = store.claimJobs({ owner: "worker-b", at: 500, leaseMs: 100, limit: 2 });
+
+  assert.deepEqual(claimed.map((job) => job.id), ["job-a", "job-b"]);
+  for (const job of claimed) {
+    assert.equal(job.state, "running");
+    assert.equal(job.attempt_count, 1);
+    assert.equal(job.lease_owner, "worker-b");
+    assert.equal(job.lease_expires_at, 600);
+  }
+  assert.deepEqual(
+    db.prepare(`
+      SELECT id, state, lease_owner, lease_expires_at
+      FROM processing_jobs WHERE id IN ('job-current', 'job-later') ORDER BY id
+    `).all(),
+    [
+      { id: "job-current", state: "running", lease_owner: "worker-a", lease_expires_at: 501 },
+      { id: "job-later", state: "retry", lease_owner: null, lease_expires_at: null },
+    ]
+  );
+});
+
+test("rejects stale lease owners and keeps terminal transitions idempotent", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    state: "running",
+    attemptCount: 1,
+    leaseOwner: "worker-old",
+    leaseExpiresAt: 150,
+  });
+
+  assert.equal(store.recoverExpiredLeases(200), 1);
+  assert.equal(
+    store.claimJobs({ owner: "worker-new", at: 200, leaseMs: 100, limit: 1 })[0].lease_owner,
+    "worker-new"
+  );
+  assert.equal(store.completeJob("lease-job", { owner: "worker-old", at: 210 }), false);
+  assert.equal(
+    store.retryJob("lease-job", {
+      owner: "worker-old",
+      at: 210,
+      nextRetryAt: 220,
+      errorCode: "STALE",
+    }),
+    false
+  );
+  assert.equal(
+    store.blockJob("lease-job", { owner: "worker-old", at: 210, errorCode: "STALE" }),
+    false
+  );
+  assert.deepEqual(
+    db.prepare("SELECT state, lease_owner FROM processing_jobs WHERE id = 'lease-job'").get(),
+    { state: "running", lease_owner: "worker-new" }
+  );
+
+  assert.equal(store.completeJob("lease-job", { owner: "worker-new", at: 230 }), true);
+  assert.equal(store.completeJob("lease-job", { owner: "worker-new", at: 231 }), false);
+  assert.equal(
+    store.retryJob("lease-job", {
+      owner: "worker-new",
+      at: 231,
+      nextRetryAt: 231,
+      errorCode: "TOO_LATE",
+    }),
+    false
+  );
+  assert.deepEqual(
+    db.prepare(`
+      SELECT state, completed_at, lease_owner, lease_expires_at, error_code
+      FROM processing_jobs WHERE id = 'lease-job'
+    `).get(),
+    {
+      state: "completed",
+      completed_at: 230,
+      lease_owner: null,
+      lease_expires_at: null,
+      error_code: null,
+    }
+  );
+});
+
+test("validates processing-job lease boundaries before touching durable state", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db);
+
+  assert.throws(
+    () => store.claimJobs({ owner: "", at: 100, leaseMs: 10, limit: 1 }),
+    /owner.*safe identifier/i
+  );
+  assert.throws(
+    () => store.claimJobs({ owner: "worker", at: -1, leaseMs: 10, limit: 1 }),
+    /at.*non-negative/i
+  );
+  assert.throws(
+    () => store.claimJobs({ owner: "worker", at: 100, leaseMs: 0, limit: 1 }),
+    /leaseMs.*positive/i
+  );
+  assert.throws(
+    () => store.claimJobs({ owner: "worker", at: 100, leaseMs: 10, limit: 0 }),
+    /limit.*positive/i
+  );
+  assert.throws(
+    () =>
+      store.retryJob("lease-job", {
+        owner: "worker",
+        at: 100,
+        nextRetryAt: 99,
+        errorCode: "FAILED",
+      }),
+    /nextRetryAt.*before/i
+  );
+  assert.deepEqual(
+    db.prepare("SELECT state, attempt_count FROM processing_jobs WHERE id = 'lease-job'").get(),
+    { state: "pending", attempt_count: 0 }
+  );
 });
