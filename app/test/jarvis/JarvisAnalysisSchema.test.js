@@ -1,49 +1,197 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { validateAnalysisPayload } = require("../../src/jarvis/main/JarvisAnalysisSchema");
 
-function payload() {
+const {
+  AnalysisSchemaError,
+  validateCandidateAnalysis,
+  ANALYSIS_TOOL,
+} = require("../../src/jarvis/main/JarvisAnalysisSchema");
+
+function candidate(overrides = {}) {
   return {
-    summary: "讨论了产品交付。",
-    topics: [{ title: "产品交付", description: "范围和时间", evidenceSegmentIds: ["seg-1"] }],
+    schemaVersion: "jarvis-analysis-v2",
+    sessionSummary: {
+      title: "Delivery discussion",
+      summary: "The team agreed on the delivery scope.",
+      evidenceSegmentIds: ["seg-1"],
+    },
     memories: [
       {
-        type: "decision",
-        content: "周五交付",
-        personRef: "self",
-        topicRef: "产品交付",
+        kind: "decision",
+        title: "Delivery date",
+        body: "The delivery remains scheduled for Friday.",
         confidence: 0.9,
+        evidenceSegmentIds: ["seg-1"],
+      },
+    ],
+    topics: [
+      {
+        name: "Delivery",
+        summary: "Scope and timing were discussed.",
         evidenceSegmentIds: ["seg-1"],
       },
     ],
     todos: [
       {
-        content: "完成验收",
-        ownerRef: "self",
-        dueDate: null,
-        topicRef: "产品交付",
-        evidenceSegmentIds: ["seg-1"],
+        title: "Prepare acceptance checklist",
+        ownerLabel: "SELF",
+        dueText: "Friday afternoon",
+        evidenceSegmentIds: ["seg-2"],
       },
     ],
-    decisions: ["周五交付"],
-    suggestions: [{ content: "补充验收清单", reason: "当前范围不完整" }],
+    suggestions: [
+      {
+        title: "Review risks tomorrow",
+        rationale: "A follow-up may reveal missing dependencies.",
+        basedOnEvidenceSegmentIds: [],
+      },
+    ],
+    ...overrides,
   };
 }
 
-test("accepts a grounded strict analysis payload", () => {
-  assert.deepEqual(validateAnalysisPayload(payload(), new Set(["seg-1"])), payload());
+const context = {
+  allowedSegmentIds: new Set(["seg-1", "seg-2"]),
+  allowedOwnerLabels: new Set(["SELF", "P1"]),
+};
+
+function expectIssue(payload, issueCode) {
+  assert.throws(
+    () => validateCandidateAnalysis(payload, context),
+    (error) => {
+      assert.ok(error instanceof AnalysisSchemaError);
+      assert.equal(error.code, "invalid_structure");
+      assert.equal(error.issueCode, issueCode);
+      assert.equal(error.message, "Analysis response failed validation");
+      assert.doesNotMatch(JSON.stringify(error), /seg-1|seg-other|Delivery|Friday/);
+      return true;
+    }
+  );
+}
+
+test("accepts and copies one closed jarvis-analysis-v2 candidate", () => {
+  const input = candidate();
+  const result = validateCandidateAnalysis(input, context);
+  assert.deepEqual(result, input);
+  assert.notStrictEqual(result, input);
+  assert.notStrictEqual(result.sessionSummary, input.sessionSummary);
 });
 
-test("rejects unknown evidence, extra fields, and unsupported memory types", () => {
-  const unknown = payload();
-  unknown.todos[0].evidenceSegmentIds = ["seg-other"];
-  assert.throws(() => validateAnalysisPayload(unknown, new Set(["seg-1"])), /unknown evidence/);
+test("rejects non-object top levels and wrong collection types", () => {
+  for (const value of [null, [], "candidate", 1]) {
+    expectIssue(value, "schema.top_level_type");
+  }
+  for (const field of ["memories", "topics", "todos", "suggestions"]) {
+    for (const value of [null, {}, "none"]) {
+      expectIssue(candidate({ [field]: value }), `schema.collection_type.${field}`);
+    }
+  }
+});
 
-  const extra = payload();
-  extra.untrusted = true;
-  assert.throws(() => validateAnalysisPayload(extra, new Set(["seg-1"])), /unknown field/);
+test("rejects missing and unknown fields recursively", () => {
+  const missing = candidate();
+  delete missing.sessionSummary;
+  expectIssue(missing, "schema.missing_field");
 
-  const unsupported = payload();
-  unsupported.memories[0].type = "suggestion";
-  assert.throws(() => validateAnalysisPayload(unsupported, new Set(["seg-1"])), /memory type/);
+  expectIssue(candidate({ modelId: "model-controlled" }), "schema.unknown_field");
+  expectIssue(
+    candidate({ sessionSummary: { ...candidate().sessionSummary, revision: 2 } }),
+    "schema.unknown_field"
+  );
+  expectIssue(
+    candidate({ todos: [{ ...candidate().todos[0], dueAt: 123 }] }),
+    "schema.unknown_field"
+  );
+});
+
+test("requires unique in-scope evidence for every factual output", () => {
+  expectIssue(
+    candidate({ sessionSummary: { ...candidate().sessionSummary, evidenceSegmentIds: [] } }),
+    "schema.evidence_empty"
+  );
+  expectIssue(
+    candidate({ memories: [{ ...candidate().memories[0], evidenceSegmentIds: [] }] }),
+    "schema.evidence_empty"
+  );
+  expectIssue(
+    candidate({ topics: [{ ...candidate().topics[0], evidenceSegmentIds: ["seg-other"] }] }),
+    "schema.evidence_out_of_scope"
+  );
+  expectIssue(
+    candidate({ todos: [{ ...candidate().todos[0], evidenceSegmentIds: ["seg-2", "seg-2"] }] }),
+    "schema.evidence_duplicate"
+  );
+});
+
+test("allows ungrounded suggestions but validates any supplied suggestion evidence", () => {
+  assert.deepEqual(
+    validateCandidateAnalysis(candidate(), context).suggestions[0],
+    candidate().suggestions[0]
+  );
+  expectIssue(
+    candidate({
+      suggestions: [{ ...candidate().suggestions[0], basedOnEvidenceSegmentIds: ["seg-other"] }],
+    }),
+    "schema.evidence_out_of_scope"
+  );
+});
+
+test("rejects invalid memory kinds confidence owner labels and due text", () => {
+  expectIssue(
+    candidate({ memories: [{ ...candidate().memories[0], kind: "opinion" }] }),
+    "schema.memory_kind"
+  );
+  for (const confidence of [-0.1, 1.1, Number.NaN, "0.9"]) {
+    expectIssue(
+      candidate({ memories: [{ ...candidate().memories[0], confidence }] }),
+      "schema.confidence"
+    );
+  }
+  expectIssue(
+    candidate({ todos: [{ ...candidate().todos[0], ownerLabel: "P2" }] }),
+    "schema.owner_out_of_scope"
+  );
+  expectIssue(
+    candidate({ todos: [{ ...candidate().todos[0], ownerLabel: "person-real" }] }),
+    "schema.owner_label"
+  );
+  expectIssue(
+    candidate({ todos: [{ ...candidate().todos[0], dueText: { date: "Friday" } }] }),
+    "schema.due_text"
+  );
+});
+
+test("rejects untrimmed empty and overlong strings without echoing their contents", () => {
+  expectIssue(
+    candidate({ sessionSummary: { ...candidate().sessionSummary, title: " padded " } }),
+    "schema.string"
+  );
+  expectIssue(candidate({ topics: [{ ...candidate().topics[0], name: "" }] }), "schema.string");
+  expectIssue(
+    candidate({ suggestions: [{ ...candidate().suggestions[0], rationale: "x".repeat(4_001) }] }),
+    "schema.string"
+  );
+});
+
+test("exports a recursively closed tool schema matching the v2 contract", () => {
+  assert.equal(ANALYSIS_TOOL.type, "function");
+  assert.equal(ANALYSIS_TOOL.function.name, "submit_jarvis_analysis");
+  const root = ANALYSIS_TOOL.function.parameters;
+  assert.equal(root.additionalProperties, false);
+  assert.deepEqual(root.required, [
+    "schemaVersion",
+    "sessionSummary",
+    "memories",
+    "topics",
+    "todos",
+    "suggestions",
+  ]);
+  assert.equal(root.properties.sessionSummary.additionalProperties, false);
+  for (const field of ["memories", "topics", "todos", "suggestions"]) {
+    assert.equal(root.properties[field].type, "array");
+    assert.equal(root.properties[field].items.additionalProperties, false);
+    assert.equal(root.properties[field].maxItems, 100);
+  }
+  assert.equal(root.properties.memories.items.properties.evidenceSegmentIds.minItems, 1);
+  assert.equal(root.properties.suggestions.items.properties.basedOnEvidenceSegmentIds.minItems, 0);
 });

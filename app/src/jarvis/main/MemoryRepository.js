@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { AnalysisSchemaError, validateCandidateAnalysis } = require("./JarvisAnalysisSchema");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -154,112 +155,19 @@ function legacyDueText(value) {
   }
 }
 
-function validateCandidateText(value) {
-  return typeof value === "string" && value.trim().length > 0 && Array.from(value).length <= 4000;
-}
-
-function validateEvidenceIds(ids, { required, allowedSegmentIds }) {
-  if (!Array.isArray(ids) || ids.length > 100 || (required && ids.length === 0)) {
-    throw codedError(required ? "MEMORY_EVIDENCE_REQUIRED" : "MEMORY_CANDIDATE_INVALID");
-  }
-  if (ids.some((id) => typeof id !== "string") || new Set(ids).size !== ids.length) {
-    throw codedError("MEMORY_CANDIDATE_INVALID");
-  }
-  if (ids.some((id) => !allowedSegmentIds.has(id))) {
-    throw codedError("MEMORY_EVIDENCE_OUT_OF_SCOPE");
-  }
-}
-
 function validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels }) {
-  if (
-    !hasExactKeys(candidate, [
-      "schemaVersion",
-      "sessionSummary",
-      "memories",
-      "topics",
-      "todos",
-      "suggestions",
-    ]) ||
-    candidate.schemaVersion !== "jarvis-analysis-v2" ||
-    !Array.isArray(candidate.memories) ||
-    !Array.isArray(candidate.topics) ||
-    !Array.isArray(candidate.todos) ||
-    !Array.isArray(candidate.suggestions) ||
-    [candidate.memories, candidate.topics, candidate.todos, candidate.suggestions].some(
-      (items) => items.length > 100
-    )
-  ) {
+  try {
+    return validateCandidateAnalysis(candidate, { allowedSegmentIds, allowedOwnerLabels });
+  } catch (error) {
+    if (!(error instanceof AnalysisSchemaError)) throw error;
+    if (error.issueCode === "schema.evidence_empty") throw codedError("MEMORY_EVIDENCE_REQUIRED");
+    if (error.issueCode === "schema.evidence_out_of_scope") {
+      throw codedError("MEMORY_EVIDENCE_OUT_OF_SCOPE");
+    }
+    if (error.issueCode === "schema.owner_out_of_scope") {
+      throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
+    }
     throw codedError("MEMORY_CANDIDATE_INVALID");
-  }
-  const summary = candidate.sessionSummary;
-  if (
-    !hasExactKeys(summary, ["title", "summary", "evidenceSegmentIds"]) ||
-    !validateCandidateText(summary.title) ||
-    !validateCandidateText(summary.summary)
-  ) {
-    throw codedError("MEMORY_CANDIDATE_INVALID");
-  }
-  validateEvidenceIds(summary.evidenceSegmentIds, { required: true, allowedSegmentIds });
-
-  for (const memory of candidate.memories) {
-    if (
-      !hasExactKeys(memory, ["kind", "title", "body", "confidence", "evidenceSegmentIds"]) ||
-      !new Set(["fact", "event", "decision", "commitment", "preference", "relationship"]).has(
-        memory.kind
-      ) ||
-      !validateCandidateText(memory.title) ||
-      !validateCandidateText(memory.body) ||
-      typeof memory.confidence !== "number" ||
-      !Number.isFinite(memory.confidence) ||
-      memory.confidence < 0 ||
-      memory.confidence > 1
-    ) {
-      throw codedError("MEMORY_CANDIDATE_INVALID");
-    }
-    validateEvidenceIds(memory.evidenceSegmentIds, { required: true, allowedSegmentIds });
-  }
-  for (const topic of candidate.topics) {
-    if (
-      !hasExactKeys(topic, ["name", "summary", "evidenceSegmentIds"]) ||
-      !validateCandidateText(topic.name) ||
-      !validateCandidateText(topic.summary)
-    ) {
-      throw codedError("MEMORY_CANDIDATE_INVALID");
-    }
-    validateEvidenceIds(topic.evidenceSegmentIds, { required: true, allowedSegmentIds });
-  }
-  for (const todo of candidate.todos) {
-    if (
-      !hasExactKeys(todo, ["title", "ownerLabel", "dueText", "evidenceSegmentIds"]) ||
-      !validateCandidateText(todo.title) ||
-      (todo.ownerLabel !== null &&
-        (typeof todo.ownerLabel !== "string" || !allowedOwnerLabels.has(todo.ownerLabel))) ||
-      (todo.dueText !== null &&
-        (typeof todo.dueText !== "string" || Array.from(todo.dueText).length > 500))
-    ) {
-      if (
-        todo?.ownerLabel !== null &&
-        typeof todo?.ownerLabel === "string" &&
-        !allowedOwnerLabels.has(todo.ownerLabel)
-      ) {
-        throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
-      }
-      throw codedError("MEMORY_CANDIDATE_INVALID");
-    }
-    validateEvidenceIds(todo.evidenceSegmentIds, { required: true, allowedSegmentIds });
-  }
-  for (const suggestion of candidate.suggestions) {
-    if (
-      !hasExactKeys(suggestion, ["title", "rationale", "basedOnEvidenceSegmentIds"]) ||
-      !validateCandidateText(suggestion.title) ||
-      !validateCandidateText(suggestion.rationale)
-    ) {
-      throw codedError("MEMORY_CANDIDATE_INVALID");
-    }
-    validateEvidenceIds(suggestion.basedOnEvidenceSegmentIds, {
-      required: false,
-      allowedSegmentIds,
-    });
   }
 }
 
@@ -308,8 +216,8 @@ class MemoryRepository {
     const bindings = [];
     const deviceLabels = new Set();
     let nextOtherLabel = 1;
-    const segments = segmentIds.map((segmentId, ordinal) => {
-      const segment = this.db
+    const selectedSegments = segmentIds.map((segmentId) =>
+      this.db
         .prepare(
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
                   segment.version, segment.text, segment.person_id, segment.result_kind,
@@ -319,7 +227,17 @@ class MemoryRepository {
            LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
            WHERE segment.id = ?`
         )
-        .get(segmentId);
+        .get(segmentId)
+    );
+    selectedSegments.sort(
+      (left, right) =>
+        (left?.started_at ?? Number.MAX_SAFE_INTEGER) -
+          (right?.started_at ?? Number.MAX_SAFE_INTEGER) ||
+        (left?.ended_at ?? Number.MAX_SAFE_INTEGER) -
+          (right?.ended_at ?? Number.MAX_SAFE_INTEGER) ||
+        String(left?.id ?? "").localeCompare(String(right?.id ?? ""))
+    );
+    const segments = selectedSegments.map((segment, ordinal) => {
       if (
         !segment ||
         segment.session_id !== sessionId ||
@@ -328,7 +246,11 @@ class MemoryRepository {
         segment.superseded_by !== null ||
         segment.duplicate_of !== null ||
         typeof segment.text !== "string" ||
-        segment.text.length === 0
+        segment.text.length === 0 ||
+        !Number.isSafeInteger(segment.started_at) ||
+        !Number.isSafeInteger(segment.ended_at) ||
+        segment.started_at < 0 ||
+        segment.ended_at <= segment.started_at
       ) {
         throw codedError("MEMORY_INPUT_STALE");
       }
@@ -393,6 +315,11 @@ class MemoryRepository {
         segmentVersion: segment.version,
         textHash: sha256(segment.text),
         textSnapshot: segment.text,
+        resultKind: segment.result_kind,
+        isStable: segment.is_stable === 1,
+        isCurrent: segment.superseded_by === null,
+        supersededBy: segment.superseded_by,
+        duplicateOf: segment.duplicate_of,
         startedAt: segment.started_at,
         endedAt: segment.ended_at,
         speakerBindingLabel: label,
@@ -450,6 +377,11 @@ class MemoryRepository {
         segmentId: segment.segmentId,
         segmentVersion: segment.segmentVersion,
         textHash: segment.textHash,
+        resultKind: segment.resultKind,
+        isStable: segment.isStable,
+        isCurrent: segment.isCurrent,
+        supersededBy: segment.supersededBy,
+        duplicateOf: segment.duplicateOf,
         speakerBindingLabel: segment.speakerBindingLabel,
       })),
     };
@@ -709,7 +641,12 @@ class MemoryRepository {
         ) {
           throw codedError("MEMORY_INPUT_CORRUPT");
         }
-        return { status: "existing", analysisInputId: existing.id, inputHash };
+        return {
+          status: "existing",
+          candidateState: stored.row.candidate_hash === null ? "pending" : "applied",
+          analysisInputId: existing.id,
+          inputHash,
+        };
       }
 
       const analysisInputId = assertId(this.createId("analysis_input"), "analysisInputId");
@@ -767,7 +704,12 @@ class MemoryRepository {
           segment.speakerBindingLabel
         );
       }
-      return { status: "created", analysisInputId, inputHash };
+      return {
+        status: "created",
+        candidateState: "pending",
+        analysisInputId,
+        inputHash,
+      };
     });
     return transaction.immediate();
   }

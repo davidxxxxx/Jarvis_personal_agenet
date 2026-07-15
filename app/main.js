@@ -318,7 +318,7 @@ const StorageGovernor = require("./src/jarvis/main/StorageGovernor");
 const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
-const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
+const AnalysisInputBuilder = require("./src/jarvis/main/AnalysisInputBuilder");
 const AnalysisScheduler = require("./src/jarvis/main/AnalysisScheduler");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 const SpeakerCorrectionService = require("./src/jarvis/main/SpeakerCorrectionService");
@@ -526,7 +526,10 @@ async function initializeCoreManagers() {
       : (legacyConfiguredRecordings ?? legacyRecordings),
     recordingsRoot,
   });
-  jarvisRepository = new JarvisRepository(configuredDb);
+  const analysisInputBuilder = new AnalysisInputBuilder();
+  jarvisRepository = new JarvisRepository(configuredDb, {
+    validateRedactedCloudPayload: (input) => analysisInputBuilder.verifyRedactedCloudPayload(input),
+  });
   const speakerCorrectionService = new SpeakerCorrectionService({
     repository: jarvisRepository,
     createPersonId: () => `person_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
@@ -664,15 +667,11 @@ async function initializeCoreManagers() {
     voiceProfileStore,
   });
   environmentManager = new EnvironmentManager();
-  const miniMaxAnalysisClient = new MiniMaxAnalysisClient({
-    getApiKey: () => environmentManager.getMiniMaxKey(),
-    fetchImpl: (url, options) => net.fetch(url, options),
-    baseUrl: process.env.MINIMAX_BASE_URL || "https://api.minimaxi.com/v1",
-    model: process.env.MINIMAX_MODEL || "MiniMax-M2.7",
-  });
   jarvisAnalysisScheduler = new AnalysisScheduler({
     repository: jarvisRepository,
-    client: miniMaxAnalysisClient,
+    memoryRepository: jarvisRepository.memoryRepository,
+    inputBuilder: analysisInputBuilder,
+    cloudTransportEnabled: false,
   });
   cloudBudgetGuard = new CloudBudgetGuard({
     repository: jarvisRepository,

@@ -1,199 +1,310 @@
-const TOP_LEVEL_FIELDS = new Set([
-  "summary",
-  "topics",
-  "memories",
-  "todos",
-  "decisions",
-  "suggestions",
+const ANALYSIS_SCHEMA_VERSION = "jarvis-analysis-v2";
+const MAX_COLLECTION_ITEMS = 100;
+const MAX_EVIDENCE_ITEMS = 100;
+const MAX_RESPONSE_BYTES = 512 * 1024;
+const MEMORY_KINDS = Object.freeze([
+  "fact",
+  "event",
+  "decision",
+  "commitment",
+  "preference",
+  "relationship",
 ]);
-const MEMORY_TYPES = new Set(["fact", "decision", "commitment", "opinion"]);
+const MEMORY_KIND_SET = new Set(MEMORY_KINDS);
+const OWNER_LABEL_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
 
-function object(value, name) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError(`${name} must be an object`);
+class AnalysisSchemaError extends Error {
+  constructor(issueCode) {
+    super("Analysis response failed validation");
+    this.name = "AnalysisSchemaError";
+    this.code = "invalid_structure";
+    this.retryable = false;
+    this.issueCode = issueCode;
+  }
+}
+
+function fail(issueCode) {
+  throw new AnalysisSchemaError(issueCode);
+}
+
+function plainObject(value, issueCode = "schema.object_type") {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  ) {
+    fail(issueCode);
   }
   return value;
 }
 
-function string(value, name, max = 2_000) {
-  if (typeof value !== "string" || !value.trim()) throw new TypeError(`${name} must not be empty`);
-  const trimmed = value.trim();
-  if (Array.from(trimmed).length > max) throw new RangeError(`${name} is too long`);
-  return trimmed;
+function exactObject(value, requiredKeys, issueCode = "schema.object_type") {
+  const input = plainObject(value, issueCode);
+  const expected = new Set(requiredKeys);
+  for (const key of Object.keys(input)) {
+    if (!expected.has(key)) fail("schema.unknown_field");
+  }
+  for (const key of requiredKeys) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) fail("schema.missing_field");
+  }
+  return input;
 }
 
-function array(value, name, max = 100) {
-  if (!Array.isArray(value)) throw new TypeError(`${name} must be an array`);
-  if (value.length > max) throw new RangeError(`${name} has too many items`);
+function boundedString(value, maxCodePoints) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    Array.from(value).length > maxCodePoints ||
+    /[\u0000-\u001f\u007f]/u.test(value)
+  ) {
+    fail("schema.string");
+  }
   return value;
 }
 
-function evidence(value, allowedSegmentIds) {
-  const ids = array(value, "evidenceSegmentIds", 100).map((id) => string(id, "evidence id", 128));
-  if (ids.length === 0) throw new TypeError("evidenceSegmentIds must not be empty");
-  for (const id of ids) {
-    if (!allowedSegmentIds.has(id)) throw new Error(`unknown evidence segment: ${id}`);
+function collection(value, field) {
+  if (!Array.isArray(value)) fail(`schema.collection_type.${field}`);
+  if (value.length > MAX_COLLECTION_ITEMS) fail("schema.collection_count");
+  return value;
+}
+
+function evidenceIds(value, { required, allowedSegmentIds }) {
+  if (!Array.isArray(value)) fail("schema.evidence_type");
+  if (value.length > MAX_EVIDENCE_ITEMS) fail("schema.evidence_count");
+  if (required && value.length === 0) fail("schema.evidence_empty");
+  if (value.some((id) => typeof id !== "string" || !id || id !== id.trim())) {
+    fail("schema.evidence_id");
   }
-  return ids;
+  if (new Set(value).size !== value.length) fail("schema.evidence_duplicate");
+  if (value.some((id) => !allowedSegmentIds.has(id))) fail("schema.evidence_out_of_scope");
+  return [...value];
 }
 
-function nullableString(value, name) {
-  return value === null || value === undefined || value === "" ? null : string(value, name, 200);
-}
-
-function exactFields(value, allowed, name) {
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new TypeError(`unknown field ${name}.${key}`);
+function normalizeContext(context) {
+  const input = plainObject(context, "schema.validation_context");
+  if (!(input.allowedSegmentIds instanceof Set) || !(input.allowedOwnerLabels instanceof Set)) {
+    fail("schema.validation_context");
   }
+  return input;
 }
 
-function validateAnalysisPayload(payload, allowedSegmentIds) {
-  const input = object(payload, "analysis payload");
-  exactFields(input, TOP_LEVEL_FIELDS, "analysis");
-  if (!(allowedSegmentIds instanceof Set)) throw new TypeError("allowedSegmentIds must be a Set");
+function validateCandidateAnalysis(payload, context) {
+  const { allowedSegmentIds, allowedOwnerLabels } = normalizeContext(context);
+  const serializedBytes = (() => {
+    try {
+      return Buffer.byteLength(JSON.stringify(payload), "utf8");
+    } catch {
+      fail("schema.top_level_type");
+    }
+  })();
+  if (serializedBytes > MAX_RESPONSE_BYTES) fail("schema.response_too_large");
+  const input = exactObject(
+    payload,
+    ["schemaVersion", "sessionSummary", "memories", "topics", "todos", "suggestions"],
+    "schema.top_level_type"
+  );
+  if (input.schemaVersion !== ANALYSIS_SCHEMA_VERSION) fail("schema.version");
 
-  const result = {
-    summary: string(input.summary, "summary", 10_000),
-    topics: array(input.topics, "topics").map((raw) => {
-      const item = object(raw, "topic");
-      exactFields(item, new Set(["title", "description", "evidenceSegmentIds"]), "topic");
-      return {
-        title: string(item.title, "topic title", 200),
-        description: string(item.description, "topic description", 2_000),
-        evidenceSegmentIds: evidence(item.evidenceSegmentIds, allowedSegmentIds),
-      };
-    }),
-    memories: array(input.memories, "memories").map((raw) => {
-      const item = object(raw, "memory");
-      exactFields(
-        item,
-        new Set(["type", "content", "personRef", "topicRef", "confidence", "evidenceSegmentIds"]),
-        "memory"
-      );
-      if (!MEMORY_TYPES.has(item.type)) throw new TypeError("unsupported memory type");
-      if (
-        typeof item.confidence !== "number" ||
-        !Number.isFinite(item.confidence) ||
-        item.confidence < 0 ||
-        item.confidence > 1
-      ) {
-        throw new RangeError("memory confidence must be between 0 and 1");
-      }
-      return {
-        type: item.type,
-        content: string(item.content, "memory content"),
-        personRef: nullableString(item.personRef, "personRef"),
-        topicRef: nullableString(item.topicRef, "topicRef"),
-        confidence: item.confidence,
-        evidenceSegmentIds: evidence(item.evidenceSegmentIds, allowedSegmentIds),
-      };
-    }),
-    todos: array(input.todos, "todos").map((raw) => {
-      const item = object(raw, "todo");
-      exactFields(
-        item,
-        new Set(["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"]),
-        "todo"
-      );
-      const dueDate = nullableString(item.dueDate, "dueDate");
-      if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(dueDate))
-        throw new TypeError("dueDate must use YYYY-MM-DD");
-      return {
-        content: string(item.content, "todo content"),
-        ownerRef: nullableString(item.ownerRef, "ownerRef"),
-        dueDate,
-        topicRef: nullableString(item.topicRef, "topicRef"),
-        evidenceSegmentIds: evidence(item.evidenceSegmentIds, allowedSegmentIds),
-      };
-    }),
-    decisions: array(input.decisions, "decisions").map((value) => string(value, "decision")),
-    suggestions: array(input.suggestions, "suggestions").map((raw) => {
-      const item = object(raw, "suggestion");
-      exactFields(item, new Set(["content", "reason"]), "suggestion");
-      return {
-        content: string(item.content, "suggestion content"),
-        reason: string(item.reason, "suggestion reason"),
-      };
+  const rawSummary = exactObject(input.sessionSummary, ["title", "summary", "evidenceSegmentIds"]);
+  const sessionSummary = {
+    title: boundedString(rawSummary.title, 200),
+    summary: boundedString(rawSummary.summary, 4_000),
+    evidenceSegmentIds: evidenceIds(rawSummary.evidenceSegmentIds, {
+      required: true,
+      allowedSegmentIds,
     }),
   };
-  return result;
+
+  const memories = collection(input.memories, "memories").map((raw) => {
+    const item = exactObject(raw, ["kind", "title", "body", "confidence", "evidenceSegmentIds"]);
+    if (!MEMORY_KIND_SET.has(item.kind)) fail("schema.memory_kind");
+    if (
+      typeof item.confidence !== "number" ||
+      !Number.isFinite(item.confidence) ||
+      item.confidence < 0 ||
+      item.confidence > 1
+    ) {
+      fail("schema.confidence");
+    }
+    return {
+      kind: item.kind,
+      title: boundedString(item.title, 200),
+      body: boundedString(item.body, 4_000),
+      confidence: item.confidence,
+      evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
+        required: true,
+        allowedSegmentIds,
+      }),
+    };
+  });
+
+  const topics = collection(input.topics, "topics").map((raw) => {
+    const item = exactObject(raw, ["name", "summary", "evidenceSegmentIds"]);
+    return {
+      name: boundedString(item.name, 200),
+      summary: boundedString(item.summary, 4_000),
+      evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
+        required: true,
+        allowedSegmentIds,
+      }),
+    };
+  });
+
+  const todos = collection(input.todos, "todos").map((raw) => {
+    const item = exactObject(raw, ["title", "ownerLabel", "dueText", "evidenceSegmentIds"]);
+    let ownerLabel = null;
+    if (item.ownerLabel !== null) {
+      if (typeof item.ownerLabel !== "string" || !OWNER_LABEL_PATTERN.test(item.ownerLabel)) {
+        fail("schema.owner_label");
+      }
+      if (!allowedOwnerLabels.has(item.ownerLabel)) fail("schema.owner_out_of_scope");
+      ownerLabel = item.ownerLabel;
+    }
+    let dueText = null;
+    if (item.dueText !== null) {
+      if (typeof item.dueText !== "string" || item.dueText.length === 0) fail("schema.due_text");
+      try {
+        dueText = boundedString(item.dueText, 500);
+      } catch (error) {
+        if (error instanceof AnalysisSchemaError) fail("schema.due_text");
+        throw error;
+      }
+    }
+    return {
+      title: boundedString(item.title, 500),
+      ownerLabel,
+      dueText,
+      evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
+        required: true,
+        allowedSegmentIds,
+      }),
+    };
+  });
+
+  const suggestions = collection(input.suggestions, "suggestions").map((raw) => {
+    const item = exactObject(raw, ["title", "rationale", "basedOnEvidenceSegmentIds"]);
+    return {
+      title: boundedString(item.title, 500),
+      rationale: boundedString(item.rationale, 4_000),
+      basedOnEvidenceSegmentIds: evidenceIds(item.basedOnEvidenceSegmentIds, {
+        required: false,
+        allowedSegmentIds,
+      }),
+    };
+  });
+
+  return {
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    sessionSummary,
+    memories,
+    topics,
+    todos,
+    suggestions,
+  };
 }
 
-const ANALYSIS_TOOL = {
+const evidenceArraySchema = (minItems) => ({
+  type: "array",
+  minItems,
+  maxItems: MAX_EVIDENCE_ITEMS,
+  uniqueItems: true,
+  items: { type: "string", minLength: 1, maxLength: 512 },
+});
+
+const ANALYSIS_TOOL = Object.freeze({
   type: "function",
   function: {
     name: "submit_jarvis_analysis",
-    description: "Return grounded structured analysis of the supplied transcript segments.",
+    description: "Return evidence-grounded Jarvis analysis for the supplied pseudonymous text.",
     parameters: {
       type: "object",
       additionalProperties: false,
-      required: ["summary", "topics", "memories", "todos", "decisions", "suggestions"],
+      required: ["schemaVersion", "sessionSummary", "memories", "topics", "todos", "suggestions"],
       properties: {
-        summary: { type: "string" },
-        topics: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["title", "description", "evidenceSegmentIds"],
-            properties: {
-              title: { type: "string" },
-              description: { type: "string" },
-              evidenceSegmentIds: { type: "array", items: { type: "string" } },
-            },
+        schemaVersion: { const: ANALYSIS_SCHEMA_VERSION },
+        sessionSummary: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "summary", "evidenceSegmentIds"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 200 },
+            summary: { type: "string", minLength: 1, maxLength: 4_000 },
+            evidenceSegmentIds: evidenceArraySchema(1),
           },
         },
         memories: {
           type: "array",
+          maxItems: MAX_COLLECTION_ITEMS,
           items: {
             type: "object",
             additionalProperties: false,
-            required: [
-              "type",
-              "content",
-              "personRef",
-              "topicRef",
-              "confidence",
-              "evidenceSegmentIds",
-            ],
+            required: ["kind", "title", "body", "confidence", "evidenceSegmentIds"],
             properties: {
-              type: { type: "string", enum: [...MEMORY_TYPES] },
-              content: { type: "string" },
-              personRef: { type: ["string", "null"] },
-              topicRef: { type: ["string", "null"] },
+              kind: { type: "string", enum: MEMORY_KINDS },
+              title: { type: "string", minLength: 1, maxLength: 200 },
+              body: { type: "string", minLength: 1, maxLength: 4_000 },
               confidence: { type: "number", minimum: 0, maximum: 1 },
-              evidenceSegmentIds: { type: "array", items: { type: "string" } },
+              evidenceSegmentIds: evidenceArraySchema(1),
+            },
+          },
+        },
+        topics: {
+          type: "array",
+          maxItems: MAX_COLLECTION_ITEMS,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["name", "summary", "evidenceSegmentIds"],
+            properties: {
+              name: { type: "string", minLength: 1, maxLength: 200 },
+              summary: { type: "string", minLength: 1, maxLength: 4_000 },
+              evidenceSegmentIds: evidenceArraySchema(1),
             },
           },
         },
         todos: {
           type: "array",
+          maxItems: MAX_COLLECTION_ITEMS,
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["content", "ownerRef", "dueDate", "topicRef", "evidenceSegmentIds"],
+            required: ["title", "ownerLabel", "dueText", "evidenceSegmentIds"],
             properties: {
-              content: { type: "string" },
-              ownerRef: { type: ["string", "null"] },
-              dueDate: { type: ["string", "null"] },
-              topicRef: { type: ["string", "null"] },
-              evidenceSegmentIds: { type: "array", items: { type: "string" } },
+              title: { type: "string", minLength: 1, maxLength: 500 },
+              ownerLabel: {
+                anyOf: [{ type: "null" }, { type: "string", pattern: "^(SELF|P[1-9][0-9]*)$" }],
+              },
+              dueText: {
+                anyOf: [{ type: "null" }, { type: "string", minLength: 1, maxLength: 500 }],
+              },
+              evidenceSegmentIds: evidenceArraySchema(1),
             },
           },
         },
-        decisions: { type: "array", items: { type: "string" } },
         suggestions: {
           type: "array",
+          maxItems: MAX_COLLECTION_ITEMS,
           items: {
             type: "object",
             additionalProperties: false,
-            required: ["content", "reason"],
-            properties: { content: { type: "string" }, reason: { type: "string" } },
+            required: ["title", "rationale", "basedOnEvidenceSegmentIds"],
+            properties: {
+              title: { type: "string", minLength: 1, maxLength: 500 },
+              rationale: { type: "string", minLength: 1, maxLength: 4_000 },
+              basedOnEvidenceSegmentIds: evidenceArraySchema(0),
+            },
           },
         },
       },
     },
   },
-};
+});
 
-module.exports = { validateAnalysisPayload, ANALYSIS_TOOL };
+module.exports = {
+  ANALYSIS_SCHEMA_VERSION,
+  AnalysisSchemaError,
+  validateCandidateAnalysis,
+  ANALYSIS_TOOL,
+};

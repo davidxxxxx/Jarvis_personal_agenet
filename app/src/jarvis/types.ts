@@ -505,7 +505,7 @@ export interface JarvisTodayInsights {
 
 export interface JarvisAnalysisStatus {
   sessionId: string;
-  state: "waiting" | "analyzing" | "ready" | "quota_limited" | "retry_needed";
+  state: "waiting" | "analyzing" | "ready" | "quota_limited" | "retry_needed" | "blocked";
   errorCode: string | null;
   updatedAt: number | null;
 }

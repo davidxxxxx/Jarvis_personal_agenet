@@ -436,11 +436,11 @@ function registerJarvisIpc({
       model: process.env.MINIMAX_MODEL || "MiniMax-M2.7",
     });
     ipcMain.handle(CHANNELS.getMiniMaxConfig, miniMaxConfig);
-    ipcMain.handle(CHANNELS.setMiniMaxKey, (_event, key) => {
+    ipcMain.handle(CHANNELS.setMiniMaxKey, async (_event, key) => {
       if (typeof key !== "string" || !key.trim() || key.length > 512) {
         throw new TypeError("MiniMax key must be a non-empty string");
       }
-      environmentManager.saveMiniMaxKey(key.trim());
+      await environmentManager.saveMiniMaxKey(key.trim());
       return miniMaxConfig();
     });
   }

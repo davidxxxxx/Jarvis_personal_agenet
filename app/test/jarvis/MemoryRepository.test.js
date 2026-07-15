@@ -265,6 +265,11 @@ function expectedPrepareToken() {
           segmentId: "segment-1",
           segmentVersion: 1,
           textHash: sha256("durable evidence"),
+          resultKind: "final",
+          isStable: true,
+          isCurrent: true,
+          supersededBy: null,
+          duplicateOf: null,
           speakerBindingLabel: "SELF",
         },
       ],
@@ -1024,6 +1029,11 @@ test("prepareAnalysisInput returns a worker-private live snapshot, bindings, and
         segmentVersion: 1,
         textHash: sha256("durable evidence"),
         textSnapshot: "durable evidence",
+        resultKind: "final",
+        isStable: true,
+        isCurrent: true,
+        supersededBy: null,
+        duplicateOf: null,
         startedAt: 1000,
         endedAt: 5000,
         speakerBindingLabel: "SELF",
@@ -1046,6 +1056,44 @@ test("prepareAnalysisInput returns a worker-private live snapshot, bindings, and
   }
 });
 
+test("prepareAnalysisInput orders the complete manifest before assigning SELF and Pn labels", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-omitted", "segment-1"] })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ ordinal, segmentId, speakerBindingLabel }) => ({
+        ordinal,
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { ordinal: 0, segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { ordinal: 1, segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [
+        { label: "SELF", subjectId: "person-self" },
+        { label: "P1", subjectId: "person-other" },
+      ]
+    );
+    for (const segment of prepared.segments) {
+      assert.equal(segment.resultKind, "final");
+      assert.equal(segment.isStable, true);
+      assert.equal(segment.isCurrent, true);
+      assert.equal(segment.supersededBy, null);
+      assert.equal(segment.duplicateOf, null);
+    }
+  } finally {
+    db.close();
+  }
+});
+
 test("createAnalysisInput persists exact redacted payload and canonical v2 input identity", () => {
   const db = createFixture();
   try {
@@ -1056,6 +1104,7 @@ test("createAnalysisInput persists exact redacted payload and canonical v2 input
 
     assert.deepEqual(result, {
       status: "created",
+      candidateState: "pending",
       analysisInputId: "analysis_input-1",
       inputHash: identity.inputHash,
     });
@@ -1131,10 +1180,33 @@ test("createAnalysisInput is canonically idempotent without consuming another id
     repository.createAnalysisInput(validCreateInput());
     assert.deepEqual(repository.createAnalysisInput(validCreateInput()), {
       status: "existing",
+      candidateState: "pending",
       analysisInputId: "analysis_input-1",
       inputHash: expectedInputIdentity().inputHash,
     });
     assert.deepEqual(counters, { ids: 1, clocks: 1 });
+  } finally {
+    db.close();
+  }
+});
+
+test("createAnalysisInput reports an already applied canonical input without another cloud attempt", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const first = repository.createAnalysisInput(validCreateInput());
+    repository.applyCandidateAnalysis({
+      analysisInputId: first.analysisInputId,
+      inputHash: first.inputHash,
+      candidate: validCandidate(),
+    });
+
+    assert.deepEqual(repository.createAnalysisInput(validCreateInput()), {
+      status: "existing",
+      candidateState: "applied",
+      analysisInputId: first.analysisInputId,
+      inputHash: first.inputHash,
+    });
   } finally {
     db.close();
   }
