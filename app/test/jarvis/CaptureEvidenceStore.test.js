@@ -1402,9 +1402,7 @@ test("model rollback keeps completed A byte-for-byte while superseding pending B
     }),
     { enqueued: 1, superseded: 0 }
   );
-  const modelA = db
-    .prepare("SELECT * FROM processing_jobs WHERE model_version = 'model-a'")
-    .get();
+  const modelA = db.prepare("SELECT * FROM processing_jobs WHERE model_version = 'model-a'").get();
 
   assert.deepEqual(
     store.enqueueCurrentModelTranscriptionJobs({
@@ -1414,10 +1412,7 @@ test("model rollback keeps completed A byte-for-byte while superseding pending B
     }),
     { enqueued: 0, superseded: 1 }
   );
-  assert.deepEqual(
-    db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(modelA.id),
-    modelA
-  );
+  assert.deepEqual(db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(modelA.id), modelA);
   assert.deepEqual(
     db
       .prepare(

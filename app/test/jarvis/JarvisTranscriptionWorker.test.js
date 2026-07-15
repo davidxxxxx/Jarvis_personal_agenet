@@ -208,10 +208,9 @@ test("rejects transcription lineage mismatches before reading durable audio", as
     worker.handle(transcriptionJob("chunk-1", { input_version: INPUT_VERSION + 1 })),
     { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
   );
-  await assert.rejects(
-    worker.handle(transcriptionJob("chunk-1", { input_hash: "stale-hash" })),
-    { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
-  );
+  await assert.rejects(worker.handle(transcriptionJob("chunk-1", { input_hash: "stale-hash" })), {
+    code: "TRANSCRIPTION_LINEAGE_MISMATCH",
+  });
   assert.equal(readerCalls, 0);
   assert.equal(transcribeCalls, 0);
   assert.equal(commitCalls, 0);

@@ -261,8 +261,7 @@ class ProcessingJobRunner {
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
       const terminalObsoleteJob =
-        (job.job_type === "transcribe_chunk" &&
-          errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
+        (job.job_type === "transcribe_chunk" && errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
         (["diarize_track", "resolve_identities"].includes(job.job_type) &&
           TERMINAL_OBSOLETE_ERRORS.has(errorCode));
       if (terminalObsoleteJob) {

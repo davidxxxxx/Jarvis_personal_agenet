@@ -80,10 +80,7 @@ class JarvisTranscriptionWorker {
 
   async handle(job, executionContext = null) {
     const resourceContext = executionContext?.device ? executionContext : null;
-    if (
-      job?.input_version !== this.inputVersion ||
-      job?.model_version !== this.modelVersion
-    ) {
+    if (job?.input_version !== this.inputVersion || job?.model_version !== this.modelVersion) {
       throw codedError("TRANSCRIPTION_LINEAGE_MISMATCH");
     }
     const chunkId = job?.chunk_id;

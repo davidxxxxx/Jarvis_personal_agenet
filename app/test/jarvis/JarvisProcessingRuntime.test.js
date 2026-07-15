@@ -664,10 +664,12 @@ test("production startup replaces an expired old-model lease before any transcri
       previewAudioRing: { withPreviewWav: async () => null },
     }),
     ipcHandlers: {
-      createJarvisTranscribeWavAdapter: ({ model }) => async () => {
-        transcriptions.push(model);
-        return { noSpeech: true, executionDevice: "cpu" };
-      },
+      createJarvisTranscribeWavAdapter:
+        ({ model }) =>
+        async () => {
+          transcriptions.push(model);
+          return { noSpeech: true, executionDevice: "cpu" };
+        },
     },
     model: "current-model",
     owner: "startup-worker",
