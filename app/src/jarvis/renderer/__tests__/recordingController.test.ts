@@ -582,19 +582,20 @@ describe("Jarvis recording controller", () => {
       startedAt: 2_000,
     });
     expect(harness.jarvis.syncSegments).toHaveBeenNthCalledWith(1, "s1", expect.any(Array));
-    expect(harness.jarvis.syncSegments).toHaveBeenNthCalledWith(
-      2,
+    expect(harness.jarvis.upsertSegments).toHaveBeenNthCalledWith(
+      1,
       "s2",
       expect.arrayContaining([expect.objectContaining({ text: "after" })])
     );
-    expect(vi.mocked(harness.jarvis.syncSegments).mock.calls[1][1]).toHaveLength(1);
+    expect(vi.mocked(harness.jarvis.upsertSegments).mock.calls[0][1]).toHaveLength(1);
 
     await controller.rotateAtLocalDate({
       previousSessionId: "s1",
       sessionId: "s2",
       startedAt: 2_000,
     });
-    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(2);
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(1);
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(1);
   });
 
   it("prepares midnight persistence before switching sessions and commits buffered segments once", async () => {
@@ -648,7 +649,7 @@ describe("Jarvis recording controller", () => {
     expect(harness.getSession()).toMatchObject({ id: "s2", status: "recording" });
     expect(harness.rebindUpstreamSession).toHaveBeenCalledOnce();
     const s2Calls = vi
-      .mocked(harness.jarvis.syncSegments)
+      .mocked(harness.jarvis.upsertSegments)
       .mock.calls.filter(([sessionId]) => sessionId === "s2");
     expect(s2Calls).toHaveLength(1);
     expect(s2Calls[0][1]).toEqual([expect.objectContaining({ text: "after" })]);
@@ -660,7 +661,9 @@ describe("Jarvis recording controller", () => {
       startedAt: 2_000,
     });
     expect(
-      vi.mocked(harness.jarvis.syncSegments).mock.calls.filter(([sessionId]) => sessionId === "s2")
+      vi
+        .mocked(harness.jarvis.upsertSegments)
+        .mock.calls.filter(([sessionId]) => sessionId === "s2")
     ).toHaveLength(1);
   });
 
@@ -1084,21 +1087,40 @@ describe("Jarvis recording controller", () => {
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "completed" });
   });
 
-  it("debounces stable-segment persistence by 500 ms", async () => {
+  it("debounces and upserts only changed stable segment ids during live recording", async () => {
     vi.useFakeTimers();
     const harness = createHarness({ status: "recording", segments: [stableSegment] });
     const controller = createRecordingController(harness.deps);
 
     controller.handleSegmentsChanged([stableSegment]);
     await vi.advanceTimersByTimeAsync(499);
-    expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
+    expect(harness.jarvis.upsertSegments).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(1);
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(1);
+    expect(harness.jarvis.upsertSegments).toHaveBeenLastCalledWith("s1", [
+      expect.objectContaining({ id: "s1__seg-1", text: "Ship the capture foundation" }),
+    ]);
+
+    const added = { ...stableSegment, id: "seg-2", text: "Only the new stable row" };
+    controller.handleSegmentsChanged([stableSegment, added]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(2);
+    expect(harness.jarvis.upsertSegments).toHaveBeenLastCalledWith("s1", [
+      expect.objectContaining({ id: "s1__seg-2", text: "Only the new stable row" }),
+    ]);
+
+    controller.handleSegmentsChanged([{ ...stableSegment, text: "Corrected by stable id" }, added]);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(3);
+    expect(harness.jarvis.upsertSegments).toHaveBeenLastCalledWith("s1", [
+      expect.objectContaining({ id: "s1__seg-1", text: "Corrected by stable id" }),
+    ]);
 
     controller.handleSegmentsChanged([]);
     await vi.advanceTimersByTimeAsync(500);
-    expect(harness.jarvis.syncSegments).toHaveBeenLastCalledWith("s1", []);
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledTimes(3);
+    expect(harness.jarvis.syncSegments).not.toHaveBeenCalled();
     controller.dispose();
   });
 

@@ -415,6 +415,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   let activationGeneration = 0;
   let activeActivationSettled: Promise<void> | null = null;
   const persistenceFloors = new Map<string, number>();
+  const persistedSegmentFingerprints = new Map<string, Map<string, string>>();
   let persistenceRotation: {
     previousSessionId: string;
     sessionId: string;
@@ -477,7 +478,8 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   const persistSnapshot = (
     sessionId: string,
     sessionStartedAt: number,
-    segments: TranscriptSegment[]
+    segments: TranscriptSegment[],
+    mode: "incremental" | "sync" = "sync"
   ): Promise<void> => {
     const persist = async () => {
       const floor = persistenceFloors.get(sessionId);
@@ -488,10 +490,23 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
               const timestamp = safeTimestamp(segment.timestamp, floor);
               return safeTimestamp(segment.endedAt, timestamp) >= floor;
             });
-      await deps.jarvis.syncSegments(
-        sessionId,
-        mapStableSegments(sessionId, eligibleSegments, sessionStartedAt)
+      const mapped = mapStableSegments(sessionId, eligibleSegments, sessionStartedAt);
+      if (mode === "sync") {
+        await deps.jarvis.syncSegments(sessionId, mapped);
+        persistedSegmentFingerprints.set(
+          sessionId,
+          new Map(mapped.map((segment) => [segment.id, JSON.stringify(segment)]))
+        );
+        return;
+      }
+      const fingerprints = persistedSegmentFingerprints.get(sessionId) ?? new Map<string, string>();
+      const changed = mapped.filter(
+        (segment) => fingerprints.get(segment.id) !== JSON.stringify(segment)
       );
+      if (changed.length === 0) return;
+      await deps.jarvis.upsertSegments(sessionId, changed);
+      for (const segment of changed) fingerprints.set(segment.id, JSON.stringify(segment));
+      persistedSegmentFingerprints.set(sessionId, fingerprints);
     };
     const result = persistenceTail.then(persist, persist);
     persistenceTail = result.catch(() => undefined);
@@ -1002,6 +1017,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     persistenceFloors.set(sessionId, startedAt);
     deps.setSessionState(reduceSession(state, { type: "ROTATED", id: sessionId, at: startedAt }));
     persistenceRotation = null;
+    persistedSegmentFingerprints.delete(previousSessionId);
     if (rotation.bufferedSegments) handleSegmentsChanged(rotation.bufferedSegments);
     await refreshSessions();
   };
@@ -1102,11 +1118,14 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       const pending = pendingPersistence;
       pendingPersistence = null;
       if (!pending) return;
-      void persistSnapshot(pending.sessionId, pending.sessionStartedAt, pending.segments).catch(
-        () => {
-          deps.onError("segment_persist_failed");
-        }
-      );
+      void persistSnapshot(
+        pending.sessionId,
+        pending.sessionStartedAt,
+        pending.segments,
+        "incremental"
+      ).catch(() => {
+        deps.onError("segment_persist_failed");
+      });
     }, PERSIST_DEBOUNCE_MS);
   };
 
