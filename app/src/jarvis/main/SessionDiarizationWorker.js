@@ -166,6 +166,7 @@ class SessionDiarizationWorker {
     embedWindow,
     modelArtifactSha256,
     policy = SESSION_DIARIZATION_POLICY,
+    speakerProcessingPolicy,
     clock = Date.now,
   } = {}) {
     const repositoryMethods = [
@@ -195,6 +196,13 @@ class SessionDiarizationWorker {
     if (!policy || typeof policy !== "object" || !Object.isFrozen(policy)) {
       throw new TypeError("policy must be immutable");
     }
+    if (
+      !speakerProcessingPolicy ||
+      typeof speakerProcessingPolicy.evaluate !== "function" ||
+      !Object.isFrozen(speakerProcessingPolicy)
+    ) {
+      throw new TypeError("speakerProcessingPolicy must be immutable and implement evaluate");
+    }
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.repository = repository;
     this.audioEvidenceReader = audioEvidenceReader;
@@ -202,6 +210,7 @@ class SessionDiarizationWorker {
     this.embedWindow = embedWindow;
     this.modelArtifactSha256 = modelArtifactSha256;
     this.policy = policy;
+    this.speakerProcessingPolicy = speakerProcessingPolicy;
     this.clock = clock;
   }
 
@@ -219,7 +228,7 @@ class SessionDiarizationWorker {
     const existing = this.repository.getDiarizationRun({
       sessionId: identity.sessionId,
       trackId: identity.trackId,
-      transcriptRevision: identity.transcriptRevision,
+      evidenceRevision: identity.evidenceRevision,
       policyId: identity.policyId,
     });
     if (existing) return { executionDevice: "cpu", status: "already_completed" };
@@ -227,17 +236,21 @@ class SessionDiarizationWorker {
       sessionId: identity.sessionId,
       trackId: identity.trackId,
       at: this.clock(),
+      speakerProcessingPolicy: this.speakerProcessingPolicy,
     });
     if (!snapshot.eligible) {
       throw codedError(
-        snapshot.reason === "audio_expired"
+        snapshot.reason === "final_audio_expired"
           ? "DIARIZATION_AUDIO_EXPIRED"
           : "DIARIZATION_STALE_INPUT"
       );
     }
-    if (snapshot.transcriptRevision !== identity.transcriptRevision) {
+    if (snapshot.evidenceRevision !== identity.evidenceRevision) {
       throw codedError("DIARIZATION_SUPERSEDED");
     }
+    const renewLease = async () => {
+      if (typeof context?.renewLease === "function") await context.renewLease();
+    };
     const modelArtifactSha256 =
       typeof this.modelArtifactSha256 === "function"
         ? await this.modelArtifactSha256()
@@ -260,14 +273,27 @@ class SessionDiarizationWorker {
     const turns = [];
     const segmentLinks = new Map();
 
-    for (const chunk of snapshot.chunks) {
+    const admittedChunks = snapshot.chunks.map((entry) =>
+      entry?.audioChunk
+        ? {
+            ...entry.audioChunk,
+            transcriptionResult: entry.transcriptionResult,
+            transcriptionJob: entry.latestTranscriptionJob,
+            finalSegments: entry.transcriptSegments,
+          }
+        : entry
+    );
+    for (const chunk of admittedChunks) {
+      await renewLease();
       if (chunk.transcriptionResult === "no_speech") {
         await this.audioEvidenceReader.withVerifiedWav(chunk, async () => undefined);
-        context?.renewLease?.();
+        await renewLease();
         continue;
       }
       await this.audioEvidenceReader.withVerifiedWav(chunk, async (wavPath) => {
+        await renewLease();
         const rawTurns = await this.diarizeAudio({ wavPath, chunk, policy: this.policy });
+        await renewLease();
         if (!Array.isArray(rawTurns)) throw codedError("DIARIZATION_INVALID_TURN");
         const normalizedTurns = rawTurns
           .map((raw) => normalizedTurn(raw, chunk, this.policy))
@@ -281,10 +307,12 @@ class SessionDiarizationWorker {
         const localLabels = new Map();
         for (let turnIndex = 0; turnIndex < normalizedTurns.length; turnIndex += 1) {
           const rawTurn = normalizedTurns[turnIndex];
+          await renewLease();
           const embedding = normalizeEmbedding(
             await this.embedWindow({ wavPath, chunk, turn: rawTurn, policy: this.policy }),
             this.policy.embeddingDimension
           );
+          await renewLease();
           const startedAt = chunk.started_at + rawTurn.startMs;
           const endedAt = chunk.started_at + rawTurn.endMs;
           const overlaps = overlappingSegments(chunk.finalSegments, startedAt, endedAt);
@@ -349,7 +377,7 @@ class SessionDiarizationWorker {
           }
           const id = deterministicId(
             "speaker_turn",
-            identity.transcriptRevision,
+            identity.evidenceRevision,
             chunk.id,
             String(turnIndex)
           );
@@ -374,25 +402,41 @@ class SessionDiarizationWorker {
           }
         }
       });
-      context?.renewLease?.();
+      await renewLease();
     }
 
+    await renewLease();
+    const precommit = this.repository.getDiarizationEvidenceSnapshot({
+      sessionId: identity.sessionId,
+      trackId: identity.trackId,
+      at: this.clock(),
+      speakerProcessingPolicy: this.speakerProcessingPolicy,
+    });
+    if (
+      !precommit.eligible ||
+      precommit.stableAudioRevision !== snapshot.stableAudioRevision ||
+      precommit.transcriptRevision !== snapshot.transcriptRevision ||
+      precommit.evidenceRevision !== snapshot.evidenceRevision
+    ) {
+      throw codedError("DIARIZATION_SUPERSEDED");
+    }
     const completedAt = this.clock();
     const runId = deterministicId(
       "diarization_run",
       identity.sessionId,
       identity.trackId,
-      identity.transcriptRevision,
+      identity.evidenceRevision,
       identity.policyId
     );
     const committed = this.repository.commitDiarizationRun({
-      expectedRevision: identity.transcriptRevision,
+      expectedRevision: identity.evidenceRevision,
       validatedAt: completedAt,
+      speakerProcessingPolicy: this.speakerProcessingPolicy,
       run: {
         id: runId,
         sessionId: identity.sessionId,
         trackId: identity.trackId,
-        transcriptRevision: identity.transcriptRevision,
+        evidenceRevision: identity.evidenceRevision,
         policyId: identity.policyId,
         diarizerModelId: this.policy.diarizerModelId,
         embeddingModelId: this.policy.embeddingModelId,

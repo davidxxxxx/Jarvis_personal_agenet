@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const SpeakerIdentityResolver = require("../../src/jarvis/main/SpeakerIdentityResolver");
 const { meetsMinimum } = SpeakerIdentityResolver;
@@ -197,11 +198,15 @@ function seedReadyEvidence(t, { trackCount = 2, completeTracks = trackCount } = 
       sessionId: "session-ready",
       trackId,
       at: 15000,
+      speakerProcessingPolicy: new SpeakerProcessingPolicy({
+        transcriptionInputVersion: 1,
+        transcriptionModelVersion: "whisper-v1",
+      }),
     });
     const diarizationKey = buildDiarizationJobKey({
       sessionId: "session-ready",
       trackId,
-      transcriptRevision: evidence.transcriptRevision,
+      evidenceRevision: evidence.evidenceRevision,
     });
     repository.db
       .prepare(
@@ -249,7 +254,7 @@ function seedReadyEvidence(t, { trackCount = 2, completeTracks = trackCount } = 
       .run(
         runId,
         trackId,
-        evidence.transcriptRevision,
+        evidence.evidenceRevision,
         SESSION_DIARIZATION_POLICY.policyId,
         MODEL_ID,
         String(index + 5).repeat(64),

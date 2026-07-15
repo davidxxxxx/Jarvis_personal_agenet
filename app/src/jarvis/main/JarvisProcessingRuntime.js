@@ -1,6 +1,7 @@
 const ProcessingJobRunner = require("./ProcessingJobRunner");
 const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
 const SessionDiarizationWorker = require("./SessionDiarizationWorker");
+const SpeakerProcessingPolicy = require("./SpeakerProcessingPolicy");
 const SpeakerIdentityResolutionWorker = require("./SpeakerIdentityResolutionWorker");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
@@ -159,6 +160,7 @@ class JarvisProcessingRuntime {
     whisperController = null,
     startupBarrier = null,
     previewScheduler = null,
+    speakerProcessingPolicy = null,
   } = {}) {
     if (
       !runner ||
@@ -207,6 +209,13 @@ class JarvisProcessingRuntime {
     ) {
       throw new TypeError("previewScheduler must implement request, tick, and status");
     }
+    if (
+      speakerProcessingPolicy !== null &&
+      (typeof speakerProcessingPolicy?.evaluate !== "function" ||
+        !Object.isFrozen(speakerProcessingPolicy))
+    ) {
+      throw new TypeError("speakerProcessingPolicy must be immutable and implement evaluate");
+    }
 
     this.runner = runner;
     this.repository = repository;
@@ -224,6 +233,7 @@ class JarvisProcessingRuntime {
     this.whisperController = whisperController;
     this.startupBarrier = startupBarrier;
     this.previewScheduler = previewScheduler;
+    this.speakerProcessingPolicy = speakerProcessingPolicy;
     this.restrictiveReleaseLatched = false;
     this.timer = null;
     this.inFlight = null;
@@ -381,6 +391,7 @@ class JarvisProcessingRuntime {
         this.repository.enqueueDiarizationJobs?.(session.id, {
           at: this.now(),
           policy: SESSION_DIARIZATION_POLICY,
+          speakerProcessingPolicy: this.speakerProcessingPolicy,
         });
         this.repository.enqueueSpeakerIdentityResolutionJob?.(session.id, {
           at: this.now(),
@@ -520,6 +531,10 @@ function createJarvisProcessingRuntime({
     throw new TypeError("speakerIdentityResolutionWorker.run must be a function");
   }
   const configuredModel = model.trim();
+  const speakerProcessingPolicy = new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: configuredModel,
+  });
   const whisperManager = ipcHandlers.whisperManager || null;
   const cudaManager = ipcHandlers.whisperCudaManager || null;
   const diarizationManager = ipcHandlers.diarizationManager || null;
@@ -569,6 +584,7 @@ function createJarvisProcessingRuntime({
               turn.embeddingEndMs / 1_000
             ),
           modelArtifactSha256: combinedDiarizationArtifactHash,
+          speakerProcessingPolicy,
           clock: now,
         })
       : null);
@@ -717,6 +733,7 @@ function createJarvisProcessingRuntime({
     governor: effectiveGovernor,
     whisperController: effectiveWhisperController,
     previewScheduler: effectivePreviewScheduler,
+    speakerProcessingPolicy,
     ...runtimeOptions,
     startupBarrier,
   });

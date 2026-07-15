@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const {
   SESSION_DIARIZATION_POLICY,
@@ -67,23 +68,114 @@ function seedFinalTrack(repo) {
       'whisper-v1', 5100
     );
   `);
-  return repo.getDiarizationEvidenceSnapshot({
+  return getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6000,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
   });
 }
+
+function finalSpeakerPolicy(model = "whisper-v1") {
+  return new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: model,
+  });
+}
+
+function getFinalSnapshot(repo, input) {
+  return repo["getDiarizationEvidenceSnapshot"]({
+    ...input,
+    speakerProcessingPolicy: input.speakerProcessingPolicy ?? finalSpeakerPolicy(),
+  });
+}
+
+function enqueueFinalDiarization(repo, sessionId, input) {
+  return repo["enqueueDiarizationJobs"](sessionId, {
+    ...input,
+    speakerProcessingPolicy: input.speakerProcessingPolicy ?? finalSpeakerPolicy(),
+  });
+}
+
+test("repository exposes raw speaker evidence before final-evidence policy filtering", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db
+    .prepare(
+      "UPDATE audio_chunks SET write_state = 'writing', deleted_at = 5500, expires_at = 5600, path = 'tombstone:deleted' WHERE id = 'chunk-cas'"
+    )
+    .run();
+  repo.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
+        input_hash, input_version, model_version, attempt_count, created_at
+      ) VALUES (
+        'job-cas-newer', 'session-cas', 'track-cas', 'chunk-cas',
+        'transcribe_chunk', 'retry', 30, ?, 2, 'whisper-v2', 1, 5200
+      )`
+    )
+    .run("b".repeat(64));
+
+  const raw = repo.getDiarizationTrackEvidence({
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    observedAt: 6000,
+  });
+
+  assert.equal(raw.observedAt, 6000);
+  assert.equal(raw.chunks.length, 1);
+  assert.equal(raw.chunks[0].audioChunk.write_state, "writing");
+  assert.equal(raw.chunks[0].audioChunk.deleted_at, 5500);
+  assert.equal(raw.chunks[0].audioChunk.expires_at, 5600);
+  assert.equal(raw.chunks[0].audioChunk.path, "tombstone:deleted");
+  assert.equal(raw.chunks[0].latestTranscriptionJob.id, "job-cas-newer");
+  assert.deepEqual(
+    raw.chunks[0].transcriptSegments.map((segment) => segment.id),
+    ["segment-cas"]
+  );
+});
+
+test("repository delegates raw evidence to the configured speaker processing policy", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+
+  const eligible = getFinalSnapshot(repo, {
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 6000,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  const wrongModel = getFinalSnapshot(repo, {
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 6000,
+    speakerProcessingPolicy: finalSpeakerPolicy("whisper-other"),
+  });
+
+  assert.equal(eligible.eligible, true);
+  assert.match(eligible.stableAudioRevision, /^[0-9a-f]{64}$/);
+  assert.match(eligible.transcriptRevision, /^[0-9a-f]{64}$/);
+  assert.match(eligible.evidenceRevision, /^[0-9a-f]{64}$/);
+  assert.equal(wrongModel.eligible, false);
+  assert.equal(wrongModel.reason, "final_transcript_model_mismatch");
+  assert.match(wrongModel.stableAudioRevision, /^[0-9a-f]{64}$/);
+  assert.equal(wrongModel.evidenceRevision, null);
+});
 
 function commitInput(snapshot, suffix = "one") {
   const clusterId = "speaker_cluster_session_cas_1";
   return {
-    expectedRevision: snapshot.transcriptRevision,
+    expectedRevision: snapshot.evidenceRevision,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
     validatedAt: 6000,
     run: {
       id: `diarization_run_${suffix}`,
       sessionId: "session-cas",
       trackId: "track-cas",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
       policyId: "jarvis-session-diarization-v1",
       diarizerModelId: "sherpa-segmentation+3dspeaker-campplus",
       embeddingModelId: "3dspeaker-campplus-voxceleb-16k-v1",
@@ -146,7 +238,7 @@ function revisedCommitInput(repo, suffix, clusters) {
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run(`revision ${suffix}`, "segment-cas");
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -357,7 +449,7 @@ function createPartialV20Fixture(databasePath, options) {
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("partial historical revision two", "segment-cas");
-  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const secondSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -405,7 +497,7 @@ test("atomic diarization commit is idempotent and preserves revision history", (
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("revised", "segment-cas");
-  const revisedSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const revisedSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -507,6 +599,10 @@ test("turn evidence cannot link a final segment from another authoritative chunk
   t.after(() => repo.close());
   seedFinalTrack(repo);
   repo.db.exec(`
+    UPDATE audio_chunks
+    SET ended_at = 3000, duration_ms = 2000
+    WHERE id = 'chunk-cas';
+    UPDATE transcript_segments SET ended_at = 3000 WHERE id = 'segment-cas';
     INSERT INTO audio_chunks (
       id, session_id, track_id, source_type, sequence_number, path,
       started_at, ended_at, duration_ms, sha256, expires_at,
@@ -536,12 +632,13 @@ test("turn evidence cannot link a final segment from another authoritative chunk
       'whisper-v1', 5100
     );
   `);
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6000,
   });
   const input = commitInput(snapshot, "cross_chunk");
+  input.turns = [input.turns[0]];
   input.turns[0].transcriptSegmentId = "segment-other";
 
   assert.throws(() => repo.commitDiarizationRun(input), {
@@ -557,19 +654,22 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
   const snapshot = seedFinalTrack(repo);
+  const speakerProcessingPolicy = finalSpeakerPolicy();
   const expectedKey = buildDiarizationJobKey({
     sessionId: "session-cas",
     trackId: "track-cas",
-    transcriptRevision: snapshot.transcriptRevision,
+    evidenceRevision: snapshot.evidenceRevision,
   });
 
-  const first = repo.enqueueDiarizationJobs("session-cas", {
+  const first = enqueueFinalDiarization(repo, "session-cas", {
     at: 6000,
     policy: SESSION_DIARIZATION_POLICY,
+    speakerProcessingPolicy,
   });
-  const repeated = repo.enqueueDiarizationJobs("session-cas", {
+  const repeated = enqueueFinalDiarization(repo, "session-cas", {
     at: 6001,
     policy: SESSION_DIARIZATION_POLICY,
+    speakerProcessingPolicy,
   });
 
   assert.equal(first.enqueued, 1);
@@ -615,7 +715,7 @@ test("nonterminal latest transcription never schedules diarization", (t) => {
     .run();
 
   assert.deepEqual(
-    repo.enqueueDiarizationJobs("session-cas", {
+    enqueueFinalDiarization(repo, "session-cas", {
       at: 6000,
       policy: SESSION_DIARIZATION_POLICY,
     }),
@@ -642,7 +742,7 @@ test("a terminal track with only explicit no-speech evidence schedules durable d
     .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'chunk-cas'")
     .run();
 
-  const result = repo.enqueueDiarizationJobs("session-cas", {
+  const result = enqueueFinalDiarization(repo, "session-cas", {
     at: 6000,
     policy: SESSION_DIARIZATION_POLICY,
   });
@@ -661,7 +761,7 @@ test("an empty no-speech run remains distinguishable and idempotent after restar
   repo.db
     .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'chunk-cas'")
     .run();
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6000,
@@ -678,7 +778,7 @@ test("an empty no-speech run remains distinguishable and idempotent after restar
   const reopened = repo.getDiarizationRun({
     sessionId: "session-cas",
     trackId: "track-cas",
-    transcriptRevision: snapshot.transcriptRevision,
+    evidenceRevision: snapshot.evidenceRevision,
     policyId: SESSION_DIARIZATION_POLICY.policyId,
   });
   assert.equal(reopened.id, "diarization_run_no_speech_empty");
@@ -697,7 +797,7 @@ test("revision history retains run-scoped segment links as well as the latest pr
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("revised", "segment-cas");
-  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const secondSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -779,7 +879,7 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("historical revision two", "segment-cas");
-  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const secondSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -886,7 +986,7 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("post migration revision", "segment-cas");
-  const thirdSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const thirdSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 7001,
@@ -981,7 +1081,7 @@ test("partial v20 diarization schemas all migrate without losing provenance", as
       repo.db
         .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
         .run(`post migration ${variant.name}`, "segment-cas");
-      const snapshot = repo.getDiarizationEvidenceSnapshot({
+      const snapshot = getFinalSnapshot(repo, {
         sessionId: "session-cas",
         trackId: "track-cas",
         at: 7001,
@@ -1206,7 +1306,7 @@ test("cross-revision stable clusters reuse voice one-to-one instead of local lab
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("Alice then Bob", "segment-cas");
-  const revisedSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const revisedSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -1303,7 +1403,7 @@ test("zero-window echo cluster never reuses an identified stable cluster by labe
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("echo revision", "segment-cas");
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,
@@ -1384,7 +1484,7 @@ test("commit sequence, not wall clock or run id, defines revision and echo lates
   repo.db
     .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
     .run("clock rollback", "segment-cas");
-  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+  const secondSnapshot = getFinalSnapshot(repo, {
     sessionId: "session-cas",
     trackId: "track-cas",
     at: 6001,

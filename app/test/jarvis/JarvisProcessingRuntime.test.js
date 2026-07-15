@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
@@ -26,6 +27,13 @@ function deferred() {
     resolve = next;
   });
   return { promise, resolve };
+}
+
+function finalSpeakerPolicy(model = "large-v3-turbo") {
+  return new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: model,
+  });
 }
 
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
@@ -237,6 +245,7 @@ test("restart resumes a persisted pending chunk and no-speech can make it ready"
   const runtime = new JarvisProcessingRuntime({
     runner,
     ...noopPostProcessors(repository),
+    speakerProcessingPolicy: finalSpeakerPolicy(),
     now: () => 2_000,
   });
 
@@ -573,7 +582,7 @@ test("production composition registers diarize_track as CPU speaker work", async
   const jobKey = buildDiarizationJobKey({
     sessionId: "s1",
     trackId: "track-mic",
-    transcriptRevision: revision,
+    evidenceRevision: revision,
   });
   repository.db
     .prepare(
@@ -626,6 +635,10 @@ test("production composition registers diarize_track as CPU speaker work", async
     maxJobsPerDrain: 1,
   });
 
+  assert.equal(Object.isFrozen(runtime.speakerProcessingPolicy), true);
+  assert.equal(runtime.speakerProcessingPolicy.transcriptionInputVersion, 1);
+  assert.equal(runtime.speakerProcessingPolicy.transcriptionModelVersion, "large-v3-turbo");
+
   assert.equal(await runtime.drainOnce(), 1);
   assert.deepEqual(calls, ["diarize-job"]);
   assert.deepEqual(capabilities, [{ kind: "speaker", capability: { executionDevice: "cpu" } }]);
@@ -649,10 +662,15 @@ test("production composition builds the durable diarization worker from local ma
     .prepare("UPDATE processing_jobs SET model_version = 'large-v3-turbo' WHERE id = 'job-mic'")
     .run();
   insertFinalCoverage(repository, "chunk-mic", 4_200);
+  const speakerProcessingPolicy = new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: "large-v3-turbo",
+  });
   const snapshot = repository.getDiarizationEvidenceSnapshot({
     sessionId: "s1",
     trackId: "track-mic",
     at: 5_000,
+    speakerProcessingPolicy,
   });
   assert.equal(snapshot.eligible, true);
   let modelsAvailable = true;
@@ -670,7 +688,7 @@ test("production composition builds the durable diarization worker from local ma
       buildDiarizationJobKey({
         sessionId: "s1",
         trackId: "track-mic",
-        transcriptRevision: snapshot.transcriptRevision,
+        evidenceRevision: snapshot.evidenceRevision,
       }),
       SESSION_DIARIZATION_POLICY.policyId
     );
@@ -773,7 +791,7 @@ test("missing local diarization dependencies defer instead of producing HANDLER_
       buildDiarizationJobKey({
         sessionId: "s1",
         trackId: "track-mic",
-        transcriptRevision: revision,
+        evidenceRevision: revision,
       }),
       SESSION_DIARIZATION_POLICY.policyId
     );
@@ -1278,6 +1296,7 @@ test("committing required evidence invalidates ready atomically and same drain p
   const runtime = new JarvisProcessingRuntime({
     runner,
     repository,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
     reconciler: { reconcileSession: (id) => order.push(`reconcile:${id}`) },
     deduper: { dedupe: (id) => order.push(`dedupe:${id}`) },
     now: () => 2_000,
@@ -1439,6 +1458,7 @@ test("blocked and retry transcription sessions stay processing without heavy pos
   const runtime = new JarvisProcessingRuntime({
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository,
+    speakerProcessingPolicy: finalSpeakerPolicy("whisper-v1"),
     reconciler: { reconcileSession: (id) => heavy.push(`reconcile:${id}`) },
     deduper: { dedupe: (id) => heavy.push(`dedupe:${id}`) },
     maxSessionsPerDrain: 2,
@@ -1553,6 +1573,7 @@ test("bounded processing-session pages rotate past blocked backlog to an eligibl
   const runtime = new JarvisProcessingRuntime({
     runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
     repository,
+    speakerProcessingPolicy: finalSpeakerPolicy("whisper-v1"),
     reconciler: { reconcileSession: (id) => heavy.push(`reconcile:${id}`) },
     deduper: { dedupe: (id) => heavy.push(`dedupe:${id}`) },
     now: () => 2_000,

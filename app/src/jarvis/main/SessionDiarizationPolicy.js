@@ -23,7 +23,7 @@ function safeId(value, name) {
 
 function revision(value) {
   if (typeof value !== "string" || !REVISION.test(value)) {
-    throw new TypeError("transcriptRevision must be a lowercase SHA-256 digest");
+    throw new TypeError("evidenceRevision must be a lowercase SHA-256 digest");
   }
   return value;
 }
@@ -31,28 +31,28 @@ function revision(value) {
 function buildDiarizationJobKey({
   sessionId,
   trackId,
-  transcriptRevision,
+  evidenceRevision,
   policyId = SESSION_DIARIZATION_POLICY.policyId,
 } = {}) {
   return [
     "diarize_track",
     safeId(sessionId, "sessionId"),
     safeId(trackId, "trackId"),
-    revision(transcriptRevision),
+    revision(evidenceRevision),
     safeId(policyId, "policyId"),
   ].join(":");
 }
 
 function parseDiarizationJobKey(value) {
   if (typeof value !== "string") throw new TypeError("diarization job key must be a string");
-  const [prefix, sessionId, trackId, transcriptRevision, policyId, ...extra] = value.split(":");
+  const [prefix, sessionId, trackId, evidenceRevision, policyId, ...extra] = value.split(":");
   if (prefix !== "diarize_track" || extra.length > 0) {
     throw new TypeError("invalid diarization job key");
   }
   return {
     sessionId: safeId(sessionId, "sessionId"),
     trackId: safeId(trackId, "trackId"),
-    transcriptRevision: revision(transcriptRevision),
+    evidenceRevision: revision(evidenceRevision),
     policyId: safeId(policyId, "policyId"),
   };
 }

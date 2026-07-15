@@ -584,15 +584,7 @@ class JarvisRepository {
         SELECT * FROM audio_chunks
         WHERE session_id = @sessionId
           AND track_id = @trackId
-          AND write_state = 'committed'
-          AND deleted_at IS NULL
-          AND expires_at > @at
-          AND path NOT LIKE 'tombstone:%'
-        ORDER BY started_at, ended_at, sequence_number, id
-      `),
-      countDiarizationTrackChunks: this.db.prepare(`
-        SELECT count(*) AS count FROM audio_chunks
-        WHERE session_id = @sessionId AND track_id = @trackId
+        ORDER BY sequence_number, id
       `),
       getLatestChunkTranscriptionJob: this.db.prepare(`
         SELECT * FROM processing_jobs
@@ -600,14 +592,9 @@ class JarvisRepository {
         ORDER BY input_version DESC, created_at DESC, id DESC
         LIMIT 1
       `),
-      listDiarizationFinalSegments: this.db.prepare(`
+      listDiarizationSegments: this.db.prepare(`
         SELECT * FROM transcript_segments
-        WHERE chunk_id = @chunkId
-          AND track_id = @trackId
-          AND source_type = @sourceType
-          AND result_kind = 'final'
-          AND is_stable = 1
-          AND model_version = @modelVersion
+        WHERE chunk_id = ?
         ORDER BY started_at, ended_at, id
       `),
       getDiarizationRun: this.db.prepare(`
@@ -1781,12 +1768,17 @@ class JarvisRepository {
         sessionId: input.run.sessionId,
         trackId: input.run.trackId,
         at: input.validatedAt,
+        speakerProcessingPolicy: input.speakerProcessingPolicy,
       });
-      if (!current.eligible || current.transcriptRevision !== input.expectedRevision) {
+      if (!current.eligible || current.evidenceRevision !== input.expectedRevision) {
         throw codedError("DIARIZATION_STALE_INPUT");
       }
       const commitSequence = this.statements.nextDiarizationCommitSequence.get().value;
-      this.statements.insertDiarizationRun.run({ ...input.run, commitSequence });
+      this.statements.insertDiarizationRun.run({
+        ...input.run,
+        transcriptRevision: input.run.evidenceRevision,
+        commitSequence,
+      });
       const persistedClusterIds = new Map();
       const stableCandidates = this.statements.listDiarizationStableClusters.all({
         sessionId: input.run.sessionId,
@@ -1918,15 +1910,17 @@ class JarvisRepository {
         });
       }
 
-      const chunks = new Map(current.chunks.map((chunk) => [chunk.id, chunk]));
+      const chunks = new Map(
+        current.chunks.map((entry) => [entry.audioChunk.id, entry.audioChunk])
+      );
       const segmentIdsByChunk = new Map(
-        current.chunks.map((chunk) => [
-          chunk.id,
-          new Set(chunk.finalSegments.map((segment) => segment.id)),
+        current.chunks.map((entry) => [
+          entry.audioChunk.id,
+          new Set(entry.transcriptSegments.map((segment) => segment.id)),
         ])
       );
       const segmentIds = new Set(
-        current.chunks.flatMap((chunk) => chunk.finalSegments.map((segment) => segment.id))
+        current.chunks.flatMap((entry) => entry.transcriptSegments.map((segment) => segment.id))
       );
       for (const turn of input.turns) {
         const chunk = chunks.get(turn.chunkId);
@@ -2225,153 +2219,55 @@ class JarvisRepository {
     return this.statements.listPendingJobs.all(assertId(sessionId, "sessionId"));
   }
 
-  getDiarizationEvidenceSnapshot({ sessionId, trackId, at = Date.now() } = {}) {
+  getDiarizationTrackEvidence({ sessionId, trackId, observedAt = Date.now() } = {}) {
     const safeSessionId = assertId(sessionId, "sessionId");
     const safeTrackId = assertId(trackId, "trackId");
-    const safeAt = assertNonNegativeInteger(at, "at");
+    const safeObservedAt = assertNonNegativeInteger(observedAt, "observedAt");
     const session = this.statements.getSession.get(safeSessionId);
     const track = this.statements.getDiarizationTrack.get({
       sessionId: safeSessionId,
       trackId: safeTrackId,
     });
-    const ineligible = (reason, chunks = []) =>
-      deepFreeze({
-        eligible: false,
-        reason,
-        transcriptRevision: null,
-        session: session ?? null,
-        track: track ?? null,
-        chunks,
-      });
-
-    if (!session || !track) return ineligible("final_audio_pending");
-    if (
-      !["completed", "recovered"].includes(session.status) ||
-      !Number.isSafeInteger(session.ended_at) ||
-      !["ended", "recovered"].includes(track.state) ||
-      !Number.isSafeInteger(track.ended_at)
-    ) {
-      return ineligible("final_audio_pending");
-    }
-
-    const authoritative = this.statements.listDiarizationChunks.all({
+    const chunks = this.statements.listDiarizationChunks.all({
       sessionId: safeSessionId,
       trackId: safeTrackId,
-      at: safeAt,
     });
-    if (authoritative.length === 0) {
-      const historicalCount = this.statements.countDiarizationTrackChunks.get({
-        sessionId: safeSessionId,
-        trackId: safeTrackId,
-      }).count;
-      return ineligible(historicalCount > 0 ? "audio_expired" : "final_audio_pending");
-    }
-
-    const chunks = [];
-    for (const chunk of authoritative) {
-      const job = this.statements.getLatestChunkTranscriptionJob.get(chunk.id);
-      if (!job || job.state !== "completed") {
-        return ineligible("final_transcript_pending", chunks);
-      }
-      if (job.session_id !== safeSessionId || job.track_id !== safeTrackId) {
-        return ineligible("final_transcript_pending", chunks);
-      }
-      if (chunk.transcription_status === "no_speech") {
-        chunks.push({
-          ...chunk,
-          transcriptionResult: "no_speech",
-          transcriptionJob: job,
-          finalSegments: [],
-        });
-        continue;
-      }
-      if (chunk.transcription_status !== "completed") {
-        return ineligible("final_transcript_pending", chunks);
-      }
-      const finalSegments = this.statements.listDiarizationFinalSegments.all({
-        chunkId: chunk.id,
-        trackId: safeTrackId,
-        sourceType: chunk.source_type,
-        modelVersion: job.model_version,
-      });
-      if (finalSegments.length === 0) {
-        return ineligible("final_transcript_pending", chunks);
-      }
-      chunks.push({
-        ...chunk,
-        transcriptionResult: "final",
-        transcriptionJob: job,
-        finalSegments,
-      });
-    }
-
-    const revisionInput = {
-      version: 1,
-      session: {
-        id: session.id,
-        startedAt: session.started_at,
-        endedAt: session.ended_at,
-        status: session.status,
-      },
-      track: {
-        id: track.id,
-        sourceType: track.source_type,
-        startedAt: track.started_at,
-        endedAt: track.ended_at,
-        state: track.state,
-      },
-      chunks: chunks.map((chunk) => ({
-        id: chunk.id,
-        sourceType: chunk.source_type,
-        sequenceNumber: chunk.sequence_number,
-        startedAt: chunk.started_at,
-        endedAt: chunk.ended_at,
-        durationMs: chunk.duration_ms,
-        pcmSha256: chunk.sha256,
-        transcriptionStatus: chunk.transcription_status,
-        result: chunk.transcriptionResult,
-        job: {
-          inputHash: chunk.transcriptionJob.input_hash,
-          inputVersion: chunk.transcriptionJob.input_version,
-          modelVersion: chunk.transcriptionJob.model_version,
-        },
-        segments: chunk.finalSegments.map((segment) => ({
-          id: segment.id,
-          startedAt: segment.started_at,
-          endedAt: segment.ended_at,
-          sourceType: segment.source_type,
-          text: segment.text,
-          confidence: segment.confidence,
-          version: segment.version,
-          modelVersion: segment.model_version,
-          echoScore: segment.echo_score,
-          duplicateOf: segment.duplicate_of,
-        })),
-      })),
-    };
-    const transcriptRevision = crypto
-      .createHash("sha256")
-      .update(JSON.stringify(revisionInput))
-      .digest("hex");
     return deepFreeze({
-      eligible: true,
-      reason: null,
-      transcriptRevision,
-      session,
-      track,
-      chunks,
+      observedAt: safeObservedAt,
+      session: session ?? null,
+      track: track ?? null,
+      chunks: chunks.map((audioChunk) => ({
+        audioChunk,
+        latestTranscriptionJob:
+          this.statements.getLatestChunkTranscriptionJob.get(audioChunk.id) ?? null,
+        transcriptSegments: this.statements.listDiarizationSegments.all(audioChunk.id),
+      })),
     });
   }
 
-  getDiarizationRun({ sessionId, trackId, transcriptRevision, policyId } = {}) {
-    if (typeof transcriptRevision !== "string" || !/^[0-9a-f]{64}$/.test(transcriptRevision)) {
-      throw new TypeError("transcriptRevision must be a lowercase SHA-256 digest");
+  getDiarizationEvidenceSnapshot({
+    sessionId,
+    trackId,
+    at = Date.now(),
+    speakerProcessingPolicy,
+  } = {}) {
+    if (!speakerProcessingPolicy || typeof speakerProcessingPolicy.evaluate !== "function") {
+      throw new TypeError("speakerProcessingPolicy.evaluate is required");
+    }
+    return speakerProcessingPolicy.evaluate(
+      this.getDiarizationTrackEvidence({ sessionId, trackId, observedAt: at })
+    );
+  }
+
+  getDiarizationRun({ sessionId, trackId, evidenceRevision, policyId } = {}) {
+    if (typeof evidenceRevision !== "string" || !/^[0-9a-f]{64}$/.test(evidenceRevision)) {
+      throw new TypeError("evidenceRevision must be a lowercase SHA-256 digest");
     }
     return (
       this.statements.getDiarizationRun.get({
         sessionId: assertId(sessionId, "sessionId"),
         trackId: assertId(trackId, "trackId"),
-        transcriptRevision,
+        transcriptRevision: evidenceRevision,
         policyId: assertId(policyId, "policyId"),
       }) ?? null
     );
@@ -2394,7 +2290,7 @@ class JarvisRepository {
       }));
   }
 
-  enqueueDiarizationJobs(sessionId, { at = Date.now(), policy } = {}) {
+  enqueueDiarizationJobs(sessionId, { at = Date.now(), policy, speakerProcessingPolicy } = {}) {
     const safeSessionId = assertId(sessionId, "sessionId");
     const safeAt = assertNonNegativeInteger(at, "at");
     if (
@@ -2404,6 +2300,9 @@ class JarvisRepository {
       policy.inputVersion !== 1
     ) {
       throw new TypeError("a versioned diarization policy is required");
+    }
+    if (!speakerProcessingPolicy || typeof speakerProcessingPolicy.evaluate !== "function") {
+      throw new TypeError("speakerProcessingPolicy.evaluate is required");
     }
     const tracks = this.statements.listSessionReadinessTracks.all(safeSessionId);
     const jobs = [];
@@ -2415,6 +2314,7 @@ class JarvisRepository {
           sessionId: safeSessionId,
           trackId: track.id,
           at: safeAt,
+          speakerProcessingPolicy,
         });
         if (!snapshot.eligible) {
           skipped.push({ trackId: track.id, reason: snapshot.reason });
@@ -2423,7 +2323,7 @@ class JarvisRepository {
         const inputHash = buildDiarizationJobKey({
           sessionId: safeSessionId,
           trackId: track.id,
-          transcriptRevision: snapshot.transcriptRevision,
+          evidenceRevision: snapshot.evidenceRevision,
           policyId: policy.policyId,
         });
         const identity = {
@@ -2476,7 +2376,7 @@ class JarvisRepository {
       const inputHash = buildDiarizationJobKey({
         sessionId: safeSessionId,
         trackId: track.id,
-        transcriptRevision: run.transcript_revision,
+        evidenceRevision: run.transcript_revision,
         policyId: diarizationPolicy.policyId,
       });
       const job = this.statements.getIdentityDiarizationJobByIdentity.get({
@@ -2503,7 +2403,7 @@ class JarvisRepository {
       evidenceRuns.push({
         id: run.id,
         trackId: track.id,
-        transcriptRevision: run.transcript_revision,
+        evidenceRevision: run.transcript_revision,
         policyId: run.policy_id,
         embeddingModelId: run.embedding_model_id,
         modelArtifactSha256: run.model_artifact_sha256,
@@ -2631,6 +2531,12 @@ class JarvisRepository {
       throw new TypeError("expectedRevision must be a lowercase SHA-256 digest");
     }
     const validatedAt = assertNonNegativeInteger(input.validatedAt, "validatedAt");
+    if (
+      !input.speakerProcessingPolicy ||
+      typeof input.speakerProcessingPolicy.evaluate !== "function"
+    ) {
+      throw new TypeError("speakerProcessingPolicy.evaluate is required");
+    }
     const run = input.run;
     if (!run || typeof run !== "object" || Array.isArray(run)) {
       throw new TypeError("diarization run is required");
@@ -2639,7 +2545,7 @@ class JarvisRepository {
       id: assertId(run.id, "run.id"),
       sessionId: assertId(run.sessionId, "run.sessionId"),
       trackId: assertId(run.trackId, "run.trackId"),
-      transcriptRevision: run.transcriptRevision,
+      evidenceRevision: run.evidenceRevision,
       policyId: assertId(run.policyId, "run.policyId"),
       diarizerModelId: assertDiarizationModelId(run.diarizerModelId, "run.diarizerModelId"),
       embeddingModelId: assertDiarizationModelId(run.embeddingModelId, "run.embeddingModelId"),
@@ -2652,8 +2558,8 @@ class JarvisRepository {
       completedAt: assertNonNegativeInteger(run.completedAt, "run.completedAt"),
     };
     if (
-      normalizedRun.transcriptRevision !== input.expectedRevision ||
-      !/^[0-9a-f]{64}$/.test(normalizedRun.transcriptRevision) ||
+      normalizedRun.evidenceRevision !== input.expectedRevision ||
+      !/^[0-9a-f]{64}$/.test(normalizedRun.evidenceRevision) ||
       !/^[0-9a-f]{64}$/.test(normalizedRun.modelArtifactSha256) ||
       normalizedRun.embeddingDimension !== 512 ||
       normalizedRun.sampleRate !== 16_000 ||
@@ -2747,6 +2653,7 @@ class JarvisRepository {
     return this._commitDiarizationRun({
       expectedRevision: input.expectedRevision,
       validatedAt,
+      speakerProcessingPolicy: input.speakerProcessingPolicy,
       run: normalizedRun,
       clusters,
       turns,

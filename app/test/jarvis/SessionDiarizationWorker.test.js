@@ -2,12 +2,29 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const {
   applyJarvisMigrations,
   TARGET_VERSION,
   transcriptSegmentsSchema,
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
 } = require("../../src/jarvis/main/JarvisMigrations");
+
+const TEST_SPEAKER_PROCESSING_POLICY = Object.freeze({ evaluate: (evidence) => evidence });
+
+function finalSpeakerPolicy() {
+  return new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: "whisper-v1",
+  });
+}
+
+function getFinalSnapshot(repo, input) {
+  return repo["getDiarizationEvidenceSnapshot"]({
+    ...input,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+}
 
 function columns(db, table) {
   return db
@@ -30,13 +47,13 @@ function seedFinalEvidence(repo) {
       transcription_status, write_state, format, sample_rate, channels
     ) VALUES
       (
-        'chunk-late', 'session-final', 'track-mic', 'mic', 0, 'late.wav',
+        'chunk-late', 'session-final', 'track-mic', 'mic', 1, 'late.wav',
         3000, 4000, 1000,
         'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 10000,
         'no_speech', 'committed', 'wav', 24000, 1
       ),
       (
-        'chunk-early', 'session-final', 'track-mic', 'mic', 1, 'early.wav',
+        'chunk-early', 'session-final', 'track-mic', 'mic', 0, 'early.wav',
         1000, 3000, 2000,
         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 10000,
         'completed', 'committed', 'wav', 24000, 1
@@ -225,7 +242,7 @@ test("diarization evidence snapshot is final-only, capture ordered, and revision
   t.after(() => repo.close());
   seedFinalEvidence(repo);
 
-  const first = repo.getDiarizationEvidenceSnapshot({
+  const first = getFinalSnapshot(repo, {
     sessionId: "session-final",
     trackId: "track-mic",
     at: 5000,
@@ -238,10 +255,10 @@ test("diarization evidence snapshot is final-only, capture ordered, and revision
   assert.equal(Object.isFrozen(first.chunks[0]), true);
   assert.match(first.transcriptRevision, /^[0-9a-f]{64}$/);
   assert.deepEqual(
-    first.chunks.map((chunk) => ({
-      id: chunk.id,
-      result: chunk.transcriptionResult,
-      segmentIds: chunk.finalSegments.map((segment) => segment.id),
+    first.chunks.map((entry) => ({
+      id: entry.audioChunk.id,
+      result: entry.transcriptionResult,
+      segmentIds: entry.transcriptSegments.map((segment) => segment.id),
     })),
     [
       { id: "chunk-early", result: "final", segmentIds: ["segment-early"] },
@@ -251,7 +268,7 @@ test("diarization evidence snapshot is final-only, capture ordered, and revision
 
   repo.db.prepare("UPDATE processing_jobs SET completed_at = completed_at + 999").run();
   repo.db.prepare("UPDATE transcript_segments SET completed_at = completed_at + 777").run();
-  const completionClockChanged = repo.getDiarizationEvidenceSnapshot({
+  const completionClockChanged = getFinalSnapshot(repo, {
     sessionId: "session-final",
     trackId: "track-mic",
     at: 5001,
@@ -261,7 +278,7 @@ test("diarization evidence snapshot is final-only, capture ordered, and revision
   repo.db
     .prepare("UPDATE transcript_segments SET text = 'hello revised' WHERE id = ?")
     .run("segment-early");
-  const transcriptChanged = repo.getDiarizationEvidenceSnapshot({
+  const transcriptChanged = getFinalSnapshot(repo, {
     sessionId: "session-final",
     trackId: "track-mic",
     at: 5002,
@@ -287,7 +304,7 @@ test("diarization evidence rejects provisional or nonterminal latest transcripti
     )
     .run();
 
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-final",
     trackId: "track-mic",
     at: 5000,
@@ -297,12 +314,12 @@ test("diarization evidence rejects provisional or nonterminal latest transcripti
     {
       eligible: snapshot.eligible,
       reason: snapshot.reason,
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     },
     {
       eligible: false,
       reason: "final_transcript_pending",
-      transcriptRevision: null,
+      evidenceRevision: null,
     }
   );
 });
@@ -312,7 +329,7 @@ test("diarization evidence reports terminal retained audio expiry explicitly", (
   t.after(() => repo.close());
   seedFinalEvidence(repo);
 
-  const snapshot = repo.getDiarizationEvidenceSnapshot({
+  const snapshot = getFinalSnapshot(repo, {
     sessionId: "session-final",
     trackId: "track-mic",
     at: 10_001,
@@ -322,9 +339,9 @@ test("diarization evidence reports terminal retained audio expiry explicitly", (
     {
       eligible: snapshot.eligible,
       reason: snapshot.reason,
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     },
-    { eligible: false, reason: "audio_expired", transcriptRevision: null }
+    { eligible: false, reason: "final_audio_expired", evidenceRevision: null }
   );
 });
 
@@ -339,7 +356,9 @@ function immutableWorkerSnapshot() {
   const snapshot = {
     eligible: true,
     reason: null,
-    transcriptRevision: "d".repeat(64),
+    stableAudioRevision: "b".repeat(64),
+    transcriptRevision: "c".repeat(64),
+    evidenceRevision: "d".repeat(64),
     session: { id: "session-worker", started_at: 1000, ended_at: 9000, status: "completed" },
     track: {
       id: "track-worker",
@@ -379,6 +398,30 @@ function immutableWorkerSnapshot() {
   return Object.freeze(snapshot);
 }
 
+test("diarization job keys expose the combined evidence revision without changing serialization", () => {
+  const {
+    buildDiarizationJobKey,
+    parseDiarizationJobKey,
+  } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const evidenceRevision = "a".repeat(64);
+  const legacySerialized = `diarize_track:session-worker:track-worker:${evidenceRevision}:jarvis-session-diarization-v1`;
+
+  assert.equal(
+    buildDiarizationJobKey({
+      sessionId: "session-worker",
+      trackId: "track-worker",
+      evidenceRevision,
+    }),
+    legacySerialized
+  );
+  assert.deepEqual(parseDiarizationJobKey(legacySerialized), {
+    sessionId: "session-worker",
+    trackId: "track-worker",
+    evidenceRevision,
+    policyId: "jarvis-session-diarization-v1",
+  });
+});
+
 test("exports one immutable versioned diarization policy for the actual CPU models", () => {
   const { SESSION_DIARIZATION_POLICY } = require("../../src/jarvis/main/SessionDiarizationPolicy");
 
@@ -413,6 +456,7 @@ test("worker preserves raw multi-turn evidence and clusters adjacent chunks by f
   };
   try {
     const worker = new SessionDiarizationWorker({
+      speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
       repository: {
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
@@ -448,7 +492,7 @@ test("worker preserves raw multi-turn evidence and clusters adjacent chunks by f
     const key = buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     });
 
     const result = await worker.run(
@@ -464,7 +508,7 @@ test("worker preserves raw multi-turn evidence and clusters adjacent chunks by f
 
     assert.deepEqual(result, { executionDevice: "cpu", status: "completed" });
     assert.deepEqual(verified, ["chunk-1", "chunk-2"]);
-    assert.equal(leaseRenewals, 2);
+    assert.equal(leaseRenewals, 15);
     assert.equal(fetchCalls, 0);
     assert.equal(artifactHashCalls, 1);
     assert.equal(committed.run.modelArtifactSha256, "a".repeat(64));
@@ -522,6 +566,7 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
   let commits = 0;
   const createWorker = (diarizeAudio, embedWindow) =>
     new SessionDiarizationWorker({
+      speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
       repository: {
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
@@ -541,7 +586,7 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
   const key = buildDiarizationJobKey({
     sessionId: "session-worker",
     trackId: "track-worker",
-    transcriptRevision: snapshot.transcriptRevision,
+    evidenceRevision: snapshot.evidenceRevision,
   });
   const job = {
     id: "job-diarize",
@@ -583,6 +628,7 @@ test("worker propagates every strict sidecar failure without committing an empty
     "DIARIZATION_SIDECAR_EXIT_NONZERO",
   ]) {
     const worker = new SessionDiarizationWorker({
+      speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
       repository: {
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
@@ -610,7 +656,7 @@ test("worker propagates every strict sidecar failure without committing an empty
         input_hash: buildDiarizationJobKey({
           sessionId: "session-worker",
           trackId: "track-worker",
-          transcriptRevision: snapshot.transcriptRevision,
+          evidenceRevision: snapshot.evidenceRevision,
         }),
         model_version: "jarvis-session-diarization-v1",
       }),
@@ -631,12 +677,13 @@ test("worker distinguishes expired and superseded durable evidence", async () =>
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: revision,
+      evidenceRevision: revision,
     }),
     model_version: "jarvis-session-diarization-v1",
   };
   const createWorker = (snapshot) =>
     new SessionDiarizationWorker({
+      speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
       repository: {
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
@@ -652,18 +699,77 @@ test("worker distinguishes expired and superseded durable evidence", async () =>
     });
 
   await assert.rejects(
-    createWorker({ eligible: false, reason: "audio_expired", transcriptRevision: null }).run(job),
+    createWorker({
+      eligible: false,
+      reason: "final_audio_expired",
+      stableAudioRevision: null,
+      transcriptRevision: null,
+      evidenceRevision: null,
+    }).run(job),
     { code: "DIARIZATION_AUDIO_EXPIRED" }
   );
   await assert.rejects(
     createWorker({
       eligible: true,
       reason: null,
-      transcriptRevision: "b".repeat(64),
+      stableAudioRevision: "c".repeat(64),
+      transcriptRevision: "d".repeat(64),
+      evidenceRevision: "b".repeat(64),
       chunks: [],
     }).run(job),
     { code: "DIARIZATION_SUPERSEDED" }
   );
+});
+
+test("worker re-evaluates every evidence revision immediately before commit", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const evidenceRevision = "a".repeat(64);
+  const first = {
+    eligible: true,
+    reason: null,
+    stableAudioRevision: "b".repeat(64),
+    transcriptRevision: "c".repeat(64),
+    evidenceRevision,
+    chunks: [],
+  };
+  const changedBeforeCommit = {
+    ...first,
+    stableAudioRevision: "d".repeat(64),
+  };
+  let reads = 0;
+  const worker = new SessionDiarizationWorker({
+    repository: {
+      getDiarizationEvidenceSnapshot: () => (reads++ === 0 ? first : changedBeforeCommit),
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: () => assert.fail("changed evidence committed"),
+    },
+    speakerProcessingPolicy: Object.freeze({ evaluate: (evidence) => evidence }),
+    audioEvidenceReader: {
+      withVerifiedWav: async () => assert.fail("empty final evidence read audio"),
+    },
+    diarizeAudio: async () => assert.fail("empty final evidence ran diarization"),
+    embedWindow: async () => assert.fail("empty final evidence ran embeddings"),
+    modelArtifactSha256: "e".repeat(64),
+    clock: () => 10_000,
+  });
+
+  await assert.rejects(
+    worker.run({
+      id: "job-precommit-cas",
+      session_id: "session-worker",
+      track_id: "track-worker",
+      input_hash: buildDiarizationJobKey({
+        sessionId: "session-worker",
+        trackId: "track-worker",
+        evidenceRevision,
+      }),
+      model_version: "jarvis-session-diarization-v1",
+    }),
+    { code: "DIARIZATION_SUPERSEDED" }
+  );
+  assert.equal(reads, 2);
 });
 
 test("worker marks transcript-confirmed cross-track echo and excludes its centroid contribution", async () => {
@@ -682,6 +788,7 @@ test("worker marks transcript-confirmed cross-track echo and excludes its centro
   };
   let committed = null;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => snapshot,
       getDiarizationRun: () => null,
@@ -711,7 +818,7 @@ test("worker marks transcript-confirmed cross-track echo and excludes its centro
   const key = buildDiarizationJobKey({
     sessionId: "session-worker",
     trackId: "track-worker",
-    transcriptRevision: snapshot.transcriptRevision,
+    evidenceRevision: snapshot.evidenceRevision,
   });
 
   await worker.run({
@@ -749,6 +856,7 @@ test("worker returns an existing completed run before loading retained audio", a
   let snapshots = 0;
   let artifacts = 0;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => {
         snapshots += 1;
@@ -776,7 +884,7 @@ test("worker returns an existing completed run before loading retained audio", a
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: revision,
+      evidenceRevision: revision,
     }),
     model_version: "jarvis-session-diarization-v1",
   });
@@ -801,6 +909,7 @@ test("worker verifies every authoritative no-speech chunk and commits an empty c
   const verified = [];
   let committed = null;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => snapshot,
       getDiarizationRun: () => null,
@@ -829,7 +938,7 @@ test("worker verifies every authoritative no-speech chunk and commits an empty c
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     }),
     model_version: "jarvis-session-diarization-v1",
   });
@@ -848,6 +957,7 @@ test("worker preserves a short raw turn while padding only its embedding window"
   let committed = null;
   let embeddedTurn = null;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => snapshot,
       getDiarizationRun: () => null,
@@ -877,7 +987,7 @@ test("worker preserves a short raw turn while padding only its embedding window"
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     }),
     model_version: "jarvis-session-diarization-v1",
   });
@@ -913,11 +1023,12 @@ test("worker sorts raw turns before assigning stable first-appearance labels and
   const key = buildDiarizationJobKey({
     sessionId: "session-worker",
     trackId: "track-worker",
-    transcriptRevision: snapshot.transcriptRevision,
+    evidenceRevision: snapshot.evidenceRevision,
   });
   const runWith = async (rawTurns) => {
     let committed;
     const worker = new SessionDiarizationWorker({
+      speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
       repository: {
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
@@ -998,6 +1109,7 @@ test("worker links a turn to every strictly overlapping final segment", async ()
   };
   let committed;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => snapshot,
       getDiarizationRun: () => null,
@@ -1032,7 +1144,7 @@ test("worker links a turn to every strictly overlapping final segment", async ()
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     }),
     model_version: "jarvis-session-diarization-v1",
   });
@@ -1052,6 +1164,7 @@ test("worker persists minimum centroid consistency instead of perfect synthetic 
   let committed;
   let embeddingIndex = 0;
   const worker = new SessionDiarizationWorker({
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
     repository: {
       getDiarizationEvidenceSnapshot: () => snapshot,
       getDiarizationRun: () => null,
@@ -1083,7 +1196,7 @@ test("worker persists minimum centroid consistency instead of perfect synthetic 
     input_hash: buildDiarizationJobKey({
       sessionId: "session-worker",
       trackId: "track-worker",
-      transcriptRevision: snapshot.transcriptRevision,
+      evidenceRevision: snapshot.evidenceRevision,
     }),
     model_version: "jarvis-session-diarization-v1",
   });
