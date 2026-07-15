@@ -931,6 +931,12 @@ const MEMORY_LINEAGE_SCHEMA = `
     owner_subject_id TEXT CHECK(
       owner_subject_id IS NULL OR (typeof(owner_subject_id) = 'text' AND length(owner_subject_id) > 0)
     ),
+    owner_display_name_snapshot TEXT CHECK(
+      owner_display_name_snapshot IS NULL OR (
+        typeof(owner_display_name_snapshot) = 'text'
+        AND length(trim(owner_display_name_snapshot)) > 0
+      )
+    ),
     status TEXT NOT NULL CHECK(typeof(status) = 'text' AND status IN ('open','completed','dismissed')),
     completed_at INTEGER CHECK(
       completed_at IS NULL OR (typeof(completed_at) = 'integer' AND completed_at >= 0)
@@ -946,7 +952,14 @@ const MEMORY_LINEAGE_SCHEMA = `
     ),
     created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
     updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
-    CHECK((owner_subject_kind IS NULL) = (owner_subject_id IS NULL)),
+    CHECK(
+      (owner_subject_kind IS NULL AND owner_subject_id IS NULL AND owner_display_name_snapshot IS NULL)
+      OR (
+        owner_subject_kind IS NOT NULL
+        AND owner_subject_id IS NOT NULL
+        AND owner_display_name_snapshot IS NOT NULL
+      )
+    ),
     CHECK(
       (status = 'open' AND completed_at IS NULL AND dismissed_at IS NULL)
       OR (status = 'completed' AND completed_at IS NOT NULL AND dismissed_at IS NULL)
@@ -1510,9 +1523,22 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
   CREATE TRIGGER IF NOT EXISTS todos_v2_immutable_content
   BEFORE UPDATE OF id, canonical_base_key, instance_key, title, owner_subject_kind,
-    owner_subject_id, recurrence_of_id, created_at ON todos_v2
+    owner_subject_id, owner_display_name_snapshot, recurrence_of_id, created_at ON todos_v2
   BEGIN
     SELECT RAISE(ABORT, 'todo content is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding
+  BEFORE INSERT ON todos_v2
+  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings AS binding
+    WHERE binding.analysis_input_id = NEW.source_analysis_input_id
+      AND binding.subject_kind = NEW.owner_subject_kind
+      AND binding.subject_id = NEW.owner_subject_id
+      AND binding.subject_display_name_snapshot = NEW.owner_display_name_snapshot
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo owner binding is invalid');
   END;
   CREATE TRIGGER IF NOT EXISTS todos_v2_source_guard
   BEFORE UPDATE OF source_analysis_input_id ON todos_v2

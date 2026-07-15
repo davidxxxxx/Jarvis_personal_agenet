@@ -65,6 +65,7 @@ const LINEAGE_TRIGGERS = [
   "memory_supersessions_validate_slot",
   "memory_conflict_members_validate_slot",
   "memory_conflict_groups_validate_resolution",
+  "todos_v2_validate_owner_binding",
   "todos_v2_terminal_state",
   "suggestions_v2_terminal_state",
   "evidence_refs_validate_target_insert",
@@ -784,6 +785,252 @@ test("speaker bindings require durable targets and exact session scope", () => {
   }
 });
 
+test("todo owner snapshots require the exact analysis input binding and survive source deletion", () => {
+  const db = createPreviousVersionDatabase();
+  try {
+    seedCaptureLineage(db);
+    db.exec(`
+      INSERT INTO people (id, display_name, is_self, created_at, last_seen_at) VALUES
+        ('person-1', 'Self', 1, 1000, 5000),
+        ('person-bound', 'Bound person', 0, 1000, 5000),
+        ('person-outside', 'Outside person', 0, 1000, 5000);
+      INSERT INTO speaker_clusters (
+        id, session_id, local_label, model_id, person_id, link_state, created_at, updated_at
+      ) VALUES
+        ('cluster-person-bound', 'session-1', 'speaker_1', 'speaker-v1', 'person-bound', 'confirmed', 5000, 5000),
+        ('cluster-bound', 'session-1', 'speaker_2', 'speaker-v1', NULL, 'unknown', 5000, 5000),
+        ('cluster-outside', 'session-1', 'speaker_3', 'speaker-v1', 'person-outside', 'confirmed', 5000, 5000);
+    `);
+    applyJarvisMigrations(db);
+    db.prepare(
+      `INSERT INTO analysis_inputs (
+         id, session_id, transcript_revision, identity_revision, prompt_version,
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'input-owner-snapshots', 'session-1', ?, ?, 'jarvis-analysis-v2',
+         ?, ?, ?, ?, ?, ?, 6000
+       )`
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_C,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
+    db.exec(`
+      INSERT INTO analysis_input_speaker_bindings (
+        analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+      ) VALUES
+        ('input-owner-snapshots', 'P1', 'person', 'person-bound', 'Bound person'),
+        ('input-owner-snapshots', 'P2', 'speaker_cluster', 'cluster-bound', 'speaker_2');
+    `);
+
+    const insertTodo = db.prepare(
+      `INSERT INTO todos_v2 (
+         id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+         status, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (
+         @id, @canonicalBaseKey, @instanceKey, @title,
+         @ownerSubjectKind, @ownerSubjectId, @ownerDisplayNameSnapshot,
+         'open', @sourceAnalysisInputId, @provenance, 6000, 6000
+       )`
+    );
+    const modelTodo = {
+      canonicalBaseKey: HASH_A,
+      title: "Bound todo",
+      sourceAnalysisInputId: "input-owner-snapshots",
+      provenance: "evidence_linked",
+    };
+
+    assert.equal(
+      insertTodo.run({
+        ...modelTodo,
+        id: "todo-person-owner",
+        instanceKey: HASH_B,
+        ownerSubjectKind: "person",
+        ownerSubjectId: "person-bound",
+        ownerDisplayNameSnapshot: "Bound person",
+      }).changes,
+      1
+    );
+    assert.equal(
+      insertTodo.run({
+        ...modelTodo,
+        id: "todo-cluster-owner",
+        instanceKey: HASH_C,
+        ownerSubjectKind: "speaker_cluster",
+        ownerSubjectId: "cluster-bound",
+        ownerDisplayNameSnapshot: "speaker_2",
+      }).changes,
+      1
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          ...modelTodo,
+          id: "todo-wrong-snapshot",
+          instanceKey: HASH_D,
+          ownerSubjectKind: "person",
+          ownerSubjectId: "person-bound",
+          ownerDisplayNameSnapshot: "Renamed person",
+        }),
+      /todo owner binding is invalid/
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          ...modelTodo,
+          id: "todo-wrong-cluster-snapshot",
+          instanceKey: HASH_D,
+          ownerSubjectKind: "speaker_cluster",
+          ownerSubjectId: "cluster-bound",
+          ownerDisplayNameSnapshot: "speaker_renamed",
+        }),
+      /todo owner binding is invalid/
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          ...modelTodo,
+          id: "todo-owner-outside-input",
+          instanceKey: HASH_D,
+          ownerSubjectKind: "speaker_cluster",
+          ownerSubjectId: "cluster-outside",
+          ownerDisplayNameSnapshot: "speaker_3",
+        }),
+      /todo owner binding is invalid/
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          ...modelTodo,
+          id: "todo-model-without-owner",
+          instanceKey: HASH_D,
+          ownerSubjectKind: null,
+          ownerSubjectId: null,
+          ownerDisplayNameSnapshot: null,
+        }),
+      /todo owner binding is invalid/
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          ...modelTodo,
+          id: "todo-blank-snapshot",
+          instanceKey: HASH_D,
+          ownerSubjectKind: "person",
+          ownerSubjectId: "person-bound",
+          ownerDisplayNameSnapshot: "   ",
+          sourceAnalysisInputId: null,
+          provenance: "legacy_unverified",
+        }),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          id: "todo-owner-without-snapshot",
+          canonicalBaseKey: HASH_D,
+          instanceKey: HASH_E,
+          title: "Missing historical snapshot",
+          ownerSubjectKind: "person",
+          ownerSubjectId: "deleted-person",
+          ownerDisplayNameSnapshot: null,
+          sourceAnalysisInputId: null,
+          provenance: "legacy_unverified",
+        }),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
+    );
+    assert.throws(
+      () =>
+        insertTodo.run({
+          id: "todo-snapshot-without-owner",
+          canonicalBaseKey: HASH_D,
+          instanceKey: HASH_E,
+          title: "Orphaned historical snapshot",
+          ownerSubjectKind: null,
+          ownerSubjectId: null,
+          ownerDisplayNameSnapshot: "Historical name",
+          sourceAnalysisInputId: null,
+          provenance: "legacy_unverified",
+        }),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
+    );
+    assert.equal(
+      insertTodo.run({
+        id: "todo-legacy-owner",
+        canonicalBaseKey: HASH_D,
+        instanceKey: HASH_E,
+        title: "Historical owner",
+        ownerSubjectKind: "person",
+        ownerSubjectId: "deleted-person",
+        ownerDisplayNameSnapshot: "Historical name",
+        sourceAnalysisInputId: null,
+        provenance: "legacy_unverified",
+      }).changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `UPDATE todos_v2
+             SET owner_display_name_snapshot = 'Hostile rewrite'
+             WHERE id = 'todo-cluster-owner'`
+          )
+          .run(),
+      /todo content is immutable/
+    );
+
+    assert.equal(db.prepare("DELETE FROM sessions WHERE id = 'session-1'").run().changes, 1);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM speaker_clusters").get().count, 0);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+                  source_analysis_input_id, provenance
+           FROM todos_v2
+           ORDER BY id`
+        )
+        .all(),
+      [
+        {
+          id: "todo-cluster-owner",
+          owner_subject_kind: "speaker_cluster",
+          owner_subject_id: "cluster-bound",
+          owner_display_name_snapshot: "speaker_2",
+          source_analysis_input_id: null,
+          provenance: "source_deleted",
+        },
+        {
+          id: "todo-legacy-owner",
+          owner_subject_kind: "person",
+          owner_subject_id: "deleted-person",
+          owner_display_name_snapshot: "Historical name",
+          source_analysis_input_id: null,
+          provenance: "legacy_unverified",
+        },
+        {
+          id: "todo-person-owner",
+          owner_subject_kind: "person",
+          owner_subject_id: "person-bound",
+          owner_display_name_snapshot: "Bound person",
+          source_analysis_input_id: null,
+          provenance: "source_deleted",
+        },
+      ]
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
 test("analysis input segments accept only current final same-session manifest evidence", () => {
   const db = createPreviousVersionDatabase();
   try {
@@ -911,17 +1158,23 @@ test("history is immutable while session cascade removes owned occurrences and e
       ) VALUES ('memory-1', 'memory-2', 'transcript_replacement', 'input-1', 7000);
 
       INSERT INTO todos_v2 (
-        id, canonical_base_key, instance_key, title, status, completed_at,
+        id, canonical_base_key, instance_key, title,
+        owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+        status, completed_at,
         source_analysis_input_id, provenance, created_at, updated_at
       ) VALUES (
-        'todo-history-previous', '${HASH_D}', '${HASH_E}', 'Previous', 'completed', 5000,
+        'todo-history-previous', '${HASH_D}', '${HASH_E}', 'Previous',
+        'person', 'person-1', 'Local', 'completed', 5000,
         'input-1', 'evidence_linked', 4000, 5000
       );
       INSERT INTO todos_v2 (
-        id, canonical_base_key, instance_key, title, status, recurrence_of_id,
+        id, canonical_base_key, instance_key, title,
+        owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+        status, recurrence_of_id,
         source_analysis_input_id, provenance, created_at, updated_at
       ) VALUES (
-        'todo-history-next', '${HASH_D}', '${HASH_F}', 'Next', 'open', 'todo-history-previous',
+        'todo-history-next', '${HASH_D}', '${HASH_F}', 'Next',
+        'person', 'person-1', 'Local', 'open', 'todo-history-previous',
         'input-1', 'evidence_linked', 6000, 6000
       );
       INSERT INTO todo_revisions (
@@ -1184,10 +1437,11 @@ test("relation guards enforce predecessor, slot, conflict, terminal, and polymor
 
     db.prepare(
       `INSERT INTO todos_v2 (
-       id, canonical_base_key, instance_key, title, status,
+       id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot, status,
          completed_at, source_analysis_input_id, provenance, created_at, updated_at
        ) VALUES (
-         'todo-1', ?, ?, 'Do it', 'completed',
+         'todo-1', ?, ?, 'Do it', 'person', 'person-1', 'Local', 'completed',
          6000, 'input-1', 'evidence_linked', 6000, 6000
        )`
     ).run(HASH_A, HASH_B);
@@ -1286,11 +1540,14 @@ test("occurrences are idempotent per input and revisions must belong to their ca
     `);
     db.prepare(
       `INSERT INTO todos_v2 (
-         id, canonical_base_key, instance_key, title, status,
+         id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot, status,
          source_analysis_input_id, provenance, created_at, updated_at
        ) VALUES
-         ('todo-1', ?, ?, 'Todo one', 'open', 'input-1', 'evidence_linked', 6000, 6000),
-         ('todo-2', ?, ?, 'Todo two', 'open', 'input-1', 'evidence_linked', 6000, 6000)`
+         ('todo-1', ?, ?, 'Todo one', 'person', 'person-1', 'Local', 'open',
+          'input-1', 'evidence_linked', 6000, 6000),
+         ('todo-2', ?, ?, 'Todo two', 'person', 'person-1', 'Local', 'open',
+          'input-1', 'evidence_linked', 6000, 6000)`
     ).run(HASH_A, HASH_D, HASH_B, HASH_E);
     db.exec(`
       INSERT INTO todo_revisions (
@@ -1722,16 +1979,22 @@ test("conflicts, recurrences, acceptances, and topic merges preserve explicit du
 
     db.prepare(
       `INSERT INTO todos_v2 (
-         id, canonical_base_key, instance_key, title, status, completed_at,
+         id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+         status, completed_at,
          source_analysis_input_id, provenance, created_at, updated_at
-       ) VALUES ('todo-previous', ?, ?, 'Previous', 'completed', 6000,
+       ) VALUES ('todo-previous', ?, ?, 'Previous',
+                 'person', 'person-1', 'Local', 'completed', 6000,
                  'input-1', 'evidence_linked', 5000, 6000)`
     ).run(HASH_A, HASH_D);
     db.prepare(
       `INSERT INTO todos_v2 (
-         id, canonical_base_key, instance_key, title, status, recurrence_of_id,
+         id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+         status, recurrence_of_id,
          source_analysis_input_id, provenance, created_at, updated_at
-       ) VALUES ('todo-next', ?, ?, 'Next', 'open', 'todo-previous',
+       ) VALUES ('todo-next', ?, ?, 'Next',
+                 'person', 'person-1', 'Local', 'open', 'todo-previous',
                  'input-1', 'evidence_linked', 7000, 7000)`
     ).run(HASH_A, HASH_E);
     db.exec(`
@@ -1833,6 +2096,8 @@ test("todo transition reasons enforce the actor, source, and state-shape contrac
     db.exec(`
       INSERT INTO sessions (id, started_at, ended_at, status, created_at)
       VALUES ('session-transition-contract', 1000, 5000, 'completed', 1000);
+      INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+      VALUES ('person-1', 'Local', 1, 1000, 5000);
     `);
     applyJarvisMigrations(db);
     db.prepare(
@@ -1854,18 +2119,25 @@ test("todo transition reasons enforce the actor, source, and state-shape contrac
       CLOUD_PAYLOAD_BYTES,
       HASH_F
     );
+    db.exec(`
+      INSERT INTO analysis_input_speaker_bindings (
+        analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+      ) VALUES ('input-transition-contract', 'SELF', 'person', 'person-1', 'Local');
+    `);
     db.prepare(
       `INSERT INTO todos_v2 (
-         id, canonical_base_key, instance_key, title, status,
+         id, canonical_base_key, instance_key, title,
+         owner_subject_kind, owner_subject_id, owner_display_name_snapshot, status,
          source_analysis_input_id, provenance, created_at, updated_at
        ) VALUES
-         ('todo-analysis-created', ?, ?, 'Created', 'open',
+         ('todo-analysis-created', ?, ?, 'Created', 'person', 'person-1', 'Local', 'open',
           'input-transition-contract', 'evidence_linked', 6000, 6000),
-         ('todo-recurrence-created', ?, ?, 'Recurrence', 'open',
+         ('todo-recurrence-created', ?, ?, 'Recurrence', 'person', 'person-1', 'Local', 'open',
           'input-transition-contract', 'evidence_linked', 6000, 6000),
-         ('todo-user-action', ?, ?, 'User action', 'open',
+         ('todo-user-action', ?, ?, 'User action', 'person', 'person-1', 'Local', 'open',
           'input-transition-contract', 'evidence_linked', 6000, 6000),
-         ('todo-suggestion-acceptance', ?, ?, 'Suggestion acceptance', 'open',
+         ('todo-suggestion-acceptance', ?, ?, 'Suggestion acceptance',
+          'person', 'person-1', 'Local', 'open',
           'input-transition-contract', 'evidence_linked', 6000, 6000)`
     ).run(HASH_A, HASH_B, HASH_A, HASH_C, HASH_A, HASH_D, HASH_A, HASH_E);
 
