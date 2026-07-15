@@ -74,6 +74,7 @@ class ProcessingJobRunner {
       "claimJobs",
       "recoverExpiredLeases",
       "renewJobLease",
+      "recordJobExecutionDevice",
       "completeJob",
       "retryJob",
       "blockJob",
@@ -226,7 +227,17 @@ class ProcessingJobRunner {
     heartbeat?.unref?.();
 
     try {
-      const invoke = () => handler(job, context);
+      const invoke = () => {
+        if (this.governor) {
+          const recorded = this.store.recordJobExecutionDevice(job.id, {
+            owner: this.owner,
+            at: this.now(),
+            executionDevice: context.device,
+          });
+          if (!recorded) throw codedError("JOB_LEASE_LOST");
+        }
+        return handler(job, context);
+      };
       let result;
       if (permit !== null) {
         result = await this.heavyGate.runWithinPermit(permit, kind, invoke);

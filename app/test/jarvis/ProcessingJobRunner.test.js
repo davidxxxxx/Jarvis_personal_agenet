@@ -5,6 +5,7 @@ const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
+const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 
 function deferred() {
@@ -954,6 +955,56 @@ test("classifies resolve_identities as CPU speaker work without claiming CUDA", 
     db.prepare("SELECT execution_device FROM processing_jobs WHERE id = 'j1'").get()
       .execution_device,
     "cpu"
+  );
+});
+
+test("a running admitted CPU speaker job is durably visible before its handler completes", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  repository.createSession({ id: "s1", startedAt: 10, micDeviceId: null });
+  seedJob(repository.db, { jobType: "resolve_identities", priority: 45 });
+  const entered = deferred();
+  const release = deferred();
+  const runner = new ProcessingJobRunner({
+    store: repository.captureEvidenceStore,
+    owner: "speaker-status-worker",
+    now: () => 2_000,
+    leaseMs: 1_000,
+    governor: {
+      sample: async () => ({ state: "available", selectedGpuUuid: "GPU-private" }),
+      admit: () => ({ action: "run_cpu", reason: "cpu_backend" }),
+    },
+    heavyGate: new HeavyJobGate(),
+  });
+  runner.register("resolve_identities", async (_job, context) => {
+    assert.equal(context.device, "cpu");
+    assert.equal(context.selectedGpuUuid, null);
+    entered.resolve();
+    await release.promise;
+    return { executionDevice: "cpu" };
+  });
+
+  const running = runner.runOnce(2_000);
+  await entered.promise;
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT state, lease_owner, execution_device FROM processing_jobs WHERE id = 'j1'")
+      .get(),
+    {
+      state: "running",
+      lease_owner: "speaker-status-worker",
+      execution_device: "cpu",
+    }
+  );
+  assert.equal(repository.getRuntimeProcessingStatus().activeExecutionDevice, "cpu");
+
+  release.resolve();
+  assert.equal(await running, 1);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT state, execution_device FROM processing_jobs WHERE id = 'j1'")
+      .get(),
+    { state: "completed", execution_device: "cpu" }
   );
 });
 

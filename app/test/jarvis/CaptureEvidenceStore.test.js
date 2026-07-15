@@ -2101,6 +2101,62 @@ test("rejects stale lease owners and keeps terminal transitions idempotent", (t)
   );
 });
 
+test("records an admitted execution device only for the current live lease owner", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    state: "running",
+    attemptCount: 1,
+    leaseOwner: "worker-current",
+    leaseExpiresAt: 200,
+  });
+
+  assert.equal(
+    store.recordJobExecutionDevice("lease-job", {
+      owner: "worker-stale",
+      at: 100,
+      executionDevice: "cpu",
+    }),
+    false
+  );
+  assert.equal(
+    store.recordJobExecutionDevice("lease-job", {
+      owner: "worker-current",
+      at: 100,
+      executionDevice: "cpu",
+    }),
+    true
+  );
+  assert.equal(
+    store.recordJobExecutionDevice("lease-job", {
+      owner: "worker-current",
+      at: 101,
+      executionDevice: "cuda",
+    }),
+    false
+  );
+  assert.equal(
+    store.recordJobExecutionDevice("lease-job", {
+      owner: "worker-current",
+      at: 200,
+      executionDevice: "cpu",
+    }),
+    false
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT state, lease_owner, lease_expires_at, execution_device FROM processing_jobs WHERE id = 'lease-job'"
+      )
+      .get(),
+    {
+      state: "running",
+      lease_owner: "worker-current",
+      lease_expires_at: 200,
+      execution_device: "cpu",
+    }
+  );
+});
+
 test("resource deferral releases the lease without consuming an attempt or retaining an error", (t) => {
   const { db, store } = fixture(t);
   seedProcessingJob(db, {

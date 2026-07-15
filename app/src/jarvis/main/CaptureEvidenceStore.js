@@ -500,6 +500,17 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > @at
       `),
+      recordLeasedJobExecutionDevice: db.prepare(`
+        UPDATE processing_jobs
+        SET execution_device = @executionDevice
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > @at
+          AND (execution_device IS NULL OR execution_device = @executionDevice)
+      `),
       completeLeasedJob: db.prepare(`
         UPDATE processing_jobs
         SET state = 'completed',
@@ -1350,6 +1361,19 @@ class CaptureEvidenceStore {
     const leaseExpiresAt = at + leaseMs;
     if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
     return this.statements.renewLeasedJob.run({ ...input, leaseExpiresAt }).changes === 1;
+  }
+
+  recordJobExecutionDevice(id, { owner, at, executionDevice }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    if (!["cuda", "cpu", "cloud"].includes(executionDevice)) {
+      throw new TypeError("executionDevice must be cuda, cpu, or cloud");
+    }
+    return (
+      this.statements.recordLeasedJobExecutionDevice.run({
+        ...input,
+        executionDevice,
+      }).changes === 1
+    );
   }
 
   completeJob(id, { owner, at, executionDevice = null }) {

@@ -501,3 +501,36 @@ test("runtime snapshot prefers the currently running preview backend", async () 
 
   assert.equal(result.backend.actualBackend, "cpu");
 });
+
+test("runtime IPC reports durable running CPU work separately from CUDA inventory", async (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({ id: "cpu-session", startedAt: 10, micDeviceId: null });
+  repo.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash,
+        input_version, model_version, attempt_count, lease_owner,
+        lease_expires_at, execution_device, created_at
+      ) VALUES (
+        'cpu-speaker-job', 'cpu-session', 'resolve_identities', 'running', 45,
+        'cpu-speaker-input', 1, 'speaker-identity-resolution-v1', 1,
+        'cpu-worker', 200000, 'cpu', 90000
+      )`
+    )
+    .run();
+  const { handlers } = register({
+    repository: {
+      getRuntimeProcessingStatus: () => repo.getRuntimeProcessingStatus(),
+    },
+  });
+
+  const result = await handlers.get(CHANNELS.getRuntimeStatus)(null);
+
+  assert.deepEqual(result.backend, {
+    actualBackend: "cpu",
+    cudaGpuUuid: "GPU-verified",
+  });
+  assert.equal(result.queue.running, 1);
+  assert.equal(result.queue.byStage.speaker.running, 1);
+});
