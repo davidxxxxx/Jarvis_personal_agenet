@@ -326,6 +326,21 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
         .run("9".repeat(64), "9".repeat(64)).changes,
       1
     );
+    assert.equal(
+      db
+        .prepare(
+          `INSERT INTO todos_v2 (
+             id, canonical_base_key, instance_key, title,
+             owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+             status, source_analysis_input_id, provenance, created_at, updated_at
+           ) VALUES (
+             'todo-valid-unowned', ?, ?, 'Valid unowned model todo',
+             NULL, NULL, NULL, 'open', 'input-v23', 'evidence_linked', 20, 20
+           )`
+        )
+        .run("a".repeat(64), "a".repeat(64)).changes,
+      1
+    );
     assert.throws(
       () =>
         db.exec(`

@@ -908,17 +908,16 @@ test("todo owner snapshots require the exact analysis input binding and survive 
         }),
       /todo owner binding is invalid/
     );
-    assert.throws(
-      () =>
-        insertTodo.run({
-          ...modelTodo,
-          id: "todo-model-without-owner",
-          instanceKey: HASH_D,
-          ownerSubjectKind: null,
-          ownerSubjectId: null,
-          ownerDisplayNameSnapshot: null,
-        }),
-      /todo owner binding is invalid/
+    assert.equal(
+      insertTodo.run({
+        ...modelTodo,
+        id: "todo-model-without-owner",
+        instanceKey: HASH_D,
+        ownerSubjectKind: null,
+        ownerSubjectId: null,
+        ownerDisplayNameSnapshot: null,
+      }).changes,
+      1
     );
     assert.throws(
       () =>
@@ -1017,6 +1016,14 @@ test("todo owner snapshots require the exact analysis input binding and survive 
           owner_display_name_snapshot: "Historical name",
           source_analysis_input_id: null,
           provenance: "legacy_unverified",
+        },
+        {
+          id: "todo-model-without-owner",
+          owner_subject_kind: null,
+          owner_subject_id: null,
+          owner_display_name_snapshot: null,
+          source_analysis_input_id: null,
+          provenance: "source_deleted",
         },
         {
           id: "todo-person-owner",

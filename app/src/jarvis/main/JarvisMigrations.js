@@ -681,7 +681,11 @@ const TODO_OWNER_SNAPSHOT_TRIGGERS = `
   END;
   CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding
   BEFORE INSERT ON todos_v2
-  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
+  WHEN NEW.source_analysis_input_id IS NOT NULL
+    AND NEW.owner_subject_kind IS NOT NULL
+    AND NEW.owner_subject_id IS NOT NULL
+    AND NEW.owner_display_name_snapshot IS NOT NULL
+    AND NOT EXISTS (
     SELECT 1
     FROM analysis_input_speaker_bindings AS binding
     WHERE binding.analysis_input_id = NEW.source_analysis_input_id
@@ -695,7 +699,11 @@ const TODO_OWNER_SNAPSHOT_TRIGGERS = `
   CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding_update
   BEFORE UPDATE OF owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
     source_analysis_input_id ON todos_v2
-  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
+  WHEN NEW.source_analysis_input_id IS NOT NULL
+    AND NEW.owner_subject_kind IS NOT NULL
+    AND NEW.owner_subject_id IS NOT NULL
+    AND NEW.owner_display_name_snapshot IS NOT NULL
+    AND NOT EXISTS (
     SELECT 1
     FROM analysis_input_speaker_bindings AS binding
     WHERE binding.analysis_input_id = NEW.source_analysis_input_id
