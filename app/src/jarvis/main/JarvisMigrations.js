@@ -1,4 +1,4 @@
-const TARGET_VERSION = 24;
+const TARGET_VERSION = 25;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -2463,6 +2463,72 @@ const EVIDENCE_EXPIRY_TRIGGER = `
   END;
 `;
 
+const LEGACY_V24_ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER = `
+  CREATE TRIGGER analysis_budget_attempts_validate_period
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1 FROM analysis_budget_periods AS period
+    WHERE period.id = NEW.period_id
+      AND period.policy_revision = NEW.policy_revision
+      AND period.currency = NEW.currency
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
+  END;
+`;
+
+const INTERMEDIATE_ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER = `
+  CREATE TRIGGER analysis_budget_attempts_validate_period
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM analysis_budget_periods AS period
+    JOIN analysis_budget_policy_revisions AS policy
+      ON policy.revision = NEW.policy_revision
+    WHERE period.id = NEW.period_id
+      AND period.currency = NEW.currency
+      AND policy.currency = NEW.currency
+      AND policy.effective_at <= NEW.created_at
+      AND policy.revision = (
+        SELECT latest.revision
+        FROM analysis_budget_policy_revisions AS latest
+        WHERE latest.effective_at <= NEW.created_at
+        ORDER BY latest.effective_at DESC, latest.revision DESC
+        LIMIT 1
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
+  END;
+`;
+
+const ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER = `
+  CREATE TRIGGER analysis_budget_attempts_validate_period
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM analysis_budget_periods AS period
+    JOIN analysis_budget_policy_revisions AS policy
+      ON policy.revision = NEW.policy_revision
+    WHERE period.id = NEW.period_id
+      AND period.starts_at <= NEW.created_at
+      AND period.ends_at > NEW.created_at
+      AND period.currency = NEW.currency
+      AND policy.currency = NEW.currency
+      AND policy.effective_at <= NEW.created_at
+      AND policy.revision = (
+        SELECT latest.revision
+        FROM analysis_budget_policy_revisions AS latest
+        WHERE latest.effective_at <= NEW.created_at
+        ORDER BY latest.effective_at DESC, latest.revision DESC
+        LIMIT 1
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
+  END;
+`;
+
 const ANALYSIS_BUDGET_SCHEMA = `
   CREATE TABLE analysis_budget_policy_revisions (
     revision INTEGER PRIMARY KEY AUTOINCREMENT
@@ -2828,17 +2894,7 @@ const ANALYSIS_BUDGET_SCHEMA = `
     SELECT RAISE(ABORT, 'analysis budget attempt unique replacement is forbidden');
   END;
 
-  CREATE TRIGGER analysis_budget_attempts_validate_period
-  BEFORE INSERT ON analysis_budget_attempts
-  WHEN NOT EXISTS (
-    SELECT 1 FROM analysis_budget_periods AS period
-    WHERE period.id = NEW.period_id
-      AND period.policy_revision = NEW.policy_revision
-      AND period.currency = NEW.currency
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
-  END;
+  ${ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER}
 
   CREATE TRIGGER analysis_budget_attempts_validate_reservation_cost
   BEFORE INSERT ON analysis_budget_attempts
@@ -3076,7 +3132,11 @@ function reviewedAnalysisBudgetSchemaSignature(db) {
   }
 }
 
-function retainValidAnalysisBudgetSchema(db) {
+function normalizeSchemaSql(sql) {
+  return sql.replace(/\s+/g, " ").trim().replace(/;$/u, "");
+}
+
+function retainValidAnalysisBudgetSchema(db, { allowAttemptPeriodTriggerUpgrade = false } = {}) {
   const tableNames = Object.keys(ANALYSIS_BUDGET_TABLE_COLUMNS);
   const existing = tableNames.filter((table) => tableExists(db, table));
   if (existing.length === 0) return false;
@@ -3096,10 +3156,31 @@ function retainValidAnalysisBudgetSchema(db) {
   if (ANALYSIS_BUDGET_TRIGGER_NAMES.some((name) => !triggers.has(name))) {
     throw new Error("analysis budget schema collision");
   }
-  if (
-    JSON.stringify(analysisBudgetSchemaSignature(db)) !==
-    JSON.stringify(reviewedAnalysisBudgetSchemaSignature(db))
-  ) {
+  let actualSignature = analysisBudgetSchemaSignature(db);
+  let reviewedSignature = reviewedAnalysisBudgetSchemaSignature(db);
+  if (allowAttemptPeriodTriggerUpgrade) {
+    const isAttemptPeriodTrigger = (entry) =>
+      entry.type === "trigger" && entry.name === "analysis_budget_attempts_validate_period";
+    actualSignature = actualSignature.filter((entry) => !isAttemptPeriodTrigger(entry));
+    reviewedSignature = reviewedSignature.filter((entry) => !isAttemptPeriodTrigger(entry));
+    const actualTrigger = db
+      .prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'analysis_budget_attempts_validate_period'`
+      )
+      .get();
+    const allowedTriggerSql = new Set(
+      [
+        LEGACY_V24_ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER,
+        INTERMEDIATE_ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER,
+        ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER,
+      ].map(normalizeSchemaSql)
+    );
+    if (!actualTrigger || !allowedTriggerSql.has(normalizeSchemaSql(actualTrigger.sql))) {
+      throw new Error("analysis budget schema collision");
+    }
+  }
+  if (JSON.stringify(actualSignature) !== JSON.stringify(reviewedSignature)) {
     throw new Error("analysis budget schema collision");
   }
   const settings = db
@@ -3135,6 +3216,25 @@ function retainValidAnalysisBudgetSchema(db) {
     throw new Error("analysis budget schema collision");
   }
   return true;
+}
+
+function upgradeAnalysisBudgetAttemptPeriodTriggerV25(db) {
+  if (!retainValidAnalysisBudgetSchema(db, { allowAttemptPeriodTriggerUpgrade: true })) {
+    throw new Error("analysis budget schema collision");
+  }
+  const current = db
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'analysis_budget_attempts_validate_period'`
+    )
+    .get();
+  if (
+    normalizeSchemaSql(current.sql) !== normalizeSchemaSql(ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER)
+  ) {
+    db.exec(`DROP TRIGGER analysis_budget_attempts_validate_period;`);
+    db.exec(ANALYSIS_BUDGET_ATTEMPT_PERIOD_TRIGGER);
+  }
+  retainValidAnalysisBudgetSchema(db);
 }
 
 function disambiguateUnboundSpeakerClusters(db) {
@@ -3852,6 +3952,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 24) {
         upgradeTodoOwnerSnapshots(db);
         if (!retainValidAnalysisBudgetSchema(db)) db.exec(ANALYSIS_BUDGET_SCHEMA);
+      }
+      if (fromVersion < 25) {
+        upgradeAnalysisBudgetAttemptPeriodTriggerV25(db);
       }
 
       const violations = db.pragma("foreign_key_check");

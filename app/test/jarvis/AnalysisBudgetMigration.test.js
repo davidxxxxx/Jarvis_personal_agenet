@@ -3,6 +3,21 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
+const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
+
+const LEGACY_V24_ATTEMPT_PERIOD_TRIGGER = `
+  CREATE TRIGGER analysis_budget_attempts_validate_period
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1 FROM analysis_budget_periods AS period
+    WHERE period.id = NEW.period_id
+      AND period.policy_revision = NEW.policy_revision
+      AND period.currency = NEW.currency
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
+  END;
+`;
 
 const TABLES = [
   "analysis_budget_policy_revisions",
@@ -170,11 +185,11 @@ function createRepresentativeV23Database() {
   return db;
 }
 
-test("v24 creates the durable analysis budget schema and reviewed MiniMax price rows", () => {
+test("v25 creates the durable analysis budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 24);
-    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: 24 });
+    assert.equal(TARGET_VERSION, 25);
+    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: 25 });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 
     assert.deepEqual(
@@ -258,7 +273,7 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
         .all(),
       []
     );
-    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 24 });
+    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 25 });
     assert.deepEqual(db.prepare("SELECT id, status FROM sessions").get(), {
       id: "preserved-v23-session",
       status: "completed",
@@ -370,10 +385,69 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     const first = db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all();
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 24 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 25, toVersion: 25 });
     assert.deepEqual(
       db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all(),
       first
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a base v24 database replaces the legacy period trigger before revised-policy reserve", () => {
+  const db = new Database(":memory:");
+  try {
+    migrate(db);
+    db.exec(`
+      DROP TRIGGER analysis_budget_attempts_validate_period;
+      ${LEGACY_V24_ATTEMPT_PERIOD_TRIGGER}
+      PRAGMA user_version = 24;
+    `);
+    assert.match(
+      db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+           WHERE type = 'trigger' AND name = 'analysis_budget_attempts_validate_period'`
+        )
+        .get().sql,
+      /period\.policy_revision = NEW\.policy_revision/
+    );
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 25 });
+    const upgradedSql = db
+      .prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'analysis_budget_attempts_validate_period'`
+      )
+      .get().sql;
+    assert.match(upgradedSql, /period\.starts_at <= NEW\.created_at/);
+    assert.match(upgradedSql, /ORDER BY latest\.effective_at DESC, latest\.revision DESC/);
+
+    const repository = new AnalysisBudgetRepository(db);
+    const at = Date.UTC(2026, 6, 15, 4);
+    repository.initialize({
+      monthlyLimitMicrousd: 5_000_000,
+      timezone: "Asia/Shanghai",
+      at,
+    });
+    repository.setPolicy({
+      monthlyLimitMicrousd: 10_000_000,
+      timezone: "Asia/Shanghai",
+      at: at + 1,
+    });
+    assert.equal(
+      repository.reserve({
+        requestId: "request-upgraded-v24",
+        jobId: "job-upgraded-v24",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        estimatedUsage: { inputTokens: 1, outputTokens: 1 },
+        at: at + 2,
+      }).ok,
+      true
     );
   } finally {
     db.close();
@@ -648,7 +722,7 @@ test("attempt rows enforce one logical request and the legal durable state trans
         INSERT INTO analysis_budget_periods (
           month_key, timezone, starts_at, ends_at, currency,
           monthly_limit_microusd, policy_revision, created_at
-        ) VALUES ('2026-07', 'Asia/Shanghai', 100, 200, 'USD', 5000000, ?, 1)
+        ) VALUES ('2026-07', 'Asia/Shanghai', 1, 200, 'USD', 5000000, ?, 1)
       `
       )
       .run(revision).lastInsertRowid;
@@ -791,7 +865,7 @@ test("attempt rows enforce one logical request and the legal durable state trans
   }
 });
 
-test("a hostile preexisting budget table rolls the v24 migration back without partial schema", () => {
+test("a hostile preexisting budget table rolls the budget migration back without partial schema", () => {
   const db = new Database(":memory:");
   try {
     db.exec(`
