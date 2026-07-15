@@ -627,7 +627,7 @@ class CaptureEvidenceStore {
             WHERE candidate.job_id = processing_jobs.id
               AND candidate.analysis_input_id = processing_jobs.analysis_input_id
               AND candidate.desired_vector_hash = processing_jobs.desired_head_hash
-              AND candidate.state IN ('validated','applied')
+              AND candidate.state IN ('validated','applied','superseded')
               AND attempt.job_id = processing_jobs.id
               AND attempt.state = 'reconciled'
           )
@@ -647,7 +647,7 @@ class CaptureEvidenceStore {
           AND job.lease_expires_at <= @at
           AND candidate.analysis_input_id = job.analysis_input_id
           AND candidate.desired_vector_hash = job.desired_head_hash
-          AND candidate.state IN ('validated','applied')
+          AND candidate.state IN ('validated','applied','superseded')
           AND attempt.job_id = job.id
           AND attempt.state = 'reconciled'
         ORDER BY candidate.created_at ASC, candidate.id ASC

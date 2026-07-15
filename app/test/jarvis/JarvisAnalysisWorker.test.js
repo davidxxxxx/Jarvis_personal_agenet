@@ -134,6 +134,22 @@ test("startup applies a validated candidate and completes it with zero client ca
   ]);
 });
 
+test("startup supersedes a reconciled superseded candidate with zero network or apply calls", () => {
+  const { worker, calls } = workerHarness();
+
+  assert.deepEqual(
+    worker.recoverCandidate({
+      jobId: "job-analysis-1",
+      candidateId: "candidate-1",
+      candidateState: "superseded",
+      leaseOwner: "cloud-worker",
+      leaseExpiresAt: 500,
+    }),
+    { status: "superseded", jobId: "job-analysis-1" }
+  );
+  assert.deepEqual(calls, [["supersede", "job-analysis-1", { owner: "cloud-worker", at: 200 }]]);
+});
+
 const INPUT_HASH = "a".repeat(64);
 const DESIRED_HASH = "b".repeat(64);
 const TRANSCRIPT_HASH = "c".repeat(64);
@@ -311,6 +327,7 @@ function executionHarness({
   attempts = [],
   applyResult = { status: "applied" },
   executionDeviceRecorded = true,
+  executionDeviceError = null,
 } = {}) {
   const JarvisAnalysisWorker = loadWorker();
   const calls = [];
@@ -353,6 +370,7 @@ function executionHarness({
     },
     recordJobExecutionDevice(jobId, input) {
       calls.push(["execution_device", jobId, input]);
+      if (executionDeviceError) throw executionDeviceError;
       return executionDeviceRecorded;
     },
   };
@@ -462,8 +480,8 @@ test("executes the exact durable request ordering and applies through candidate 
       "load_head",
       "policy_snapshot",
       "mark_started",
-      "request",
       "execution_device",
+      "request",
       "validate",
       "reconcile",
       "persist",
@@ -852,24 +870,52 @@ test("a head change after paid response reconciles cost but CAS causes no visibl
   );
 });
 
-test("lease ownership loss before apply preserves reconciled candidate without visible write", async () => {
+test("execution-device lease loss prevents client invocation and fences the started attempt", async () => {
   const { worker, calls } = executionHarness({ executionDeviceRecorded: false });
 
   await assert.rejects(worker.execute(claimedJob()), { code: "JOB_LEASE_LOST" });
   assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+  assert.deepEqual(calls.find(([name]) => name === "usage_unknown")[1], {
+    requestId: "budget-request-1",
+    reasonCode: "process_recovery",
+  });
+  assert.equal(
     calls.some(([name]) => name === "reconcile"),
-    true
+    false
   );
   assert.equal(
     calls.some(([name]) => name === "persist"),
-    true
+    false
   );
   assert.equal(
     calls.some(([name]) => name === "apply"),
     false
   );
+});
+
+test("execution-device persistence failure never starts an unjoined client request", async () => {
+  const persistenceFailure = new Error("execution-device write failed");
+  const { worker, calls } = executionHarness({ executionDeviceError: persistenceFailure });
+
+  await assert.rejects(worker.execute(claimedJob()), persistenceFailure);
+  assert.equal(calls.filter(([name]) => name === "request").length, 0);
+  assert.deepEqual(calls.find(([name]) => name === "usage_unknown")[1], {
+    requestId: "budget-request-1",
+    reasonCode: "process_recovery",
+  });
   assert.equal(
-    calls.some(([name]) => name === "complete"),
+    calls.some(([name]) => name === "reconcile"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "persist"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "apply"),
     false
   );
 });

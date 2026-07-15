@@ -2597,6 +2597,79 @@ test("bounded cloud candidate recovery discovers applied work without a network 
   );
 });
 
+test("restart recovery leases an exactly linked reconciled superseded candidate", (t) => {
+  const { db, store } = fixture(t);
+  const job = seedCloudAnalysisRecovery(db, store, { candidateState: "superseded" });
+
+  assert.deepEqual(
+    store.recoverExpiredCloudCandidateLeases({
+      owner: "restart-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+    }),
+    [
+      {
+        jobId: job.id,
+        candidateId: "analysis-candidate-recovery",
+        candidateState: "superseded",
+        leaseOwner: "restart-cloud-worker",
+        leaseExpiresAt: 500,
+      },
+    ]
+  );
+});
+
+test("superseded candidate recovery rejects forged and unreconciled evidence", (t) => {
+  const scenarios = [
+    {
+      name: "forged desired-vector linkage",
+      corrupt(db) {
+        db.exec("DROP TRIGGER analysis_response_candidates_immutable_update;");
+        db.prepare(
+          "UPDATE analysis_response_candidates SET desired_vector_hash = ? WHERE id = ?"
+        ).run("9".repeat(64), "analysis-candidate-recovery");
+      },
+    },
+    {
+      name: "unreconciled budget attempt",
+      corrupt(db) {
+        db.exec("DROP TRIGGER analysis_budget_attempts_terminal;");
+        db.pragma("ignore_check_constraints = ON");
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET state = 'started' WHERE request_id = ?"
+        ).run("analysis-request-recovery");
+        db.pragma("ignore_check_constraints = OFF");
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const child = fixture(t);
+    const job = seedCloudAnalysisRecovery(child.db, child.store, {
+      candidateState: "superseded",
+    });
+    scenario.corrupt(child.db);
+
+    assert.deepEqual(
+      child.store.recoverExpiredCloudCandidateLeases({
+        owner: "restart-cloud-worker",
+        at: 200,
+        leaseMs: 300,
+        limit: 1,
+      }),
+      [],
+      scenario.name
+    );
+    assert.equal(
+      child.db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(job.id)
+        .lease_owner,
+      "dead-cloud-worker",
+      scenario.name
+    );
+  }
+});
+
 test("cloud candidate lease recovery refuses live, ambiguous, and non-analysis work", (t) => {
   const scenarios = [
     {

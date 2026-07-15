@@ -458,16 +458,37 @@ class JarvisAnalysisWorker {
       state: "started",
       replayed: false,
     });
-    const request = this.client.analyze(reloadedInput);
-    const deviceRecorded =
-      this.store.recordJobExecutionDevice(job.id, {
-        owner: this.owner,
-        at: this._at(),
-        executionDevice: "cloud",
-      }) === true;
+    let deviceRecorded;
+    try {
+      deviceRecorded =
+        this.store.recordJobExecutionDevice(job.id, {
+          owner: this.owner,
+          at: this._at(),
+          executionDevice: "cloud",
+        }) === true;
+    } catch (error) {
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId,
+          reasonCode: "process_recovery",
+        }),
+        { requestId, state: "usage_unknown" }
+      );
+      throw error;
+    }
+    if (!deviceRecorded) {
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId,
+          reasonCode: "process_recovery",
+        }),
+        { requestId, state: "usage_unknown" }
+      );
+      throw codedError("JOB_LEASE_LOST");
+    }
     let response;
     try {
-      response = await request;
+      response = await this.client.analyze(reloadedInput);
     } catch (error) {
       const authoritativeUsage = usage(error?.authoritativeUsage);
       if (authoritativeUsage) {
@@ -514,7 +535,6 @@ class JarvisAnalysisWorker {
     ) {
       throw codedError("ANALYSIS_CANDIDATE_PERSIST_INVALID");
     }
-    if (!deviceRecorded) throw codedError("JOB_LEASE_LOST");
     const applied = this.memoryRepository.applyStoredAnalysisCandidate({
       candidateId: persisted.candidateId,
       jobId: job.id,
@@ -538,13 +558,17 @@ class JarvisAnalysisWorker {
     }
     const jobId = assertId(recovery.jobId, "jobId");
     const candidateId = assertId(recovery.candidateId, "candidateId");
-    if (!new Set(["validated", "applied"]).has(recovery.candidateState)) {
-      throw new TypeError("candidateState must be validated or applied");
+    if (!new Set(["validated", "applied", "superseded"]).has(recovery.candidateState)) {
+      throw new TypeError("candidateState must be validated, applied, or superseded");
     }
     if (recovery.leaseOwner !== this.owner) throw codedError("JOB_LEASE_LOST");
     const at = this._at();
     if (positiveSafeInteger(recovery.leaseExpiresAt, "leaseExpiresAt") <= at) {
       throw codedError("JOB_LEASE_LOST");
+    }
+    if (recovery.candidateState === "superseded") {
+      this._supersede(jobId);
+      return { status: "superseded", jobId };
     }
     let status = "already_applied";
     if (recovery.candidateState === "validated") {

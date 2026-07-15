@@ -25,7 +25,7 @@ Implemented an enqueue-only, durable analysis path with a single-request cloud d
 - `AnalysisScheduler` now persists the exact redacted immutable input, advances the desired head, and enqueues only an exact durable `analyze_session` cloud job. Timers/scheduler calls do not invoke the client.
 - `AgentCloudDispatcher` explicitly requires startup budget recovery wiring, recovers bounded reconciled candidates before claims, claims only one analysis job below the daily-digest priority, coalesces concurrent drains, and joins active work during shutdown.
 - `JarvisAnalysisWorker` validates the claimed job and durable identities; loads input/head/candidate/attempt state; recovers candidates without network; evaluates immutable admission before and after reservation; releases pre-start stale/revoked work; starts exactly one request; durably accounts for ambiguous/known usage; reconciles before candidate persistence; and applies only through the existing desired-head CAS.
-- `CaptureEvidenceStore` has one narrow recovery boundary for expired running `analyze_session` leases backed by an exact `validated` or `applied` candidate and a `reconciled` budget attempt. It changes only owner/lease, never increments the request attempt, and refuses live, ambiguous, digest, and unknown work.
+- `CaptureEvidenceStore` has one narrow recovery boundary for expired running `analyze_session` leases backed by an exact `validated`, `applied`, or `superseded` candidate and a `reconciled` budget attempt. It changes only owner/lease, never increments the request attempt, and refuses live, ambiguous, digest, and unknown work.
 - `JarvisProcessingRuntime` ticks cloud work independently of local work, catches cloud failures without blocking local processing, stops new cloud claims, and joins dispatcher work during shutdown.
 - No transcript, audio, path, secret, device name, key, or candidate payload is placed in the durable job envelope or added to logs by this task.
 
@@ -116,7 +116,7 @@ git diff --check
 
 ## Self-review
 
-- Verified `markStarted` is immediately adjacent to the single client invocation and `execution_device='cloud'` is recorded only afterward.
+- Verified `markStarted` is immediately followed by durable `execution_device='cloud'` persistence before the single client invocation; the invocation is created only inside its awaited disposition boundary.
 - Verified every pre-send stale/admission branch releases the reservation, while budget denial defers without deleting work.
 - Verified every started ambiguous branch becomes `usage_unknown`; known nonzero invalid usage reconciles and blocks; only the durable authoritative-zero marker allows another attempt.
 - Verified reconciliation precedes immutable candidate persistence, preserving the v26 database trigger, and application uses only the existing lease-checked desired-head CAS.
@@ -129,7 +129,7 @@ git diff --check
 
 - Production transport is intentionally not composed or enabled in this task. The worker/dispatcher are dependency-injected and covered only with fake clients.
 - Expired `started` or `usage_unknown` cloud work without a persisted candidate is deliberately not reclaimed or resent. This is the fail-closed ambiguity contract; it requires explicit external/manual disposition rather than risking duplicate paid work.
-- The authorized recovery API handles only `validated` and `applied` candidates. Daily digest and unknown cloud types remain outside this task.
+- The authorized recovery API handles only exact reconciled `validated`, `applied`, and `superseded` candidates. Daily digest and unknown cloud types remain outside this task.
 
 ## Independent review fix pass
 
@@ -246,3 +246,78 @@ git diff --check
 - Candidate recovery remains separate and first. Generic local lease recovery remains cloud-blind.
 - Supersession is terminal and auditable rather than reported as successful completion. Paid CAS supersession retains the previously recorded `execution_device='cloud'`.
 - Production MiniMax remains unreachable by default. Every client in tests is injected and fake; no real key or network was used.
+
+## Independent re-review fix pass (round 2)
+
+Fix scope: independent re-review round 2 `Critical 0 / Important 2 / Minor 0`, based on parent commit `07a6d25f`. The round closes the superseded-candidate crash window and the pre-request execution-device persistence window in one follow-up commit.
+
+### Round 2 fix files
+
+- `app/src/jarvis/main/CaptureEvidenceStore.js`
+- `app/src/jarvis/main/JarvisAnalysisWorker.js`
+- `app/test/jarvis/CaptureEvidenceStore.test.js`
+- `app/test/jarvis/JarvisAnalysisWorker.test.js`
+- `.superpowers/sdd/phase-4-task-3-report.md`
+
+No scheduler, dispatcher, runtime, renderer, IPC, daily-digest, MemoryMerger, key, network, or production transport file changed in this pass.
+
+### Round 2 RED/GREEN evidence
+
+All commands used the same G-drive cache environment documented above.
+
+1. Reconciled superseded-candidate restart convergence
+
+   ```powershell
+   node --test --test-name-pattern="superseded candidate" test/jarvis/CaptureEvidenceStore.test.js test/jarvis/JarvisAnalysisWorker.test.js
+   ```
+
+   - RED: 3 tests, 1 pass / 2 fail. SQLite returned no recovery for an exact reconciled `superseded` candidate, and the worker rejected that state as validated/applied-only. The forged-linkage and unreconciled-attempt refusal case already passed.
+   - GREEN: 3 tests, 3 pass / 0 fail. Recovery repeats the exact job/input/head linkage and reconciled-budget predicate in discovery and lease update, then the worker performs only the lease-checked job supersede. It never loads a payload, applies a candidate, reserves budget, or invokes the client.
+   - Existing refusal coverage also proves daily digest and usage-unknown work remain ineligible.
+
+2. Pre-request execution-device persistence
+
+   ```powershell
+   node --test --test-name-pattern="execution-device" test/jarvis/JarvisAnalysisWorker.test.js
+   ```
+
+   - RED: 2 tests, 0 pass / 2 fail. Both a lost-lease `false` result and a thrown execution-device persistence error invoked the client; the thrown path exited with one request started outside an awaited disposition boundary.
+   - GREEN: 2 tests, 2 pass / 0 fail. Ordering is now `markStarted -> record execution_device -> invoke and immediately await client`. A false or thrown persistence result makes zero client calls and durably fences the started attempt as `usage_unknown` with `process_recovery`; neither path reconciles, persists, or applies a candidate.
+   - Full worker file: 26 tests, 26 pass / 0 fail.
+
+### Round 2 verification
+
+Covering files:
+
+```powershell
+node --test test/jarvis/AnalysisBudgetRepository.test.js test/jarvis/JarvisAnalysisWorker.test.js test/jarvis/AgentCloudDispatcher.test.js test/jarvis/CaptureEvidenceStore.test.js
+```
+
+- Result: 131 tests, 131 pass / 0 fail.
+
+Fresh related main-process combination after formatting:
+
+```powershell
+node --test test/jarvis/CaptureEvidenceStore.test.js test/jarvis/JarvisAnalysisWorker.test.js test/jarvis/AgentCloudDispatcher.test.js test/jarvis/AnalysisScheduler.test.js test/jarvis/JarvisProcessingRuntime.test.js test/jarvis/AgentWorkloadPolicy.test.js test/jarvis/AnalysisBudgetGuard.test.js test/jarvis/AnalysisBudgetRepository.test.js test/jarvis/AnalysisBudgetService.test.js test/jarvis/AnalysisInputBuilder.test.js test/jarvis/AnalysisProductionWiring.test.js test/jarvis/MemoryRepository.test.js test/jarvis/MiniMaxAnalysisClient.test.js test/jarvis/ProcessingJobRunner.test.js
+```
+
+- Result: 304 tests, 304 pass, 0 fail, 0 skipped, 0 cancelled.
+
+Static commands:
+
+```powershell
+npx eslint src/jarvis/main/CaptureEvidenceStore.js src/jarvis/main/JarvisAnalysisWorker.js test/jarvis/CaptureEvidenceStore.test.js test/jarvis/JarvisAnalysisWorker.test.js
+npx prettier --check src/jarvis/main/CaptureEvidenceStore.js src/jarvis/main/JarvisAnalysisWorker.js test/jarvis/CaptureEvidenceStore.test.js test/jarvis/JarvisAnalysisWorker.test.js
+git diff --check
+```
+
+- ESLint: exit 0, no findings; only the existing Node typeless-package performance notice.
+- Prettier: all matched files use Prettier style.
+- `git diff --check`: exit 0; only the Windows checkout line-ending notices were emitted.
+
+### Round 2 self-review
+
+- Superseded-candidate recovery remains bounded and zero-network. SQLite is the authority for exact candidate linkage and reconciled usage; the worker validates the acquired lease and performs only the existing lease-checked supersede transition.
+- An admitted client request cannot exist before execution-device persistence succeeds. Once invoked, it is immediately awaited inside the branch that gives every failure an authoritative-usage reconciliation or conservative `usage_unknown` disposition.
+- Device persistence failure leaves a durable started/usage-unknown authority that cannot be resent on restart, even if the original persistence error prevents later job mutation.
+- No public interface was added. Production MiniMax remains unreachable by default, and every client exercised here is injected and fake.
