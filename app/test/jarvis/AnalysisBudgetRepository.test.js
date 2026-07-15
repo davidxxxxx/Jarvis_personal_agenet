@@ -711,6 +711,71 @@ test("release is pre-transport only while unknown usage retains the estimate for
   });
 });
 
+test("attempt dispositions expose authoritative reconciliation facts", () => {
+  withDatabase((databasePath) => {
+    const at = Date.UTC(2026, 6, 15, 4);
+    const repository = openAnalysisBudgetRepository(databasePath);
+    try {
+      repository.initialize({ monthlyLimitMicrousd: 100, timezone: "Asia/Shanghai", at });
+      repository.reserveNextAttempt(
+        nextReservation(at + 1, { requestId: "request-zero", jobId: "job-zero" })
+      );
+      repository.markStarted({ requestId: "request-zero", at: at + 2 });
+      repository.reconcile({
+        requestId: "request-zero",
+        usage: { inputTokens: 0, outputTokens: 0 },
+        at: at + 3,
+      });
+
+      repository.reserveNextAttempt(
+        nextReservation(at + 4, { requestId: "request-paid", jobId: "job-paid" })
+      );
+      repository.markStarted({ requestId: "request-paid", at: at + 5 });
+      const paid = repository.reconcile({
+        requestId: "request-paid",
+        usage: { inputTokens: 1, outputTokens: 2 },
+        at: at + 6,
+      });
+
+      assert.deepEqual(
+        (({ state, actualInputTokens, actualOutputTokens, actualMicrousd }) => ({
+          state,
+          actualInputTokens,
+          actualOutputTokens,
+          actualMicrousd,
+        }))(repository.getAttemptDispositionByRequestId("request-zero")),
+        {
+          state: "reconciled",
+          actualInputTokens: 0,
+          actualOutputTokens: 0,
+          actualMicrousd: 0,
+        }
+      );
+      const [paidDisposition] = repository.listAttemptDispositionsByJob({
+        jobId: "job-paid",
+        provider: "minimax",
+        operation: "session_analysis",
+      });
+      assert.deepEqual(
+        (({ state, actualInputTokens, actualOutputTokens, actualMicrousd }) => ({
+          state,
+          actualInputTokens,
+          actualOutputTokens,
+          actualMicrousd,
+        }))(paidDisposition),
+        {
+          state: "reconciled",
+          actualInputTokens: 1,
+          actualOutputTokens: 2,
+          actualMicrousd: paid.actualMicrousd,
+        }
+      );
+    } finally {
+      repository.close();
+    }
+  });
+});
+
 test("lowering the active limit preserves held rows and raising it admits only new attempts", () => {
   withDatabase((databasePath) => {
     const at = Date.UTC(2026, 6, 15, 4);
@@ -793,6 +858,9 @@ test("durable attempt disposition queries distinguish every lifecycle and startu
         disposition: "reserved_not_started",
         startupAction: "release_and_retry",
         reasonCode: null,
+        actualInputTokens: null,
+        actualOutputTokens: null,
+        actualMicrousd: null,
         createdAt: at + 1,
         startedAt: null,
         finalizedAt: null,

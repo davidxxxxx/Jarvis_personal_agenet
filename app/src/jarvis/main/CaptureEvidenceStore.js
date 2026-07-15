@@ -653,6 +653,94 @@ class CaptureEvidenceStore {
         ORDER BY candidate.created_at ASC, candidate.id ASC
         LIMIT @limit
       `),
+      recoverExpiredCloudPrestartLease: db.prepare(`
+        UPDATE processing_jobs
+        SET lease_owner = @owner,
+            lease_expires_at = @leaseExpiresAt
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'analyze_session'
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= @at
+          AND analysis_input_id IS NOT NULL
+          AND desired_head_hash IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_response_candidates AS candidate
+            WHERE candidate.job_id = processing_jobs.id
+          )
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM analysis_budget_attempts AS attempt
+              WHERE attempt.job_id = processing_jobs.id
+            )
+            OR EXISTS (
+              SELECT 1 FROM analysis_budget_attempts AS latest
+              WHERE latest.job_id = processing_jobs.id
+                AND latest.attempt_number = (
+                  SELECT MAX(attempt.attempt_number)
+                  FROM analysis_budget_attempts AS attempt
+                  WHERE attempt.job_id = processing_jobs.id
+                )
+                AND latest.provider = 'minimax'
+                AND latest.operation = 'session_analysis'
+                AND (
+                  latest.state = 'released'
+                  OR (
+                    latest.state = 'reconciled'
+                    AND latest.actual_input_tokens = 0
+                    AND latest.actual_output_tokens = 0
+                    AND latest.actual_microusd = 0
+                  )
+                )
+            )
+          )
+      `),
+      listExpiredCloudPrestartLeases: db.prepare(`
+        SELECT job.id
+        FROM processing_jobs AS job
+        WHERE job.lane = 'cloud'
+          AND job.job_type = 'analyze_session'
+          AND job.state = 'running'
+          AND job.completed_at IS NULL
+          AND job.lease_expires_at IS NOT NULL
+          AND job.lease_expires_at <= @at
+          AND job.analysis_input_id IS NOT NULL
+          AND job.desired_head_hash IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_response_candidates AS candidate
+            WHERE candidate.job_id = job.id
+          )
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM analysis_budget_attempts AS attempt
+              WHERE attempt.job_id = job.id
+            )
+            OR EXISTS (
+              SELECT 1 FROM analysis_budget_attempts AS latest
+              WHERE latest.job_id = job.id
+                AND latest.attempt_number = (
+                  SELECT MAX(attempt.attempt_number)
+                  FROM analysis_budget_attempts AS attempt
+                  WHERE attempt.job_id = job.id
+                )
+                AND latest.provider = 'minimax'
+                AND latest.operation = 'session_analysis'
+                AND (
+                  latest.state = 'released'
+                  OR (
+                    latest.state = 'reconciled'
+                    AND latest.actual_input_tokens = 0
+                    AND latest.actual_output_tokens = 0
+                    AND latest.actual_microusd = 0
+                  )
+                )
+            )
+          )
+        ORDER BY job.created_at ASC, job.id ASC
+        LIMIT @limit
+      `),
       listAgentAdmissionBacklog: db.prepare(`
         SELECT job_type, state, priority, next_retry_at
         FROM processing_jobs
@@ -720,6 +808,23 @@ class CaptureEvidenceStore {
             blocked_reason = NULL,
             execution_device = @executionDevice
         WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
+      supersedeLeasedAnalysisJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            completed_at = @at,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'ANALYSIS_SUPERSEDED',
+            blocked_reason = NULL
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'analyze_session'
           AND state = 'running'
           AND completed_at IS NULL
           AND lease_owner = @owner
@@ -875,6 +980,24 @@ class CaptureEvidenceStore {
               leaseOwner: owner,
               leaseExpiresAt,
             });
+          }
+        }
+        return recovered;
+      }
+    );
+    this.recoverExpiredCloudPrestartLeasesTransaction = db.transaction(
+      ({ owner, at, leaseExpiresAt, limit }) => {
+        const candidates = this.statements.listExpiredCloudPrestartLeases.all({ at, limit });
+        const recovered = [];
+        for (const candidate of candidates) {
+          const result = this.statements.recoverExpiredCloudPrestartLease.run({
+            id: candidate.id,
+            owner,
+            at,
+            leaseExpiresAt,
+          });
+          if (result.changes === 1) {
+            recovered.push(this.statements.getProcessingJob.get(candidate.id));
           }
         }
         return recovered;
@@ -1714,6 +1837,22 @@ class CaptureEvidenceStore {
     });
   }
 
+  recoverExpiredCloudPrestartLeases({ owner, at, leaseMs, limit = 1 } = {}) {
+    this._assertIdentifier(owner, "owner");
+    this._assertNonNegativeSafeInteger(at, "at");
+    this._assertPositiveSafeInteger(leaseMs, "leaseMs");
+    this._assertPositiveSafeInteger(limit, "limit");
+    if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
+    const leaseExpiresAt = at + leaseMs;
+    if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
+    return this.recoverExpiredCloudPrestartLeasesTransaction({
+      owner,
+      at,
+      leaseExpiresAt,
+      limit,
+    });
+  }
+
   listAgentAdmissionBacklog({ priorityBefore = 70 } = {}) {
     this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
     return this.statements.listAgentAdmissionBacklog.all({ priorityBefore }).map((row) => ({
@@ -1763,6 +1902,11 @@ class CaptureEvidenceStore {
       throw new TypeError("executionDevice must be cuda, cpu, cloud, or null");
     }
     return this.statements.completeLeasedJob.run({ ...input, executionDevice }).changes === 1;
+  }
+
+  supersedeAnalysisJob(id, { owner, at }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    return this.statements.supersedeLeasedAnalysisJob.run(input).changes === 1;
   }
 
   retryJob(id, { owner, at, nextRetryAt = at, errorCode }) {

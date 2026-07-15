@@ -79,7 +79,13 @@ class JarvisAnalysisWorker {
     validateCandidate = validateCandidateAnalysis,
     now = Date.now,
   } = {}) {
-    for (const method of ["completeJob", "deferJob", "blockJob", "recordJobExecutionDevice"]) {
+    for (const method of [
+      "completeJob",
+      "supersedeAnalysisJob",
+      "deferJob",
+      "blockJob",
+      "recordJobExecutionDevice",
+    ]) {
       requiredMethod(store, method, "store");
     }
     for (const method of [
@@ -156,8 +162,7 @@ class JarvisAnalysisWorker {
     if (
       !HASH_PATTERN.test(job.input_hash) ||
       !HASH_PATTERN.test(job.desired_head_hash) ||
-      !Number.isSafeInteger(job.input_version) ||
-      job.input_version < 1 ||
+      job.input_version !== 1 ||
       job.model_version !== this.model ||
       typeof job.analysis_input_id !== "string" ||
       !job.analysis_input_id ||
@@ -247,6 +252,17 @@ class JarvisAnalysisWorker {
     }
   }
 
+  _supersede(jobId) {
+    if (
+      this.store.supersedeAnalysisJob(jobId, {
+        owner: this.owner,
+        at: this._at(),
+      }) !== true
+    ) {
+      throw codedError("JOB_LEASE_LOST");
+    }
+  }
+
   _block(jobId, errorCode) {
     if (
       this.store.blockJob(jobId, {
@@ -304,20 +320,72 @@ class JarvisAnalysisWorker {
     }
   }
 
-  _handlePriorAttempt(job, attempts) {
+  _requireBudgetTransition(result, { requestId, state, replayed = undefined }) {
+    if (
+      !result ||
+      result.ok !== true ||
+      result.requestId !== requestId ||
+      result.state !== state ||
+      (replayed !== undefined && result.replayed !== replayed)
+    ) {
+      throw codedError("ANALYSIS_BUDGET_TRANSITION_INVALID");
+    }
+    return result;
+  }
+
+  _preparePriorAttempt(job, attempts) {
     const latest = attempts.at(-1);
-    if (latest?.state === "usage_unknown") {
+    if (!latest) return { attemptNumber: 1 };
+    if (
+      !Number.isSafeInteger(latest.attemptNumber) ||
+      latest.attemptNumber < 1 ||
+      typeof latest.requestId !== "string" ||
+      !latest.requestId
+    ) {
+      throw codedError("ANALYSIS_DURABLE_STATE_INVALID");
+    }
+    const attemptNumber = latest.attemptNumber + 1;
+    if (!Number.isSafeInteger(attemptNumber)) {
+      throw codedError("ANALYSIS_DURABLE_STATE_INVALID");
+    }
+    if (latest.state === "reserved") {
+      this._requireBudgetTransition(
+        this.budgetGuard.release({
+          requestId: latest.requestId,
+          reasonCode: "shutdown_before_transport",
+        }),
+        { requestId: latest.requestId, state: "released" }
+      );
+      return { attemptNumber };
+    }
+    if (latest.state === "started") {
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId: latest.requestId,
+          reasonCode: "process_recovery",
+        }),
+        { requestId: latest.requestId, state: "usage_unknown" }
+      );
       this._block(job.id, "analysis_usage_unknown");
       return { status: "blocked", reason: "usage_unknown", jobId: job.id };
     }
-    if (
-      latest?.state === "reconciled" &&
-      job.blocked_reason !== "analysis_authoritative_zero_usage"
-    ) {
+    if (latest.state === "usage_unknown") {
+      this._block(job.id, "analysis_usage_unknown");
+      return { status: "blocked", reason: "usage_unknown", jobId: job.id };
+    }
+    if (latest.state === "reconciled") {
+      if (
+        latest.actualInputTokens === 0 &&
+        latest.actualOutputTokens === 0 &&
+        latest.actualMicrousd === 0
+      ) {
+        return { attemptNumber };
+      }
       this._block(job.id, "analysis_reconciled_without_candidate");
       return { status: "blocked", reason: "reconciled_without_candidate", jobId: job.id };
     }
-    return null;
+    if (latest.state === "released") return { attemptNumber };
+    throw codedError("ANALYSIS_DURABLE_STATE_INVALID");
   }
 
   async execute(claimedJob) {
@@ -331,10 +399,10 @@ class JarvisAnalysisWorker {
         leaseExpiresAt: job.lease_expires_at,
       });
     }
-    const blockedAttempt = this._handlePriorAttempt(job, initial.attempts);
-    if (blockedAttempt) return blockedAttempt;
+    const priorAttempt = this._preparePriorAttempt(job, initial.attempts);
+    if (priorAttempt.status) return priorAttempt;
     if (!this._isCurrent(job, initial.analysisInput, initial.head)) {
-      this._complete(job.id);
+      this._supersede(job.id);
       return { status: "superseded", jobId: job.id };
     }
     const initialDecision = this._evaluate(job, initial.analysisInput, initial.head);
@@ -360,12 +428,22 @@ class JarvisAnalysisWorker {
       this._defer(job.id, "analysis_budget_denied");
       return { status: "deferred", reason: reservation?.reason ?? "budget_denied", jobId: job.id };
     }
+    if (
+      reservation.requestId !== requestId ||
+      reservation.attemptNumber !== priorAttempt.attemptNumber ||
+      reservation.state !== "reserved" ||
+      reservation.replayed !== false ||
+      !Number.isSafeInteger(reservation.reservedMicrousd) ||
+      reservation.reservedMicrousd < 0
+    ) {
+      throw codedError("ANALYSIS_BUDGET_TRANSITION_INVALID");
+    }
 
     const reloadedInput = this.memoryRepository.getAnalysisInputForCloud(job.analysis_input_id);
     const reloadedHead = this.memoryRepository.getAnalysisDesiredHead(job.session_id);
     if (!this._isCurrent(job, reloadedInput, reloadedHead)) {
       this.budgetGuard.release({ requestId, reasonCode: "superseded_before_transport" });
-      this._complete(job.id);
+      this._supersede(job.id);
       return { status: "superseded", jobId: job.id };
     }
     const finalDecision = this._evaluate(job, reloadedInput, reloadedHead);
@@ -375,7 +453,11 @@ class JarvisAnalysisWorker {
       return { status: "deferred", reason: finalDecision.reason, jobId: job.id };
     }
 
-    this.budgetGuard.markStarted(requestId);
+    this._requireBudgetTransition(this.budgetGuard.markStarted(requestId), {
+      requestId,
+      state: "started",
+      replayed: false,
+    });
     const request = this.client.analyze(reloadedInput);
     const deviceRecorded =
       this.store.recordJobExecutionDevice(job.id, {
@@ -442,6 +524,10 @@ class JarvisAnalysisWorker {
     if (!applied || !new Set(["applied", "already_applied", "superseded"]).has(applied.status)) {
       throw codedError("ANALYSIS_CANDIDATE_APPLY_INVALID");
     }
+    if (applied.status === "superseded") {
+      this._supersede(job.id);
+      return { status: "superseded", jobId: job.id };
+    }
     this._complete(job.id, { executionDevice: "cloud" });
     return { status: applied.status, jobId: job.id };
   }
@@ -472,6 +558,10 @@ class JarvisAnalysisWorker {
         throw codedError("ANALYSIS_CANDIDATE_RECOVERY_INVALID");
       }
       status = applied.status;
+    }
+    if (status === "superseded") {
+      this._supersede(jobId);
+      return { status, jobId };
     }
     if (
       this.store.completeJob(jobId, {

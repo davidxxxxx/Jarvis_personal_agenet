@@ -14,6 +14,10 @@ function workerHarness({ applyResult = { status: "applied" } } = {}) {
       calls.push(["complete", jobId, input]);
       return true;
     },
+    supersedeAnalysisJob(jobId, input) {
+      calls.push(["supersede", jobId, input]);
+      return true;
+    },
     deferJob() {
       return true;
     },
@@ -296,6 +300,12 @@ function executionHarness({
     reservedMicrousd: 100,
     replayed: false,
   },
+  markStartedResult = {
+    ok: true,
+    requestId: "budget-request-1",
+    state: "started",
+    replayed: false,
+  },
   response = clientResponse(),
   clientError = null,
   attempts = [],
@@ -327,6 +337,10 @@ function executionHarness({
   const store = {
     completeJob(jobId, input) {
       calls.push(["complete", jobId, input]);
+      return true;
+    },
+    supersedeAnalysisJob(jobId, input) {
+      calls.push(["supersede", jobId, input]);
       return true;
     },
     deferJob(jobId, input) {
@@ -381,7 +395,7 @@ function executionHarness({
     },
     markStarted(requestId) {
       calls.push(["mark_started", requestId]);
-      return { ok: true, requestId, state: "started", replayed: false };
+      return markStartedResult;
     },
     reconcile(input) {
       calls.push(["reconcile", input]);
@@ -460,6 +474,15 @@ test("executes the exact durable request ordering and applies through candidate 
   assert.equal(calls.find(([name]) => name === "request")[1], cloudInput);
 });
 
+test("analysis jobs require the fixed input contract version before durable reads", async () => {
+  const { worker, calls } = executionHarness();
+
+  await assert.rejects(worker.execute(claimedJob({ input_version: 2 })), {
+    code: "ANALYSIS_JOB_CONTRACT_INVALID",
+  });
+  assert.deepEqual(calls, []);
+});
+
 test("finishes a stale job before reserve without a paid attempt", async () => {
   const { worker, calls } = executionHarness({
     initialHead: desiredHead({ desiredVectorHash: "9".repeat(64) }),
@@ -477,6 +500,14 @@ test("finishes a stale job before reserve without a paid attempt", async () => {
     calls.some(([name]) => name === "request"),
     false
   );
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+  assert.deepEqual(calls.find(([name]) => name === "supersede").slice(1), [
+    "job-analysis-1",
+    { owner: "cloud-worker", at: 200 },
+  ]);
 });
 
 test("releases a reservation when the desired head becomes stale before send", async () => {
@@ -497,6 +528,14 @@ test("releases a reservation when the desired head becomes stale before send", a
   assert.equal(
     calls.some(([name]) => name === "request"),
     false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "supersede"),
+    true
   );
 });
 
@@ -557,6 +596,165 @@ test("budget denial defers without deleting pending analysis work", async () => 
     calls.some(([name]) => name === "complete"),
     false
   );
+});
+
+test("prior started and usage-unknown attempts always block before reservation", async () => {
+  for (const state of ["started", "usage_unknown"]) {
+    const { worker, calls } = executionHarness({
+      attempts: [
+        {
+          requestId: `budget-request-${state}`,
+          jobId: "job-analysis-1",
+          attemptNumber: 1,
+          provider: "minimax",
+          model: "MiniMax-M2.7",
+          operation: "session_analysis",
+          state,
+        },
+      ],
+    });
+
+    assert.equal((await worker.execute(claimedJob())).status, "blocked");
+    assert.equal(
+      calls.some(([name]) => name === "reserve"),
+      false
+    );
+    assert.equal(
+      calls.some(([name]) => name === "request"),
+      false
+    );
+    if (state === "started") {
+      assert.deepEqual(calls.find(([name]) => name === "usage_unknown")[1], {
+        requestId: "budget-request-started",
+        reasonCode: "process_recovery",
+      });
+    }
+  }
+});
+
+test("a prior reserved attempt is durably released before the next attempt", async () => {
+  const { worker, calls } = executionHarness({
+    attempts: [
+      {
+        requestId: "budget-request-old",
+        jobId: "job-analysis-1",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        state: "reserved",
+      },
+    ],
+    reserveResult: {
+      ok: true,
+      requestId: "budget-request-1",
+      attemptNumber: 2,
+      state: "reserved",
+      reservedMicrousd: 100,
+      replayed: false,
+    },
+  });
+
+  assert.equal((await worker.execute(claimedJob())).status, "applied");
+  assert.deepEqual(calls.find(([name]) => name === "release")[1], {
+    requestId: "budget-request-old",
+    reasonCode: "shutdown_before_transport",
+  });
+  assert.equal(
+    calls.findIndex(([name]) => name === "release") <
+      calls.findIndex(([name]) => name === "reserve"),
+    true
+  );
+  assert.equal(calls.find(([name]) => name === "reserve")[1].requestId, "budget-request-1");
+});
+
+test("only fresh exact reserve and start transitions may invoke the client", async (t) => {
+  const invalidTransitions = [
+    {
+      name: "replayed reservation",
+      reserveResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        attemptNumber: 1,
+        state: "reserved",
+        reservedMicrousd: 100,
+        replayed: true,
+      },
+    },
+    {
+      name: "wrong reservation request",
+      reserveResult: {
+        ok: true,
+        requestId: "budget-request-other",
+        attemptNumber: 1,
+        state: "reserved",
+        reservedMicrousd: 100,
+        replayed: false,
+      },
+    },
+    {
+      name: "wrong reservation attempt",
+      reserveResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        attemptNumber: 2,
+        state: "reserved",
+        reservedMicrousd: 100,
+        replayed: false,
+      },
+    },
+    {
+      name: "non-reserved reservation",
+      reserveResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        attemptNumber: 1,
+        state: "started",
+        reservedMicrousd: 100,
+        replayed: false,
+      },
+    },
+    {
+      name: "replayed start",
+      markStartedResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        state: "started",
+        replayed: true,
+      },
+    },
+    {
+      name: "wrong start request",
+      markStartedResult: {
+        ok: true,
+        requestId: "budget-request-other",
+        state: "started",
+        replayed: false,
+      },
+    },
+    {
+      name: "non-started transition",
+      markStartedResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        state: "reserved",
+        replayed: false,
+      },
+    },
+  ];
+
+  for (const scenario of invalidTransitions) {
+    await t.test(scenario.name, async () => {
+      const { worker, calls } = executionHarness(scenario);
+      await assert.rejects(worker.execute(claimedJob()), {
+        code: "ANALYSIS_BUDGET_TRANSITION_INVALID",
+      });
+      assert.equal(
+        calls.some(([name]) => name === "request"),
+        false
+      );
+    });
+  }
 });
 
 test("started timeout becomes usage-unknown and a restart never resends it", async () => {
@@ -644,6 +842,14 @@ test("a head change after paid response reconciles cost but CAS causes no visibl
       calls.findIndex(([name]) => name === "apply"),
     true
   );
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "supersede"),
+    true
+  );
 });
 
 test("lease ownership loss before apply preserves reconciled candidate without visible write", async () => {
@@ -702,46 +908,70 @@ test("authoritative zero usage reconciles and durably permits one new attempt", 
         model: "MiniMax-M2.7",
         operation: "session_analysis",
         state: "reconciled",
+        actualInputTokens: 0,
+        actualOutputTokens: 0,
+        actualMicrousd: 0,
       },
     ],
+    reserveResult: {
+      ok: true,
+      requestId: "budget-request-1",
+      attemptNumber: 2,
+      state: "reserved",
+      reservedMicrousd: 100,
+      replayed: false,
+    },
   });
   assert.equal(
-    (
-      await retry.worker.execute(
-        claimedJob({ blocked_reason: "analysis_authoritative_zero_usage" })
-      )
-    ).status,
+    (await retry.worker.execute(claimedJob({ blocked_reason: "stale-non-authority" }))).status,
     "applied"
   );
   assert.equal(retry.calls.filter(([name]) => name === "request").length, 1);
 });
 
-test("reconciled usage without a candidate cannot silently resend", async () => {
-  const { worker, calls } = executionHarness({
-    attempts: [
-      {
-        requestId: "budget-request-paid",
-        jobId: "job-analysis-1",
-        attemptNumber: 1,
-        provider: "minimax",
-        model: "MiniMax-M2.7",
-        operation: "session_analysis",
-        state: "reconciled",
+test("job reasons never override nonzero or unknown reconciled accounting", async () => {
+  for (const accounting of [
+    { actualInputTokens: 1, actualOutputTokens: 0, actualMicrousd: 1 },
+    { actualInputTokens: null, actualOutputTokens: null, actualMicrousd: null },
+  ]) {
+    const { worker, calls } = executionHarness({
+      attempts: [
+        {
+          requestId: "budget-request-paid",
+          jobId: "job-analysis-1",
+          attemptNumber: 1,
+          provider: "minimax",
+          model: "MiniMax-M2.7",
+          operation: "session_analysis",
+          state: "reconciled",
+          ...accounting,
+        },
+      ],
+      reserveResult: {
+        ok: true,
+        requestId: "budget-request-1",
+        attemptNumber: 2,
+        state: "reserved",
+        reservedMicrousd: 100,
+        replayed: false,
       },
-    ],
-  });
+    });
 
-  assert.deepEqual(await worker.execute(claimedJob()), {
-    status: "blocked",
-    reason: "reconciled_without_candidate",
-    jobId: "job-analysis-1",
-  });
-  assert.equal(
-    calls.some(([name]) => name === "reserve"),
-    false
-  );
-  assert.equal(
-    calls.some(([name]) => name === "request"),
-    false
-  );
+    assert.deepEqual(
+      await worker.execute(claimedJob({ blocked_reason: "analysis_authoritative_zero_usage" })),
+      {
+        status: "blocked",
+        reason: "reconciled_without_candidate",
+        jobId: "job-analysis-1",
+      }
+    );
+    assert.equal(
+      calls.some(([name]) => name === "reserve"),
+      false
+    );
+    assert.equal(
+      calls.some(([name]) => name === "request"),
+      false
+    );
+  }
 });

@@ -30,7 +30,11 @@ class AgentCloudDispatcher {
     leaseMs = 120_000,
     recoveryLimit = 100,
   } = {}) {
-    for (const method of ["recoverExpiredCloudCandidateLeases", "claimCloudJobs"]) {
+    for (const method of [
+      "recoverExpiredCloudCandidateLeases",
+      "recoverExpiredCloudPrestartLeases",
+      "claimCloudJobs",
+    ]) {
       requiredMethod(store, method, "store");
     }
     for (const method of ["recoverCandidate", "execute"]) {
@@ -51,6 +55,8 @@ class AgentCloudDispatcher {
     this.inFlight = null;
     this.startPromise = null;
     this.stopPromise = null;
+    this.recoveryInFlight = null;
+    this.recoveryReady = false;
     this.stopping = false;
   }
 
@@ -61,24 +67,45 @@ class AgentCloudDispatcher {
   start() {
     if (this.startPromise) return this.startPromise;
     if (this.stopping) return Promise.resolve(0);
-    this.startPromise = Promise.resolve().then(async () => {
-      if (this.stopping) return 0;
-      await this.recoverIncompleteBudgetAttempts();
-      if (this.stopping) return 0;
-      return this.drainOnce();
+    const operation = this.drainOnce();
+    const wrapped = operation.catch((error) => {
+      if (this.startPromise === wrapped) this.startPromise = null;
+      throw error;
     });
-    return this.startPromise;
+    this.startPromise = wrapped;
+    return wrapped;
   }
 
   drainOnce() {
     if (this.stopping) return Promise.resolve(0);
     if (this.inFlight) return this.inFlight;
-    const operation = this._drain();
+    const operation = this._gatedDrain();
     const wrapped = operation.finally(() => {
       if (this.inFlight === wrapped) this.inFlight = null;
     });
     this.inFlight = wrapped;
     return wrapped;
+  }
+
+  _ensureRecoveryReady() {
+    if (this.recoveryReady) return Promise.resolve();
+    if (this.recoveryInFlight) return this.recoveryInFlight;
+    const operation = Promise.resolve()
+      .then(() => this.recoverIncompleteBudgetAttempts())
+      .then(() => {
+        this.recoveryReady = true;
+      });
+    const wrapped = operation.finally(() => {
+      if (this.recoveryInFlight === wrapped) this.recoveryInFlight = null;
+    });
+    this.recoveryInFlight = wrapped;
+    return wrapped;
+  }
+
+  async _gatedDrain() {
+    await this._ensureRecoveryReady();
+    if (this.stopping) return 0;
+    return this._drain();
   }
 
   async _drain() {
@@ -98,6 +125,27 @@ class AgentCloudDispatcher {
       processed += 1;
     }
     if (this.stopping) return processed;
+    const prestart = this.store.recoverExpiredCloudPrestartLeases({
+      owner: this.owner,
+      at: this._now(),
+      leaseMs: this.leaseMs,
+      limit: 1,
+    });
+    if (!Array.isArray(prestart) || prestart.length > 1) {
+      throw new TypeError("cloud pre-start recovery must return at most one job");
+    }
+    if (prestart.length === 1) {
+      const job = prestart[0];
+      if (
+        job?.job_type !== "analyze_session" ||
+        job?.lane !== "cloud" ||
+        job?.state !== "running"
+      ) {
+        throw new TypeError("pre-start recovery returned a non-analysis cloud job");
+      }
+      await this.worker.execute(job);
+      return processed + 1;
+    }
     const claimed = this.store.claimCloudJobs({
       owner: this.owner,
       at: this._now(),

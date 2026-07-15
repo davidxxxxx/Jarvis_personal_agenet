@@ -68,6 +68,9 @@ function toAttemptDisposition(attempt) {
     disposition: mapping.disposition,
     startupAction: mapping.startupAction,
     reasonCode: attempt.reason_code,
+    actualInputTokens: attempt.actual_input_tokens,
+    actualOutputTokens: attempt.actual_output_tokens,
+    actualMicrousd: attempt.actual_microusd,
     createdAt: attempt.created_at,
     startedAt: attempt.started_at,
     finalizedAt: attempt.finalized_at,
@@ -542,6 +545,7 @@ class AnalysisBudgetRepository {
     return this.db
       .prepare(
         `SELECT request_id, job_id, attempt_number, provider, model, operation,
+                actual_input_tokens, actual_output_tokens, actual_microusd,
                 state, reason_code, created_at, started_at, finalized_at
          FROM analysis_budget_attempts
          WHERE job_id = ? AND provider = ? AND operation = ?
@@ -555,6 +559,7 @@ class AnalysisBudgetRepository {
     return this.db
       .prepare(
         `SELECT request_id, job_id, attempt_number, provider, model, operation,
+                actual_input_tokens, actual_output_tokens, actual_microusd,
                 state, reason_code, created_at, started_at, finalized_at
          FROM analysis_budget_attempts
          WHERE state IN ('reserved', 'started')

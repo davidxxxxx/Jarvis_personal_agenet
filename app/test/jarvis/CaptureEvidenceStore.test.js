@@ -94,7 +94,12 @@ function seedProcessingJob(db, overrides = {}) {
 function seedCloudAnalysisRecovery(
   db,
   store,
-  { attemptState = "reconciled", candidateState = "validated" } = {}
+  {
+    attemptState = "reconciled",
+    candidateState = "validated",
+    persistCandidate = true,
+    actualUsage = { inputTokens: 100, outputTokens: 100 },
+  } = {}
 ) {
   const inputHash = "a".repeat(64);
   const desiredHeadHash = "b".repeat(64);
@@ -149,6 +154,7 @@ function seedCloudAnalysisRecovery(
   const budgetAt = Date.UTC(2026, 6, 16, 4);
   const budget = new AnalysisBudgetRepository(db);
   budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at: budgetAt });
+  if (attemptState === "none") return job;
   budget.reserve({
     requestId: "analysis-request-recovery",
     jobId: job.id,
@@ -159,7 +165,17 @@ function seedCloudAnalysisRecovery(
     estimatedUsage: { inputTokens: 100, outputTokens: 100 },
     at: budgetAt + 1,
   });
+  if (attemptState === "reserved") return job;
+  if (attemptState === "released") {
+    budget.release({
+      requestId: "analysis-request-recovery",
+      reasonCode: "shutdown_before_transport",
+      at: budgetAt + 2,
+    });
+    return job;
+  }
   budget.markStarted({ requestId: "analysis-request-recovery", at: budgetAt + 2 });
+  if (attemptState === "started") return job;
   if (attemptState === "usage_unknown") {
     budget.markUsageUnknown({
       requestId: "analysis-request-recovery",
@@ -169,9 +185,10 @@ function seedCloudAnalysisRecovery(
   } else if (attemptState === "reconciled") {
     budget.reconcile({
       requestId: "analysis-request-recovery",
-      usage: { inputTokens: 100, outputTokens: 100 },
+      usage: actualUsage,
       at: budgetAt + 3,
     });
+    if (!persistCandidate) return job;
     const candidateJson = JSON.stringify({ schemaVersion: "jarvis-analysis-v2" });
     db.prepare(
       `INSERT INTO analysis_response_candidates (
@@ -198,6 +215,44 @@ function seedCloudAnalysisRecovery(
     }
   }
   return job;
+}
+
+function setPrestartRecoveryState(db, store, state) {
+  if (state === "none") {
+    return seedCloudAnalysisRecovery(db, store, {
+      attemptState: "none",
+      persistCandidate: false,
+    });
+  }
+  if (state === "released") {
+    return seedCloudAnalysisRecovery(db, store, {
+      attemptState: "released",
+      persistCandidate: false,
+    });
+  }
+  if (state === "reconciled_zero" || state === "reconciled_unknown") {
+    const job = seedCloudAnalysisRecovery(db, store, {
+      persistCandidate: false,
+      actualUsage: { inputTokens: 0, outputTokens: 0 },
+    });
+    if (state === "reconciled_zero") return job;
+    db.exec(`
+      DROP TRIGGER analysis_budget_attempts_terminal;
+      DROP TRIGGER analysis_budget_attempts_validate_actual_cost;
+    `);
+    db.pragma("ignore_check_constraints = ON");
+    db.prepare(
+      `UPDATE analysis_budget_attempts
+       SET actual_input_tokens = NULL, actual_output_tokens = NULL, actual_microusd = NULL
+       WHERE job_id = ? AND state = 'reconciled'`
+    ).run(job.id);
+    db.pragma("ignore_check_constraints = OFF");
+    return job;
+  }
+  return seedCloudAnalysisRecovery(db, store, {
+    attemptState: state === "reconciled_nonzero" ? "reconciled" : state,
+    persistCandidate: false,
+  });
 }
 
 test("stores track state and gap lifecycle evidence", (t) => {
@@ -2594,6 +2649,143 @@ test("cloud candidate lease recovery refuses live, ambiguous, and non-analysis w
       scenario.name
     );
   }
+});
+
+test("expired cloud pre-start recovery reassigns only absent released or zero-cost attempts", (t) => {
+  for (const state of ["none", "released", "reconciled_zero"]) {
+    const child = fixture(t);
+    const job = setPrestartRecoveryState(child.db, child.store, state);
+    const recovered = child.store.recoverExpiredCloudPrestartLeases({
+      owner: "restart-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+    });
+
+    assert.equal(recovered.length, 1, state);
+    assert.equal(recovered[0].id, job.id, state);
+    assert.equal(recovered[0].state, "running", state);
+    assert.equal(recovered[0].lease_owner, "restart-cloud-worker", state);
+    assert.equal(recovered[0].lease_expires_at, 500, state);
+    assert.equal(recovered[0].attempt_count, 1, state);
+  }
+});
+
+test("expired cloud pre-start recovery refuses ambiguous paid candidate and non-analysis work", async (t) => {
+  const scenarios = [
+    {
+      name: "started",
+      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "started"),
+    },
+    {
+      name: "usage unknown",
+      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "usage_unknown"),
+    },
+    {
+      name: "reconciled nonzero",
+      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "reconciled_nonzero"),
+    },
+    {
+      name: "reconciled unknown",
+      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "reconciled_unknown"),
+    },
+    {
+      name: "candidate present",
+      seed: ({ db, store }) => seedCloudAnalysisRecovery(db, store),
+    },
+    {
+      name: "daily digest",
+      seed: ({ store }) => {
+        const job = store.enqueueCloudJob({
+          sessionId: "s1",
+          jobType: "generate_daily_digest",
+          inputHash: "8".repeat(64),
+          inputVersion: 1,
+          modelVersion: "MiniMax-M2.7",
+        });
+        store.claimCloudJobs({ owner: "dead-cloud-worker", at: 100, leaseMs: 100 });
+        return job;
+      },
+    },
+    {
+      name: "unknown cloud",
+      seed: ({ db }) => {
+        db.pragma("ignore_check_constraints = ON");
+        db.exec("DROP TRIGGER processing_jobs_cloud_contract_insert;");
+        seedProcessingJob(db, {
+          id: "unknown-cloud",
+          jobType: "future_cloud_job",
+          state: "running",
+          lane: "cloud",
+          leaseOwner: "dead-cloud-worker",
+          leaseExpiresAt: 200,
+          inputHash: "unknown-cloud",
+        });
+        db.pragma("ignore_check_constraints = OFF");
+        return { id: "unknown-cloud" };
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, (childTest) => {
+      const child = fixture(childTest);
+      const job = scenario.seed(child);
+      assert.deepEqual(
+        child.store.recoverExpiredCloudPrestartLeases({
+          owner: "restart-cloud-worker",
+          at: 200,
+          leaseMs: 300,
+          limit: 1,
+        }),
+        []
+      );
+      assert.equal(
+        child.db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(job.id)
+          .lease_owner,
+        "dead-cloud-worker"
+      );
+    });
+  }
+});
+
+test("analysis supersede is lease checked and persists an auditable terminal disposition", (t) => {
+  const { db, store } = fixture(t);
+  const job = setPrestartRecoveryState(db, store, "none");
+
+  assert.equal(
+    store.supersedeAnalysisJob(job.id, {
+      owner: "wrong-cloud-worker",
+      at: 199,
+    }),
+    false
+  );
+  assert.equal(
+    store.supersedeAnalysisJob(job.id, {
+      owner: "dead-cloud-worker",
+      at: 199,
+    }),
+    true
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, completed_at, next_retry_at, lease_owner, lease_expires_at,
+                error_code, blocked_reason, execution_device
+         FROM processing_jobs WHERE id = ?`
+      )
+      .get(job.id),
+    {
+      state: "superseded",
+      completed_at: 199,
+      next_retry_at: null,
+      lease_owner: null,
+      lease_expires_at: null,
+      error_code: "ANALYSIS_SUPERSEDED",
+      blocked_reason: null,
+      execution_device: null,
+    }
+  );
 });
 
 test("agent admission backlog includes running and future-retry local work only", (t) => {
