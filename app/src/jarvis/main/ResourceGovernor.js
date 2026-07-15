@@ -10,14 +10,20 @@ const JOB_PRIORITY = Object.freeze({
   preview: 20,
   final_transcription: 30,
   speaker: 40,
-  analysis: 50,
+  identity: 45,
   maintenance: 60,
+  analysis: 70,
+  daily_digest: 80,
 });
 const DEFAULT_SAMPLING_INTERVAL_MS = 15_000;
 const DEFAULT_VRAM_SAFETY_MARGIN_MB = 1_024;
 const MAX_CPU_FALLBACK_THREADS = 4;
 const CPU_UNSAFE_LOAD_PCT = 90;
 const GPU_UNSAFE_UTILIZATION_PCT = 90;
+const CLOUD_BUSY_CPU_LOAD_PCT = 75;
+const CLOUD_BUSY_MEMORY_LOAD_PCT = 80;
+const CLOUD_UNSAFE_MEMORY_LOAD_PCT = 90;
+const CLOUD_LOW_BATTERY_PCT = 20;
 const WINDOWS_POWER_STATUS_SCRIPT = String.raw`
 Add-Type -TypeDefinition @'
 using System;
@@ -52,6 +58,54 @@ $batteryLevelPct = if ($batteryPresent -and $status.BatteryLifePercent -ne 255) 
 
 function unknownCpuReading() {
   return { loadPct: null, telemetryAvailable: false };
+}
+
+function unknownMemoryReading() {
+  return { loadPct: null, telemetryAvailable: false };
+}
+
+function normalizeMemoryReading(reading) {
+  if (
+    reading?.telemetryAvailable === false ||
+    typeof reading?.loadPct !== "number" ||
+    !Number.isFinite(reading.loadPct) ||
+    reading.loadPct < 0 ||
+    reading.loadPct > 100
+  ) {
+    return unknownMemoryReading();
+  }
+  return { loadPct: reading.loadPct, telemetryAvailable: true };
+}
+
+function createSystemMemoryProvider({
+  memoryStatsProvider = () => ({ totalBytes: os.totalmem(), freeBytes: os.freemem() }),
+} = {}) {
+  if (typeof memoryStatsProvider !== "function") {
+    throw new TypeError("memoryStatsProvider must be a function");
+  }
+  return async () => {
+    let reading;
+    try {
+      reading = memoryStatsProvider();
+    } catch {
+      return unknownMemoryReading();
+    }
+    const totalBytes = reading?.totalBytes;
+    const freeBytes = reading?.freeBytes;
+    if (
+      !Number.isFinite(totalBytes) ||
+      totalBytes <= 0 ||
+      !Number.isFinite(freeBytes) ||
+      freeBytes < 0 ||
+      freeBytes > totalBytes
+    ) {
+      return unknownMemoryReading();
+    }
+    return {
+      loadPct: Math.max(0, Math.min(100, ((totalBytes - freeBytes) / totalBytes) * 100)),
+      telemetryAvailable: true,
+    };
+  };
 }
 
 function summarizeCpuTimes(cpus) {
@@ -207,6 +261,67 @@ function orderJobs(kinds) {
     .map(({ kind }) => kind);
 }
 
+function projectCloudPressure(snapshot) {
+  const cpuKnown =
+    snapshot?.cpuTelemetryAvailable === true &&
+    typeof snapshot?.cpuLoadPct === "number" &&
+    Number.isFinite(snapshot.cpuLoadPct) &&
+    snapshot.cpuLoadPct >= 0 &&
+    snapshot.cpuLoadPct <= 100;
+  const memoryKnown =
+    snapshot?.memoryTelemetryAvailable === true &&
+    typeof snapshot?.memoryLoadPct === "number" &&
+    Number.isFinite(snapshot.memoryLoadPct) &&
+    snapshot.memoryLoadPct >= 0 &&
+    snapshot.memoryLoadPct <= 100;
+  const powerKnown =
+    snapshot?.powerTelemetryAvailable === true &&
+    typeof snapshot?.onAcPower === "boolean" &&
+    typeof snapshot?.batterySaver === "boolean";
+  const batteryLevelPct = snapshot?.batteryLevelPct;
+  const batteryLevelKnown =
+    typeof batteryLevelPct === "number" &&
+    Number.isFinite(batteryLevelPct) &&
+    batteryLevelPct >= 0 &&
+    batteryLevelPct <= 100;
+  let state = "normal";
+  let reason = null;
+  if (snapshot?.batterySaver === true) {
+    state = "battery_saver";
+    reason = "battery_saver";
+  } else if (!cpuKnown || !memoryKnown || !powerKnown) {
+    state = "constrained";
+    reason = "telemetry_unavailable";
+  } else if (
+    snapshot.onAcPower === false &&
+    snapshot.batteryPresent === true &&
+    (!batteryLevelKnown || batteryLevelPct <= CLOUD_LOW_BATTERY_PCT)
+  ) {
+    state = "constrained";
+    reason = "low_battery";
+  } else if (snapshot.cpuLoadPct >= CPU_UNSAFE_LOAD_PCT) {
+    state = "constrained";
+    reason = "cpu_load_high";
+  } else if (snapshot.memoryLoadPct >= CLOUD_UNSAFE_MEMORY_LOAD_PCT) {
+    state = "constrained";
+    reason = "memory_pressure";
+  } else if (snapshot.cpuLoadPct >= CLOUD_BUSY_CPU_LOAD_PCT) {
+    state = "busy";
+    reason = "cpu_busy";
+  } else if (snapshot.memoryLoadPct >= CLOUD_BUSY_MEMORY_LOAD_PCT) {
+    state = "busy";
+    reason = "memory_busy";
+  }
+  return Object.freeze({
+    state,
+    reason,
+    cpuLoadPct: cpuKnown ? snapshot.cpuLoadPct : null,
+    memoryLoadPct: memoryKnown ? snapshot.memoryLoadPct : null,
+    onAcPower: powerKnown ? snapshot.onAcPower : null,
+    batteryLevelPct: powerKnown && batteryLevelKnown ? batteryLevelPct : null,
+  });
+}
+
 class ResourceGovernor {
   constructor({
     now = Date.now,
@@ -219,6 +334,7 @@ class ResourceGovernor {
       peakVramMb: null,
     }),
     cpuProvider = null,
+    memoryProvider = null,
     powerProvider = null,
     ownedPidsProvider = () => [process.pid],
     previewEnabled = true,
@@ -227,11 +343,13 @@ class ResourceGovernor {
   } = {}) {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     const effectiveCpuProvider = cpuProvider ?? createWindowsCpuProvider();
+    const effectiveMemoryProvider = memoryProvider ?? createSystemMemoryProvider();
     const effectivePowerProvider = powerProvider ?? createWindowsPowerProvider();
     for (const [name, provider] of Object.entries({
       telemetryProvider,
       cudaProvider,
       cpuProvider: effectiveCpuProvider,
+      memoryProvider: effectiveMemoryProvider,
       powerProvider: effectivePowerProvider,
       ownedPidsProvider,
     })) {
@@ -247,6 +365,7 @@ class ResourceGovernor {
     this.telemetryProvider = telemetryProvider;
     this.cudaProvider = cudaProvider;
     this.cpuProvider = effectiveCpuProvider;
+    this.memoryProvider = effectiveMemoryProvider;
     this.powerProvider = effectivePowerProvider;
     this.ownedPidsProvider = ownedPidsProvider;
     this.previewEnabled = previewEnabled !== false;
@@ -264,12 +383,14 @@ class ResourceGovernor {
       return this.latestSnapshot;
     }
     const ownedPids = this.ownedPidsProvider();
-    const [telemetryResult, cudaResult, cpuResult, powerResult] = await Promise.allSettled([
-      this.telemetryProvider({ ownedPids }),
-      this.cudaProvider(),
-      this.cpuProvider(),
-      this.powerProvider(),
-    ]);
+    const [telemetryResult, cudaResult, cpuResult, memoryResult, powerResult] =
+      await Promise.allSettled([
+        this.telemetryProvider({ ownedPids }),
+        this.cudaProvider(),
+        this.cpuProvider(),
+        this.memoryProvider(),
+        this.powerProvider(),
+      ]);
     const telemetry =
       telemetryResult.status === "fulfilled"
         ? telemetryResult.value
@@ -293,6 +414,10 @@ class ResourceGovernor {
             peakVramMb: null,
           };
     const cpu = cpuResult.status === "fulfilled" ? cpuResult.value : unknownCpuReading();
+    const memory =
+      memoryResult.status === "fulfilled"
+        ? normalizeMemoryReading(memoryResult.value)
+        : unknownMemoryReading();
     const power =
       powerResult.status === "fulfilled"
         ? normalizePowerReading(powerResult.value)
@@ -391,6 +516,8 @@ class ResourceGovernor {
       externalGpuBusy,
       cpuLoadPct: cpuTelemetryAvailable ? cpuLoadPct : null,
       cpuTelemetryAvailable,
+      memoryLoadPct: memory.loadPct,
+      memoryTelemetryAvailable: memory.telemetryAvailable,
       onAcPower: power.onAcPower,
       batteryPresent: power.batteryPresent,
       batteryLevelPct: power.batteryLevelPct,
@@ -411,6 +538,10 @@ class ResourceGovernor {
     };
     this.latestSnapshot = snapshot;
     return snapshot;
+  }
+
+  cloudPressure(snapshot = this.latestSnapshot) {
+    return projectCloudPressure(snapshot);
   }
 
   admit(kind, snapshot = this.latestSnapshot, capability = undefined) {
@@ -514,4 +645,6 @@ module.exports.MAX_CPU_FALLBACK_THREADS = MAX_CPU_FALLBACK_THREADS;
 module.exports.CPU_UNSAFE_LOAD_PCT = CPU_UNSAFE_LOAD_PCT;
 module.exports.GPU_UNSAFE_UTILIZATION_PCT = GPU_UNSAFE_UTILIZATION_PCT;
 module.exports.createWindowsCpuProvider = createWindowsCpuProvider;
+module.exports.createSystemMemoryProvider = createSystemMemoryProvider;
 module.exports.createWindowsPowerProvider = createWindowsPowerProvider;
+module.exports.projectCloudPressure = projectCloudPressure;

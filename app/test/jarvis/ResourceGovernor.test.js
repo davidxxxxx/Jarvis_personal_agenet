@@ -7,7 +7,9 @@ const {
   JOB_PRIORITY,
   orderJobs,
   createWindowsCpuProvider,
+  createSystemMemoryProvider,
   createWindowsPowerProvider,
+  projectCloudPressure,
 } = require("../../src/jarvis/main/ResourceGovernor");
 const {
   parseNvidiaSmiTelemetry,
@@ -57,13 +59,118 @@ test("exports the exact resource state, action, and durable priority contracts",
     preview: 20,
     final_transcription: 30,
     speaker: 40,
-    analysis: 50,
+    identity: 45,
     maintenance: 60,
+    analysis: 70,
+    daily_digest: 80,
   });
   assert.deepEqual(
-    orderJobs(["analysis", "preview", "retention_urgent", "preview", "storage_recovery_compress"]),
-    ["retention_urgent", "storage_recovery_compress", "preview", "preview", "analysis"]
+    orderJobs([
+      "analysis",
+      "preview",
+      "retention_urgent",
+      "maintenance",
+      "daily_digest",
+      "identity",
+    ]),
+    ["retention_urgent", "preview", "identity", "maintenance", "analysis", "daily_digest"]
   );
+});
+
+test("cloud pressure ignores CUDA availability when CPU, memory, and power are healthy", async () => {
+  const governor = new ResourceGovernor({
+    now: () => 1_000,
+    telemetryProvider: async () => ({
+      telemetryAvailable: false,
+      processTelemetryAvailable: false,
+      gpus: [],
+      processes: [],
+      ownedPids: [],
+      externalGpuBusy: false,
+    }),
+    cudaProvider: async () => ({
+      installed: false,
+      verified: false,
+      quarantined: false,
+      gpuUuid: null,
+      peakVramMb: null,
+    }),
+    cpuProvider: async () => ({ loadPct: 20, telemetryAvailable: true }),
+    memoryProvider: async () => ({ loadPct: 40, telemetryAvailable: true }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryPresent: false,
+      batteryLevelPct: null,
+      batterySaver: false,
+    }),
+  });
+
+  const localSnapshot = await governor.sample();
+  assert.equal(localSnapshot.state, "unavailable");
+  assert.equal(localSnapshot.reason, "cuda_unavailable");
+  assert.deepEqual(governor.cloudPressure(localSnapshot), {
+    state: "normal",
+    reason: null,
+    cpuLoadPct: 20,
+    memoryLoadPct: 40,
+    onAcPower: true,
+    batteryLevelPct: null,
+  });
+});
+
+test("cloud pressure projects CPU, memory, and power constraints without GPU fields", () => {
+  const healthy = {
+    cpuLoadPct: 20,
+    cpuTelemetryAvailable: true,
+    memoryLoadPct: 40,
+    memoryTelemetryAvailable: true,
+    onAcPower: true,
+    batteryPresent: false,
+    batteryLevelPct: null,
+    batterySaver: false,
+    powerTelemetryAvailable: true,
+    state: "unavailable",
+    reason: "cuda_unavailable",
+    selectedGpuUuid: "forbidden-gpu",
+    cudaVerified: false,
+  };
+
+  assert.equal(projectCloudPressure({ ...healthy, cpuLoadPct: 75 }).state, "busy");
+  assert.deepEqual(projectCloudPressure({ ...healthy, cpuLoadPct: 95 }).reason, "cpu_load_high");
+  assert.equal(projectCloudPressure({ ...healthy, memoryLoadPct: 80 }).state, "busy");
+  assert.deepEqual(
+    projectCloudPressure({ ...healthy, memoryLoadPct: 95 }).reason,
+    "memory_pressure"
+  );
+  assert.deepEqual(
+    projectCloudPressure({
+      ...healthy,
+      onAcPower: false,
+      batteryPresent: true,
+      batteryLevelPct: 10,
+    }).reason,
+    "low_battery"
+  );
+  assert.deepEqual(projectCloudPressure({ ...healthy, batterySaver: true }).state, "battery_saver");
+  assert.deepEqual(
+    projectCloudPressure({ ...healthy, memoryTelemetryAvailable: false }).reason,
+    "telemetry_unavailable"
+  );
+  assert.equal(Object.isFrozen(projectCloudPressure(healthy)), true);
+  assert.equal("selectedGpuUuid" in projectCloudPressure(healthy), false);
+  assert.equal("cudaVerified" in projectCloudPressure(healthy), false);
+});
+
+test("system memory provider reports bounded load and rejects invalid readings", async () => {
+  const provider = createSystemMemoryProvider({
+    memoryStatsProvider: () => ({ totalBytes: 1_000, freeBytes: 250 }),
+  });
+  assert.deepEqual(await provider(), { loadPct: 75, telemetryAvailable: true });
+
+  const invalid = createSystemMemoryProvider({
+    memoryStatsProvider: () => ({ totalBytes: 0, freeBytes: -1 }),
+  });
+  assert.deepEqual(await invalid(), { loadPct: null, telemetryAvailable: false });
 });
 
 test("external GPU work immediately defers final work and pauses preview", () => {
