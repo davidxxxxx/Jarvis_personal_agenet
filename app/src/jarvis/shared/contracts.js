@@ -8,6 +8,12 @@ const CHANNELS = Object.freeze({
   listSegments: "jarvis:segments:list",
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
+  listSessionSpeakerClusters: "jarvis:speaker:list-session",
+  confirmSpeaker: "jarvis:speaker:confirm",
+  rejectSpeaker: "jarvis:speaker:reject",
+  undoSpeakerCorrection: "jarvis:speaker:undo",
+  listSpeakerCorrections: "jarvis:speaker:corrections",
+  mergePeople: "jarvis:people:merge",
   listAudioChunks: "jarvis:audio:list",
   readAudioChunk: "jarvis:audio:read",
   getSessionDetail: "jarvis:memory:session-detail",
@@ -66,6 +72,43 @@ function assertId(value, name) {
   return value;
 }
 
+function normalizeSpeakerConfirmationInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("speaker confirmation input must be an object");
+  }
+  const allowed = new Set(["clusterId", "personId", "newPersonName", "scope"]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key))
+      throw new TypeError(`speaker confirmation input has unknown key: ${key}`);
+  }
+  if (input.scope !== "session" && input.scope !== "persistent") {
+    throw new TypeError("invalid speaker correction scope");
+  }
+  const hasPersonId = Object.prototype.hasOwnProperty.call(input, "personId");
+  const hasNewPersonName = Object.prototype.hasOwnProperty.call(input, "newPersonName");
+  if (hasPersonId === hasNewPersonName) {
+    throw new TypeError("speaker confirmation must provide exactly one target");
+  }
+  const normalized = {
+    clusterId: assertId(input.clusterId, "clusterId"),
+    scope: input.scope,
+  };
+  if (hasPersonId) {
+    normalized.personId = assertId(input.personId, "personId");
+  } else {
+    if (typeof input.newPersonName !== "string") {
+      throw new TypeError("newPersonName must be a string");
+    }
+    const displayName = input.newPersonName.trim().replace(/\s+/gu, " ");
+    if (!displayName) throw new TypeError("newPersonName must not be empty");
+    if (Array.from(displayName).length > 80) {
+      throw new RangeError("newPersonName must contain at most 80 Unicode code points");
+    }
+    normalized.newPersonName = displayName;
+  }
+  return normalized;
+}
+
 function assertSessionStatus(value) {
   if (!SESSION_STATUSES.has(value)) throw new TypeError("invalid session status");
   return value;
@@ -91,6 +134,7 @@ module.exports = {
   CHANNELS,
   SESSION_STATUSES,
   assertId,
+  normalizeSpeakerConfirmationInput,
   assertSessionStatus,
   assertCaptureFailureCode,
   assertCaptureMode,

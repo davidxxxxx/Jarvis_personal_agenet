@@ -1,4 +1,8 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
+const {
+  assertId: assertJarvisId,
+  normalizeSpeakerConfirmationInput,
+} = require("./src/jarvis/shared/contracts");
 
 const ENROLLMENT_WINDOW_COUNT = 3;
 const ENROLLMENT_WINDOW_SAMPLES = 24_000 * 10;
@@ -50,6 +54,31 @@ function assertVoiceEnrollmentPreflight(sessionId, payload) {
   }
 }
 
+async function invokeSpeakerConfirmation(normalizedInput) {
+  const response = await ipcRenderer.invoke("jarvis:speaker:confirm", normalizedInput);
+  const failure = response?.speakerCorrectionError;
+  if (failure?.code !== "ambiguous_duplicate_name") return response;
+  if (!Array.isArray(failure.candidates)) {
+    throw new TypeError("ambiguous speaker candidates must be an array");
+  }
+  const candidates = failure.candidates.map((candidate) => {
+    const id = assertJarvisId(candidate?.id, "candidate personId");
+    if (
+      typeof candidate?.displayName !== "string" ||
+      !candidate.displayName.trim() ||
+      Array.from(candidate.displayName).length > 80 ||
+      typeof candidate.isSelf !== "boolean"
+    ) {
+      throw new TypeError("ambiguous speaker candidate is invalid");
+    }
+    return { id, displayName: candidate.displayName, isSelf: candidate.isSelf };
+  });
+  const error = new Error("That name matches multiple people. Choose an existing person.");
+  error.code = "ambiguous_duplicate_name";
+  error.candidates = candidates;
+  throw error;
+}
+
 /**
  * Helper to register an IPC listener and return a cleanup function.
  * Ensures renderer code can easily remove listeners to avoid leaks.
@@ -94,6 +123,27 @@ contextBridge.exposeInMainWorld("electronAPI", {
     listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
+    listSessionSpeakerClusters: (sessionId) =>
+      ipcRenderer.invoke("jarvis:speaker:list-session", assertJarvisId(sessionId, "sessionId")),
+    confirmSpeaker: (input) => invokeSpeakerConfirmation(normalizeSpeakerConfirmationInput(input)),
+    rejectSpeaker: (clusterId, personId) =>
+      ipcRenderer.invoke(
+        "jarvis:speaker:reject",
+        assertJarvisId(clusterId, "clusterId"),
+        assertJarvisId(personId, "personId")
+      ),
+    undoSpeakerCorrection: (clusterId) =>
+      ipcRenderer.invoke("jarvis:speaker:undo", assertJarvisId(clusterId, "clusterId")),
+    listSpeakerCorrections: (clusterId) =>
+      ipcRenderer.invoke("jarvis:speaker:corrections", assertJarvisId(clusterId, "clusterId")),
+    mergePeople: (sourcePersonId, targetPersonId) => {
+      const sourceId = assertJarvisId(sourcePersonId, "sourcePersonId");
+      const targetId = assertJarvisId(targetPersonId, "targetPersonId");
+      if (sourceId === targetId) {
+        throw new TypeError("source and target people must be different");
+      }
+      return ipcRenderer.invoke("jarvis:people:merge", sourceId, targetId);
+    },
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
     readAudioChunk: (audioChunkId) => ipcRenderer.invoke("jarvis:audio:read", audioChunkId),
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),

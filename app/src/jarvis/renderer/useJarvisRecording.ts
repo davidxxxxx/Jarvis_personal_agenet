@@ -204,7 +204,8 @@ function safeTimestamp(value: number | undefined, fallback: number): number {
 }
 
 function safePersonId(value: string | undefined): string | null {
-  return value && /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
+  if (!value || /^speaker(?:_|-)\d+$/iu.test(value)) return null;
+  return /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
 }
 
 export function mapStableSegments(

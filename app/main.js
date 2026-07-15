@@ -321,6 +321,7 @@ const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionServi
 const MiniMaxAnalysisClient = require("./src/jarvis/main/MiniMaxAnalysisClient");
 const AnalysisScheduler = require("./src/jarvis/main/AnalysisScheduler");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
+const SpeakerCorrectionService = require("./src/jarvis/main/SpeakerCorrectionService");
 const JarvisControlQueue = require("./src/jarvis/main/JarvisControlQueue");
 const {
   GracefulShutdownCoordinator,
@@ -526,6 +527,10 @@ async function initializeCoreManagers() {
     recordingsRoot,
   });
   jarvisRepository = new JarvisRepository(configuredDb);
+  const speakerCorrectionService = new SpeakerCorrectionService({
+    repository: jarvisRepository,
+    createPersonId: () => `person_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
+  });
   const storageGovernor = new StorageGovernor({
     reserve: new StorageGovernor.FileEmergencyReserve({
       filePath: path.join(configuredDataRoot, ".emergency-reserve"),
@@ -729,6 +734,7 @@ async function initializeCoreManagers() {
     ipcMain,
     repository: jarvisRepository,
     service: jarvisService,
+    speakerCorrectionService,
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler: jarvisAnalysisScheduler,

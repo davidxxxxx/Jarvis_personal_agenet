@@ -3301,6 +3301,7 @@ class JarvisRepository {
       `
         )
         .all(personId),
+      identity: this.speakerIdentityRepository.getPersonIdentityDetail(personId),
     };
   }
 
@@ -3846,8 +3847,16 @@ class JarvisRepository {
     return this.speakerIdentityRepository.getCluster(clusterId);
   }
 
+  getSpeakerClusterView(clusterId) {
+    return this.speakerIdentityRepository.getClusterView(clusterId);
+  }
+
   listSessionSpeakerClusters(sessionId) {
     return this.speakerIdentityRepository.listSessionClusters(sessionId);
+  }
+
+  listSessionSpeakerClusterViews(sessionId) {
+    return this.speakerIdentityRepository.listSessionClusterViews(sessionId);
   }
 
   listVoiceProfiles(modelId) {
@@ -3876,6 +3885,16 @@ class JarvisRepository {
 
   confirmSpeakerLink(input) {
     return this.speakerIdentityRepository.confirmLink(input);
+  }
+
+  confirmSpeakerLinkWithOutcome(input) {
+    return this.speakerIdentityRepository.confirmLinkWithOutcome(input);
+  }
+
+  runSpeakerCorrectionTransaction(work) {
+    if (typeof work !== "function")
+      throw new TypeError("speaker correction work must be a function");
+    return this.db.transaction(work).immediate();
   }
 
   rejectSpeakerSuggestion(input) {

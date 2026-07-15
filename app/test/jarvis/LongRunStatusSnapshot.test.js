@@ -44,16 +44,16 @@ function register(overrides = {}) {
   let resourceSamples = 0;
   const runtime = {
     previewStatus: () =>
-      overrides.previewStatus ?? ({
-      mode: "paused",
-      cadenceMs: null,
-      pending: 1,
-      running: 0,
-      pausedReason: "gpu_busy",
-      executionDevice: null,
-      lastError: null,
-      recordingContinues: true,
-    }),
+      overrides.previewStatus ?? {
+        mode: "paused",
+        cadenceMs: null,
+        pending: 1,
+        running: 0,
+        pausedReason: "gpu_busy",
+        executionDevice: null,
+        lastError: null,
+        recordingContinues: true,
+      },
     governor: {
       latestSnapshot: {
         sampledAt: 99_000,
@@ -93,13 +93,22 @@ function register(overrides = {}) {
       resumeCapture: () => null,
       finishCapture: () => null,
       failCapture: () => null,
-      getState: () => overrides.serviceState ?? ({
-        sessionId: "session-1",
-        status: "recording",
-        captureMode: "dual",
-        retentionMode: "speech_triggered",
-        errorCode: null,
-      }),
+      getState: () =>
+        overrides.serviceState ?? {
+          sessionId: "session-1",
+          status: "recording",
+          captureMode: "dual",
+          retentionMode: "speech_triggered",
+          errorCode: null,
+        },
+    },
+    speakerCorrectionService: {
+      listSessionClusters: () => [],
+      confirm: () => null,
+      reject: () => null,
+      undo: () => null,
+      listCorrections: () => [],
+      mergePeople: () => null,
     },
     voiceEnrollmentService: {
       getStatus: () => ({}),

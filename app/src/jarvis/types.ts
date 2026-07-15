@@ -174,6 +174,96 @@ export interface JarvisPerson {
   last_seen_at: number;
 }
 
+export type JarvisSpeakerLinkState = "unknown" | "suggested" | "confirmed" | "rejected";
+export type JarvisSpeakerCorrectionScope = "session" | "persistent";
+
+export interface JarvisSpeakerPersonSummary {
+  id: string;
+  displayName: string;
+  isSelf: boolean;
+}
+
+export interface JarvisSpeakerClusterView {
+  id: string;
+  sessionId: string;
+  trackId: string | null;
+  localLabel: string;
+  linkState: JarvisSpeakerLinkState;
+  person: JarvisSpeakerPersonSummary | null;
+  suggestedPerson: JarvisSpeakerPersonSummary | null;
+  lastRejectedPerson: JarvisSpeakerPersonSummary | null;
+  score: number | null;
+  margin: number | null;
+  reason: string;
+  policyId: string;
+  diarizationRevision: string;
+  profileRevision: string;
+  evidenceSegmentIds: string[];
+  canUndo: boolean;
+  updatedAt: number;
+}
+
+export interface JarvisConfirmSpeakerInput {
+  clusterId: string;
+  personId?: string;
+  newPersonName?: string;
+  scope: JarvisSpeakerCorrectionScope;
+}
+
+export type JarvisProfileSampleReason =
+  | "added"
+  | "session_scope"
+  | "insufficient_speech"
+  | "insufficient_windows"
+  | "insufficient_quality"
+  | "missing_embedding"
+  | "already_present";
+
+export interface JarvisSpeakerConfirmationResult {
+  cluster: JarvisSpeakerClusterView;
+  profileSampleAdded: boolean;
+  profileSampleReason: JarvisProfileSampleReason;
+  createdPerson: boolean;
+}
+
+export interface JarvisSpeakerCorrectionView {
+  id: string;
+  clusterId: string;
+  previousPersonId: string | null;
+  nextPersonId: string | null;
+  previousPersonRef: string | null;
+  nextPersonRef: string | null;
+  previousState: JarvisSpeakerLinkState;
+  nextState: JarvisSpeakerLinkState;
+  scope: JarvisSpeakerCorrectionScope;
+  actor: "user" | "system";
+  correctionKind: "link" | "merge";
+  createdAt: number;
+  undoneAt: number | null;
+}
+
+export interface JarvisPersonIdentityDetail {
+  samples: Array<{
+    id: string;
+    modelId: string;
+    sourceKind: "enrollment" | "user_confirmed";
+    sourceClusterId: string | null;
+    speechMs: number;
+    windowCount: number;
+    createdAt: number;
+  }>;
+  appearances: Array<{
+    clusterId: string;
+    sessionId: string;
+    localLabel: string;
+    linkState: JarvisSpeakerLinkState;
+    score: number | null;
+    margin: number | null;
+    updatedAt: number;
+  }>;
+  corrections: JarvisSpeakerCorrectionView[];
+}
+
 export interface JarvisAudioChunk {
   id: string;
   session_id: string;
@@ -386,6 +476,7 @@ export interface JarvisPersonDetail {
   todos: JarvisTodo[];
   memories: JarvisMemoryItem[];
   topics: JarvisTopic[];
+  identity: JarvisPersonIdentityDetail;
 }
 
 export interface JarvisTopicDetail {

@@ -8,7 +8,26 @@ const {
   assertSourceType,
   assertRetentionMode,
 } = require("../../src/jarvis/shared/contracts");
-const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
+const registerJarvisIpcImpl = require("../../src/jarvis/main/registerJarvisIpc");
+
+function createSpeakerCorrectionService(overrides = {}) {
+  return {
+    listSessionClusters: () => [],
+    confirm: () => ({ cluster: { id: "c1" } }),
+    reject: () => ({ id: "c1" }),
+    undo: () => ({ id: "c1" }),
+    listCorrections: () => [],
+    mergePeople: () => ({ person: { id: "p-target" } }),
+    ...overrides,
+  };
+}
+
+function registerJarvisIpc(options) {
+  return registerJarvisIpcImpl({
+    speakerCorrectionService: createSpeakerCorrectionService(),
+    ...options,
+  });
+}
 
 function createRepository(overrides = {}) {
   return {
@@ -520,6 +539,12 @@ test("contract exposes only the named Jarvis channels", () => {
       "pauseCapture",
       "pickStorageDirectory",
       "renamePerson",
+      "confirmSpeaker",
+      "listSessionSpeakerClusters",
+      "listSpeakerCorrections",
+      "mergePeople",
+      "rejectSpeaker",
+      "undoSpeakerCorrection",
       "resumeCapture",
       "setCloudBudget",
       "setMiniMaxKey",
@@ -553,6 +578,12 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.listSegments,
       CHANNELS.listSessions,
       CHANNELS.renamePerson,
+      CHANNELS.listSessionSpeakerClusters,
+      CHANNELS.confirmSpeaker,
+      CHANNELS.rejectSpeaker,
+      CHANNELS.undoSpeakerCorrection,
+      CHANNELS.listSpeakerCorrections,
+      CHANNELS.mergePeople,
       CHANNELS.setSessionStatus,
       CHANNELS.setRetentionMode,
       CHANNELS.syncSegments,
@@ -591,6 +622,144 @@ test("IPC registers only request-response repository channels", () => {
   );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
+});
+
+test("speaker correction IPC validates renderer input and routes only to the correction service", () => {
+  const calls = [];
+  const speakerCorrectionService = createSpeakerCorrectionService({
+    listSessionClusters: (...args) => calls.push(["list", ...args]),
+    confirm: (...args) => calls.push(["confirm", ...args]),
+    reject: (...args) => calls.push(["reject", ...args]),
+    undo: (...args) => calls.push(["undo", ...args]),
+    listCorrections: (...args) => calls.push(["corrections", ...args]),
+    mergePeople: (...args) => calls.push(["merge", ...args]),
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    speakerCorrectionService,
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  handlers.get(CHANNELS.listSessionSpeakerClusters)(null, "s1");
+  handlers.get(CHANNELS.confirmSpeaker)(null, {
+    clusterId: "c1",
+    personId: "p1",
+    scope: "session",
+  });
+  handlers.get(CHANNELS.rejectSpeaker)(null, "c1", "p1");
+  handlers.get(CHANNELS.undoSpeakerCorrection)(null, "c1");
+  handlers.get(CHANNELS.listSpeakerCorrections)(null, "c1");
+  handlers.get(CHANNELS.mergePeople)(null, "p-source", "p-target");
+  assert.deepEqual(calls, [
+    ["list", "s1"],
+    ["confirm", { clusterId: "c1", personId: "p1", scope: "session" }],
+    ["reject", "c1", "p1"],
+    ["undo", "c1"],
+    ["corrections", "c1"],
+    ["merge", "p-source", "p-target"],
+  ]);
+
+  for (const invoke of [
+    () => handlers.get(CHANNELS.listSessionSpeakerClusters)(null, "../s1"),
+    () =>
+      handlers.get(CHANNELS.confirmSpeaker)(null, {
+        clusterId: "c1",
+        personId: "p1",
+        scope: "session",
+        actor: "system",
+      }),
+    () =>
+      handlers.get(CHANNELS.confirmSpeaker)(null, {
+        clusterId: "c1",
+        personId: "p1",
+        newPersonName: "P1",
+        scope: "session",
+      }),
+    () =>
+      handlers.get(CHANNELS.confirmSpeaker)(null, {
+        clusterId: "c1",
+        newPersonName: "P1",
+        scope: "persistent-ish",
+      }),
+    () => handlers.get(CHANNELS.rejectSpeaker)(null, "../c1", "p1"),
+    () => handlers.get(CHANNELS.mergePeople)(null, "same", "same"),
+  ]) {
+    assert.throws(invoke);
+  }
+  assert.equal(calls.length, 6);
+});
+
+test("speaker confirmation serializes only public ambiguous duplicate candidates", async () => {
+  const error = new Error("database duplicate details");
+  error.code = "ambiguous_duplicate_name";
+  error.candidates = [
+    {
+      id: "p1",
+      displayName: "Alice",
+      isSelf: false,
+      embedding: new Float32Array([0.5]),
+      path: "private.wav",
+    },
+  ];
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    speakerCorrectionService: createSpeakerCorrectionService({
+      confirm: async () => {
+        throw error;
+      },
+    }),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  assert.deepEqual(
+    await handlers.get(CHANNELS.confirmSpeaker)(null, {
+      clusterId: "c1",
+      newPersonName: "Alice",
+      scope: "session",
+    }),
+    {
+      speakerCorrectionError: {
+        code: "ambiguous_duplicate_name",
+        candidates: [{ id: "p1", displayName: "Alice", isSelf: false }],
+      },
+    }
+  );
+});
+
+test("IPC registration requires every speaker correction service capability", () => {
+  for (const method of [
+    "listSessionClusters",
+    "confirm",
+    "reject",
+    "undo",
+    "listCorrections",
+    "mergePeople",
+  ]) {
+    const speakerCorrectionService = createSpeakerCorrectionService();
+    delete speakerCorrectionService[method];
+    const registered = [];
+    assert.throws(
+      () =>
+        registerJarvisIpcImpl({
+          ipcMain: { handle: (channel) => registered.push(channel) },
+          repository: createRepository(),
+          service: createService(),
+          voiceEnrollmentService: createVoiceEnrollmentService(),
+          speakerCorrectionService,
+          environmentManager: { getOpenAIKey: () => null },
+        }),
+      new RegExp(`speakerCorrectionService\\.${method} must be a function`)
+    );
+    assert.deepEqual(registered, []);
+  }
 });
 
 test("IPC exposes MiniMax configured state without returning the secret", async () => {

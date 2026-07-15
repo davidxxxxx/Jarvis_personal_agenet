@@ -1,43 +1,88 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { UserRound } from "lucide-react";
 import type { JarvisPersonDetail, JarvisPersonOverview } from "../types";
+import { useJarvisStore } from "./jarvisStore";
+
+function personName(
+  person: Pick<JarvisPersonOverview, "is_self" | "display_name">,
+  selfLabel: string
+): string {
+  return person.is_self ? selfLabel : person.display_name;
+}
 
 export default function PeopleView() {
+  const { t } = useTranslation();
+  const mergePeople = useJarvisStore((state) => state.mergePeople);
   const [people, setPeople] = useState<JarvisPersonOverview[]>([]);
   const [detail, setDetail] = useState<JarvisPersonDetail | null>(null);
-  const [error, setError] = useState(false);
+  const [mergeTargetId, setMergeTargetId] = useState("");
+  const [reviewingMerge, setReviewingMerge] = useState(false);
+  const [mergeBusy, setMergeBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshOverview = async () => {
+    setPeople(await window.electronAPI.jarvis.listPeopleOverview());
+  };
+
   useEffect(() => {
-    void window.electronAPI.jarvis
-      .listPeopleOverview()
-      .then(setPeople)
-      .catch(() => setError(true));
-  }, []);
-  const open = (id: string) =>
-    void window.electronAPI.jarvis
-      .getPersonDetail(id)
-      .then(setDetail)
-      .catch(() => setError(true));
+    void refreshOverview().catch(() => setError(t("jarvis.peopleLoadFailed")));
+  }, [t]);
+
+  const open = async (id: string) => {
+    setError(null);
+    setMergeTargetId("");
+    setReviewingMerge(false);
+    try {
+      setDetail(await window.electronAPI.jarvis.getPersonDetail(id));
+    } catch {
+      setError(t("jarvis.peopleLoadFailed"));
+    }
+  };
+
+  const source = detail?.person ?? null;
+  const target = people.find((person) => person.id === mergeTargetId) ?? null;
+  const selfLabel = t("jarvis.speakerSelf");
+
+  const commitMerge = async () => {
+    if (!source || !target || source.is_self || mergeBusy) return;
+    setMergeBusy(true);
+    setError(null);
+    try {
+      const nextDetail = await mergePeople(source.id, target.id);
+      setDetail(nextDetail);
+      setMergeTargetId("");
+      setReviewingMerge(false);
+      await refreshOverview();
+    } catch {
+      setError(t("jarvis.peopleMergeFailed"));
+    } finally {
+      setMergeBusy(false);
+    }
+  };
+
   return (
     <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
-      <h1 className="text-2xl font-semibold">人物</h1>
-      <p className="mt-1 text-sm text-muted-foreground">按说话人整理互动、主题、待办和长期记忆。</p>
-      {error && <p className="mt-4 text-sm text-destructive">人物数据读取失败。</p>}
+      <h1 className="text-2xl font-semibold">{t("jarvis.peopleTitle")}</h1>
+      <p className="mt-1 text-sm text-muted-foreground">{t("jarvis.peopleDescription")}</p>
+      {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
       <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {people.map((person) => (
           <button
             type="button"
             key={person.id}
-            onClick={() => open(person.id)}
+            onClick={() => void open(person.id)}
             className="rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
           >
             <div className="flex items-center gap-3">
               <span className="grid size-10 place-items-center rounded-full bg-primary/10 text-primary">
-                <UserRound className="size-5" />
+                <UserRound className="size-5" aria-hidden="true" />
               </span>
               <div>
-                <p className="font-medium">{person.is_self ? "我" : person.display_name}</p>
+                <p className="font-medium">{personName(person, selfLabel)}</p>
                 <p className="text-xs text-muted-foreground">
-                  {person.session_count} 次对话 · {person.open_todo_count} 个待办
+                  {person.session_count} {t("jarvis.peopleSessions")} · {person.open_todo_count}{" "}
+                  {t("jarvis.peopleOpenTodos")}
                 </p>
               </div>
             </div>
@@ -45,35 +90,31 @@ export default function PeopleView() {
         ))}
       </div>
       {!people.length && !error && (
-        <p className="mt-8 text-sm text-muted-foreground">
-          完成带说话人标记的录音后，人物会显示在这里。
-        </p>
+        <p className="mt-8 text-sm text-muted-foreground">{t("jarvis.peopleEmpty")}</p>
       )}
       {detail && (
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
-          <div className="flex justify-between">
-            <h2 className="text-lg font-semibold">
-              {detail.person.is_self ? "我" : detail.person.display_name}
-            </h2>
+          <div className="flex justify-between gap-4">
+            <h2 className="text-lg font-semibold">{personName(detail.person, selfLabel)}</h2>
             <button
               type="button"
               onClick={() => setDetail(null)}
               className="text-xs text-muted-foreground"
             >
-              关闭
+              {t("jarvis.peopleClose")}
             </button>
           </div>
           <div className="mt-4 grid gap-4 md:grid-cols-3">
             <div>
-              <p className="text-xs text-muted-foreground">相关会话</p>
+              <p className="text-xs text-muted-foreground">{t("jarvis.peopleSessions")}</p>
               <p className="mt-1 text-xl font-semibold">{detail.sessions.length}</p>
             </div>
             <div>
-              <p className="text-xs text-muted-foreground">相关主题</p>
+              <p className="text-xs text-muted-foreground">{t("jarvis.peopleTopics")}</p>
               <p className="mt-1 text-xl font-semibold">{detail.topics.length}</p>
             </div>
             <div>
-              <p className="text-xs text-muted-foreground">开放待办</p>
+              <p className="text-xs text-muted-foreground">{t("jarvis.peopleOpenTodos")}</p>
               <p className="mt-1 text-xl font-semibold">
                 {detail.todos.filter((todo) => todo.status === "open").length}
               </p>
@@ -86,6 +127,105 @@ export default function PeopleView() {
               </p>
             ))}
           </div>
+          <div className="mt-6 grid gap-4 lg:grid-cols-3">
+            <section>
+              <h3 className="text-sm font-semibold">{t("jarvis.peopleSamples")}</h3>
+              <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
+                {detail.identity.samples.map((sample) => (
+                  <li key={sample.id} className="rounded-lg bg-muted/30 p-3">
+                    <span className="block font-medium text-foreground">{sample.modelId}</span>
+                    {sample.speechMs.toLocaleString()} ms · {sample.windowCount} windows ·{" "}
+                    {sample.sourceKind}
+                  </li>
+                ))}
+              </ul>
+            </section>
+            <section>
+              <h3 className="text-sm font-semibold">{t("jarvis.peopleAppearances")}</h3>
+              <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
+                {detail.identity.appearances.map((appearance) => (
+                  <li key={appearance.clusterId} className="rounded-lg bg-muted/30 p-3">
+                    <span className="block font-medium text-foreground">
+                      {appearance.sessionId}
+                    </span>
+                    {appearance.localLabel} · {appearance.linkState}
+                  </li>
+                ))}
+              </ul>
+            </section>
+            <section>
+              <h3 className="text-sm font-semibold">{t("jarvis.peopleCorrections")}</h3>
+              <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
+                {detail.identity.corrections.map((correction) => (
+                  <li key={correction.id} className="rounded-lg bg-muted/30 p-3">
+                    {correction.scope} · {correction.actor} · {correction.correctionKind}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          </div>
+          {!detail.person.is_self && (
+            <section className="mt-6 border-t border-border/50 pt-4">
+              <label className="block text-sm font-medium" htmlFor="people-merge-target">
+                {t("jarvis.peopleMergeInto")}
+              </label>
+              <select
+                id="people-merge-target"
+                aria-label={t("jarvis.peopleMergeInto")}
+                value={mergeTargetId}
+                onChange={(event) => {
+                  setMergeTargetId(event.target.value);
+                  setReviewingMerge(false);
+                }}
+                className="mt-2 h-9 w-full max-w-sm rounded-md border border-border bg-background px-2 text-sm"
+              >
+                <option value="">{t("jarvis.speakerChoosePerson")}</option>
+                {people
+                  .filter((person) => person.id !== detail.person.id)
+                  .map((person) => (
+                    <option key={person.id} value={person.id}>
+                      {personName(person, selfLabel)}
+                    </option>
+                  ))}
+              </select>
+              <button
+                type="button"
+                disabled={!target || mergeBusy}
+                onClick={() => setReviewingMerge(true)}
+                className="ml-2 rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50"
+              >
+                {t("jarvis.peopleReviewMerge")}
+              </button>
+              {reviewingMerge && target && (
+                <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+                  <p className="text-sm">
+                    {t("jarvis.peopleMergeWarning", {
+                      source: personName(detail.person, selfLabel),
+                      target: personName(target, selfLabel),
+                    })}
+                  </p>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      disabled={mergeBusy}
+                      onClick={() => setReviewingMerge(false)}
+                      className="rounded-lg border border-border px-3 py-2 text-sm"
+                    >
+                      {t("jarvis.cancel")}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={mergeBusy}
+                      onClick={() => void commitMerge()}
+                      className="rounded-lg bg-destructive px-3 py-2 text-sm text-destructive-foreground"
+                    >
+                      {t("jarvis.peopleMerge")}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
         </section>
       )}
     </main>

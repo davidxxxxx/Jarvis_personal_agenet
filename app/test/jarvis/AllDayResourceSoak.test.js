@@ -226,6 +226,14 @@ test(
         failCapture: () => null,
         getState: serviceState,
       },
+      speakerCorrectionService: {
+        listSessionClusters: () => [],
+        confirm: () => null,
+        reject: () => null,
+        undo: () => null,
+        listCorrections: () => [],
+        mergePeople: () => null,
+      },
       voiceEnrollmentService: {
         getStatus: () => ({}),
         begin: () => ({}),

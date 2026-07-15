@@ -53,6 +53,59 @@ function createCluster(identities, overrides = {}) {
   });
 }
 
+function applySuggestion(repository, identities, overrides = {}) {
+  const diarizationRevision = overrides.diarizationRevision ?? "a".repeat(64);
+  const profileRevision = overrides.profileRevision ?? "b".repeat(64);
+  const policyId = overrides.policyId ?? "identity-policy-v1";
+  const evidenceRunId = overrides.evidenceRunId ?? "evidence-run-1";
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_runs (
+        id, session_id, track_id, transcript_revision, policy_id,
+        diarizer_model_id, embedding_model_id, model_artifact_sha256,
+        embedding_dimension, sample_rate, input_version, execution_device,
+        commit_sequence, created_at, completed_at
+      ) VALUES (?, 's1', 't-mic', ?, 'diarization-policy-v1',
+        'diarizer-v1', 'campplus-v1', ?, 512, 16000, 1, 'cpu', 1, 2000, 3000)`
+    )
+    .run(evidenceRunId, "c".repeat(64), "d".repeat(64));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_run_clusters (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      ) VALUES (?, 'c1', 'speaker_1', ?, 18000, 4, 0.9, 2000)`
+    )
+    .run(evidenceRunId, Buffer.alloc(2048));
+  return identities.applySystemResolution({
+    evidenceRunId,
+    clusterId: "c1",
+    candidatePersonId: overrides.personId ?? "p-zhang",
+    state: "suggested",
+    score: overrides.score ?? 0.84,
+    margin: overrides.margin ?? 0.17,
+    reason: overrides.reason ?? "candidate_above_suggestion_threshold",
+    diarizationRevision,
+    profileRevision,
+    policyId,
+    at: overrides.at ?? 4_000,
+  });
+}
+
+function assertNoPrivateIdentityData(value) {
+  const visit = (current) => {
+    assert.equal(Buffer.isBuffer(current), false);
+    assert.equal(current instanceof Uint8Array, false);
+    assert.equal(current instanceof Float32Array, false);
+    if (!current || typeof current !== "object") return;
+    for (const [key, nested] of Object.entries(current)) {
+      assert.doesNotMatch(key, /embedding|blob|path/i);
+      visit(nested);
+    }
+  };
+  visit(value);
+}
+
 function downgradeIdentitySchemaToV17(repository) {
   repository.db.exec(`
     DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
@@ -801,4 +854,165 @@ test("v17 legacy merges become non-undoable provenance while ordinary links stay
   assert.equal(migrated.getSpeakerCluster("ordinary-reject-cluster").personId, "ordinary-reject");
   assert.equal(migrated.getSpeakerCluster("ordinary-reject-cluster").linkState, "suggested");
   migrated.close();
+});
+
+test("public cluster projection allowlists current monotonic provenance and evidence", (t) => {
+  const { repository, identities } = fixture(t);
+  addPerson(repository, "p-zhang", "张三");
+  createCluster(identities);
+  repository.upsertTranscriptSegments("s1", [
+    {
+      id: "seg-1",
+      startedAt: 2_000,
+      endedAt: 3_000,
+      personId: null,
+      speakerLabel: "speaker_1",
+      text: "你好",
+      confidence: 0.9,
+      isStable: true,
+      trackId: "t-mic",
+    },
+  ]);
+  identities.replaceClusterSegments("c1", ["seg-1"]);
+  applySuggestion(repository, identities);
+
+  const view = identities.getClusterView("c1");
+
+  assert.deepEqual(Object.keys(view).sort(), [
+    "canUndo",
+    "diarizationRevision",
+    "evidenceSegmentIds",
+    "id",
+    "lastRejectedPerson",
+    "linkState",
+    "localLabel",
+    "margin",
+    "person",
+    "policyId",
+    "profileRevision",
+    "reason",
+    "score",
+    "sessionId",
+    "suggestedPerson",
+    "trackId",
+    "updatedAt",
+  ]);
+  assert.equal(view.linkState, "suggested");
+  assert.deepEqual(view.suggestedPerson, {
+    id: "p-zhang",
+    displayName: "张三",
+    isSelf: false,
+  });
+  assert.equal(view.person, null);
+  assert.equal(view.reason, "candidate_above_suggestion_threshold");
+  assert.equal(view.policyId, "identity-policy-v1");
+  assert.equal(view.diarizationRevision, "a".repeat(64));
+  assert.equal(view.profileRevision, "b".repeat(64));
+  assert.deepEqual(view.evidenceSegmentIds, ["seg-1"]);
+  assert.equal(view.canUndo, false);
+  assertNoPrivateIdentityData(view);
+});
+
+test("correction mutations atomically synchronize transcript identity and stable labels", (t) => {
+  const { repository, identities } = fixture(t);
+  addPerson(repository, "p-zhang", "张三");
+  addPerson(repository, "p-target", "张三（合并）");
+  createCluster(identities);
+  repository.upsertTranscriptSegments("s1", [
+    {
+      id: "seg-1",
+      startedAt: 2_000,
+      endedAt: 3_000,
+      personId: null,
+      speakerLabel: "speaker_1",
+      text: "你好",
+      confidence: 0.9,
+      isStable: true,
+      trackId: "t-mic",
+    },
+  ]);
+  identities.replaceClusterSegments("c1", ["seg-1"]);
+
+  const outcome = identities.confirmLinkWithOutcome({
+    clusterId: "c1",
+    personId: "p-zhang",
+    actor: "user",
+    scope: "persistent",
+  });
+  assert.deepEqual(outcome, { profileSampleAdded: true, profileSampleReason: "added" });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = 'seg-1'")
+      .get(),
+    { person_id: "p-zhang", speaker_label: "张三" }
+  );
+  assert.equal(identities.getClusterView("c1").canUndo, true);
+
+  identities.undoLastCorrection("c1");
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = 'seg-1'")
+      .get(),
+    { person_id: null, speaker_label: "张三" }
+  );
+
+  identities.confirmLink({
+    clusterId: "c1",
+    personId: "p-zhang",
+    actor: "user",
+    scope: "session",
+  });
+  identities.mergePeople({ sourcePersonId: "p-zhang", targetPersonId: "p-target" });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = 'seg-1'")
+      .get(),
+    { person_id: "p-target", speaker_label: "张三" }
+  );
+  assert.equal(identities.getClusterView("c1").canUndo, false);
+  identities.undoLastCorrection("c1");
+  assert.equal(identities.getCluster("c1").personId, "p-target");
+});
+
+test("person identity detail exposes metadata without vectors or filesystem paths", (t) => {
+  const { repository, identities } = fixture(t);
+  addPerson(repository, "p-zhang", "张三");
+  createCluster(identities);
+  identities.confirmLink({
+    clusterId: "c1",
+    personId: "p-zhang",
+    actor: "user",
+    scope: "persistent",
+  });
+
+  const identity = identities.getPersonIdentityDetail("p-zhang");
+
+  assert.equal(identity.samples.length, 1);
+  assert.deepEqual(identity.samples[0], {
+    id: identity.samples[0].id,
+    modelId: "campplus-v1",
+    sourceKind: "user_confirmed",
+    sourceClusterId: "c1",
+    speechMs: 18_000,
+    windowCount: 4,
+    createdAt: identity.samples[0].createdAt,
+  });
+  assert.equal(identity.appearances[0].clusterId, "c1");
+  assert.equal(identity.corrections[0].actor, "user");
+  assert.deepEqual(Object.keys(identity.corrections[0]).sort(), [
+    "actor",
+    "clusterId",
+    "correctionKind",
+    "createdAt",
+    "id",
+    "nextPersonId",
+    "nextPersonRef",
+    "nextState",
+    "previousPersonId",
+    "previousPersonRef",
+    "previousState",
+    "scope",
+    "undoneAt",
+  ]);
+  assertNoPrivateIdentityData(identity);
 });

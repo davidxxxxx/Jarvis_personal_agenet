@@ -29,6 +29,10 @@ import type {
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
   JarvisPersonOverview,
+  JarvisConfirmSpeakerInput,
+  JarvisSpeakerClusterView,
+  JarvisSpeakerConfirmationResult,
+  JarvisSpeakerCorrectionView,
   JarvisSessionDetail,
   JarvisSessionTimeline,
   JarvisRuntimeStatus,
@@ -581,6 +585,17 @@ declare global {
         listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
+        listSessionSpeakerClusters: (sessionId: string) => Promise<JarvisSpeakerClusterView[]>;
+        confirmSpeaker: (
+          input: JarvisConfirmSpeakerInput
+        ) => Promise<JarvisSpeakerConfirmationResult>;
+        rejectSpeaker: (clusterId: string, personId: string) => Promise<JarvisSpeakerClusterView>;
+        undoSpeakerCorrection: (clusterId: string) => Promise<JarvisSpeakerClusterView>;
+        listSpeakerCorrections: (clusterId: string) => Promise<JarvisSpeakerCorrectionView[]>;
+        mergePeople: (
+          sourcePersonId: string,
+          targetPersonId: string
+        ) => Promise<JarvisPersonDetail>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
         readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;

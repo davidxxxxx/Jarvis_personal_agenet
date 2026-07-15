@@ -5,6 +5,7 @@ const {
   assertCaptureFailureCode,
   assertSourceType,
   assertRetentionMode,
+  normalizeSpeakerConfirmationInput,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const { toPublicAudioChunk, toPublicSessionDetail } = require("./AudioChunkPublicView");
@@ -37,6 +38,15 @@ const REQUIRED_SERVICE_METHODS = [
   "failCapture",
 ];
 
+const REQUIRED_SPEAKER_CORRECTION_METHODS = [
+  "listSessionClusters",
+  "confirm",
+  "reject",
+  "undo",
+  "listCorrections",
+  "mergePeople",
+];
+
 function assertExactKeys(input, expected, name) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError(`${name} must be an object`);
@@ -46,6 +56,31 @@ function assertExactKeys(input, expected, name) {
   if (JSON.stringify(actual) !== JSON.stringify(required)) {
     throw new TypeError(`${name} has an invalid structure`);
   }
+}
+
+function toPublicAmbiguousSpeakerFailure(error) {
+  if (error?.code !== "ambiguous_duplicate_name") throw error;
+  if (!Array.isArray(error.candidates)) {
+    throw new TypeError("ambiguous speaker candidates must be an array");
+  }
+  const candidates = error.candidates.map((candidate) => {
+    const id = assertId(candidate?.id, "candidate personId");
+    if (
+      typeof candidate?.displayName !== "string" ||
+      !candidate.displayName.trim() ||
+      Array.from(candidate.displayName).length > 80 ||
+      typeof candidate.isSelf !== "boolean"
+    ) {
+      throw new TypeError("ambiguous speaker candidate is invalid");
+    }
+    return { id, displayName: candidate.displayName, isSelf: candidate.isSelf };
+  });
+  return {
+    speakerCorrectionError: {
+      code: "ambiguous_duplicate_name",
+      candidates,
+    },
+  };
 }
 
 function assertLifecycleTime(value) {
@@ -123,6 +158,7 @@ function registerJarvisIpc({
   ipcMain,
   repository,
   service,
+  speakerCorrectionService,
   voiceEnrollmentService,
   environmentManager,
   analysisScheduler,
@@ -149,6 +185,11 @@ function registerJarvisIpc({
   for (const method of REQUIRED_SERVICE_METHODS) {
     if (typeof service[method] !== "function") {
       throw new TypeError(`service.${method} must be a function`);
+    }
+  }
+  for (const method of REQUIRED_SPEAKER_CORRECTION_METHODS) {
+    if (!speakerCorrectionService || typeof speakerCorrectionService[method] !== "function") {
+      throw new TypeError(`speakerCorrectionService.${method} must be a function`);
     }
   }
   for (const method of ["getStatus", "begin", "complete", "cancel", "cancelOwner"]) {
@@ -200,6 +241,37 @@ function registerJarvisIpc({
   );
   ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
+  ipcMain.handle(CHANNELS.listSessionSpeakerClusters, (_event, sessionId) =>
+    speakerCorrectionService.listSessionClusters(assertId(sessionId, "sessionId"))
+  );
+  ipcMain.handle(CHANNELS.confirmSpeaker, (_event, input) => {
+    const normalized = normalizeSpeakerConfirmationInput(input);
+    try {
+      return Promise.resolve(speakerCorrectionService.confirm(normalized)).catch(
+        toPublicAmbiguousSpeakerFailure
+      );
+    } catch (error) {
+      return toPublicAmbiguousSpeakerFailure(error);
+    }
+  });
+  ipcMain.handle(CHANNELS.rejectSpeaker, (_event, clusterId, personId) =>
+    speakerCorrectionService.reject(
+      assertId(clusterId, "clusterId"),
+      assertId(personId, "personId")
+    )
+  );
+  ipcMain.handle(CHANNELS.undoSpeakerCorrection, (_event, clusterId) =>
+    speakerCorrectionService.undo(assertId(clusterId, "clusterId"))
+  );
+  ipcMain.handle(CHANNELS.listSpeakerCorrections, (_event, clusterId) =>
+    speakerCorrectionService.listCorrections(assertId(clusterId, "clusterId"))
+  );
+  ipcMain.handle(CHANNELS.mergePeople, (_event, sourcePersonId, targetPersonId) => {
+    const sourceId = assertId(sourcePersonId, "sourcePersonId");
+    const targetId = assertId(targetPersonId, "targetPersonId");
+    if (sourceId === targetId) throw new TypeError("source and target people must be different");
+    return speakerCorrectionService.mergePeople(sourceId, targetId);
+  });
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
     repository.listAudioChunks(assertId(sessionId, "sessionId")).map(toPublicAudioChunk)
   );

@@ -54,19 +54,27 @@ test("startup recovery finalizes every degraded dual track and open gap", () => 
   try {
     const recovered = repository.recoverOpenSessions(5_000);
 
-    assert.deepEqual(recovered.map((row) => row.id), ["s1"]);
+    assert.deepEqual(
+      recovered.map((row) => row.id),
+      ["s1"]
+    );
     assert.deepEqual(repository.db.prepare("SELECT status, ended_at FROM sessions").get(), {
       status: "recovered",
       ended_at: 5_000,
     });
-    assert.deepEqual(repository.db.prepare("SELECT DISTINCT state, ended_at FROM audio_tracks").all(), [
-      { state: "recovered", ended_at: 5_000 },
-    ]);
+    assert.deepEqual(
+      repository.db.prepare("SELECT DISTINCT state, ended_at FROM audio_tracks").all(),
+      [{ state: "recovered", ended_at: 5_000 }]
+    );
     assert.equal(
-      repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get().count,
+      repository.db.prepare("SELECT count(*) count FROM audio_gaps WHERE ended_at IS NULL").get()
+        .count,
       0
     );
-    assert.equal(repository.db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at, 5_000);
+    assert.equal(
+      repository.db.prepare("SELECT ended_at FROM audio_gaps WHERE id='g1'").get().ended_at,
+      5_000
+    );
   } finally {
     repository.close();
   }
@@ -95,14 +103,20 @@ test("model download wiring reports VAD recovery only after verified initializat
 test("main registers runtime and production composition providers without optional gaps", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
   const providerStart = mainSource.indexOf("createJarvisRuntimeMigrationParticipant({");
-  const providerEnd = mainSource.indexOf("storageComposition.registerWriterProvider()", providerStart);
+  const providerEnd = mainSource.indexOf(
+    "storageComposition.registerWriterProvider()",
+    providerStart
+  );
   const provider = mainSource.slice(providerStart, providerEnd);
   const compositionStart = mainSource.indexOf("createProductionStorageComposition({");
   const compositionEnd = mainSource.indexOf("const hasSavedDataRoot", compositionStart);
   const composition = mainSource.slice(compositionStart, compositionEnd);
 
   assert.match(provider, /processingLifecycle: jarvisProcessingLifecycle/);
-  assert.match(provider, /prepareStorageMigration: \(\) => jarvisService\.prepareStorageMigration\(\)/);
+  assert.match(
+    provider,
+    /prepareStorageMigration: \(\) => jarvisService\.prepareStorageMigration\(\)/
+  );
   assert.match(provider, /stopRetention: \(\) => retentionCleaner\.stop\(\)/);
   assert.match(provider, /quiesceAnalysis: \(\) => jarvisAnalysisScheduler\.quiesce\(\)/);
   assert.match(provider, /jarvisRepository\.checkpointForMigration\(\)/);
@@ -118,4 +132,19 @@ test("main registers runtime and production composition providers without option
   assert.match(composition, /modelManagerBridge/);
   assert.match(mainSource, /whisperCudaManager\?\.resetDataRoot\?\.\(\)/);
   assert.match(mainSource, /storageComposition\.registerWriterProvider\(\)/);
+});
+
+test("main passes speaker correction service only to the production IPC registrar", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+  const lifecycleStart = mainSource.indexOf("jarvisPowerLifecycle = new JarvisPowerLifecycle({");
+  const lifecycleEnd = mainSource.indexOf("  });", lifecycleStart);
+  const ipcStart = mainSource.indexOf("registerJarvisIpc({", lifecycleEnd);
+  const ipcEnd = mainSource.indexOf("  });", ipcStart);
+
+  assert.ok(lifecycleStart >= 0);
+  assert.ok(lifecycleEnd > lifecycleStart);
+  assert.ok(ipcStart > lifecycleEnd);
+  assert.ok(ipcEnd > ipcStart);
+  assert.doesNotMatch(mainSource.slice(lifecycleStart, lifecycleEnd), /speakerCorrectionService/);
+  assert.match(mainSource.slice(ipcStart, ipcEnd), /\bspeakerCorrectionService,/);
 });

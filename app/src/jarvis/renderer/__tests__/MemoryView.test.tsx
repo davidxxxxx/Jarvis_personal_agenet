@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../../../i18n";
 import type {
   JarvisSession,
   JarvisSessionDetail,
@@ -20,6 +21,10 @@ const session = {
   created_at: 1_000,
   capture_mode: "mic" as const,
 };
+
+beforeAll(async () => {
+  await i18n.changeLanguage("zh-CN");
+});
 
 const timeline: JarvisSessionTimeline = {
   session_id: session.id,
@@ -416,5 +421,53 @@ describe("MemoryView processing timeline", () => {
       clearTimeoutSpy.mockRestore();
       if (originalHidden) Object.defineProperty(document, "hidden", originalHidden);
     }
+  });
+
+  it("keeps completed-session speaker corrections reachable through durable evidence", async () => {
+    const completedDetail = { ...detailFor(session), segments: [visibleSegment] };
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => completedDetail),
+          getSessionTimeline: vi.fn(async () => ({
+            ...timeline,
+            processing_state: "ready",
+            ready_at: 3_000,
+            segments: [visibleSegment],
+          })),
+          getRuntimeStatus: vi.fn(async () => runtimeStatus),
+          listSessionSpeakerClusters: vi.fn(async () => [
+            {
+              id: "cluster-1",
+              sessionId: session.id,
+              trackId: null,
+              localLabel: "speaker_1",
+              linkState: "suggested",
+              person: null,
+              suggestedPerson: { id: "p1", displayName: "Alice", isSelf: false },
+              lastRejectedPerson: null,
+              score: 0.8,
+              margin: 0.1,
+              reason: "candidate",
+              policyId: "policy",
+              diarizationRevision: "a".repeat(64),
+              profileRevision: "b".repeat(64),
+              evidenceSegmentIds: [visibleSegment.id],
+              canUndo: false,
+              updatedAt: 1,
+            },
+          ]),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect((await screen.findAllByText(visibleSegment.text)).length).toBeGreaterThan(0);
+    expect(await screen.findByRole("button", { name: /Alice/ })).toBeInTheDocument();
   });
 });

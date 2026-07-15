@@ -194,6 +194,27 @@ describe("Jarvis capture argument mapping", () => {
 });
 
 describe("Jarvis provisional transcript intervals", () => {
+  it("never persists temporary diarization labels as durable person ids", () => {
+    expect(
+      mapStableSegments(
+        "session-1",
+        [
+          {
+            id: "temporary-speaker",
+            text: "hello",
+            source: "system",
+            speaker: "speaker_1",
+            speakerName: "Local speaker 1",
+          },
+        ],
+        1_000
+      )[0]
+    ).toMatchObject({
+      personId: null,
+      speakerLabel: "Local speaker 1",
+    });
+  });
+
   it("keeps a one millisecond safe-integer interval at the maximum timestamp", () => {
     expect(
       mapStableSegments(

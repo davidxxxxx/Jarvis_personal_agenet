@@ -8,6 +8,7 @@ import type {
 } from "../types";
 import { useJarvisStore } from "./jarvisStore";
 import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
+import DurableTranscript from "./DurableTranscript";
 import ProcessingStatus from "./ProcessingStatus";
 
 function duration(session: JarvisSession): string {
@@ -238,6 +239,10 @@ export default function MemoryView() {
             <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
           </div>
         )}
+        <DurableTranscript
+          sessionId={detail.session.id}
+          segments={timeline?.segments.length ? timeline.segments : detail.segments}
+        />
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
           <h2 className="font-semibold">完整总结</h2>
           <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">

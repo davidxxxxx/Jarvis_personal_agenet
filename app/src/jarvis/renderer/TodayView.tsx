@@ -86,7 +86,11 @@ export default function TodayView({ recording }: TodayViewProps) {
           <p className="mt-1 text-sm text-muted-foreground">{t("jarvis.todayDescription")}</p>
         </div>
         <RecordingControls recording={recording} />
-        <LiveTranscript segments={recording.segments} partialText={recording.partialText} />
+        <LiveTranscript
+          sessionId={recording.session.id}
+          segments={recording.segments}
+          partialText={recording.partialText}
+        />
       </main>
       <aside
         className="overflow-y-visible border-t border-border/40 bg-muted/10 p-4 lg:overflow-y-auto lg:border-l lg:border-t-0"

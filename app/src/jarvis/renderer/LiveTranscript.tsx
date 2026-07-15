@@ -1,19 +1,33 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { TranscriptSegment } from "../../stores/meetingRecordingStore";
+import type { JarvisSpeakerClusterView } from "../types";
+import { createStableSegmentId } from "../shared/segmentIds";
 import SpeakerChip from "./SpeakerChip";
+import { useJarvisStore } from "./jarvisStore";
 
 interface LiveTranscriptProps {
   segments: TranscriptSegment[];
   partialText: string;
+  sessionId?: string | null;
 }
+
+const EMPTY_CLUSTERS: JarvisSpeakerClusterView[] = [];
 
 function segmentTime(segment: TranscriptSegment): number {
   return Number.isFinite(segment.timestamp) ? (segment.timestamp as number) : 0;
 }
 
-export default function LiveTranscript({ segments, partialText }: LiveTranscriptProps) {
+export default function LiveTranscript({
+  segments,
+  partialText,
+  sessionId = null,
+}: LiveTranscriptProps) {
   const { t } = useTranslation();
+  const clusters = useJarvisStore((state) =>
+    sessionId ? (state.clustersBySession[sessionId] ?? EMPTY_CLUSTERS) : EMPTY_CLUSTERS
+  );
+  const loadSessionClusters = useJarvisStore((state) => state.loadSessionClusters);
   const tailRef = useRef<HTMLDivElement>(null);
   const orderedSegments = useMemo(
     () =>
@@ -23,6 +37,11 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
     [segments]
   );
   const lastSegment = orderedSegments.at(-1);
+  const lastEvidenceId =
+    lastSegment && sessionId ? createStableSegmentId(sessionId, lastSegment.id) : null;
+  const lastCluster = lastEvidenceId
+    ? clusters.find((cluster) => cluster.evidenceSegmentIds.includes(lastEvidenceId))
+    : null;
   const tailSignature = lastSegment
     ? [
         lastSegment.id,
@@ -32,8 +51,15 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
         lastSegment.confidence,
         lastSegment.speakerLocked,
         lastSegment.timestamp,
+        lastCluster?.updatedAt,
       ].join("\u0000")
     : "";
+
+  useEffect(() => {
+    if (sessionId && typeof window.electronAPI?.jarvis?.listSessionSpeakerClusters === "function") {
+      void loadSessionClusters(sessionId).catch(() => undefined);
+    }
+  }, [loadSessionClusters, sessionId]);
 
   useEffect(() => {
     const tail = tailRef.current;
@@ -63,6 +89,14 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
           )}
           {orderedSegments.map((segment) => {
             const timestamp = new Date(segmentTime(segment));
+            const evidenceSegmentId = sessionId
+              ? createStableSegmentId(sessionId, segment.id)
+              : null;
+            const cluster = evidenceSegmentId
+              ? (clusters.find((candidate) =>
+                  candidate.evidenceSegmentIds.includes(evidenceSegmentId)
+                ) ?? null)
+              : null;
             return (
               <article
                 key={segment.id}
@@ -72,10 +106,8 @@ export default function LiveTranscript({ segments, partialText }: LiveTranscript
                 <div className="mb-1.5 flex items-center gap-2">
                   {segment.speaker && (
                     <SpeakerChip
-                      personId={segment.speaker}
-                      displayName={segment.speakerName || segment.speaker}
-                      confidence={segment.confidence}
-                      confirmed={segment.speakerLocked === true}
+                      cluster={cluster}
+                      localLabel={segment.speakerName || segment.speaker}
                     />
                   )}
                   {segment.timestamp != null && (
