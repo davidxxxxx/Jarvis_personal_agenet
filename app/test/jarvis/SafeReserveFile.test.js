@@ -29,7 +29,7 @@ function availableBytes(stat) {
   return Number(stat.bavail) * Number(stat.bsize);
 }
 
-test("successful unlink survives same-volume writes that obscure free-space telemetry", async (t) => {
+test("successful object-bound release survives same-volume writes that obscure telemetry", async (t) => {
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-reserve-contention-"));
   t.after(() => fsp.rm(base, { recursive: true, force: true }));
   const reservePath = path.join(base, ".emergency-reserve");
@@ -37,13 +37,28 @@ test("successful unlink survives same-volume writes that obscure free-space tele
   const sizeBytes = 4096;
   await fsp.writeFile(reservePath, Buffer.alloc(sizeBytes, 1));
 
-  const reserveUnlinked = deferred();
+  const reserveReleased = deferred();
   const writerFinished = deferred();
   const fsImpl = Object.assign({}, fsp, {
+    async open(candidate, ...args) {
+      const handle = await fsp.open(candidate, ...args);
+      if (path.resolve(candidate) !== path.resolve(reservePath)) return handle;
+      return {
+        close: handle.close.bind(handle),
+        stat: handle.stat.bind(handle),
+        sync: handle.sync.bind(handle),
+        async truncate(length) {
+          const result = await handle.truncate(length);
+          reserveReleased.resolve();
+          await writerFinished.promise;
+          return result;
+        },
+      };
+    },
     async unlink(candidate) {
       await fsp.unlink(candidate);
       if (String(candidate).includes(".release-")) {
-        reserveUnlinked.resolve();
+        reserveReleased.resolve();
         await writerFinished.promise;
       }
     },
@@ -55,7 +70,7 @@ test("successful unlink survives same-volume writes that obscure free-space tele
     },
   };
   const competingWriter = (async () => {
-    await reserveUnlinked.promise;
+    await reserveReleased.promise;
     const handle = await fsp.open(competingPath, "w");
     try {
       const chunk = Buffer.alloc(1024 * 1024, 0x5a);
@@ -86,6 +101,11 @@ test("successful unlink survives same-volume writes that obscure free-space tele
   assert.equal(telemetry[0].requiredBytes, sizeBytes);
   assert.equal(telemetry[0].observedDeltaBytes < sizeBytes, true);
   assert.equal(Object.hasOwn(telemetry[0], "filePath"), false);
+  const tombstones = (await fsp.readdir(base)).filter((name) =>
+    name.startsWith(".emergency-reserve.release-")
+  );
+  assert.equal(tombstones.length, 1);
+  assert.equal((await fsp.stat(path.join(base, tombstones[0]))).size, 0);
 });
 
 test("free-space telemetry sampling cannot undo an authoritative release", async (t) => {
@@ -200,4 +220,181 @@ test("release rejects a hard-linked reserve without removing either name", async
 
   assert.equal(fs.existsSync(reservePath), true);
   assert.equal(fs.existsSync(linkedPath), true);
+});
+
+test("async release does not restore an unverified replacement after the quarantine rename", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-reserve-async-rename-swap-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const reservePath = path.join(base, ".emergency-reserve");
+  const movedOriginalPath = path.join(base, "moved-original-reserve");
+  const latercomer = Buffer.from("unverified quarantine replacement");
+  await fsp.writeFile(reservePath, Buffer.alloc(4096, 0x31));
+  let quarantinePath = null;
+  const fsImpl = Object.assign({}, fsp, {
+    async rename(source, target) {
+      if (path.resolve(source) === path.resolve(reservePath)) {
+        quarantinePath = target;
+        await fsp.rename(source, movedOriginalPath);
+        await fsp.writeFile(source, latercomer);
+      }
+      return fsp.rename(source, target);
+    },
+  });
+
+  await assert.rejects(
+    releaseReserve({
+      filePath: reservePath,
+      sizeBytes: 4096,
+      fsImpl,
+      allocationInspector: { inspect: () => allocated(4096) },
+      freeSpaceInspector: { inspectAsync: async () => 1_000_000 },
+    }),
+    /emergency reserve file is unsafe/
+  );
+
+  assert.equal(fs.existsSync(reservePath), false);
+  assert.deepEqual(await fsp.readFile(quarantinePath), latercomer);
+  assert.equal((await fsp.stat(quarantinePath)).nlink, 1);
+  assert.equal((await fsp.stat(movedOriginalPath)).size, 4096);
+});
+
+test("sync release does not restore an unverified replacement after the quarantine rename", (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-sync-rename-swap-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const reservePath = path.join(base, ".emergency-reserve");
+  const movedOriginalPath = path.join(base, "moved-original-reserve");
+  const latercomer = Buffer.from("unverified quarantine replacement");
+  fs.writeFileSync(reservePath, Buffer.alloc(4096, 0x32));
+  let quarantinePath = null;
+  const fsImpl = Object.create(fs);
+  fsImpl.renameSync = (source, target) => {
+    if (path.resolve(source) === path.resolve(reservePath)) {
+      quarantinePath = target;
+      fs.renameSync(source, movedOriginalPath);
+      fs.writeFileSync(source, latercomer);
+    }
+    return fs.renameSync(source, target);
+  };
+
+  assert.throws(
+    () =>
+      releaseReserveSync({
+        filePath: reservePath,
+        sizeBytes: 4096,
+        fsImpl,
+        allocationInspector: { inspect: () => allocated(4096) },
+        freeSpaceInspector: { inspect: () => 1_000_000 },
+      }),
+    /emergency reserve file is unsafe/
+  );
+
+  assert.equal(fs.existsSync(reservePath), false);
+  assert.deepEqual(fs.readFileSync(quarantinePath), latercomer);
+  assert.equal(fs.statSync(quarantinePath).nlink, 1);
+  assert.equal(fs.statSync(movedOriginalPath).size, 4096);
+});
+
+test("async release preserves a quarantine replacement introduced after validation", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-reserve-async-swap-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const reservePath = path.join(base, ".emergency-reserve");
+  const movedOriginalPath = path.join(base, "moved-original-reserve");
+  const latercomer = Buffer.from("later quarantine occupant");
+  await fsp.writeFile(reservePath, Buffer.alloc(4096, 0x41));
+  let quarantinePath = null;
+  let raced = false;
+  const injectRace = async () => {
+    if (raced) return;
+    raced = true;
+    await fsp.rename(quarantinePath, movedOriginalPath);
+    await fsp.writeFile(quarantinePath, latercomer);
+  };
+  const fsImpl = Object.assign({}, fsp, {
+    async open(candidate, ...args) {
+      const handle = await fsp.open(candidate, ...args);
+      if (path.resolve(candidate) !== path.resolve(reservePath)) return handle;
+      return {
+        close: handle.close.bind(handle),
+        stat: handle.stat.bind(handle),
+        sync: handle.sync.bind(handle),
+        async truncate(length) {
+          await injectRace();
+          return handle.truncate(length);
+        },
+      };
+    },
+    async rename(source, target) {
+      await fsp.rename(source, target);
+      if (path.resolve(source) === path.resolve(reservePath)) quarantinePath = target;
+    },
+    async unlink(candidate) {
+      if (quarantinePath && path.resolve(candidate) === path.resolve(quarantinePath)) {
+        await injectRace();
+      }
+      return fsp.unlink(candidate);
+    },
+  });
+
+  await assert.rejects(
+    releaseReserve({
+      filePath: reservePath,
+      sizeBytes: 4096,
+      fsImpl,
+      allocationInspector: { inspect: () => allocated(4096) },
+      freeSpaceInspector: { inspectAsync: async () => 1_000_000 },
+    }),
+    /emergency reserve file is unsafe/
+  );
+
+  assert.equal(raced, true);
+  assert.deepEqual(await fsp.readFile(quarantinePath), latercomer);
+  assert.equal((await fsp.stat(movedOriginalPath)).size, 0);
+  assert.equal(fs.existsSync(reservePath), false);
+});
+
+test("sync release preserves a quarantine replacement introduced after validation", (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-sync-swap-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const reservePath = path.join(base, ".emergency-reserve");
+  const movedOriginalPath = path.join(base, "moved-original-reserve");
+  const latercomer = Buffer.from("later quarantine occupant");
+  fs.writeFileSync(reservePath, Buffer.alloc(4096, 0x42));
+  let quarantinePath = null;
+  let raced = false;
+  const injectRace = () => {
+    if (raced) return;
+    raced = true;
+    fs.renameSync(quarantinePath, movedOriginalPath);
+    fs.writeFileSync(quarantinePath, latercomer);
+  };
+  const fsImpl = Object.create(fs);
+  fsImpl.renameSync = (source, target) => {
+    fs.renameSync(source, target);
+    if (path.resolve(source) === path.resolve(reservePath)) quarantinePath = target;
+  };
+  fsImpl.ftruncateSync = (descriptor, length) => {
+    injectRace();
+    return fs.ftruncateSync(descriptor, length);
+  };
+  fsImpl.unlinkSync = (candidate) => {
+    if (quarantinePath && path.resolve(candidate) === path.resolve(quarantinePath)) injectRace();
+    return fs.unlinkSync(candidate);
+  };
+
+  assert.throws(
+    () =>
+      releaseReserveSync({
+        filePath: reservePath,
+        sizeBytes: 4096,
+        fsImpl,
+        allocationInspector: { inspect: () => allocated(4096) },
+        freeSpaceInspector: { inspect: () => 1_000_000 },
+      }),
+    /emergency reserve file is unsafe/
+  );
+
+  assert.equal(raced, true);
+  assert.deepEqual(fs.readFileSync(quarantinePath), latercomer);
+  assert.equal(fs.statSync(movedOriginalPath).size, 0);
+  assert.equal(fs.existsSync(reservePath), false);
 });

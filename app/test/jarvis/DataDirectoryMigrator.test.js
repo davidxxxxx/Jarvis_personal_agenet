@@ -9,6 +9,24 @@ const test = require("node:test");
 const DataDirectoryMigrator = require("../../src/jarvis/main/DataDirectoryMigrator");
 const { DirectoryLeaseProvider } = require("../../src/jarvis/main/DirectoryLease");
 const MigrationCoordinator = require("../../src/jarvis/main/MigrationCoordinator");
+const { releaseReserve } = require("../../src/jarvis/main/SafeReserveFile");
+
+const RESERVE_TOMBSTONE_PREFIX = ".emergency-reserve.release-";
+
+function releaseRealReserve(options) {
+  return releaseReserve({
+    ...options,
+    allocationInspector: {
+      inspect: (_filePath, stat) => ({
+        allocatedBytes: stat.size,
+        reparse: false,
+        sparse: false,
+        compressed: false,
+      }),
+    },
+    freeSpaceInspector: { inspectAsync: async () => 1_000_000 },
+  });
+}
 
 async function writeTree(root) {
   await fsp.mkdir(path.join(root, "recordings", "nested"), { recursive: true });
@@ -137,6 +155,109 @@ test("rolls configuration back and reopens the old root when the new root cannot
     "reopen:old-root",
   ]);
   assert.equal(fs.existsSync(from), true);
+});
+
+test("retries the same target after rollback leaves a real reserve tombstone", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-reserve-retry-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const to = path.join(base, "new-root");
+  await writeTree(from);
+  let failTargetReopen = true;
+  const migrator = createMigrator([], {
+    releaseReserveImpl: releaseRealReserve,
+    reopenHolders: async (root) => {
+      if (root !== to || !failTargetReopen) return;
+      failTargetReopen = false;
+      await fsp.writeFile(path.join(root, ".emergency-reserve"), Buffer.alloc(4096, 0x51));
+      throw new Error("target reopen failed");
+    },
+  });
+
+  await assert.rejects(migrator.migrate({ from, to }), /migration activation failed/);
+  const tombstone = (await fsp.readdir(to)).find((name) =>
+    name.startsWith(RESERVE_TOMBSTONE_PREFIX)
+  );
+  assert.equal((await fsp.lstat(path.join(to, tombstone))).size, 0);
+
+  const result = await migrator.migrate({ from, to });
+
+  assert.equal(result.switched, true);
+  assert.equal((await fsp.lstat(path.join(to, tombstone))).nlink, 1);
+});
+
+test("source scanning ignores only validated reserve tombstones", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-reserve-source-scan-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const source = path.join(base, "source");
+  await writeTree(source);
+  const reservePath = path.join(source, ".emergency-reserve");
+  await fsp.writeFile(reservePath, Buffer.alloc(4096, 0x52));
+  await releaseRealReserve({ filePath: reservePath, sizeBytes: 4096, fsImpl: fsp });
+  const migrator = createMigrator([]);
+
+  const entries = await migrator._scanSource(source);
+
+  assert.equal(
+    entries.some((entry) => entry.relative.startsWith(RESERVE_TOMBSTONE_PREFIX)),
+    false
+  );
+  assert.equal(entries.length, 4);
+});
+
+test("source scanning rejects forged reserve tombstones", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-forged-reserve-source-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const tombstoneName = `${RESERVE_TOMBSTONE_PREFIX}11111111-1111-4111-8111-111111111111`;
+  for (const kind of ["nonzero", "multiple-links", "reparse"]) {
+    const source = path.join(base, kind);
+    await fsp.mkdir(source, { recursive: true });
+    const tombstonePath = path.join(source, tombstoneName);
+    await fsp.writeFile(tombstonePath, kind === "nonzero" ? "forged" : "");
+    if (kind === "multiple-links") {
+      await fsp.link(tombstonePath, path.join(base, "attacker-link"));
+    }
+    const migrator = createMigrator([], {
+      pathInspector: {
+        inspect: async (candidate) => ({
+          reparse: kind === "reparse" && path.resolve(candidate) === path.resolve(tombstonePath),
+          mountPoint: false,
+        }),
+      },
+    });
+
+    await assert.rejects(
+      migrator._scanSource(source),
+      /source contains an unsafe reserve tombstone/
+    );
+  }
+});
+
+test("target tree validation rejects forged reserve tombstones", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-forged-reserve-target-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const tombstoneName = `${RESERVE_TOMBSTONE_PREFIX}22222222-2222-4222-8222-222222222222`;
+  for (const validator of ["_assertExactTree", "_assertNoUnexpectedTree"]) {
+    for (const kind of ["nonzero", "multiple-links", "reparse"]) {
+      const target = path.join(base, `${validator}-${kind}`);
+      await fsp.mkdir(target, { recursive: true });
+      const tombstonePath = path.join(target, tombstoneName);
+      await fsp.writeFile(tombstonePath, kind === "nonzero" ? "forged" : "");
+      if (kind === "multiple-links") {
+        await fsp.link(tombstonePath, path.join(base, `${validator}-${kind}-attacker-link`));
+      }
+      const migrator = createMigrator([], {
+        pathInspector: {
+          inspect: async (candidate) => ({
+            reparse: kind === "reparse" && path.resolve(candidate) === path.resolve(tombstonePath),
+            mountPoint: false,
+          }),
+        },
+      });
+
+      await assert.rejects(migrator[validator](target, []), /migration staging tree is invalid/);
+    }
+  }
 });
 
 test("releases only the obsolete root reserve after success and the target reserve after rollback", async (t) => {

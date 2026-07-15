@@ -11,20 +11,11 @@ const GIB = 1024 ** 3;
 
 test("uses the greater absolute and percentage thresholds at inclusive boundaries", () => {
   const governor = new StorageGovernor({ reserve: { ensure() {}, release() {} } });
-  assert.equal(
-    governor.evaluate({ volumeBytes: 100 * GIB, freeBytes: 20 * GIB }),
-    "warning"
-  );
+  assert.equal(governor.evaluate({ volumeBytes: 100 * GIB, freeBytes: 20 * GIB }), "warning");
   assert.equal(governor.evaluate({ volumeBytes: 100 * GIB, freeBytes: 5 * GIB }), "stop");
-  assert.equal(
-    governor.evaluate({ volumeBytes: 400 * GIB, freeBytes: 40 * GIB }),
-    "warning"
-  );
+  assert.equal(governor.evaluate({ volumeBytes: 400 * GIB, freeBytes: 40 * GIB }), "warning");
   assert.equal(governor.evaluate({ volumeBytes: 400 * GIB, freeBytes: 12 * GIB }), "stop");
-  assert.equal(
-    governor.evaluate({ volumeBytes: 400 * GIB, freeBytes: 40 * GIB + 1 }),
-    "ok"
-  );
+  assert.equal(governor.evaluate({ volumeBytes: 400 * GIB, freeBytes: 40 * GIB + 1 }), "ok");
 });
 
 test("counts pending writes against free space before classifying", () => {
@@ -189,15 +180,19 @@ test("reserve quarantine release preserves a replacement raced in after handle v
   });
 
   assert.throws(() => reserve.release(), /emergency reserve file is unsafe/);
-  assert.equal(fs.readFileSync(filePath, "utf8"), "foreign!");
+  assert.equal(fs.existsSync(filePath), false);
+  const quarantine = fs
+    .readdirSync(base)
+    .find((name) => name.startsWith(".emergency-reserve.release-"));
+  assert.equal(fs.readFileSync(path.join(base, quarantine), "utf8"), "foreign!");
   assert.equal(fs.readFileSync(originalPath, "utf8"), "reserved");
 });
 
-test("production reserve verifies real allocation and the released-free-space adapter", (t) => {
+test("production reserve supports repeated ensure and object-bound release cycles", (t) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-real-"));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
   const filePath = path.join(base, ".emergency-reserve");
-  const freeSpace = [1_000_000, 1_000_000 + 1024 * 1024];
+  const freeSpace = [1_000_000, 1_000_000 + 1024 * 1024, 2_000_000, 2_000_000 + 1024 * 1024];
   const reserve = new StorageGovernor.FileEmergencyReserve({
     filePath,
     sizeBytes: 1024 * 1024,
@@ -208,6 +203,19 @@ test("production reserve verifies real allocation and the released-free-space ad
   assert.equal(fs.statSync(filePath).size, 1024 * 1024);
   assert.equal(reserve.release(), true);
   assert.equal(fs.existsSync(filePath), false);
+  reserve.ensure();
+  assert.equal(reserve.release(), true);
+  const tombstones = fs
+    .readdirSync(base)
+    .filter((name) => name.startsWith(".emergency-reserve.release-"));
+  assert.equal(tombstones.length, 2);
+  for (const tombstone of tombstones) {
+    const stat = fs.lstatSync(path.join(base, tombstone));
+    assert.equal(stat.isFile(), true);
+    assert.equal(stat.isSymbolicLink(), false);
+    assert.equal(stat.size, 0);
+    assert.equal(stat.nlink, 1);
+  }
 });
 
 test("rejects invalid or unsafe numeric inputs", () => {

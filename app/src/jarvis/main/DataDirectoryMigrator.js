@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const MigrationCoordinator = require("./MigrationCoordinator");
 const { DirectoryLeaseProvider } = require("./DirectoryLease");
-const { releaseReserve } = require("./SafeReserveFile");
+const { isEmergencyReserveTombstoneName, releaseReserve } = require("./SafeReserveFile");
 const { DefaultPathInspector, DefaultVolumeInspector } = require("./StoragePathInspector");
 
 const MANIFEST_VERSION = 3;
@@ -626,6 +626,13 @@ class DataDirectoryMigrator {
         }
         const absolute = this._inside(root, relative);
         const stat = await this.fs.lstat(absolute);
+        if (prefix === "" && isEmergencyReserveTombstoneName(child.name)) {
+          const inspected = await this.pathInspector.inspect(absolute, stat);
+          if (!this._isValidatedReserveTombstone(stat, inspected)) {
+            throw new Error("source contains an unsafe reserve tombstone");
+          }
+          continue;
+        }
         if (stat.isSymbolicLink()) throw new Error("source contains a link");
         if (stat.isDirectory()) await walk(absolute, relative);
         else if (stat.isFile()) {
@@ -955,6 +962,12 @@ class DataDirectoryMigrator {
         const absolute = this._inside(root, relative);
         const stat = await this.fs.lstat(absolute);
         const inspected = await this.pathInspector.inspect(absolute, stat);
+        if (prefix === "" && isEmergencyReserveTombstoneName(entry.name)) {
+          if (!this._isValidatedReserveTombstone(stat, inspected)) {
+            throw new Error("migration staging tree is invalid");
+          }
+          continue;
+        }
         if (stat.isSymbolicLink() || inspected?.reparse || inspected?.mountPoint) {
           throw new Error("migration staging tree is invalid");
         }
@@ -978,6 +991,12 @@ class DataDirectoryMigrator {
         const absolute = this._inside(root, relative);
         const stat = await this.fs.lstat(absolute);
         const inspected = await this.pathInspector.inspect(absolute, stat);
+        if (prefix === "" && isEmergencyReserveTombstoneName(entry.name)) {
+          if (!this._isValidatedReserveTombstone(stat, inspected)) {
+            throw new Error("migration staging tree is invalid");
+          }
+          continue;
+        }
         if (stat.isSymbolicLink() || inspected?.reparse || inspected?.mountPoint) {
           throw new Error("migration staging tree is invalid");
         }
@@ -1033,6 +1052,17 @@ class DataDirectoryMigrator {
       }
     };
     await walk(root);
+  }
+
+  _isValidatedReserveTombstone(stat, inspected) {
+    return (
+      stat?.isFile?.() === true &&
+      stat.isSymbolicLink() === false &&
+      stat.size === 0 &&
+      stat.nlink === 1 &&
+      inspected?.reparse === false &&
+      inspected?.mountPoint === false
+    );
   }
 
   async _validSqliteResidue(filePath, kind) {
