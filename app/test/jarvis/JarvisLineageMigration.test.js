@@ -292,8 +292,9 @@ function insertEvidence(
     );
 }
 
-test("lineage migration allocates exactly the next checked-in schema version", () => {
-  assert.equal(TARGET_VERSION, PREVIOUS_VERSION + 1);
+test("lineage migration remains pinned to its checked-in schema version", () => {
+  assert.equal(PREVIOUS_VERSION + 1, 23);
+  assert.ok(TARGET_VERSION >= 23);
 });
 
 test("empty and latest migration paths create the complete lineage schema without legacy tables", () => {

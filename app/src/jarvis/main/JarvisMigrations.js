@@ -1,4 +1,4 @@
-const TARGET_VERSION = 23;
+const TARGET_VERSION = 24;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -2367,6 +2367,680 @@ const EVIDENCE_EXPIRY_TRIGGER = `
   END;
 `;
 
+const ANALYSIS_BUDGET_SCHEMA = `
+  CREATE TABLE analysis_budget_policy_revisions (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT
+      CHECK(typeof(revision) = 'integer' AND revision > 0),
+    monthly_limit_microusd INTEGER NOT NULL
+      CHECK(typeof(monthly_limit_microusd) = 'integer'
+        AND monthly_limit_microusd BETWEEN 0 AND 10000000),
+    timezone TEXT NOT NULL
+      CHECK(typeof(timezone) = 'text' AND length(timezone) BETWEEN 1 AND 64),
+    currency TEXT NOT NULL CHECK(currency = 'USD'),
+    created_at INTEGER NOT NULL
+      CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    effective_at INTEGER NOT NULL
+      CHECK(typeof(effective_at) = 'integer' AND effective_at >= 0)
+  );
+
+  CREATE TABLE analysis_budget_settings (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+    default_monthly_limit_microusd INTEGER NOT NULL DEFAULT 5000000
+      CHECK(typeof(default_monthly_limit_microusd) = 'integer'
+        AND default_monthly_limit_microusd BETWEEN 0 AND 10000000),
+    currency TEXT NOT NULL DEFAULT 'USD' CHECK(currency = 'USD'),
+    active_policy_revision INTEGER
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    pending_policy_revision INTEGER
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    pending_effective_at INTEGER
+      CHECK(pending_effective_at IS NULL
+        OR (typeof(pending_effective_at) = 'integer' AND pending_effective_at >= 0)),
+    CHECK((pending_policy_revision IS NULL) = (pending_effective_at IS NULL)),
+    CHECK(pending_policy_revision IS NULL
+      OR active_policy_revision IS NULL
+      OR pending_policy_revision <> active_policy_revision)
+  );
+
+  CREATE TABLE analysis_budget_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(typeof(id) = 'integer' AND id > 0),
+    month_key TEXT NOT NULL
+      CHECK(month_key GLOB '[0-9][0-9][0-9][0-9]-[0-1][0-9]'
+        AND substr(month_key, 6, 2) BETWEEN '01' AND '12'),
+    timezone TEXT NOT NULL
+      CHECK(typeof(timezone) = 'text' AND length(timezone) BETWEEN 1 AND 64),
+    starts_at INTEGER NOT NULL
+      CHECK(typeof(starts_at) = 'integer' AND starts_at >= 0),
+    ends_at INTEGER NOT NULL
+      CHECK(typeof(ends_at) = 'integer' AND ends_at > starts_at),
+    currency TEXT NOT NULL CHECK(currency = 'USD'),
+    monthly_limit_microusd INTEGER NOT NULL
+      CHECK(typeof(monthly_limit_microusd) = 'integer'
+        AND monthly_limit_microusd BETWEEN 0 AND 10000000),
+    policy_revision INTEGER NOT NULL
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL
+      CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    UNIQUE(month_key, timezone, starts_at),
+    UNIQUE(starts_at)
+  );
+
+  CREATE TABLE analysis_budget_price_versions (
+    provider TEXT NOT NULL CHECK(typeof(provider) = 'text' AND length(provider) BETWEEN 1 AND 64),
+    model TEXT NOT NULL CHECK(typeof(model) = 'text' AND length(model) BETWEEN 1 AND 128),
+    operation TEXT NOT NULL CHECK(operation IN ('session_analysis','daily_digest')),
+    price_version TEXT NOT NULL
+      CHECK(typeof(price_version) = 'text' AND length(price_version) BETWEEN 1 AND 128),
+    currency TEXT NOT NULL CHECK(currency = 'USD'),
+    input_per_million_microusd INTEGER NOT NULL
+      CHECK(typeof(input_per_million_microusd) = 'integer'
+        AND input_per_million_microusd BETWEEN 0 AND 1000000000),
+    output_per_million_microusd INTEGER NOT NULL
+      CHECK(typeof(output_per_million_microusd) = 'integer'
+        AND output_per_million_microusd BETWEEN 0 AND 1000000000),
+    billing_basis TEXT NOT NULL CHECK(billing_basis = 'paygo_list_price_equivalent'),
+    created_at INTEGER NOT NULL
+      CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    PRIMARY KEY(provider, model, operation, price_version)
+  );
+
+  CREATE TABLE analysis_budget_attempts (
+    request_id TEXT PRIMARY KEY
+      CHECK(typeof(request_id) = 'text' AND length(request_id) BETWEEN 1 AND 128),
+    job_id TEXT NOT NULL CHECK(typeof(job_id) = 'text' AND length(job_id) BETWEEN 1 AND 128),
+    attempt_number INTEGER NOT NULL
+      CHECK(typeof(attempt_number) = 'integer' AND attempt_number >= 1),
+    period_id INTEGER NOT NULL
+      REFERENCES analysis_budget_periods(id) ON DELETE RESTRICT,
+    policy_revision INTEGER NOT NULL
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    price_version TEXT NOT NULL,
+    currency TEXT NOT NULL CHECK(currency = 'USD'),
+    input_per_million_microusd INTEGER NOT NULL
+      CHECK(typeof(input_per_million_microusd) = 'integer'
+        AND input_per_million_microusd BETWEEN 0 AND 1000000000),
+    output_per_million_microusd INTEGER NOT NULL
+      CHECK(typeof(output_per_million_microusd) = 'integer'
+        AND output_per_million_microusd BETWEEN 0 AND 1000000000),
+    estimated_input_tokens INTEGER NOT NULL
+      CHECK(typeof(estimated_input_tokens) = 'integer'
+        AND estimated_input_tokens BETWEEN 0 AND 1000000000),
+    estimated_output_tokens INTEGER NOT NULL
+      CHECK(typeof(estimated_output_tokens) = 'integer'
+        AND estimated_output_tokens BETWEEN 0 AND 1000000000),
+    reserved_microusd INTEGER NOT NULL
+      CHECK(typeof(reserved_microusd) = 'integer' AND reserved_microusd >= 0),
+    actual_input_tokens INTEGER
+      CHECK(actual_input_tokens IS NULL
+        OR (typeof(actual_input_tokens) = 'integer'
+          AND actual_input_tokens BETWEEN 0 AND 1000000000)),
+    actual_output_tokens INTEGER
+      CHECK(actual_output_tokens IS NULL
+        OR (typeof(actual_output_tokens) = 'integer'
+          AND actual_output_tokens BETWEEN 0 AND 1000000000)),
+    actual_microusd INTEGER
+      CHECK(actual_microusd IS NULL
+        OR (typeof(actual_microusd) = 'integer' AND actual_microusd >= 0)),
+    state TEXT NOT NULL
+      CHECK(state IN ('reserved','started','reconciled','released','usage_unknown')),
+    reason_code TEXT
+      CHECK(reason_code IS NULL OR reason_code IN (
+        'local_preflight_failed','admission_revoked','shutdown_before_transport',
+        'superseded_before_transport','transport_ambiguous','usage_missing',
+        'usage_invalid','process_recovery','shutdown_after_transport','client_contract_error'
+      )),
+    created_at INTEGER NOT NULL
+      CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    started_at INTEGER
+      CHECK(started_at IS NULL OR (typeof(started_at) = 'integer' AND started_at >= created_at)),
+    finalized_at INTEGER
+      CHECK(finalized_at IS NULL
+        OR (typeof(finalized_at) = 'integer' AND finalized_at >= created_at)),
+    CHECK(finalized_at IS NULL OR started_at IS NULL OR finalized_at >= started_at),
+    UNIQUE(job_id, attempt_number, provider, operation),
+    FOREIGN KEY(provider, model, operation, price_version)
+      REFERENCES analysis_budget_price_versions(provider, model, operation, price_version)
+      ON DELETE RESTRICT,
+    CHECK(
+      (state = 'reserved' AND started_at IS NULL AND finalized_at IS NULL
+        AND actual_input_tokens IS NULL AND actual_output_tokens IS NULL
+        AND actual_microusd IS NULL AND reason_code IS NULL)
+      OR
+      (state = 'started' AND started_at IS NOT NULL AND finalized_at IS NULL
+        AND actual_input_tokens IS NULL AND actual_output_tokens IS NULL
+        AND actual_microusd IS NULL AND reason_code IS NULL)
+      OR
+      (state = 'reconciled' AND started_at IS NOT NULL AND finalized_at IS NOT NULL
+        AND actual_input_tokens IS NOT NULL AND actual_output_tokens IS NOT NULL
+        AND actual_microusd IS NOT NULL AND reason_code IS NULL)
+      OR
+      (state = 'released' AND started_at IS NULL AND finalized_at IS NOT NULL
+        AND actual_input_tokens IS NULL AND actual_output_tokens IS NULL
+        AND actual_microusd IS NULL AND reason_code IS NOT NULL)
+      OR
+      (state = 'usage_unknown' AND started_at IS NOT NULL AND finalized_at IS NOT NULL
+        AND actual_input_tokens IS NULL AND actual_output_tokens IS NULL
+        AND actual_microusd IS NULL AND reason_code IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX idx_analysis_budget_periods_end
+  ON analysis_budget_periods(ends_at, starts_at);
+  CREATE INDEX idx_analysis_budget_attempts_period_state
+  ON analysis_budget_attempts(period_id, state);
+
+  CREATE TRIGGER analysis_budget_policy_revisions_no_update
+  BEFORE UPDATE ON analysis_budget_policy_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_policy_revisions_no_replacement
+  BEFORE INSERT ON analysis_budget_policy_revisions
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_policy_revisions WHERE revision = NEW.revision
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_settings_immutable_identity
+  BEFORE UPDATE OF singleton_id, default_monthly_limit_microusd, currency
+  ON analysis_budget_settings
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget settings identity is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_settings_no_replacement
+  BEFORE INSERT ON analysis_budget_settings
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_settings WHERE singleton_id = NEW.singleton_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget settings replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_settings_no_delete
+  BEFORE DELETE ON analysis_budget_settings
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget settings history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_settings_validate_policy_pointers
+  BEFORE UPDATE OF active_policy_revision, pending_policy_revision, pending_effective_at
+  ON analysis_budget_settings
+  WHEN
+    (NEW.active_policy_revision IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM analysis_budget_policy_revisions AS active
+      WHERE active.revision = NEW.active_policy_revision
+        AND active.currency = NEW.currency
+    ))
+    OR
+    (NEW.pending_policy_revision IS NOT NULL AND NOT EXISTS (
+      SELECT 1
+      FROM analysis_budget_policy_revisions AS pending
+      JOIN analysis_budget_policy_revisions AS active
+        ON active.revision = NEW.active_policy_revision
+      WHERE pending.revision = NEW.pending_policy_revision
+        AND pending.currency = NEW.currency
+        AND pending.effective_at = NEW.pending_effective_at
+        AND pending.effective_at > active.effective_at
+        AND pending.timezone <> active.timezone
+        AND pending.monthly_limit_microusd = active.monthly_limit_microusd
+    ))
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget settings policy pointer mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_policy_revisions_no_delete
+  BEFORE DELETE ON analysis_budget_policy_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_price_versions_no_update
+  BEFORE UPDATE ON analysis_budget_price_versions
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget price history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_price_versions_no_replacement
+  BEFORE INSERT ON analysis_budget_price_versions
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_price_versions
+    WHERE provider = NEW.provider
+      AND model = NEW.model
+      AND operation = NEW.operation
+      AND price_version = NEW.price_version
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget price replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_price_versions_no_delete
+  BEFORE DELETE ON analysis_budget_price_versions
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget price history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_no_overlap
+  BEFORE INSERT ON analysis_budget_periods
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_periods AS existing
+    WHERE NEW.starts_at < existing.ends_at AND NEW.ends_at > existing.starts_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period overlap');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_no_replacement
+  BEFORE INSERT ON analysis_budget_periods
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_periods AS existing
+    WHERE existing.id = NEW.id
+      OR existing.starts_at = NEW.starts_at
+      OR (
+        existing.month_key = NEW.month_key
+        AND existing.timezone = NEW.timezone
+        AND existing.starts_at = NEW.starts_at
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_validate_policy_insert
+  BEFORE INSERT ON analysis_budget_periods
+  WHEN NOT EXISTS (
+    SELECT 1 FROM analysis_budget_policy_revisions AS policy
+    WHERE policy.revision = NEW.policy_revision
+      AND policy.monthly_limit_microusd = NEW.monthly_limit_microusd
+      AND policy.timezone = NEW.timezone
+      AND policy.currency = NEW.currency
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period policy snapshot mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_validate_policy_update
+  BEFORE UPDATE OF monthly_limit_microusd, policy_revision ON analysis_budget_periods
+  WHEN NOT EXISTS (
+    SELECT 1 FROM analysis_budget_policy_revisions AS policy
+    WHERE policy.revision = NEW.policy_revision
+      AND policy.monthly_limit_microusd = NEW.monthly_limit_microusd
+      AND policy.timezone = NEW.timezone
+      AND policy.currency = NEW.currency
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period policy snapshot mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_immutable_identity
+  BEFORE UPDATE OF id, month_key, timezone, starts_at, ends_at, currency,
+    monthly_limit_microusd, policy_revision, created_at
+  ON analysis_budget_periods
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period identity is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_periods_no_delete
+  BEFORE DELETE ON analysis_budget_periods
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_snapshot
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM analysis_budget_price_versions AS price
+    WHERE price.provider = NEW.provider
+      AND price.model = NEW.model
+      AND price.operation = NEW.operation
+      AND price.price_version = NEW.price_version
+      AND price.currency = NEW.currency
+      AND price.input_per_million_microusd = NEW.input_per_million_microusd
+      AND price.output_per_million_microusd = NEW.output_per_million_microusd
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget price snapshot mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_initial_state
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NEW.state <> 'reserved'
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt initial state must be reserved');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_no_replacement
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_attempts AS existing
+    WHERE existing.request_id = NEW.request_id
+      OR (
+        existing.job_id = NEW.job_id
+        AND existing.attempt_number = NEW.attempt_number
+        AND existing.provider = NEW.provider
+        AND existing.operation = NEW.operation
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt unique replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_period
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NOT EXISTS (
+    SELECT 1 FROM analysis_budget_periods AS period
+    WHERE period.id = NEW.period_id
+      AND period.policy_revision = NEW.policy_revision
+      AND period.currency = NEW.currency
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt period snapshot mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_reservation_cost
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NEW.reserved_microusd <>
+    ((NEW.estimated_input_tokens * NEW.input_per_million_microusd + 999999) / 1000000)
+    + ((NEW.estimated_output_tokens * NEW.output_per_million_microusd + 999999) / 1000000)
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget reservation cost mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_actual_cost
+  BEFORE UPDATE ON analysis_budget_attempts
+  WHEN NEW.state = 'reconciled' AND NEW.actual_microusd <>
+    ((NEW.actual_input_tokens * NEW.input_per_million_microusd + 999999) / 1000000)
+    + ((NEW.actual_output_tokens * NEW.output_per_million_microusd + 999999) / 1000000)
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget actual cost mismatch');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_reason_insert
+  BEFORE INSERT ON analysis_budget_attempts
+  WHEN NEW.reason_code IS NOT NULL AND NEW.reason_code NOT IN (
+    'local_preflight_failed','admission_revoked','shutdown_before_transport',
+    'superseded_before_transport','transport_ambiguous','usage_missing',
+    'usage_invalid','process_recovery','shutdown_after_transport','client_contract_error'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget reason code is invalid');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_validate_reason_update
+  BEFORE UPDATE OF reason_code ON analysis_budget_attempts
+  WHEN NEW.reason_code IS NOT NULL AND NEW.reason_code NOT IN (
+    'local_preflight_failed','admission_revoked','shutdown_before_transport',
+    'superseded_before_transport','transport_ambiguous','usage_missing',
+    'usage_invalid','process_recovery','shutdown_after_transport','client_contract_error'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget reason code is invalid');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_immutable_identity
+  BEFORE UPDATE OF request_id, job_id, attempt_number, period_id, policy_revision,
+    provider, model, operation, price_version, currency,
+    input_per_million_microusd, output_per_million_microusd,
+    estimated_input_tokens, estimated_output_tokens, reserved_microusd, created_at
+  ON analysis_budget_attempts
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt identity is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_started_at_immutable
+  BEFORE UPDATE OF started_at ON analysis_budget_attempts
+  WHEN NEW.started_at IS NOT OLD.started_at
+    AND NOT (
+      OLD.state = 'reserved'
+      AND NEW.state = 'started'
+      AND OLD.started_at IS NULL
+      AND NEW.started_at IS NOT NULL
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt started_at is immutable after start');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_terminal
+  BEFORE UPDATE ON analysis_budget_attempts
+  WHEN OLD.state IN ('reconciled','released','usage_unknown')
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget terminal attempt is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_transition
+  BEFORE UPDATE ON analysis_budget_attempts
+  WHEN OLD.state NOT IN ('reconciled','released','usage_unknown')
+    AND NOT (
+    (OLD.state = 'reserved' AND NEW.state IN ('started','released'))
+    OR
+    (OLD.state = 'started' AND NEW.state IN ('reconciled','usage_unknown'))
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid analysis budget attempt transition');
+  END;
+
+  CREATE TRIGGER analysis_budget_attempts_no_delete
+  BEFORE DELETE ON analysis_budget_attempts
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget attempt history is immutable');
+  END;
+
+  INSERT INTO analysis_budget_settings (
+    singleton_id, default_monthly_limit_microusd, currency,
+    active_policy_revision, pending_policy_revision, pending_effective_at
+  ) VALUES (1, 5000000, 'USD', NULL, NULL, NULL);
+
+  INSERT INTO analysis_budget_price_versions (
+    provider, model, operation, price_version, currency,
+    input_per_million_microusd, output_per_million_microusd,
+    billing_basis, created_at
+  ) VALUES
+    ('minimax', 'MiniMax-M2.7', 'session_analysis',
+      'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
+      'paygo_list_price_equivalent', 1784160000000),
+    ('minimax', 'MiniMax-M2.7', 'daily_digest',
+      'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
+      'paygo_list_price_equivalent', 1784160000000);
+`;
+
+const ANALYSIS_BUDGET_TABLE_COLUMNS = Object.freeze({
+  analysis_budget_policy_revisions: [
+    "revision",
+    "monthly_limit_microusd",
+    "timezone",
+    "currency",
+    "created_at",
+    "effective_at",
+  ],
+  analysis_budget_settings: [
+    "singleton_id",
+    "default_monthly_limit_microusd",
+    "currency",
+    "active_policy_revision",
+    "pending_policy_revision",
+    "pending_effective_at",
+  ],
+  analysis_budget_periods: [
+    "id",
+    "month_key",
+    "timezone",
+    "starts_at",
+    "ends_at",
+    "currency",
+    "monthly_limit_microusd",
+    "policy_revision",
+    "created_at",
+  ],
+  analysis_budget_price_versions: [
+    "provider",
+    "model",
+    "operation",
+    "price_version",
+    "currency",
+    "input_per_million_microusd",
+    "output_per_million_microusd",
+    "billing_basis",
+    "created_at",
+  ],
+  analysis_budget_attempts: [
+    "request_id",
+    "job_id",
+    "attempt_number",
+    "period_id",
+    "policy_revision",
+    "provider",
+    "model",
+    "operation",
+    "price_version",
+    "currency",
+    "input_per_million_microusd",
+    "output_per_million_microusd",
+    "estimated_input_tokens",
+    "estimated_output_tokens",
+    "reserved_microusd",
+    "actual_input_tokens",
+    "actual_output_tokens",
+    "actual_microusd",
+    "state",
+    "reason_code",
+    "created_at",
+    "started_at",
+    "finalized_at",
+  ],
+});
+
+const ANALYSIS_BUDGET_TRIGGER_NAMES = Object.freeze([
+  "analysis_budget_policy_revisions_no_update",
+  "analysis_budget_policy_revisions_no_replacement",
+  "analysis_budget_policy_revisions_no_delete",
+  "analysis_budget_settings_immutable_identity",
+  "analysis_budget_settings_no_replacement",
+  "analysis_budget_settings_no_delete",
+  "analysis_budget_settings_validate_policy_pointers",
+  "analysis_budget_price_versions_no_update",
+  "analysis_budget_price_versions_no_replacement",
+  "analysis_budget_price_versions_no_delete",
+  "analysis_budget_periods_no_overlap",
+  "analysis_budget_periods_no_replacement",
+  "analysis_budget_periods_validate_policy_insert",
+  "analysis_budget_periods_validate_policy_update",
+  "analysis_budget_periods_immutable_identity",
+  "analysis_budget_periods_no_delete",
+  "analysis_budget_attempts_validate_snapshot",
+  "analysis_budget_attempts_initial_state",
+  "analysis_budget_attempts_no_replacement",
+  "analysis_budget_attempts_validate_period",
+  "analysis_budget_attempts_validate_reservation_cost",
+  "analysis_budget_attempts_validate_actual_cost",
+  "analysis_budget_attempts_validate_reason_insert",
+  "analysis_budget_attempts_validate_reason_update",
+  "analysis_budget_attempts_immutable_identity",
+  "analysis_budget_attempts_started_at_immutable",
+  "analysis_budget_attempts_terminal",
+  "analysis_budget_attempts_transition",
+  "analysis_budget_attempts_no_delete",
+]);
+
+function analysisBudgetSchemaSignature(db) {
+  return db
+    .prepare(
+      `SELECT type, name, tbl_name, sql
+       FROM sqlite_master
+       WHERE sql IS NOT NULL
+         AND (
+           name LIKE 'analysis_budget_%'
+           OR name LIKE 'idx_analysis_budget_%'
+           OR tbl_name LIKE 'analysis_budget_%'
+         )
+       ORDER BY type, name`
+    )
+    .all()
+    .map((row) => ({
+      type: row.type,
+      name: row.name,
+      table: row.tbl_name,
+      sql: row.sql.replace(/\s+/g, " ").trim(),
+    }));
+}
+
+function reviewedAnalysisBudgetSchemaSignature(db) {
+  const reference = new db.constructor(":memory:");
+  try {
+    reference.exec(ANALYSIS_BUDGET_SCHEMA);
+    return analysisBudgetSchemaSignature(reference);
+  } finally {
+    reference.close();
+  }
+}
+
+function retainValidAnalysisBudgetSchema(db) {
+  const tableNames = Object.keys(ANALYSIS_BUDGET_TABLE_COLUMNS);
+  const existing = tableNames.filter((table) => tableExists(db, table));
+  if (existing.length === 0) return false;
+  if (existing.length !== tableNames.length) throw new Error("analysis budget schema collision");
+  for (const [table, required] of Object.entries(ANALYSIS_BUDGET_TABLE_COLUMNS)) {
+    const actual = columns(db, table);
+    if (actual.size !== required.length || required.some((column) => !actual.has(column))) {
+      throw new Error("analysis budget schema collision");
+    }
+  }
+  const triggers = new Set(
+    db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+      .all()
+      .map((row) => row.name)
+  );
+  if (ANALYSIS_BUDGET_TRIGGER_NAMES.some((name) => !triggers.has(name))) {
+    throw new Error("analysis budget schema collision");
+  }
+  if (
+    JSON.stringify(analysisBudgetSchemaSignature(db)) !==
+    JSON.stringify(reviewedAnalysisBudgetSchemaSignature(db))
+  ) {
+    throw new Error("analysis budget schema collision");
+  }
+  const settings = db
+    .prepare(
+      `SELECT default_monthly_limit_microusd, currency
+       FROM analysis_budget_settings WHERE singleton_id = 1`
+    )
+    .get();
+  if (settings?.default_monthly_limit_microusd !== 5_000_000 || settings.currency !== "USD") {
+    throw new Error("analysis budget schema collision");
+  }
+  const reviewedPrices = db
+    .prepare(
+      `SELECT operation, input_per_million_microusd, output_per_million_microusd,
+              currency, billing_basis
+       FROM analysis_budget_price_versions
+       WHERE provider = 'minimax'
+         AND model = 'MiniMax-M2.7'
+         AND price_version = 'minimax-m2.7-standard-2026-07-16'`
+    )
+    .all();
+  if (
+    reviewedPrices.length !== 2 ||
+    reviewedPrices.some(
+      (price) =>
+        !new Set(["session_analysis", "daily_digest"]).has(price.operation) ||
+        price.input_per_million_microusd !== 300_000 ||
+        price.output_per_million_microusd !== 1_200_000 ||
+        price.currency !== "USD" ||
+        price.billing_basis !== "paygo_list_price_equivalent"
+    )
+  ) {
+    throw new Error("analysis budget schema collision");
+  }
+  return true;
+}
+
 function disambiguateUnboundSpeakerClusters(db) {
   if (!tableExists(db, "speaker_clusters")) return;
   const duplicates = db
@@ -3011,6 +3685,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
             ? EVIDENCE_EXPIRY_TRIGGER.replace("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS")
             : EVIDENCE_EXPIRY_TRIGGER
         );
+      }
+      if (fromVersion < 24) {
+        if (!retainValidAnalysisBudgetSchema(db)) db.exec(ANALYSIS_BUDGET_SCHEMA);
       }
 
       const violations = db.pragma("foreign_key_check");
