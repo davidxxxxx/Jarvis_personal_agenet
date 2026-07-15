@@ -14,7 +14,11 @@ const MODEL_FILE = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx";
 const SPEAKER_EMBEDDING_MODEL_ID = "3dspeaker-campplus-voxceleb-16k-v1";
 
 class SpeakerEmbeddings {
-  constructor() {
+  constructor({ workerClient = onnxWorkerClient } = {}) {
+    if (!workerClient || typeof workerClient.request !== "function") {
+      throw new TypeError("workerClient.request must be a function");
+    }
+    this.workerClient = workerClient;
     this.loadPromise = null;
   }
 
@@ -42,7 +46,7 @@ class SpeakerEmbeddings {
     }
     const modelPath = this.getModelPath();
     debugLogger.debug("speaker-embeddings loading model", { modelPath });
-    this.loadPromise = onnxWorkerClient
+    this.loadPromise = this.workerClient
       .request("speaker.load", { modelPath })
       .then(() => debugLogger.debug("speaker-embeddings model loaded"))
       .catch((err) => {
@@ -61,12 +65,16 @@ class SpeakerEmbeddings {
     );
 
     // No transfer-list: MessagePortMain can't transfer ArrayBuffers, so the samples are cloned.
-    const { embeddingBuffer } = await onnxWorkerClient.request("speaker.extract", {
-      samplesBuffer,
-    });
+    try {
+      const { embeddingBuffer } = await this.workerClient.request("speaker.extract", {
+        samplesBuffer,
+      });
 
-    if (!embeddingBuffer) return null;
-    return new Float32Array(embeddingBuffer);
+      if (!embeddingBuffer) return null;
+      return new Float32Array(embeddingBuffer);
+    } finally {
+      new Uint8Array(samplesBuffer).fill(0);
+    }
   }
 
   async extractEmbeddingFromSamples(samples) {
@@ -101,7 +109,12 @@ class SpeakerEmbeddings {
       samples[i] = int16 / 32768;
     }
 
-    return this._extractEmbeddingFromSamples(samples);
+    try {
+      return await this._extractEmbeddingFromSamples(samples);
+    } finally {
+      samples.fill(0);
+      buf.fill(0);
+    }
   }
 
   _parseWavHeader(buf) {

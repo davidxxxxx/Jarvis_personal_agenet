@@ -290,6 +290,47 @@ test("classifier resetSession and stop clear VAD worker streams", async () => {
   assert.ok(requests.some((request) => request.method === "vad.reset"));
 });
 
+test("detailed classification preserves per-window probabilities and clears its PCM clone", async () => {
+  let captured = null;
+  const classifier = new SpeechVadClassifier({
+    workerClient: {
+      async request(method, payload) {
+        if (method === "vad.load") return { ok: true };
+        if (method === "vad.health") return { ok: true, probability: 0.01 };
+        if (method === "vad.classify") {
+          captured = payload.samplesBuffer;
+          return { probability: 0.8, windowCount: 2, probabilities: [0.8, 0.2] };
+        }
+        return { ok: true };
+      },
+    },
+    getModelPath: () => "vad.onnx",
+    fsImpl: { existsSync: () => true },
+  });
+  await classifier.initialize();
+  const pcm = Buffer.alloc(3_072, 7);
+
+  assert.deepEqual(
+    await classifier.classifyDetailed({
+      sessionId: "s1",
+      sourceType: "mic",
+      streamId: "s1:mic:1",
+      sampleRate: 24_000,
+      pcm,
+    }),
+    { probability: 0.8, windowCount: 2, probabilities: [0.8, 0.2] }
+  );
+  assert.equal(
+    new Uint8Array(captured).every((value) => value === 0),
+    true
+  );
+  assert.equal(
+    pcm.every((value) => value === 7),
+    true
+  );
+  await classifier.stop();
+});
+
 test("stop prevents an in-flight initialize from restoring ready state", async () => {
   const loading = deferred();
   const workerClient = {

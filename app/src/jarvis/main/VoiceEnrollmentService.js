@@ -153,6 +153,7 @@ function zeroPayloadSamples(payload) {
 class VoiceEnrollmentService {
   constructor({
     speakerEmbeddings,
+    speechDurationMeasurer,
     voiceProfileStore,
     createId = randomUUID,
     now = Date.now,
@@ -161,6 +162,9 @@ class VoiceEnrollmentService {
   }) {
     if (!speakerEmbeddings || typeof speakerEmbeddings.extractEmbeddingFromSamples !== "function") {
       throw new TypeError("speakerEmbeddings is required");
+    }
+    if (!speechDurationMeasurer || typeof speechDurationMeasurer.measureSpeechMs !== "function") {
+      throw new TypeError("speechDurationMeasurer is required");
     }
     if (
       !voiceProfileStore ||
@@ -183,6 +187,7 @@ class VoiceEnrollmentService {
       throw new TypeError("maxActiveSessions must be a safe integer between 1 and 32");
     }
     this.speakerEmbeddings = speakerEmbeddings;
+    this.speechDurationMeasurer = speechDurationMeasurer;
     this.voiceProfileStore = voiceProfileStore;
     this.createId = createId;
     this.now = now;
@@ -250,15 +255,32 @@ class VoiceEnrollmentService {
       const embeddings = [];
       const sampleSpeechMs = [];
       try {
-        for (const window of windows) {
-          const raw = await this.speakerEmbeddings.extractEmbeddingFromSamples(
-            downsampleForEmbedding(window.samples)
-          );
+        for (const [windowIndex, window] of windows.entries()) {
+          const speechMs = await this.speechDurationMeasurer.measureSpeechMs({
+            sessionId,
+            windowIndex,
+            sampleRate: CAPTURE_SAMPLE_RATE,
+            samples: window.samples,
+          });
+          if (
+            !Number.isSafeInteger(speechMs) ||
+            speechMs < 0 ||
+            speechMs > WINDOW_SECONDS * 1_000
+          ) {
+            return result("model_error");
+          }
+          const downsampled = downsampleForEmbedding(window.samples);
+          let raw;
+          try {
+            raw = await this.speakerEmbeddings.extractEmbeddingFromSamples(downsampled);
+          } finally {
+            downsampled.fill(0);
+          }
           if (raw === null || raw === undefined) continue;
           const normalized = normalizeEmbedding(raw);
           if (!normalized) return result("model_error");
           embeddings.push(normalized);
-          sampleSpeechMs.push(WINDOW_SECONDS * 1_000);
+          sampleSpeechMs.push(speechMs);
         }
       } catch {
         return result("model_error");

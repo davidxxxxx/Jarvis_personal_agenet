@@ -10,6 +10,7 @@ const {
   MAX_EMBEDDING_SECONDS,
   SPEAKER_EMBEDDING_MODEL_ID,
 } = require("../../src/helpers/speakerEmbeddings");
+const VoiceSpeechDurationMeasurer = require("../../src/jarvis/main/VoiceSpeechDurationMeasurer");
 
 const OWNER_ID = 41;
 const WINDOW_SAMPLES = CAPTURE_SAMPLE_RATE * 10;
@@ -56,7 +57,10 @@ function validPayload() {
 
 function createHarness({
   embeddings = nearIdenticalVectors(),
+  speechDurations = [10_000, 10_000, 10_000],
   extractError = null,
+  measureError = null,
+  speechDurationMeasurer = null,
   status = null,
   sessionTtlMs,
   maxActiveSessions,
@@ -66,12 +70,21 @@ function createHarness({
   let nextId = 0;
   const saves = [];
   const extractedLengths = [];
+  const extractedSamples = [];
+  let measuredWindow = 0;
   const service = new VoiceEnrollmentService({
     speakerEmbeddings: {
       async extractEmbeddingFromSamples(samples) {
         extractedLengths.push(samples.length);
+        extractedSamples.push(samples);
         if (extractError) throw extractError;
         return embeddings[index++] ?? null;
+      },
+    },
+    speechDurationMeasurer: speechDurationMeasurer ?? {
+      async measureSpeechMs() {
+        if (measureError) throw measureError;
+        return speechDurations[measuredWindow++] ?? 0;
       },
     },
     voiceProfileStore: {
@@ -98,6 +111,7 @@ function createHarness({
     service,
     saves,
     extractedLengths,
+    extractedSamples,
     advance(ms) {
       now += ms;
     },
@@ -145,6 +159,96 @@ test("accepts three near-identical ten-second windows and persists normalized ev
     payload.windows.every((entry) => entry.samples.every((sample) => sample === 0)),
     true
   );
+  assert.equal(
+    harness.extractedSamples.every((samples) => samples.every((sample) => sample === 0)),
+    true
+  );
+});
+
+test("uses measured VAD speech duration instead of treating finite embeddings as speech", async (t) => {
+  for (const [name, speechDurations, expectedMs] of [
+    ["silence", [0, 0, 0], 0],
+    ["stable noise", [1_200, 800, 1_000], 3_000],
+    ["partial speech", [10_000, 9_500, 10_000], 29_500],
+  ]) {
+    await t.test(name, async () => {
+      const harness = createHarness({ speechDurations });
+      const result = await harness.service.complete({
+        ownerId: OWNER_ID,
+        sessionId: begin(harness).sessionId,
+        payload: validPayload(),
+      });
+
+      assert.equal(result.status, "insufficient_speech");
+      assert.equal(result.acceptedSpeechMs, expectedMs);
+      assert.equal(result.windowCount, 3);
+      assert.equal(harness.extractedLengths.length, 3);
+      assert.equal(harness.saves.length, 0);
+    });
+  }
+});
+
+test("returns model_error when production speech measurement is unavailable", async () => {
+  const harness = createHarness({ measureError: new Error("VAD unavailable") });
+  const result = await harness.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: begin(harness).sessionId,
+    payload: validPayload(),
+  });
+
+  assert.equal(result.status, "model_error");
+  assert.equal(harness.extractedLengths.length, 0);
+  assert.equal(harness.saves.length, 0);
+});
+
+test("rejects exactly 29,999 measured speech milliseconds", async () => {
+  const harness = createHarness({ speechDurations: [10_000, 10_000, 9_999] });
+  const result = await harness.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: begin(harness).sessionId,
+    payload: validPayload(),
+  });
+
+  assert.equal(result.status, "insufficient_speech");
+  assert.equal(result.acceptedSpeechMs, 29_999);
+  assert.equal(harness.saves.length, 0);
+});
+
+test("production VAD duration path rejects silence or stable noise despite finite embeddings", async (t) => {
+  for (const name of ["silence", "stable noise"]) {
+    await t.test(name, async () => {
+      const measurer = new VoiceSpeechDurationMeasurer({
+        classifier: {
+          isReady: () => true,
+          async classifyDetailed({ pcm }) {
+            const windowCount = pcm.length / (768 * 2);
+            return {
+              probability: 0.01,
+              windowCount,
+              probabilities: new Array(windowCount).fill(0.01),
+            };
+          },
+          async reset() {},
+        },
+      });
+      const harness = createHarness({ speechDurationMeasurer: measurer });
+      const payload = validPayload();
+      for (const window of payload.windows) {
+        window.samples.fill(name === "silence" ? 0 : 0.1);
+      }
+
+      const result = await harness.service.complete({
+        ownerId: OWNER_ID,
+        sessionId: begin(harness).sessionId,
+        payload,
+      });
+
+      assert.equal(result.status, "insufficient_speech");
+      assert.equal(result.acceptedSpeechMs, 0);
+      assert.equal(harness.extractedLengths.length, 3);
+      assert.equal(harness.saves.length, 0);
+    });
+  }
 });
 
 test("returns insufficient_speech without writing when any accepted window is missing", async () => {
@@ -219,6 +323,10 @@ test("returns model_error for thrown, malformed, NaN, or zero embeddings and zer
         selfConsistency: null,
       });
       assert.equal(harness.saves.length, 0);
+      assert.equal(
+        harness.extractedSamples.every((samples) => samples.every((sample) => sample === 0)),
+        true
+      );
       assert.equal(
         payload.windows.every((entry) => entry.samples.every((sample) => sample === 0)),
         true

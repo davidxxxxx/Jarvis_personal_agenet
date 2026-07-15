@@ -9,6 +9,13 @@ const SELF_PERSON_ID = "self";
 const LEGACY_MODEL_ID = "legacy-unversioned";
 const LEGACY_IMPORT_MARKER = "speaker_profiles:self:-1:v1";
 
+class InvalidLegacyVoiceProfileError extends Error {
+  constructor() {
+    super("legacy voice profile is invalid");
+    this.name = "InvalidLegacyVoiceProfileError";
+  }
+}
+
 function decodeLegacyEmbedding(value) {
   if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
     throw new TypeError("legacy self profile embedding must be binary");
@@ -150,13 +157,31 @@ class VoiceProfileStore {
     if (this.repository.hasVoiceProfileImportMarker(LEGACY_IMPORT_MARKER)) return false;
     const profile = this.legacyProfileReader.getSpeakerProfileById(SELF_VOICE_PROFILE_ID, true);
     if (!profile || profile.id !== SELF_VOICE_PROFILE_ID) return false;
+    let embedding;
+    try {
+      embedding = decodeLegacyEmbedding(profile.embedding);
+    } catch {
+      throw new InvalidLegacyVoiceProfileError();
+    }
     return this.repository.importLegacyVoiceProfile({
       markerKey: LEGACY_IMPORT_MARKER,
       personId: SELF_PERSON_ID,
       modelId: LEGACY_MODEL_ID,
-      embedding: decodeLegacyEmbedding(profile.embedding),
+      embedding,
       importedAt: this.now(),
     });
+  }
+
+  importLegacySelfProfileSafely(log = () => {}) {
+    if (typeof log !== "function") throw new TypeError("legacy import logger must be a function");
+    try {
+      const imported = this.importLegacySelfProfile();
+      return { imported, status: imported ? "imported" : "not_imported" };
+    } catch (error) {
+      if (!(error instanceof InvalidLegacyVoiceProfileError)) throw error;
+      log({ code: "legacy_voice_profile_invalid" });
+      return { imported: false, status: "invalid_legacy_profile" };
+    }
   }
 }
 

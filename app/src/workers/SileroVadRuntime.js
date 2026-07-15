@@ -87,7 +87,9 @@ class SileroVadRuntime {
     this._assertModelPath(modelPath);
     if (this.session && this.modelPath === modelPath) return { ok: true };
     const loaded = await this._createSession(modelPath, sessionOptions);
+    const previousStreams = this.streams;
     this._commitSession(loaded);
+    this._clearStreams(previousStreams);
     return { ok: true };
   }
 
@@ -97,7 +99,9 @@ class SileroVadRuntime {
     const previous = this._snapshotRuntime();
     this._commitSession(loaded);
     try {
-      return await this._health();
+      const result = await this._health();
+      this._clearStreams(previous.streams);
+      return result;
     } catch (error) {
       this._restoreRuntime(previous);
       throw error;
@@ -144,6 +148,7 @@ class SileroVadRuntime {
   }
 
   _restoreRuntime(snapshot) {
+    this._clearStreams(this.streams);
     this.session = snapshot.session;
     this.modelPath = snapshot.modelPath;
     this.stateInputNames = snapshot.stateInputNames;
@@ -158,10 +163,12 @@ class SileroVadRuntime {
 
   _reset(streamId = null) {
     if (streamId === null || streamId === undefined) {
+      this._clearStreams(this.streams);
       this.streams.clear();
       return { ok: true };
     }
     this._assertStreamId(streamId);
+    this._clearStream(this.streams.get(streamId));
     this.streams.delete(streamId);
     return { ok: true };
   }
@@ -177,6 +184,7 @@ class SileroVadRuntime {
     const streamPrefix = `${sessionId}:`;
     for (const [streamId, stream] of this.streams) {
       if (stream.sessionId === sessionId || streamId.startsWith(streamPrefix)) {
+        this._clearStream(stream);
         this.streams.delete(streamId);
       }
     }
@@ -190,20 +198,32 @@ class SileroVadRuntime {
   async _classify({ sessionId = null, streamId, samplesBuffer, sampleRate }) {
     if (!this.session) throw new Error("VAD session not loaded");
     this._assertStreamId(streamId);
-    const stream = this._stream(streamId, sessionId);
-    stream.remainder = appendFloat32(
-      stream.remainder,
-      pcm16To16kFloat32(samplesBuffer, sampleRate)
-    );
-    let probability = 0;
-    let windowCount = 0;
-    while (stream.remainder.length >= WINDOW_SIZE) {
-      const window = new Float32Array(stream.remainder.subarray(0, WINDOW_SIZE));
-      stream.remainder = stream.remainder.slice(WINDOW_SIZE);
-      probability = Math.max(probability, await this._classifyWindow(stream, window));
-      windowCount += 1;
+    try {
+      const stream = this._stream(streamId, sessionId);
+      const converted = pcm16To16kFloat32(samplesBuffer, sampleRate);
+      const previousRemainder = stream.remainder;
+      stream.remainder = appendFloat32(previousRemainder, converted);
+      previousRemainder.fill(0);
+      converted.fill(0);
+      let probability = 0;
+      const probabilities = [];
+      while (stream.remainder.length >= WINDOW_SIZE) {
+        const retained = stream.remainder;
+        const window = new Float32Array(retained.subarray(0, WINDOW_SIZE));
+        stream.remainder = retained.slice(WINDOW_SIZE);
+        retained.fill(0);
+        try {
+          const windowProbability = await this._classifyWindow(stream, window);
+          probability = Math.max(probability, windowProbability);
+          probabilities.push(windowProbability);
+        } finally {
+          window.fill(0);
+        }
+      }
+      return { probability, windowCount: probabilities.length, probabilities };
+    } finally {
+      new Uint8Array(samplesBuffer).fill(0);
     }
-    return { probability, windowCount };
   }
 
   async health() {
@@ -271,10 +291,22 @@ class SileroVadRuntime {
       states,
     };
     while (this.streams.size >= this.maxStreams) {
-      this.streams.delete(this.streams.keys().next().value);
+      const oldestId = this.streams.keys().next().value;
+      this._clearStream(this.streams.get(oldestId));
+      this.streams.delete(oldestId);
     }
     this.streams.set(streamId, stream);
     return stream;
+  }
+
+  _clearStream(stream) {
+    if (!stream) return;
+    stream.remainder?.fill?.(0);
+    for (const state of stream.states?.values?.() || []) state.fill?.(0);
+  }
+
+  _clearStreams(streams) {
+    for (const stream of streams?.values?.() || []) this._clearStream(stream);
   }
 
   async _classifyWindow(stream, window) {

@@ -202,25 +202,29 @@ async function speakerExtract({ samplesBuffer }) {
   if (!speakerSession) throw new Error("speaker session not loaded");
 
   const allSamples = new Float32Array(samplesBuffer);
-  const samples =
-    allSamples.length > SPEAKER_MAX_SAMPLES
-      ? allSamples.subarray(allSamples.length - SPEAKER_MAX_SAMPLES)
-      : allSamples;
+  try {
+    const samples =
+      allSamples.length > SPEAKER_MAX_SAMPLES
+        ? allSamples.subarray(allSamples.length - SPEAKER_MAX_SAMPLES)
+        : allSamples;
 
-  const fbank = computeFbank(samples);
-  if (!fbank) return { embeddingBuffer: null };
+    const fbank = computeFbank(samples);
+    if (!fbank) return { embeddingBuffer: null };
 
-  const feeds = {
-    [speakerInputName]: new ort.Tensor("float32", fbank.features, [
-      1,
-      fbank.numFrames,
-      FBANK_NUM_MELS,
-    ]),
-  };
-  const results = await speakerSession.run(feeds);
-  const output = results[Object.keys(results)[0]];
-  const data = new Float32Array(output.data);
-  return { embeddingBuffer: data.buffer };
+    const feeds = {
+      [speakerInputName]: new ort.Tensor("float32", fbank.features, [
+        1,
+        fbank.numFrames,
+        FBANK_NUM_MELS,
+      ]),
+    };
+    const results = await speakerSession.run(feeds);
+    const output = results[Object.keys(results)[0]];
+    const data = new Float32Array(output.data);
+    return { embeddingBuffer: data.buffer };
+  } finally {
+    allSamples.fill(0);
+  }
 }
 
 function buildTextTokenizer(tokenizerData) {

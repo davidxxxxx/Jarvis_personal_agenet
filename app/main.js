@@ -304,6 +304,7 @@ const {
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
 const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
+const VoiceSpeechDurationMeasurer = require("./src/jarvis/main/VoiceSpeechDurationMeasurer");
 const {
   DataRootConfig,
   resolveJarvisDataRoot,
@@ -647,9 +648,14 @@ async function initializeCoreManagers() {
     repository: jarvisRepository,
     legacyProfileReader: databaseManager,
   });
-  voiceProfileStore.importLegacySelfProfile();
+  voiceProfileStore.importLegacySelfProfileSafely((details) =>
+    debugLogger.warn("Jarvis skipped an invalid legacy voice profile", details, "jarvis")
+  );
   voiceEnrollmentService = new VoiceEnrollmentService({
     speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
+    speechDurationMeasurer: new VoiceSpeechDurationMeasurer({
+      classifier: speechVadClassifier,
+    }),
     voiceProfileStore,
   });
   environmentManager = new EnvironmentManager();

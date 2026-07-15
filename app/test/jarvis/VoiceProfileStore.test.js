@@ -222,6 +222,42 @@ test("legacy marker and imported target roll back in the same transaction", (t) 
   assert.equal(repository.listVoiceProfiles("legacy-unversioned").length, 0);
 });
 
+test("corrupt legacy data is classified safely, leaves no marker, and imports after repair", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  let embedding = Buffer.alloc(3, 9);
+  const logs = [];
+  const store = createStore(repository, {
+    legacyProfileReader: {
+      getSpeakerProfileById: () => ({ id: -1, embedding }),
+    },
+  });
+
+  assert.deepEqual(
+    store.importLegacySelfProfileSafely((entry) => logs.push(entry)),
+    {
+      imported: false,
+      status: "invalid_legacy_profile",
+    }
+  );
+  assert.deepEqual(logs, [{ code: "legacy_voice_profile_invalid" }]);
+  assert.equal(
+    repository.db.prepare("SELECT COUNT(*) AS count FROM voice_profile_import_markers").get().count,
+    0
+  );
+  assert.equal(repository.listVoiceProfiles("legacy-unversioned").length, 0);
+
+  embedding = Buffer.from(normalized(3).buffer);
+  assert.deepEqual(
+    store.importLegacySelfProfileSafely((entry) => logs.push(entry)),
+    {
+      imported: true,
+      status: "imported",
+    }
+  );
+  assert.equal(repository.listVoiceProfiles("legacy-unversioned").length, 1);
+});
+
 test("rejects enrollment from any model other than the exact current CAMPPlus model", (t) => {
   const repository = new JarvisRepository(":memory:");
   t.after(() => repository.close());

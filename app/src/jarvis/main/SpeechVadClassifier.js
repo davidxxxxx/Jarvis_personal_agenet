@@ -80,6 +80,18 @@ class SpeechVadClassifier {
   }
 
   async classify({ sessionId, sourceType, streamId, sampleRate, pcm }) {
+    const result = await this._classify(
+      { sessionId, sourceType, streamId, sampleRate, pcm },
+      false
+    );
+    return result.probability;
+  }
+
+  async classifyDetailed({ sessionId, sourceType, streamId, sampleRate, pcm }) {
+    return this._classify({ sessionId, sourceType, streamId, sampleRate, pcm }, true);
+  }
+
+  async _classify({ sessionId, sourceType, streamId, sampleRate, pcm }, detailed) {
     if (!this.ready) throw new Error("Silero VAD is unavailable");
     if (typeof streamId !== "string" || streamId.length === 0) {
       throw new TypeError("streamId is required");
@@ -108,11 +120,26 @@ class SpeechVadClassifier {
       if (!Number.isFinite(probability) || probability < 0 || probability > 1) {
         throw new Error("Silero VAD returned an invalid probability");
       }
-      return probability;
+      if (!detailed) return { probability };
+      if (
+        !Number.isSafeInteger(result?.windowCount) ||
+        result.windowCount < 0 ||
+        !Array.isArray(result?.probabilities) ||
+        result.probabilities.length !== result.windowCount ||
+        result.probabilities.some((value) => !Number.isFinite(value) || value < 0 || value > 1)
+      ) {
+        throw new Error("Silero VAD returned an invalid detailed result");
+      }
+      return {
+        probability,
+        windowCount: result.windowCount,
+        probabilities: [...result.probabilities],
+      };
     } catch (error) {
       this.reportFailure(error);
       throw error;
     } finally {
+      new Uint8Array(samplesBuffer).fill(0);
       this.inFlightClassifications.delete(request);
       if (!this.ready) this._scheduleRecovery(0);
     }
