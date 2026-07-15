@@ -24,12 +24,142 @@ function migrate(db, fromVersion = 0) {
   return applyJarvisMigrations(db, { now: () => 1_720_992_000_000 });
 }
 
+function replaceTodosWithHistoricalV23Schema(db) {
+  const historicalTriggers = db
+    .prepare(
+      `SELECT name, sql FROM sqlite_master
+       WHERE type = 'trigger' AND tbl_name = 'todos_v2'
+       ORDER BY name`
+    )
+    .all()
+    .filter(
+      ({ name }) =>
+        !new Set([
+          "todos_v2_validate_owner_shape_insert",
+          "todos_v2_validate_owner_shape_update",
+          "todos_v2_validate_owner_binding",
+          "todos_v2_validate_owner_binding_update",
+        ]).has(name)
+    )
+    .map(({ name, sql }) => ({
+      name,
+      sql:
+        name === "todos_v2_immutable_content"
+          ? sql.replace(
+              "owner_subject_id, owner_display_name_snapshot, recurrence_of_id",
+              "owner_subject_id, recurrence_of_id"
+            )
+          : sql,
+    }));
+
+  db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
+  try {
+    db.exec(`
+      ALTER TABLE todos_v2 RENAME TO todos_v24_fixture;
+      CREATE TABLE todos_v2 (
+        id TEXT PRIMARY KEY,
+        canonical_base_key TEXT NOT NULL CHECK(
+          typeof(canonical_base_key) = 'text' AND length(canonical_base_key) = 64
+          AND canonical_base_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        instance_key TEXT NOT NULL UNIQUE CHECK(
+          typeof(instance_key) = 'text' AND length(instance_key) = 64
+          AND instance_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        title TEXT NOT NULL CHECK(typeof(title) = 'text' AND length(trim(title)) > 0),
+        owner_subject_kind TEXT CHECK(
+          owner_subject_kind IS NULL OR (
+            typeof(owner_subject_kind) = 'text'
+            AND owner_subject_kind IN ('person','speaker_cluster')
+          )
+        ),
+        owner_subject_id TEXT CHECK(
+          owner_subject_id IS NULL OR (
+            typeof(owner_subject_id) = 'text' AND length(owner_subject_id) > 0
+          )
+        ),
+        status TEXT NOT NULL CHECK(
+          typeof(status) = 'text' AND status IN ('open','completed','dismissed')
+        ),
+        completed_at INTEGER CHECK(
+          completed_at IS NULL OR (typeof(completed_at) = 'integer' AND completed_at >= 0)
+        ),
+        dismissed_at INTEGER CHECK(
+          dismissed_at IS NULL OR (typeof(dismissed_at) = 'integer' AND dismissed_at >= 0)
+        ),
+        recurrence_of_id TEXT REFERENCES todos_v2(id) ON DELETE SET NULL,
+        source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+        provenance TEXT NOT NULL CHECK(
+          typeof(provenance) = 'text'
+          AND provenance IN ('evidence_linked','legacy_unverified','suggestion','source_deleted')
+        ),
+        created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+        updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+        CHECK((owner_subject_kind IS NULL) = (owner_subject_id IS NULL)),
+        CHECK(
+          (status = 'open' AND completed_at IS NULL AND dismissed_at IS NULL)
+          OR (status = 'completed' AND completed_at IS NOT NULL AND dismissed_at IS NULL)
+          OR (status = 'dismissed' AND dismissed_at IS NOT NULL AND completed_at IS NULL)
+        ),
+        CHECK(recurrence_of_id IS NULL OR recurrence_of_id <> id)
+      );
+      DROP TABLE todos_v24_fixture;
+    `);
+    for (const trigger of historicalTriggers) db.exec(trigger.sql);
+  } finally {
+    db.pragma("legacy_alter_table = OFF");
+    db.pragma("foreign_keys = ON");
+  }
+}
+
 function createRepresentativeV23Database() {
   const db = new Database(":memory:");
   migrate(db);
+  replaceTodosWithHistoricalV23Schema(db);
+  const cloudPayload = JSON.stringify({ inputVersion: "jarvis-analysis-input-v2" });
   db.exec(`
     INSERT INTO sessions (id, started_at, ended_at, status, created_at)
     VALUES ('preserved-v23-session', 10, 20, 'completed', 10);
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at) VALUES
+      ('person-bound', 'Bound snapshot', 1, 10, 20),
+      ('person-live', 'Live person', 0, 10, 20);
+    INSERT INTO speaker_clusters (
+      id, session_id, local_label, model_id, person_id, link_state, created_at, updated_at
+    ) VALUES (
+      'cluster-live', 'preserved-v23-session', 'speaker_live', 'speaker-v1',
+      NULL, 'unknown', 20, 20
+    );
+    INSERT INTO analysis_inputs (
+      id, session_id, transcript_revision, identity_revision, prompt_version,
+      input_hash, input_contract_version, redaction_version, cloud_payload_json,
+      cloud_payload_bytes, cloud_payload_sha256, created_at
+    ) VALUES (
+      'input-v23', 'preserved-v23-session', '${"a".repeat(64)}', '${"b".repeat(64)}',
+      'jarvis-analysis-v2', '${"c".repeat(64)}', 'jarvis-analysis-input-v2',
+      'jarvis-redaction-v1', '${cloudPayload}', ${Buffer.byteLength(cloudPayload, "utf8")},
+      '${"d".repeat(64)}', 20
+    );
+    INSERT INTO analysis_input_speaker_bindings (
+      analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+    ) VALUES ('input-v23', 'SELF', 'person', 'person-bound', 'Bound snapshot');
+    UPDATE people SET display_name = 'Renamed live person' WHERE id = 'person-bound';
+    INSERT INTO todos_v2 (
+      id, canonical_base_key, instance_key, title, owner_subject_kind, owner_subject_id,
+      status, source_analysis_input_id, provenance, created_at, updated_at
+    ) VALUES
+      ('todo-binding', '${"1".repeat(64)}', '${"1".repeat(64)}', 'Binding snapshot',
+       'person', 'person-bound', 'open', 'input-v23', 'evidence_linked', 20, 20),
+      ('todo-live-person', '${"2".repeat(64)}', '${"2".repeat(64)}', 'Live person',
+       'person', 'person-live', 'open', NULL, 'legacy_unverified', 20, 20),
+      ('todo-live-cluster', '${"3".repeat(64)}', '${"3".repeat(64)}', 'Live cluster',
+       'speaker_cluster', 'cluster-live', 'open', NULL, 'legacy_unverified', 20, 20),
+      ('todo-missing-person', '${"4".repeat(64)}', '${"4".repeat(64)}', 'Missing person',
+       'person', 'missing-person', 'open', NULL, 'legacy_unverified', 20, 20),
+      ('todo-missing-cluster', '${"5".repeat(64)}', '${"5".repeat(64)}', 'Missing cluster',
+       'speaker_cluster', 'missing-cluster', 'open', NULL, 'legacy_unverified', 20, 20),
+      ('todo-unowned', '${"6".repeat(64)}', '${"6".repeat(64)}', 'Unowned',
+       NULL, NULL, 'open', 'input-v23', 'evidence_linked', 20, 20);
     DROP TABLE analysis_budget_attempts;
     DROP TABLE analysis_budget_periods;
     DROP TABLE analysis_budget_settings;
@@ -101,11 +231,129 @@ test("v24 creates the durable analysis budget schema and reviewed MiniMax price 
 test("a v23 database upgrades once and the latest reopen is a no-op", () => {
   const db = createRepresentativeV23Database();
   try {
+    assert.equal(
+      db
+        .prepare("PRAGMA table_info(todos_v2)")
+        .all()
+        .some(({ name }) => name === "owner_display_name_snapshot"),
+      false
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 6);
+    assert.doesNotMatch(
+      db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+           WHERE type = 'trigger' AND name = 'todos_v2_immutable_content'`
+        )
+        .get().sql,
+      /owner_display_name_snapshot/
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'trigger' AND name LIKE 'todos_v2_validate_owner_%'
+           ORDER BY name`
+        )
+        .all(),
+      []
+    );
     assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 24 });
     assert.deepEqual(db.prepare("SELECT id, status FROM sessions").get(), {
       id: "preserved-v23-session",
       status: "completed",
     });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, owner_display_name_snapshot
+           FROM todos_v2
+           ORDER BY id`
+        )
+        .all(),
+      [
+        { id: "todo-binding", owner_display_name_snapshot: "Bound snapshot" },
+        { id: "todo-live-cluster", owner_display_name_snapshot: "speaker_live" },
+        { id: "todo-live-person", owner_display_name_snapshot: "Live person" },
+        { id: "todo-missing-cluster", owner_display_name_snapshot: "[Unknown speaker]" },
+        { id: "todo-missing-person", owner_display_name_snapshot: "[Unknown person]" },
+        { id: "todo-unowned", owner_display_name_snapshot: null },
+      ]
+    );
+    assert.throws(
+      () =>
+        db.exec(`
+          INSERT INTO todos_v2 (
+            id, canonical_base_key, instance_key, title,
+            owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+            status, source_analysis_input_id, provenance, created_at, updated_at
+          ) VALUES (
+            'todo-invalid-shape', '${"7".repeat(64)}', '${"7".repeat(64)}',
+            'Invalid shape', 'person', 'person-live', '   ', 'open', NULL,
+            'legacy_unverified', 20, 20
+          )
+        `),
+      /todo owner shape is invalid/
+    );
+    assert.throws(
+      () =>
+        db.exec(`
+          INSERT INTO todos_v2 (
+            id, canonical_base_key, instance_key, title,
+            owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+            status, source_analysis_input_id, provenance, created_at, updated_at
+          ) VALUES (
+            'todo-invalid-binding', '${"8".repeat(64)}', '${"8".repeat(64)}',
+            'Invalid binding', 'person', 'person-bound', 'Renamed live person', 'open',
+            'input-v23', 'evidence_linked', 20, 20
+          )
+        `),
+      /todo owner binding is invalid/
+    );
+    assert.equal(
+      db
+        .prepare(
+          `INSERT INTO todos_v2 (
+             id, canonical_base_key, instance_key, title,
+             owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+             status, source_analysis_input_id, provenance, created_at, updated_at
+           ) VALUES (
+             'todo-valid-binding', ?, ?, 'Valid binding',
+             'person', 'person-bound', 'Bound snapshot', 'open',
+             'input-v23', 'evidence_linked', 20, 20
+           )`
+        )
+        .run("9".repeat(64), "9".repeat(64)).changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db.exec(`
+          UPDATE todos_v2
+          SET owner_display_name_snapshot = 'Wrong binding'
+          WHERE id = 'todo-binding'
+        `),
+      /todo owner binding is invalid/
+    );
+    assert.throws(
+      () =>
+        db.exec(`
+          UPDATE todos_v2
+          SET owner_display_name_snapshot = '   '
+          WHERE id = 'todo-live-person'
+        `),
+      /todo owner shape is invalid/
+    );
+    assert.throws(
+      () =>
+        db.exec(`
+          UPDATE todos_v2
+          SET owner_display_name_snapshot = 'Hostile rewrite'
+          WHERE id = 'todo-live-person'
+        `),
+      /todo content is immutable/
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
     const first = db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all();
     assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 24 });
     assert.deepEqual(

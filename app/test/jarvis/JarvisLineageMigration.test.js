@@ -65,7 +65,10 @@ const LINEAGE_TRIGGERS = [
   "memory_supersessions_validate_slot",
   "memory_conflict_members_validate_slot",
   "memory_conflict_groups_validate_resolution",
+  "todos_v2_validate_owner_shape_insert",
+  "todos_v2_validate_owner_shape_update",
   "todos_v2_validate_owner_binding",
+  "todos_v2_validate_owner_binding_update",
   "todos_v2_terminal_state",
   "suggestions_v2_terminal_state",
   "evidence_refs_validate_target_insert",
@@ -929,7 +932,7 @@ test("todo owner snapshots require the exact analysis input binding and survive 
           sourceAnalysisInputId: null,
           provenance: "legacy_unverified",
         }),
-      { code: "SQLITE_CONSTRAINT_CHECK" }
+      /todo owner shape is invalid/
     );
     assert.throws(
       () =>
@@ -944,7 +947,7 @@ test("todo owner snapshots require the exact analysis input binding and survive 
           sourceAnalysisInputId: null,
           provenance: "legacy_unverified",
         }),
-      { code: "SQLITE_CONSTRAINT_CHECK" }
+      /todo owner shape is invalid/
     );
     assert.throws(
       () =>
@@ -959,7 +962,7 @@ test("todo owner snapshots require the exact analysis input binding and survive 
           sourceAnalysisInputId: null,
           provenance: "legacy_unverified",
         }),
-      { code: "SQLITE_CONSTRAINT_CHECK" }
+      /todo owner shape is invalid/
     );
     assert.equal(
       insertTodo.run({
@@ -981,7 +984,7 @@ test("todo owner snapshots require the exact analysis input binding and survive 
           .prepare(
             `UPDATE todos_v2
              SET owner_display_name_snapshot = 'Hostile rewrite'
-             WHERE id = 'todo-cluster-owner'`
+             WHERE id = 'todo-legacy-owner'`
           )
           .run(),
       /todo content is immutable/

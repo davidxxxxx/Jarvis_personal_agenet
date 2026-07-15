@@ -628,6 +628,86 @@ const SPEAKER_IDENTITY_RESOLUTION_SCHEMA = `
   END;
 `;
 
+const TODO_OWNER_SNAPSHOT_TRIGGER_NAMES = Object.freeze([
+  "todos_v2_immutable_content",
+  "todos_v2_validate_owner_shape_insert",
+  "todos_v2_validate_owner_shape_update",
+  "todos_v2_validate_owner_binding",
+  "todos_v2_validate_owner_binding_update",
+]);
+
+const TODO_OWNER_SNAPSHOT_TRIGGERS = `
+  CREATE TRIGGER IF NOT EXISTS todos_v2_immutable_content
+  BEFORE UPDATE OF id, canonical_base_key, instance_key, title, owner_subject_kind,
+    owner_subject_id, owner_display_name_snapshot, recurrence_of_id, created_at ON todos_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'todo content is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_shape_insert
+  BEFORE INSERT ON todos_v2
+  WHEN NOT (
+    (
+      NEW.owner_subject_kind IS NULL
+      AND NEW.owner_subject_id IS NULL
+      AND NEW.owner_display_name_snapshot IS NULL
+    )
+    OR (
+      NEW.owner_subject_kind IS NOT NULL
+      AND NEW.owner_subject_id IS NOT NULL
+      AND typeof(NEW.owner_display_name_snapshot) = 'text'
+      AND length(trim(NEW.owner_display_name_snapshot)) > 0
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo owner shape is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_shape_update
+  BEFORE UPDATE OF owner_subject_kind, owner_subject_id, owner_display_name_snapshot ON todos_v2
+  WHEN NOT (
+    (
+      NEW.owner_subject_kind IS NULL
+      AND NEW.owner_subject_id IS NULL
+      AND NEW.owner_display_name_snapshot IS NULL
+    )
+    OR (
+      NEW.owner_subject_kind IS NOT NULL
+      AND NEW.owner_subject_id IS NOT NULL
+      AND typeof(NEW.owner_display_name_snapshot) = 'text'
+      AND length(trim(NEW.owner_display_name_snapshot)) > 0
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo owner shape is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding
+  BEFORE INSERT ON todos_v2
+  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings AS binding
+    WHERE binding.analysis_input_id = NEW.source_analysis_input_id
+      AND binding.subject_kind = NEW.owner_subject_kind
+      AND binding.subject_id = NEW.owner_subject_id
+      AND binding.subject_display_name_snapshot = NEW.owner_display_name_snapshot
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo owner binding is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding_update
+  BEFORE UPDATE OF owner_subject_kind, owner_subject_id, owner_display_name_snapshot,
+    source_analysis_input_id ON todos_v2
+  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings AS binding
+    WHERE binding.analysis_input_id = NEW.source_analysis_input_id
+      AND binding.subject_kind = NEW.owner_subject_kind
+      AND binding.subject_id = NEW.owner_subject_id
+      AND binding.subject_display_name_snapshot = NEW.owner_display_name_snapshot
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo owner binding is invalid');
+  END;
+`;
+
 const MEMORY_LINEAGE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS analysis_inputs (
     id TEXT PRIMARY KEY,
@@ -1521,25 +1601,7 @@ const MEMORY_LINEAGE_SCHEMA = `
   BEGIN
     SELECT RAISE(ABORT, 'topic lifecycle is terminal');
   END;
-  CREATE TRIGGER IF NOT EXISTS todos_v2_immutable_content
-  BEFORE UPDATE OF id, canonical_base_key, instance_key, title, owner_subject_kind,
-    owner_subject_id, owner_display_name_snapshot, recurrence_of_id, created_at ON todos_v2
-  BEGIN
-    SELECT RAISE(ABORT, 'todo content is immutable');
-  END;
-  CREATE TRIGGER IF NOT EXISTS todos_v2_validate_owner_binding
-  BEFORE INSERT ON todos_v2
-  WHEN NEW.source_analysis_input_id IS NOT NULL AND NOT EXISTS (
-    SELECT 1
-    FROM analysis_input_speaker_bindings AS binding
-    WHERE binding.analysis_input_id = NEW.source_analysis_input_id
-      AND binding.subject_kind = NEW.owner_subject_kind
-      AND binding.subject_id = NEW.owner_subject_id
-      AND binding.subject_display_name_snapshot = NEW.owner_display_name_snapshot
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'todo owner binding is invalid');
-  END;
+  ${TODO_OWNER_SNAPSHOT_TRIGGERS}
   CREATE TRIGGER IF NOT EXISTS todos_v2_source_guard
   BEFORE UPDATE OF source_analysis_input_id ON todos_v2
   WHEN NOT (
@@ -3126,6 +3188,73 @@ function tableExists(db, table) {
   );
 }
 
+function upgradeTodoOwnerSnapshots(db) {
+  if (!tableExists(db, "todos_v2")) return;
+
+  const addedOwnerSnapshot = !columns(db, "todos_v2").has("owner_display_name_snapshot");
+  if (!addedOwnerSnapshot) {
+    db.exec(TODO_OWNER_SNAPSHOT_TRIGGERS);
+    return;
+  }
+  for (const trigger of TODO_OWNER_SNAPSHOT_TRIGGER_NAMES) {
+    db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+  }
+  addColumn(db, "todos_v2", "owner_display_name_snapshot TEXT");
+  db.exec(`
+    UPDATE todos_v2
+    SET owner_display_name_snapshot = NULL
+    WHERE owner_subject_kind IS NULL AND owner_subject_id IS NULL;
+  `);
+  const hasOwnedTodos = db
+    .prepare(
+      `SELECT 1 FROM todos_v2
+       WHERE owner_subject_kind IS NOT NULL AND owner_subject_id IS NOT NULL
+       LIMIT 1`
+    )
+    .get();
+  if (hasOwnedTodos) {
+    db.exec(`
+    UPDATE todos_v2 AS todo
+    SET owner_display_name_snapshot = COALESCE(
+      (
+        SELECT binding.subject_display_name_snapshot
+        FROM analysis_input_speaker_bindings AS binding
+        WHERE binding.analysis_input_id = todo.source_analysis_input_id
+          AND binding.subject_kind = todo.owner_subject_kind
+          AND binding.subject_id = todo.owner_subject_id
+        ORDER BY binding.label
+        LIMIT 1
+      ),
+      CASE
+        WHEN todo.owner_subject_kind = 'person' THEN (
+          SELECT person.display_name
+          FROM people AS person
+          WHERE person.id = todo.owner_subject_id
+        )
+      END,
+      CASE
+        WHEN todo.owner_subject_kind = 'speaker_cluster' THEN (
+          SELECT cluster.local_label
+          FROM speaker_clusters AS cluster
+          WHERE cluster.id = todo.owner_subject_id
+        )
+      END,
+      CASE todo.owner_subject_kind
+        WHEN 'person' THEN '[Unknown person]'
+        WHEN 'speaker_cluster' THEN '[Unknown speaker]'
+      END
+    )
+    WHERE todo.owner_subject_kind IS NOT NULL
+      AND todo.owner_subject_id IS NOT NULL
+      AND (
+        todo.owner_display_name_snapshot IS NULL
+        OR length(trim(todo.owner_display_name_snapshot)) = 0
+      );
+    `);
+  }
+  db.exec(TODO_OWNER_SNAPSHOT_TRIGGERS);
+}
+
 function migrateSessionDiarizationV21(db) {
   if (!tableExists(db, "speaker_diarization_runs")) return;
   const hasCommitSequence = columns(db, "speaker_diarization_runs").has("commit_sequence");
@@ -3713,6 +3842,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         );
       }
       if (fromVersion < 24) {
+        upgradeTodoOwnerSnapshots(db);
         if (!retainValidAnalysisBudgetSchema(db)) db.exec(ANALYSIS_BUDGET_SCHEMA);
       }
 
