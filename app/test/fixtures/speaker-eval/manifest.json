@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "modelId": "3dspeaker-campplus-voxceleb-16k-v1",
+  "profiles": [
+    {
+      "personId": "self",
+      "kind": "self",
+      "audio": ["profiles/self-01.wav"]
+    },
+    {
+      "personId": "known-a",
+      "kind": "known",
+      "audio": ["profiles/known-a-01.wav"]
+    }
+  ],
+  "cases": [
+    {
+      "id": "case-owner-known-unknown",
+      "audio": "cases/case-owner-known-unknown.wav",
+      "speakers": [
+        { "speakerId": "self", "kind": "self" },
+        { "speakerId": "known-a", "kind": "known" },
+        { "speakerId": "unknown-a", "kind": "unknown" }
+      ],
+      "segments": [
+        { "speakerId": "self", "startMs": 0, "endMs": 5000 },
+        { "speakerId": "known-a", "startMs": 5000, "endMs": 10000 },
+        { "speakerId": "unknown-a", "startMs": 10000, "endMs": 15000 },
+        { "speakerId": "self", "startMs": 15000, "endMs": 20000 },
+        { "speakerId": "known-a", "startMs": 20000, "endMs": 25000 },
+        { "speakerId": "unknown-a", "startMs": 25000, "endMs": 30000 },
+        { "speakerId": "self", "startMs": 30000, "endMs": 35000 },
+        { "speakerId": "known-a", "startMs": 35000, "endMs": 40000 },
+        { "speakerId": "unknown-a", "startMs": 40000, "endMs": 45000 }
+      ]
+    }
+  ]
+}

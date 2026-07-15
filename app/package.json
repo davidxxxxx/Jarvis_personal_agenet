@@ -78,6 +78,7 @@
     "test:jarvis": "node --test \"test/jarvis/*.test.js\" && npm run test:renderer",
     "test:jarvis:capture-soak": "node --test --test-timeout=120000 test/jarvis/AllDayCaptureSoak.test.js",
     "test:jarvis:resource-soak": "node --test --test-timeout=30000 test/jarvis/AllDayResourceSoak.test.js",
+    "test:speaker-eval": "node --test test/jarvis/SpeakerIdentityEvaluation.test.js",
     "jarvis:cuda:self-test": "node scripts/jarvis-cuda-self-test.js",
     "quality-check": "npm run format:check && npm run typecheck",
     "i18n:check": "node scripts/check-i18n.js",
