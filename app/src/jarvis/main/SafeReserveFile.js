@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -29,15 +30,105 @@ class DefaultFreeSpaceInspector {
   }
 }
 
-function assertFreed(before, after, requiredBytes) {
+class DefaultAllocationInspector {
+  inspect(filePath, stat) {
+    let reparse = stat.isSymbolicLink();
+    let sparse = false;
+    let compressed = false;
+    if (process.platform === "win32") {
+      try {
+        const raw = execFileSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { $a=(Get-Item -LiteralPath $args[0] -Force).Attributes; [Console]::Write([int]$a) }",
+            filePath,
+          ],
+          { windowsHide: true, timeout: 5_000, encoding: "utf8" }
+        );
+        const attributes = Number(String(raw).trim());
+        if (!Number.isSafeInteger(attributes)) throw new Error("invalid file attributes");
+        reparse ||= (attributes & 0x400) !== 0;
+        sparse = (attributes & 0x200) !== 0;
+        compressed = (attributes & 0x800) !== 0;
+      } catch {
+        throw new Error("emergency reserve allocation could not be inspected");
+      }
+    }
+    return {
+      allocatedBytes:
+        Number.isSafeInteger(stat.blocks) && stat.blocks >= 0 ? stat.blocks * 512 : stat.size,
+      reparse,
+      sparse,
+      compressed,
+    };
+  }
+}
+
+function assertAllocated(filePath, stat, requiredBytes, allocationInspector) {
+  const allocation = allocationInspector.inspect(filePath, stat);
   if (
-    !Number.isSafeInteger(before) ||
-    !Number.isSafeInteger(after) ||
-    !Number.isSafeInteger(requiredBytes) ||
-    requiredBytes <= 0 ||
-    after - before < requiredBytes
+    !stat?.isFile?.() ||
+    stat.isSymbolicLink() ||
+    stat.nlink !== 1 ||
+    stat.size !== requiredBytes ||
+    !allocation ||
+    allocation.reparse ||
+    allocation.sparse ||
+    allocation.compressed ||
+    !Number.isSafeInteger(allocation.allocatedBytes) ||
+    allocation.allocatedBytes < requiredBytes
   ) {
-    throw new Error("emergency reserve released allocation could not be verified");
+    throw new Error("emergency reserve file is unsafe");
+  }
+}
+
+function freeSpaceTelemetry(beforeBytes, afterBytes, requiredBytes) {
+  const observedDeltaBytes =
+    Number.isSafeInteger(beforeBytes) && Number.isSafeInteger(afterBytes)
+      ? afterBytes - beforeBytes
+      : null;
+  return Object.freeze({
+    beforeBytes: Number.isSafeInteger(beforeBytes) ? beforeBytes : null,
+    afterBytes: Number.isSafeInteger(afterBytes) ? afterBytes : null,
+    observedDeltaBytes,
+    requiredBytes,
+    confirmed: Number.isSafeInteger(observedDeltaBytes) && observedDeltaBytes >= requiredBytes,
+  });
+}
+
+function inspectFreeSpaceSync(inspector, directory) {
+  try {
+    return inspector.inspect(directory);
+  } catch {
+    return null;
+  }
+}
+
+async function inspectFreeSpace(inspector, directory) {
+  try {
+    return inspector.inspectAsync
+      ? await inspector.inspectAsync(directory)
+      : await inspector.inspect(directory);
+  } catch {
+    return null;
+  }
+}
+
+function reportTelemetrySync(callback, sample) {
+  try {
+    const pending = callback(sample);
+    if (pending && typeof pending.then === "function") {
+      Promise.resolve(pending).catch(() => {});
+    }
+  } catch {}
+}
+
+function assertSizeBytes(sizeBytes) {
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+    throw new TypeError("sizeBytes must be a positive safe integer");
   }
 }
 
@@ -91,12 +182,15 @@ function releaseReserveSync({
   filePath,
   sizeBytes,
   fsImpl = fs,
-  validate,
+  validate = () => {},
+  allocationInspector = new DefaultAllocationInspector(),
   freeSpaceInspector = new DefaultFreeSpaceInspector(),
+  onFreeSpaceTelemetry = () => {},
 }) {
+  assertSizeBytes(sizeBytes);
   const reservePath = path.resolve(filePath);
   const directory = path.dirname(reservePath);
-  const before = freeSpaceInspector.inspect(directory);
+  const before = inspectFreeSpaceSync(freeSpaceInspector, directory);
   let handle = null;
   try {
     handle = fsImpl.openSync(reservePath, "r");
@@ -106,6 +200,7 @@ function releaseReserveSync({
   }
   const expected = fsImpl.fstatSync(handle);
   try {
+    assertAllocated(reservePath, expected, sizeBytes, allocationInspector);
     validate(reservePath, expected);
     const quarantine = `${reservePath}.release-${crypto.randomUUID()}`;
     fsImpl.renameSync(reservePath, quarantine);
@@ -114,14 +209,15 @@ function releaseReserveSync({
       restoreQuarantineSync(fsImpl, quarantine, reservePath);
       throw new Error("emergency reserve file is unsafe");
     }
+    assertAllocated(quarantine, renamed, sizeBytes, allocationInspector);
     validate(quarantine, renamed);
     fsImpl.unlinkSync(quarantine);
   } finally {
     fsImpl.closeSync(handle);
   }
   fsyncDirectorySync(fsImpl, directory);
-  const after = freeSpaceInspector.inspect(directory);
-  assertFreed(before, after, sizeBytes);
+  const after = inspectFreeSpaceSync(freeSpaceInspector, directory);
+  reportTelemetrySync(onFreeSpaceTelemetry, freeSpaceTelemetry(before, after, sizeBytes));
   return true;
 }
 
@@ -130,13 +226,14 @@ async function releaseReserve({
   sizeBytes,
   fsImpl = fsp,
   validate = async () => {},
+  allocationInspector = new DefaultAllocationInspector(),
   freeSpaceInspector = new DefaultFreeSpaceInspector(),
+  onFreeSpaceTelemetry = () => {},
 }) {
+  assertSizeBytes(sizeBytes);
   const reservePath = path.resolve(filePath);
   const directory = path.dirname(reservePath);
-  const before = freeSpaceInspector.inspectAsync
-    ? await freeSpaceInspector.inspectAsync(directory)
-    : await freeSpaceInspector.inspect(directory);
+  const before = await inspectFreeSpace(freeSpaceInspector, directory);
   let handle = null;
   try {
     handle = await fsImpl.open(reservePath, "r");
@@ -146,6 +243,7 @@ async function releaseReserve({
   }
   const expected = await handle.stat();
   try {
+    assertAllocated(reservePath, expected, sizeBytes, allocationInspector);
     await validate(reservePath, expected);
     const quarantine = `${reservePath}.release-${crypto.randomUUID()}`;
     await fsImpl.rename(reservePath, quarantine);
@@ -154,20 +252,20 @@ async function releaseReserve({
       await restoreQuarantine(fsImpl, quarantine, reservePath);
       throw new Error("emergency reserve file is unsafe");
     }
+    assertAllocated(quarantine, renamed, sizeBytes, allocationInspector);
     await validate(quarantine, renamed);
     await fsImpl.unlink(quarantine);
   } finally {
     await handle.close();
   }
   await fsyncDirectory(fsImpl, directory);
-  const after = freeSpaceInspector.inspectAsync
-    ? await freeSpaceInspector.inspectAsync(directory)
-    : await freeSpaceInspector.inspect(directory);
-  assertFreed(before, after, sizeBytes);
+  const after = await inspectFreeSpace(freeSpaceInspector, directory);
+  reportTelemetrySync(onFreeSpaceTelemetry, freeSpaceTelemetry(before, after, sizeBytes));
   return true;
 }
 
 module.exports = {
+  DefaultAllocationInspector,
   DefaultFreeSpaceInspector,
   releaseReserve,
   releaseReserveSync,

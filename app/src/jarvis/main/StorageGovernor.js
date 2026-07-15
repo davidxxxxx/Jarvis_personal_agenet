@@ -1,8 +1,8 @@
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
-const { execFileSync } = require("node:child_process");
 const {
+  DefaultAllocationInspector,
   DefaultFreeSpaceInspector,
   releaseReserveSync,
 } = require("./SafeReserveFile");
@@ -10,43 +10,6 @@ const {
 const GIB = 1024 ** 3;
 const DEFAULT_RESERVE_BYTES = 512 * 1024 ** 2;
 const RESERVE_CHUNK_BYTES = 1024 ** 2;
-
-class DefaultAllocationInspector {
-  inspect(filePath, stat) {
-    let reparse = stat.isSymbolicLink();
-    let sparse = false;
-    let compressed = false;
-    if (process.platform === "win32") {
-      try {
-        const raw = execFileSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { $a=(Get-Item -LiteralPath $args[0] -Force).Attributes; [Console]::Write([int]$a) }",
-            filePath,
-          ],
-          { windowsHide: true, timeout: 5_000, encoding: "utf8" }
-        );
-        const attributes = Number(String(raw).trim());
-        if (!Number.isSafeInteger(attributes)) throw new Error("invalid file attributes");
-        reparse ||= (attributes & 0x400) !== 0;
-        sparse = (attributes & 0x200) !== 0;
-        compressed = (attributes & 0x800) !== 0;
-      } catch {
-        throw new Error("emergency reserve allocation could not be inspected");
-      }
-    }
-    return {
-      allocatedBytes:
-        Number.isSafeInteger(stat.blocks) && stat.blocks >= 0 ? stat.blocks * 512 : stat.size,
-      reparse,
-      sparse,
-      compressed,
-    };
-  }
-}
 
 class FileEmergencyReserve {
   constructor({
@@ -113,7 +76,7 @@ class FileEmergencyReserve {
       filePath: this.filePath,
       sizeBytes: this.sizeBytes,
       fsImpl: this.fs,
-      validate: (candidate, stat) => this._assertAllocated(candidate, stat),
+      allocationInspector: this.allocationInspector,
       freeSpaceInspector: this.freeSpaceInspector,
     });
   }

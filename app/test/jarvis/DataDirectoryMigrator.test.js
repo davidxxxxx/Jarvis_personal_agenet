@@ -109,14 +109,25 @@ test("rolls configuration back and reopens the old root when the new root cannot
   await writeTree(from);
   const events = [];
   let reopenCount = 0;
+  const activationFailure = new Error(`cannot reopen private target ${to}`);
   const migrator = createMigrator(events, {
     reopenHolders: async (root) => {
       events.push(`reopen:${path.basename(root)}`);
-      if (reopenCount++ === 0) throw new Error("cannot reopen target");
+      if (reopenCount++ === 0) throw activationFailure;
     },
   });
 
-  await assert.rejects(migrator.migrate({ from, to }), /migration activation failed/);
+  await assert.rejects(migrator.migrate({ from, to }), (error) => {
+    assert.equal(
+      error.message,
+      "migration activation failed; the previous data directory was restored"
+    );
+    assert.equal(error.code, "MIGRATION_ACTIVATION_FAILED");
+    assert.equal(error.step, "reopen_target");
+    assert.equal(error.cause, activationFailure);
+    assert.equal(error.message.includes(base), false);
+    return true;
+  });
 
   assert.deepEqual(events, [
     "close",
@@ -139,17 +150,15 @@ test("releases only the obsolete root reserve after success and the target reser
     await fsp.writeFile(path.join(from, "keep-old-data.txt"), "preserve");
     let targetReopens = 0;
     const releasedAllocation = [];
-    const fsImpl = Object.assign({}, fsp, {
-      async rename(candidate, destination) {
-        if (path.basename(candidate) === ".emergency-reserve") {
-          const stat = await fsp.lstat(candidate);
-          releasedAllocation.push({ root: path.dirname(candidate), bytes: stat.size });
-        }
-        return fsp.rename(candidate, destination);
-      },
-    });
+    const releaseReserveImpl = async ({ filePath, sizeBytes, fsImpl }) => {
+      const stat = await fsImpl.lstat(filePath);
+      releasedAllocation.push({ root: path.dirname(filePath), bytes: stat.size });
+      assert.equal(sizeBytes, stat.size);
+      await fsImpl.rm(filePath);
+      return true;
+    };
     const migrator = createMigrator([], {
-      fsImpl,
+      releaseReserveImpl,
       reopenHolders: async (root) => {
         await fsp.writeFile(path.join(root, ".emergency-reserve"), Buffer.alloc(4096, 2));
         if (root === to && outcome === "rollback" && targetReopens++ === 0) {
@@ -173,6 +182,41 @@ test("releases only the obsolete root reserve after success and the target reser
       { root: outcome === "success" ? from : to, bytes: 4096 },
     ]);
   }
+});
+
+test("preserves activation and rollback causes with stable private-path-free steps", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-rollback-cause-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const from = path.join(base, "old-root");
+  const to = path.join(base, "new-root");
+  await writeTree(from);
+  const activationFailure = new Error(`target reopen failed at ${to}`);
+  const rollbackFailure = new Error(`reserve release failed at ${to}`);
+  const migrator = createMigrator([], {
+    releaseReserveImpl: async ({ filePath }) => {
+      if (path.dirname(filePath) === to) throw rollbackFailure;
+      return false;
+    },
+    reopenHolders: async (root) => {
+      if (root !== to) return;
+      await fsp.writeFile(path.join(root, ".emergency-reserve"), Buffer.alloc(4096, 5));
+      throw activationFailure;
+    },
+  });
+
+  await assert.rejects(migrator.migrate({ from, to }), (error) => {
+    assert.equal(
+      error.message,
+      "migration rollback failed; restart Jarvis and select the previous data directory"
+    );
+    assert.equal(error.code, "MIGRATION_ROLLBACK_FAILED");
+    assert.equal(error.step, "release_target_reserve");
+    assert.equal(error.activationStep, "reopen_target");
+    assert.equal(error.cause instanceof AggregateError, true);
+    assert.deepEqual(error.cause.errors, [activationFailure, rollbackFailure]);
+    assert.equal(error.message.includes(base), false);
+    return true;
+  });
 });
 
 test("rejects roots, nested paths, network and removable destinations without leaking paths", async (t) => {

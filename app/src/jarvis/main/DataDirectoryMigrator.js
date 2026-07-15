@@ -34,6 +34,15 @@ async function sha256(filePath, fsImpl) {
   return hash.digest("hex");
 }
 
+function migrationFailure(message, { code, step, cause, activationStep = null }) {
+  const error = new Error(message, { cause });
+  error.name = "DataDirectoryMigrationError";
+  error.code = code;
+  error.step = step;
+  if (activationStep !== null) error.activationStep = activationStep;
+  return error;
+}
+
 class DataDirectoryMigrator {
   constructor({
     fsImpl = fsp,
@@ -50,6 +59,7 @@ class DataDirectoryMigrator {
     directoryIdentityProvider = null,
     directoryLeaseProvider = new DirectoryLeaseProvider({ fsImpl }),
     faultInjector = async () => {},
+    releaseReserveImpl = releaseReserve,
   } = {}) {
     if (!fsImpl || typeof fsImpl.lstat !== "function" || typeof fsImpl.copyFile !== "function") {
       throw new TypeError("fsImpl must provide promise-based file operations");
@@ -63,6 +73,7 @@ class DataDirectoryMigrator {
       reopenHolders,
       onProgress,
       relocateTarget,
+      releaseReserveImpl,
     })) {
       if (typeof callback !== "function") throw new TypeError(`${name} must be a function`);
     }
@@ -73,6 +84,7 @@ class DataDirectoryMigrator {
     this.reopenHolders = reopenHolders;
     this.onProgress = onProgress;
     this.relocateTarget = relocateTarget;
+    this.releaseReserve = releaseReserveImpl;
     if (
       activationJournal !== null &&
       (!activationJournal ||
@@ -374,38 +386,66 @@ class DataDirectoryMigrator {
               totalFiles: entries.length,
             });
             await this.activationJournal.mark("activating");
+            let activationStep = "persist_target";
             try {
               await this.persistRoot(target);
+              activationStep = "journal_mark_persisted";
               await this.activationJournal.mark("persisted");
+              activationStep = "journal_mark_reopening";
               await this.activationJournal.mark("reopening");
+              activationStep = "reopen_target";
               await lease.reopen(target, source);
+              activationStep = "release_source_reserve";
               await this._releaseEmergencyReserve(source);
+              activationStep = "journal_finalize";
               await this.activationJournal.finalize(target);
+              activationStep = "commit_target";
               lease.commit(target);
-            } catch {
+            } catch (activationError) {
+              let rollbackStep = "progress_rollback_start";
               try {
                 this.onProgress({
                   state: "rollback",
                   completedFiles: 0,
                   totalFiles: entries.length,
                 });
+                rollbackStep = "journal_mark_rollback";
                 await this.activationJournal.mark("rollback");
+                rollbackStep = "persist_source";
                 await this.persistRoot(source);
+                rollbackStep = "reopen_source";
                 await lease.rollback(source);
+                rollbackStep = "release_target_reserve";
                 await this._releaseEmergencyReserve(target);
+                rollbackStep = "journal_rollback_complete";
                 await this.activationJournal.rollback(source);
+                rollbackStep = "progress_rollback_complete";
                 this.onProgress({
                   state: "rollback",
                   completedFiles: entries.length,
                   totalFiles: entries.length,
                 });
-              } catch {
-                throw new Error(
-                  "migration rollback failed; restart Jarvis and select the previous data directory"
+              } catch (rollbackError) {
+                throw migrationFailure(
+                  "migration rollback failed; restart Jarvis and select the previous data directory",
+                  {
+                    code: "MIGRATION_ROLLBACK_FAILED",
+                    step: rollbackStep,
+                    activationStep,
+                    cause: new AggregateError(
+                      [activationError, rollbackError],
+                      "migration activation and rollback failed"
+                    ),
+                  }
                 );
               }
-              throw new Error(
-                "migration activation failed; the previous data directory was restored"
+              throw migrationFailure(
+                "migration activation failed; the previous data directory was restored",
+                {
+                  code: "MIGRATION_ACTIVATION_FAILED",
+                  step: activationStep,
+                  cause: activationError,
+                }
               );
             }
             manifest.phase = "activated";
@@ -1045,7 +1085,7 @@ class DataDirectoryMigrator {
       throw error;
     });
     if (stat === null) return false;
-    return releaseReserve({
+    return this.releaseReserve({
       filePath: reservePath,
       sizeBytes: stat.size,
       fsImpl: this.fs,
