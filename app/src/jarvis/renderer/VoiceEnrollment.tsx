@@ -5,15 +5,16 @@ import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
 import type {
   JarvisVoiceEnrollmentPayload,
+  JarvisVoiceEnrollmentOutcome,
   JarvisVoiceEnrollmentSession,
   JarvisVoiceEnrollmentStatus,
 } from "../types";
 
-const RECORDING_SECONDS = 30;
-const WINDOW_SECONDS = 8;
+const RECORDING_SECONDS = 32;
+const WINDOW_SECONDS = 10;
 const WORKLET_CHUNK_SIZE = 2_400;
-const MIN_READY_SECONDS = 29;
-const MAX_CAPTURE_SECONDS = 31;
+const MIN_READY_SECONDS = 30;
+const MAX_CAPTURE_SECONDS = 34;
 
 type EnrollmentState =
   "idle" | "setup" | "recording" | "stopping" | "ready" | "saving" | "saved" | "error";
@@ -66,6 +67,10 @@ export default function VoiceEnrollment() {
   const [secondsLeft, setSecondsLeft] = useState(RECORDING_SECONDS);
   const [level, setLevel] = useState(0);
   const [profileStatus, setProfileStatus] = useState<JarvisVoiceEnrollmentStatus | null>(null);
+  const [errorOutcome, setErrorOutcome] = useState<Exclude<
+    JarvisVoiceEnrollmentOutcome,
+    "accepted"
+  > | null>(null);
   const mountedRef = useRef(true);
   const operationRef = useRef(false);
   const chunksRef = useRef<Float32Array[]>([]);
@@ -194,6 +199,7 @@ export default function VoiceEnrollment() {
     if (operationRef.current) return;
     operationRef.current = true;
     setState("setup");
+    setErrorOutcome(null);
     setLevel(0);
     setSecondsLeft(RECORDING_SECONDS);
     dropChunks();
@@ -278,6 +284,7 @@ export default function VoiceEnrollment() {
     dropChunks();
     if (mountedRef.current) {
       setSecondsLeft(RECORDING_SECONDS);
+      setErrorOutcome(null);
       setState("idle");
     }
     operationRef.current = false;
@@ -308,11 +315,17 @@ export default function VoiceEnrollment() {
       }),
     };
     try {
-      await window.electronAPI.jarvis.completeVoiceEnrollment(session.sessionId, payload);
+      const enrollment = await window.electronAPI.jarvis.completeVoiceEnrollment(
+        session.sessionId,
+        payload
+      );
       sessionRef.current = null;
-      if (mountedRef.current) {
+      if (mountedRef.current && enrollment.status === "accepted") {
         setState("saved");
         await refreshProfileStatus();
+      } else if (mountedRef.current) {
+        setErrorOutcome(enrollment.status === "accepted" ? null : enrollment.status);
+        setState("error");
       }
     } catch {
       await cleanupCapture({ cancelSession: true, flush: false });
@@ -329,6 +342,10 @@ export default function VoiceEnrollment() {
   const cancelEnabled = state === "recording" || state === "ready";
   const micLevel = Math.max(0, Math.min(1, level));
   const pending = state === "setup" || state === "stopping" || state === "saving";
+  const guidedWindow = Math.min(
+    3,
+    Math.max(1, Math.floor((RECORDING_SECONDS - secondsLeft) / WINDOW_SECONDS) + 1)
+  );
 
   return (
     <section
@@ -364,6 +381,11 @@ export default function VoiceEnrollment() {
           className="h-2 min-w-0 flex-1"
         />
       </div>
+      {state === "recording" && (
+        <p className="mt-1 text-xs text-muted-foreground" aria-live="polite">
+          {t("jarvis.voiceEnrollmentWindowProgress", { current: guidedWindow, total: 3 })}
+        </p>
+      )}
       {profileStatus && (
         <p className="mt-2 text-xs text-muted-foreground" role="status">
           <span className="font-medium text-foreground">
@@ -378,7 +400,9 @@ export default function VoiceEnrollment() {
       )}
       {state === "error" && (
         <p role="alert" className="mt-2 text-xs text-destructive">
-          {t("jarvis.voiceEnrollmentError")}
+          {errorOutcome
+            ? t(`jarvis.voiceEnrollmentOutcome.${errorOutcome}`)
+            : t("jarvis.voiceEnrollmentError")}
         </p>
       )}
       {state === "saved" && (

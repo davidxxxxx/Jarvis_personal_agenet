@@ -79,19 +79,16 @@ test("preload rejects oversized or malformed enrollment payloads before IPC clon
     /Float32Array/
   );
   assert.throws(
-    () =>
-      api.completeVoiceEnrollment(
-        "session",
-        payload([window(new Float32Array(600_001)), tiny(), tiny()])
-      ),
-    /payload cap/
+    () => api.completeVoiceEnrollment("session", payload([tiny(), tiny(), tiny()])),
+    /ten seconds/
   );
   assert.equal(invokes.length, 0);
 
+  const tenSeconds = () => new Float32Array(24_000 * 10).fill(0.1);
   const valid = payload([
-    window(new Float32Array([0.1]), 0),
-    window(new Float32Array([0.2]), 1),
-    window(new Float32Array([0.3]), 2),
+    window(tenSeconds(), 0),
+    window(tenSeconds(), 24_000 * 10),
+    window(tenSeconds(), 24_000 * 20),
   ]);
   assert.equal(await api.completeVoiceEnrollment("session", valid), "invoked");
   assert.deepEqual(invokes[0], ["jarvis:voice-enrollment:complete", "session", valid]);
@@ -110,10 +107,7 @@ test("preload exposes narrow cloud budget controls", async () => {
 
   assert.equal(await api.getCloudBudget(), "invoked");
   assert.equal(await api.setCloudBudget(input), "invoked");
-  assert.deepEqual(invokes, [
-    ["jarvis:cloud-budget:get"],
-    ["jarvis:cloud-budget:set", input],
-  ]);
+  assert.deepEqual(invokes, [["jarvis:cloud-budget:get"], ["jarvis:cloud-budget:set", input]]);
 });
 
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
@@ -142,9 +136,7 @@ test("preload exposes narrow authoritative capture failure IPC", async () => {
   const { api, invokes } = loadPreloadApi();
 
   assert.equal(await api.failCapture("s1", "MIC_DISCONNECTED", 1_100), "invoked");
-  assert.deepEqual(invokes, [
-    ["jarvis:capture:fail", "s1", "MIC_DISCONNECTED", 1_100],
-  ]);
+  assert.deepEqual(invokes, [["jarvis:capture:fail", "s1", "MIC_DISCONNECTED", 1_100]]);
 });
 
 test("preload exposes the session timeline request to the renderer", async () => {
@@ -176,9 +168,7 @@ test("preload exposes the narrow retention mode switch IPC", async () => {
   const { api, invokes } = loadPreloadApi();
 
   assert.equal(await api.setRetentionMode("s1", "continuous", 1_300), "invoked");
-  assert.deepEqual(invokes, [
-    ["jarvis:capture:set-retention-mode", "s1", "continuous", 1_300],
-  ]);
+  assert.deepEqual(invokes, [["jarvis:capture:set-retention-mode", "s1", "continuous", 1_300]]);
 });
 
 test("preload exposes metadata-only meeting input rejection events", () => {
@@ -199,9 +189,7 @@ test("preload exposes metadata-only meeting input rejection events", () => {
     }
   );
 
-  assert.deepEqual(sends, [
-    ["meeting-transcription-send", chunk, "system", "input-generation-1"],
-  ]);
+  assert.deepEqual(sends, [["meeting-transcription-send", chunk, "system", "input-generation-1"]]);
   assert.deepEqual(rejected, [
     {
       source: "system",
@@ -217,9 +205,7 @@ test("preload exposes generation-bound meeting source state events", () => {
   const { rootApi, listeners } = loadPreloadApi();
   const states = [];
 
-  const unsubscribe = rootApi.onMeetingTranscriptionSourceState((payload) =>
-    states.push(payload)
-  );
+  const unsubscribe = rootApi.onMeetingTranscriptionSourceState((payload) => states.push(payload));
   listeners.get("meeting-transcription-source-state")(
     {},
     {

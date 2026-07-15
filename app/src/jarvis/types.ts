@@ -420,14 +420,27 @@ export interface JarvisVoiceEnrollmentSession {
   sampleRate: 24000;
   channels: 1;
   format: "float32";
-  targetDurationSeconds: 30;
+  targetDurationSeconds: 32;
 }
 
 export interface JarvisVoiceEnrollmentStatus {
   enrolled: boolean;
-  profileId: number | null;
-  sampleCount: number;
-  updatedAt: string | null;
+  modelId: string;
+  acceptedSpeechMs: number;
+  windowCount: number;
+  selfConsistency: number | null;
+  updatedAt: number | null;
+}
+
+export type JarvisVoiceEnrollmentOutcome =
+  "accepted" | "insufficient_speech" | "inconsistent_samples" | "model_error";
+
+export interface JarvisVoiceEnrollmentResult {
+  status: JarvisVoiceEnrollmentOutcome;
+  modelId: string;
+  acceptedSpeechMs: number;
+  windowCount: number;
+  selfConsistency: number | null;
 }
 
 export type JarvisCloudBudgetBlockedReason =

@@ -2747,6 +2747,22 @@ class JarvisRepository {
     return this.speakerIdentityRepository.addProfileSample(input);
   }
 
+  getVoiceProfileAggregate(personId, modelId) {
+    return this.speakerIdentityRepository.getProfileAggregate(personId, modelId);
+  }
+
+  replaceVoiceEnrollmentSamples(input) {
+    return this.speakerIdentityRepository.replaceEnrollmentSamples(input);
+  }
+
+  importLegacyVoiceProfile(input) {
+    return this.speakerIdentityRepository.importLegacyProfile(input);
+  }
+
+  hasVoiceProfileImportMarker(markerKey) {
+    return this.speakerIdentityRepository.hasImportMarker(markerKey);
+  }
+
   confirmSpeakerLink(input) {
     return this.speakerIdentityRepository.confirmLink(input);
   }

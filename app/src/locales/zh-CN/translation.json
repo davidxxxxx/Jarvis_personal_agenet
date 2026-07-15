@@ -95,6 +95,12 @@
     "voiceEnrollmentError": "声纹校准未完成，请录满时长后重试。",
     "voiceEnrollmentSaved": "你的本地声纹已保存。",
     "voiceEnrollmentPending": "正在准备声纹校准",
+    "voiceEnrollmentWindowProgress": "第 {{current}} 段，共 {{total}} 段",
+    "voiceEnrollmentOutcome": {
+      "insufficient_speech": "声纹样本不足，请清晰读完三段十秒语音后重试。",
+      "inconsistent_samples": "三段声音不一致，请独自在更安静的环境中重试。",
+      "model_error": "声纹模型暂时不可用，请等待模型就绪后重试。"
+    },
     "audioLevel": "音频电平",
     "enableAfterAnalysis": "完成首次分析后启用",
     "todayDescription": "记录今天的对话，并随时查看实时转写。",

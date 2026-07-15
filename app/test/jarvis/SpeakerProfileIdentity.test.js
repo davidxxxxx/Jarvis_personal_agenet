@@ -44,5 +44,14 @@ test("reserved self profile never blends with an unrelated profile named 我", (
     .prepare("INSERT INTO speaker_profiles (display_name, embedding) VALUES (?, ?)")
     .run("下一位", Buffer.from(new Float32Array([3, 4]).buffer));
   assert.equal(Number(nextNormal.lastInsertRowid), 2);
+  assert.equal(
+    manager.getSpeakerProfileById(SELF_VOICE_PROFILE_ID, true).id,
+    SELF_VOICE_PROFILE_ID
+  );
+  assert.equal(manager.getSpeakerProfileById(Number(unrelated.lastInsertRowid), false).id, 1);
+  assert.equal(
+    "embedding" in manager.getSpeakerProfileById(Number(unrelated.lastInsertRowid), false),
+    false
+  );
   manager.db.close();
 });

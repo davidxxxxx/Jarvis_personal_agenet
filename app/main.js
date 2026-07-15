@@ -303,6 +303,7 @@ const {
 } = require("./src/jarvis/main/LegacyRecordingBackfill");
 const { createSafeRecordingDelete } = require("./src/jarvis/main/SafeRecordingDelete");
 const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService");
+const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
 const {
   DataRootConfig,
   resolveJarvisDataRoot,
@@ -641,10 +642,15 @@ async function initializeCoreManagers() {
     migrator: dataDirectoryMigrator,
     usageProvider: (since) => jarvisRepository.getStorageUsageSince(since),
   });
+  jarvisRepository.renamePerson({ personId: "self", displayName: "我", isSelf: true });
+  const voiceProfileStore = new VoiceProfileStore({
+    repository: jarvisRepository,
+    legacyProfileReader: databaseManager,
+  });
+  voiceProfileStore.importLegacySelfProfile();
   voiceEnrollmentService = new VoiceEnrollmentService({
     speakerEmbeddings: require("./src/helpers/speakerEmbeddings"),
-    databaseManager,
-    repository: jarvisRepository,
+    voiceProfileStore,
   });
   environmentManager = new EnvironmentManager();
   const miniMaxAnalysisClient = new MiniMaxAnalysisClient({

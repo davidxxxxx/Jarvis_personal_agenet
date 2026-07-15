@@ -8,9 +8,10 @@ const SAMPLE_RATE = 16000;
 const EMBEDDING_DIM = 512;
 const MIN_SEGMENT_SECONDS = 1.5;
 const MIN_SEGMENT_SAMPLES = SAMPLE_RATE * MIN_SEGMENT_SECONDS;
-const MAX_EMBEDDING_SECONDS = 8;
+const MAX_EMBEDDING_SECONDS = 10;
 const MAX_EMBEDDING_SAMPLES = SAMPLE_RATE * MAX_EMBEDDING_SECONDS;
 const MODEL_FILE = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx";
+const SPEAKER_EMBEDDING_MODEL_ID = "3dspeaker-campplus-voxceleb-16k-v1";
 
 class SpeakerEmbeddings {
   constructor() {
@@ -158,3 +159,4 @@ const instance = new SpeakerEmbeddings();
 module.exports = instance;
 module.exports.SpeakerEmbeddings = SpeakerEmbeddings;
 module.exports.MAX_EMBEDDING_SECONDS = MAX_EMBEDDING_SECONDS;
+module.exports.SPEAKER_EMBEDDING_MODEL_ID = SPEAKER_EMBEDDING_MODEL_ID;

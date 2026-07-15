@@ -9,7 +9,7 @@ const SESSION = {
   sampleRate: 24_000 as const,
   channels: 1 as const,
   format: "float32" as const,
-  targetDurationSeconds: 30 as const,
+  targetDurationSeconds: 32 as const,
 };
 
 function deferred<T>() {
@@ -112,12 +112,20 @@ function installElectronApi(overrides = {}) {
   const jarvis = {
     getVoiceEnrollmentStatus: vi.fn().mockResolvedValue({
       enrolled: false,
-      profileId: null,
-      sampleCount: 0,
+      modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+      acceptedSpeechMs: 0,
+      windowCount: 0,
+      selfConsistency: null,
       updatedAt: null,
     }),
     beginVoiceEnrollment: vi.fn().mockResolvedValue(SESSION),
-    completeVoiceEnrollment: vi.fn().mockResolvedValue({ profileId: 2_147_483_647 }),
+    completeVoiceEnrollment: vi.fn().mockResolvedValue({
+      status: "accepted",
+      modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+      acceptedSpeechMs: 30_000,
+      windowCount: 3,
+      selfConsistency: 0.99,
+    }),
     cancelVoiceEnrollment: vi.fn().mockResolvedValue({ cancelled: true }),
     ...overrides,
   };
@@ -142,25 +150,27 @@ describe("VoiceEnrollment", () => {
     installElectronApi({
       getVoiceEnrollmentStatus: vi.fn().mockResolvedValue({
         enrolled: true,
-        profileId: -1,
-        sampleCount: 3,
-        updatedAt: "2026-07-11 03:00:00",
+        modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+        acceptedSpeechMs: 30_000,
+        windowCount: 3,
+        selfConsistency: 0.99,
+        updatedAt: 1_783_733_400_000,
       }),
     });
 
     render(<VoiceEnrollment />);
 
     expect(await screen.findByText("已绑定")).toBeInTheDocument();
-    expect(screen.getByText(/2026-07-11 03:00:00/)).toBeInTheDocument();
+    expect(screen.getByText(/1783733400000/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新校准" })).toBeEnabled();
   });
 
-  it("shows an explicit local 30-second calibration flow with meter values", () => {
+  it("shows an explicit local 32-second guided calibration flow with meter values", () => {
     render(<VoiceEnrollment />);
 
     expect(screen.getByText("声纹校准")).toBeInTheDocument();
     expect(screen.getByText("请独自朗读，避免其他人同时说话")).toBeInTheDocument();
-    expect(screen.getByText("00:30")).toBeInTheDocument();
+    expect(screen.getByText("00:32")).toBeInTheDocument();
     const meter = screen.getByRole("meter", { name: "音频电平" });
     expect(meter).toHaveAttribute("min", "0");
     expect(meter).toHaveAttribute("max", "1");
@@ -245,6 +255,7 @@ describe("VoiceEnrollment", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始校准" }));
     const cancel = await screen.findByRole("button", { name: "取消" });
     expect(cancel).toBeEnabled();
+    expect(screen.getByText("第 1 段，共 3 段")).toBeInTheDocument();
     expect(audio.context.resume).toHaveBeenCalledTimes(1);
     expect(audio.context.audioWorklet.addModule).toHaveBeenCalledTimes(1);
 
@@ -254,7 +265,7 @@ describe("VoiceEnrollment", () => {
     expect(jarvis.cancelVoiceEnrollment).toHaveBeenCalledWith(SESSION.sessionId);
   });
 
-  it("stops a full guided capture and saves three bounded 24 kHz windows", async () => {
+  it("stops a full guided capture and saves three ten-second 24 kHz windows", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     const audio = createAudioHarness();
@@ -267,11 +278,11 @@ describe("VoiceEnrollment", () => {
     expect(audio.port.onmessage).toBeTypeOf("function");
     act(() => {
       audio.port.onmessage?.({
-        data: new Float32Array(24_000 * 30).fill(0.2).buffer,
+        data: new Float32Array(24_000 * 32).fill(0.2).buffer,
       } as MessageEvent<ArrayBuffer>);
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(30_100);
+      await vi.advanceTimersByTimeAsync(32_100);
     });
 
     const save = screen.getByRole("button", { name: "保存声纹" });
@@ -286,13 +297,13 @@ describe("VoiceEnrollment", () => {
       sampleRate: 24_000,
       channels: 1,
       format: "float32",
-      recordedSampleCount: 24_000 * 30,
+      recordedSampleCount: 24_000 * 32,
     });
     expect(payload.windows).toHaveLength(3);
     expect(payload.windows.map((window) => window.samples.length)).toEqual([
-      24_000 * 8,
-      24_000 * 8,
-      24_000 * 8,
+      24_000 * 10,
+      24_000 * 10,
+      24_000 * 10,
     ]);
     expect(audio.track.stop).toHaveBeenCalledTimes(1);
     expect(audio.context.close).toHaveBeenCalledTimes(1);
@@ -313,11 +324,11 @@ describe("VoiceEnrollment", () => {
     await act(async () => Promise.resolve());
     act(() => {
       audio.port.onmessage?.({
-        data: new Float32Array(24_000 * 30).fill(0.2).buffer,
+        data: new Float32Array(24_000 * 32).fill(0.2).buffer,
       } as MessageEvent<ArrayBuffer>);
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(30_100);
+      await vi.advanceTimersByTimeAsync(32_100);
     });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "保存声纹" }));
@@ -340,5 +351,40 @@ describe("VoiceEnrollment", () => {
     await act(async () => Promise.resolve());
     expect(jarvis.beginVoiceEnrollment).toHaveBeenCalledTimes(2);
     expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["insufficient_speech", "声纹样本不足"],
+    ["inconsistent_samples", "三段声音不一致"],
+    ["model_error", "声纹模型暂时不可用"],
+  ])("renders the structured %s outcome without claiming success", async (status, message) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const audio = createAudioHarness();
+    installMedia(audio.stream);
+    installElectronApi({
+      completeVoiceEnrollment: vi.fn().mockResolvedValue({
+        status,
+        modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+        acceptedSpeechMs: status === "insufficient_speech" ? 20_000 : 30_000,
+        windowCount: status === "insufficient_speech" ? 2 : 3,
+        selfConsistency: status === "inconsistent_samples" ? 0.5 : null,
+      }),
+    });
+    render(<VoiceEnrollment />);
+    fireEvent.click(screen.getByRole("button", { name: "开始校准" }));
+    await act(async () => Promise.resolve());
+    act(() => {
+      audio.port.onmessage?.({
+        data: new Float32Array(24_000 * 32).fill(0.2).buffer,
+      } as MessageEvent<ArrayBuffer>);
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(32_100));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "保存声纹" }));
+      await Promise.resolve();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    expect(screen.queryByText("你的本地声纹已保存。")).not.toBeInTheDocument();
   });
 });

@@ -157,6 +157,35 @@ class SpeakerIdentityRepository {
         SELECT * FROM voice_profile_samples
         WHERE model_id = ? ORDER BY person_id, created_at, id
       `),
+      getProfileAggregate: db.prepare(`
+        SELECT * FROM voice_profile_aggregates
+        WHERE person_id = ? AND model_id = ?
+      `),
+      deleteEnrollmentProfiles: db.prepare(`
+        DELETE FROM voice_profile_samples
+        WHERE person_id = ? AND model_id = ? AND source_kind = 'enrollment'
+      `),
+      upsertProfileAggregate: db.prepare(`
+        INSERT INTO voice_profile_aggregates (
+          person_id, model_id, embedding, accepted_speech_ms,
+          window_count, self_consistency, updated_at
+        ) VALUES (
+          @personId, @modelId, @embedding, @acceptedSpeechMs,
+          @windowCount, @selfConsistency, @updatedAt
+        )
+        ON CONFLICT(person_id, model_id) DO UPDATE SET
+          embedding = excluded.embedding,
+          accepted_speech_ms = excluded.accepted_speech_ms,
+          window_count = excluded.window_count,
+          self_consistency = excluded.self_consistency,
+          updated_at = excluded.updated_at
+      `),
+      getImportMarker: db.prepare(
+        "SELECT marker_key FROM voice_profile_import_markers WHERE marker_key = ?"
+      ),
+      insertImportMarker: db.prepare(`
+        INSERT INTO voice_profile_import_markers (marker_key, imported_at) VALUES (?, ?)
+      `),
       insertProfile: db.prepare(`
         INSERT INTO voice_profile_samples (
           id, person_id, model_id, embedding, source_cluster_id,
@@ -384,6 +413,20 @@ class SpeakerIdentityRepository {
       db.prepare("DELETE FROM people WHERE id = ?").run(input.sourcePersonId);
       return target;
     });
+
+    this._replaceEnrollmentSamples = db.transaction((values) => {
+      this.statements.deleteEnrollmentProfiles.run(values.personId, values.modelId);
+      for (const sample of values.samples) this.statements.insertProfile.run(sample);
+      this.statements.upsertProfileAggregate.run(values.aggregate);
+    });
+
+    this._importLegacyProfile = db.transaction((values) => {
+      if (this.statements.getImportMarker.get(values.markerKey)) return false;
+      this.statements.insertProfile.run(values.sample);
+      this.statements.upsertProfileAggregate.run(values.aggregate);
+      this.statements.insertImportMarker.run(values.markerKey, values.importedAt);
+      return true;
+    });
   }
 
   _tableExists(table) {
@@ -452,6 +495,19 @@ class SpeakerIdentityRepository {
       speechMs: row.speech_ms,
       windowCount: row.window_count,
       createdAt: row.created_at,
+    };
+  }
+
+  _mapProfileAggregate(row) {
+    if (!row) return null;
+    return {
+      personId: row.person_id,
+      modelId: row.model_id,
+      embedding: decodeEmbedding(row.embedding),
+      acceptedSpeechMs: row.accepted_speech_ms,
+      windowCount: row.window_count,
+      selfConsistency: row.self_consistency,
+      updatedAt: row.updated_at,
     };
   }
 
@@ -609,6 +665,108 @@ class SpeakerIdentityRepository {
     return this._mapProfile(
       this.db.prepare("SELECT * FROM voice_profile_samples WHERE id = ?").get(values.id)
     );
+  }
+
+  getProfileAggregate(personId, modelId) {
+    return this._mapProfileAggregate(
+      this.statements.getProfileAggregate.get(
+        assertId(personId, "personId"),
+        assertText(modelId, "modelId")
+      )
+    );
+  }
+
+  replaceEnrollmentSamples(input) {
+    if (!input || typeof input !== "object") throw new TypeError("enrollment profile is required");
+    const personId = assertId(input.personId, "personId");
+    const modelId = assertText(input.modelId, "modelId");
+    this._requirePerson(personId);
+    if (!Array.isArray(input.samples) || input.samples.length === 0) {
+      throw new TypeError("enrollment samples must be a non-empty array");
+    }
+    if (!(input.centroid instanceof Float32Array)) {
+      throw new TypeError("enrollment centroid must be a Float32Array");
+    }
+    const dimension = input.centroid.length;
+    const encodedCentroid = encodeEmbedding(input.centroid);
+    const acceptedSpeechMs = assertNonNegativeInteger(input.acceptedSpeechMs, "acceptedSpeechMs");
+    const windowCount = assertNonNegativeInteger(input.windowCount, "windowCount");
+    const selfConsistency = assertOptionalScore(input.selfConsistency, "selfConsistency");
+    const updatedAt = assertNonNegativeInteger(input.updatedAt ?? this.now(), "updatedAt");
+    const samples = input.samples.map((embedding, index) => {
+      if (!(embedding instanceof Float32Array) || embedding.length !== dimension) {
+        throw new TypeError("enrollment sample dimensions must match the centroid");
+      }
+      return {
+        id: this.createId("voice_profile_sample"),
+        personId,
+        modelId,
+        embedding: encodeEmbedding(embedding),
+        sourceClusterId: null,
+        sourceKind: "enrollment",
+        speechMs: assertNonNegativeInteger(input.sampleSpeechMs?.[index] ?? 0, "sampleSpeechMs"),
+        windowCount: 1,
+        createdAt: updatedAt,
+      };
+    });
+    this._assertModelDimension(modelId, input.centroid);
+    this._replaceEnrollmentSamples({
+      personId,
+      modelId,
+      samples,
+      aggregate: {
+        personId,
+        modelId,
+        embedding: encodedCentroid,
+        acceptedSpeechMs,
+        windowCount,
+        selfConsistency,
+        updatedAt,
+      },
+    });
+    return this.getProfileAggregate(personId, modelId);
+  }
+
+  importLegacyProfile(input) {
+    if (!input || typeof input !== "object") throw new TypeError("legacy profile is required");
+    const markerKey = assertId(input.markerKey, "markerKey");
+    if (this.statements.getImportMarker.get(markerKey)) return false;
+    const personId = assertId(input.personId, "personId");
+    const modelId = assertText(input.modelId, "modelId");
+    this._requirePerson(personId);
+    if (!(input.embedding instanceof Float32Array)) {
+      throw new TypeError("legacy embedding must be a Float32Array");
+    }
+    const importedAt = assertNonNegativeInteger(input.importedAt ?? this.now(), "importedAt");
+    const embedding = encodeEmbedding(input.embedding);
+    return this._importLegacyProfile({
+      markerKey,
+      importedAt,
+      sample: {
+        id: this.createId("voice_profile_sample"),
+        personId,
+        modelId,
+        embedding,
+        sourceClusterId: null,
+        sourceKind: "enrollment",
+        speechMs: 0,
+        windowCount: 0,
+        createdAt: importedAt,
+      },
+      aggregate: {
+        personId,
+        modelId,
+        embedding,
+        acceptedSpeechMs: 0,
+        windowCount: 0,
+        selfConsistency: null,
+        updatedAt: importedAt,
+      },
+    });
+  }
+
+  hasImportMarker(markerKey) {
+    return Boolean(this.statements.getImportMarker.get(assertId(markerKey, "markerKey")));
   }
 
   confirmLink(input) {

@@ -19,6 +19,7 @@ import type {
   JarvisTranscriptSegment,
   JarvisTranscriptSegmentInput,
   JarvisVoiceEnrollmentPayload,
+  JarvisVoiceEnrollmentResult,
   JarvisVoiceEnrollmentSession,
   JarvisVoiceEnrollmentStatus,
   JarvisCloudBudgetInput,
@@ -635,7 +636,7 @@ declare global {
         completeVoiceEnrollment: (
           sessionId: string,
           payload: JarvisVoiceEnrollmentPayload
-        ) => Promise<{ profileId: number }>;
+        ) => Promise<JarvisVoiceEnrollmentResult>;
         cancelVoiceEnrollment: (sessionId: string) => Promise<{ cancelled: boolean }>;
         getCloudBudget: () => Promise<JarvisCloudBudgetStatus>;
         setCloudBudget: (input: JarvisCloudBudgetInput) => Promise<JarvisCloudBudgetStatus>;

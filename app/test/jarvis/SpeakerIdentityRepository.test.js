@@ -529,6 +529,8 @@ test("identity migrations are idempotent and preserve existing data", (t) => {
   db.exec(`
     DROP TRIGGER clear_deleted_person_speaker_links;
     DROP TABLE speaker_identity_corrections;
+    DROP TABLE voice_profile_import_markers;
+    DROP TABLE voice_profile_aggregates;
     DROP TABLE voice_profile_samples;
     DROP TABLE speaker_cluster_segments;
     DROP TABLE speaker_clusters;
@@ -548,6 +550,8 @@ test("identity migrations are idempotent and preserve existing data", (t) => {
     "speaker_clusters",
     "speaker_cluster_segments",
     "voice_profile_samples",
+    "voice_profile_aggregates",
+    "voice_profile_import_markers",
     "speaker_identity_corrections",
   ]) {
     assert.equal(

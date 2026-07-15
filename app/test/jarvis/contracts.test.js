@@ -682,14 +682,31 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
 });
 
 test("IPC binds narrow voice enrollment sessions to the requesting renderer", async () => {
-  const { handlers, voiceEnrollmentService } = createIpcHarness();
+  const expectedEnrollment = {
+    status: "accepted",
+    modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+    acceptedSpeechMs: 30_000,
+    windowCount: 3,
+    selfConsistency: 0.99,
+  };
+  const voiceEnrollmentService = createVoiceEnrollmentService({
+    complete: () => expectedEnrollment,
+  });
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService,
+    environmentManager: { getOpenAIKey: () => null },
+  });
   const event = { sender: { id: 42 } };
   const payload = { sampleRate: 24_000, channels: 1, format: "float32", windows: [] };
 
   assert.equal(await handlers.get(CHANNELS.beginVoiceEnrollment)(event), "voice-begun");
-  assert.equal(
+  assert.deepEqual(
     await handlers.get(CHANNELS.completeVoiceEnrollment)(event, "opaque-id", payload),
-    "voice-enrolled"
+    expectedEnrollment
   );
   assert.equal(handlers.get(CHANNELS.cancelVoiceEnrollment)(event, "opaque-id"), "voice-cancelled");
   assert.equal(typeof voiceEnrollmentService.complete, "function");

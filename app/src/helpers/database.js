@@ -2579,6 +2579,21 @@ class DatabaseManager {
     }
   }
 
+  getSpeakerProfileById(profileId, includeEmbedding = false) {
+    if (!this.db) throw new Error("Database not initialized");
+    if (!Number.isSafeInteger(profileId) || profileId === 0) {
+      throw new TypeError("profileId must be a non-zero safe integer");
+    }
+    return includeEmbedding
+      ? this.db.prepare("SELECT * FROM speaker_profiles WHERE id = ?").get(profileId)
+      : this.db
+          .prepare(
+            `SELECT id, display_name, email, sample_count, created_at, updated_at
+             FROM speaker_profiles WHERE id = ?`
+          )
+          .get(profileId);
+  }
+
   setSpeakerMapping(noteId, speakerId, profileId, displayName) {
     try {
       if (!this.db) throw new Error("Database not initialized");

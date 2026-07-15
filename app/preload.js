@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 const ENROLLMENT_WINDOW_COUNT = 3;
-const ENROLLMENT_MAX_SAMPLES = 24_000 * 25;
+const ENROLLMENT_WINDOW_SAMPLES = 24_000 * 10;
+const ENROLLMENT_MAX_SAMPLES = ENROLLMENT_WINDOW_COUNT * ENROLLMENT_WINDOW_SAMPLES;
 const ENROLLMENT_MAX_BYTES = ENROLLMENT_MAX_SAMPLES * Float32Array.BYTES_PER_ELEMENT;
 
 function assertVoiceEnrollmentPreflight(sessionId, payload) {
@@ -38,8 +39,11 @@ function assertVoiceEnrollmentPreflight(sessionId, payload) {
     ) {
       throw new TypeError("voice enrollment preflight window boundaries are invalid");
     }
+    if (entry.samples.length !== ENROLLMENT_WINDOW_SAMPLES) {
+      throw new TypeError("voice enrollment preflight windows must contain exactly ten seconds");
+    }
     totalSamples += entry.samples.length;
-    totalBytes += entry.samples.buffer.byteLength;
+    totalBytes += entry.samples.byteLength;
     if (totalSamples > ENROLLMENT_MAX_SAMPLES || totalBytes > ENROLLMENT_MAX_BYTES) {
       throw new RangeError("voice enrollment preflight exceeds the local PCM payload cap");
     }

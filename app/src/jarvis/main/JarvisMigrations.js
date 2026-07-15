@@ -1,4 +1,4 @@
-const TARGET_VERSION = 18;
+const TARGET_VERSION = 19;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -370,6 +370,22 @@ const SPEAKER_IDENTITY_SCHEMA = `
     speech_ms INTEGER NOT NULL,
     window_count INTEGER NOT NULL,
     created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS voice_profile_aggregates (
+    person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    accepted_speech_ms INTEGER NOT NULL CHECK(accepted_speech_ms >= 0),
+    window_count INTEGER NOT NULL CHECK(window_count >= 0),
+    self_consistency REAL CHECK(
+      self_consistency IS NULL OR (self_consistency >= 0 AND self_consistency <= 1)
+    ),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(person_id, model_id)
+  );
+  CREATE TABLE IF NOT EXISTS voice_profile_import_markers (
+    marker_key TEXT PRIMARY KEY,
+    imported_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS speaker_identity_corrections (
     id TEXT PRIMARY KEY,
