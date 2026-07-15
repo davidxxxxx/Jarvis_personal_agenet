@@ -544,7 +544,7 @@ test("duplicate and repeated local-date callbacks return the same destination", 
   assert.equal(new Set(results.map((result) => result.sessionId)).size, 1);
   assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
   assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 2);
-  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 2);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 3);
 });
 
 test("local midnight prepares renderer and PCM before an atomic service switch", async () => {
@@ -576,6 +576,16 @@ test("local midnight prepares renderer and PCM before an atomic service switch",
           newSessionId: "session-day-2",
           localDate: "2026-07-15",
           at: 2_000,
+        },
+      ],
+      [
+        "rotate-upstream",
+        {
+          phase: "activate",
+          previousSessionId: "session-day-1",
+          sessionId: "session-day-2",
+          startedAt: 2_000,
+          localDate: "2026-07-15",
         },
       ],
       ["rebind-pcm", "session-day-1", "session-day-2", "commit"],
@@ -663,7 +673,46 @@ test("a failed renderer midnight commit retries without rotating or rebinding PC
   assert.equal(result.sessionId, "session-day-2");
   assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
   assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 2);
-  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 3);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 4);
+  assert.equal(
+    calls.filter(([name, rotation]) => name === "rotate-upstream" && rotation.phase === "activate")
+      .length,
+    1
+  );
+});
+
+test("a failed renderer activation retries before PCM commits to the new session", async () => {
+  const { lifecycle, calls } = createHarness();
+  let activateAttempts = 0;
+  lifecycle.rotateUpstream = async (rotation) => {
+    calls.push(["rotate-upstream", rotation]);
+    if (rotation.phase === "activate") {
+      activateAttempts += 1;
+      if (activateAttempts === 1) throw new Error("renderer binding unavailable");
+    }
+  };
+
+  await assert.rejects(lifecycle.onLocalDateChange(2_000), /renderer binding unavailable/);
+  assert.equal(
+    calls.filter(([name, _previous, _next, phase]) => name === "rebind-pcm" && phase === "commit")
+      .length,
+    0
+  );
+
+  const result = await lifecycle.onLocalDateChange(2_100);
+
+  assert.equal(result.sessionId, "session-day-2");
+  assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
+  assert.equal(
+    calls.filter(([name, rotation]) => name === "rotate-upstream" && rotation.phase === "activate")
+      .length,
+    2
+  );
+  assert.equal(
+    calls.filter(([name, _previous, _next, phase]) => name === "rebind-pcm" && phase === "commit")
+      .length,
+    1
+  );
 });
 
 test("idle local-date changes never start capture", async () => {

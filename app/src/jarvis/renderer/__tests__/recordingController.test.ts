@@ -143,34 +143,35 @@ describe("power resume device enumeration", () => {
   it("routes each midnight transaction phase to the renderer controller", async () => {
     const rotateAtLocalDate = vi.fn(async () => {});
 
-    await expect(
-      routePowerLifecycleRequest(
-        {
-          id: "rotate-prepare",
-          kind: "rotate",
-          token: {
-            phase: "prepare",
-            previousSessionId: "s1",
-            sessionId: "s2",
-            startedAt: 2_000,
-            sources: {},
+    for (const phase of ["prepare", "activate", "commit", "abort"] as const) {
+      await expect(
+        routePowerLifecycleRequest(
+          {
+            id: `rotate-${phase}`,
+            kind: "rotate",
+            token: {
+              phase,
+              previousSessionId: "s1",
+              sessionId: "s2",
+              startedAt: 2_000,
+              sources: {},
+            },
           },
-        },
-        {
-          suspendUpstream: vi.fn(),
-          resume: vi.fn(),
-          rotateAtLocalDate,
-          enumerateDevices: vi.fn(),
-        }
-      )
-    ).resolves.toBeNull();
+          {
+            suspendUpstream: vi.fn(),
+            resume: vi.fn(),
+            rotateAtLocalDate,
+            enumerateDevices: vi.fn(),
+          }
+        )
+      ).resolves.toBeNull();
+    }
 
-    expect(rotateAtLocalDate).toHaveBeenCalledWith({
-      phase: "prepare",
-      previousSessionId: "s1",
-      sessionId: "s2",
-      startedAt: 2_000,
-    });
+    expect(rotateAtLocalDate.mock.calls).toEqual(
+      ["prepare", "activate", "commit", "abort"].map((phase) => [
+        { phase, previousSessionId: "s1", sessionId: "s2", startedAt: 2_000 },
+      ])
+    );
   });
 });
 
@@ -627,6 +628,16 @@ describe("Jarvis recording controller", () => {
     harness.setMeeting({ segments: [oldSegment, newSegment] });
     controller.handleSegmentsChanged([oldSegment, newSegment]);
     await controller.rotateAtLocalDate({
+      phase: "activate",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
+    expect(harness.rebindUpstreamSession).toHaveBeenCalledOnce();
+    expect(harness.rebindUpstreamSession).toHaveBeenCalledWith("s1", "s2");
+
+    await controller.rotateAtLocalDate({
       phase: "commit",
       previousSessionId: "s1",
       sessionId: "s2",
@@ -636,7 +647,6 @@ describe("Jarvis recording controller", () => {
 
     expect(harness.getSession()).toMatchObject({ id: "s2", status: "recording" });
     expect(harness.rebindUpstreamSession).toHaveBeenCalledOnce();
-    expect(harness.rebindUpstreamSession).toHaveBeenCalledWith("s1", "s2");
     const s2Calls = vi
       .mocked(harness.jarvis.syncSegments)
       .mock.calls.filter(([sessionId]) => sessionId === "s2");

@@ -162,7 +162,7 @@ export interface RecordingController {
     restorations?: JarvisPowerResumeRestorations
   ) => Promise<JarvisPowerResumeRestorations | null | void>;
   rotateAtLocalDate: (input: {
-    phase?: "prepare" | "commit" | "abort";
+    phase?: "prepare" | "activate" | "commit" | "abort";
     previousSessionId: string;
     sessionId: string;
     startedAt: number;
@@ -311,7 +311,7 @@ export async function routePowerLifecycleRequest(
       restorations?: JarvisPowerResumeRestorations
     ) => Promise<JarvisPowerResumeRestorations | null | void>;
     rotateAtLocalDate?: (input: {
-      phase?: "prepare" | "commit" | "abort";
+      phase?: "prepare" | "activate" | "commit" | "abort";
       previousSessionId: string;
       sessionId: string;
       startedAt: number;
@@ -419,6 +419,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     previousSessionId: string;
     sessionId: string;
     startedAt: number;
+    activated: boolean;
     bufferedSegments: TranscriptSegment[] | null;
   } | null = null;
 
@@ -905,7 +906,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     sessionId,
     startedAt,
   }: {
-    phase?: "prepare" | "commit" | "abort";
+    phase?: "prepare" | "activate" | "commit" | "abort";
     previousSessionId: string;
     sessionId: string;
     startedAt: number;
@@ -916,6 +917,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       const current = deps.getSessionState();
       if (current.id === sessionId && current.status === "recording") return;
       await rotateAtLocalDate({ phase: "prepare", ...rotationInput });
+      await rotateAtLocalDate({ phase: "activate", ...rotationInput });
       await rotateAtLocalDate({ phase: "commit", ...rotationInput });
       return;
     }
@@ -939,10 +941,17 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         if (stale.previousSessionId !== previousSessionId) {
           throw new Error("another renderer midnight transaction is already prepared");
         }
+        if (stale.activated) {
+          throw new Error("an activated renderer midnight transaction must be retried");
+        }
         persistenceRotation = null;
         if (stale.bufferedSegments) handleSegmentsChanged(stale.bufferedSegments);
       }
-      const rotation = { ...rotationInput, bufferedSegments: null as TranscriptSegment[] | null };
+      const rotation = {
+        ...rotationInput,
+        activated: false,
+        bufferedSegments: null as TranscriptSegment[] | null,
+      };
       persistenceRotation = rotation;
       try {
         await flushPendingPersistence();
@@ -964,6 +973,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       ) {
         throw new Error("renderer midnight transaction does not match abort request");
       }
+      if (rotation.activated) {
+        throw new Error("an activated renderer midnight transaction cannot be aborted");
+      }
       persistenceRotation = null;
       if (rotation.bufferedSegments) handleSegmentsChanged(rotation.bufferedSegments);
       return;
@@ -982,7 +994,11 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     if (state.id !== previousSessionId || state.status !== "recording") {
       throw new Error("renderer session does not match the midnight source");
     }
-    deps.rebindUpstreamSession(previousSessionId, sessionId);
+    if (!rotation.activated) {
+      deps.rebindUpstreamSession(previousSessionId, sessionId);
+      rotation.activated = true;
+    }
+    if (phase === "activate") return;
     persistenceFloors.set(sessionId, startedAt);
     deps.setSessionState(reduceSession(state, { type: "ROTATED", id: sessionId, at: startedAt }));
     persistenceRotation = null;

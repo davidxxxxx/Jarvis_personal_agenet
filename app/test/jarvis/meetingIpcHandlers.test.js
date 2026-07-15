@@ -358,6 +358,41 @@ test("midnight two-phase rebind buffers PCM until the new service session commit
   );
 });
 
+test("midnight PCM commit retains an unaccepted buffered suffix for retry", async (t) => {
+  const persisted = [];
+  let rejectNext = true;
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      if (rejectNext) {
+        rejectNext = false;
+        return false;
+      }
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "prepare");
+  send({ sender: fixture.sender }, Buffer.from([17, 18]), "mic", started.inputGeneration);
+  assert.throws(
+    () => fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "commit"),
+    /buffered Jarvis PCM could not be routed/
+  );
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "commit");
+
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [["session-day-2", "mic", [17, 18]]]
+  );
+});
+
 test("midnight two-phase abort flushes buffered PCM back to the old session", async (t) => {
   const persisted = [];
   const fixture = createFixture({
@@ -381,6 +416,37 @@ test("midnight two-phase abort flushes buffered PCM back to the old session", as
   assert.deepEqual(
     persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
     [["session-day-1", "mic", [9, 10]]]
+  );
+});
+
+test("a later midnight prepare recovers a stale same-source PCM transaction", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  fixture.instance.rebindJarvisSession("session-day-1", "stale-day-2", "prepare");
+  send({ sender: fixture.sender }, Buffer.from([13, 14]), "mic", started.inputGeneration);
+  fixture.instance.rebindJarvisSession("session-day-1", "fresh-day-2", "prepare");
+  send({ sender: fixture.sender }, Buffer.from([15, 16]), "mic", started.inputGeneration);
+  fixture.instance.rebindJarvisSession("session-day-1", "fresh-day-2", "commit");
+
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [
+      ["session-day-1", "mic", [13, 14]],
+      ["fresh-day-2", "mic", [15, 16]],
+    ]
   );
 });
 

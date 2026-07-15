@@ -4903,6 +4903,31 @@ class IPCHandlers {
     let activeJarvisSessionId = null;
     let pendingJarvisSessionRebind = null;
     let activeMeetingInputBinding = null;
+    const flushPendingJarvisSessionRebind = (pending) => {
+      for (let index = 0; index < pending.chunks.length; index += 1) {
+        let accepted = false;
+        try {
+          accepted = sendMeetingAudio(pending.chunks[index].buffer, pending.chunks[index].source);
+        } catch (error) {
+          const chunks = pending.chunks.slice(index);
+          pendingJarvisSessionRebind = {
+            ...pending,
+            chunks,
+            byteLength: chunks.reduce((total, chunk) => total + chunk.buffer.byteLength, 0),
+          };
+          throw error;
+        }
+        if (!accepted) {
+          const chunks = pending.chunks.slice(index);
+          pendingJarvisSessionRebind = {
+            ...pending,
+            chunks,
+            byteLength: chunks.reduce((total, chunk) => total + chunk.buffer.byteLength, 0),
+          };
+          throw new Error("buffered Jarvis PCM could not be routed");
+        }
+      }
+    };
     this._rebindJarvisSession = (previousSessionId, nextSessionId, phase = "commit") => {
       const previous = assertId(previousSessionId, "previousSessionId");
       const next = assertId(nextSessionId, "nextSessionId");
@@ -4910,6 +4935,7 @@ class IPCHandlers {
         throw new TypeError("Jarvis PCM rebind phase is invalid");
       }
       if (phase === "prepare") {
+        let recovered = false;
         if (pendingJarvisSessionRebind) {
           if (
             pendingJarvisSessionRebind.previousSessionId === previous &&
@@ -4917,7 +4943,16 @@ class IPCHandlers {
           ) {
             return { prepared: false, sessionId: previous };
           }
-          throw new Error("another Jarvis PCM rebind is already prepared");
+          if (
+            pendingJarvisSessionRebind.previousSessionId !== previous ||
+            activeJarvisSessionId !== previous
+          ) {
+            throw new Error("another Jarvis PCM rebind is already prepared");
+          }
+          const stale = pendingJarvisSessionRebind;
+          pendingJarvisSessionRebind = null;
+          flushPendingJarvisSessionRebind(stale);
+          recovered = true;
         }
         if (activeJarvisSessionId !== previous) {
           throw new Error("active Jarvis PCM session does not match the midnight source");
@@ -4928,7 +4963,7 @@ class IPCHandlers {
           chunks: [],
           byteLength: 0,
         };
-        return { prepared: true, sessionId: previous };
+        return { prepared: true, recovered, sessionId: previous };
       }
 
       const pending = pendingJarvisSessionRebind;
@@ -4938,7 +4973,7 @@ class IPCHandlers {
           throw new Error("prepared Jarvis PCM rebind does not match abort request");
         }
         pendingJarvisSessionRebind = null;
-        for (const chunk of pending.chunks) sendMeetingAudio(chunk.buffer, chunk.source);
+        flushPendingJarvisSessionRebind(pending);
         return { aborted: true, sessionId: previous };
       }
 
@@ -4955,7 +4990,7 @@ class IPCHandlers {
       }
       activeJarvisSessionId = next;
       pendingJarvisSessionRebind = null;
-      for (const chunk of pending.chunks) sendMeetingAudio(chunk.buffer, chunk.source);
+      flushPendingJarvisSessionRebind(pending);
       return { rebound: true, sessionId: next, flushedChunks: pending.chunks.length };
     };
 

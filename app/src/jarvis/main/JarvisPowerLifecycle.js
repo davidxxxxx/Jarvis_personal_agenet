@@ -329,6 +329,7 @@ class JarvisPowerLifecycle {
       }
       const pending = {
         result,
+        upstreamActivated: false,
         pcmRebound: false,
         upstream,
       };
@@ -338,6 +339,10 @@ class JarvisPowerLifecycle {
   }
 
   async _completeLocalDateRotation(localDate, pending) {
+    if (!pending.upstreamActivated) {
+      await this.rotateUpstream({ phase: "activate", ...structuredClone(pending.upstream) });
+      pending.upstreamActivated = true;
+    }
     if (!pending.pcmRebound) {
       this.rebindPcmSession(
         pending.upstream.previousSessionId,
