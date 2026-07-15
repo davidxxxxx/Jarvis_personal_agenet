@@ -1,5 +1,6 @@
 import type {
   JarvisPreviewStatus,
+  JarvisRuntimeDeferral,
   JarvisRuntimeRecoveryAction,
   JarvisRuntimeStatus,
   JarvisSessionTimeline,
@@ -32,6 +33,33 @@ const STAGE_LABELS: Record<string, string> = {
   speaker: "说话人",
   analysis: "分析",
 };
+
+const SPEAKER_DEFERRAL_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  external_gpu_busy: "其他 GPU 重任务正在运行，说话人处理已让路",
+  battery_saver: "节电模式已暂停说话人处理",
+  cpu_load_high: "CPU 负载较高，等待系统负载降低",
+  telemetry_unavailable: "正在等待可信的资源状态",
+  diarization_runtime_unavailable: "本地说话人运行时不可用",
+  diarization_model_unavailable: "本地说话人模型不可用",
+  resources_constrained: "资源受限，说话人处理已延后（resources_constrained）",
+});
+
+const SPEAKER_JOB_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  speaker: "说话人处理",
+  diarize_track: "说话人分段",
+  resolve_identities: "说话人身份解析",
+});
+
+function speakerDeferralLabel(reason: string) {
+  return SPEAKER_DEFERRAL_LABELS[reason] ?? `说话人处理已延后（${reason}）`;
+}
+
+function speakerRetryLabel(deferral: JarvisRuntimeDeferral, observedAt: number) {
+  if (deferral.nextRetryAt === null) return null;
+  const waitMs = Math.max(0, deferral.nextRetryAt - observedAt);
+  if (waitMs === 0) return "等待重新调度";
+  return `${Math.max(1, Math.ceil(waitMs / 60_000))} 分钟后重试`;
+}
 
 function primaryRuntimeLabel(status: JarvisRuntimeStatus) {
   const capture = status.capture;
@@ -89,6 +117,7 @@ function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
       : `最终覆盖 ${status.queue.finalCoveragePct}%`
   }`;
   const stageRows = Object.entries(status.queue.byStage).filter(([, counts]) => counts.total > 0);
+  const speakerDeferrals = status.queue.deferrals.filter(({ stage }) => stage === "speaker");
   const action = status.nextRecoveryAction ? ACTION_LABELS[status.nextRecoveryAction] : null;
   return (
     <div className="space-y-3 text-sm">
@@ -102,7 +131,9 @@ function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
       <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
         <p>
           后端 {backend}
-          {status.backend.cudaGpuUuid ? ` · ${status.backend.cudaGpuUuid}` : null}
+          {status.backend.actualBackend === "cuda" && status.backend.cudaGpuUuid
+            ? ` · ${status.backend.cudaGpuUuid}`
+            : null}
         </p>
         <p>
           资源 {status.resources.state} · {status.resources.reason}
@@ -134,6 +165,21 @@ function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
               {counts.retry} / 受阻 {counts.blocked}
             </li>
           ))}
+        </ul>
+      )}
+      {speakerDeferrals.length > 0 && (
+        <ul aria-label="说话人处理等待原因" className="space-y-1 text-xs text-muted-foreground">
+          {speakerDeferrals.map((deferral) => {
+            const retry = speakerRetryLabel(deferral, status.observedAt);
+            return (
+              <li key={`${deferral.jobType}:${deferral.reason}:${deferral.state}`}>
+                {SPEAKER_JOB_LABELS[deferral.jobType] ?? deferral.jobType}：
+                {speakerDeferralLabel(deferral.reason)}
+                {deferral.count > 1 ? ` · ${deferral.count} 个任务` : null}
+                {retry ? ` · ${retry}` : null}
+              </li>
+            );
+          })}
         </ul>
       )}
       {action && (

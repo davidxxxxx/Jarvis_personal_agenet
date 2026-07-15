@@ -132,6 +132,7 @@ function unavailableProcessingStatus() {
     blocked: 0,
     total: 0,
     byStage: {},
+    deferrals: [],
     backlogMs: 0,
     oldestCreatedAt: null,
     activeExecutionDevice: null,
@@ -148,6 +149,9 @@ function nextRecoveryAction({ capture, resources, queue, disk }) {
       ? "restore_microphone"
       : "retry_jobs";
   }
+  const deferralReasons = new Set(queue.deferrals.map(({ reason }) => reason));
+  if (deferralReasons.has("external_gpu_busy")) return "wait_for_gpu";
+  if (queue.deferrals.length > 0) return "retry_jobs";
   if (resources.state === "busy") return "wait_for_gpu";
   if (resources.state === "unavailable") return "check_cuda";
   if (queue.blocked > 0 || queue.retry > 0) return "retry_jobs";
@@ -351,6 +355,7 @@ function registerJarvisIpc({
       blocked: processing.blocked,
       total: processing.total,
       byStage: processing.byStage,
+      deferrals: processing.deferrals ?? [],
       backlogMinutes: processing.backlogMs / 60_000,
       oldestJobAgeMs:
         processing.oldestCreatedAt === null

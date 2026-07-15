@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { JarvisRuntimeStatus, JarvisSessionTimeline } from "../../types";
 import ProcessingStatus from "../ProcessingStatus";
@@ -57,6 +57,7 @@ function runtime(overrides: Partial<JarvisRuntimeStatus> = {}): JarvisRuntimeSta
       byStage: {
         final_transcription: { pending: 4, running: 0, retry: 0, blocked: 0, total: 4 },
       },
+      deferrals: [],
       backlogMinutes: 18,
       oldestJobAgeMs: 90_000,
       finalCoveragePct: 72,
@@ -79,6 +80,58 @@ function runtime(overrides: Partial<JarvisRuntimeStatus> = {}): JarvisRuntimeSta
 }
 
 describe("ProcessingStatus", () => {
+  it.each([
+    ["external_gpu_busy", "其他 GPU 重任务正在运行"],
+    ["battery_saver", "节电模式已暂停说话人处理"],
+    ["cpu_load_high", "CPU 负载较高"],
+    ["telemetry_unavailable", "正在等待可信的资源状态"],
+    ["diarization_runtime_unavailable", "本地说话人运行时不可用"],
+    ["diarization_model_unavailable", "本地说话人模型不可用"],
+    ["resources_constrained", "resources_constrained"],
+    ["future_safe_reason", "future_safe_reason"],
+  ])(
+    "shows persisted speaker deferral reason %s without inventing CUDA or identity",
+    (reason, label) => {
+      render(
+        <ProcessingStatus
+          timeline={timeline()}
+          runtimeStatus={runtime({
+            backend: { actualBackend: "cpu", cudaGpuUuid: "GPU-inventory-only" },
+            resources: { ...runtime().resources, state: "constrained", reason },
+            queue: {
+              ...runtime().queue,
+              pending: 0,
+              retry: 1,
+              total: 1,
+              byStage: {
+                speaker: { pending: 0, running: 0, retry: 1, blocked: 0, total: 1 },
+              },
+              deferrals: [
+                {
+                  stage: "speaker",
+                  jobType: "resolve_identities",
+                  state: "retry",
+                  reason,
+                  count: 1,
+                  nextRetryAt: 220_000,
+                },
+              ],
+            },
+            preview: null,
+            nextRecoveryAction: null,
+          })}
+        />
+      );
+
+      const deferrals = screen.getByRole("list", { name: "说话人处理等待原因" });
+      expect(within(deferrals).getByText(new RegExp(label))).toBeVisible();
+      expect(screen.getByText(/^后端 CPU$/)).toBeVisible();
+      expect(within(deferrals).getByText(/2 分钟后重试/)).toBeVisible();
+      expect(screen.queryByText(/CUDA/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/GPU-inventory-only/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/张三/)).not.toBeInTheDocument();
+    }
+  );
   it.each([
     ["recording", "正在录音"],
     ["paused", "录音已暂停"],

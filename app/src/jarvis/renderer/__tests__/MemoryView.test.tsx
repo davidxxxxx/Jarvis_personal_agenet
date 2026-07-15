@@ -76,6 +76,7 @@ const runtimeStatus: JarvisRuntimeStatus = {
     byStage: {
       final_transcription: { pending: 1, running: 0, retry: 0, blocked: 0, total: 1 },
     },
+    deferrals: [],
     backlogMinutes: 1,
     oldestJobAgeMs: 30_000,
     finalCoveragePct: 50,

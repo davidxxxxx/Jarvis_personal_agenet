@@ -29,6 +29,16 @@ function repository(overrides = {}) {
         final_transcription: { pending: 3, running: 1, retry: 1, blocked: 0, total: 5 },
         speaker: { pending: 1, running: 0, retry: 1, blocked: 0, total: 2 },
       },
+      deferrals: [
+        {
+          stage: "speaker",
+          jobType: "diarize_track",
+          state: "retry",
+          reason: "external_gpu_busy",
+          count: 1,
+          nextRetryAt: 110_000,
+        },
+      ],
       backlogMs: 18 * 60_000,
       oldestCreatedAt: 10_000,
       activeExecutionDevice: "cuda",
@@ -168,6 +178,16 @@ test("runtime snapshot reports truthful capture, resource, queue, preview, and d
         final_transcription: { pending: 3, running: 1, retry: 1, blocked: 0, total: 5 },
         speaker: { pending: 1, running: 0, retry: 1, blocked: 0, total: 2 },
       },
+      deferrals: [
+        {
+          stage: "speaker",
+          jobType: "diarize_track",
+          state: "retry",
+          reason: "external_gpu_busy",
+          count: 1,
+          nextRetryAt: 110_000,
+        },
+      ],
       backlogMinutes: 18,
       oldestJobAgeMs: 90_000,
       finalCoveragePct: 72,
@@ -206,6 +226,7 @@ test("runtime snapshot marks missing subsystems as unavailable instead of invent
         blocked: 0,
         total: 0,
         byStage: {},
+        deferrals: [],
         backlogMs: 0,
         oldestCreatedAt: null,
         activeExecutionDevice: null,
@@ -256,9 +277,10 @@ test("repository aggregates active work by runtime stage without double-counting
     const insertJob = repo.db.prepare(
       `INSERT INTO processing_jobs (
         id, session_id, chunk_id, job_type, state, priority, input_hash,
-        input_version, model_version, execution_device, created_at, completed_at
+        input_version, model_version, execution_device, blocked_reason, next_retry_at,
+        created_at, completed_at
       ) VALUES (@id, 's1', @chunkId, @jobType, @state, @priority, @hash,
-        1, '', @executionDevice, @createdAt, @completedAt)`
+        1, '', @executionDevice, @blockedReason, @nextRetryAt, @createdAt, @completedAt)`
     );
     insertJob.run({
       id: "j1",
@@ -268,6 +290,8 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 20,
       hash: "j1",
       executionDevice: null,
+      blockedReason: null,
+      nextRetryAt: null,
       createdAt: 10_000,
       completedAt: null,
     });
@@ -279,6 +303,8 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 20,
       hash: "j2",
       executionDevice: "cuda",
+      blockedReason: null,
+      nextRetryAt: null,
       createdAt: 20_000,
       completedAt: null,
     });
@@ -290,6 +316,8 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 30,
       hash: "j3",
       executionDevice: null,
+      blockedReason: "resources_constrained",
+      nextRetryAt: 90_000,
       createdAt: 30_000,
       completedAt: null,
     });
@@ -301,6 +329,8 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 50,
       hash: "j4",
       executionDevice: null,
+      blockedReason: null,
+      nextRetryAt: null,
       createdAt: 40_000,
       completedAt: null,
     });
@@ -312,8 +342,49 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 20,
       hash: "j5",
       executionDevice: "cpu",
+      blockedReason: null,
+      nextRetryAt: null,
       createdAt: 50_000,
       completedAt: 60_000,
+    });
+    insertJob.run({
+      id: "j7",
+      chunkId: null,
+      jobType: "diarize_track",
+      state: "retry",
+      priority: 40,
+      hash: "j7",
+      executionDevice: null,
+      blockedReason: "cpu_load_high",
+      nextRetryAt: 80_000,
+      createdAt: 55_000,
+      completedAt: null,
+    });
+    insertJob.run({
+      id: "j8",
+      chunkId: null,
+      jobType: "diarize_track",
+      state: "retry",
+      priority: 40,
+      hash: "j8",
+      executionDevice: null,
+      blockedReason: "cpu_load_high",
+      nextRetryAt: 70_000,
+      createdAt: 56_000,
+      completedAt: null,
+    });
+    insertJob.run({
+      id: "j9",
+      chunkId: null,
+      jobType: "resolve_identities",
+      state: "blocked",
+      priority: 45,
+      hash: "j9",
+      executionDevice: null,
+      blockedReason: "battery_saver",
+      nextRetryAt: null,
+      createdAt: 57_000,
+      completedAt: null,
     });
     repo.db
       .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'c3'")
@@ -335,14 +406,40 @@ test("repository aggregates active work by runtime stage without double-counting
     assert.deepEqual(repo.getRuntimeProcessingStatus(), {
       pending: 1,
       running: 1,
-      retry: 1,
-      blocked: 1,
-      total: 4,
+      retry: 3,
+      blocked: 2,
+      total: 7,
       byStage: {
         analysis: { pending: 0, running: 0, retry: 0, blocked: 1, total: 1 },
         final_transcription: { pending: 1, running: 1, retry: 0, blocked: 0, total: 2 },
-        speaker: { pending: 0, running: 0, retry: 1, blocked: 0, total: 1 },
+        speaker: { pending: 0, running: 0, retry: 3, blocked: 1, total: 4 },
       },
+      deferrals: [
+        {
+          stage: "speaker",
+          jobType: "diarize_track",
+          state: "retry",
+          reason: "cpu_load_high",
+          count: 2,
+          nextRetryAt: 70_000,
+        },
+        {
+          stage: "speaker",
+          jobType: "resolve_identities",
+          state: "blocked",
+          reason: "battery_saver",
+          count: 1,
+          nextRetryAt: null,
+        },
+        {
+          stage: "speaker",
+          jobType: "speaker",
+          state: "retry",
+          reason: "resources_constrained",
+          count: 1,
+          nextRetryAt: 90_000,
+        },
+      ],
       backlogMs: 1_080_000,
       oldestCreatedAt: 10_000,
       activeExecutionDevice: "cuda",
@@ -358,6 +455,8 @@ test("repository aggregates active work by runtime stage without double-counting
       priority: 20,
       hash: "j6",
       executionDevice: null,
+      blockedReason: null,
+      nextRetryAt: null,
       createdAt: 70_000,
       completedAt: null,
     });

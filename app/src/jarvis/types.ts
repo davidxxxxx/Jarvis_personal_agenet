@@ -349,6 +349,15 @@ export interface JarvisRuntimeQueueStageCounts {
   total: number;
 }
 
+export interface JarvisRuntimeDeferral {
+  stage: string;
+  jobType: string;
+  state: "retry" | "blocked";
+  reason: string;
+  count: number;
+  nextRetryAt: number | null;
+}
+
 export interface JarvisRuntimeStatus {
   observedAt: number;
   capture: {
@@ -372,6 +381,7 @@ export interface JarvisRuntimeStatus {
   };
   queue: JarvisRuntimeQueueStageCounts & {
     byStage: Record<string, JarvisRuntimeQueueStageCounts>;
+    deferrals: JarvisRuntimeDeferral[];
     backlogMinutes: number;
     oldestJobAgeMs: number | null;
     finalCoveragePct: number | null;

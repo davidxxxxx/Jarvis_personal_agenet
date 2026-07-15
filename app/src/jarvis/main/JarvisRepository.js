@@ -54,7 +54,7 @@ function runtimeJobStage({ job_type: jobType, state, priority }) {
   }
   if (jobType === "transcribe_chunk") return "final_transcription";
   if (jobType === "preview_transcription") return "preview";
-  if (jobType === "speaker") return "speaker";
+  if (["speaker", "diarize_track", "resolve_identities"].includes(jobType)) return "speaker";
   if (jobType === "analyze_session") return "analysis";
   if (jobType === "compress_chunk") return "compression";
   return jobType;
@@ -1050,11 +1050,17 @@ class JarvisRepository {
         WHERE session_id = ?
       `),
       listRuntimeProcessingGroups: this.db.prepare(`
-        SELECT job_type, state, priority, COUNT(*) AS count
+        SELECT
+          job_type,
+          state,
+          priority,
+          blocked_reason,
+          COUNT(*) AS count,
+          MIN(next_retry_at) AS next_retry_at
         FROM processing_jobs
         WHERE state <> 'completed'
-        GROUP BY job_type, state, priority
-        ORDER BY job_type ASC, state ASC, priority ASC
+        GROUP BY job_type, state, priority, blocked_reason
+        ORDER BY job_type ASC, state ASC, priority ASC, blocked_reason ASC
       `),
       getRuntimeTranscriptionBacklog: this.db.prepare(`
         SELECT COALESCE(SUM(chunk.duration_ms), 0) AS backlog_ms
@@ -3650,6 +3656,7 @@ class JarvisRepository {
   getRuntimeProcessingStatus() {
     const totals = emptyRuntimeCounts();
     const stages = new Map();
+    const deferralGroups = new Map();
     for (const row of this.statements.listRuntimeProcessingGroups.all()) {
       const count = Number(row.count);
       const state = runtimeQueueState(row.state);
@@ -3660,10 +3667,42 @@ class JarvisRepository {
       stageCounts[state] += count;
       stageCounts.total += count;
       stages.set(stage, stageCounts);
+
+      const reason = typeof row.blocked_reason === "string" ? row.blocked_reason.trim() : "";
+      if ((row.state === "retry" || row.state === "blocked") && reason) {
+        const key = JSON.stringify([stage, row.job_type, row.state, reason]);
+        const existing = deferralGroups.get(key);
+        const nextRetryAt = row.next_retry_at === null ? null : Number(row.next_retry_at);
+        if (existing) {
+          existing.count += count;
+          if (
+            nextRetryAt !== null &&
+            (existing.nextRetryAt === null || nextRetryAt < existing.nextRetryAt)
+          ) {
+            existing.nextRetryAt = nextRetryAt;
+          }
+        } else {
+          deferralGroups.set(key, {
+            stage,
+            jobType: row.job_type,
+            state: row.state,
+            reason,
+            count,
+            nextRetryAt,
+          });
+        }
+      }
     }
     const byStage = Object.fromEntries(
       [...stages.entries()].sort(([left], [right]) => compareStableIds(left, right))
     );
+    const deferrals = [...deferralGroups.values()].sort((left, right) => {
+      for (const key of ["stage", "jobType", "reason", "state"]) {
+        const result = compareStableIds(left[key], right[key]);
+        if (result !== 0) return result;
+      }
+      return 0;
+    });
     const backlog = this.statements.getRuntimeTranscriptionBacklog.get();
     const oldest = this.statements.getRuntimeOldestProcessingJob.get();
     const active = this.statements.getActiveProcessingExecutionDevice.get();
@@ -3676,6 +3715,7 @@ class JarvisRepository {
     return {
       ...totals,
       byStage,
+      deferrals,
       backlogMs: Number(backlog.backlog_ms),
       oldestCreatedAt: oldest.oldest_created_at ?? null,
       activeExecutionDevice: active?.execution_device ?? null,
