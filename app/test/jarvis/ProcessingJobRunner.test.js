@@ -402,6 +402,121 @@ test("records handler failure with backoff without losing durable input metadata
   );
 });
 
+test("obsolete diarization inputs become terminal while the runner continues other jobs", async (t) => {
+  const { db, runner } = fixture(t);
+  const obsoleteCodes = [
+    "DIARIZATION_STALE_INPUT",
+    "DIARIZATION_AUDIO_EXPIRED",
+    "DIARIZATION_SUPERSEDED",
+  ];
+  obsoleteCodes.forEach((code, index) =>
+    seedJob(db, {
+      id: `obsolete-${index}`,
+      jobType: "diarize_track",
+      priority: 40,
+      inputHash: `obsolete-${index}`,
+      modelVersion: "jarvis-session-diarization-v1",
+      createdAt: 100 + index,
+    })
+  );
+  seedJob(db, {
+    id: "ordinary-after-obsolete",
+    jobType: "transcribe_chunk",
+    priority: 50,
+    inputHash: "ordinary",
+    createdAt: 200,
+  });
+  const ordinaryCalls = [];
+  runner.register("diarize_track", async (job) => {
+    const error = new Error(obsoleteCodes[Number(job.id.slice(-1))]);
+    error.code = obsoleteCodes[Number(job.id.slice(-1))];
+    throw error;
+  });
+  runner.register("transcribe_chunk", async (job) => ordinaryCalls.push(job.id));
+
+  for (let index = 0; index < 4; index += 1) assert.equal(await runner.runOnce(), 1);
+  for (let index = 0; index < 5; index += 1) assert.equal(await runner.runOnce(), 0);
+
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, error_code, next_retry_at, completed_at
+         FROM processing_jobs WHERE id LIKE 'obsolete-%' ORDER BY id`
+      )
+      .all(),
+    obsoleteCodes.map((code, index) => ({
+      id: `obsolete-${index}`,
+      state: "blocked",
+      error_code: code,
+      next_retry_at: null,
+      completed_at: 2000,
+    }))
+  );
+  assert.deepEqual(ordinaryCalls, ["ordinary-after-obsolete"]);
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE id = 'ordinary-after-obsolete'").get()
+      .state,
+    "completed"
+  );
+});
+
+test("diarization dependency deferrals use a long retry window without a claim storm", async (t) => {
+  let now = 2_000;
+  let available = false;
+  const governor = {
+    sample: async () => ({ state: "available" }),
+    admit: () =>
+      available
+        ? { action: "run_cpu", reason: "cpu_backend" }
+        : { action: "defer", reason: "diarization_model_unavailable" },
+  };
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    governor,
+    heavyGate: new HeavyJobGate(),
+  });
+  const calls = [];
+  for (let index = 0; index < 8; index += 1) {
+    seedJob(db, {
+      id: `model-wait-${index}`,
+      jobType: "diarize_track",
+      priority: 40,
+      inputHash: `model-wait-${index}`,
+      modelVersion: "jarvis-session-diarization-v1",
+      createdAt: 100 + index,
+    });
+  }
+  runner.register("diarize_track", async (job) => {
+    calls.push(job.id);
+    return { executionDevice: "cpu" };
+  });
+
+  for (let index = 0; index < 8; index += 1) assert.equal(await runner.runOnce(), 1);
+  now += 15_000;
+  for (let index = 0; index < 20; index += 1) assert.equal(await runner.runOnce(), 0);
+  const waiting = db
+    .prepare(
+      `SELECT state, attempt_count, next_retry_at, blocked_reason
+       FROM processing_jobs ORDER BY id`
+    )
+    .all();
+  assert.ok(waiting.every((job) => job.state === "retry"));
+  assert.ok(waiting.every((job) => job.attempt_count === 0));
+  assert.ok(waiting.every((job) => job.next_retry_at >= 2_000 + 30 * 60_000));
+  assert.ok(waiting.every((job) => job.blocked_reason === "diarization_model_unavailable"));
+  assert.deepEqual(calls, []);
+
+  available = true;
+  now = Math.max(...waiting.map((job) => job.next_retry_at));
+  for (let index = 0; index < 8; index += 1) assert.equal(await runner.runOnce(), 1);
+  assert.equal(await runner.runOnce(), 0);
+  assert.equal(calls.length, 8);
+  assert.equal(
+    db.prepare("SELECT count(*) count FROM processing_jobs WHERE state = 'completed'").get().count,
+    8
+  );
+});
+
 test("resource admission defers durably before the handler without counting an attempt", async (t) => {
   let handlerCalled = false;
   const governor = {

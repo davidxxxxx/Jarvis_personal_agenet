@@ -14,12 +14,36 @@ const MAX_EMBEDDING_SAMPLES = SAMPLE_RATE * MAX_EMBEDDING_SECONDS;
 const MODEL_FILE = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx";
 const SPEAKER_EMBEDDING_MODEL_ID = "3dspeaker-campplus-voxceleb-16k-v1";
 
+function resampleLinear(samples, inputSampleRate, outputSampleRate = SAMPLE_RATE) {
+  if (!(samples instanceof Float32Array)) throw new TypeError("samples must be Float32Array");
+  if (!Number.isSafeInteger(inputSampleRate) || inputSampleRate <= 0) {
+    throw new RangeError("inputSampleRate must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(outputSampleRate) || outputSampleRate <= 0) {
+    throw new RangeError("outputSampleRate must be a positive safe integer");
+  }
+  if (inputSampleRate === outputSampleRate) return samples;
+  const outputLength = Math.round((samples.length * outputSampleRate) / inputSampleRate);
+  const output = new Float32Array(outputLength);
+  const ratio = inputSampleRate / outputSampleRate;
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourcePosition = index * ratio;
+    const leftIndex = Math.floor(sourcePosition);
+    const rightIndex = Math.min(samples.length - 1, leftIndex + 1);
+    const fraction = sourcePosition - leftIndex;
+    output[index] = samples[leftIndex] * (1 - fraction) + samples[rightIndex] * fraction;
+  }
+  return output;
+}
+
 class SpeakerEmbeddings {
-  constructor({ workerClient = onnxWorkerClient } = {}) {
+  constructor({ workerClient = onnxWorkerClient, resampleImpl = resampleLinear } = {}) {
     if (!workerClient || typeof workerClient.request !== "function") {
       throw new TypeError("workerClient.request must be a function");
     }
+    if (typeof resampleImpl !== "function") throw new TypeError("resampleImpl must be a function");
     this.workerClient = workerClient;
+    this.resampleImpl = resampleImpl;
     this.loadPromise = null;
     this.artifactHashPromise = null;
   }
@@ -117,6 +141,7 @@ class SpeakerEmbeddings {
     const numSamples = endSample - startSample;
 
     const samples = new Float32Array(numSamples);
+    let modelSamples = samples;
     const bytesPerSample = 2;
     const offset = dataOffset + startSample * bytesPerSample;
 
@@ -128,8 +153,15 @@ class SpeakerEmbeddings {
     }
 
     try {
-      return await this._extractEmbeddingFromSamples(samples);
+      if (sampleRate !== SAMPLE_RATE) {
+        modelSamples = this.resampleImpl(samples, sampleRate, SAMPLE_RATE);
+        if (!(modelSamples instanceof Float32Array)) {
+          throw new TypeError("resampleImpl must return Float32Array");
+        }
+      }
+      return await this._extractEmbeddingFromSamples(modelSamples);
     } finally {
+      if (modelSamples !== samples) modelSamples.fill(0);
       samples.fill(0);
       buf.fill(0);
     }
@@ -186,8 +218,11 @@ class SpeakerEmbeddings {
   }
 }
 
+SpeakerEmbeddings.resampleLinear = resampleLinear;
+
 const instance = new SpeakerEmbeddings();
 module.exports = instance;
 module.exports.SpeakerEmbeddings = SpeakerEmbeddings;
 module.exports.MAX_EMBEDDING_SECONDS = MAX_EMBEDDING_SECONDS;
 module.exports.SPEAKER_EMBEDDING_MODEL_ID = SPEAKER_EMBEDDING_MODEL_ID;
+module.exports.resampleLinear = resampleLinear;

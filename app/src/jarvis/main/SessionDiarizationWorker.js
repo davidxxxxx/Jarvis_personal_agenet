@@ -228,8 +228,15 @@ class SessionDiarizationWorker {
       trackId: identity.trackId,
       at: this.clock(),
     });
-    if (!snapshot.eligible || snapshot.transcriptRevision !== identity.transcriptRevision) {
-      throw codedError("DIARIZATION_STALE_INPUT");
+    if (!snapshot.eligible) {
+      throw codedError(
+        snapshot.reason === "audio_expired"
+          ? "DIARIZATION_AUDIO_EXPIRED"
+          : "DIARIZATION_STALE_INPUT"
+      );
+    }
+    if (snapshot.transcriptRevision !== identity.transcriptRevision) {
+      throw codedError("DIARIZATION_SUPERSEDED");
     }
     const modelArtifactSha256 =
       typeof this.modelArtifactSha256 === "function"
@@ -255,6 +262,7 @@ class SessionDiarizationWorker {
 
     for (const chunk of snapshot.chunks) {
       if (chunk.transcriptionResult === "no_speech") {
+        await this.audioEvidenceReader.withVerifiedWav(chunk, async () => undefined);
         context?.renewLease?.();
         continue;
       }

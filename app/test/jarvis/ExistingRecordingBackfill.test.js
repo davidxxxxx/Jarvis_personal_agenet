@@ -8,24 +8,14 @@ const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader");
 const JarvisTranscriptionWorker = require("../../src/jarvis/main/JarvisTranscriptionWorker");
-const {
-  JarvisProcessingRuntime,
-} = require("../../src/jarvis/main/JarvisProcessingRuntime");
+const { JarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const TranscriptReconciler = require("../../src/jarvis/main/TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("../../src/jarvis/main/DualTrackTranscriptDeduper");
-const {
-  backfillLegacyRecordings,
-} = require("../../src/jarvis/main/LegacyRecordingBackfill");
+const { backfillLegacyRecordings } = require("../../src/jarvis/main/LegacyRecordingBackfill");
 
 const NOW = 2_000;
 
-function addLegacyChunk(repository, {
-  id,
-  sessionId,
-  filePath,
-  startedAt,
-  format,
-}) {
+function addLegacyChunk(repository, { id, sessionId, filePath, startedAt, format }) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const pcm = Buffer.alloc(480, format === "wav" ? 1 : 2);
   const bytes =
@@ -43,9 +33,7 @@ function addLegacyChunk(repository, {
     sha256: crypto.createHash("sha256").update(pcm).digest("hex"),
     expiresAt: 100_000,
   });
-  repository.db
-    .prepare("UPDATE audio_chunks SET format = ? WHERE id = ?")
-    .run(format, id);
+  repository.db.prepare("UPDATE audio_chunks SET format = ? WHERE id = ?").run(format, id);
 }
 
 function createSourceFixture(sourceRoot) {
@@ -116,7 +104,8 @@ function createRuntime(repository, recordingsRoot, owner) {
 
 function assertTerminalAndTruthful(repository) {
   const rows = repository.db
-    .prepare(`
+    .prepare(
+      `
       SELECT chunk.id AS chunk_id, chunk.path, chunk.format,
              chunk.track_id, chunk.transcription_status,
              job.job_type, job.state AS job_state, job.error_code,
@@ -125,25 +114,33 @@ function assertTerminalAndTruthful(repository) {
       JOIN sessions AS session ON session.id = chunk.session_id
       LEFT JOIN processing_jobs AS job ON job.chunk_id = chunk.id
       ORDER BY chunk.id
-    `)
+    `
+    )
     .all();
   assert.equal(rows.length, 2);
   assert.ok(rows.every((row) => row.track_id !== null));
   assert.ok(rows.every((row) => ["completed", "blocked"].includes(row.job_state)));
-  assert.equal(
-    rows.filter((row) => row.job_state === "blocked" && !row.error_code).length,
-    0
-  );
+  assert.equal(rows.filter((row) => row.job_state === "blocked" && !row.error_code).length, 0);
   assert.deepEqual(
-    rows.map(({ chunk_id, format, transcription_status, job_type, job_state, error_code, processing_state }) => ({
-      chunk_id,
-      format,
-      transcription_status,
-      job_type,
-      job_state,
-      error_code,
-      processing_state,
-    })),
+    rows.map(
+      ({
+        chunk_id,
+        format,
+        transcription_status,
+        job_type,
+        job_state,
+        error_code,
+        processing_state,
+      }) => ({
+        chunk_id,
+        format,
+        transcription_status,
+        job_type,
+        job_state,
+        error_code,
+        processing_state,
+      })
+    ),
     [
       {
         chunk_id: "blocked-chunk",
@@ -166,14 +163,16 @@ function assertTerminalAndTruthful(repository) {
     ]
   );
   const untruthfulReady = repository.db
-    .prepare(`
+    .prepare(
+      `
       SELECT COUNT(*) AS count
       FROM sessions AS session
       JOIN processing_jobs AS job ON job.session_id = session.id
       WHERE session.processing_state = 'ready'
         AND job.chunk_id IS NOT NULL
         AND job.state <> 'completed'
-    `)
+    `
+    )
     .get().count;
   assert.equal(untruthfulReady, 0);
 }
@@ -181,9 +180,7 @@ function assertTerminalAndTruthful(repository) {
 function assertIdempotentBackfill(result) {
   assert.equal(result.linked, 0);
   assert.equal(result.jobsCreated, 0);
-  assert.ok(
-    result.orphaned.every((candidate) => path.basename(candidate) === ".evidence-tmp")
-  );
+  assert.ok(result.orphaned.every((candidate) => path.basename(candidate) === ".evidence-tmp"));
 }
 
 test("a copied legacy database reaches terminal truthful transcription states idempotently", async (t) => {
@@ -205,7 +202,8 @@ test("a copied legacy database reaches terminal truthful transcription states id
   const copiedRecordingsRoot = path.join(destinationRoot, "recordings");
   repository = new JarvisRepository(copiedDatabasePath);
   assert.equal(
-    repository.db.prepare("SELECT COUNT(*) AS count FROM audio_chunks WHERE track_id IS NULL").get().count,
+    repository.db.prepare("SELECT COUNT(*) AS count FROM audio_chunks WHERE track_id IS NULL").get()
+      .count,
     2
   );
   const relocateCopiedChunk = repository.db.prepare(
@@ -228,23 +226,31 @@ test("a copied legacy database reaches terminal truthful transcription states id
   });
   assert.deepEqual(backfill, { linked: 2, orphaned: [], jobsCreated: 2 });
   repository.db
-    .prepare(`
+    .prepare(
+      `
       UPDATE processing_jobs
       SET job_type = 'test_unsupported_transcription'
       WHERE chunk_id = 'blocked-chunk'
-    `)
+    `
+    )
     .run();
 
   runtime = createRuntime(repository, copiedRecordingsRoot, "copied-fixture-worker");
   assert.equal(await runtime.drainOnce(), 2);
-  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(await runtime.drainOnce(), 1);
   assertTerminalAndTruthful(repository);
   assertIdempotentBackfill(
     backfillLegacyRecordings({ repository, recordingsRoot: copiedRecordingsRoot })
   );
   assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM audio_tracks").get().count, 2);
-  assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count, 2);
-  assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count, 0);
+  assert.equal(
+    repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count,
+    3
+  );
+  assert.equal(
+    repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count,
+    0
+  );
   await runtime.stop();
   repository.close();
 
@@ -252,16 +258,18 @@ test("a copied legacy database reaches terminal truthful transcription states id
   assertIdempotentBackfill(
     backfillLegacyRecordings({ repository, recordingsRoot: copiedRecordingsRoot })
   );
-  runtime = createRuntime(
-    repository,
-    copiedRecordingsRoot,
-    "copied-fixture-reopen-worker"
-  );
+  runtime = createRuntime(repository, copiedRecordingsRoot, "copied-fixture-reopen-worker");
   assert.equal(await runtime.drainOnce(), 0);
   assertTerminalAndTruthful(repository);
   assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM audio_tracks").get().count, 2);
-  assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count, 2);
-  assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count, 0);
+  assert.equal(
+    repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count,
+    3
+  );
+  assert.equal(
+    repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count,
+    0
+  );
   await runtime.stop();
   repository.close();
 });

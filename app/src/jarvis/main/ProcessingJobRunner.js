@@ -1,4 +1,13 @@
 const ERROR_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const TERMINAL_OBSOLETE_ERRORS = new Set([
+  "DIARIZATION_STALE_INPUT",
+  "DIARIZATION_AUDIO_EXPIRED",
+  "DIARIZATION_SUPERSEDED",
+]);
+const LONG_DEPENDENCY_DEFERRALS = new Set([
+  "diarization_runtime_unavailable",
+  "diarization_model_unavailable",
+]);
 
 function normalizeErrorCode(error) {
   let code;
@@ -49,6 +58,7 @@ class ProcessingJobRunner {
     leaseMs = 60_000,
     retryBaseMs = 1_000,
     retryMaxMs = 60_000,
+    dependencyRetryMs = 30 * 60_000,
     governor = null,
     heavyGate = null,
     classifyJob = defaultJobKind,
@@ -80,6 +90,9 @@ class ProcessingJobRunner {
     if (!Number.isSafeInteger(retryMaxMs) || retryMaxMs < retryBaseMs) {
       throw new RangeError("retryMaxMs must be a safe integer at least retryBaseMs");
     }
+    if (!Number.isSafeInteger(dependencyRetryMs) || dependencyRetryMs < 60_000) {
+      throw new RangeError("dependencyRetryMs must be a safe integer of at least one minute");
+    }
     if (governor !== null) {
       if (typeof governor.sample !== "function" || typeof governor.admit !== "function") {
         throw new TypeError("governor must implement sample and admit");
@@ -105,6 +118,7 @@ class ProcessingJobRunner {
     this.leaseMs = leaseMs;
     this.retryBaseMs = retryBaseMs;
     this.retryMaxMs = retryMaxMs;
+    this.dependencyRetryMs = dependencyRetryMs;
     this.governor = governor;
     this.heavyGate = heavyGate;
     this.classifyJob = classifyJob;
@@ -152,9 +166,14 @@ class ProcessingJobRunner {
         admission = { action: "defer", reason: "telemetry_unavailable" };
       }
       if (["defer", "pause_preview"].includes(admission.action)) {
+        const deferredAt = this.now();
+        const delay = LONG_DEPENDENCY_DEFERRALS.has(admission.reason)
+          ? this.dependencyRetryMs
+          : 15_000;
         const deferred = this.store.deferJob(job.id, {
           owner: this.owner,
-          at: this.now(),
+          at: deferredAt,
+          nextRetryAt: Math.min(Number.MAX_SAFE_INTEGER, deferredAt + delay),
           reason: admission.reason,
         });
         if (!deferred) throw codedError("JOB_LEASE_LOST");
@@ -225,6 +244,15 @@ class ProcessingJobRunner {
       if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
+      if (job.job_type === "diarize_track" && TERMINAL_OBSOLETE_ERRORS.has(errorCode)) {
+        const blocked = this.store.blockJob(job.id, {
+          owner: this.owner,
+          at: failedAt,
+          errorCode,
+        });
+        if (!blocked) throw codedError("JOB_LEASE_LOST");
+        return 1;
+      }
       const exponent = Math.max(0, Math.min(30, (job.attempt_count ?? 1) - 1));
       const retryDelay = Math.min(this.retryMaxMs, this.retryBaseMs * 2 ** exponent);
       const nextRetryAt = Math.min(Number.MAX_SAFE_INTEGER, failedAt + retryDelay);

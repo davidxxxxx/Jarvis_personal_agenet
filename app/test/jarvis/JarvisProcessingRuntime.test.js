@@ -689,7 +689,7 @@ test("production composition builds the durable diarization worker from local ma
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
       diarizationManager: {
         isAvailable: () => modelsAvailable,
-        diarize: async (wavPath) => {
+        diarizeStrict: async (wavPath) => {
           calls.push(["diarize", wavPath]);
           return [{ start: 0, end: 2, speaker: "speaker-a" }];
         },
@@ -698,6 +698,7 @@ test("production composition builds the durable diarization worker from local ma
     },
     speakerEmbeddingHelper: {
       isAvailable: () => true,
+      getModelArtifactSha256: async () => "c".repeat(64),
       extractEmbedding: async (wavPath, startSec, endSec) => {
         calls.push(["embed", wavPath, startSec, endSec]);
         const embedding = new Float32Array(512);
@@ -736,7 +737,14 @@ test("production composition builds the durable diarization worker from local ma
     ["diarize", "verified-final.wav"],
     ["embed", "verified-final.wav", 0, 2],
   ]);
-  assert.equal(repository.listDiarizationRuns("s1").length, 1);
+  const [run] = repository.listDiarizationRuns("s1");
+  assert.ok(run);
+  const expectedArtifactHash = require("node:crypto")
+    .createHash("sha256")
+    .update(`diarization-manager\0${"b".repeat(64)}\0`)
+    .update(`speaker-embedding-helper\0${"c".repeat(64)}\0`)
+    .digest("hex");
+  assert.equal(run.model_artifact_sha256, expectedArtifactHash);
   modelsAvailable = false;
   assert.deepEqual(runtime.runner.classifyCapability({ job_type: "diarize_track" }), {
     executionDevice: "cpu",
@@ -802,12 +810,13 @@ test("missing local diarization dependencies defer instead of producing HANDLER_
   assert.deepEqual(
     repository.db
       .prepare(
-        "SELECT state, attempt_count, blocked_reason, error_code FROM processing_jobs WHERE id = 'unavailable-diarize-job'"
+        "SELECT state, attempt_count, next_retry_at, blocked_reason, error_code FROM processing_jobs WHERE id = 'unavailable-diarize-job'"
       )
       .get(),
     {
       state: "retry",
       attempt_count: 0,
+      next_retry_at: 1_802_000,
       blocked_reason: "diarization_runtime_unavailable",
       error_code: null,
     }

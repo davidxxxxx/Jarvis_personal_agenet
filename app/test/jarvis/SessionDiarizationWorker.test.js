@@ -89,6 +89,7 @@ test("v20 creates revisioned diarization evidence with constrained foreign keys"
       "sample_rate",
       "input_version",
       "execution_device",
+      "commit_sequence",
       "created_at",
       "completed_at",
     ]);
@@ -118,6 +119,23 @@ test("v20 creates revisioned diarization evidence with constrained foreign keys"
       "excluded_from_centroid",
       "created_at",
     ]);
+    assert.deepEqual(columns(db, "speaker_diarization_run_cluster_segments"), [
+      "run_id",
+      "cluster_id",
+      "transcript_segment_id",
+    ]);
+    assert.deepEqual(
+      db
+        .prepare("PRAGMA foreign_key_list(speaker_diarization_run_cluster_segments)")
+        .all()
+        .map((row) => `${row.from}:${row.table}:${row.to}:${row.on_delete}`)
+        .sort(),
+      [
+        "cluster_id:speaker_diarization_run_clusters:cluster_id:CASCADE",
+        "run_id:speaker_diarization_run_clusters:run_id:CASCADE",
+        "transcript_segment_id:transcript_segments:id:CASCADE",
+      ]
+    );
     assert.deepEqual(
       db
         .prepare("PRAGMA foreign_key_list(speaker_turns)")
@@ -286,6 +304,27 @@ test("diarization evidence rejects provisional or nonterminal latest transcripti
       reason: "final_transcript_pending",
       transcriptRevision: null,
     }
+  );
+});
+
+test("diarization evidence reports terminal retained audio expiry explicitly", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalEvidence(repo);
+
+  const snapshot = repo.getDiarizationEvidenceSnapshot({
+    sessionId: "session-final",
+    trackId: "track-mic",
+    at: 10_001,
+  });
+
+  assert.deepEqual(
+    {
+      eligible: snapshot.eligible,
+      reason: snapshot.reason,
+      transcriptRevision: snapshot.transcriptRevision,
+    },
+    { eligible: false, reason: "audio_expired", transcriptRevision: null }
   );
 });
 
@@ -531,6 +570,102 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
   assert.equal(commits, 0);
 });
 
+test("worker propagates every strict sidecar failure without committing an empty run", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const snapshot = immutableWorkerSnapshot();
+  let commits = 0;
+  for (const code of [
+    "DIARIZATION_BINARY_UNAVAILABLE",
+    "DIARIZATION_MODEL_UNAVAILABLE",
+    "DIARIZATION_SIDECAR_TIMEOUT",
+    "DIARIZATION_SIDECAR_SPAWN_FAILED",
+    "DIARIZATION_SIDECAR_EXIT_NONZERO",
+  ]) {
+    const worker = new SessionDiarizationWorker({
+      repository: {
+        getDiarizationEvidenceSnapshot: () => snapshot,
+        getDiarizationRun: () => null,
+        listDiarizationEchoCandidates: () => [],
+        commitDiarizationRun: () => {
+          commits += 1;
+        },
+      },
+      audioEvidenceReader: {
+        withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
+      },
+      diarizeAudio: async () => {
+        const error = new Error("sidecar failed");
+        error.code = code;
+        throw error;
+      },
+      embedWindow: async () => assert.fail("sidecar failure ran embeddings"),
+      modelArtifactSha256: "a".repeat(64),
+    });
+    await assert.rejects(
+      worker.run({
+        id: `job-${code}`,
+        session_id: "session-worker",
+        track_id: "track-worker",
+        input_hash: buildDiarizationJobKey({
+          sessionId: "session-worker",
+          trackId: "track-worker",
+          transcriptRevision: snapshot.transcriptRevision,
+        }),
+        model_version: "jarvis-session-diarization-v1",
+      }),
+      { code }
+    );
+  }
+  assert.equal(commits, 0);
+});
+
+test("worker distinguishes expired and superseded durable evidence", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const revision = "a".repeat(64);
+  const job = {
+    id: "job-obsolete",
+    session_id: "session-worker",
+    track_id: "track-worker",
+    input_hash: buildDiarizationJobKey({
+      sessionId: "session-worker",
+      trackId: "track-worker",
+      transcriptRevision: revision,
+    }),
+    model_version: "jarvis-session-diarization-v1",
+  };
+  const createWorker = (snapshot) =>
+    new SessionDiarizationWorker({
+      repository: {
+        getDiarizationEvidenceSnapshot: () => snapshot,
+        getDiarizationRun: () => null,
+        listDiarizationEchoCandidates: () => [],
+        commitDiarizationRun: () => assert.fail("obsolete input committed"),
+      },
+      audioEvidenceReader: {
+        withVerifiedWav: async () => assert.fail("obsolete input read audio"),
+      },
+      diarizeAudio: async () => assert.fail("obsolete input ran diarization"),
+      embedWindow: async () => assert.fail("obsolete input ran embeddings"),
+      modelArtifactSha256: "a".repeat(64),
+    });
+
+  await assert.rejects(
+    createWorker({ eligible: false, reason: "audio_expired", transcriptRevision: null }).run(job),
+    { code: "DIARIZATION_AUDIO_EXPIRED" }
+  );
+  await assert.rejects(
+    createWorker({
+      eligible: true,
+      reason: null,
+      transcriptRevision: "b".repeat(64),
+      chunks: [],
+    }).run(job),
+    { code: "DIARIZATION_SUPERSEDED" }
+  );
+});
+
 test("worker marks transcript-confirmed cross-track echo and excludes its centroid contribution", async () => {
   const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
   const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
@@ -649,6 +784,61 @@ test("worker returns an existing completed run before loading retained audio", a
   assert.deepEqual(result, { executionDevice: "cpu", status: "already_completed" });
   assert.equal(snapshots, 0);
   assert.equal(artifacts, 0);
+});
+
+test("worker verifies every authoritative no-speech chunk and commits an empty completed run", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const base = immutableWorkerSnapshot();
+  const snapshot = {
+    ...base,
+    chunks: base.chunks.map((chunk) => ({
+      ...chunk,
+      transcriptionResult: "no_speech",
+      finalSegments: [],
+    })),
+  };
+  const verified = [];
+  let committed = null;
+  const worker = new SessionDiarizationWorker({
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: (input) => {
+        committed = input;
+        return { status: "completed", runId: input.run.id };
+      },
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async (chunk, consume) => {
+        verified.push(chunk.id);
+        return consume(`${chunk.id}.wav`);
+      },
+    },
+    diarizeAudio: async () => assert.fail("no-speech evidence ran the diarizer"),
+    embedWindow: async () => assert.fail("no-speech evidence ran embeddings"),
+    modelArtifactSha256: "a".repeat(64),
+    clock: () => 10_000,
+  });
+
+  const result = await worker.run({
+    id: "job-no-speech",
+    session_id: "session-worker",
+    track_id: "track-worker",
+    input_hash: buildDiarizationJobKey({
+      sessionId: "session-worker",
+      trackId: "track-worker",
+      transcriptRevision: snapshot.transcriptRevision,
+    }),
+    model_version: "jarvis-session-diarization-v1",
+  });
+
+  assert.deepEqual(result, { executionDevice: "cpu", status: "completed" });
+  assert.deepEqual(verified, ["chunk-1", "chunk-2"]);
+  assert.deepEqual(committed.clusters, []);
+  assert.deepEqual(committed.turns, []);
+  assert.deepEqual(committed.segmentLinks, []);
 });
 
 test("worker preserves a short raw turn while padding only its embedding window", async () => {

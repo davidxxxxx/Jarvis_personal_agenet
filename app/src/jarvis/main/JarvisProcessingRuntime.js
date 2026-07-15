@@ -514,25 +514,50 @@ function createJarvisProcessingRuntime({
   const diarizationManager = ipcHandlers.diarizationManager || null;
   const canBuildDiarizationWorker = Boolean(
     diarizationManager &&
-    typeof diarizationManager.diarize === "function" &&
+    typeof diarizationManager.diarizeStrict === "function" &&
     typeof diarizationManager.getModelArtifactSha256 === "function" &&
     speakerEmbeddingHelper &&
-    typeof speakerEmbeddingHelper.extractEmbedding === "function"
+    typeof speakerEmbeddingHelper.extractEmbedding === "function" &&
+    typeof speakerEmbeddingHelper.getModelArtifactSha256 === "function"
   );
+  let combinedDiarizationArtifactHashPromise = null;
+  const combinedDiarizationArtifactHash = () => {
+    if (combinedDiarizationArtifactHashPromise) return combinedDiarizationArtifactHashPromise;
+    combinedDiarizationArtifactHashPromise = Promise.all([
+      diarizationManager.getModelArtifactSha256(),
+      speakerEmbeddingHelper.getModelArtifactSha256(),
+    ])
+      .then(([managerHash, speakerHash]) => {
+        if (!/^[0-9a-f]{64}$/.test(managerHash) || !/^[0-9a-f]{64}$/.test(speakerHash)) {
+          const error = new Error("DIARIZATION_MODEL_ARTIFACT_INVALID");
+          error.code = "DIARIZATION_MODEL_ARTIFACT_INVALID";
+          throw error;
+        }
+        return createHash("sha256")
+          .update(`diarization-manager\0${managerHash}\0`)
+          .update(`speaker-embedding-helper\0${speakerHash}\0`)
+          .digest("hex");
+      })
+      .catch((error) => {
+        combinedDiarizationArtifactHashPromise = null;
+        throw error;
+      });
+    return combinedDiarizationArtifactHashPromise;
+  };
   const effectiveDiarizationWorker =
     sessionDiarizationWorker ??
     (canBuildDiarizationWorker
       ? new SessionDiarizationWorker({
           repository,
           audioEvidenceReader: service.audioEvidenceReader,
-          diarizeAudio: ({ wavPath }) => diarizationManager.diarize(wavPath),
+          diarizeAudio: ({ wavPath }) => diarizationManager.diarizeStrict(wavPath),
           embedWindow: ({ wavPath, turn }) =>
             speakerEmbeddingHelper.extractEmbedding(
               wavPath,
               turn.embeddingStartMs / 1_000,
               turn.embeddingEndMs / 1_000
             ),
-          modelArtifactSha256: () => diarizationManager.getModelArtifactSha256(),
+          modelArtifactSha256: combinedDiarizationArtifactHash,
           clock: now,
         })
       : null);

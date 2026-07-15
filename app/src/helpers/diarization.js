@@ -60,12 +60,39 @@ const SEGMENTATION_ONNX = path.join(SEGMENTATION_DIR, "model.onnx");
 const EMBEDDING_ONNX = "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx";
 const SILERO_VAD_ONNX = "silero_vad.onnx";
 
+function diarizationError(code, message = code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 class DiarizationManager {
-  constructor() {
+  constructor({
+    spawnImpl = spawn,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+    gracefulStopProcessImpl = gracefulStopProcess,
+    timeoutMs = DIARIZATION_TIMEOUT_MS,
+  } = {}) {
+    if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
+    if (typeof setTimeoutImpl !== "function" || typeof clearTimeoutImpl !== "function") {
+      throw new TypeError("timer implementations must be functions");
+    }
+    if (typeof gracefulStopProcessImpl !== "function") {
+      throw new TypeError("gracefulStopProcessImpl must be a function");
+    }
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new RangeError("timeoutMs must be a positive safe integer");
+    }
     this._process = null;
     this.currentDownloadProcess = null;
     this.cachedBinaryPath = null;
     this.modelArtifactHashPromise = null;
+    this.spawnImpl = spawnImpl;
+    this.setTimeoutImpl = setTimeoutImpl;
+    this.clearTimeoutImpl = clearTimeoutImpl;
+    this.gracefulStopProcessImpl = gracefulStopProcessImpl;
+    this.timeoutMs = timeoutMs;
   }
 
   getBinaryPath() {
@@ -348,22 +375,31 @@ class DiarizationManager {
   }
 
   async diarize(wavPath, options = {}) {
+    try {
+      return await this.diarizeStrict(wavPath, options);
+    } catch (error) {
+      debugLogger.warn("Diarization unavailable", {
+        code: error?.code,
+        error: error?.message,
+      });
+      return [];
+    }
+  }
+
+  async diarizeStrict(wavPath, options = {}) {
     const { numSpeakers = -1, threshold = 0.55 } = options;
 
     const binaryPath = this.getBinaryPath();
     if (!binaryPath) {
-      debugLogger.warn("Diarization binary not found");
-      return [];
+      throw diarizationError("DIARIZATION_BINARY_UNAVAILABLE", "Diarization binary not found");
     }
 
     if (!this.isModelDownloaded()) {
-      debugLogger.warn("Diarization models not downloaded");
-      return [];
+      throw diarizationError("DIARIZATION_MODEL_UNAVAILABLE", "Diarization models not downloaded");
     }
 
     if (!fs.existsSync(wavPath)) {
-      debugLogger.warn("Diarization input file not found", { wavPath });
-      return [];
+      throw diarizationError("DIARIZATION_INPUT_UNAVAILABLE", "Diarization input file not found");
     }
 
     const segPath = this._resolveModelPath(SEGMENTATION_ONNX);
@@ -386,25 +422,52 @@ class DiarizationManager {
       wavPath,
     });
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
+      let settled = false;
+      let proc;
+      let timeout;
 
-      const proc = spawn(binaryPath, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-        detached: process.platform !== "win32",
-      });
+      const cleanup = () => {
+        if (timeout !== undefined) this.clearTimeoutImpl(timeout);
+        if (this._process === proc) this._process = null;
+        sidecarPidFile.clear("diarization");
+      };
+      const finishResolve = (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+      const finishReject = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+
+      try {
+        proc = this.spawnImpl(binaryPath, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          detached: process.platform !== "win32",
+        });
+      } catch (error) {
+        finishReject(
+          diarizationError("DIARIZATION_SIDECAR_SPAWN_FAILED", error?.message || "spawn failed")
+        );
+        return;
+      }
 
       this._process = proc;
       sidecarPidFile.write("diarization", proc.pid);
 
-      const timeout = setTimeout(() => {
-        debugLogger.warn("Diarization timed out", { timeoutMs: DIARIZATION_TIMEOUT_MS });
-        gracefulStopProcess(proc);
-        this._process = null;
-        resolve([]);
-      }, DIARIZATION_TIMEOUT_MS);
+      timeout = this.setTimeoutImpl(() => {
+        debugLogger.warn("Diarization timed out", { timeoutMs: this.timeoutMs });
+        finishReject(diarizationError("DIARIZATION_SIDECAR_TIMEOUT"));
+        void Promise.resolve(this.gracefulStopProcessImpl(proc)).catch(() => {});
+      }, this.timeoutMs);
 
       proc.stdout.on("data", (data) => {
         stdout += data.toString();
@@ -415,32 +478,48 @@ class DiarizationManager {
       });
 
       proc.on("close", (code) => {
-        clearTimeout(timeout);
-        this._process = null;
-        sidecarPidFile.clear("diarization");
-
+        if (settled) return;
         if (code !== 0) {
           debugLogger.warn("Diarization process exited with error", {
             code,
             stderr: stderr.slice(-500).trim(),
           });
-          resolve([]);
+          finishReject(
+            diarizationError(
+              "DIARIZATION_SIDECAR_EXIT_NONZERO",
+              `Diarization sidecar exited with code ${code}`
+            )
+          );
           return;
         }
 
-        const segments = this._parseOutput(stdout);
-        debugLogger.info("Diarization complete", { segmentCount: segments.length });
-        resolve(segments);
+        try {
+          const segments = this._parseStrictOutput(stdout);
+          debugLogger.info("Diarization complete", { segmentCount: segments.length });
+          finishResolve(segments);
+        } catch (error) {
+          finishReject(error);
+        }
       });
 
       proc.on("error", (err) => {
-        clearTimeout(timeout);
-        this._process = null;
-        sidecarPidFile.clear("diarization");
+        if (settled) return;
         debugLogger.warn("Diarization process error", { error: err.message });
-        resolve([]);
+        finishReject(diarizationError("DIARIZATION_SIDECAR_SPAWN_FAILED", err.message));
       });
     });
+  }
+
+  _parseStrictOutput(stdout) {
+    const segments = this._parseOutput(stdout);
+    const nonemptyLines = stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (nonemptyLines.length !== segments.length) {
+      throw diarizationError("DIARIZATION_SIDECAR_INVALID_OUTPUT");
+    }
+    return segments;
   }
 
   _parseOutput(stdout) {

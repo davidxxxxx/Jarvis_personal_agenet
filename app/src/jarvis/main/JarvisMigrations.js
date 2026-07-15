@@ -449,6 +449,7 @@ const SESSION_DIARIZATION_SCHEMA = `
     sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
     input_version INTEGER NOT NULL CHECK(input_version = 1),
     execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+    commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
     created_at INTEGER NOT NULL,
     completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
     UNIQUE(session_id, track_id, transcript_revision, policy_id)
@@ -495,18 +496,28 @@ const SESSION_DIARIZATION_SCHEMA = `
     created_at INTEGER NOT NULL,
     UNIQUE(run_id, chunk_id, turn_index),
     CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
-    CHECK(echo_state = 'confirmed' OR excluded_from_centroid = 0)
+    CHECK((echo_state = 'confirmed') = (excluded_from_centroid = 1))
+  );
+  CREATE TABLE IF NOT EXISTS speaker_diarization_run_cluster_segments (
+    run_id TEXT NOT NULL,
+    cluster_id TEXT NOT NULL,
+    transcript_segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    PRIMARY KEY(run_id, cluster_id, transcript_segment_id),
+    FOREIGN KEY(run_id, cluster_id)
+      REFERENCES speaker_diarization_run_clusters(run_id, cluster_id) ON DELETE CASCADE
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_diarization_run_revision
     ON speaker_diarization_runs(session_id, track_id, transcript_revision, policy_id);
-  CREATE INDEX IF NOT EXISTS idx_diarization_runs_session_completed
-    ON speaker_diarization_runs(session_id, completed_at, id);
+  CREATE INDEX IF NOT EXISTS idx_diarization_runs_session_sequence
+    ON speaker_diarization_runs(session_id, commit_sequence);
   CREATE INDEX IF NOT EXISTS idx_diarization_run_clusters_cluster
     ON speaker_diarization_run_clusters(cluster_id, run_id);
   CREATE INDEX IF NOT EXISTS idx_speaker_turns_run_time
     ON speaker_turns(run_id, started_at, ended_at, id);
   CREATE INDEX IF NOT EXISTS idx_speaker_turns_segment
     ON speaker_turns(transcript_segment_id, run_id);
+  CREATE INDEX IF NOT EXISTS idx_diarization_run_cluster_segments_segment
+    ON speaker_diarization_run_cluster_segments(transcript_segment_id, run_id, cluster_id);
 `;
 
 function disambiguateUnboundSpeakerClusters(db) {
