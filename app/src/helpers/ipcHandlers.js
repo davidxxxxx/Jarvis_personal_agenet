@@ -26,6 +26,8 @@ const {
 // Tinfoil's only realtime STT model — fallback when the renderer omits one.
 const TINFOIL_REALTIME_MODEL = "voxtral-mini-4b-realtime";
 const liveSpeakerIdentifier = require("./liveSpeakerIdentifier");
+const { LIVE_SPEAKER_SCOPES, createLiveSpeakerRouter } = require("./liveSpeakerRouting");
+const liveSpeakerRouter = createLiveSpeakerRouter({ identifier: liveSpeakerIdentifier });
 const MeetingEchoLeakDetector = require("./meetingEchoLeakDetector");
 const { applySmartSpacing } = require("./smartSpacing");
 const {
@@ -4862,6 +4864,7 @@ class IPCHandlers {
     let meetingLiveSpeakerActive = false;
     let meetingLiveSpeakerState = null;
     let meetingLiveSpeakerStartedAt = null;
+    let meetingLiveSpeakerBinding = null;
     let meetingReclusterTimer = null;
     let meetingSpeakerRemapper = (id) => id;
 
@@ -5250,8 +5253,12 @@ class IPCHandlers {
       return false;
     };
 
-    const stopLiveSpeakerIdentification = async () => {
-      if (!meetingLiveSpeakerActive) {
+    const stopLiveSpeakerIdentification = async (inputBinding = meetingLiveSpeakerBinding) => {
+      if (
+        !meetingLiveSpeakerActive ||
+        !inputBinding ||
+        meetingLiveSpeakerBinding !== inputBinding
+      ) {
         return null;
       }
 
@@ -5261,12 +5268,23 @@ class IPCHandlers {
       }
 
       meetingLiveSpeakerActive = false;
-      meetingLiveSpeakerState = await liveSpeakerIdentifier.stop();
+      meetingLiveSpeakerBinding = null;
+      meetingLiveSpeakerState = await liveSpeakerRouter.stop(inputBinding.liveSpeakerScope);
       return meetingLiveSpeakerState;
     };
 
-    const startLiveSpeakerIdentification = async (win, systemAudioMode, micOnly = false) => {
-      await stopLiveSpeakerIdentification();
+    const startLiveSpeakerIdentification = async (
+      inputBinding,
+      win,
+      systemAudioMode,
+      micOnly = false
+    ) => {
+      await stopLiveSpeakerIdentification(meetingLiveSpeakerBinding);
+
+      const liveSpeakerScope = inputBinding?.liveSpeakerScope;
+      if (liveSpeakerScope === LIVE_SPEAKER_SCOPES.JARVIS) {
+        return liveSpeakerRouter.start(liveSpeakerScope, {});
+      }
 
       if ((!micOnly && systemAudioMode !== "native") || !liveSpeakerIdentifier.isAvailable()) {
         return false;
@@ -5280,8 +5298,8 @@ class IPCHandlers {
       meetingLiveSpeakerState = null;
       meetingLiveSpeakerStartedAt = Date.now();
       meetingSpeakerRemapper = createSpeakerRemapper(resolveSessionMaxSpeakers());
-      const started = await liveSpeakerIdentifier.start(
-        (identification) => {
+      const started = await liveSpeakerRouter.start(liveSpeakerScope, {
+        onSpeakerIdentified: (identification) => {
           if (!win || win.isDestroyed()) {
             return;
           }
@@ -5327,17 +5345,23 @@ class IPCHandlers {
             }
           }
         },
-        {
-          getSpeakerProfiles: getLiveSpeakerProfiles,
-          maxSpeakers: resolveSessionMaxSpeakers(),
-          enabled: true,
-        }
-      );
+        getSpeakerProfiles: getLiveSpeakerProfiles,
+        maxSpeakers: resolveSessionMaxSpeakers(),
+        enabled: true,
+      });
 
       if (started) {
         meetingLiveSpeakerActive = true;
+        meetingLiveSpeakerBinding = inputBinding;
         meetingReclusterTimer = setInterval(async () => {
-          if (!meetingLiveSpeakerActive || !win || win.isDestroyed()) return;
+          if (
+            !meetingLiveSpeakerActive ||
+            meetingLiveSpeakerBinding !== inputBinding ||
+            !win ||
+            win.isDestroyed()
+          ) {
+            return;
+          }
 
           const merges = await liveSpeakerIdentifier.recluster();
           if (!merges.length) return;
@@ -5670,7 +5694,7 @@ class IPCHandlers {
       }
     };
 
-    const resetMeetingLocalState = () => {
+    const resetMeetingLocalState = (inputBinding = meetingLiveSpeakerBinding) => {
       meetingLocalGeneration += 1;
       meetingLocalTranscriptionPromise = null;
       meetingPendingCorrectionPromises.clear();
@@ -5682,7 +5706,7 @@ class IPCHandlers {
         clearInterval(meetingReclusterTimer);
         meetingReclusterTimer = null;
       }
-      void stopLiveSpeakerIdentification();
+      void stopLiveSpeakerIdentification(inputBinding);
       meetingLiveSpeakerState = null;
       meetingLiveSpeakerStartedAt = null;
       meetingOneOnOneAttendee = null;
@@ -5852,8 +5876,8 @@ class IPCHandlers {
           await this.windowsLoopbackAudioManager.stop().catch(() => {});
         }
         await stopMeetingAec();
-        await stopLiveSpeakerIdentification().catch(() => {});
-        resetMeetingLocalState();
+        await stopLiveSpeakerIdentification(inputBinding).catch(() => {});
+        resetMeetingLocalState(inputBinding);
         await disconnectMeetingStreaming().catch(() => {});
       })();
       if (inputBinding) inputBinding.teardownPromise = teardownPromise;
@@ -6181,6 +6205,12 @@ class IPCHandlers {
           captureMode.micOnly || options.jarvisSessionId != null
             ? assertId(options.jarvisSessionId, "jarvisSessionId")
             : null;
+        Object.defineProperty(startInputBinding, "liveSpeakerScope", {
+          value: activeJarvisSessionId
+            ? LIVE_SPEAKER_SCOPES.JARVIS
+            : LIVE_SPEAKER_SCOPES.LEGACY_MEETING,
+          enumerable: true,
+        });
         if (activeJarvisSessionId && !this.jarvisService) {
           throw new Error("Jarvis capture service is unavailable");
         }
@@ -6214,14 +6244,20 @@ class IPCHandlers {
           }
           await startMeetingAec(systemAudioMode);
           assertMeetingTranscriptionStartCurrent();
-          await startLiveSpeakerIdentification(win, systemAudioMode, captureMode.micOnly);
+          await startLiveSpeakerIdentification(
+            startInputBinding,
+            win,
+            systemAudioMode,
+            captureMode.micOnly
+          );
           assertMeetingTranscriptionStartCurrent();
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,
             systemAudioMode,
             systemAudioStrategy,
             captureMode,
-            "during warm-start reuse"
+            "during warm-start reuse",
+            startInputBinding
           ));
           assertMeetingTranscriptionStartCurrent();
           return completeMeetingTranscriptionStart({
@@ -6244,6 +6280,7 @@ class IPCHandlers {
           meetingLocalTranscriptBySource = { mic: "", system: "" };
 
           await startLiveSpeakerIdentification(
+            startInputBinding,
             meetingLocalWin,
             systemAudioMode,
             captureMode.micOnly
@@ -6264,7 +6301,8 @@ class IPCHandlers {
             systemAudioMode,
             systemAudioStrategy,
             captureMode,
-            "in local meeting mode"
+            "in local meeting mode",
+            startInputBinding
           ));
           assertMeetingTranscriptionStartCurrent();
 
@@ -6289,7 +6327,12 @@ class IPCHandlers {
         await connectRealtimeStreaming(event, options, captureMode);
         assertMeetingTranscriptionStartCurrent();
         const realtimeWin = BrowserWindow.fromWebContents(event.sender);
-        await startLiveSpeakerIdentification(realtimeWin, systemAudioMode, captureMode.micOnly);
+        await startLiveSpeakerIdentification(
+          startInputBinding,
+          realtimeWin,
+          systemAudioMode,
+          captureMode.micOnly
+        );
         assertMeetingTranscriptionStartCurrent();
         await startMeetingAec(systemAudioMode);
         assertMeetingTranscriptionStartCurrent();
@@ -6298,7 +6341,8 @@ class IPCHandlers {
           systemAudioMode,
           systemAudioStrategy,
           captureMode,
-          "in realtime mode"
+          "in realtime mode",
+          startInputBinding
         ));
         assertMeetingTranscriptionStartCurrent();
         return completeMeetingTranscriptionStart({
@@ -6368,7 +6412,19 @@ class IPCHandlers {
         appendPcm: (sessionId, persistedSource, buffer) =>
           this.jarvisService.appendPcm(sessionId, persistedSource, buffer),
         afterPersist: (buffer, persistedSource) => {
+          const inputBinding = activeMeetingInputBinding;
           const derivedBuffer = activeJarvisSessionId ? Buffer.from(buffer) : buffer;
+          const routeLiveSpeakerAudio = () => {
+            const liveSpeakerScope = inputBinding?.liveSpeakerScope;
+            if (!liveSpeakerScope) return null;
+            if (
+              liveSpeakerScope === LIVE_SPEAKER_SCOPES.LEGACY_MEETING &&
+              (!meetingLiveSpeakerActive || meetingLiveSpeakerBinding !== inputBinding)
+            ) {
+              return null;
+            }
+            return liveSpeakerRouter.feed(liveSpeakerScope, derivedBuffer);
+          };
 
           if (persistedSource === "system") {
             const receivedAt = Date.now();
@@ -6378,11 +6434,7 @@ class IPCHandlers {
             }
             flushPendingMeetingMicChunks();
 
-            void liveSpeakerIdentifier.routeLegacyMeetingAudio({
-              jarvisSessionActive: Boolean(activeJarvisSessionId),
-              meetingLiveSpeakerActive,
-              pcmBuffer: derivedBuffer,
-            });
+            void routeLiveSpeakerAudio();
 
             writeMeetingDiarizationPcm(derivedBuffer, receivedAt);
             dispatchMeetingAudioBuffer(derivedBuffer, "system");
@@ -6391,11 +6443,7 @@ class IPCHandlers {
 
           if (persistedSource === "mic") {
             if (activeMeetingCaptureMode.micOnly) {
-              void liveSpeakerIdentifier.routeLegacyMeetingAudio({
-                jarvisSessionActive: Boolean(activeJarvisSessionId),
-                meetingLiveSpeakerActive,
-                pcmBuffer: derivedBuffer,
-              });
+              void routeLiveSpeakerAudio();
               writeMeetingDiarizationPcm(derivedBuffer, Date.now());
               dispatchMeetingAudioBuffer(derivedBuffer, "mic", { preserveExactInput: true });
               return true;
@@ -6936,7 +6984,7 @@ class IPCHandlers {
       inputBinding.currentManagedSystemProducer = producer;
     };
 
-    const fallBackToMicOnly = async (context) => {
+    const fallBackToMicOnly = async (context, inputBinding) => {
       if (this._meetingSystemStreaming?.isConnected) {
         await this._meetingSystemStreaming.disconnect().catch((disconnectError) => {
           debugLogger.debug(
@@ -6947,7 +6995,7 @@ class IPCHandlers {
         });
       }
       this._meetingSystemStreaming = null;
-      await stopLiveSpeakerIdentification().catch(() => {});
+      await stopLiveSpeakerIdentification(inputBinding).catch(() => {});
     };
 
     const startMeetingSystemAudio = async (
@@ -6955,7 +7003,8 @@ class IPCHandlers {
       systemAudioMode,
       systemAudioStrategy,
       captureMode,
-      context
+      context,
+      inputBinding
     ) => {
       if (captureMode.micOnly) {
         return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
@@ -6975,7 +7024,7 @@ class IPCHandlers {
             { error: error.message },
             "meeting"
           );
-          await fallBackToMicOnly("native");
+          await fallBackToMicOnly("native", inputBinding);
           return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
         }
       }
@@ -7017,7 +7066,7 @@ class IPCHandlers {
           { error: error.message },
           "meeting"
         );
-        await fallBackToMicOnly("PipeWire");
+        await fallBackToMicOnly("PipeWire", inputBinding);
         return { systemAudioMode: "unsupported", systemAudioStrategy: "unsupported" };
       }
     };
@@ -7058,7 +7107,9 @@ class IPCHandlers {
         flushPendingMeetingMicChunks(true);
         await stopMeetingAec();
 
-        const liveSpeakerState = await stopLiveSpeakerIdentification().catch(() => null);
+        const liveSpeakerState = await stopLiveSpeakerIdentification(stopInputBinding).catch(
+          () => null
+        );
 
         const diarizationSessionId = `diar-${Date.now()}`;
         const diarizationWin = meetingLocalWin || this.windowManager.controlPanelWindow;
@@ -7093,7 +7144,7 @@ class IPCHandlers {
           const sessionSpeakerConfigSnapshot = this.activeMeetingSpeakerConfig;
           const noteIdSnapshot = meetingNoteId;
           this.activeMeetingSpeakerConfig = null;
-          resetMeetingLocalState();
+          resetMeetingLocalState(stopInputBinding);
 
           // Fire-and-forget background diarization (or notify skip)
           this._startOrSkipDiarization(

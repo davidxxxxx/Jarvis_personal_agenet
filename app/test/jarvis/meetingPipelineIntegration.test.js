@@ -149,7 +149,7 @@ test("main routes exact mic and system PCM once before every derived consumer", 
     "processSystemBuffer",
     "processMeetingMicWithAec",
     "analyzeMicChunk",
-    "routeLegacyMeetingAudio",
+    "liveSpeakerRouter.feed",
     "writeMeetingDiarizationPcm",
     "dispatchMeetingAudioBuffer",
   ]) {
@@ -158,6 +158,25 @@ test("main routes exact mic and system PCM once before every derived consumer", 
       `${derivedConsumer} must be lexically contained after the evidence-first route`
     );
   }
+});
+
+test("meeting IPC has one live-speaker router and no direct lifecycle bypass", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+  const meetingSection = source.slice(
+    source.indexOf("let meetingTranscriptionStartInProgress"),
+    source.indexOf('ipcMain.handle("dictation-realtime-warmup"')
+  );
+
+  assert.match(source, /createLiveSpeakerRouter\(\{ identifier: liveSpeakerIdentifier \}\)/);
+  assert.match(meetingSection, /liveSpeakerScope/);
+  assert.match(meetingSection, /liveSpeakerRouter\.start\(/);
+  assert.match(meetingSection, /liveSpeakerRouter\.feed\(/);
+  assert.match(meetingSection, /liveSpeakerRouter\.stop\(/);
+  assert.doesNotMatch(
+    meetingSection,
+    /liveSpeakerIdentifier\.(?:start|feedAudio|stop)\(/,
+    "meeting IPC must not bypass the explicit scope router"
+  );
 });
 
 test("Jarvis local mode uses stable bilingual windows with PCM overlap and quality confidence", () => {

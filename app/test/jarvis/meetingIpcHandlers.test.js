@@ -62,6 +62,8 @@ function createFixture({
   aecAvailable = false,
   diarizationManager = null,
   speakerDiarizationEnabled = false,
+  liveSpeakerIdentifier = null,
+  nativeSystemAudio = false,
 } = {}) {
   const handles = new Map();
   const listeners = new Map();
@@ -149,6 +151,9 @@ function createFixture({
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
     if (request === "electron") return electron;
+    if (request === "./liveSpeakerIdentifier" && liveSpeakerIdentifier) {
+      return liveSpeakerIdentifier;
+    }
     if (request === "./meetingRecoveryLoop") {
       const recoveryModule = originalLoad.call(this, request, parent, isMain);
       return {
@@ -249,7 +254,9 @@ function createFixture({
     meetingDetectionEngine: {
       setUserRecording: (value) => detectionStates.push(value),
     },
-    audioTapManager: null,
+    audioTapManager: nativeSystemAudio
+      ? { ...windowsLoopbackAudioManager, isSupported: () => true }
+      : null,
     linuxPortalAudioManager: null,
     windowsLoopbackAudioManager,
     meetingAecManager,
@@ -298,6 +305,80 @@ function createFixture({
     },
   };
 }
+
+function createLiveSpeakerProbe() {
+  const lifecycle = [];
+  return {
+    lifecycle,
+    identifier: {
+      setDiarizationManager() {},
+      isAvailable: () => true,
+      start: async (options) => {
+        lifecycle.push(["start", options]);
+        return true;
+      },
+      feedAudio: async (buffer) => {
+        lifecycle.push(["feed", Buffer.from(buffer)]);
+      },
+      stop: async () => {
+        lifecycle.push(["stop"]);
+        return {};
+      },
+      recluster: async () => [],
+      getSpeakerEmbedding: () => null,
+      mapSpeaker: () => false,
+      setEnabled() {},
+      setMaxSpeakers() {},
+    },
+  };
+}
+
+test("Jarvis IPC start, dual-source send, and stop never touch the live identifier", async (t) => {
+  const probe = createLiveSpeakerProbe();
+  const fixture = createFixture({
+    liveSpeakerIdentifier: probe.identifier,
+    speakerDiarizationEnabled: true,
+    nativeSystemAudio: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-live-routing" }
+  );
+  send({ sender: fixture.sender }, Buffer.from([1, 2]), "mic", started.inputGeneration);
+  send({ sender: fixture.sender }, Buffer.from([3, 4]), "system", started.inputGeneration);
+  await stop();
+
+  assert.equal(started.success, true);
+  assert.deepEqual(probe.lifecycle, []);
+});
+
+test("legacy meeting IPC delegates live start, system feed, and stop", async (t) => {
+  const probe = createLiveSpeakerProbe();
+  const fixture = createFixture({
+    liveSpeakerIdentifier: probe.identifier,
+    speakerDiarizationEnabled: true,
+    nativeSystemAudio: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  const started = await start({ sender: fixture.sender }, { provider: "local" });
+  send({ sender: fixture.sender }, Buffer.from([5, 6]), "system", started.inputGeneration);
+  await stop();
+
+  assert.equal(started.success, true);
+  assert.deepEqual(
+    probe.lifecycle.map(([operation]) => operation),
+    ["start", "feed", "stop"]
+  );
+});
 
 test("midnight rebind keeps one live PCM producer writing into the next session", async (t) => {
   const persisted = [];

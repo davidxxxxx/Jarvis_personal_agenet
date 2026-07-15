@@ -792,21 +792,6 @@ class LiveSpeakerIdentifier {
   }
 }
 
-function routeLegacyMeetingAudio({
-  jarvisSessionActive,
-  meetingLiveSpeakerActive,
-  pcmBuffer,
-  feedAudio = null,
-} = {}) {
-  if (jarvisSessionActive === true || meetingLiveSpeakerActive !== true) return null;
-  const effectiveFeed = feedAudio ?? ((buffer) => instance.feedAudio(buffer));
-  if (typeof effectiveFeed !== "function") {
-    throw new TypeError("feedAudio must be a function or null");
-  }
-  return effectiveFeed(pcmBuffer);
-}
-
 const instance = new LiveSpeakerIdentifier();
 module.exports = instance;
 module.exports.LiveSpeakerIdentifier = LiveSpeakerIdentifier;
-module.exports.routeLegacyMeetingAudio = routeLegacyMeetingAudio;
