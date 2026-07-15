@@ -1430,9 +1430,52 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
   CREATE TRIGGER IF NOT EXISTS memory_items_v2_terminal_lifecycle
   BEFORE UPDATE OF lifecycle ON memory_items_v2
-  WHEN OLD.lifecycle <> 'active' AND NEW.lifecycle IS NOT OLD.lifecycle
+  WHEN NEW.lifecycle IS NOT OLD.lifecycle AND NOT (
+    (
+      OLD.lifecycle = 'active'
+      AND NEW.lifecycle IN ('conflict','superseded','dismissed')
+    )
+    OR (
+      OLD.lifecycle = 'conflict'
+      AND NEW.lifecycle = 'active'
+      AND EXISTS (
+        SELECT 1
+        FROM memory_conflict_groups AS conflict
+        WHERE conflict.slot_key = OLD.canonical_slot_key
+          AND conflict.state = 'resolved'
+          AND conflict.selected_member_id = OLD.id
+          AND conflict.episode = (
+            SELECT MAX(latest.episode)
+            FROM memory_conflict_groups AS latest
+            WHERE latest.slot_key = OLD.canonical_slot_key
+          )
+      )
+    )
+    OR (
+      OLD.lifecycle = 'conflict'
+      AND NEW.lifecycle = 'superseded'
+      AND EXISTS (
+        SELECT 1
+        FROM memory_conflict_groups AS conflict
+        JOIN memory_conflict_members AS member
+          ON member.group_id = conflict.id AND member.memory_item_id = OLD.id
+        JOIN memory_supersessions AS supersession
+          ON supersession.previous_id = OLD.id
+          AND supersession.next_id = conflict.selected_member_id
+          AND supersession.reason = 'conflict_resolution'
+        WHERE conflict.slot_key = OLD.canonical_slot_key
+          AND conflict.state = 'resolved'
+          AND conflict.selected_member_id <> OLD.id
+          AND conflict.episode = (
+            SELECT MAX(latest.episode)
+            FROM memory_conflict_groups AS latest
+            WHERE latest.slot_key = OLD.canonical_slot_key
+          )
+      )
+    )
+  )
   BEGIN
-    SELECT RAISE(ABORT, 'memory item lifecycle is terminal');
+    SELECT RAISE(ABORT, 'memory item lifecycle transition is invalid');
   END;
   CREATE TRIGGER IF NOT EXISTS topics_v2_immutable_content
   BEFORE UPDATE OF id, canonical_key, name, canonical_algorithm, created_at ON topics_v2

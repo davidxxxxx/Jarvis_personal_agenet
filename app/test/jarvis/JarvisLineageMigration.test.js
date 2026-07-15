@@ -1410,6 +1410,186 @@ test("occurrences are idempotent per input and revisions must belong to their ca
   }
 });
 
+test("resolved conflict membership authorizes only the selected and superseded lifecycle outcomes", () => {
+  const db = createPreviousVersionDatabase();
+  try {
+    seedCaptureLineage(db);
+    db.exec(`
+      INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+      VALUES ('person-1', 'Local', 1, 1000, 5000);
+    `);
+    applyJarvisMigrations(db);
+    seedAnalysisInput(db);
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+        lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+      ) VALUES
+        ('memory-selected', 'fact', '${HASH_A}', '${HASH_B}', 'Selected', 'Selected', 0.9,
+         'conflict', 'input-1', 'evidence_linked', 6000, 6000),
+        ('memory-loser', 'fact', '${HASH_A}', '${HASH_C}', 'Loser', 'Loser', 0.8,
+         'conflict', 'input-1', 'evidence_linked', 6000, 6000),
+        ('memory-dismissed', 'fact', '${HASH_A}', '${HASH_D}', 'Dismissed', 'Dismissed', 0.7,
+         'dismissed', 'input-1', 'evidence_linked', 6000, 6000);
+      INSERT INTO memory_conflict_groups (
+        id, slot_key, episode, state, created_at, updated_at
+      ) VALUES ('conflict-lifecycle-1', '${HASH_A}', 1, 'open', 6000, 6000);
+      INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at) VALUES
+        ('conflict-lifecycle-1', 'memory-selected', 6000),
+        ('conflict-lifecycle-1', 'memory-loser', 6000);
+    `);
+
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'active' WHERE id = 'memory-selected'")
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'superseded' WHERE id = 'memory-loser'")
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'dismissed' WHERE id = 'memory-loser'")
+          .run(),
+      /memory item lifecycle/
+    );
+
+    db.exec(`
+      UPDATE memory_conflict_groups
+      SET state = 'resolved', selected_member_id = 'memory-selected',
+          resolved_at = 7000, updated_at = 7000
+      WHERE id = 'conflict-lifecycle-1';
+    `);
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'active' WHERE id = 'memory-loser'")
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            "UPDATE memory_items_v2 SET lifecycle = 'superseded' WHERE id = 'memory-selected'"
+          )
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.equal(
+      db
+        .prepare(
+          "UPDATE memory_items_v2 SET lifecycle = 'active', updated_at = 7000 WHERE id = 'memory-selected'"
+        )
+        .run().changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'superseded' WHERE id = 'memory-loser'")
+          .run(),
+      /memory item lifecycle/
+    );
+
+    db.exec(`
+      INSERT INTO memory_supersessions (
+        previous_id, next_id, reason, analysis_input_id, created_at
+      ) VALUES (
+        'memory-loser', 'memory-selected', 'conflict_resolution', 'input-1', 7000
+      );
+    `);
+    assert.equal(
+      db
+        .prepare(
+          "UPDATE memory_items_v2 SET lifecycle = 'superseded', updated_at = 7000 WHERE id = 'memory-loser'"
+        )
+        .run().changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'active' WHERE id = 'memory-loser'")
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'active' WHERE id = 'memory-dismissed'")
+          .run(),
+      /memory item lifecycle/
+    );
+
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+        lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+      ) VALUES (
+        'memory-challenger', 'fact', '${HASH_A}', '${HASH_E}', 'Challenger', 'Challenger', 0.85,
+        'conflict', 'input-1', 'evidence_linked', 8000, 8000
+      );
+      INSERT INTO memory_conflict_groups (
+        id, slot_key, episode, state, created_at, updated_at
+      ) VALUES ('conflict-lifecycle-2', '${HASH_A}', 2, 'open', 8000, 8000);
+      INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at) VALUES
+        ('conflict-lifecycle-2', 'memory-selected', 8000),
+        ('conflict-lifecycle-2', 'memory-challenger', 8000);
+    `);
+    assert.equal(
+      db
+        .prepare(
+          "UPDATE memory_items_v2 SET lifecycle = 'conflict', updated_at = 8000 WHERE id = 'memory-selected'"
+        )
+        .run().changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_items_v2 SET lifecycle = 'active' WHERE id = 'memory-selected'")
+          .run(),
+      /memory item lifecycle/
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, episode, state, selected_member_id, resolved_at
+           FROM memory_conflict_groups
+           WHERE slot_key = ?
+           ORDER BY episode`
+        )
+        .all(HASH_A),
+      [
+        {
+          id: "conflict-lifecycle-1",
+          episode: 1,
+          state: "resolved",
+          selected_member_id: "memory-selected",
+          resolved_at: 7000,
+        },
+        {
+          id: "conflict-lifecycle-2",
+          episode: 2,
+          state: "open",
+          selected_member_id: null,
+          resolved_at: null,
+        },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("conflicts, recurrences, acceptances, and topic merges preserve explicit durable relations", () => {
   const db = createPreviousVersionDatabase();
   try {
