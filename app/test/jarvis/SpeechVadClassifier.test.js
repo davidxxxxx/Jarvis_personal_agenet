@@ -331,6 +331,42 @@ test("detailed classification preserves per-window probabilities and clears its 
   await classifier.stop();
 });
 
+test("Silero runtime clears cloned PCM when the model is unloaded or stream id is invalid", async (t) => {
+  const ort = {
+    Tensor: class Tensor {},
+    InferenceSession: {
+      create: async () => ({ inputNames: ["input"], outputNames: ["output"] }),
+    },
+  };
+  const runtime = new SileroVadRuntime({ ort });
+  await t.test("model unloaded", async () => {
+    const samplesBuffer = new ArrayBuffer(1_536);
+    new Uint8Array(samplesBuffer).fill(7);
+    await assert.rejects(
+      runtime.classify({ streamId: "valid", sampleRate: 24_000, samplesBuffer }),
+      /not loaded/
+    );
+    assert.equal(
+      new Uint8Array(samplesBuffer).every((value) => value === 0),
+      true
+    );
+  });
+
+  await runtime.load("vad.onnx");
+  await t.test("invalid stream", async () => {
+    const samplesBuffer = new ArrayBuffer(1_536);
+    new Uint8Array(samplesBuffer).fill(7);
+    await assert.rejects(
+      runtime.classify({ streamId: "", sampleRate: 24_000, samplesBuffer }),
+      /streamId/
+    );
+    assert.equal(
+      new Uint8Array(samplesBuffer).every((value) => value === 0),
+      true
+    );
+  });
+});
+
 test("stop prevents an in-flight initialize from restoring ready state", async () => {
   const loading = deferred();
   const workerClient = {

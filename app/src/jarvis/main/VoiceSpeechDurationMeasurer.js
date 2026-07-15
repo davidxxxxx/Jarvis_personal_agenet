@@ -3,6 +3,27 @@ const VAD_WINDOW_MS = 32;
 const VAD_WINDOW_SAMPLES = (VAD_SAMPLE_RATE * VAD_WINDOW_MS) / 1_000;
 const SPEECH_THRESHOLD = 0.5;
 
+function pcm16FromSamples(samples, startSample, sampleCount) {
+  const pcm = Buffer.alloc(sampleCount * Int16Array.BYTES_PER_ELEMENT);
+  for (let index = 0; index < sampleCount; index += 1) {
+    const value = Math.max(-1, Math.min(1, samples[startSample + index]));
+    const int16 = value < 0 ? Math.round(value * 32_768) : Math.round(value * 32_767);
+    pcm.writeInt16LE(int16, index * Int16Array.BYTES_PER_ELEMENT);
+  }
+  return pcm;
+}
+
+function validateDetails(details, expectedWindows) {
+  if (
+    details?.windowCount !== expectedWindows ||
+    !Array.isArray(details?.probabilities) ||
+    details.probabilities.length !== expectedWindows
+  ) {
+    throw new Error("Silero detailed VAD result does not match the enrollment window");
+  }
+  return details.probabilities;
+}
+
 class VoiceSpeechDurationMeasurer {
   constructor({ classifier, speechThreshold = SPEECH_THRESHOLD }) {
     if (
@@ -34,6 +55,9 @@ class VoiceSpeechDurationMeasurer {
     if (sampleRate !== VAD_SAMPLE_RATE || !(samples instanceof Float32Array)) {
       throw new TypeError("voice speech measurement requires 24 kHz Float32 PCM");
     }
+    if (samples.length < VAD_WINDOW_SAMPLES) {
+      throw new RangeError("voice speech measurement requires at least one VAD window");
+    }
     if (typeof this.classifier.isReady === "function" && !this.classifier.isReady()) {
       if (typeof this.classifier.initialize !== "function") {
         throw new Error("Silero VAD is unavailable");
@@ -41,43 +65,64 @@ class VoiceSpeechDurationMeasurer {
       await this.classifier.initialize();
     }
 
-    const frameCount = Math.ceil(samples.length / VAD_WINDOW_SAMPLES);
-    const pcm = Buffer.alloc(frameCount * VAD_WINDOW_SAMPLES * Int16Array.BYTES_PER_ELEMENT);
-    const streamId = `${sessionId}:voice-enrollment:${windowIndex}`;
+    const fullWindowCount = Math.floor(samples.length / VAD_WINDOW_SAMPLES);
+    const fullSampleCount = fullWindowCount * VAD_WINDOW_SAMPLES;
+    const tailSampleCount = samples.length - fullSampleCount;
+    const mainPcm = pcm16FromSamples(samples, 0, fullSampleCount);
+    const tailPcm =
+      tailSampleCount > 0
+        ? pcm16FromSamples(samples, samples.length - VAD_WINDOW_SAMPLES, VAD_WINDOW_SAMPLES)
+        : null;
+    const streamPrefix = `${sessionId}:voice-enrollment:${windowIndex}`;
+    const mainStreamId = `${streamPrefix}:main`;
+    const tailStreamId = `${streamPrefix}:tail`;
+    let operationError = null;
+    let speechMs = 0;
+    let resetErrors = [];
     try {
-      for (let index = 0; index < samples.length; index += 1) {
-        const value = Math.max(-1, Math.min(1, samples[index]));
-        const int16 = value < 0 ? Math.round(value * 32_768) : Math.round(value * 32_767);
-        pcm.writeInt16LE(int16, index * Int16Array.BYTES_PER_ELEMENT);
-      }
-      const details = await this.classifier.classifyDetailed({
+      const mainDetails = await this.classifier.classifyDetailed({
         sessionId,
         sourceType: "mic",
-        streamId,
+        streamId: mainStreamId,
         sampleRate,
-        pcm,
+        pcm: mainPcm,
       });
-      if (
-        details?.windowCount !== frameCount ||
-        !Array.isArray(details?.probabilities) ||
-        details.probabilities.length !== frameCount
-      ) {
-        throw new Error("Silero detailed VAD result does not match the enrollment window");
+      const mainProbabilities = validateDetails(mainDetails, fullWindowCount);
+      speechMs =
+        mainProbabilities.filter((probability) => probability >= this.speechThreshold).length *
+        VAD_WINDOW_MS;
+
+      if (tailPcm) {
+        const tailDetails = await this.classifier.classifyDetailed({
+          sessionId,
+          sourceType: "mic",
+          streamId: tailStreamId,
+          sampleRate,
+          pcm: tailPcm,
+        });
+        const [tailProbability] = validateDetails(tailDetails, 1);
+        if (tailProbability >= this.speechThreshold) {
+          speechMs += Math.round((tailSampleCount * 1_000) / sampleRate);
+        }
       }
-      let speechMs = 0;
-      for (let index = 0; index < frameCount; index += 1) {
-        if (details.probabilities[index] < this.speechThreshold) continue;
-        const actualSamples = Math.min(
-          VAD_WINDOW_SAMPLES,
-          samples.length - index * VAD_WINDOW_SAMPLES
-        );
-        speechMs += Math.round((actualSamples * 1_000) / sampleRate);
-      }
-      return speechMs;
+    } catch (error) {
+      operationError = error;
     } finally {
-      pcm.fill(0);
-      await this.classifier.reset(streamId);
+      mainPcm.fill(0);
+      tailPcm?.fill(0);
+      const resetResults = await Promise.allSettled([
+        Promise.resolve().then(() => this.classifier.reset(mainStreamId)),
+        ...(tailPcm ? [Promise.resolve().then(() => this.classifier.reset(tailStreamId))] : []),
+      ]);
+      resetErrors = resetResults
+        .filter((reset) => reset.status === "rejected")
+        .map((reset) => reset.reason);
     }
+    if (operationError !== null) throw operationError;
+    if (resetErrors.length > 0) {
+      throw new AggregateError(resetErrors, "voice enrollment VAD stream reset failed");
+    }
+    return speechMs;
   }
 }
 

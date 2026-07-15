@@ -2,6 +2,7 @@ const WINDOW_SIZE = 512;
 const TARGET_SAMPLE_RATE = 16_000;
 const DEFAULT_STATE_SHAPE = Object.freeze([2, 1, 64]);
 const DEFAULT_MAX_STREAMS = 64;
+const { zeroSamplesBuffer } = require("./WorkerPcmBufferGuard");
 
 function normalizeShape(shape) {
   if (!Array.isArray(shape) || shape.length === 0) return [...DEFAULT_STATE_SHAPE];
@@ -195,10 +196,12 @@ class SileroVadRuntime {
     return this._enqueue(() => this._classify({ sessionId, streamId, samplesBuffer, sampleRate }));
   }
 
-  async _classify({ sessionId = null, streamId, samplesBuffer, sampleRate }) {
-    if (!this.session) throw new Error("VAD session not loaded");
-    this._assertStreamId(streamId);
+  async _classify(input) {
+    const samplesBuffer = input?.samplesBuffer;
     try {
+      const { sessionId = null, streamId, sampleRate } = input || {};
+      if (!this.session) throw new Error("VAD session not loaded");
+      this._assertStreamId(streamId);
       const stream = this._stream(streamId, sessionId);
       const converted = pcm16To16kFloat32(samplesBuffer, sampleRate);
       const previousRemainder = stream.remainder;
@@ -222,7 +225,7 @@ class SileroVadRuntime {
       }
       return { probability, windowCount: probabilities.length, probabilities };
     } finally {
-      new Uint8Array(samplesBuffer).fill(0);
+      zeroSamplesBuffer(samplesBuffer);
     }
   }
 
