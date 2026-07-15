@@ -60,6 +60,10 @@ function createHarness({ initialState = activeState(), resumeFailure = null } = 
       state.sessionId = resumeToken.sessionId;
       return structuredClone(state);
     },
+    confirmPowerRestorations(resumeToken, restorations, at) {
+      calls.push(["confirm-restorations", resumeToken.sessionId, restorations, at]);
+      return structuredClone(state);
+    },
     rotateAtLocalDate(input) {
       calls.push(["rotate", input]);
       state = { ...state, sessionId: input.newSessionId, status: "recording" };
@@ -94,7 +98,13 @@ function createHarness({ initialState = activeState(), resumeFailure = null } = 
         mic: { deviceId: "physical-mic", deviceLabel: "MV7", strategy: "physical" },
       };
     },
-    resumeUpstream: async (resumeToken) => calls.push(["resume-upstream", resumeToken.sessionId]),
+    resumeUpstream: async (resumeToken) => {
+      calls.push(["resume-upstream", resumeToken.sessionId]);
+      return null;
+    },
+    rebindPcmSession: (previousSessionId, nextSessionId) =>
+      calls.push(["rebind-pcm", previousSessionId, nextSessionId]),
+    rotateUpstream: async (rotation) => calls.push(["rotate-upstream", rotation]),
     ensureGpuReady: async () => calls.push(["gpu-ready"]),
     localDateKey: (at) => (at < 2_000 ? "2026-07-14" : "2026-07-15"),
     createSessionId: () => "session-day-2",
@@ -252,6 +262,25 @@ test("suspend still releases Whisper when the processing join reports failure", 
   assert.equal(lifecycle.getResumeToken().sessionId, "session-day-1");
 });
 
+test("wake retries after a rejected processing join instead of inheriting a poisoned quiesce", async () => {
+  const { lifecycle, processing, calls, getState } = createHarness();
+  processing.stop = async () => {
+    calls.push(["processing-stop"]);
+    throw new Error("processing join failed");
+  };
+
+  await assert.rejects(lifecycle.onSuspend(1_500), /processing join failed/);
+  assert.equal(getState().status, "paused");
+
+  const resumed = await lifecycle.onResume(1_700);
+
+  assert.equal(resumed.resumed, true);
+  assert.equal(getState().status, "recording");
+  assert.equal(calls.filter(([name]) => name === "release-whisper").length, 1);
+  assert.equal(calls.filter(([name]) => name === "resume-devices").length, 1);
+  assert.equal(calls.filter(([name]) => name === "processing-start").length, 1);
+});
+
 test("resume re-enumerates devices, keeps the same session, and only then restarts processing", async () => {
   const { lifecycle, calls, getState } = createHarness();
   await lifecycle.onSuspend(1_500);
@@ -269,9 +298,38 @@ test("resume re-enumerates devices, keeps the same session, and only then restar
       1_700,
     ],
     ["resume-upstream", "session-day-1"],
+    [
+      "confirm-restorations",
+      "session-day-1",
+      { mic: { deviceId: "physical-mic", deviceLabel: "MV7", strategy: "physical" } },
+      1_700,
+    ],
     ["gpu-ready"],
     ["processing-start"],
   ]);
+});
+
+test("wake drives the selected restoration upstream and persists the actual binding", async () => {
+  const { lifecycle, calls } = createHarness();
+  lifecycle.resumeUpstream = async (resumeToken) => {
+    calls.push(["resume-upstream", resumeToken.sessionId, resumeToken.restorations]);
+    return {
+      mic: { deviceId: "actual-mic", deviceLabel: "Actual MV7", strategy: "physical" },
+      system: { deviceId: null, deviceLabel: "System", strategy: "wasapi-loopback" },
+    };
+  };
+
+  await lifecycle.onSuspend(1_500);
+  await lifecycle.onResume(1_700);
+
+  const upstream = calls.find(([name]) => name === "resume-upstream");
+  assert.equal(upstream[2].mic.deviceId, "physical-mic");
+  const confirmed = calls.find(([name]) => name === "confirm-restorations");
+  assert.equal(confirmed[2].mic.deviceId, "actual-mic");
+  assert.ok(
+    calls.findIndex(([name]) => name === "resume-upstream") <
+      calls.findIndex(([name]) => name === "confirm-restorations")
+  );
 });
 
 test("renderer power handshake waits for fresh device metadata and upstream acknowledgement", async () => {
@@ -449,6 +507,65 @@ test("duplicate and repeated local-date callbacks return the same destination", 
 
   assert.equal(new Set(results.map((result) => result.sessionId)).size, 1);
   assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
+  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 1);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 1);
+});
+
+test("local midnight rebinds PCM before awaiting renderer persistence rotation", async () => {
+  const { lifecycle, calls } = createHarness();
+  const renderer = deferred();
+  lifecycle.rotateUpstream = async (rotation) => {
+    calls.push(["rotate-upstream", rotation]);
+    await renderer.promise;
+  };
+
+  const rotating = lifecycle.onLocalDateChange(2_000);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(
+    calls.filter(([name]) => ["rotate", "rebind-pcm", "rotate-upstream"].includes(name)),
+    [
+      [
+        "rotate",
+        {
+          sessionId: "session-day-1",
+          newSessionId: "session-day-2",
+          localDate: "2026-07-15",
+          at: 2_000,
+        },
+      ],
+      ["rebind-pcm", "session-day-1", "session-day-2"],
+      [
+        "rotate-upstream",
+        {
+          previousSessionId: "session-day-1",
+          sessionId: "session-day-2",
+          startedAt: 2_000,
+          localDate: "2026-07-15",
+        },
+      ],
+    ]
+  );
+  renderer.resolve();
+  await rotating;
+});
+
+test("a failed renderer midnight switch retries without rotating or rebinding PCM twice", async () => {
+  const { lifecycle, calls } = createHarness();
+  let attempts = 0;
+  lifecycle.rotateUpstream = async (rotation) => {
+    attempts += 1;
+    calls.push(["rotate-upstream", rotation]);
+    if (attempts === 1) throw new Error("renderer persistence unavailable");
+  };
+
+  await assert.rejects(lifecycle.onLocalDateChange(2_000), /renderer persistence unavailable/);
+  const result = await lifecycle.onLocalDateChange(2_100);
+
+  assert.equal(result.sessionId, "session-day-2");
+  assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
+  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 1);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 2);
 });
 
 test("idle local-date changes never start capture", async () => {
@@ -507,6 +624,124 @@ test("real suspend persists one system gap per active source and resume closes b
       [
         ["mic", 3_000, "physical-mic-2"],
         ["system", 3_000, null],
+      ]
+    );
+  } finally {
+    runtime.close();
+  }
+});
+
+test("actual wake bindings replace preselected metadata in durable suspend gaps", () => {
+  const runtime = createRealCapture();
+  try {
+    const suspended = runtime.service.suspendForPower(2_000);
+    runtime.service.resumeAfterPower(
+      suspended.resumeToken,
+      {
+        mic: { deviceId: "desired-mic", deviceLabel: "Desired", strategy: "physical" },
+        system: { deviceId: null, deviceLabel: "System", strategy: "wasapi-loopback" },
+      },
+      3_000
+    );
+
+    const confirmed = runtime.service.confirmPowerRestorations(
+      suspended.resumeToken,
+      {
+        mic: { deviceId: "actual-mic", deviceLabel: "Actual MV7", strategy: "physical" },
+        system: {
+          deviceId: "actual-loopback",
+          deviceLabel: "Actual speakers",
+          strategy: "wasapi-loopback",
+        },
+      },
+      3_000
+    );
+    const gaps = runtime.repository.db
+      .prepare(
+        `SELECT track.source_type, gap.restored_device_id, gap.restored_device_label
+         FROM audio_gaps gap JOIN audio_tracks track ON track.id = gap.track_id
+         WHERE track.session_id = ? ORDER BY track.source_type`
+      )
+      .all("session-day-1");
+
+    assert.equal(confirmed.sources.mic.deviceId, "actual-mic");
+    assert.equal(confirmed.sources.system.deviceId, "actual-loopback");
+    assert.deepEqual(
+      gaps.map((gap) => [gap.source_type, gap.restored_device_id, gap.restored_device_label]),
+      [
+        ["mic", "actual-mic", "Actual MV7"],
+        ["system", "actual-loopback", "Actual speakers"],
+      ]
+    );
+  } finally {
+    runtime.close();
+  }
+});
+
+test("power wake restores a dual session whose tracks were already reconnecting", () => {
+  const runtime = createRealCapture();
+  try {
+    runtime.service.sourceInterrupted("session-day-1", "mic", {
+      at: 1_500,
+      reason: "device-change",
+    });
+    runtime.service.sourceInterrupted("session-day-1", "system", {
+      at: 1_600,
+      reason: "device-change",
+    });
+
+    const suspended = runtime.service.suspendForPower(2_000);
+    assert.equal(suspended.state.status, "paused");
+    assert.equal(suspended.state.sources.mic.state, "reconnecting");
+    assert.equal(suspended.state.sources.system.state, "reconnecting");
+
+    const resumed = runtime.service.resumeAfterPower(
+      suspended.resumeToken,
+      {
+        mic: { deviceId: "physical-mic-2", deviceLabel: "MV7", strategy: "physical" },
+        system: {
+          deviceId: "loopback-2",
+          deviceLabel: "Speakers",
+          strategy: "wasapi-loopback",
+        },
+      },
+      3_000
+    );
+
+    assert.equal(resumed.sessionId, "session-day-1");
+    assert.equal(resumed.status, "recording");
+    assert.equal(resumed.sources.mic.state, "active");
+    assert.equal(resumed.sources.system.state, "active");
+    assert.equal(
+      runtime.service.appendPcm("session-day-1", "mic", Buffer.alloc(24_000 * 2, 1)),
+      true
+    );
+    assert.equal(
+      runtime.service.appendPcm("session-day-1", "system", Buffer.alloc(24_000 * 2, 2)),
+      true
+    );
+
+    const evidence = runtime.repository.db
+      .prepare(
+        `SELECT track.source_type, track.state, gap.reason, gap.ended_at,
+                gap.restored_device_id
+         FROM audio_tracks track
+         JOIN audio_gaps gap ON gap.track_id = track.id
+         WHERE track.session_id = ?
+         ORDER BY track.source_type`
+      )
+      .all("session-day-1");
+    assert.deepEqual(
+      evidence.map((row) => [
+        row.source_type,
+        row.state,
+        row.reason,
+        row.ended_at,
+        row.restored_device_id,
+      ]),
+      [
+        ["mic", "active", "device-change", 3_000, "physical-mic-2"],
+        ["system", "active", "device-change", 3_000, "loopback-2"],
       ]
     );
   } finally {

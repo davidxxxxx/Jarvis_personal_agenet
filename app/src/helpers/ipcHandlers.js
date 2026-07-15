@@ -802,6 +802,13 @@ class IPCHandlers {
     return { token, environment, tenant };
   }
 
+  rebindJarvisSession(previousSessionId, nextSessionId) {
+    if (typeof this._rebindJarvisSession !== "function") {
+      throw new Error("Jarvis PCM router is not initialized");
+    }
+    return this._rebindJarvisSession(previousSessionId, nextSessionId);
+  }
+
   setupHandlers() {
     ipcMain.handle("window-minimize", () => {
       if (this.windowManager.controlPanelWindow) {
@@ -4894,6 +4901,16 @@ class IPCHandlers {
     let activeMeetingCaptureMode = resolveMeetingCaptureMode();
     let activeJarvisSessionId = null;
     let activeMeetingInputBinding = null;
+    this._rebindJarvisSession = (previousSessionId, nextSessionId) => {
+      const previous = assertId(previousSessionId, "previousSessionId");
+      const next = assertId(nextSessionId, "nextSessionId");
+      if (activeJarvisSessionId === next) return { rebound: false, sessionId: next };
+      if (activeJarvisSessionId !== previous) {
+        throw new Error("active Jarvis PCM session does not match the midnight source");
+      }
+      activeJarvisSessionId = next;
+      return { rebound: true, sessionId: next };
+    };
 
     const clearActiveMeetingInputBinding = (inputBinding = activeMeetingInputBinding) => {
       if (activeMeetingInputBinding !== inputBinding) return false;

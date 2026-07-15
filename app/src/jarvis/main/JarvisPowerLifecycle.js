@@ -40,7 +40,7 @@ class RendererPowerResumeHandshake {
   }
 
   request(kind, token) {
-    if (!new Set(["suspend", "enumerate", "resume"]).has(kind)) {
+    if (!new Set(["suspend", "enumerate", "resume", "rotate"]).has(kind)) {
       return Promise.reject(new TypeError("unsupported renderer power recovery kind"));
     }
     if (!token || typeof token !== "object" || typeof token.sessionId !== "string") {
@@ -101,6 +101,8 @@ class JarvisPowerLifecycle {
     suspendUpstream,
     resumeDevices,
     resumeUpstream,
+    rebindPcmSession,
+    rotateUpstream,
     ensureGpuReady,
     localDateKey = defaultLocalDateKey,
     createSessionId,
@@ -111,6 +113,7 @@ class JarvisPowerLifecycle {
       "getState",
       "suspendForPower",
       "resumeAfterPower",
+      "confirmPowerRestorations",
       "rotateAtLocalDate",
       "recoverOpenSessions",
     ]) {
@@ -123,6 +126,8 @@ class JarvisPowerLifecycle {
     this.suspendUpstream = requiredFunction(suspendUpstream, "suspendUpstream");
     this.resumeDevices = requiredFunction(resumeDevices, "resumeDevices");
     this.resumeUpstream = requiredFunction(resumeUpstream, "resumeUpstream");
+    this.rebindPcmSession = requiredFunction(rebindPcmSession, "rebindPcmSession");
+    this.rotateUpstream = requiredFunction(rotateUpstream, "rotateUpstream");
     this.ensureGpuReady = requiredFunction(ensureGpuReady, "ensureGpuReady");
     this.localDateKey = requiredFunction(localDateKey, "localDateKey");
     this.createSessionId = requiredFunction(createSessionId, "createSessionId");
@@ -130,6 +135,7 @@ class JarvisPowerLifecycle {
     this.resumeToken = null;
     this.observedLocalDate = null;
     this.rotationsByLocalDate = new Map();
+    this.pendingRotationsByLocalDate = new Map();
     this.inFlight = new Map();
     this.runtimeQuiesce = Promise.resolve();
     this.upstreamQuiesce = Promise.resolve();
@@ -163,18 +169,19 @@ class JarvisPowerLifecycle {
       () => undefined,
       () => undefined
     );
-    this.runtimeQuiesce = (async () => {
+    const runtimeWork = (async () => {
       try {
         await this.processingLifecycle.stop();
       } finally {
         await this.releaseWhisper();
       }
     })();
+    this.runtimeQuiesce = runtimeWork.then(
+      () => undefined,
+      () => undefined
+    );
     const pending = (async () => {
-      const [upstreamResult, runtimeResult] = await Promise.allSettled([
-        upstreamWork,
-        this.runtimeQuiesce,
-      ]);
+      const [upstreamResult, runtimeResult] = await Promise.allSettled([upstreamWork, runtimeWork]);
       const upstreamError = upstreamResult.status === "rejected" ? upstreamResult.reason : null;
       const runtimeError = runtimeResult.status === "rejected" ? runtimeResult.reason : null;
       if (captureError) {
@@ -209,7 +216,11 @@ class JarvisPowerLifecycle {
       let state;
       try {
         state = this.service.resumeAfterPower(token, restoration, at);
-        await this.resumeUpstream(structuredClone(token));
+        const actualRestorations = await this.resumeUpstream({
+          ...structuredClone(token),
+          restorations: structuredClone(restoration),
+        });
+        state = this.service.confirmPowerRestorations(token, actualRestorations ?? restoration, at);
         await this.ensureGpuReady();
         this.processingLifecycle.start();
       } catch (error) {
@@ -265,6 +276,10 @@ class JarvisPowerLifecycle {
       this.observedLocalDate = localDate;
       const existing = this.rotationsByLocalDate.get(localDate);
       if (existing) return existing;
+      const pendingRotation = this.pendingRotationsByLocalDate.get(localDate);
+      if (pendingRotation) {
+        return this._completeLocalDateRotation(localDate, pendingRotation);
+      }
       const state = this.service.getState();
       if (!["recording", "degraded"].includes(state.status) || !state.sessionId) {
         return { rotated: false, localDate, ...state };
@@ -275,16 +290,41 @@ class JarvisPowerLifecycle {
       if (sessionLocalDate === null || sessionLocalDate === localDate) {
         return { rotated: false, localDate, ...state };
       }
-      const result = await this.service.rotateAtLocalDate({
+      const rotationWork = this.service.rotateAtLocalDate({
         sessionId: state.sessionId,
         newSessionId: this.createSessionId(),
         localDate,
         at: now,
       });
-      const rotation = { rotated: true, ...result };
-      this.rotationsByLocalDate.set(localDate, rotation);
-      return rotation;
+      const result =
+        rotationWork && typeof rotationWork.then === "function" ? await rotationWork : rotationWork;
+      const pending = {
+        result,
+        pcmRebound: false,
+        upstream: {
+          previousSessionId: state.sessionId,
+          sessionId: result.sessionId,
+          startedAt: now,
+          localDate,
+        },
+      };
+      this.pendingRotationsByLocalDate.set(localDate, pending);
+      return this._completeLocalDateRotation(localDate, pending);
     });
+  }
+
+  async _completeLocalDateRotation(localDate, pending) {
+    if (!pending.pcmRebound) {
+      this.rebindPcmSession(pending.upstream.previousSessionId, pending.upstream.sessionId);
+      pending.pcmRebound = true;
+    }
+    await this.rotateUpstream(structuredClone(pending.upstream));
+    const rotation = { rotated: true, ...pending.result };
+    this.rotationsByLocalDate.set(localDate, rotation);
+    if (this.pendingRotationsByLocalDate.get(localDate) === pending) {
+      this.pendingRotationsByLocalDate.delete(localDate);
+    }
+    return rotation;
   }
 
   _singleFlight(key, operation) {

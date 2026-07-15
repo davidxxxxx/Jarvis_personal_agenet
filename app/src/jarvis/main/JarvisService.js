@@ -805,6 +805,38 @@ class JarvisService {
     return this.resumeCapture(token.sessionId, at, restorations);
   }
 
+  confirmPowerRestorations(token, restorations = {}, at = this.now()) {
+    this._assertOpen();
+    this._assertTime(at, "at");
+    if (!token || typeof token !== "object" || token.sessionId !== this.state.sessionId) {
+      throw new Error("power resume token does not match the active session");
+    }
+    this._assertActive(token.sessionId, ["recording", "degraded"]);
+    if (typeof this.repository.confirmPowerRestorations !== "function") {
+      throw new TypeError("repository.confirmPowerRestorations must be a function");
+    }
+    const sources = Object.values(this.state.sources).map((source) => {
+      const tokenSource = token.sources?.[source.sourceType];
+      const gapId = tokenSource?.powerSuspendGapId ?? tokenSource?.gapId ?? null;
+      const restored = normalizeSource({
+        ...(restorations[source.sourceType] ?? source),
+        sourceType: source.sourceType,
+      });
+      return { trackId: source.trackId, gapId, restoration: restored };
+    });
+    this.repository.confirmPowerRestorations({
+      sessionId: this.state.sessionId,
+      sources,
+      at,
+    });
+    for (const source of Object.values(this.state.sources)) {
+      const restored = restorations[source.sourceType];
+      if (!restored || typeof restored !== "object") continue;
+      Object.assign(source, normalizeSource({ ...restored, sourceType: source.sourceType }));
+    }
+    return this._publish(at);
+  }
+
   resumeCapture(sessionId, at = this.now(), restorations = {}) {
     this._assertOpen();
     this._assertTime(at, "at");
@@ -814,7 +846,15 @@ class JarvisService {
     }
     this._assertActive(id, "paused");
     const isPowerResume = Boolean(this.powerResumeToken);
-    if (!Object.values(this.state.sources).some((source) => source.state === "paused")) {
+    const resumableSources = Object.values(this.state.sources).filter(
+      (source) =>
+        source.state === "paused" ||
+        (isPowerResume &&
+          source.state === "reconnecting" &&
+          restorations[source.sourceType] &&
+          typeof restorations[source.sourceType] === "object")
+    );
+    if (resumableSources.length === 0) {
       throw new Error("capture has no paused sources to resume");
     }
     this.storageGovernor.ensureReserve();
@@ -830,8 +870,7 @@ class JarvisService {
     }
     const reopenedSourceTypes = [];
     try {
-      for (const source of Object.values(this.state.sources)) {
-        if (source.state !== "paused") continue;
+      for (const source of resumableSources) {
         this._resetSourceAfterBoundary(source, at);
         if (this.state.effectiveRetentionMode !== "speech_triggered") {
           this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
@@ -847,6 +886,7 @@ class JarvisService {
             ? "recovering"
             : source.state,
         gapId: source.powerSuspendGapId ?? null,
+        recoveryGapId: source.gapId ?? null,
       }));
       if (isPowerResume) {
         if (typeof this.repository.resumeCaptureAfterPower !== "function") {
@@ -870,13 +910,16 @@ class JarvisService {
       }
       throw error;
     }
-    for (const source of Object.values(this.state.sources)) {
-      if (source.state !== "paused") continue;
+    for (const source of resumableSources) {
       const restored = restorations[source.sourceType];
       if (restored && typeof restored === "object") {
         Object.assign(source, normalizeSource({ ...restored, sourceType: source.sourceType }));
       }
       source.state = "active";
+      source.gapId = null;
+      source.interruptedAt = null;
+      source.reason = null;
+      source.errorCode = null;
       source.powerSuspendGapId = null;
     }
     const status = this._deriveSessionStatus();

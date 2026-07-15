@@ -274,6 +274,7 @@ function createFixture({
   instance.setupHandlers();
 
   return {
+    instance,
     handles,
     listeners,
     sent,
@@ -297,6 +298,38 @@ function createFixture({
     },
   };
 }
+
+test("midnight rebind keeps one live PCM producer writing into the next session", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  send({ sender: fixture.sender }, Buffer.from([1, 2]), "mic", started.inputGeneration);
+  const rebound = fixture.instance.rebindJarvisSession("session-day-1", "session-day-2");
+  const duplicate = fixture.instance.rebindJarvisSession("session-day-1", "session-day-2");
+  send({ sender: fixture.sender }, Buffer.from([3, 4]), "mic", started.inputGeneration);
+
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [
+      ["session-day-1", "mic", [1, 2]],
+      ["session-day-2", "mic", [3, 4]],
+    ]
+  );
+  assert.deepEqual(rebound, { rebound: true, sessionId: "session-day-2" });
+  assert.deepEqual(duplicate, { rebound: false, sessionId: "session-day-2" });
+});
 
 test("bounded managed recovery buffer clears bytes and remains reusable after overflow", () => {
   const buffer = createBoundedRecoveryBuffer(4);
@@ -804,7 +837,10 @@ test("stop, rollback, and cancel invalidate ingress and the next start gets a di
   assert.equal(failed.success, false);
   assert.equal(cancelled.success, true);
   assert.notEqual(second.inputGeneration, first.inputGeneration);
-  assert.deepEqual(persisted.map(([sessionId]) => sessionId), ["jarvis-second"]);
+  assert.deepEqual(
+    persisted.map(([sessionId]) => sessionId),
+    ["jarvis-second"]
+  );
 });
 
 test("a stale managed system callback cannot touch a newer mic-only generation", async (t) => {
@@ -821,10 +857,7 @@ test("a stale managed system callback cannot touch a newer mic-only generation",
   const stop = fixture.handles.get("meeting-transcription-stop");
   const send = fixture.listeners.get("meeting-transcription-send");
 
-  await start(
-    { sender: fixture.sender },
-    { provider: "local", jarvisSessionId: "jarvis-old" }
-  );
+  await start({ sender: fixture.sender }, { provider: "local", jarvisSessionId: "jarvis-old" });
   const oldManagedProducer = fixture.managedStarts[0];
   await stop({ sender: fixture.sender });
   const current = await start(
@@ -937,9 +970,7 @@ test("managed system errors publish only for their current input generation", as
   });
   assert.equal(Number.isSafeInteger(interruptions[0][2].at), true);
   assert.equal(
-    fixture.sent.some(([, payload]) =>
-      JSON.stringify(payload).includes("private device details")
-    ),
+    fixture.sent.some(([, payload]) => JSON.stringify(payload).includes("private device details")),
     false
   );
 });
@@ -1230,12 +1261,7 @@ test("stop and a new input binding cancel an in-flight managed system restoratio
     { sender: fixture.sender },
     { provider: "local", micOnly: true, jarvisSessionId: "jarvis-inflight-recovery-new" }
   );
-  send(
-    { sender: fixture.sender },
-    Buffer.from([9, 10]),
-    "mic",
-    current.inputGeneration
-  );
+  send({ sender: fixture.sender }, Buffer.from([9, 10]), "mic", current.inputGeneration);
   const staleAccepted = recoveryProducer.onChunk(Buffer.from([1, 2]));
   restoration.resolve();
   await new Promise((resolve) => setImmediate(resolve));
@@ -1309,9 +1335,7 @@ test("stop settles a post-restoration gap retry false and late persistence canno
 
   const outcome = await Promise.race([
     recoveryPromise.then((value) => ({ settled: true, value })),
-    new Promise((resolve) =>
-      setTimeout(() => resolve({ settled: false, value: null }), 250)
-    ),
+    new Promise((resolve) => setTimeout(() => resolve({ settled: false, value: null }), 250)),
   ]);
   assert.deepEqual(outcome, { settled: true, value: false });
   assert.deepEqual(
@@ -1367,9 +1391,7 @@ test("managed recovery buffer overflow stops the candidate without appending and
   );
 
   assert.deepEqual(fixture.managedStartAcceptances, [true, false, true]);
-  assert.deepEqual(persisted, [
-    ["jarvis-overflow-recovery", "system", recoveredChunk],
-  ]);
+  assert.deepEqual(persisted, [["jarvis-overflow-recovery", "system", recoveredChunk]]);
   assert.ok(fixture.managerStops.length >= 2);
   assert.equal(restorationCalls, 1);
   assert.equal(
@@ -1402,11 +1424,7 @@ test("managed recovery reopens the gap and retries when buffered delivery throws
   let systemDeliveryAttempts = 0;
   const fixture = createFixture({
     systemAvailable: true,
-    managedStartSequence: [
-      {},
-      { chunks: [failedDeliveryChunk] },
-      { chunks: [recoveredChunk] },
-    ],
+    managedStartSequence: [{}, { chunks: [failedDeliveryChunk] }, { chunks: [recoveredChunk] }],
     appendPcm: (sessionId, source, buffer) => {
       if (source === "system") {
         systemDeliveryAttempts += 1;
@@ -1748,18 +1766,12 @@ test("early explicit stop waits for startup settlement before one fresh rollback
   assert.equal(startResult.success, false);
   assert.equal(stopResult.success, true);
   assert.equal(managedStartsAfterRollback, 0);
-  assert.equal(
-    lifecycleAfterRollback.filter((entry) => entry === "manager-stop").length,
-    1
-  );
+  assert.equal(lifecycleAfterRollback.filter((entry) => entry === "manager-stop").length, 1);
   assert.ok(
     lifecycleAfterRollback.indexOf("aec-stop") > lifecycleAfterRollback.indexOf("aec-start")
   );
 
-  const current = await start(
-    { sender: fixture.sender },
-    { provider: "local" }
-  );
+  const current = await start({ sender: fixture.sender }, { provider: "local" });
   send({ sender: fixture.sender }, Buffer.alloc(4), "mic", current.inputGeneration);
   assert.equal(current.success, true);
   assert.deepEqual(persisted, []);
@@ -1982,8 +1994,7 @@ test("Jarvis retains low-amplitude double-talk without inventing echo evidence",
   );
   const doubleTalkPcm = createPcm16(12_000, (sample) =>
     Math.round(
-      300 * Math.sin((2 * Math.PI * sample) / 61) +
-        300 * Math.sin((2 * Math.PI * sample) / 37)
+      300 * Math.sin((2 * Math.PI * sample) / 61) + 300 * Math.sin((2 * Math.PI * sample) / 37)
     )
   );
 

@@ -15,6 +15,7 @@ export type SessionEvent =
   | { type: "STARTED"; id: string; at: number }
   | { type: "PAUSED"; at: number }
   | { type: "RESUMED"; at: number }
+  | { type: "ROTATED"; id: string; at: number }
   | { type: "FINISHED"; at: number }
   | { type: "COMPLETED" }
   | { type: "FAILED"; code: string };
@@ -33,6 +34,7 @@ const EVENT_ACTION: Record<SessionEvent["type"], string> = {
   STARTED: "start",
   PAUSED: "pause",
   RESUMED: "resume",
+  ROTATED: "rotate",
   FINISHED: "finish",
   COMPLETED: "complete",
   FAILED: "fail",
@@ -102,6 +104,19 @@ export function reduceSession(state: SessionState, event: SessionEvent): Session
       if (state.status !== "paused") return impossible(state, event);
       assertTime(event.at);
       return { ...state, status: "recording", activeSince: event.at, errorCode: null };
+    }
+    case "ROTATED": {
+      if (state.status !== "recording") return impossible(state, event);
+      assertId(event.id);
+      assertTime(event.at);
+      return {
+        id: event.id,
+        status: "recording",
+        startedAt: event.at,
+        activeSince: event.at,
+        accumulatedMs: 0,
+        errorCode: null,
+      };
     }
     case "FINISHED": {
       if (state.status !== "recording" && state.status !== "paused") {

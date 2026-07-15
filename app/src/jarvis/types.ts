@@ -68,11 +68,15 @@ export interface JarvisPowerResumeSource extends JarvisCaptureSourceInput {
 export interface JarvisPowerResumeToken {
   sessionId: string;
   sources: Record<string, JarvisPowerResumeSource>;
+  restorations?: JarvisPowerResumeRestorations;
+  previousSessionId?: string;
+  startedAt?: number;
+  localDate?: string;
 }
 
 export interface JarvisPowerResumeRequest {
   id: string;
-  kind: "suspend" | "enumerate" | "resume";
+  kind: "suspend" | "enumerate" | "resume" | "rotate";
   token: JarvisPowerResumeToken;
 }
 

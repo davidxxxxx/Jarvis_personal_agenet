@@ -54,14 +54,11 @@ test("renderer mic-only start bypasses system access and forwards Jarvis identit
   assert.match(source, /captureMicrophone\?: boolean/);
   assert.match(source, /requireAllSources\?: boolean/);
   assert.match(source, /jarvisSessionId\?: string \| null/);
-  assert.match(
-    source,
-    /!captureSystemAudio\s*\? Promise\.resolve\(DEFAULT_SYSTEM_AUDIO_ACCESS\)/
-  );
+  assert.match(source, /!captureSystemAudio\s*\? Promise\.resolve\(DEFAULT_SYSTEM_AUDIO_ACCESS\)/);
   assert.match(source, /micOnly,/);
   assert.match(
     source,
-    /captureMicrophone\s*\? getMeetingMicConstraints\(\)[\s\S]*?: Promise\.resolve\(null\)/
+    /captureMicrophone\s*\? getMeetingMicConstraints\(args\.micDeviceIdOverride\)[\s\S]*?: Promise\.resolve\(null\)/
   );
   assert.match(source, /jarvisSessionId: args\.jarvisSessionId \?\? null/);
   assert.match(source, /hasExactDevice[\s\S]*?micOnly[\s\S]*?return null/);

@@ -437,10 +437,29 @@ class JarvisProcessingRuntime {
       this.clearInterval(this.timer);
       this.timer = null;
     }
-    this.stopPromise = Promise.resolve(this.inFlight)
-      .then(() => Promise.resolve(this.previewInFlight))
-      .then(() => this.whisperController?.stop?.())
-      .then(() => undefined);
+    this.stopPromise = (async () => {
+      let primaryError = null;
+      try {
+        await Promise.resolve(this.inFlight);
+      } catch (error) {
+        primaryError = error;
+      }
+      try {
+        await Promise.resolve(this.previewInFlight);
+      } catch (error) {
+        primaryError ??= error;
+      }
+      try {
+        await this.whisperController?.stop?.();
+      } catch (error) {
+        if (primaryError && typeof primaryError === "object") {
+          primaryError.whisperReleaseError = error;
+        } else {
+          primaryError ??= error;
+        }
+      }
+      if (primaryError) throw primaryError;
+    })();
     return this.stopPromise;
   }
 }

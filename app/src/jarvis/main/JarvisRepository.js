@@ -2343,6 +2343,10 @@ class JarvisRepository {
     return this.captureEvidenceStore.resumeCaptureAfterPower(input);
   }
 
+  confirmPowerRestorations(input) {
+    return this.captureEvidenceStore.confirmPowerRestorations(input);
+  }
+
   resumeCapture(input) {
     return this.captureEvidenceStore.resumeCapture(input);
   }

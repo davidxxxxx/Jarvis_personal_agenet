@@ -64,6 +64,13 @@ class CaptureEvidenceStore {
             restored_strategy = @restoredStrategy
         WHERE id = @id AND ended_at IS NULL
       `),
+      confirmClosedGapRestoration: db.prepare(`
+        UPDATE audio_gaps
+        SET restored_device_id = @restoredDeviceId,
+            restored_device_label = @restoredDeviceLabel,
+            restored_strategy = @restoredStrategy
+        WHERE id = @id AND track_id = @trackId AND ended_at = @endedAt
+      `),
       getTrack: db.prepare("SELECT * FROM audio_tracks WHERE id = ?"),
       getGap: db.prepare("SELECT * FROM audio_gaps WHERE id = ?"),
       getSession: db.prepare("SELECT * FROM sessions WHERE id = ?"),
@@ -837,8 +844,19 @@ class CaptureEvidenceStore {
           sessionState: "paused",
           sourceStates: new Set(["recovering"]),
         });
-        for (const { track, source } of evidence) {
+        for (const { track, openGap, source } of evidence) {
+          const restored = restorations[track.source_type];
           if (source.gapId === null && track.state === "recovering") {
+            if (!restored || source.recoveryGapId !== openGap?.id) continue;
+            const closed = this.closeGap(openGap.id, at, 1, {
+              deviceId: restored.deviceId === undefined ? track.device_id : restored.deviceId,
+              deviceLabel:
+                restored.deviceLabel === undefined ? track.device_label : restored.deviceLabel,
+              strategy: restored.strategy === undefined ? track.strategy : restored.strategy,
+            });
+            if (closed.changes !== 1) throw new Error(`gap ${openGap.id} is not open`);
+            const updated = this.setTrackState(track.id, "active", null);
+            if (updated.changes !== 1) throw new Error(`track ${track.id} was not resumed`);
             continue;
           }
           this._assertIdentifier(source.gapId, "suspend gapId");
@@ -847,12 +865,12 @@ class CaptureEvidenceStore {
             throw new Error(`track ${track.id} does not have the requested suspend gap`);
           }
           if (gap.ended_at !== null) throw new Error(`gap ${source.gapId} is not open`);
-          const restored = restorations[track.source_type] ?? {};
+          const restoration = restored ?? {};
           const closed = this.closeGap(source.gapId, at, 1, {
-            deviceId: restored.deviceId === undefined ? track.device_id : restored.deviceId,
+            deviceId: restoration.deviceId === undefined ? track.device_id : restoration.deviceId,
             deviceLabel:
-              restored.deviceLabel === undefined ? track.device_label : restored.deviceLabel,
-            strategy: restored.strategy === undefined ? track.strategy : restored.strategy,
+              restoration.deviceLabel === undefined ? track.device_label : restoration.deviceLabel,
+            strategy: restoration.strategy === undefined ? track.strategy : restoration.strategy,
           });
           if (closed.changes !== 1) throw new Error(`gap ${source.gapId} was not closed`);
           const updated = this.setTrackState(track.id, "active", null);
@@ -867,6 +885,49 @@ class CaptureEvidenceStore {
         return { sessionId, status: "recording" };
       }
     );
+    this.confirmPowerRestorationsTransaction = db.transaction(({ sessionId, sources, at }) => {
+      this._assertIdentifier(sessionId, "sessionId");
+      this._assertSafeInteger(at, "transition at");
+      if (!Array.isArray(sources)) throw new TypeError("transition sources must be an array");
+      const session = this.statements.getSession.get(sessionId);
+      if (!session || session.status !== "recording") {
+        throw new Error(`session ${sessionId} must be recording`);
+      }
+      const tracks = this.statements.listTracksForSession.all(sessionId);
+      if (sources.length !== tracks.length) {
+        throw new Error("power restoration must include every session track exactly once");
+      }
+      const seen = new Set();
+      for (const source of sources) {
+        this._assertIdentifier(source.trackId, "trackId");
+        this._assertIdentifier(source.gapId, "gapId");
+        if (seen.has(source.trackId)) throw new Error("power restoration track is duplicated");
+        seen.add(source.trackId);
+        const track = this.statements.getTrack.get(source.trackId);
+        const gap = this.statements.getGap.get(source.gapId);
+        if (!track || track.session_id !== sessionId || track.state !== "active") {
+          throw new Error(`track ${source.trackId} is not active in ${sessionId}`);
+        }
+        if (!gap || gap.track_id !== track.id || gap.ended_at !== at) {
+          throw new Error(`gap ${source.gapId} is not the completed wake restoration`);
+        }
+        for (const [name, value] of Object.entries(source.restoration ?? {})) {
+          if (value !== null && (typeof value !== "string" || value.length > 512)) {
+            throw new TypeError(`${name} must be a string of at most 512 characters or null`);
+          }
+        }
+        const updated = this.statements.confirmClosedGapRestoration.run({
+          id: gap.id,
+          trackId: track.id,
+          endedAt: at,
+          restoredDeviceId: source.restoration?.deviceId ?? null,
+          restoredDeviceLabel: source.restoration?.deviceLabel ?? null,
+          restoredStrategy: source.restoration?.strategy ?? null,
+        });
+        if (updated.changes !== 1) throw new Error(`gap ${gap.id} restoration changed`);
+      }
+      return { sessionId, status: "recording" };
+    });
     this.resumeCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
       const evidence = this._assertLifecycleTransition({
         sessionId,
@@ -1063,6 +1124,10 @@ class CaptureEvidenceStore {
 
   resumeCaptureAfterPower(input) {
     return this.resumeCaptureAfterPowerTransaction(input);
+  }
+
+  confirmPowerRestorations(input) {
+    return this.confirmPowerRestorationsTransaction(input);
   }
 
   resumeCapture(input) {

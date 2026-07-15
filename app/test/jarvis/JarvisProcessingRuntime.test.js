@@ -892,6 +892,45 @@ test("stop joins active work before releasing the owned Whisper server", async (
   assert.deepEqual(order, ["work-entered", "work-finished", "whisper-released"]);
 });
 
+test("stop releases Whisper after a rejected join and preserves the original failure", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const joinFailure = new Error("processing join failed");
+  const order = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        order.push("work-entered");
+        entered.resolve();
+        await release.promise;
+        order.push("work-rejected");
+        throw joinFailure;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: { dedupe: () => {} },
+    whisperController: {
+      isIdle: () => false,
+      stop: async () => order.push("whisper-released"),
+    },
+  });
+
+  const draining = runtime.drainOnce();
+  await entered.promise;
+  const stopping = runtime.stop();
+  release.resolve();
+
+  await assert.rejects(draining, (error) => error === joinFailure);
+  await assert.rejects(stopping, (error) => error === joinFailure);
+  assert.deepEqual(order, ["work-entered", "work-rejected", "whisper-released"]);
+});
+
 test("stop reached during the first handler prevents every later claim in the same drain", async () => {
   const entered = deferred();
   const release = deferred();

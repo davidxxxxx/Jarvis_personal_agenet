@@ -676,10 +676,18 @@ async function initializeCoreManagers() {
   jarvisPowerLifecycle = new JarvisPowerLifecycle({
     service: jarvisService,
     processingLifecycle: jarvisProcessingLifecycle,
-    releaseWhisper: async () => {},
+    releaseWhisper: async () => whisperManager?.stopServer(),
     suspendUpstream: (token) => rendererPowerResumeHandshake.request("suspend", token),
     resumeDevices: (token) => rendererPowerResumeHandshake.request("enumerate", token),
     resumeUpstream: (token) => rendererPowerResumeHandshake.request("resume", token),
+    rebindPcmSession: (previousSessionId, nextSessionId) =>
+      ipcHandlers.rebindJarvisSession(previousSessionId, nextSessionId),
+    rotateUpstream: (rotation) =>
+      rendererPowerResumeHandshake.request("rotate", {
+        ...rotation,
+        sessionId: rotation.sessionId,
+        sources: {},
+      }),
     ensureGpuReady: async () => {
       await new Promise((resolve) => setTimeout(resolve, WHISPER_WAKE_REWARM_DELAY_MS));
       await whisperManager?.onWakeFromSleep();

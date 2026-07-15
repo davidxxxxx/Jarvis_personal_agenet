@@ -121,6 +121,24 @@ describe("power resume device enumeration", () => {
     expect(resume).not.toHaveBeenCalled();
     expect(enumerateDevices).not.toHaveBeenCalled();
   });
+
+  it("passes fresh restoration choices to the recorder and acknowledges actual bindings", async () => {
+    const desired = {
+      mic: { deviceId: "fresh-mic", deviceLabel: "Fresh MV7", strategy: "physical" },
+    };
+    const actual = {
+      mic: { deviceId: "actual-mic", deviceLabel: "Actual MV7", strategy: "physical" },
+    };
+    const resume = vi.fn(async () => actual);
+
+    await expect(
+      routePowerLifecycleRequest(
+        { id: "power-2", kind: "resume", token: { ...token, restorations: desired } },
+        { suspendUpstream: vi.fn(), resume, enumerateDevices: vi.fn() }
+      )
+    ).resolves.toEqual(actual);
+    expect(resume).toHaveBeenCalledWith(desired);
+  });
 });
 
 describe("Jarvis capture argument mapping", () => {
@@ -454,6 +472,74 @@ afterEach(() => {
 });
 
 describe("Jarvis recording controller", () => {
+  it("resumes with the enumerated microphone override and returns the actual recorder binding", async () => {
+    const harness = createHarness({ status: "paused", captureMode: "mic" });
+    const actual = {
+      mic: { deviceId: "actual-mic", deviceLabel: "Actual MV7", strategy: "physical" },
+    };
+    harness.startRecording.mockImplementationOnce(async (args) => {
+      harness.calls.push("upstream:start");
+      harness.setMeeting({ isRecording: true });
+      expect(args.micDeviceIdOverride).toBe("fresh-mic");
+      return actual;
+    });
+    const controller = createRecordingController(harness.deps);
+
+    await expect(
+      controller.resume({
+        mic: { deviceId: "fresh-mic", deviceLabel: "Fresh MV7", strategy: "physical" },
+      })
+    ).resolves.toEqual(actual);
+  });
+
+  it("rotates renderer persistence to the next day without restarting audio", async () => {
+    vi.useFakeTimers();
+    const oldSegment: TranscriptSegment = {
+      id: "old",
+      text: "before",
+      source: "mic",
+      timestamp: 1_500,
+    };
+    const newSegment: TranscriptSegment = {
+      id: "new",
+      text: "after",
+      source: "mic",
+      timestamp: 2_100,
+    };
+    const harness = createHarness({ status: "recording", segments: [oldSegment] });
+    const controller = createRecordingController(harness.deps);
+    controller.handleSegmentsChanged([oldSegment]);
+
+    await controller.rotateAtLocalDate({
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    harness.setMeeting({ segments: [oldSegment, newSegment] });
+    controller.handleSegmentsChanged([oldSegment, newSegment]);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(harness.stopRecording).not.toHaveBeenCalled();
+    expect(harness.getSession()).toMatchObject({
+      id: "s2",
+      status: "recording",
+      startedAt: 2_000,
+    });
+    expect(harness.jarvis.syncSegments).toHaveBeenNthCalledWith(1, "s1", expect.any(Array));
+    expect(harness.jarvis.syncSegments).toHaveBeenNthCalledWith(
+      2,
+      "s2",
+      expect.arrayContaining([expect.objectContaining({ text: "after" })])
+    );
+    expect(vi.mocked(harness.jarvis.syncSegments).mock.calls[1][1]).toHaveLength(1);
+
+    await controller.rotateAtLocalDate({
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(2);
+  });
   it("publishes pending operation truth until the command settles", async () => {
     const gate = deferred<void>();
     const harness = createHarness();

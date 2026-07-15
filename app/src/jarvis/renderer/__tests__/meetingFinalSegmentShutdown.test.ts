@@ -247,6 +247,42 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     });
   });
 
+  it("uses a wake-selected physical microphone override and reports the actual track", async () => {
+    const previous = {
+      selectedMicDeviceId: useSettingsStore.getState().selectedMicDeviceId,
+      preferBuiltInMic: useSettingsStore.getState().preferBuiltInMic,
+    };
+    useSettingsStore.setState({ selectedMicDeviceId: "sonar", preferBuiltInMic: false });
+    try {
+      const actualTrack = new FakeTrack("Microphone (Shure MV7)", "fresh-mic");
+      vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(streamFor(actualTrack));
+
+      const result = await startRecording({
+        noteId: null,
+        noteTitle: "Jarvis",
+        folderId: null,
+        captureSystemAudio: false,
+        captureMicrophone: true,
+        micOnly: true,
+        jarvisSessionId: "s-power-resume",
+        micDeviceIdOverride: "fresh-mic",
+      });
+
+      expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
+        audio: expect.objectContaining({ deviceId: { exact: "fresh-mic" } }),
+      });
+      expect(result).toEqual({
+        mic: {
+          deviceId: "fresh-mic",
+          deviceLabel: "Microphone (Shure MV7)",
+          strategy: "physical",
+        },
+      });
+    } finally {
+      useSettingsStore.setState(previous);
+    }
+  });
+
   afterEach(async () => {
     vi.useRealTimers();
     await stopRecording();
@@ -727,9 +763,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     );
     const initialSystemStream = streamFor(initialSystemTrack);
     const replacementSystemStream = streamFor(replacementSystemTrack);
-    const restoration = createDeferred<
-      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>
-    >();
+    const restoration =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>>();
     const replacementChunk = new ArrayBuffer(8);
     const survivingMicChunk = new ArrayBuffer(6);
     workletChunksOnAttach.push([], [], [replacementChunk]);
@@ -820,9 +855,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       vi
         .mocked(window.electronAPI.meetingTranscriptionSend!)
         .mock.invocationCallOrder.find((_, index) => {
-          const [chunk, source] = vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock.calls[
-            index
-          ];
+          const [chunk, source] = vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock
+            .calls[index];
           return chunk === replacementChunk && source === "system";
         }) as number
     );
@@ -912,9 +946,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     );
     const initialSystemStream = streamFor(initialSystemTrack);
     const replacementSystemStream = streamFor(replacementSystemTrack);
-    const restoration = createDeferred<
-      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>
-    >();
+    const restoration =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>>();
     vi.mocked(navigator.mediaDevices.getUserMedia)
       .mockResolvedValueOnce(streamFor(micTrack))
       .mockResolvedValueOnce(streamFor(new FakeTrack("New microphone", "new-mic-generation")));
@@ -1146,9 +1179,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       mode: "loopback" as const,
       strategy: "loopback" as const,
     }));
-    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(
-      streamFor(newMicTrack)
-    );
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockResolvedValueOnce(streamFor(newMicTrack));
     vi.mocked(window.electronAPI.meetingTranscriptionStart!)
       .mockResolvedValueOnce({
         success: true,
@@ -1620,7 +1651,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   it("recovers the microphone in dual mode without overwriting computer-audio state", async () => {
     const replacementTrack = new FakeTrack("Replacement microphone", "replacement-mic");
     const replacementCapture = createDeferred<MediaStream>();
-    const restoration = createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>>();
+    const restoration =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>>();
     vi.mocked(window.electronAPI.jarvis.sourceRestored).mockReturnValueOnce(restoration.promise);
     vi.mocked(navigator.mediaDevices.getUserMedia)
       .mockResolvedValueOnce(streamFor(track))
@@ -1700,11 +1732,13 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     expect(
       vi.mocked(window.electronAPI.jarvis.sourceRestored).mock.invocationCallOrder[0]
     ).toBeLessThan(
-      vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock.invocationCallOrder.find(
-        (_order, index) =>
-          vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock.calls[index]?.[0] ===
-          replacementChunk
-      ) as number
+      vi
+        .mocked(window.electronAPI.meetingTranscriptionSend!)
+        .mock.invocationCallOrder.find(
+          (_order, index) =>
+            vi.mocked(window.electronAPI.meetingTranscriptionSend!).mock.calls[index]?.[0] ===
+            replacementChunk
+        ) as number
     );
     track.dispatchEvent(new Event("ended"));
     expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledTimes(1);
@@ -1758,9 +1792,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
 
   it("stops a recovery candidate immediately when stop occurs during restoration persistence", async () => {
     const replacementTrack = new FakeTrack("Pending restoration", "pending-restoration");
-    const pendingRestoration = createDeferred<
-      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>
-    >();
+    const pendingRestoration =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceRestored"]>>>();
     vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([]);
     vi.mocked(navigator.mediaDevices.getUserMedia)
       .mockResolvedValueOnce(streamFor(track))
@@ -1777,9 +1810,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       jarvisSessionId: "s-pending-restoration-stop",
     });
     track.end();
-    await vi.waitFor(() =>
-      expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledOnce()
-    );
+    await vi.waitFor(() => expect(window.electronAPI.jarvis.sourceRestored).toHaveBeenCalledOnce());
 
     await stopRecording();
     const stopCallsAtStopCompletion = replacementTrack.stop.mock.calls.length;
@@ -1839,9 +1870,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
 
   it("keeps the original microphone interruption timestamp across persistence retries", async () => {
     vi.useFakeTimers();
-    const firstPersistence = createDeferred<
-      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceInterrupted"]>>
-    >();
+    const firstPersistence =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceInterrupted"]>>>();
     vi.mocked(window.electronAPI.jarvis.sourceInterrupted)
       .mockReturnValueOnce(firstPersistence.promise)
       .mockResolvedValueOnce({
@@ -1878,9 +1908,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   it("keeps an attach-failure interruption reason and timestamp until it is persisted", async () => {
     vi.useFakeTimers();
     const failedTrack = new FakeTrack("Failed replacement", "failed-replacement");
-    const attachFailurePersistence = createDeferred<
-      Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceInterrupted"]>>
-    >();
+    const attachFailurePersistence =
+      createDeferred<Awaited<ReturnType<RecordingDependencies["jarvis"]["sourceInterrupted"]>>>();
     vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValue([]);
     vi.mocked(navigator.mediaDevices.getUserMedia)
       .mockResolvedValueOnce(streamFor(track))
@@ -2276,7 +2305,9 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       captureSystemAudio: true,
       jarvisSessionId: "s-old-pre-bind",
     });
-    await vi.waitFor(() => expect(window.electronAPI.checkSystemAudioAccess).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(window.electronAPI.checkSystemAudioAccess).toHaveBeenCalledOnce()
+    );
 
     await stopRecording();
     await startRecording({
@@ -2317,7 +2348,9 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     window.electronAPI.meetingTranscriptionCancel = vi.fn(async () => ({ success: true }));
 
     const prepare = prepareTranscription({ captureSystemAudio: false });
-    await vi.waitFor(() => expect(window.electronAPI.meetingTranscriptionPrepare).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(window.electronAPI.meetingTranscriptionPrepare).toHaveBeenCalledOnce()
+    );
 
     const start = startRecording({
       noteId: null,
@@ -3020,9 +3053,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockImplementationOnce(
       () => mainStart.promise
     );
-    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementationOnce(
-      () => microphone.promise
-    );
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementationOnce(() => microphone.promise);
 
     const starting = startRecording({
       noteId: null,
@@ -3045,9 +3076,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
   it("cancels a pending microphone setup before its permission promise settles", async () => {
     const microphone = createDeferred<MediaStream>();
     const lateTrack = new FakeTrack("Permission microphone", "permission-mic");
-    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementationOnce(
-      () => microphone.promise
-    );
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockImplementationOnce(() => microphone.promise);
 
     let startSettled = false;
     const starting = startRecording({
