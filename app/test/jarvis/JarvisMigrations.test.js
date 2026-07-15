@@ -15,7 +15,7 @@ function columnNames(db, table) {
     .map((row) => row.name);
 }
 
-test("v16 adds an idempotent local-midnight continuation relation", () => {
+test("current migration retains the idempotent local-midnight continuation relation", () => {
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 100 });
@@ -30,8 +30,7 @@ test("v16 adds an idempotent local-midnight continuation relation", () => {
 
     const result = applyJarvisMigrations(db, { now: () => 200 });
 
-    assert.equal(TARGET_VERSION, 16);
-    assert.deepEqual(result, { fromVersion: 15, toVersion: 16 });
+    assert.deepEqual(result, { fromVersion: 15, toVersion: TARGET_VERSION });
     db.prepare(
       `INSERT INTO session_continuations (
         source_session_id, destination_session_id, reason, boundary_at,
@@ -50,20 +49,20 @@ test("v16 adds an idempotent local-midnight continuation relation", () => {
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     assert.deepEqual(applyJarvisMigrations(db, { now: () => 300 }), {
-      fromVersion: 16,
-      toVersion: 16,
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
     });
   } finally {
     db.close();
   }
 });
 
-test("clean v16 migration creates the continuation table with foreign keys", () => {
+test("clean migration creates the continuation table with foreign keys", () => {
   const db = new Database(":memory:");
   try {
     assert.deepEqual(applyJarvisMigrations(db, { now: () => 100 }), {
       fromVersion: 0,
-      toVersion: 16,
+      toVersion: TARGET_VERSION,
     });
     assert.ok(
       db
@@ -176,7 +175,7 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
   }
 });
 
-test("v16 preserves v15 resource metadata while adding session continuations", () => {
+test("current migration preserves v15 resource metadata while adding session continuations", () => {
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 100 });
@@ -196,7 +195,6 @@ test("v16 preserves v15 resource metadata while adding session continuations", (
       fromVersion: 14,
       toVersion: TARGET_VERSION,
     });
-    assert.equal(TARGET_VERSION, 16);
     assert.ok(columnNames(db, "processing_jobs").includes("blocked_reason"));
     assert.ok(columnNames(db, "processing_jobs").includes("execution_device"));
     assert.deepEqual(
@@ -1309,7 +1307,7 @@ test("v15 leaves every genuine v14 transcript row and schema relationship unchan
     db.pragma("foreign_keys = ON");
     applyJarvisMigrations(db, { now: () => 1_000 });
     db.exec(`
-      CREATE TABLE people (
+      CREATE TABLE IF NOT EXISTS people (
         id TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
         created_at INTEGER NOT NULL,

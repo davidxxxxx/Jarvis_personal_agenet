@@ -1,4 +1,4 @@
-const TARGET_VERSION = 16;
+const TARGET_VERSION = 17;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -283,6 +283,15 @@ const PROCESSING_JOBS_INDEXES = `
 `;
 
 const MIGRATION_BASE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS people (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    is_self INTEGER NOT NULL DEFAULT 0,
+    voice_profile_id INTEGER,
+    voice_confidence REAL,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     started_at INTEGER NOT NULL,
@@ -324,6 +333,77 @@ const MIGRATION_BASE_SCHEMA = `
     retired_format TEXT,
     retired_file_sha256 TEXT
   );
+`;
+
+const SPEAKER_IDENTITY_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS speaker_clusters (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    track_id TEXT REFERENCES audio_tracks(id) ON DELETE SET NULL,
+    local_label TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    embedding BLOB,
+    speech_ms INTEGER NOT NULL DEFAULT 0,
+    window_count INTEGER NOT NULL DEFAULT 0,
+    quality_score REAL,
+    person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    link_state TEXT NOT NULL DEFAULT 'unknown'
+      CHECK(link_state IN ('unknown','suggested','confirmed','rejected')),
+    match_score REAL,
+    match_margin REAL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(session_id, track_id, local_label)
+  );
+  CREATE TABLE IF NOT EXISTS speaker_cluster_segments (
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    transcript_segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    PRIMARY KEY(cluster_id, transcript_segment_id)
+  );
+  CREATE TABLE IF NOT EXISTS voice_profile_samples (
+    id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    source_cluster_id TEXT REFERENCES speaker_clusters(id) ON DELETE SET NULL,
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('enrollment','user_confirmed')),
+    speech_ms INTEGER NOT NULL,
+    window_count INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS speaker_identity_corrections (
+    id TEXT PRIMARY KEY,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    previous_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    next_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    previous_state TEXT NOT NULL
+      CHECK(previous_state IN ('unknown','suggested','confirmed','rejected')),
+    next_state TEXT NOT NULL
+      CHECK(next_state IN ('unknown','suggested','confirmed','rejected')),
+    scope TEXT NOT NULL CHECK(scope IN ('session','persistent')),
+    actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+    created_at INTEGER NOT NULL,
+    undone_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_speaker_clusters_session
+    ON speaker_clusters(session_id, track_id, local_label);
+  CREATE INDEX IF NOT EXISTS idx_speaker_cluster_segments_segment
+    ON speaker_cluster_segments(transcript_segment_id, cluster_id);
+  CREATE INDEX IF NOT EXISTS idx_voice_profile_samples_model_person
+    ON voice_profile_samples(model_id, person_id, created_at, id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_profile_user_confirmed_cluster
+    ON voice_profile_samples(source_cluster_id, person_id, model_id, source_kind)
+    WHERE source_cluster_id IS NOT NULL AND source_kind = 'user_confirmed';
+  CREATE INDEX IF NOT EXISTS idx_speaker_corrections_cluster_time
+    ON speaker_identity_corrections(cluster_id, created_at, id);
+  CREATE TRIGGER IF NOT EXISTS clear_deleted_person_speaker_links
+  BEFORE DELETE ON people
+  BEGIN
+    UPDATE speaker_clusters
+    SET person_id = NULL, link_state = 'unknown', match_score = NULL,
+        match_margin = NULL, updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS INTEGER) * 1000)
+    WHERE person_id = OLD.id;
+  END;
 `;
 
 function columns(db, table) {
@@ -708,6 +788,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         CHECK(source_session_id <> destination_session_id)
       );
     `);
+      db.exec(SPEAKER_IDENTITY_SCHEMA);
 
       if (rebuildsTranscriptSegments) {
         const violations = db.pragma("foreign_key_check");
@@ -732,4 +813,5 @@ module.exports = {
   FLAC_ENCODER_VERSION,
   transcriptSegmentsSchema,
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
+  SPEAKER_IDENTITY_SCHEMA,
 };

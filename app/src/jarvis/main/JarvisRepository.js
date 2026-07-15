@@ -8,6 +8,7 @@ const {
   normalizeCapturePolicy,
 } = require("../shared/captureModes");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
+const SpeakerIdentityRepository = require("./SpeakerIdentityRepository");
 const {
   applyJarvisMigrations,
   transcriptSegmentsSchema,
@@ -326,6 +327,9 @@ class JarvisRepository {
       this.db.transaction(() => this.db.exec(SCHEMA))();
       this._prepareStatements();
       this.captureEvidenceStore = new CaptureEvidenceStore(this.db, {
+        createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
+      });
+      this.speakerIdentityRepository = new SpeakerIdentityRepository(this.db, {
         createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
       });
     } catch (error) {
@@ -2717,6 +2721,50 @@ class JarvisRepository {
       for (const row of updates) update.run(row);
       return { relocated: updates.length };
     })();
+  }
+
+  createSpeakerCluster(input) {
+    return this.speakerIdentityRepository.createCluster(input);
+  }
+
+  replaceSpeakerClusterSegments(clusterId, transcriptSegmentIds) {
+    return this.speakerIdentityRepository.replaceClusterSegments(clusterId, transcriptSegmentIds);
+  }
+
+  getSpeakerCluster(clusterId) {
+    return this.speakerIdentityRepository.getCluster(clusterId);
+  }
+
+  listSessionSpeakerClusters(sessionId) {
+    return this.speakerIdentityRepository.listSessionClusters(sessionId);
+  }
+
+  listVoiceProfiles(modelId) {
+    return this.speakerIdentityRepository.listProfiles(modelId);
+  }
+
+  addVoiceProfileSample(input) {
+    return this.speakerIdentityRepository.addProfileSample(input);
+  }
+
+  confirmSpeakerLink(input) {
+    return this.speakerIdentityRepository.confirmLink(input);
+  }
+
+  rejectSpeakerSuggestion(input) {
+    return this.speakerIdentityRepository.rejectSuggestion(input);
+  }
+
+  undoSpeakerCorrection(clusterId) {
+    return this.speakerIdentityRepository.undoLastCorrection(clusterId);
+  }
+
+  mergeSpeakerPeople(input) {
+    return this.speakerIdentityRepository.mergePeople(input);
+  }
+
+  listSpeakerCorrections(clusterId) {
+    return this.speakerIdentityRepository.listCorrections(clusterId);
   }
 
   close() {
