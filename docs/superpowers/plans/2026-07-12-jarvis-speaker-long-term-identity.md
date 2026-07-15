@@ -511,7 +511,7 @@ git commit -m "test: gate long term speaker identity quality"
 - Consumes: `ResourceGovernor.admit('speaker')`, `HeavyJobGate.run('speaker', fn)`, final transcript revision IDs, and `AudioEvidenceReader.readVerifiedPcm(chunk)` from phases 1–2.
 - Produces: `SpeakerProcessingPolicy.evaluate(session): { eligible, reason }` and durable speaker-job deferral reasons.
 
-- [ ] **Step 1: Write failing eligibility and no-live-embedding tests**
+- [x] **Step 1: Write failing eligibility and no-live-embedding tests**
 
 ```js
 test('requires final transcript and committed final audio', () => {
@@ -529,13 +529,13 @@ test('accepting live PCM never invokes the embedding extractor', async () => {
 })
 ```
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [x] **Step 2: Run focused tests and verify failure**
 
 Run: `cd app && node --test test/jarvis/SpeakerProcessingPolicy.test.js test/jarvis/NoLiveSpeakerEmbedding.test.js`
 
 Expected: FAIL because no final-evidence policy exists and the legacy live path can still invoke embeddings.
 
-- [ ] **Step 3: Implement explicit final-evidence admission**
+- [x] **Step 3: Implement explicit final-evidence admission**
 
 ```js
 export class SpeakerProcessingPolicy {
@@ -549,21 +549,21 @@ export class SpeakerProcessingPolicy {
 
 Require immutable input revision IDs in the speaker job key. Never read renderer preview buffers or provisional segments in `SessionDiarizationWorker`.
 
-- [ ] **Step 4: Route all speaker inference through the heavy-job gate**
+- [x] **Step 4: Route all speaker inference through the heavy-job gate**
 
 Call `ResourceGovernor.admit('speaker')`; on `defer` or `pause_preview`, release the durable lease with a retry time and visible reason. On admission, run diarization and embedding inside `HeavyJobGate.run('speaker', ...)`. Remove Jarvis capture subscriptions from `liveSpeakerIdentifier`; keep any non-Jarvis legacy export inert unless called explicitly.
 
-- [ ] **Step 5: Expose deferred state without inventing identity**
+- [x] **Step 5: Expose deferred state without inventing identity**
 
 While speaker work waits, render session-local labels such as `说话人 1（待确认）` and `声纹分析等待 GPU`; never substitute `我` or a persisted person name before the identity resolver creates an evidence-backed link.
 
-- [ ] **Step 6: Run focused, integration, and evaluation tests**
+- [x] **Step 6: Run focused, integration, and evaluation tests**
 
 Run: `cd app && node --test test/jarvis/SpeakerProcessingPolicy.test.js test/jarvis/NoLiveSpeakerEmbedding.test.js test/jarvis/SessionDiarizationWorker.test.js test/jarvis/SpeakerProfileIdentity.test.js`
 
 Expected: all tests pass; live PCM produces zero embedding calls, speaker/Whisper maximum heavy concurrency is 1, and deferred work later completes against the same immutable revisions.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add app/src/jarvis/main/SpeakerProcessingPolicy.js app/src/jarvis/main/SessionDiarizationWorker.js app/src/jarvis/main/JarvisProcessingRuntime.js app/src/helpers/liveSpeakerIdentifier.js app/src/jarvis/renderer/ProcessingStatus.tsx app/test/jarvis/SpeakerProcessingPolicy.test.js app/test/jarvis/NoLiveSpeakerEmbedding.test.js
