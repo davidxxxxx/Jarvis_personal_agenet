@@ -139,6 +139,39 @@ describe("power resume device enumeration", () => {
     ).resolves.toEqual(actual);
     expect(resume).toHaveBeenCalledWith(desired);
   });
+
+  it("routes each midnight transaction phase to the renderer controller", async () => {
+    const rotateAtLocalDate = vi.fn(async () => {});
+
+    await expect(
+      routePowerLifecycleRequest(
+        {
+          id: "rotate-prepare",
+          kind: "rotate",
+          token: {
+            phase: "prepare",
+            previousSessionId: "s1",
+            sessionId: "s2",
+            startedAt: 2_000,
+            sources: {},
+          },
+        },
+        {
+          suspendUpstream: vi.fn(),
+          resume: vi.fn(),
+          rotateAtLocalDate,
+          enumerateDevices: vi.fn(),
+        }
+      )
+    ).resolves.toBeNull();
+
+    expect(rotateAtLocalDate).toHaveBeenCalledWith({
+      phase: "prepare",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+  });
 });
 
 describe("Jarvis capture argument mapping", () => {
@@ -412,6 +445,7 @@ function createHarness({
     meeting = { ...meeting, isRecording: false };
     return { diarizationSessionId: null, success: true };
   });
+  const rebindUpstreamSession = vi.fn<RecordingDependencies["rebindUpstreamSession"]>();
   const setSessions = vi.fn();
   const createId = vi.fn(() => "s1");
   const setPeople = vi.fn();
@@ -431,6 +465,7 @@ function createHarness({
     ensureTranscriptionReady,
     startRecording,
     stopRecording,
+    rebindUpstreamSession,
     lockSpeaker: vi.fn(),
     getMeetingSnapshot: () => meeting,
     getSessionState: () => session,
@@ -456,6 +491,7 @@ function createHarness({
     jarvis,
     startRecording,
     stopRecording,
+    rebindUpstreamSession,
     setSessions,
     createId,
     onOperationChange,
@@ -490,6 +526,25 @@ describe("Jarvis recording controller", () => {
         mic: { deviceId: "fresh-mic", deviceLabel: "Fresh MV7", strategy: "physical" },
       })
     ).resolves.toEqual(actual);
+  });
+
+  it("leaves power-resume compensation to the main lifecycle when upstream activation fails", async () => {
+    const harness = createHarness({ status: "paused", captureMode: "mic" });
+    harness.startRecording.mockImplementationOnce(async () => {
+      harness.setMeeting({ isRecording: false, error: "MIC_DISCONNECTED" });
+    });
+    const controller = createRecordingController(harness.deps);
+
+    await expect(
+      controller.resumeForPower({
+        mic: { deviceId: "fresh-mic", deviceLabel: "Fresh MV7", strategy: "physical" },
+      })
+    ).rejects.toThrow("microphone capture failed");
+
+    expect(harness.jarvis.resumeCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.failCapture).not.toHaveBeenCalled();
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "paused" });
   });
 
   it("rotates renderer persistence to the next day without restarting audio", async () => {
@@ -540,6 +595,110 @@ describe("Jarvis recording controller", () => {
     });
     expect(harness.jarvis.syncSegments).toHaveBeenCalledTimes(2);
   });
+
+  it("prepares midnight persistence before switching sessions and commits buffered segments once", async () => {
+    vi.useFakeTimers();
+    const oldSegment: TranscriptSegment = {
+      id: "old",
+      text: "before",
+      source: "mic",
+      timestamp: 1_500,
+      endedAt: 1_900,
+    };
+    const newSegment: TranscriptSegment = {
+      id: "new",
+      text: "after",
+      source: "mic",
+      timestamp: 2_100,
+      endedAt: 2_300,
+    };
+    const harness = createHarness({ status: "recording", segments: [oldSegment] });
+    const controller = createRecordingController(harness.deps);
+    controller.handleSegmentsChanged([oldSegment]);
+
+    await controller.rotateAtLocalDate({
+      phase: "prepare",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "recording" });
+
+    harness.setMeeting({ segments: [oldSegment, newSegment] });
+    controller.handleSegmentsChanged([oldSegment, newSegment]);
+    await controller.rotateAtLocalDate({
+      phase: "commit",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(harness.getSession()).toMatchObject({ id: "s2", status: "recording" });
+    expect(harness.rebindUpstreamSession).toHaveBeenCalledOnce();
+    expect(harness.rebindUpstreamSession).toHaveBeenCalledWith("s1", "s2");
+    const s2Calls = vi
+      .mocked(harness.jarvis.syncSegments)
+      .mock.calls.filter(([sessionId]) => sessionId === "s2");
+    expect(s2Calls).toHaveLength(1);
+    expect(s2Calls[0][1]).toEqual([expect.objectContaining({ text: "after" })]);
+
+    await controller.rotateAtLocalDate({
+      phase: "commit",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+    expect(
+      vi.mocked(harness.jarvis.syncSegments).mock.calls.filter(([sessionId]) => sessionId === "s2")
+    ).toHaveLength(1);
+  });
+
+  it("replaces a stale prepared renderer rotation after main aborted with a new destination", async () => {
+    const harness = createHarness({ status: "recording" });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.rotateAtLocalDate({
+      phase: "prepare",
+      previousSessionId: "s1",
+      sessionId: "stale-s2",
+      startedAt: 2_000,
+    });
+    await controller.rotateAtLocalDate({
+      phase: "prepare",
+      previousSessionId: "s1",
+      sessionId: "fresh-s2",
+      startedAt: 2_100,
+    });
+    await controller.rotateAtLocalDate({
+      phase: "commit",
+      previousSessionId: "s1",
+      sessionId: "fresh-s2",
+      startedAt: 2_100,
+    });
+
+    expect(harness.getSession()).toMatchObject({ id: "fresh-s2", status: "recording" });
+    expect(harness.rebindUpstreamSession).toHaveBeenCalledWith("s1", "fresh-s2");
+  });
+
+  it("blocks user lifecycle commands while a midnight transaction is prepared", async () => {
+    const harness = createHarness({ status: "recording" });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.rotateAtLocalDate({
+      phase: "prepare",
+      previousSessionId: "s1",
+      sessionId: "s2",
+      startedAt: 2_000,
+    });
+
+    await expect(controller.pause()).rejects.toThrow("midnight rotation");
+    await expect(controller.setRetentionMode("continuous")).rejects.toThrow("midnight rotation");
+    expect(harness.stopRecording).not.toHaveBeenCalled();
+    expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
+    expect(harness.jarvis.setRetentionMode).not.toHaveBeenCalled();
+  });
+
   it("publishes pending operation truth until the command settles", async () => {
     const gate = deferred<void>();
     const harness = createHarness();

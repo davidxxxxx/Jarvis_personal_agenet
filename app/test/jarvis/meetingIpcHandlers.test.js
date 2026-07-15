@@ -331,6 +331,91 @@ test("midnight rebind keeps one live PCM producer writing into the next session"
   assert.deepEqual(duplicate, { rebound: false, sessionId: "session-day-2" });
 });
 
+test("midnight two-phase rebind buffers PCM until the new service session commits", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "prepare");
+  send({ sender: fixture.sender }, Buffer.from([7, 8]), "mic", started.inputGeneration);
+  assert.equal(persisted.length, 0);
+
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "commit");
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [["session-day-2", "mic", [7, 8]]]
+  );
+});
+
+test("midnight two-phase abort flushes buffered PCM back to the old session", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "prepare");
+  send({ sender: fixture.sender }, Buffer.from([9, 10]), "mic", started.inputGeneration);
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "abort");
+
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [["session-day-1", "mic", [9, 10]]]
+  );
+});
+
+test("midnight PCM barrier stays bounded and accepts later chunks after overflow", async (t) => {
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "session-day-1" }
+  );
+
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "prepare");
+  send(
+    { sender: fixture.sender },
+    Buffer.alloc(4 * 1024 * 1024 + 2),
+    "mic",
+    started.inputGeneration
+  );
+  send({ sender: fixture.sender }, Buffer.from([11, 12]), "mic", started.inputGeneration);
+  fixture.instance.rebindJarvisSession("session-day-1", "session-day-2", "commit");
+
+  assert.deepEqual(
+    persisted.map(([sessionId, source, buffer]) => [sessionId, source, [...buffer]]),
+    [["session-day-2", "mic", [11, 12]]]
+  );
+});
+
 test("bounded managed recovery buffer clears bytes and remains reusable after overflow", () => {
   const buffer = createBoundedRecoveryBuffer(4);
   const first = Buffer.from([1, 2]);

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from "react";
 import {
   CaptureSourcesUnavailableError,
   lockSpeaker,
+  rebindActiveMeetingJarvisSession,
   startRecording,
   stopRecording,
   useMeetingRecordingStore,
@@ -130,6 +131,7 @@ export interface RecordingDependencies {
   ensureTranscriptionReady: () => Promise<void>;
   startRecording: (args: StartRecordingArgs) => Promise<JarvisPowerResumeRestorations | void>;
   stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
+  rebindUpstreamSession: (previousSessionId: string, nextSessionId: string) => void;
   lockSpeaker: (speakerId: string, displayName: string) => void;
   getMeetingSnapshot: () => RecordingMeetingSnapshot;
   getSessionState: () => SessionState;
@@ -156,7 +158,11 @@ export interface RecordingController {
   resume: (
     restorations?: JarvisPowerResumeRestorations
   ) => Promise<JarvisPowerResumeRestorations | null | void>;
+  resumeForPower: (
+    restorations?: JarvisPowerResumeRestorations
+  ) => Promise<JarvisPowerResumeRestorations | null | void>;
   rotateAtLocalDate: (input: {
+    phase?: "prepare" | "commit" | "abort";
     previousSessionId: string;
     sessionId: string;
     startedAt: number;
@@ -305,6 +311,7 @@ export async function routePowerLifecycleRequest(
       restorations?: JarvisPowerResumeRestorations
     ) => Promise<JarvisPowerResumeRestorations | null | void>;
     rotateAtLocalDate?: (input: {
+      phase?: "prepare" | "commit" | "abort";
       previousSessionId: string;
       sessionId: string;
       startedAt: number;
@@ -323,6 +330,7 @@ export async function routePowerLifecycleRequest(
   if (request.kind === "rotate") {
     if (!handlers.rotateAtLocalDate) throw new Error("renderer rotation handler is unavailable");
     await handlers.rotateAtLocalDate({
+      phase: request.token.phase,
       previousSessionId: request.token.previousSessionId as string,
       sessionId: request.token.sessionId,
       startedAt: request.token.startedAt as number,
@@ -407,7 +415,12 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   let activationGeneration = 0;
   let activeActivationSettled: Promise<void> | null = null;
   const persistenceFloors = new Map<string, number>();
-  let persistenceRotation: { bufferedSegments: TranscriptSegment[] | null } | null = null;
+  let persistenceRotation: {
+    previousSessionId: string;
+    sessionId: string;
+    startedAt: number;
+    bufferedSegments: TranscriptSegment[] | null;
+  } | null = null;
 
   const transition = (event: SessionEvent): SessionState => {
     const next = reduceSession(deps.getSessionState(), event);
@@ -416,6 +429,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
   };
 
   const begin = (operation: NonNullable<typeof activeOperation>): void => {
+    if (persistenceRotation) {
+      throw new Error(`cannot ${operation} while midnight rotation is in progress`);
+    }
     if (activeOperation || retentionChangeActive) {
       const pending = activeOperation ?? "retention change";
       throw new Error(`cannot ${operation} while ${pending} is in progress`);
@@ -750,8 +766,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     }
   };
 
-  const resume = async (
-    restorations?: JarvisPowerResumeRestorations
+  const resumeInternal = async (
+    restorations: JarvisPowerResumeRestorations | undefined,
+    mainLifecycleOwnsResume: boolean
   ): Promise<JarvisPowerResumeRestorations | null | void> => {
     if (disposed || shutdownPromise) {
       throw new Error("recording controller is shutting down");
@@ -771,8 +788,10 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
           "cannot resume Jarvis while another recording is active"
         );
       }
-      await deps.jarvis.resumeCapture(state.id as string, at);
-      mainResumed = true;
+      if (!mainLifecycleOwnsResume) {
+        await deps.jarvis.resumeCapture(state.id as string, at);
+        mainResumed = true;
+      }
       activation.assertCurrent();
       const seedSegments = deps.getMeetingSnapshot().segments;
       actualRestorations = await deps.startRecording(
@@ -811,6 +830,11 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
             // Main capture still returns to a non-recording state when teardown fails.
           }
         }
+        if (mainLifecycleOwnsResume) {
+          deps.setSessionState(state);
+          deps.onError("capture_activation_cancelled");
+          throw error;
+        }
         if (mainResumed && state.id) {
           try {
             await deps.jarvis.pauseCapture(state.id, deps.now());
@@ -825,6 +849,18 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
         return;
       }
       const code = errorCode(error, "capture_resume_failed");
+      if (mainLifecycleOwnsResume) {
+        if (deps.getMeetingSnapshot().isRecording) {
+          try {
+            await deps.stopRecording({ throwOnError: false });
+          } catch {
+            // The main lifecycle owns the durable rollback even if renderer teardown fails.
+          }
+        }
+        deps.setSessionState(state);
+        deps.onError(code);
+        throw error;
+      }
       if (mainResumed && state.id) {
         const isMicError = code === "MIC_PERMISSION" || code === "MIC_DISCONNECTED";
         if (isMicError) {
@@ -855,40 +891,103 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     }
   };
 
+  const resume = (
+    restorations?: JarvisPowerResumeRestorations
+  ): Promise<JarvisPowerResumeRestorations | null | void> => resumeInternal(restorations, false);
+
+  const resumeForPower = (
+    restorations?: JarvisPowerResumeRestorations
+  ): Promise<JarvisPowerResumeRestorations | null | void> => resumeInternal(restorations, true);
+
   const rotateAtLocalDate = async ({
+    phase,
     previousSessionId,
     sessionId,
     startedAt,
   }: {
+    phase?: "prepare" | "commit" | "abort";
     previousSessionId: string;
     sessionId: string;
     startedAt: number;
   }): Promise<void> => {
     if (disposed || shutdownPromise) throw new Error("recording controller is shutting down");
+    const rotationInput = { previousSessionId, sessionId, startedAt };
+    if (phase === undefined) {
+      const current = deps.getSessionState();
+      if (current.id === sessionId && current.status === "recording") return;
+      await rotateAtLocalDate({ phase: "prepare", ...rotationInput });
+      await rotateAtLocalDate({ phase: "commit", ...rotationInput });
+      return;
+    }
     const state = deps.getSessionState();
+    if (phase === "prepare") {
+      if (
+        persistenceRotation?.previousSessionId === previousSessionId &&
+        persistenceRotation.sessionId === sessionId &&
+        persistenceRotation.startedAt === startedAt
+      ) {
+        return;
+      }
+      if (state.id !== previousSessionId || state.status !== "recording") {
+        throw new Error("renderer session does not match the midnight source");
+      }
+      if (activeOperation || retentionChangeActive) {
+        throw new Error("renderer lifecycle operation is already in progress");
+      }
+      if (persistenceRotation) {
+        const stale = persistenceRotation;
+        if (stale.previousSessionId !== previousSessionId) {
+          throw new Error("another renderer midnight transaction is already prepared");
+        }
+        persistenceRotation = null;
+        if (stale.bufferedSegments) handleSegmentsChanged(stale.bufferedSegments);
+      }
+      const rotation = { ...rotationInput, bufferedSegments: null as TranscriptSegment[] | null };
+      persistenceRotation = rotation;
+      try {
+        await flushPendingPersistence();
+      } catch (error) {
+        if (persistenceRotation === rotation) persistenceRotation = null;
+        if (rotation.bufferedSegments) handleSegmentsChanged(rotation.bufferedSegments);
+        throw error;
+      }
+      return;
+    }
+
+    if (phase === "abort") {
+      const rotation = persistenceRotation;
+      if (!rotation) return;
+      if (
+        rotation.previousSessionId !== previousSessionId ||
+        rotation.sessionId !== sessionId ||
+        rotation.startedAt !== startedAt
+      ) {
+        throw new Error("renderer midnight transaction does not match abort request");
+      }
+      persistenceRotation = null;
+      if (rotation.bufferedSegments) handleSegmentsChanged(rotation.bufferedSegments);
+      return;
+    }
+
     if (state.id === sessionId && state.status === "recording") return;
+    const rotation = persistenceRotation;
+    if (
+      !rotation ||
+      rotation.previousSessionId !== previousSessionId ||
+      rotation.sessionId !== sessionId ||
+      rotation.startedAt !== startedAt
+    ) {
+      throw new Error("renderer midnight transaction was not prepared");
+    }
     if (state.id !== previousSessionId || state.status !== "recording") {
       throw new Error("renderer session does not match the midnight source");
     }
-    if (activeOperation || retentionChangeActive || persistenceRotation) {
-      throw new Error("renderer lifecycle operation is already in progress");
-    }
-    const rotation = { bufferedSegments: null as TranscriptSegment[] | null };
-    persistenceRotation = rotation;
-    let rotated = false;
-    try {
-      await flushPendingPersistence();
-      persistenceFloors.set(sessionId, startedAt);
-      deps.setSessionState(reduceSession(state, { type: "ROTATED", id: sessionId, at: startedAt }));
-      await refreshSessions();
-      rotated = true;
-    } finally {
-      if (persistenceRotation === rotation) persistenceRotation = null;
-      if (rotation.bufferedSegments) {
-        handleSegmentsChanged(rotation.bufferedSegments);
-      }
-      if (!rotated) persistenceFloors.delete(sessionId);
-    }
+    deps.rebindUpstreamSession(previousSessionId, sessionId);
+    persistenceFloors.set(sessionId, startedAt);
+    deps.setSessionState(reduceSession(state, { type: "ROTATED", id: sessionId, at: startedAt }));
+    persistenceRotation = null;
+    if (rotation.bufferedSegments) handleSegmentsChanged(rotation.bufferedSegments);
+    await refreshSessions();
   };
 
   const finish = async (): Promise<void> => {
@@ -1070,6 +1169,9 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     if (disposed || shutdownPromise) {
       throw new Error("recording controller is shutting down");
     }
+    if (persistenceRotation) {
+      throw new Error("cannot change retention while midnight rotation is in progress");
+    }
     if (activeOperation || retentionChangeActive) {
       const pending = activeOperation ?? "retention change";
       throw new Error(`cannot change retention while ${pending} is in progress`);
@@ -1099,6 +1201,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     pauseForError,
     suspendUpstreamForPower,
     resume,
+    resumeForPower,
     rotateAtLocalDate,
     finish,
     renameSpeaker,
@@ -1255,6 +1358,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       },
       startRecording,
       stopRecording,
+      rebindUpstreamSession: rebindActiveMeetingJarvisSession,
       lockSpeaker,
       getMeetingSnapshot: () => {
         const state = useMeetingRecordingStore.getState();
@@ -1300,7 +1404,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
           try {
             const restorations = await routePowerLifecycleRequest(request, {
               suspendUpstream: controller.suspendUpstreamForPower,
-              resume: controller.resume,
+              resume: controller.resumeForPower,
               rotateAtLocalDate: controller.rotateAtLocalDate,
               enumerateDevices: () => navigator.mediaDevices.enumerateDevices(),
             });

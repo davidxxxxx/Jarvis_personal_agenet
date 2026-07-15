@@ -680,8 +680,8 @@ async function initializeCoreManagers() {
     suspendUpstream: (token) => rendererPowerResumeHandshake.request("suspend", token),
     resumeDevices: (token) => rendererPowerResumeHandshake.request("enumerate", token),
     resumeUpstream: (token) => rendererPowerResumeHandshake.request("resume", token),
-    rebindPcmSession: (previousSessionId, nextSessionId) =>
-      ipcHandlers.rebindJarvisSession(previousSessionId, nextSessionId),
+    rebindPcmSession: (previousSessionId, nextSessionId, phase) =>
+      ipcHandlers.rebindJarvisSession(previousSessionId, nextSessionId, phase),
     rotateUpstream: (rotation) =>
       rendererPowerResumeHandshake.request("rotate", {
         ...rotation,

@@ -69,6 +69,7 @@ export interface JarvisPowerResumeToken {
   sessionId: string;
   sources: Record<string, JarvisPowerResumeSource>;
   restorations?: JarvisPowerResumeRestorations;
+  phase?: "prepare" | "commit" | "abort";
   previousSessionId?: string;
   startedAt?: number;
   localDate?: string;

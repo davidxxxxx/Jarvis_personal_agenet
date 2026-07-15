@@ -84,6 +84,7 @@ const ALLOWED_MEETING_PROVIDERS = new Set([
 // streaming providers must be told the true PCM rate or they misread the audio.
 const MEETING_STREAM_SAMPLE_RATE = 24000;
 const MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES = 512 * 1024;
+const JARVIS_MIDNIGHT_REBIND_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT = 1_024;
 
 function createJarvisTranscribeWavAdapter({
@@ -802,11 +803,11 @@ class IPCHandlers {
     return { token, environment, tenant };
   }
 
-  rebindJarvisSession(previousSessionId, nextSessionId) {
+  rebindJarvisSession(previousSessionId, nextSessionId, phase = "commit") {
     if (typeof this._rebindJarvisSession !== "function") {
       throw new Error("Jarvis PCM router is not initialized");
     }
-    return this._rebindJarvisSession(previousSessionId, nextSessionId);
+    return this._rebindJarvisSession(previousSessionId, nextSessionId, phase);
   }
 
   setupHandlers() {
@@ -4900,16 +4901,62 @@ class IPCHandlers {
     let meetingNoteId = null;
     let activeMeetingCaptureMode = resolveMeetingCaptureMode();
     let activeJarvisSessionId = null;
+    let pendingJarvisSessionRebind = null;
     let activeMeetingInputBinding = null;
-    this._rebindJarvisSession = (previousSessionId, nextSessionId) => {
+    this._rebindJarvisSession = (previousSessionId, nextSessionId, phase = "commit") => {
       const previous = assertId(previousSessionId, "previousSessionId");
       const next = assertId(nextSessionId, "nextSessionId");
-      if (activeJarvisSessionId === next) return { rebound: false, sessionId: next };
-      if (activeJarvisSessionId !== previous) {
-        throw new Error("active Jarvis PCM session does not match the midnight source");
+      if (!["prepare", "commit", "abort"].includes(phase)) {
+        throw new TypeError("Jarvis PCM rebind phase is invalid");
+      }
+      if (phase === "prepare") {
+        if (pendingJarvisSessionRebind) {
+          if (
+            pendingJarvisSessionRebind.previousSessionId === previous &&
+            pendingJarvisSessionRebind.nextSessionId === next
+          ) {
+            return { prepared: false, sessionId: previous };
+          }
+          throw new Error("another Jarvis PCM rebind is already prepared");
+        }
+        if (activeJarvisSessionId !== previous) {
+          throw new Error("active Jarvis PCM session does not match the midnight source");
+        }
+        pendingJarvisSessionRebind = {
+          previousSessionId: previous,
+          nextSessionId: next,
+          chunks: [],
+          byteLength: 0,
+        };
+        return { prepared: true, sessionId: previous };
+      }
+
+      const pending = pendingJarvisSessionRebind;
+      if (phase === "abort") {
+        if (!pending) return { aborted: false, sessionId: activeJarvisSessionId };
+        if (pending.previousSessionId !== previous || pending.nextSessionId !== next) {
+          throw new Error("prepared Jarvis PCM rebind does not match abort request");
+        }
+        pendingJarvisSessionRebind = null;
+        for (const chunk of pending.chunks) sendMeetingAudio(chunk.buffer, chunk.source);
+        return { aborted: true, sessionId: previous };
+      }
+
+      if (!pending) {
+        if (activeJarvisSessionId === next) return { rebound: false, sessionId: next };
+        if (activeJarvisSessionId !== previous) {
+          throw new Error("active Jarvis PCM session does not match the midnight source");
+        }
+        activeJarvisSessionId = next;
+        return { rebound: true, sessionId: next };
+      }
+      if (pending.previousSessionId !== previous || pending.nextSessionId !== next) {
+        throw new Error("prepared Jarvis PCM rebind does not match commit request");
       }
       activeJarvisSessionId = next;
-      return { rebound: true, sessionId: next };
+      pendingJarvisSessionRebind = null;
+      for (const chunk of pending.chunks) sendMeetingAudio(chunk.buffer, chunk.source);
+      return { rebound: true, sessionId: next, flushedChunks: pending.chunks.length };
     };
 
     const clearActiveMeetingInputBinding = (inputBinding = activeMeetingInputBinding) => {
@@ -4938,6 +4985,7 @@ class IPCHandlers {
     const resetMeetingCaptureIdentity = () => {
       activeMeetingCaptureMode = resolveMeetingCaptureMode();
       activeJarvisSessionId = null;
+      pendingJarvisSessionRebind = null;
     };
 
     const resetActiveMeetingCapture = (inputBinding = activeMeetingInputBinding) => {
@@ -6258,6 +6306,25 @@ class IPCHandlers {
       const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
 
       if (source === "system" && activeMeetingCaptureMode.micOnly) return false;
+      if (pendingJarvisSessionRebind) {
+        if (
+          pendingJarvisSessionRebind.byteLength + outboundBuffer.byteLength >
+          JARVIS_MIDNIGHT_REBIND_BUFFER_MAX_BYTES
+        ) {
+          debugLogger.warn(
+            "Jarvis midnight PCM buffer reached its byte limit",
+            { maxBytes: JARVIS_MIDNIGHT_REBIND_BUFFER_MAX_BYTES },
+            "jarvis"
+          );
+          return false;
+        }
+        pendingJarvisSessionRebind.chunks.push({
+          buffer: Buffer.from(outboundBuffer),
+          source,
+        });
+        pendingJarvisSessionRebind.byteLength += outboundBuffer.byteLength;
+        return true;
+      }
 
       return routeJarvisPcm({
         sessionId: activeJarvisSessionId,

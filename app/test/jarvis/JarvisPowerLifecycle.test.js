@@ -102,8 +102,8 @@ function createHarness({ initialState = activeState(), resumeFailure = null } = 
       calls.push(["resume-upstream", resumeToken.sessionId]);
       return null;
     },
-    rebindPcmSession: (previousSessionId, nextSessionId) =>
-      calls.push(["rebind-pcm", previousSessionId, nextSessionId]),
+    rebindPcmSession: (previousSessionId, nextSessionId, phase) =>
+      calls.push(["rebind-pcm", previousSessionId, nextSessionId, phase]),
     rotateUpstream: async (rotation) => calls.push(["rotate-upstream", rotation]),
     ensureGpuReady: async () => calls.push(["gpu-ready"]),
     localDateKey: (at) => (at < 2_000 ? "2026-07-14" : "2026-07-15"),
@@ -444,6 +444,42 @@ test("GPU health failure re-suspends a durably resumed capture", async () => {
   assert.equal(calls.filter(([name]) => name === "processing-start").length, 0);
 });
 
+test("real renderer wake failure rebuilds a durable token and the next wake succeeds", async () => {
+  const runtime = createRealCapture();
+  let upstreamAttempts = 0;
+  const lifecycle = new JarvisPowerLifecycle({
+    service: runtime.service,
+    processingLifecycle: { start() {}, async stop() {} },
+    releaseWhisper: async () => {},
+    suspendUpstream: async () => {},
+    resumeDevices: async () => ({
+      mic: { deviceId: "physical-mic-2", deviceLabel: "MV7", strategy: "physical" },
+      system: { deviceId: "loopback-2", deviceLabel: "Speakers", strategy: "wasapi-loopback" },
+    }),
+    resumeUpstream: async () => {
+      upstreamAttempts += 1;
+      if (upstreamAttempts === 1) throw new Error("renderer mic open failed");
+      return null;
+    },
+    rebindPcmSession() {},
+    rotateUpstream: async () => {},
+    ensureGpuReady: async () => {},
+    createSessionId: () => "unused",
+  });
+  try {
+    await lifecycle.onSuspend(2_000);
+    await assert.rejects(lifecycle.onResume(3_000), /renderer mic open failed/);
+    assert.equal(runtime.service.getState().status, "paused");
+    assert.equal(lifecycle.getResumeToken().sessionId, "session-day-1");
+
+    const resumed = await lifecycle.onResume(4_000);
+    assert.equal(resumed.status, "recording");
+    assert.equal(runtime.service.appendPcm("session-day-1", "mic", Buffer.alloc(4_800)), true);
+  } finally {
+    runtime.close();
+  }
+});
+
 test("cold launch reports interruption without invoking device resume", async () => {
   const { lifecycle, calls } = createHarness({
     initialState: { sessionId: null, status: "idle", sources: {} },
@@ -507,24 +543,32 @@ test("duplicate and repeated local-date callbacks return the same destination", 
 
   assert.equal(new Set(results.map((result) => result.sessionId)).size, 1);
   assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
-  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 1);
-  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 1);
+  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 2);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 2);
 });
 
-test("local midnight rebinds PCM before awaiting renderer persistence rotation", async () => {
+test("local midnight prepares renderer and PCM before an atomic service switch", async () => {
   const { lifecycle, calls } = createHarness();
-  const renderer = deferred();
   lifecycle.rotateUpstream = async (rotation) => {
     calls.push(["rotate-upstream", rotation]);
-    await renderer.promise;
   };
 
-  const rotating = lifecycle.onLocalDateChange(2_000);
-  await new Promise((resolve) => setImmediate(resolve));
+  await lifecycle.onLocalDateChange(2_000);
 
   assert.deepEqual(
     calls.filter(([name]) => ["rotate", "rebind-pcm", "rotate-upstream"].includes(name)),
     [
+      [
+        "rotate-upstream",
+        {
+          phase: "prepare",
+          previousSessionId: "session-day-1",
+          sessionId: "session-day-2",
+          startedAt: 2_000,
+          localDate: "2026-07-15",
+        },
+      ],
+      ["rebind-pcm", "session-day-1", "session-day-2", "prepare"],
       [
         "rotate",
         {
@@ -534,10 +578,11 @@ test("local midnight rebinds PCM before awaiting renderer persistence rotation",
           at: 2_000,
         },
       ],
-      ["rebind-pcm", "session-day-1", "session-day-2"],
+      ["rebind-pcm", "session-day-1", "session-day-2", "commit"],
       [
         "rotate-upstream",
         {
+          phase: "commit",
           previousSessionId: "session-day-1",
           sessionId: "session-day-2",
           startedAt: 2_000,
@@ -546,17 +591,70 @@ test("local midnight rebinds PCM before awaiting renderer persistence rotation",
       ],
     ]
   );
-  renderer.resolve();
-  await rotating;
 });
 
-test("a failed renderer midnight switch retries without rotating or rebinding PCM twice", async () => {
-  const { lifecycle, calls } = createHarness();
-  let attempts = 0;
+test("a renderer midnight prepare failure leaves service and PCM on the old session", async () => {
+  const { lifecycle, calls, getState } = createHarness();
   lifecycle.rotateUpstream = async (rotation) => {
-    attempts += 1;
     calls.push(["rotate-upstream", rotation]);
-    if (attempts === 1) throw new Error("renderer persistence unavailable");
+    if (rotation.phase === "prepare") throw new Error("renderer busy");
+  };
+
+  await assert.rejects(lifecycle.onLocalDateChange(2_000), /renderer busy/);
+
+  assert.equal(getState().sessionId, "session-day-1");
+  assert.equal(calls.filter(([name]) => name === "rotate").length, 0);
+  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 0);
+});
+
+test("a service midnight failure aborts prepared PCM and renderer transactions", async () => {
+  const { lifecycle, service, calls, getState } = createHarness();
+  service.rotateAtLocalDate = (input) => {
+    calls.push(["rotate", input]);
+    throw new Error("destination writer failed");
+  };
+
+  await assert.rejects(lifecycle.onLocalDateChange(2_000), /destination writer failed/);
+
+  assert.equal(getState().sessionId, "session-day-1");
+  assert.deepEqual(
+    calls.filter(([name]) => ["rebind-pcm", "rotate-upstream"].includes(name)),
+    [
+      [
+        "rotate-upstream",
+        {
+          phase: "prepare",
+          previousSessionId: "session-day-1",
+          sessionId: "session-day-2",
+          startedAt: 2_000,
+          localDate: "2026-07-15",
+        },
+      ],
+      ["rebind-pcm", "session-day-1", "session-day-2", "prepare"],
+      ["rebind-pcm", "session-day-1", "session-day-2", "abort"],
+      [
+        "rotate-upstream",
+        {
+          phase: "abort",
+          previousSessionId: "session-day-1",
+          sessionId: "session-day-2",
+          startedAt: 2_000,
+          localDate: "2026-07-15",
+        },
+      ],
+    ]
+  );
+});
+
+test("a failed renderer midnight commit retries without rotating or rebinding PCM again", async () => {
+  const { lifecycle, calls } = createHarness();
+  let commitAttempts = 0;
+  lifecycle.rotateUpstream = async (rotation) => {
+    calls.push(["rotate-upstream", rotation]);
+    if (rotation.phase === "commit") {
+      commitAttempts += 1;
+      if (commitAttempts === 1) throw new Error("renderer persistence unavailable");
+    }
   };
 
   await assert.rejects(lifecycle.onLocalDateChange(2_000), /renderer persistence unavailable/);
@@ -564,8 +662,8 @@ test("a failed renderer midnight switch retries without rotating or rebinding PC
 
   assert.equal(result.sessionId, "session-day-2");
   assert.equal(calls.filter(([name]) => name === "rotate").length, 1);
-  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 1);
-  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 2);
+  assert.equal(calls.filter(([name]) => name === "rebind-pcm").length, 2);
+  assert.equal(calls.filter(([name]) => name === "rotate-upstream").length, 3);
 });
 
 test("idle local-date changes never start capture", async () => {

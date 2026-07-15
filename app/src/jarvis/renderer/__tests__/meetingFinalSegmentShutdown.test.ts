@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   prepareTranscription,
+  rebindActiveMeetingJarvisSession,
   startRecording,
   stopRecording,
   useMeetingRecordingStore,
@@ -281,6 +282,81 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     } finally {
       useSettingsStore.setState(previous);
     }
+  });
+
+  it("reports system-default after an exact wake microphone falls back to the default device", async () => {
+    const previous = {
+      selectedMicDeviceId: useSettingsStore.getState().selectedMicDeviceId,
+      preferBuiltInMic: useSettingsStore.getState().preferBuiltInMic,
+    };
+    useSettingsStore.setState({ selectedMicDeviceId: "sonar", preferBuiltInMic: false });
+    try {
+      const fallbackTrack = new FakeTrack("Default Microphone", "default-mic");
+      const exactFailure = new Error("selected microphone disappeared");
+      exactFailure.name = "NotFoundError";
+      vi.mocked(navigator.mediaDevices.getUserMedia)
+        .mockRejectedValueOnce(exactFailure)
+        .mockResolvedValueOnce(streamFor(fallbackTrack));
+      vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValueOnce([]);
+
+      const result = await startRecording({
+        noteId: null,
+        noteTitle: "Jarvis",
+        folderId: null,
+        captureSystemAudio: false,
+        captureMicrophone: true,
+        micOnly: true,
+        jarvisSessionId: "s-power-default",
+        micDeviceIdOverride: "fresh-mic",
+        powerRestorations: {
+          mic: { deviceId: "fresh-mic", deviceLabel: "Fresh MV7", strategy: "physical" },
+        },
+      });
+
+      expect(navigator.mediaDevices.getUserMedia).toHaveBeenNthCalledWith(1, {
+        audio: expect.objectContaining({ deviceId: { exact: "fresh-mic" } }),
+      });
+      expect(navigator.mediaDevices.getUserMedia).toHaveBeenNthCalledWith(2, {
+        audio: expect.not.objectContaining({ deviceId: expect.anything() }),
+      });
+      expect(result).toEqual({
+        mic: {
+          deviceId: "default-mic",
+          deviceLabel: "Default Microphone",
+          strategy: "system-default",
+        },
+      });
+    } finally {
+      useSettingsStore.setState(previous);
+    }
+  });
+
+  it("uses the rotated Jarvis session for later microphone interruption evidence", async () => {
+    const track = new FakeTrack("Physical microphone", "physical-mic");
+    const never = new Promise<MediaStream>(() => {});
+    vi.mocked(navigator.mediaDevices.getUserMedia)
+      .mockResolvedValueOnce(streamFor(track))
+      .mockImplementationOnce(() => never);
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      captureMicrophone: true,
+      micOnly: true,
+      jarvisSessionId: "s-before-midnight",
+    });
+    rebindActiveMeetingJarvisSession("s-before-midnight", "s-after-midnight");
+    track.end();
+
+    await vi.waitFor(() => {
+      expect(window.electronAPI.jarvis.sourceInterrupted).toHaveBeenCalledWith(
+        "s-after-midnight",
+        "mic",
+        expect.objectContaining({ reason: "mic-track-ended" })
+      );
+    });
   });
 
   afterEach(async () => {
@@ -3430,6 +3506,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       ensureTranscriptionReady: vi.fn(async () => {}),
       startRecording,
       stopRecording,
+      rebindUpstreamSession: vi.fn(),
       lockSpeaker: vi.fn(),
       getMeetingSnapshot: () => {
         const state = useMeetingRecordingStore.getState();

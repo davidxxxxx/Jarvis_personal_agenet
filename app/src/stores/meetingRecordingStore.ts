@@ -508,6 +508,7 @@ let isStartingFlag = false;
 let captureAttemptGeneration = 0;
 let meetingInputRejected = false;
 let activeMeetingInputGeneration: string | null = null;
+let activeJarvisSessionBinding: { sessionId: string } | null = null;
 let isPrepared = false;
 let preparedMicOnly: boolean | null = null;
 let segmentsRefValue: TranscriptSegment[] = [];
@@ -799,6 +800,7 @@ interface CaptureCleanupOptions {
 async function cleanupCaptureSources(options: CaptureCleanupOptions = {}): Promise<void> {
   captureAttemptGeneration += 1;
   activeMeetingInputGeneration = null;
+  activeJarvisSessionBinding = null;
   if (preparePromise) {
     prepareGeneration += 1;
     preparePromise = null;
@@ -947,11 +949,26 @@ export interface StartRecordingArgs {
   powerRestorations?: JarvisPowerResumeRestorations;
 }
 
+export function rebindActiveMeetingJarvisSession(
+  previousSessionId: string,
+  nextSessionId: string
+): void {
+  if (!activeJarvisSessionBinding) {
+    throw new Error("active Jarvis recording session is unavailable");
+  }
+  if (activeJarvisSessionBinding.sessionId === nextSessionId) return;
+  if (activeJarvisSessionBinding.sessionId !== previousSessionId) {
+    throw new Error("active Jarvis recording session does not match midnight source");
+  }
+  activeJarvisSessionBinding.sessionId = nextSessionId;
+}
+
 export async function startRecording(
   args: StartRecordingArgs
 ): Promise<JarvisPowerResumeRestorations | void> {
   if (isRecordingFlag || isStartingFlag || meetingStopCoordinator.hasPendingStop()) return;
   const captureAttempt = ++captureAttemptGeneration;
+  const jarvisSessionBinding = args.jarvisSessionId ? { sessionId: args.jarvisSessionId } : null;
   const isCurrentCaptureAttempt = () => captureAttemptGeneration === captureAttempt;
   let rejectCaptureSetupCancellation!: (reason: Error) => void;
   const captureSetupCancellation = new Promise<never>((_resolve, reject) => {
@@ -1272,6 +1289,10 @@ export async function startRecording(
     });
     let micFailureCode: "MIC_PERMISSION" | "MIC_DISCONNECTED" | null = null;
     let usedDefaultMicFallback = false;
+    let actualMicStrategy: string | null =
+      args.micDeviceIdOverride === null
+        ? "system-default"
+        : (args.powerRestorations?.mic?.strategy ?? "physical");
 
     const [startResult, micResult, initialSystemCaptureResult] = await Promise.race([
       Promise.all([
@@ -1355,6 +1376,7 @@ export async function startRecording(
                         !isDeniedAutomaticMicrophone(candidateTrack.label)
                       ) {
                         usedDefaultMicFallback = true;
+                        actualMicStrategy = "physical";
                         logger.info(
                           "Selected Jarvis microphone unavailable; using physical fallback",
                           { label: candidate.label },
@@ -1397,6 +1419,7 @@ export async function startRecording(
                       return null;
                     }
                     usedDefaultMicFallback = true;
+                    actualMicStrategy = "system-default";
                     logger.info(
                       "Selected Jarvis microphone unavailable; using system default",
                       { errorCode: "MIC_DISCONNECTED" },
@@ -1495,6 +1518,7 @@ export async function startRecording(
     const inputGeneration = startResult.inputGeneration;
     acceptedMainInputGeneration = inputGeneration;
     activeMeetingInputGeneration = inputGeneration;
+    activeJarvisSessionBinding = jarvisSessionBinding;
     acceptedSourceStateGeneration = inputGeneration;
 
     const systemAudioMode = startResult.systemAudioMode || initialSystemAudioAccess.mode;
@@ -1774,7 +1798,6 @@ export async function startRecording(
     let socketReady = false;
 
     const selectedMicDeviceId = getSettings().selectedMicDeviceId || null;
-    const jarvisSessionId = args.jarvisSessionId ?? null;
     let recoveryGeneration = 0;
     let recoveryPromise: Promise<void> | null = null;
     let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1851,6 +1874,7 @@ export async function startRecording(
       at = Date.now()
     ): Promise<boolean> => {
       if (!isCurrentInput()) return false;
+      const jarvisSessionId = jarvisSessionBinding?.sessionId ?? null;
       if (!jarvisSessionId) return true;
       try {
         await window.electronAPI.jarvis.sourceInterrupted(jarvisSessionId, sourceType, {
@@ -1917,6 +1941,7 @@ export async function startRecording(
     };
     const notifyMicRestored = async (payload: JarvisSourceRestorationInput): Promise<boolean> => {
       if (!isCurrentInput()) return false;
+      const jarvisSessionId = jarvisSessionBinding?.sessionId ?? null;
       if (!jarvisSessionId) return true;
       try {
         await window.electronAPI.jarvis.sourceRestored(jarvisSessionId, "mic", payload);
@@ -2057,6 +2082,7 @@ export async function startRecording(
       generation: number
     ): Promise<boolean> => {
       if (!rendererSystemRecoveryIsCurrent(generation)) return false;
+      const jarvisSessionId = jarvisSessionBinding?.sessionId ?? null;
       if (!jarvisSessionId) return true;
       try {
         await window.electronAPI.jarvis.sourceRestored(jarvisSessionId, "system", payload);
@@ -2883,9 +2909,7 @@ export async function startRecording(
       bindings.mic = {
         deviceId: track?.getSettings().deviceId || null,
         deviceLabel: track?.label?.trim() || null,
-        strategy:
-          args.powerRestorations?.mic?.strategy ??
-          (args.micDeviceIdOverride === null ? "system-default" : "physical"),
+        strategy: actualMicStrategy,
       };
     }
     if (captureSystemAudio) {

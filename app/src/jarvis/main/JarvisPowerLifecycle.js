@@ -290,23 +290,47 @@ class JarvisPowerLifecycle {
       if (sessionLocalDate === null || sessionLocalDate === localDate) {
         return { rotated: false, localDate, ...state };
       }
-      const rotationWork = this.service.rotateAtLocalDate({
-        sessionId: state.sessionId,
-        newSessionId: this.createSessionId(),
+      const upstream = {
+        previousSessionId: state.sessionId,
+        sessionId: this.createSessionId(),
+        startedAt: now,
         localDate,
-        at: now,
-      });
-      const result =
-        rotationWork && typeof rotationWork.then === "function" ? await rotationWork : rotationWork;
+      };
+      await this.rotateUpstream({ phase: "prepare", ...structuredClone(upstream) });
+      let pcmPrepared = false;
+      let result;
+      try {
+        this.rebindPcmSession(state.sessionId, upstream.sessionId, "prepare");
+        pcmPrepared = true;
+        const rotationWork = this.service.rotateAtLocalDate({
+          sessionId: state.sessionId,
+          newSessionId: upstream.sessionId,
+          localDate,
+          at: now,
+        });
+        result =
+          rotationWork && typeof rotationWork.then === "function"
+            ? await rotationWork
+            : rotationWork;
+      } catch (error) {
+        if (pcmPrepared) {
+          try {
+            this.rebindPcmSession(state.sessionId, upstream.sessionId, "abort");
+          } catch (abortError) {
+            if (error && typeof error === "object") error.pcmAbortError = abortError;
+          }
+        }
+        try {
+          await this.rotateUpstream({ phase: "abort", ...structuredClone(upstream) });
+        } catch (abortError) {
+          if (error && typeof error === "object") error.upstreamAbortError = abortError;
+        }
+        throw error;
+      }
       const pending = {
         result,
         pcmRebound: false,
-        upstream: {
-          previousSessionId: state.sessionId,
-          sessionId: result.sessionId,
-          startedAt: now,
-          localDate,
-        },
+        upstream,
       };
       this.pendingRotationsByLocalDate.set(localDate, pending);
       return this._completeLocalDateRotation(localDate, pending);
@@ -315,10 +339,14 @@ class JarvisPowerLifecycle {
 
   async _completeLocalDateRotation(localDate, pending) {
     if (!pending.pcmRebound) {
-      this.rebindPcmSession(pending.upstream.previousSessionId, pending.upstream.sessionId);
+      this.rebindPcmSession(
+        pending.upstream.previousSessionId,
+        pending.upstream.sessionId,
+        "commit"
+      );
       pending.pcmRebound = true;
     }
-    await this.rotateUpstream(structuredClone(pending.upstream));
+    await this.rotateUpstream({ phase: "commit", ...structuredClone(pending.upstream) });
     const rotation = { rotated: true, ...pending.result };
     this.rotationsByLocalDate.set(localDate, rotation);
     if (this.pendingRotationsByLocalDate.get(localDate) === pending) {
