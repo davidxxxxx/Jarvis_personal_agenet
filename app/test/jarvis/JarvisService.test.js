@@ -1625,7 +1625,7 @@ test("all-source interruption stays degraded and remains manually pausable", () 
   }
 });
 
-test("source interruption persists its track gap and session status in one repository call", () => {
+test("source interruption persists its track gap and session status in one repository call", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-interrupt-atomic-status-"));
   const repository = createRepository();
   const originalSetSessionStatus = repository.setSessionStatus;
@@ -1672,7 +1672,7 @@ test("source interruption persists its track gap and session status in one repos
     assert.equal(interrupted.sources.mic.state, "reconnecting");
   } finally {
     repository.setSessionStatus = originalSetSessionStatus;
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });
