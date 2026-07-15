@@ -196,6 +196,11 @@ class CaptureEvidenceStore {
               AND active.completed_at IS NULL
               AND active.lease_expires_at IS NOT NULL
               AND active.lease_expires_at > @at
+              AND NOT (
+                active.input_hash = chunk.sha256
+                AND active.input_version = @inputVersion
+                AND active.model_version = @modelVersion
+              )
           )
         ORDER BY chunk.ended_at, chunk.id
         LIMIT @limit

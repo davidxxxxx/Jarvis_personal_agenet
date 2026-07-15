@@ -1496,6 +1496,58 @@ test("completed A rollback waits for a live B lease and supersedes B at expiry",
   );
 });
 
+test("current live A remains owned while rollback supersedes pending B", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-a" }));
+  store.enqueueCurrentModelTranscriptionJobs({
+    inputVersion: 1,
+    modelVersion: "model-b",
+    at: 100,
+  });
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', attempt_count = 1, completed_at = NULL,
+         next_retry_at = NULL, lease_owner = 'worker-a', lease_expires_at = 120,
+         error_code = NULL
+     WHERE model_version = 'model-a'`
+  ).run();
+  const modelA = db.prepare("SELECT * FROM processing_jobs WHERE model_version = 'model-a'").get();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 1 }
+  );
+  assert.deepEqual(db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(modelA.id), modelA);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, completed_at, error_code
+         FROM processing_jobs WHERE model_version = 'model-b'`
+      )
+      .get(),
+    {
+      state: "superseded",
+      attempt_count: 0,
+      completed_at: 110,
+      error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+    }
+  );
+  assert.deepEqual(store.claimJobs({ owner: "worker-b", at: 110, leaseMs: 10, limit: 1 }), []);
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+});
+
 test("rejects every transcription enqueue after a chunk is tombstoned", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
