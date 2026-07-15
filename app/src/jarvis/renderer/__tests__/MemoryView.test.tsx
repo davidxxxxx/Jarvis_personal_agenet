@@ -142,11 +142,20 @@ describe("MemoryView processing timeline", () => {
 
   beforeEach(() => {
     poll = null;
-    setIntervalSpy = vi.spyOn(window, "setInterval").mockImplementation((callback) => {
-      poll = callback as () => void;
-      return 7 as unknown as ReturnType<typeof window.setInterval>;
+    const originalSetInterval = window.setInterval.bind(window);
+    const originalClearInterval = window.clearInterval.bind(window);
+    setIntervalSpy = vi
+      .spyOn(window, "setInterval")
+      .mockImplementation((callback, delay, ...args) => {
+        if (delay === 2_500) {
+          poll = callback as () => void;
+          return 7 as unknown as ReturnType<typeof window.setInterval>;
+        }
+        return originalSetInterval(callback, delay, ...args);
+      });
+    clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation((timer) => {
+      if (timer !== 7) originalClearInterval(timer);
     });
-    clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
     useJarvisStore.setState({ sessions: [session] });
   });
 
@@ -191,10 +200,13 @@ describe("MemoryView processing timeline", () => {
 
     expect(await screen.findByText("正在处理")).toBeInTheDocument();
     expect(getSessionTimeline).toHaveBeenCalledTimes(1);
-    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2_500);
+    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2_500));
+
+    const unrelatedTimer = window.setInterval(() => undefined, 50);
 
     act(() => poll?.());
     act(() => poll?.());
+    window.clearInterval(unrelatedTimer);
     expect(getSessionTimeline).toHaveBeenCalledTimes(2);
 
     await act(async () => {
@@ -203,16 +215,17 @@ describe("MemoryView processing timeline", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "返回记忆库" }));
 
-    await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalled());
+    await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalledWith(7));
     act(() => poll?.());
     expect(getSessionTimeline).toHaveBeenCalledTimes(2);
   });
 
   it("contains a failed refresh and allows the next poll to retry", async () => {
+    const failedRefresh = deferred<JarvisSessionTimeline>();
     const getSessionTimeline = vi
       .fn()
       .mockResolvedValueOnce(timeline)
-      .mockRejectedValueOnce(new Error("temporary IPC failure"))
+      .mockImplementationOnce(() => failedRefresh.promise)
       .mockResolvedValueOnce({ ...timeline, processing_state: "ready", ready_at: 3_000 });
     Object.assign(window, {
       electronAPI: {
@@ -237,10 +250,13 @@ describe("MemoryView processing timeline", () => {
     render(<MemoryView />);
     fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
     expect(await screen.findByText("正在处理")).toBeInTheDocument();
+    await waitFor(() => expect(poll).not.toBeNull());
 
     act(() => poll?.());
+    expect(getSessionTimeline).toHaveBeenCalledTimes(2);
     await act(async () => {
-      await Promise.resolve();
+      failedRefresh.reject(new Error("temporary IPC failure"));
+      await failedRefresh.promise.catch(() => undefined);
     });
     act(() => poll?.());
 
@@ -306,6 +322,7 @@ describe("MemoryView processing timeline", () => {
     fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
     expect(await screen.findByText("正在处理")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "生成总结" })).not.toBeInTheDocument();
+    await waitFor(() => expect(poll).not.toBeNull());
 
     act(() => poll?.());
 
