@@ -158,9 +158,24 @@ function assertTerminalAndTruthful(repository) {
         job_type: "transcribe_chunk",
         job_state: "completed",
         error_code: null,
-        processing_state: "ready",
+        processing_state: "processing",
       },
     ]
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT job_type, state, error_code
+         FROM processing_jobs
+         WHERE session_id = 'ready-session'
+           AND job_type = 'diarize_track'`
+      )
+      .get(),
+    {
+      job_type: "diarize_track",
+      state: "blocked",
+      error_code: "HANDLER_MISSING",
+    }
   );
   const untruthfulReady = repository.db
     .prepare(

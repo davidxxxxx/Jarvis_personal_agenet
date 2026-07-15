@@ -6,6 +6,7 @@ const path = require("node:path");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
+const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
 const { createJarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const {
   JarvisProcessingLifecycle,
@@ -70,6 +71,14 @@ test("migration stops the old runtime and rebuilds production handlers from reco
         repository,
         service,
         ipcHandlers,
+        sessionDiarizationWorker: new SessionDiarizationWorker({
+          repository,
+          audioEvidenceReader: service.audioEvidenceReader,
+          diarizeAudio: async () => assert.fail("no-speech evidence ran the diarizer"),
+          embedWindow: async () => assert.fail("no-speech evidence ran embeddings"),
+          modelArtifactSha256: "a".repeat(64),
+          clock: () => 2_000,
+        }),
         model: "large-v3-turbo",
         owner: `migration-worker-${builds.length}`,
         now: () => 2_000,
@@ -166,6 +175,9 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   const newRuntime = await participant.resume();
   await newRuntime.start();
 
+  assert.equal(repository.getSession("migrated-session").processing_state, "processing");
+  for (let drain = 0; drain < 4; drain += 1) await newRuntime.drainOnce();
+
   assert.deepEqual(events.slice(0, 8), [
     "runtime-stop:old-reader",
     "service-prepare",
@@ -185,7 +197,41 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   assert.equal(builds[1].flac, service.flacCompressionWorker);
   assert.equal(builds[1].previewRing, service.previewAudioRing);
   assert.equal(service.previewAudioRing.rootDir, path.join(nextRoot, "recordings", ".preview"));
-  assert.deepEqual(readerCalls, ["new-reader"]);
+  assert.deepEqual(readerCalls, ["new-reader", "new-reader"]);
   assert.deepEqual(compressionCalls, ["new-flac"]);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT job_type, state FROM processing_jobs
+         WHERE session_id = 'migrated-session'
+           AND job_type IN ('diarize_track', 'resolve_identities')
+         ORDER BY job_type`
+      )
+      .all(),
+    [
+      { job_type: "diarize_track", state: "completed" },
+      { job_type: "resolve_identities", state: "completed" },
+    ]
+  );
+  assert.equal(
+    repository.db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM speaker_clusters
+         WHERE session_id = 'migrated-session'`
+      )
+      .get().count,
+    0
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT expected_cluster_count, completed_at
+         FROM speaker_identity_resolution_runs
+         WHERE session_id = 'migrated-session'`
+      )
+      .get(),
+    { expected_cluster_count: 0, completed_at: 2_000 }
+  );
   assert.equal(repository.getSession("migrated-session").processing_state, "ready");
 });
