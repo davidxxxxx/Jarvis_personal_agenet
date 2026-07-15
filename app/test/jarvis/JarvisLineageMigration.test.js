@@ -193,6 +193,9 @@ function seedSecondFinalSegment(db) {
 }
 
 function seedAnalysisInput(db, { sessionId = "session-1", inputId = "input-1" } = {}) {
+  const { display_name: subjectDisplayNameSnapshot } = db
+    .prepare("SELECT display_name FROM people WHERE id = 'person-1'")
+    .get();
   db.prepare(
     `INSERT INTO analysis_inputs (
        id, session_id, transcript_revision, identity_revision, prompt_version,
@@ -201,9 +204,9 @@ function seedAnalysisInput(db, { sessionId = "session-1", inputId = "input-1" } 
   ).run(inputId, sessionId, HASH_A, HASH_B, HASH_C);
   db.prepare(
     `INSERT INTO analysis_input_speaker_bindings (
-       analysis_input_id, label, subject_kind, subject_id
-     ) VALUES (?, 'SELF', 'person', 'person-1')`
-  ).run(inputId);
+       analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+     ) VALUES (?, 'SELF', 'person', 'person-1', ?)`
+  ).run(inputId, subjectDisplayNameSnapshot);
   db.prepare(
     `INSERT INTO analysis_input_segments (
        analysis_input_id, ordinal, segment_id, segment_version, text_hash, text_snapshot,
@@ -439,7 +442,8 @@ test("speaker bindings require durable targets and exact session scope", () => {
         id, session_id, local_label, model_id, person_id, link_state, created_at, updated_at
       ) VALUES
         ('cluster-other', 'session-other', 'speaker_1', 'speaker-v1', 'person-other', 'confirmed', 5000, 5000),
-        ('cluster-local', 'session-1', 'speaker_1', 'speaker-v1', 'person-other', 'confirmed', 5000, 5000);
+        ('cluster-local', 'session-1', 'speaker_1', 'speaker-v1', 'person-other', 'confirmed', 5000, 5000),
+        ('cluster-bound', 'session-1', 'speaker_2', 'speaker-v1', 'person-other', 'confirmed', 5000, 5000);
     `);
     applyJarvisMigrations(db);
     db.prepare(
@@ -455,8 +459,8 @@ test("speaker bindings require durable targets and exact session scope", () => {
           db
             .prepare(
               `INSERT INTO analysis_input_speaker_bindings (
-                 analysis_input_id, label, subject_kind, subject_id
-               ) VALUES ('input-bindings', ?, 'person', 'person-other')`
+                 analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+               ) VALUES ('input-bindings', ?, 'person', 'person-other', 'Other')`
             )
             .run(label),
         { code: "SQLITE_CONSTRAINT_CHECK" }
@@ -468,8 +472,8 @@ test("speaker bindings require durable targets and exact session scope", () => {
         db
           .prepare(
             `INSERT INTO analysis_input_speaker_bindings (
-               analysis_input_id, label, subject_kind, subject_id
-             ) VALUES ('input-bindings', 'P1', 'person', 'missing-person')`
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P1', 'person', 'missing-person', 'Missing')`
           )
           .run(),
       /analysis input speaker binding target is invalid/
@@ -479,8 +483,8 @@ test("speaker bindings require durable targets and exact session scope", () => {
         db
           .prepare(
             `INSERT INTO analysis_input_speaker_bindings (
-               analysis_input_id, label, subject_kind, subject_id
-             ) VALUES ('input-bindings', 'P2', 'person', 'person-1')`
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P2', 'person', 'person-1', 'Self')`
           )
           .run(),
       /analysis input speaker binding target is invalid/
@@ -490,8 +494,8 @@ test("speaker bindings require durable targets and exact session scope", () => {
         db
           .prepare(
             `INSERT INTO analysis_input_speaker_bindings (
-               analysis_input_id, label, subject_kind, subject_id
-             ) VALUES ('input-bindings', 'SELF', 'person', 'person-other')`
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'SELF', 'person', 'person-other', 'Other')`
           )
           .run(),
       /analysis input speaker binding target is invalid/
@@ -501,34 +505,112 @@ test("speaker bindings require durable targets and exact session scope", () => {
         db
           .prepare(
             `INSERT INTO analysis_input_speaker_bindings (
-               analysis_input_id, label, subject_kind, subject_id
-             ) VALUES ('input-bindings', 'P1', 'speaker_cluster', 'cluster-other')`
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P1', 'speaker_cluster', 'cluster-other', 'speaker_1')`
           )
           .run(),
       /analysis input speaker binding target is invalid/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO analysis_input_speaker_bindings (
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P4', 'person', 'person-other', 'Wrong snapshot')`
+          )
+          .run(),
+      /analysis input speaker binding target is invalid/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO analysis_input_speaker_bindings (
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P5', 'speaker_cluster', 'cluster-local', 'wrong_cluster')`
+          )
+          .run(),
+      /analysis input speaker binding target is invalid/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO analysis_input_speaker_bindings (
+               analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+             ) VALUES ('input-bindings', 'P6', 'person', 'person-other', '   ')`
+          )
+          .run(),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
     );
     assert.equal(
       db
         .prepare(
           `INSERT INTO analysis_input_speaker_bindings (
-             analysis_input_id, label, subject_kind, subject_id
-           ) VALUES ('input-bindings', 'P3', 'person', 'person-other')`
+             analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+           ) VALUES ('input-bindings', 'P3', 'person', 'person-other', 'Other')`
         )
         .run().changes,
       1
     );
-    assert.throws(
-      () => db.prepare("DELETE FROM people WHERE id = 'person-other'").run(),
-      /analysis input speaker binding target is immutable/
+    assert.equal(
+      db
+        .prepare(
+          `INSERT INTO analysis_input_speaker_bindings (
+             analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+           ) VALUES ('input-bindings', 'P4', 'speaker_cluster', 'cluster-bound', 'speaker_2')`
+        )
+        .run().changes,
+      1
     );
-    assert.throws(
-      () =>
-        db
-          .prepare(
-            "UPDATE speaker_clusters SET session_id = 'session-other' WHERE id = 'cluster-local'"
-          )
-          .run(),
-      /analysis input speaker binding target is immutable/
+
+    assert.equal(
+      db
+        .prepare(
+          "UPDATE people SET display_name = 'Renamed Other', is_self = 1 WHERE id = 'person-other'"
+        )
+        .run().changes,
+      1
+    );
+    assert.equal(
+      db
+        .prepare(
+          `UPDATE speaker_clusters
+           SET local_label = 'speaker_renamed', person_id = NULL, link_state = 'rejected'
+           WHERE id = 'cluster-local'`
+        )
+        .run().changes,
+      1
+    );
+    assert.equal(
+      db.prepare("DELETE FROM speaker_clusters WHERE id = 'cluster-bound'").run().changes,
+      1
+    );
+    assert.equal(db.prepare("DELETE FROM people WHERE id = 'person-other'").run().changes, 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT label, subject_kind, subject_id, subject_display_name_snapshot
+           FROM analysis_input_speaker_bindings
+           WHERE analysis_input_id = 'input-bindings'
+           ORDER BY label`
+        )
+        .all(),
+      [
+        {
+          label: "P3",
+          subject_kind: "person",
+          subject_id: "person-other",
+          subject_display_name_snapshot: "Other",
+        },
+        {
+          label: "P4",
+          subject_kind: "speaker_cluster",
+          subject_id: "cluster-bound",
+          subject_display_name_snapshot: "speaker_2",
+        },
+      ]
     );
   } finally {
     db.close();
@@ -559,8 +641,8 @@ test("analysis input segments accept only current final same-session manifest ev
     ).run(HASH_A, HASH_B, HASH_C);
     db.prepare(
       `INSERT INTO analysis_input_speaker_bindings (
-         analysis_input_id, label, subject_kind, subject_id
-       ) VALUES ('input-segments', 'SELF', 'person', 'person-1')`
+         analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+       ) VALUES ('input-segments', 'SELF', 'person', 'person-1', 'Self')`
     ).run();
 
     assert.throws(
@@ -634,6 +716,61 @@ test("history is immutable while session cascade removes owned occurrences and e
     seedAnalysisInput(db);
     seedEvidenceOwner(db);
     insertEvidence(db);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (
+         'memory-2', 'fact', ?, ?, 'Replacement', 'Durable replacement', 0.95,
+         'active', 'input-1', 'evidence_linked', 7000, 7000
+       )`
+    ).run(HASH_A, HASH_C);
+    db.exec(`
+      INSERT INTO memory_supersessions (
+        previous_id, next_id, reason, analysis_input_id, created_at
+      ) VALUES ('memory-1', 'memory-2', 'transcript_replacement', 'input-1', 7000);
+
+      INSERT INTO todos_v2 (
+        id, canonical_base_key, instance_key, title, status, completed_at,
+        source_analysis_input_id, provenance, created_at, updated_at
+      ) VALUES (
+        'todo-history-previous', '${HASH_D}', '${HASH_E}', 'Previous', 'completed', 5000,
+        'input-1', 'evidence_linked', 4000, 5000
+      );
+      INSERT INTO todos_v2 (
+        id, canonical_base_key, instance_key, title, status, recurrence_of_id,
+        source_analysis_input_id, provenance, created_at, updated_at
+      ) VALUES (
+        'todo-history-next', '${HASH_D}', '${HASH_F}', 'Next', 'open', 'todo-history-previous',
+        'input-1', 'evidence_linked', 6000, 6000
+      );
+      INSERT INTO todo_revisions (
+        id, todo_instance_id, revision, title, source_analysis_input_id, provenance, created_at
+      ) VALUES (
+        'todo-history-revision', 'todo-history-next', 1, 'Next',
+        'input-1', 'evidence_linked', 6000
+      );
+      INSERT INTO todo_occurrences (
+        id, todo_instance_id, todo_revision_id, analysis_input_id, occurrence_key,
+        candidate_item_fingerprint, started_at, ended_at, created_at
+      ) VALUES (
+        'todo-history-occurrence', 'todo-history-next', 'todo-history-revision', 'input-1',
+        '${HASH_D}', '${HASH_E}', 6000, 6000, 6000
+      );
+      INSERT INTO todo_recurrences (
+        id, previous_todo_id, next_todo_id, source_occurrence_id, created_at
+      ) VALUES (
+        'todo-history-recurrence', 'todo-history-previous', 'todo-history-next',
+        'todo-history-occurrence', 6000
+      );
+      INSERT INTO todo_state_transitions (
+        id, todo_instance_id, from_status, to_status, reason,
+        source_analysis_input_id, actor, occurred_at
+      ) VALUES (
+        'todo-history-transition', 'todo-history-next', NULL, 'open', 'recurrence',
+        'input-1', 'system', 6000
+      );
+    `);
 
     assert.throws(
       () => db.prepare("UPDATE memory_occurrences SET candidate_item_fingerprint = ?").run(HASH_C),
@@ -659,14 +796,93 @@ test("history is immutable while session cascade removes owned occurrences and e
       () => db.prepare("DELETE FROM evidence_refs").run(),
       /evidence reference is immutable/
     );
+    assert.throws(
+      () => db.prepare("UPDATE memory_supersessions SET analysis_input_id = NULL").run(),
+      /memory supersession source can only be cleared when its input is deleted/
+    );
+    assert.throws(
+      () => db.prepare("UPDATE todo_state_transitions SET source_analysis_input_id = NULL").run(),
+      /todo state transition source can only be cleared when its input is deleted/
+    );
+    assert.throws(
+      () => db.prepare("UPDATE todo_recurrences SET source_occurrence_id = NULL").run(),
+      /todo recurrence source can only be cleared when its occurrence is deleted/
+    );
 
     assert.equal(db.prepare("DELETE FROM sessions WHERE id = 'session-1'").run().changes, 1);
     assert.equal(db.prepare("SELECT count(*) AS count FROM analysis_inputs").get().count, 0);
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count, 0);
     assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 0);
     assert.deepEqual(
-      db.prepare("SELECT id, source_analysis_input_id, provenance FROM memory_items_v2").get(),
-      { id: "memory-1", source_analysis_input_id: null, provenance: "source_deleted" }
+      db
+        .prepare("SELECT id, source_analysis_input_id, provenance FROM memory_items_v2 ORDER BY id")
+        .all(),
+      [
+        { id: "memory-1", source_analysis_input_id: null, provenance: "source_deleted" },
+        { id: "memory-2", source_analysis_input_id: null, provenance: "source_deleted" },
+      ]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT previous_id, next_id, reason, analysis_input_id, created_at
+           FROM memory_supersessions`
+        )
+        .get(),
+      {
+        previous_id: "memory-1",
+        next_id: "memory-2",
+        reason: "transcript_replacement",
+        analysis_input_id: null,
+        created_at: 7000,
+      }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT todo_instance_id, from_status, to_status, reason,
+                  source_analysis_input_id, actor, occurred_at
+           FROM todo_state_transitions
+           WHERE id = 'todo-history-transition'`
+        )
+        .get(),
+      {
+        todo_instance_id: "todo-history-next",
+        from_status: null,
+        to_status: "open",
+        reason: "recurrence",
+        source_analysis_input_id: null,
+        actor: "system",
+        occurred_at: 6000,
+      }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT previous_todo_id, next_todo_id, source_occurrence_id, created_at
+           FROM todo_recurrences
+           WHERE id = 'todo-history-recurrence'`
+        )
+        .get(),
+      {
+        previous_todo_id: "todo-history-previous",
+        next_todo_id: "todo-history-next",
+        source_occurrence_id: null,
+        created_at: 6000,
+      }
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 2);
+    assert.throws(
+      () => db.prepare("DELETE FROM memory_supersessions").run(),
+      /memory supersession is immutable/
+    );
+    assert.throws(
+      () => db.prepare("DELETE FROM todo_state_transitions").run(),
+      /todo state transition is immutable/
+    );
+    assert.throws(
+      () => db.prepare("DELETE FROM todo_recurrences").run(),
+      /todo recurrence is immutable/
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
@@ -708,8 +924,8 @@ test("relation guards enforce predecessor, slot, conflict, terminal, and polymor
 
     db.prepare(
       `INSERT INTO memory_conflict_groups (
-         id, slot_key, state, created_at, updated_at
-       ) VALUES ('conflict-1', ?, 'open', 6000, 6000)`
+         id, slot_key, episode, state, created_at, updated_at
+       ) VALUES ('conflict-1', ?, 1, 'open', 6000, 6000)`
     ).run(HASH_A);
     assert.throws(
       () =>
@@ -1032,15 +1248,15 @@ test("conflicts, recurrences, acceptances, and topic merges preserve explicit du
         db
           .prepare(
             `INSERT INTO memory_conflict_groups (
-               id, slot_key, state, selected_member_id, resolved_at, created_at, updated_at
-             ) VALUES ('conflict-resolved', ?, 'resolved', 'memory-1', 7000, 6000, 7000)`
+               id, slot_key, episode, state, selected_member_id, resolved_at, created_at, updated_at
+             ) VALUES ('conflict-resolved', ?, 1, 'resolved', 'memory-1', 7000, 6000, 7000)`
           )
           .run(HASH_A),
       /memory conflict must be created open/
     );
     db.prepare(
-      `INSERT INTO memory_conflict_groups (id, slot_key, state, created_at, updated_at)
-       VALUES ('conflict-1', ?, 'open', 6000, 6000)`
+      `INSERT INTO memory_conflict_groups (id, slot_key, episode, state, created_at, updated_at)
+       VALUES ('conflict-1', ?, 1, 'open', 6000, 6000)`
     ).run(HASH_A);
     db.exec(
       `INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
@@ -1052,6 +1268,61 @@ test("conflicts, recurrences, acceptances, and topic merges preserve explicit du
           .prepare("UPDATE memory_conflict_groups SET slot_key = ? WHERE id = 'conflict-1'")
           .run(HASH_B),
       /memory conflict identity is immutable/
+    );
+    assert.throws(
+      () =>
+        db.prepare("UPDATE memory_conflict_groups SET episode = 2 WHERE id = 'conflict-1'").run(),
+      /memory conflict identity is immutable/
+    );
+    db.exec(`
+      UPDATE memory_conflict_groups
+      SET state = 'resolved', selected_member_id = 'memory-1', resolved_at = 7000, updated_at = 7000
+      WHERE id = 'conflict-1';
+    `);
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE memory_conflict_groups SET updated_at = 8000 WHERE id = 'conflict-1'")
+          .run(),
+      /memory conflict resolution is terminal/
+    );
+    assert.equal(
+      db
+        .prepare(
+          `INSERT INTO memory_conflict_groups (id, slot_key, episode, state, created_at, updated_at)
+           VALUES ('conflict-2', ?, 2, 'open', 8000, 8000)`
+        )
+        .run(HASH_A).changes,
+      1
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO memory_conflict_groups (id, slot_key, episode, state, created_at, updated_at)
+             VALUES ('conflict-3', ?, 3, 'open', 9000, 9000)`
+          )
+          .run(HASH_A),
+      { code: "SQLITE_CONSTRAINT_UNIQUE" }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, slot_key, episode, state, selected_member_id, resolved_at, created_at, updated_at
+           FROM memory_conflict_groups
+           WHERE id = 'conflict-1'`
+        )
+        .get(),
+      {
+        id: "conflict-1",
+        slot_key: HASH_A,
+        episode: 1,
+        state: "resolved",
+        selected_member_id: "memory-1",
+        resolved_at: 7000,
+        created_at: 6000,
+        updated_at: 7000,
+      }
     );
 
     db.prepare(
@@ -1130,6 +1401,19 @@ test("conflicts, recurrences, acceptances, and topic merges preserve explicit du
           .run(),
       /todo recurrence relation is invalid/
     );
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO todo_recurrences (
+               id, previous_todo_id, next_todo_id, source_occurrence_id, created_at
+             ) VALUES (
+               'recurrence-missing-source', 'todo-previous', 'todo-next', NULL, 7000
+             )`
+          )
+          .run(),
+      /todo recurrence relation is invalid/
+    );
     assert.equal(
       db
         .prepare(
@@ -1178,6 +1462,175 @@ test("conflicts, recurrences, acceptances, and topic merges preserve explicit du
         .run().changes,
       1
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("todo transition reasons enforce the actor, source, and state-shape contract", () => {
+  const db = createPreviousVersionDatabase();
+  try {
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('session-transition-contract', 1000, 5000, 'completed', 1000);
+    `);
+    applyJarvisMigrations(db);
+    db.prepare(
+      `INSERT INTO analysis_inputs (
+         id, session_id, transcript_revision, identity_revision, prompt_version,
+         input_hash, created_at
+       ) VALUES (
+         'input-transition-contract', 'session-transition-contract', ?, ?,
+         'jarvis-analysis-v2', ?, 6000
+       )`
+    ).run(HASH_A, HASH_B, HASH_C);
+    db.prepare(
+      `INSERT INTO todos_v2 (
+         id, canonical_base_key, instance_key, title, status,
+         source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES
+         ('todo-analysis-created', ?, ?, 'Created', 'open',
+          'input-transition-contract', 'evidence_linked', 6000, 6000),
+         ('todo-recurrence-created', ?, ?, 'Recurrence', 'open',
+          'input-transition-contract', 'evidence_linked', 6000, 6000),
+         ('todo-user-action', ?, ?, 'User action', 'open',
+          'input-transition-contract', 'evidence_linked', 6000, 6000),
+         ('todo-suggestion-acceptance', ?, ?, 'Suggestion acceptance', 'open',
+          'input-transition-contract', 'evidence_linked', 6000, 6000)`
+    ).run(HASH_A, HASH_B, HASH_A, HASH_C, HASH_A, HASH_D, HASH_A, HASH_E);
+
+    const insertTransition = ({
+      id,
+      todoId,
+      fromStatus,
+      toStatus,
+      reason,
+      sourceAnalysisInputId,
+      actor,
+    }) =>
+      db
+        .prepare(
+          `INSERT INTO todo_state_transitions (
+             id, todo_instance_id, from_status, to_status, reason,
+             source_analysis_input_id, actor, occurred_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 7000)`
+        )
+        .run(id, todoId, fromStatus, toStatus, reason, sourceAnalysisInputId, actor);
+
+    const assertInvalidContract = (input) =>
+      assert.throws(
+        () => insertTransition(input),
+        /todo state transition reason contract is invalid/
+      );
+    assertInvalidContract({
+      id: "transition-invalid-analysis-actor",
+      todoId: "todo-analysis-created",
+      fromStatus: null,
+      toStatus: "open",
+      reason: "analysis_created",
+      sourceAnalysisInputId: "input-transition-contract",
+      actor: "user",
+    });
+    assertInvalidContract({
+      id: "transition-invalid-recurrence-source",
+      todoId: "todo-recurrence-created",
+      fromStatus: null,
+      toStatus: "open",
+      reason: "recurrence",
+      sourceAnalysisInputId: null,
+      actor: "system",
+    });
+    assertInvalidContract({
+      id: "transition-invalid-user-source",
+      todoId: "todo-user-action",
+      fromStatus: "open",
+      toStatus: "completed",
+      reason: "user_action",
+      sourceAnalysisInputId: "input-transition-contract",
+      actor: "user",
+    });
+    assertInvalidContract({
+      id: "transition-invalid-user-initial-shape",
+      todoId: "todo-user-action",
+      fromStatus: null,
+      toStatus: "open",
+      reason: "user_action",
+      sourceAnalysisInputId: null,
+      actor: "user",
+    });
+    assertInvalidContract({
+      id: "transition-invalid-suggestion-actor",
+      todoId: "todo-suggestion-acceptance",
+      fromStatus: "open",
+      toStatus: "dismissed",
+      reason: "suggestion_acceptance",
+      sourceAnalysisInputId: null,
+      actor: "system",
+    });
+    assertInvalidContract({
+      id: "transition-invalid-suggestion-initial-shape",
+      todoId: "todo-suggestion-acceptance",
+      fromStatus: null,
+      toStatus: "open",
+      reason: "suggestion_acceptance",
+      sourceAnalysisInputId: null,
+      actor: "user",
+    });
+
+    assert.equal(
+      insertTransition({
+        id: "transition-analysis-created",
+        todoId: "todo-analysis-created",
+        fromStatus: null,
+        toStatus: "open",
+        reason: "analysis_created",
+        sourceAnalysisInputId: "input-transition-contract",
+        actor: "system",
+      }).changes,
+      1
+    );
+    assert.equal(
+      insertTransition({
+        id: "transition-recurrence",
+        todoId: "todo-recurrence-created",
+        fromStatus: null,
+        toStatus: "open",
+        reason: "recurrence",
+        sourceAnalysisInputId: "input-transition-contract",
+        actor: "system",
+      }).changes,
+      1
+    );
+    assert.equal(
+      insertTransition({
+        id: "transition-user-action",
+        todoId: "todo-user-action",
+        fromStatus: "open",
+        toStatus: "completed",
+        reason: "user_action",
+        sourceAnalysisInputId: null,
+        actor: "user",
+      }).changes,
+      1
+    );
+    assert.equal(
+      insertTransition({
+        id: "transition-suggestion-acceptance",
+        todoId: "todo-suggestion-acceptance",
+        fromStatus: "open",
+        toStatus: "dismissed",
+        reason: "suggestion_acceptance",
+        sourceAnalysisInputId: null,
+        actor: "user",
+      }).changes,
+      1
+    );
+    assert.deepEqual(db.prepare("SELECT id, status FROM todos_v2 ORDER BY id").all(), [
+      { id: "todo-analysis-created", status: "open" },
+      { id: "todo-recurrence-created", status: "open" },
+      { id: "todo-suggestion-acceptance", status: "dismissed" },
+      { id: "todo-user-action", status: "completed" },
+    ]);
   } finally {
     db.close();
   }
@@ -1375,8 +1828,8 @@ test("evidence references validate target input, manifest, capture lineage, boun
     ).run(HASH_A, HASH_B, HASH_D);
     db.exec(`
       INSERT INTO analysis_input_speaker_bindings (
-        analysis_input_id, label, subject_kind, subject_id
-      ) VALUES ('input-other', 'SELF', 'person', 'person-1');
+        analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+      ) VALUES ('input-other', 'SELF', 'person', 'person-1', 'Local');
       INSERT INTO analysis_input_segments (
         analysis_input_id, ordinal, segment_id, segment_version, text_hash, text_snapshot,
         speaker_binding_label

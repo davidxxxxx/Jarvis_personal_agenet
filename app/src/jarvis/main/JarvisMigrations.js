@@ -680,6 +680,10 @@ const MEMORY_LINEAGE_SCHEMA = `
       typeof(subject_kind) = 'text' AND subject_kind IN ('person','speaker_cluster')
     ),
     subject_id TEXT NOT NULL CHECK(typeof(subject_id) = 'text' AND length(subject_id) > 0),
+    subject_display_name_snapshot TEXT NOT NULL CHECK(
+      typeof(subject_display_name_snapshot) = 'text'
+      AND length(trim(subject_display_name_snapshot)) > 0
+    ),
     PRIMARY KEY(analysis_input_id, label),
     UNIQUE(analysis_input_id, subject_kind, subject_id)
   );
@@ -772,17 +776,18 @@ const MEMORY_LINEAGE_SCHEMA = `
       typeof(reason) = 'text'
       AND reason IN ('transcript_replacement','user_correction','conflict_resolution')
     ),
-    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
     created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
     PRIMARY KEY(previous_id, next_id),
     CHECK(previous_id <> next_id)
   );
   CREATE TABLE IF NOT EXISTS memory_conflict_groups (
     id TEXT PRIMARY KEY,
-    slot_key TEXT NOT NULL UNIQUE CHECK(
+    slot_key TEXT NOT NULL CHECK(
       typeof(slot_key) = 'text' AND length(slot_key) = 64
       AND slot_key NOT GLOB '*[^0-9a-f]*'
     ),
+    episode INTEGER NOT NULL CHECK(typeof(episode) = 'integer' AND episode >= 1),
     state TEXT NOT NULL CHECK(typeof(state) = 'text' AND state IN ('open','resolved')),
     selected_member_id TEXT REFERENCES memory_items_v2(id) ON DELETE SET NULL,
     resolved_at INTEGER CHECK(
@@ -793,7 +798,8 @@ const MEMORY_LINEAGE_SCHEMA = `
     CHECK(
       (state = 'open' AND selected_member_id IS NULL AND resolved_at IS NULL)
       OR (state = 'resolved' AND selected_member_id IS NOT NULL AND resolved_at IS NOT NULL)
-    )
+    ),
+    UNIQUE(slot_key, episode)
   );
   CREATE TABLE IF NOT EXISTS memory_conflict_members (
     group_id TEXT NOT NULL REFERENCES memory_conflict_groups(id) ON DELETE RESTRICT,
@@ -974,7 +980,7 @@ const MEMORY_LINEAGE_SCHEMA = `
       typeof(reason) = 'text'
       AND reason IN ('analysis_created','user_action','suggestion_acceptance','recurrence')
     ),
-    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
     actor TEXT NOT NULL CHECK(typeof(actor) = 'text' AND actor IN ('system','user')),
     occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at) = 'integer' AND occurred_at >= 0),
     CHECK(from_status IS NULL OR from_status <> to_status)
@@ -983,7 +989,7 @@ const MEMORY_LINEAGE_SCHEMA = `
     id TEXT PRIMARY KEY,
     previous_todo_id TEXT NOT NULL UNIQUE REFERENCES todos_v2(id) ON DELETE RESTRICT,
     next_todo_id TEXT NOT NULL UNIQUE REFERENCES todos_v2(id) ON DELETE RESTRICT,
-    source_occurrence_id TEXT NOT NULL UNIQUE REFERENCES todo_occurrences(id) ON DELETE CASCADE,
+    source_occurrence_id TEXT UNIQUE REFERENCES todo_occurrences(id) ON DELETE SET NULL,
     created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
     CHECK(previous_todo_id <> next_todo_id)
   );
@@ -1146,6 +1152,9 @@ const MEMORY_LINEAGE_SCHEMA = `
   ON analysis_inputs(session_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_memory_items_slot_lifecycle
   ON memory_items_v2(canonical_slot_key, lifecycle);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_conflict_groups_open_slot
+  ON memory_conflict_groups(slot_key)
+  WHERE state = 'open';
   CREATE INDEX IF NOT EXISTS idx_memory_occurrences_value_created
   ON memory_occurrences(memory_value_id, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_occurrences_input_candidate
@@ -1227,20 +1236,28 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
   CREATE TRIGGER IF NOT EXISTS analysis_input_speaker_bindings_validate_target
   BEFORE INSERT ON analysis_input_speaker_bindings
-  WHEN NOT (
+  WHEN length(trim(NEW.subject_display_name_snapshot)) > 0 AND NOT (
     (
       NEW.subject_kind = 'person'
       AND (
         (
           NEW.label = 'SELF'
           AND EXISTS (
-            SELECT 1 FROM people WHERE id = NEW.subject_id AND is_self = 1
+            SELECT 1
+            FROM people
+            WHERE id = NEW.subject_id
+              AND is_self = 1
+              AND display_name = NEW.subject_display_name_snapshot
           )
         )
         OR (
           NEW.label <> 'SELF'
           AND EXISTS (
-            SELECT 1 FROM people WHERE id = NEW.subject_id AND is_self = 0
+            SELECT 1
+            FROM people
+            WHERE id = NEW.subject_id
+              AND is_self = 0
+              AND display_name = NEW.subject_display_name_snapshot
           )
           AND EXISTS (
             SELECT 1
@@ -1260,7 +1277,9 @@ const MEMORY_LINEAGE_SCHEMA = `
         SELECT 1
         FROM speaker_clusters AS cluster
         JOIN analysis_inputs AS input ON input.id = NEW.analysis_input_id
-        WHERE cluster.id = NEW.subject_id AND cluster.session_id = input.session_id
+        WHERE cluster.id = NEW.subject_id
+          AND cluster.session_id = input.session_id
+          AND cluster.local_label = NEW.subject_display_name_snapshot
       )
     )
   )
@@ -1316,69 +1335,6 @@ const MEMORY_LINEAGE_SCHEMA = `
   BEGIN
     SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
   END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_people_delete_guard
-  BEFORE DELETE ON people
-  WHEN EXISTS (
-    SELECT 1
-    FROM analysis_input_speaker_bindings
-    WHERE subject_kind = 'person' AND subject_id = OLD.id
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
-  END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_people_update_guard
-  BEFORE UPDATE OF id, is_self ON people
-  WHEN EXISTS (
-    SELECT 1
-    FROM analysis_input_speaker_bindings
-    WHERE subject_kind = 'person' AND subject_id = OLD.id
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
-  END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_cluster_delete_guard
-  BEFORE DELETE ON speaker_clusters
-  WHEN EXISTS (
-    SELECT 1
-    FROM analysis_input_speaker_bindings AS binding
-    JOIN analysis_inputs AS input ON input.id = binding.analysis_input_id
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE (
-      binding.subject_kind = 'speaker_cluster'
-      AND binding.subject_id = OLD.id
-    ) OR (
-      binding.subject_kind = 'person'
-      AND binding.subject_id = OLD.person_id
-      AND binding.label <> 'SELF'
-      AND input.session_id = OLD.session_id
-      AND OLD.link_state = 'confirmed'
-    )
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
-  END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_cluster_update_guard
-  BEFORE UPDATE OF id, session_id, person_id, link_state ON speaker_clusters
-  WHEN EXISTS (
-    SELECT 1
-    FROM analysis_input_speaker_bindings AS binding
-    JOIN analysis_inputs AS input ON input.id = binding.analysis_input_id
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE (
-      binding.subject_kind = 'speaker_cluster'
-      AND binding.subject_id = OLD.id
-    ) OR (
-      binding.subject_kind = 'person'
-      AND binding.subject_id = OLD.person_id
-      AND binding.label <> 'SELF'
-      AND input.session_id = OLD.session_id
-      AND OLD.link_state = 'confirmed'
-    )
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
-  END;
-
   CREATE TRIGGER IF NOT EXISTS memory_items_v2_source_deleted
   AFTER UPDATE OF source_analysis_input_id ON memory_items_v2
   WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
@@ -1555,18 +1511,22 @@ const MEMORY_LINEAGE_SCHEMA = `
     SELECT RAISE(ABORT, 'memory occurrence is immutable');
   END;
   CREATE TRIGGER IF NOT EXISTS memory_supersessions_immutable_update
-  BEFORE UPDATE ON memory_supersessions
+  BEFORE UPDATE OF previous_id, next_id, reason, created_at ON memory_supersessions
   BEGIN
     SELECT RAISE(ABORT, 'memory supersession is immutable');
   END;
+  CREATE TRIGGER IF NOT EXISTS memory_supersessions_source_clear
+  BEFORE UPDATE OF analysis_input_id ON memory_supersessions
+  WHEN NOT (
+    OLD.analysis_input_id IS NOT NULL
+    AND NEW.analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory supersession source can only be cleared when its input is deleted');
+  END;
   CREATE TRIGGER IF NOT EXISTS memory_supersessions_immutable_delete
   BEFORE DELETE ON memory_supersessions
-  WHEN OLD.analysis_input_id IS NULL OR EXISTS (
-    SELECT 1
-    FROM analysis_inputs AS input
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE input.id = OLD.analysis_input_id
-  )
   BEGIN
     SELECT RAISE(ABORT, 'memory supersession is immutable');
   END;
@@ -1576,7 +1536,7 @@ const MEMORY_LINEAGE_SCHEMA = `
     SELECT RAISE(ABORT, 'memory conflict group cannot be deleted');
   END;
   CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_immutable_identity
-  BEFORE UPDATE OF id, slot_key, created_at ON memory_conflict_groups
+  BEFORE UPDATE OF id, slot_key, episode, created_at ON memory_conflict_groups
   BEGIN
     SELECT RAISE(ABORT, 'memory conflict identity is immutable');
   END;
@@ -1720,35 +1680,43 @@ const MEMORY_LINEAGE_SCHEMA = `
     SELECT RAISE(ABORT, 'todo occurrence is immutable');
   END;
   CREATE TRIGGER IF NOT EXISTS todo_state_transitions_immutable_update
-  BEFORE UPDATE ON todo_state_transitions
+  BEFORE UPDATE OF id, todo_instance_id, from_status, to_status, reason, actor, occurred_at
+  ON todo_state_transitions
   BEGIN
     SELECT RAISE(ABORT, 'todo state transition is immutable');
   END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_source_clear
+  BEFORE UPDATE OF source_analysis_input_id ON todo_state_transitions
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state transition source can only be cleared when its input is deleted');
+  END;
   CREATE TRIGGER IF NOT EXISTS todo_state_transitions_immutable_delete
   BEFORE DELETE ON todo_state_transitions
-  WHEN OLD.source_analysis_input_id IS NULL OR EXISTS (
-    SELECT 1
-    FROM analysis_inputs AS input
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE input.id = OLD.source_analysis_input_id
-  )
   BEGIN
     SELECT RAISE(ABORT, 'todo state transition is immutable');
   END;
   CREATE TRIGGER IF NOT EXISTS todo_recurrences_immutable_update
-  BEFORE UPDATE ON todo_recurrences
+  BEFORE UPDATE OF id, previous_todo_id, next_todo_id, created_at ON todo_recurrences
   BEGIN
     SELECT RAISE(ABORT, 'todo recurrence is immutable');
   END;
+  CREATE TRIGGER IF NOT EXISTS todo_recurrences_source_clear
+  BEFORE UPDATE OF source_occurrence_id ON todo_recurrences
+  WHEN NOT (
+    OLD.source_occurrence_id IS NOT NULL
+    AND NEW.source_occurrence_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM todo_occurrences WHERE id = OLD.source_occurrence_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo recurrence source can only be cleared when its occurrence is deleted');
+  END;
   CREATE TRIGGER IF NOT EXISTS todo_recurrences_immutable_delete
   BEFORE DELETE ON todo_recurrences
-  WHEN EXISTS (
-    SELECT 1
-    FROM todo_occurrences AS occurrence
-    JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE occurrence.id = OLD.source_occurrence_id
-  )
   BEGIN
     SELECT RAISE(ABORT, 'todo recurrence is immutable');
   END;
@@ -1904,7 +1872,7 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
   CREATE TRIGGER IF NOT EXISTS todo_recurrences_validate_relation
   BEFORE INSERT ON todo_recurrences
-  WHEN NOT EXISTS (
+  WHEN NEW.source_occurrence_id IS NULL OR NOT EXISTS (
     SELECT 1
     FROM todos_v2 AS previous
     JOIN todos_v2 AS next ON next.id = NEW.next_todo_id
@@ -1989,11 +1957,12 @@ const MEMORY_LINEAGE_SCHEMA = `
     SELECT RAISE(ABORT, 'memory conflict resolution is invalid');
   END;
   CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_terminal_resolution
-  BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
+  BEFORE UPDATE OF state, selected_member_id, resolved_at, updated_at ON memory_conflict_groups
   WHEN OLD.state = 'resolved' AND (
     NEW.state IS NOT OLD.state
     OR NEW.selected_member_id IS NOT OLD.selected_member_id
     OR NEW.resolved_at IS NOT OLD.resolved_at
+    OR NEW.updated_at IS NOT OLD.updated_at
   )
   BEGIN
     SELECT RAISE(ABORT, 'memory conflict resolution is terminal');
@@ -2051,6 +2020,30 @@ const MEMORY_LINEAGE_SCHEMA = `
     SELECT RAISE(ABORT, 'todo state change requires transition history');
   END;
   CREATE TRIGGER IF NOT EXISTS todo_state_transitions_validate_insert
+  BEFORE INSERT ON todo_state_transitions
+  WHEN COALESCE(
+    (
+      (
+        NEW.reason IN ('analysis_created','recurrence')
+        AND NEW.actor = 'system'
+        AND NEW.source_analysis_input_id IS NOT NULL
+        AND NEW.from_status IS NULL
+        AND NEW.to_status = 'open'
+      )
+      OR (
+        NEW.reason IN ('user_action','suggestion_acceptance')
+        AND NEW.actor = 'user'
+        AND NEW.source_analysis_input_id IS NULL
+        AND NEW.from_status = 'open'
+        AND NEW.to_status IN ('completed','dismissed')
+      )
+    ),
+    0
+  ) = 0
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state transition reason contract is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_validate_state
   BEFORE INSERT ON todo_state_transitions
   WHEN NOT EXISTS (
     SELECT 1
