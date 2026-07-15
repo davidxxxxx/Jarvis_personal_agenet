@@ -165,14 +165,28 @@ class CaptureEvidenceStore {
             WHERE historical.chunk_id = chunk.id
               AND historical.job_type = 'transcribe_chunk'
           )
-          AND NOT EXISTS (
-            SELECT 1 FROM processing_jobs AS current
-            WHERE current.chunk_id = chunk.id
-              AND current.job_type = 'transcribe_chunk'
-              AND current.input_hash = chunk.sha256
-              AND current.input_version = @inputVersion
-              AND current.model_version = @modelVersion
-              AND current.state <> 'superseded'
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM processing_jobs AS current
+              WHERE current.chunk_id = chunk.id
+                AND current.job_type = 'transcribe_chunk'
+                AND current.input_hash = chunk.sha256
+                AND current.input_version = @inputVersion
+                AND current.model_version = @modelVersion
+                AND current.state <> 'superseded'
+            )
+            OR EXISTS (
+              SELECT 1 FROM processing_jobs AS stale
+              WHERE stale.chunk_id = chunk.id
+                AND stale.job_type = 'transcribe_chunk'
+                AND stale.completed_at IS NULL
+                AND stale.state IN ('pending', 'retry', 'retention_urgent')
+                AND NOT (
+                  stale.input_hash = chunk.sha256
+                  AND stale.input_version = @inputVersion
+                  AND stale.model_version = @modelVersion
+                )
+            )
           )
           AND NOT EXISTS (
             SELECT 1 FROM processing_jobs AS active
@@ -748,34 +762,42 @@ class CaptureEvidenceStore {
         let enqueued = 0;
         let superseded = 0;
         for (const row of chunks) {
-          superseded += this.statements.supersedeStaleTranscriptionJobs.run({
+          const supersededForChunk = this.statements.supersedeStaleTranscriptionJobs.run({
             chunkId: row.id,
             inputHash: row.sha256,
             inputVersion,
             modelVersion,
             at,
           }).changes;
+          superseded += supersededForChunk;
           const currentInput = {
             chunkId: row.id,
             inputHash: row.sha256,
             inputVersion,
             modelVersion,
           };
-          const reactivated = this.statements.reactivateSupersededTranscriptionJob.run({
-            ...currentInput,
-            at,
-          }).changes;
-          if (reactivated === 0) {
-            this.statements.insertTranscriptionJob.run({
-              id: this.createId("job"),
-              sessionId: row.session_id,
-              trackId: row.track_id,
+          const exactCurrent = this.statements.getTranscriptionJobByInput.get(currentInput);
+          let enqueuedForChunk = 0;
+          if (!exactCurrent || exactCurrent.state === "superseded") {
+            const reactivated = this.statements.reactivateSupersededTranscriptionJob.run({
               ...currentInput,
-              createdAt: at,
-            });
+              at,
+            }).changes;
+            if (reactivated === 0) {
+              this.statements.insertTranscriptionJob.run({
+                id: this.createId("job"),
+                sessionId: row.session_id,
+                trackId: row.track_id,
+                ...currentInput,
+                createdAt: at,
+              });
+            }
+            enqueuedForChunk = 1;
+            enqueued += 1;
           }
-          this.statements.invalidateSessionReadiness.run({ sessionId: row.session_id });
-          enqueued += 1;
+          if (enqueuedForChunk > 0 || supersededForChunk > 0) {
+            this.statements.invalidateSessionReadiness.run({ sessionId: row.session_id });
+          }
         }
         return { enqueued, superseded };
       }

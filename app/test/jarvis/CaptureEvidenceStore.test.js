@@ -1383,6 +1383,124 @@ test("model rollback A to B to A reactivates the audited A job idempotently", (t
   );
 });
 
+test("model rollback keeps completed A byte-for-byte while superseding pending B", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-a" }));
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', attempt_count = 1, completed_at = 90,
+         execution_device = 'cpu'
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-b",
+      at: 100,
+    }),
+    { enqueued: 1, superseded: 0 }
+  );
+  const modelA = db
+    .prepare("SELECT * FROM processing_jobs WHERE model_version = 'model-a'")
+    .get();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 1 }
+  );
+  assert.deepEqual(
+    db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(modelA.id),
+    modelA
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, completed_at, error_code
+         FROM processing_jobs WHERE model_version = 'model-b'`
+      )
+      .get(),
+    {
+      state: "superseded",
+      attempt_count: 0,
+      completed_at: 110,
+      error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+    }
+  );
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+});
+
+test("completed A rollback waits for a live B lease and supersedes B at expiry", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-a" }));
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', attempt_count = 1, completed_at = 90
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  store.enqueueCurrentModelTranscriptionJobs({
+    inputVersion: 1,
+    modelVersion: "model-b",
+    at: 100,
+  });
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', attempt_count = 1,
+         lease_owner = 'live-worker', lease_expires_at = 111
+     WHERE model_version = 'model-b'`
+  ).run();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE model_version = 'model-b'").get().state,
+    "running"
+  );
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 111,
+    }),
+    { enqueued: 0, superseded: 1 }
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, lease_owner, lease_expires_at, error_code
+         FROM processing_jobs WHERE model_version = 'model-b'`
+      )
+      .get(),
+    {
+      state: "superseded",
+      attempt_count: 1,
+      lease_owner: null,
+      lease_expires_at: null,
+      error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+    }
+  );
+});
+
 test("rejects every transcription enqueue after a chunk is tombstoned", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
