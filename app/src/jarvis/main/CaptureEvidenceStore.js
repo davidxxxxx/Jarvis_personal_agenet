@@ -172,6 +172,7 @@ class CaptureEvidenceStore {
               AND current.input_hash = chunk.sha256
               AND current.input_version = @inputVersion
               AND current.model_version = @modelVersion
+              AND current.state <> 'superseded'
           )
           AND NOT EXISTS (
             SELECT 1 FROM processing_jobs AS active
@@ -204,6 +205,23 @@ class CaptureEvidenceStore {
             AND input_version = @inputVersion
             AND model_version = @modelVersion
           )
+      `),
+      reactivateSupersededTranscriptionJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = CASE WHEN attempt_count > 0 THEN 'retry' ELSE 'pending' END,
+            completed_at = NULL,
+            next_retry_at = CASE WHEN attempt_count > 0 THEN @at ELSE NULL END,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = NULL,
+            blocked_reason = NULL,
+            execution_device = NULL
+        WHERE chunk_id = @chunkId
+          AND job_type = 'transcribe_chunk'
+          AND input_hash = @inputHash
+          AND input_version = @inputVersion
+          AND model_version = @modelVersion
+          AND state = 'superseded'
       `),
       insertCompressionJob: db.prepare(`
         INSERT INTO processing_jobs (
@@ -737,16 +755,25 @@ class CaptureEvidenceStore {
             modelVersion,
             at,
           }).changes;
-          this.statements.insertTranscriptionJob.run({
-            id: this.createId("job"),
-            sessionId: row.session_id,
-            trackId: row.track_id,
+          const currentInput = {
             chunkId: row.id,
             inputHash: row.sha256,
             inputVersion,
             modelVersion,
-            createdAt: at,
-          });
+          };
+          const reactivated = this.statements.reactivateSupersededTranscriptionJob.run({
+            ...currentInput,
+            at,
+          }).changes;
+          if (reactivated === 0) {
+            this.statements.insertTranscriptionJob.run({
+              id: this.createId("job"),
+              sessionId: row.session_id,
+              trackId: row.track_id,
+              ...currentInput,
+              createdAt: at,
+            });
+          }
           this.statements.invalidateSessionReadiness.run({ sessionId: row.session_id });
           enqueued += 1;
         }

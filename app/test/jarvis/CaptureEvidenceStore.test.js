@@ -1307,6 +1307,82 @@ test("model changes append one current transcription revision and preserve compl
   });
 });
 
+test("model rollback A to B to A reactivates the audited A job idempotently", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-a" }));
+  const modelA = db
+    .prepare("SELECT * FROM processing_jobs WHERE job_type = 'transcribe_chunk'")
+    .get();
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'retry', attempt_count = 2,
+         next_retry_at = 500, error_code = 'TRANSIENT'
+     WHERE id = ?`
+  ).run(modelA.id);
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-b",
+      at: 100,
+    }),
+    { enqueued: 1, superseded: 1 }
+  );
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 1, superseded: 1 }
+  );
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-a",
+      at: 110,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, model_version, attempt_count, next_retry_at,
+                error_code, completed_at, lease_owner, lease_expires_at
+         FROM processing_jobs
+         WHERE job_type = 'transcribe_chunk'
+         ORDER BY model_version`
+      )
+      .all(),
+    [
+      {
+        id: modelA.id,
+        state: "retry",
+        model_version: "model-a",
+        attempt_count: 2,
+        next_retry_at: 110,
+        error_code: null,
+        completed_at: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "job-2",
+        state: "superseded",
+        model_version: "model-b",
+        attempt_count: 0,
+        next_retry_at: null,
+        error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+        completed_at: 110,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+    ]
+  );
+});
+
 test("rejects every transcription enqueue after a chunk is tombstoned", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);
