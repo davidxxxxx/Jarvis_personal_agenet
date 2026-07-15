@@ -89,6 +89,31 @@ function normalizeSourceRestoration(input) {
   };
 }
 
+function unavailableProcessingStatus() {
+  return {
+    pending: 0,
+    running: 0,
+    retry: 0,
+    blocked: 0,
+    total: 0,
+    byStage: {},
+    backlogMs: 0,
+    oldestCreatedAt: null,
+    latestExecutionDevice: null,
+    finalCoveragePct: null,
+    provisionalCoveragePct: null,
+  };
+}
+
+function nextRecoveryAction({ capture, resources, queue, disk }) {
+  if (disk.state === "critical" || disk.state === "stopped") return "free_disk";
+  if (capture.status === "degraded") return "restore_microphone";
+  if (resources.state === "busy") return "wait_for_gpu";
+  if (resources.state === "unavailable") return "check_cuda";
+  if (queue.blocked > 0 || queue.retry > 0) return "retry_jobs";
+  return null;
+}
+
 function registerJarvisIpc({
   ipcMain,
   repository,
@@ -100,6 +125,7 @@ function registerJarvisIpc({
   storageManager,
   pickStorageDirectory,
   processingLifecycle = null,
+  now = Date.now,
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -205,6 +231,81 @@ function registerJarvisIpc({
       ...timeline,
       chunks: timeline.chunks.map(toPublicAudioChunk),
       preview_status: previewStatus,
+    };
+  });
+  ipcMain.handle(CHANNELS.getRuntimeStatus, async () => {
+    const observedAt = now();
+    const captureState = typeof service.getState === "function" ? service.getState() : null;
+    const capture = {
+      sessionId: captureState?.sessionId ?? null,
+      status: captureState?.status ?? "idle",
+      captureMode: captureState?.captureMode ?? null,
+      retentionMode: captureState?.retentionMode ?? null,
+      errorCode: captureState?.errorCode ?? null,
+    };
+    const runtime = processingLifecycle?.runtime ?? null;
+    const preview = runtime?.previewStatus?.() ?? null;
+    const resourceSnapshot = runtime?.governor?.latestSnapshot ?? null;
+    const resources = resourceSnapshot
+      ? {
+          sampledAt: resourceSnapshot.sampledAt ?? null,
+          state: resourceSnapshot.state ?? "unavailable",
+          reason: resourceSnapshot.reason ?? "unknown",
+          cudaInstalled: resourceSnapshot.cudaInstalled === true,
+          cudaVerified: resourceSnapshot.cudaVerified === true,
+          cudaQuarantined: resourceSnapshot.cudaQuarantined === true,
+        }
+      : {
+          sampledAt: null,
+          state: "unavailable",
+          reason: "not_sampled",
+          cudaInstalled: null,
+          cudaVerified: null,
+          cudaQuarantined: null,
+        };
+    const processing =
+      typeof repository.getRuntimeProcessingStatus === "function"
+        ? repository.getRuntimeProcessingStatus(observedAt)
+        : unavailableProcessingStatus();
+    const queue = {
+      pending: processing.pending,
+      running: processing.running,
+      retry: processing.retry,
+      blocked: processing.blocked,
+      total: processing.total,
+      byStage: processing.byStage,
+      backlogMinutes: processing.backlogMs / 60_000,
+      oldestJobAgeMs:
+        processing.oldestCreatedAt === null
+          ? null
+          : Math.max(0, observedAt - processing.oldestCreatedAt),
+      finalCoveragePct: processing.finalCoveragePct,
+      provisionalCoveragePct: processing.provisionalCoveragePct,
+    };
+    const storage =
+      storageManager && typeof storageManager.getStatus === "function"
+        ? await storageManager.getStatus()
+        : null;
+    const disk = {
+      state: storage?.state ?? "unavailable",
+      freeBytes: storage?.freeBytes ?? null,
+      remainingDays: storage?.remainingDays ?? null,
+      recoveryAction: storage?.recoveryAction ?? null,
+    };
+    const backend = {
+      actualBackend: processing.latestExecutionDevice ?? preview?.executionDevice ?? null,
+      cudaGpuUuid:
+        resourceSnapshot?.cudaVerified === true ? (resourceSnapshot.selectedGpuUuid ?? null) : null,
+    };
+    return {
+      observedAt,
+      capture,
+      backend,
+      resources,
+      queue,
+      preview,
+      disk,
+      nextRecoveryAction: nextRecoveryAction({ capture, resources, queue, disk }),
     };
   });
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {

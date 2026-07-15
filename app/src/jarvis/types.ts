@@ -247,6 +247,56 @@ export interface JarvisPreviewStatus {
   recordingContinues: true;
 }
 
+export type JarvisResourceState = "available" | "busy" | "constrained" | "unavailable";
+export type JarvisRuntimeRecoveryAction =
+  "wait_for_gpu" | "check_cuda" | "free_disk" | "restore_microphone" | "retry_jobs";
+
+export interface JarvisRuntimeQueueStageCounts {
+  pending: number;
+  running: number;
+  retry: number;
+  blocked: number;
+  total: number;
+}
+
+export interface JarvisRuntimeStatus {
+  observedAt: number;
+  capture: {
+    sessionId: string | null;
+    status: JarvisRuntimeState["status"];
+    captureMode: JarvisCaptureMode | null;
+    retentionMode: JarvisRetentionMode | null;
+    errorCode: string | null;
+  };
+  backend: {
+    actualBackend: "cuda" | "cpu" | "cloud" | null;
+    cudaGpuUuid: string | null;
+  };
+  resources: {
+    sampledAt: number | null;
+    state: JarvisResourceState;
+    reason: string;
+    cudaInstalled: boolean | null;
+    cudaVerified: boolean | null;
+    cudaQuarantined: boolean | null;
+  };
+  queue: JarvisRuntimeQueueStageCounts & {
+    byStage: Record<string, JarvisRuntimeQueueStageCounts>;
+    backlogMinutes: number;
+    oldestJobAgeMs: number | null;
+    finalCoveragePct: number | null;
+    provisionalCoveragePct: number | null;
+  };
+  preview: JarvisPreviewStatus | null;
+  disk: {
+    state: string;
+    freeBytes: number | null;
+    remainingDays: number | null;
+    recoveryAction: string | null;
+  };
+  nextRecoveryAction: JarvisRuntimeRecoveryAction | null;
+}
+
 export interface JarvisSessionTimeline {
   session_id: string;
   started_at: number;

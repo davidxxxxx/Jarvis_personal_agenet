@@ -95,6 +95,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),
     getSessionTimeline: (sessionId) =>
       ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId),
+    getRuntimeStatus: () => ipcRenderer.invoke("jarvis:runtime:status"),
     searchMemory: (query, limit) => ipcRenderer.invoke("jarvis:memory:search", query, limit),
     listPeopleOverview: () => ipcRenderer.invoke("jarvis:memory:people"),
     getPersonDetail: (personId) => ipcRenderer.invoke("jarvis:memory:person-detail", personId),

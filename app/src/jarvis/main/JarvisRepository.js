@@ -33,6 +33,30 @@ const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   failed: "failed",
 });
 
+function runtimeJobStage({ job_type: jobType, state, priority }) {
+  if (state === "retention_urgent" || (jobType === "transcribe_chunk" && priority === 0)) {
+    return "retention_urgent";
+  }
+  if (state === "storage_recovery_compress" || (jobType === "compress_chunk" && priority === 10)) {
+    return "storage_recovery_compress";
+  }
+  if (jobType === "transcribe_chunk") return "final_transcription";
+  if (jobType === "preview_transcription") return "preview";
+  if (jobType === "speaker") return "speaker";
+  if (jobType === "analyze_session") return "analysis";
+  if (jobType === "compress_chunk") return "compression";
+  return jobType;
+}
+
+function runtimeQueueState(state) {
+  if (state === "running" || state === "retry" || state === "blocked") return state;
+  return "pending";
+}
+
+function emptyRuntimeCounts() {
+  return { pending: 0, running: 0, retry: 0, blocked: 0, total: 0 };
+}
+
 function legacyTrackLifecycle(session) {
   const state = LEGACY_TRACK_STATE_BY_SESSION_STATUS[session.status];
   if (!state) throw new Error(`unsupported legacy session status: ${session.status}`);
@@ -690,6 +714,49 @@ class JarvisRepository {
           COUNT(*) AS total
         FROM processing_jobs
         WHERE session_id = ?
+      `),
+      listRuntimeProcessingGroups: this.db.prepare(`
+        SELECT job_type, state, priority, COUNT(*) AS count
+        FROM processing_jobs
+        WHERE state <> 'completed'
+        GROUP BY job_type, state, priority
+        ORDER BY job_type ASC, state ASC, priority ASC
+      `),
+      getRuntimeTranscriptionBacklog: this.db.prepare(`
+        SELECT COALESCE(SUM(chunk.duration_ms), 0) AS backlog_ms
+        FROM audio_chunks AS chunk
+        WHERE chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs AS job
+            WHERE job.chunk_id = chunk.id
+              AND job.job_type = 'transcribe_chunk'
+              AND job.state <> 'completed'
+          )
+      `),
+      getRuntimeOldestProcessingJob: this.db.prepare(`
+        SELECT MIN(created_at) AS oldest_created_at
+        FROM processing_jobs
+        WHERE state <> 'completed'
+      `),
+      getLatestProcessingExecutionDevice: this.db.prepare(`
+        SELECT execution_device
+        FROM processing_jobs
+        WHERE execution_device IS NOT NULL
+        ORDER BY COALESCE(completed_at, created_at) DESC, id DESC
+        LIMIT 1
+      `),
+      getRuntimeFinalCoverage: this.db.prepare(`
+        SELECT
+          COALESCE(SUM(chunk.duration_ms), 0) AS total_ms,
+          COALESCE(SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM processing_jobs AS job
+            WHERE job.chunk_id = chunk.id
+              AND job.job_type = 'transcribe_chunk'
+              AND job.state = 'completed'
+          ) THEN chunk.duration_ms ELSE 0 END), 0) AS final_ms
+        FROM audio_chunks AS chunk
+        WHERE chunk.write_state = 'committed' AND chunk.deleted_at IS NULL
       `),
       listExpiredAudioChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
@@ -2482,6 +2549,40 @@ class JarvisRepository {
       chunks: this.statements.listSessionTimelineChunks.all(sessionId).map(toPublicAudioChunk),
       segments: this.listTranscriptSegments(sessionId),
       processing_counts: this.statements.getSessionProcessingCounts.get(sessionId),
+    };
+  }
+
+  getRuntimeProcessingStatus() {
+    const totals = emptyRuntimeCounts();
+    const stages = new Map();
+    for (const row of this.statements.listRuntimeProcessingGroups.all()) {
+      const count = Number(row.count);
+      const state = runtimeQueueState(row.state);
+      const stage = runtimeJobStage(row);
+      const stageCounts = stages.get(stage) ?? emptyRuntimeCounts();
+      totals[state] += count;
+      totals.total += count;
+      stageCounts[state] += count;
+      stageCounts.total += count;
+      stages.set(stage, stageCounts);
+    }
+    const byStage = Object.fromEntries(
+      [...stages.entries()].sort(([left], [right]) => compareStableIds(left, right))
+    );
+    const backlog = this.statements.getRuntimeTranscriptionBacklog.get();
+    const oldest = this.statements.getRuntimeOldestProcessingJob.get();
+    const latest = this.statements.getLatestProcessingExecutionDevice.get();
+    const coverage = this.statements.getRuntimeFinalCoverage.get();
+    const totalMs = Number(coverage.total_ms);
+    return {
+      ...totals,
+      byStage,
+      backlogMs: Number(backlog.backlog_ms),
+      oldestCreatedAt: oldest.oldest_created_at ?? null,
+      latestExecutionDevice: latest?.execution_device ?? null,
+      finalCoveragePct:
+        totalMs > 0 ? Math.round((Number(coverage.final_ms) / totalMs) * 100) : null,
+      provisionalCoveragePct: null,
     };
   }
 

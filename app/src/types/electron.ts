@@ -30,6 +30,7 @@ import type {
   JarvisPersonOverview,
   JarvisSessionDetail,
   JarvisSessionTimeline,
+  JarvisRuntimeStatus,
   JarvisTodayInsights,
   JarvisTodo,
   JarvisTopic,
@@ -583,6 +584,7 @@ declare global {
         readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
         getSessionTimeline: (sessionId: string) => Promise<JarvisSessionTimeline | null>;
+        getRuntimeStatus: () => Promise<JarvisRuntimeStatus>;
         searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
         listPeopleOverview: () => Promise<JarvisPersonOverview[]>;
         getPersonDetail: (personId: string) => Promise<JarvisPersonDetail | null>;
