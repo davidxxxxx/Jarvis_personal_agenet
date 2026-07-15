@@ -93,6 +93,9 @@ class JarvisTranscriptionWorker {
     } catch {
       throw codedError("AUDIO_UNAVAILABLE");
     }
+    if (chunk && job.input_hash !== chunk.sha256) {
+      throw codedError("TRANSCRIPTION_LINEAGE_MISMATCH");
+    }
     const at = this.now();
     if (
       !chunk ||

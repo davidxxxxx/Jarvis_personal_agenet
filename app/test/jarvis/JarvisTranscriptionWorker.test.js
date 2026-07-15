@@ -12,6 +12,7 @@ const COMPLETED_AT = 500_000;
 function transcriptionJob(chunkId = "chunk-1", overrides = {}) {
   return {
     chunk_id: chunkId,
+    input_hash: "a".repeat(64),
     input_version: INPUT_VERSION,
     model_version: MODEL_VERSION,
     ...overrides,
@@ -177,17 +178,23 @@ test("rejects transcription lineage mismatches before reading durable audio", as
   const repository = seedChunk(t);
   let readerCalls = 0;
   let transcribeCalls = 0;
+  let commitCalls = 0;
+  const commitChunkTranscript = repository.commitChunkTranscript.bind(repository);
+  repository.commitChunkTranscript = (...args) => {
+    commitCalls += 1;
+    return commitChunkTranscript(...args);
+  };
   const { worker } = workerFixture(
     repository,
     async () => {
       transcribeCalls += 1;
-      return { text: "must not run" };
+      return { text: "must not run", confidence: 0.5 };
     },
     {
       reader: {
-        async withVerifiedWav() {
+        async withVerifiedWav(_chunk, consume) {
           readerCalls += 1;
-          return { text: "must not run" };
+          return consume("verified.wav");
         },
       },
     }
@@ -201,8 +208,13 @@ test("rejects transcription lineage mismatches before reading durable audio", as
     worker.handle(transcriptionJob("chunk-1", { input_version: INPUT_VERSION + 1 })),
     { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
   );
+  await assert.rejects(
+    worker.handle(transcriptionJob("chunk-1", { input_hash: "stale-hash" })),
+    { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
+  );
   assert.equal(readerCalls, 0);
   assert.equal(transcribeCalls, 0);
+  assert.equal(commitCalls, 0);
   assert.equal(repository.listTranscriptSegments("session-1").length, 0);
 });
 
