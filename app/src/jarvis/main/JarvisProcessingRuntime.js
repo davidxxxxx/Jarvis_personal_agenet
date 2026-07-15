@@ -711,8 +711,9 @@ function createJarvisProcessingRuntime({
     error.code = "DIARIZATION_RUNTIME_UNAVAILABLE";
     throw error;
   });
-  runner.register("resolve_identities", (job) => {
-    if (effectiveIdentityResolutionWorker) return effectiveIdentityResolutionWorker.run(job);
+  runner.register("resolve_identities", (job, context) => {
+    if (effectiveIdentityResolutionWorker)
+      return effectiveIdentityResolutionWorker.run(job, context);
     const error = new Error("IDENTITY_RESOLUTION_RUNTIME_UNAVAILABLE");
     error.code = "IDENTITY_RESOLUTION_RUNTIME_UNAVAILABLE";
     throw error;

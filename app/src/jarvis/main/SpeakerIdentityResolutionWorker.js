@@ -20,12 +20,32 @@ function resolutionRunId(inputHash) {
     .slice(0, 32)}`;
 }
 
+const CLUSTER_BATCH_SIZE = 16;
+
+function defaultYieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function compareText(left, right) {
+  const leftText = String(left);
+  const rightText = String(right);
+  return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
+}
+
+function compareClusters(left, right) {
+  return (
+    compareText(left.evidenceRunId, right.evidenceRunId) ||
+    compareText(left.clusterId, right.clusterId)
+  );
+}
+
 class SpeakerIdentityResolutionWorker {
   constructor({
     repository,
     resolver = new SpeakerIdentityResolver(),
     policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
     clock = Date.now,
+    yieldToEventLoop = defaultYieldToEventLoop,
   } = {}) {
     const methods = [
       "getSpeakerIdentityResolutionSnapshot",
@@ -41,14 +61,30 @@ class SpeakerIdentityResolutionWorker {
     assertExactIdentityResolutionPolicy(policy);
     assertExactIdentityResolutionPolicy(resolver.policy);
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
+    if (typeof yieldToEventLoop !== "function") {
+      throw new TypeError("yieldToEventLoop must be a function");
+    }
     this.repository = repository;
     this.resolver = resolver;
     this.policy = policy;
     this.clock = clock;
+    this.yieldToEventLoop = yieldToEventLoop;
   }
 
-  async run(job) {
+  async run(job, executionContext = null) {
     if (!job || typeof job !== "object") throw new TypeError("job is required");
+    if (
+      executionContext !== null &&
+      (typeof executionContext !== "object" || typeof executionContext.renewLease !== "function")
+    ) {
+      throw new TypeError("executionContext.renewLease must be a function");
+    }
+    const renewLease = async () => {
+      if (executionContext === null) return true;
+      const renewed = await executionContext.renewLease();
+      if (renewed === false) throw codedError("JOB_LEASE_LOST");
+      return true;
+    };
     let identity;
     try {
       identity = parseIdentityResolutionJobKey(job.input_hash);
@@ -84,7 +120,10 @@ class SpeakerIdentityResolutionWorker {
       policyId: identity.policyId,
     };
     const rejectedByCluster = new Map();
-    const results = snapshot.clusters.map((cluster) => {
+    const clusters = [...snapshot.clusters].sort(compareClusters);
+    const results = [];
+    for (let index = 0; index < clusters.length; index += 1) {
+      const cluster = clusters[index];
       const rejectedPersonIds = this.repository.listRejectedSpeakerPersonIds(
         cluster.clusterId,
         revision
@@ -95,7 +134,7 @@ class SpeakerIdentityResolutionWorker {
         samples: snapshot.samples,
         rejectedPersonIds,
       });
-      return {
+      results.push({
         evidenceRunId: cluster.evidenceRunId,
         clusterId: cluster.clusterId,
         candidatePersonId: result.candidatePersonId,
@@ -103,8 +142,13 @@ class SpeakerIdentityResolutionWorker {
         score: result.score,
         margin: result.margin,
         reason: result.reason,
-      };
-    });
+      });
+      await renewLease();
+      if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
+        await this.yieldToEventLoop();
+      }
+    }
+    await renewLease();
     const precommit = this.repository.getSpeakerIdentityResolutionSnapshot({
       sessionId: identity.sessionId,
       at: this.clock(),
@@ -119,7 +163,8 @@ class SpeakerIdentityResolutionWorker {
     ) {
       throw codedError("IDENTITY_RESOLUTION_SUPERSEDED");
     }
-    for (const cluster of snapshot.clusters) {
+    for (let index = 0; index < clusters.length; index += 1) {
+      const cluster = clusters[index];
       const before = rejectedByCluster.get(cluster.clusterId);
       const after = this.repository.listRejectedSpeakerPersonIds(cluster.clusterId, revision);
       if (
@@ -128,7 +173,12 @@ class SpeakerIdentityResolutionWorker {
       ) {
         throw codedError("IDENTITY_RESOLUTION_REJECTION_CHANGED");
       }
+      await renewLease();
+      if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
+        await this.yieldToEventLoop();
+      }
     }
+    await renewLease();
     const persisted = this.repository.applySystemSpeakerResolutions({
       id: resolutionRunId(job.input_hash),
       sessionId: identity.sessionId,

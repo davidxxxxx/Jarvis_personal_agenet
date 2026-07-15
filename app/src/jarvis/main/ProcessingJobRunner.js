@@ -43,7 +43,7 @@ function defaultJobKind(job) {
   }
   if (job.job_type === "transcribe_chunk") return "final_transcription";
   if (job.job_type === "preview_transcription") return "preview";
-  if (job.job_type === "speaker" || job.job_type === "diarize_track") return "speaker";
+  if (["speaker", "diarize_track", "resolve_identities"].includes(job.job_type)) return "speaker";
   if (job.job_type === "analyze_session") return "analysis";
   return "maintenance";
 }

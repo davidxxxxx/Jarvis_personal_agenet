@@ -925,6 +925,38 @@ test("classifies diarize_track as CPU speaker work without claiming CUDA", async
   );
 });
 
+test("classifies resolve_identities as CPU speaker work without claiming CUDA", async (t) => {
+  const admissions = [];
+  const governor = {
+    sample: async () => ({
+      state: "available",
+      selectedGpuUuid: "GPU-a",
+      cpuLoadPct: 20,
+      cpuTelemetryAvailable: true,
+      powerTelemetryAvailable: true,
+      batterySaver: false,
+    }),
+    admit: (kind, _snapshot, capability) => {
+      admissions.push({ kind, capability });
+      return { action: "run_cpu", reason: "cpu_backend" };
+    },
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+  seedJob(db, { jobType: "resolve_identities", priority: 45 });
+  runner.register("resolve_identities", async (_job, context) => {
+    assert.equal(context.device, "cpu");
+    return { executionDevice: "cpu" };
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(admissions, [{ kind: "speaker", capability: { executionDevice: "cpu" } }]);
+  assert.equal(
+    db.prepare("SELECT execution_device FROM processing_jobs WHERE id = 'j1'").get()
+      .execution_device,
+    "cpu"
+  );
+});
+
 test("final transcription and durable diarization share one heavy-work permit", async (t) => {
   const gate = new HeavyJobGate();
   const firstStarted = deferred();

@@ -771,6 +771,73 @@ test("production composition builds the durable diarization worker from local ma
   });
 });
 
+test("production composition passes CPU speaker lease context into identity resolution", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
+        input_hash, input_version, model_version, created_at
+      ) VALUES (
+        'resolve-job', 's1', NULL, NULL, 'resolve_identities', 'pending', 45,
+        'resolve-input', 1, 'identity-policy', 100
+      )`
+    )
+    .run();
+  const calls = [];
+  const admissions = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: { withVerifiedWav: async (_chunk, consume) => consume("verified.wav") },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    speakerIdentityResolutionWorker: {
+      run: async (job, context) => {
+        calls.push({ job, context });
+        return { executionDevice: "cpu" };
+      },
+    },
+    model: "large-v3-turbo",
+    owner: "identity-worker",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        selectedGpuUuid: "GPU-a",
+        cpuLoadPct: 10,
+        cpuTelemetryAvailable: true,
+        powerTelemetryAvailable: true,
+        batterySaver: false,
+      }),
+      admit: (kind, _snapshot, capability) => {
+        admissions.push({ kind, capability });
+        return { action: "run_cpu", reason: "cpu_backend" };
+      },
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.equal(calls[0].job.id, "resolve-job");
+  assert.equal(calls[0].context.device, "cpu");
+  assert.equal(typeof calls[0].context.renewLease, "function");
+  assert.deepEqual(admissions, [{ kind: "speaker", capability: { executionDevice: "cpu" } }]);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT state, execution_device FROM processing_jobs WHERE id = 'resolve-job'")
+      .get(),
+    { state: "completed", execution_device: "cpu" }
+  );
+});
+
 test("missing local diarization dependencies defer instead of producing HANDLER_MISSING", async (t) => {
   const repository = new JarvisRepository(":memory:");
   t.after(() => repository.close());

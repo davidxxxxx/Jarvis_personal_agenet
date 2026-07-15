@@ -1663,6 +1663,147 @@ test("worker revalidates immutable revisions and commits a complete resolution b
   await assert.rejects(() => worker.run(queued.job), { code: "IDENTITY_RESOLUTION_SUPERSEDED" });
 });
 
+test("identity worker renews deterministically and yields after every fixed cluster batch", async () => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const identity = {
+    sessionId: "session-batched-resolution",
+    diarizationRevision: "a".repeat(64),
+    profileRevision: "b".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  const clusters = Array.from({ length: 17 }, (_value, index) => ({
+    evidenceRunId: "evidence-run-batched",
+    clusterId: `cluster-${String(index).padStart(2, "0")}`,
+  }));
+  const snapshot = Object.freeze({
+    eligible: true,
+    diarizationRevision: identity.diarizationRevision,
+    profileRevision: identity.profileRevision,
+    evidenceRunIds: Object.freeze(["evidence-run-batched"]),
+    clusters: Object.freeze(clusters),
+    samples: Object.freeze([]),
+  });
+  const persisted = [];
+  const repository = {
+    getSpeakerIdentityResolutionSnapshot: () => snapshot,
+    listRejectedSpeakerPersonIds: () => [],
+    applySystemSpeakerResolutions: (input) => {
+      persisted.push(input);
+      return input.results;
+    },
+  };
+  let renewals = 0;
+  let yields = 0;
+  const worker = new SpeakerIdentityResolutionWorker({
+    repository,
+    resolver: {
+      policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+      resolveCluster: ({ cluster }) => ({
+        candidatePersonId: null,
+        state: "unknown",
+        score: null,
+        margin: null,
+        reason: cluster.clusterId,
+      }),
+    },
+    yieldToEventLoop: async () => {
+      yields += 1;
+    },
+  });
+
+  const result = await worker.run(
+    {
+      job_type: "resolve_identities",
+      session_id: identity.sessionId,
+      track_id: null,
+      chunk_id: null,
+      input_hash: buildIdentityResolutionJobKey(identity),
+      input_version: 1,
+      model_version: identity.policyId,
+    },
+    {
+      renewLease() {
+        renewals += 1;
+        return true;
+      },
+    }
+  );
+
+  assert.equal(result.executionDevice, "cpu");
+  assert.equal(persisted[0].results.length, 17);
+  assert.equal(renewals, 36);
+  assert.equal(yields, 4);
+});
+
+test("identity worker propagates lease loss before another cluster or commit", async () => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const identity = {
+    sessionId: "session-lease-loss",
+    diarizationRevision: "c".repeat(64),
+    profileRevision: "d".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  const snapshot = {
+    eligible: true,
+    diarizationRevision: identity.diarizationRevision,
+    profileRevision: identity.profileRevision,
+    evidenceRunIds: ["evidence-run-lease-loss"],
+    clusters: [
+      { evidenceRunId: "evidence-run-lease-loss", clusterId: "cluster-a" },
+      { evidenceRunId: "evidence-run-lease-loss", clusterId: "cluster-b" },
+    ],
+    samples: [],
+  };
+  let resolvedClusters = 0;
+  let commits = 0;
+  const worker = new SpeakerIdentityResolutionWorker({
+    repository: {
+      getSpeakerIdentityResolutionSnapshot: () => snapshot,
+      listRejectedSpeakerPersonIds: () => [],
+      applySystemSpeakerResolutions: () => {
+        commits += 1;
+        return [];
+      },
+    },
+    resolver: {
+      policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+      resolveCluster: () => {
+        resolvedClusters += 1;
+        return {
+          candidatePersonId: null,
+          state: "unknown",
+          score: null,
+          margin: null,
+          reason: "no_match",
+        };
+      },
+    },
+  });
+  const leaseLost = Object.assign(new Error("JOB_LEASE_LOST"), { code: "JOB_LEASE_LOST" });
+
+  await assert.rejects(
+    worker.run(
+      {
+        job_type: "resolve_identities",
+        session_id: identity.sessionId,
+        track_id: null,
+        chunk_id: null,
+        input_hash: buildIdentityResolutionJobKey(identity),
+        input_version: 1,
+        model_version: identity.policyId,
+      },
+      {
+        renewLease: () => {
+          throw leaseLost;
+        },
+      }
+    ),
+    { code: "JOB_LEASE_LOST" }
+  );
+  assert.equal(resolvedClusters, 1);
+  assert.equal(commits, 0);
+});
+
 test("completed diarization remains resolvable after source audio retention expiry", (t) => {
   const { repository } = seedReadyEvidence(t, { trackCount: 1 });
   const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
