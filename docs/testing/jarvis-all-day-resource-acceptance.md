@@ -1,26 +1,26 @@
 # Jarvis 全天运行资源验收
 
-日期：2026-07-15  
+日期：2026-07-15
 范围：Phase 2 Task 13，用户批准的 3 小时虚拟耐久门禁。
 
 ## 自动化结论
 
-| 门禁                  | 结果 | 实测                                       |
-| --------------------- | ---- | ------------------------------------------ |
-| 3 小时资源治理模拟    | PASS | 181 个最终任务，丢失 0                     |
-| 重任务串行            | PASS | 最大并发 1                                 |
-| CPU 预览回退          | PASS | 最大 4 线程，低优先级                      |
-| 外部 GPU 占用让路     | PASS | 2 个窗口均在 15 秒采样边界内识别           |
-| CUDA 崩溃恢复         | PASS | 1 次崩溃；耐久重试后全部完成               |
-| 睡眠租约恢复          | PASS | 1 次过期租约；任务 ID 保留并完成           |
-| 最终任务队列          | PASS | 峰值 11，结束为 0                          |
-| 实时预览队列          | PASS | pending 峰值 2（MIC、PC 各 1），结束为 0   |
-| GPU 可用时预览 p95    | PASS | 0 ms（确定性无墙钟推理模拟）               |
-| 状态变化/日志事件     | PASS | UI 状态变化 67，资源状态变化 11            |
-| 隐藏窗口状态读取      | PASS | 5,400 次，最大 in-flight 1                 |
-| 临时文件/sidecar 收敛 | PASS | 模拟结束遗留 0                             |
-| 3 小时录音与证据模拟  | PASS | 224 chunks、448 jobs、孤儿 0、损坏 0       |
-| 录音资源收敛          | PASS | writer/file/timer/VAD/retention 结束均为 0 |
+| 门禁                 | 结果 | 实测                                         |
+| -------------------- | ---- | -------------------------------------------- |
+| 3 小时资源治理模拟   | PASS | 181 个最终任务，丢失 0                       |
+| 重任务串行           | PASS | 最大并发 1                                   |
+| CPU 预览回退         | PASS | 最大 4 线程，低优先级                        |
+| 外部 GPU 占用让路    | PASS | 2 个窗口内重任务启动 0；预览暂停；积压后归零 |
+| CUDA 崩溃恢复        | PASS | 1 次崩溃；耐久重试后全部完成                 |
+| 睡眠租约恢复         | PASS | 1 次过期租约；任务 ID 保留并完成             |
+| 最终任务队列         | PASS | 峰值 11，结束为 0                            |
+| 实时预览队列         | PASS | pending 峰值 2（MIC、PC 各 1），结束为 0     |
+| GPU 可用时预览 p95   | PASS | 0 ms（确定性无墙钟推理模拟）                 |
+| 隐藏窗口 IPC smoke   | PASS | 5,400 次顺序读取，结果保持可用               |
+| 生产轮询单飞         | PASS | `MemoryView` 挂起请求测试证明不重叠          |
+| 捕获临时资源收敛     | PASS | CaptureSoak 结束无遗留临时文件或 helper      |
+| 3 小时录音与证据模拟 | PASS | 224 chunks、448 jobs、孤儿 0、损坏 0         |
+| 录音资源收敛         | PASS | writer/file/timer/VAD/retention 结束均为 0   |
 
 执行命令：
 
@@ -38,8 +38,9 @@ npm run test:jarvis:capture-soak
 - CPU preview fallback 必须明确携带 `cpuThreads <= 4` 和 `lowPriority=true`。
 - MIC、PC 每条轨道最多保留一个最新 preview 请求；旧请求被合并，不按运行时长累积。
 - 外部 GPU 占用和 CUDA 不可用期间允许 durable final backlog 增长；恢复后的健康窗口必须归零。
-- 运行结束时 durable queue、preview pending/running、gate active/queue 和临时 sidecar 都必须归零。
-- 运行状态为拉取式接口；三小时门禁只保存计数和最后状态，不保存无限 snapshot 历史。
+- 运行结束时 durable queue、preview pending/running、gate active/queue 必须归零；CaptureSoak 创建的临时文件与 helper 也必须清空。
+- 三小时门禁对运行状态执行 5,400 次顺序 IPC smoke 读取，只保存计数和最后状态，不保存无限 snapshot 历史。
+- 生产轮询器的频率与单飞语义由 `MemoryView.test.tsx` 的挂起请求测试独立验证；顺序 smoke 读取不用于推断 in-flight 上限。
 
 ## 参考机器
 
@@ -79,6 +80,8 @@ CUDA 运行时自检（2026-07-15）已执行：
 ```
 
 这表示应用正确、明确地回退到了 CPU；它不代表真实 CUDA 推理门禁已经通过。
+
+自动化测试没有启动真实 Whisper sidecar，也没有测量生产日志文件增长；这些只保留在上表的实机 `NOT RUN` 门禁中。
 
 ## 判定
 

@@ -77,21 +77,22 @@ test(
     let totalFinalJobs = 0;
     let activeHeavy = 0;
     let maxHeavyConcurrency = 0;
+    let heavyStartsDuringExternalGpuBusy = 0;
     let maxCpuFallbackThreads = 0;
     let maxGateQueue = 0;
     let maxFinalQueue = 0;
     let maxPreviewPending = 0;
     let provisionalWrites = 0;
-    let resourceTransitions = 0;
-    let lastResourceSignature = null;
-    let uiStateTransitions = 0;
-    let lastUiSignature = null;
     const previewLatencies = [];
     const busyObservedAt = new Map();
+    const busyWindowEvidence = new Map(
+      BUSY_WINDOWS.map(([windowStart]) => [
+        windowStart,
+        { initialBacklog: null, peakBacklog: 0, pausedTicks: 0 },
+      ])
+    );
     let statusPollBudgetMs = 0;
     let statusReads = 0;
-    let statusInFlight = 0;
-    let maxStatusInFlight = 0;
     let lastRuntimeStatus = null;
 
     const repository = new JarvisRepository(":memory:");
@@ -141,6 +142,7 @@ test(
     });
 
     const enterHeavy = async (operation) => {
+      if (isGpuBusy(now)) heavyStartsDuringExternalGpuBusy += 1;
       activeHeavy += 1;
       maxHeavyConcurrency = Math.max(maxHeavyConcurrency, activeHeavy);
       try {
@@ -250,31 +252,13 @@ test(
     const readRuntimeStatus = ipcHandlers.get(CHANNELS.getRuntimeStatus);
     assert.equal(typeof readRuntimeStatus, "function");
 
-    const observeBounds = (snapshot) => {
+    const observeBounds = () => {
       const gateState = gate.getState();
       const previewState = preview.status();
       const queue = queueCounts(db);
       maxGateQueue = Math.max(maxGateQueue, gateState.queueLength);
       maxFinalQueue = Math.max(maxFinalQueue, queue.total);
       maxPreviewPending = Math.max(maxPreviewPending, previewState.pending);
-      const resourceSignature = `${snapshot.state}:${snapshot.reason}`;
-      if (resourceSignature !== lastResourceSignature) {
-        resourceTransitions += 1;
-        lastResourceSignature = resourceSignature;
-      }
-      const uiSignature = [
-        resourceSignature,
-        previewState.mode,
-        previewState.pending,
-        previewState.running,
-        queue.pending,
-        queue.running,
-        queue.retry,
-      ].join(":");
-      if (uiSignature !== lastUiSignature) {
-        uiStateTransitions += 1;
-        lastUiSignature = uiSignature;
-      }
     };
 
     for (let tick = 0; tick < THREE_HOURS_MS / TICK_MS; tick += 1) {
@@ -307,18 +291,23 @@ test(
         }
       }
       await Promise.all([runner.runOnce(now), preview.tick(snapshot)]);
-      observeBounds(snapshot);
+      observeBounds();
+      for (const [windowStart, windowEnd] of BUSY_WINDOWS) {
+        if (now < windowStart || now >= windowEnd) continue;
+        const evidence = busyWindowEvidence.get(windowStart);
+        const backlog = queueCounts(db).total;
+        evidence.initialBacklog ??= backlog;
+        evidence.peakBacklog = Math.max(evidence.peakBacklog, backlog);
+        const previewState = preview.status();
+        assert.equal(previewState.mode, "paused");
+        assert.equal(previewState.pausedReason, "gpu_busy");
+        evidence.pausedTicks += 1;
+      }
       statusPollBudgetMs += TICK_MS;
       while (statusPollBudgetMs >= 2_000) {
         statusPollBudgetMs -= 2_000;
-        statusInFlight += 1;
-        maxStatusInFlight = Math.max(maxStatusInFlight, statusInFlight);
-        try {
-          lastRuntimeStatus = await readRuntimeStatus(null);
-          statusReads += 1;
-        } finally {
-          statusInFlight -= 1;
-        }
+        lastRuntimeStatus = await readRuntimeStatus(null);
+        statusReads += 1;
       }
     }
 
@@ -330,7 +319,7 @@ test(
       }
       const snapshot = await governor.sample();
       await Promise.all([runner.runOnce(now), preview.tick(snapshot)]);
-      observeBounds(snapshot);
+      observeBounds();
       if (
         queueCounts(db).total === 0 &&
         preview.status().pending === 0 &&
@@ -363,16 +352,13 @@ test(
     assert.ok(recoveredSleepJob.attempt_count >= 2);
     assert.equal(recoveredSleepJob.error_code, null);
     assert.equal(maxHeavyConcurrency, 1);
+    assert.equal(heavyStartsDuringExternalGpuBusy, 0);
     assert.ok(maxCpuFallbackThreads > 0 && maxCpuFallbackThreads <= 4);
     assert.ok(maxFinalQueue <= 20, `final queue grew to ${maxFinalQueue}`);
     assert.ok(maxPreviewPending <= 2, `preview pending grew to ${maxPreviewPending}`);
     assert.ok(maxGateQueue <= 1, `heavy gate queue grew to ${maxGateQueue}`);
-    assert.ok(uiStateTransitions <= 500, `UI state transitions grew to ${uiStateTransitions}`);
     assert.equal(statusReads, THREE_HOURS_MS / 2_000);
-    assert.equal(maxStatusInFlight, 1);
-    assert.equal(statusInFlight, 0);
     assert.equal(lastRuntimeStatus.capture.status, "recording");
-    assert.ok(resourceTransitions <= 16, `resource logs grew to ${resourceTransitions}`);
     assert.ok(provisionalWrites <= THREE_HOURS_MS / TICK_MS);
     assert.equal(gate.getState().activeKind, null);
     assert.equal(gate.getState().queueLength, 0);
@@ -382,6 +368,12 @@ test(
     assert.equal(busyObservedAt.size, BUSY_WINDOWS.length);
     for (const [windowStart, observedAt] of busyObservedAt) {
       assert.ok(observedAt - windowStart <= TICK_MS);
+      const evidence = busyWindowEvidence.get(windowStart);
+      assert.ok(evidence.pausedTicks > 0);
+      assert.ok(
+        evidence.peakBacklog > evidence.initialBacklog,
+        `final backlog did not grow during busy window ${windowStart}`
+      );
     }
 
     t.diagnostic(
@@ -395,15 +387,17 @@ test(
         maxPreviewPending,
         maxGateQueue,
         p95PreviewLatencyMs,
-        uiStateTransitions,
         statusReads,
-        maxStatusInFlight,
-        resourceTransitions,
         provisionalWrites,
         externalGpuBusyWindows: busyObservedAt.size,
+        heavyStartsDuringExternalGpuBusy,
+        busyBacklogGrowth: [...busyWindowEvidence.entries()].map(([windowStart, evidence]) => ({
+          windowStart,
+          initial: evidence.initialBacklog,
+          peak: evidence.peakBacklog,
+        })),
         sleeps: 1,
         cudaCrashes: 1,
-        temporarySidecarsAtEnd: 0,
       })
     );
   }
