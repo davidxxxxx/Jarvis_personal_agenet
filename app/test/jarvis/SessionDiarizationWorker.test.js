@@ -92,7 +92,7 @@ test("v21 creates revisioned diarization evidence with constrained foreign keys"
   try {
     applyJarvisMigrations(db, { now: () => 100 });
 
-    assert.equal(TARGET_VERSION, 22);
+    assert.ok(TARGET_VERSION >= 22);
     assert.deepEqual(columns(db, "speaker_diarization_runs"), [
       "id",
       "session_id",
@@ -185,7 +185,7 @@ test("v21 upgrade preserves every v19 speaker cluster and transcript link", () =
   db.pragma("foreign_keys = ON");
   try {
     applyJarvisMigrations(db, { now: () => 100 });
-    db.exec(transcriptSegmentsSchema("transcript_segments"));
+    db.exec(transcriptSegmentsSchema("transcript_segments", { ifNotExists: true }));
     db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
     db.exec(`
       INSERT INTO sessions (id, started_at, ended_at, status, created_at)

@@ -280,7 +280,7 @@ function seedReadyEvidence(t, { trackCount = 2, completeTracks = trackCount } = 
 
 test("v22 persists revisioned identity resolution history", (t) => {
   const repository = fixture(t);
-  assert.equal(TARGET_VERSION, 22);
+  assert.ok(TARGET_VERSION >= 22);
   assert.deepEqual(
     repository.db
       .prepare("PRAGMA table_info(speaker_identity_resolutions)")
@@ -337,7 +337,7 @@ test("v21 upgrades in place to the v22 identity resolution schema", () => {
       PRAGMA user_version = 21;
     `);
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 21, toVersion: 22 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 21, toVersion: TARGET_VERSION });
     assert.ok(db.prepare("SELECT 1 FROM sessions WHERE id = 'preserved-v21-session'").get());
     assert.ok(
       db
@@ -550,7 +550,7 @@ test("resolution provenance and projection survive repository restart", (t) => {
   });
   repository.close();
   repository = new JarvisRepository(databasePath);
-  assert.equal(repository.db.pragma("user_version", { simple: true }), 22);
+  assert.equal(repository.db.pragma("user_version", { simple: true }), TARGET_VERSION);
   assert.equal(repository.getSpeakerCluster("restart-cluster").personId, "restart-person");
   assert.equal(
     repository.listSpeakerResolutionHistory("restart-cluster")[0].reason,

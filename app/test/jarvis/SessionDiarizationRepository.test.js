@@ -924,7 +924,7 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   db = null;
 
   repo = new JarvisRepository(databasePath);
-  assert.equal(TARGET_VERSION, 22);
+  assert.ok(TARGET_VERSION >= 22);
   assert.equal(repo.db.pragma("user_version", { simple: true }), TARGET_VERSION);
   assert.equal(repo.db.pragma("foreign_keys", { simple: true }), 1);
   assert.deepEqual(repo.db.pragma("foreign_key_check"), []);

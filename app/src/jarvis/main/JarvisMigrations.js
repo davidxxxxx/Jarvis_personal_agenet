@@ -1,4 +1,4 @@
-const TARGET_VERSION = 22;
+const TARGET_VERSION = 23;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -628,6 +628,1679 @@ const SPEAKER_IDENTITY_RESOLUTION_SCHEMA = `
   END;
 `;
 
+const MEMORY_LINEAGE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS analysis_inputs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    transcript_revision TEXT NOT NULL CHECK(
+      typeof(transcript_revision) = 'text' AND length(transcript_revision) = 64
+      AND transcript_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    identity_revision TEXT NOT NULL CHECK(
+      typeof(identity_revision) = 'text' AND length(identity_revision) = 64
+      AND identity_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    prompt_version TEXT NOT NULL CHECK(
+      typeof(prompt_version) = 'text' AND length(trim(prompt_version)) BETWEEN 1 AND 128
+    ),
+    input_hash TEXT NOT NULL UNIQUE CHECK(
+      typeof(input_hash) = 'text' AND length(input_hash) = 64
+      AND input_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_hash TEXT CHECK(
+      candidate_hash IS NULL OR (
+        typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
+        AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    applied_at INTEGER CHECK(
+      applied_at IS NULL OR (typeof(applied_at) = 'integer' AND applied_at >= 0)
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK(
+      (candidate_hash IS NULL AND applied_at IS NULL)
+      OR (candidate_hash IS NOT NULL AND applied_at IS NOT NULL)
+    )
+  );
+  CREATE TABLE IF NOT EXISTS analysis_input_speaker_bindings (
+    analysis_input_id TEXT NOT NULL REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    label TEXT NOT NULL CHECK(
+      typeof(label) = 'text'
+      AND (
+        label = 'SELF'
+        OR (
+          length(label) BETWEEN 2 AND 16
+          AND substr(label, 1, 1) = 'P'
+          AND substr(label, 2, 1) BETWEEN '1' AND '9'
+          AND substr(label, 2) NOT GLOB '*[^0-9]*'
+        )
+      )
+    ),
+    subject_kind TEXT NOT NULL CHECK(
+      typeof(subject_kind) = 'text' AND subject_kind IN ('person','speaker_cluster')
+    ),
+    subject_id TEXT NOT NULL CHECK(typeof(subject_id) = 'text' AND length(subject_id) > 0),
+    PRIMARY KEY(analysis_input_id, label),
+    UNIQUE(analysis_input_id, subject_kind, subject_id)
+  );
+  CREATE TABLE IF NOT EXISTS analysis_input_segments (
+    analysis_input_id TEXT NOT NULL REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(typeof(ordinal) = 'integer' AND ordinal >= 0),
+    segment_id TEXT NOT NULL REFERENCES transcript_segments(id)
+      ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
+    segment_version INTEGER NOT NULL CHECK(
+      typeof(segment_version) = 'integer' AND segment_version >= 1
+    ),
+    text_hash TEXT NOT NULL CHECK(
+      typeof(text_hash) = 'text' AND length(text_hash) = 64
+      AND text_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    text_snapshot TEXT NOT NULL CHECK(
+      typeof(text_snapshot) = 'text' AND length(text_snapshot) > 0
+    ),
+    speaker_binding_label TEXT NOT NULL,
+    PRIMARY KEY(analysis_input_id, ordinal),
+    UNIQUE(analysis_input_id, segment_id),
+    FOREIGN KEY(analysis_input_id, speaker_binding_label)
+      REFERENCES analysis_input_speaker_bindings(analysis_input_id, label)
+      ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
+  );
+
+  CREATE TABLE IF NOT EXISTS memory_items_v2 (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(
+      typeof(kind) = 'text'
+      AND kind IN ('fact','event','decision','commitment','preference','relationship','opinion')
+    ),
+    canonical_slot_key TEXT NOT NULL CHECK(
+      typeof(canonical_slot_key) = 'text' AND length(canonical_slot_key) = 64
+      AND canonical_slot_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    canonical_value_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(canonical_value_key) = 'text' AND length(canonical_value_key) = 64
+      AND canonical_value_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    title TEXT NOT NULL CHECK(typeof(title) = 'text' AND length(trim(title)) > 0),
+    body TEXT NOT NULL CHECK(typeof(body) = 'text' AND length(trim(body)) > 0),
+    confidence REAL NOT NULL CHECK(
+      typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+    ),
+    lifecycle TEXT NOT NULL CHECK(
+      typeof(lifecycle) = 'text'
+      AND lifecycle IN ('active','superseded','conflict','dismissed')
+    ),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('evidence_linked','legacy_unverified','source_deleted')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at)
+  );
+  CREATE TABLE IF NOT EXISTS memory_occurrences (
+    id TEXT PRIMARY KEY,
+    memory_value_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE RESTRICT,
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    legacy_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    occurrence_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(occurrence_key) = 'text' AND length(occurrence_key) = 64
+      AND occurrence_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_item_fingerprint TEXT NOT NULL CHECK(
+      typeof(candidate_item_fingerprint) = 'text' AND length(candidate_item_fingerprint) = 64
+      AND candidate_item_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    started_at INTEGER,
+    ended_at INTEGER,
+    confidence REAL NOT NULL CHECK(
+      typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK((analysis_input_id IS NULL) <> (legacy_session_id IS NULL)),
+    CHECK(
+      (started_at IS NULL AND ended_at IS NULL)
+      OR (
+        typeof(started_at) = 'integer' AND typeof(ended_at) = 'integer'
+        AND started_at >= 0 AND ended_at >= started_at
+      )
+    )
+  );
+  CREATE TABLE IF NOT EXISTS memory_supersessions (
+    previous_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE RESTRICT,
+    next_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE RESTRICT,
+    reason TEXT NOT NULL CHECK(
+      typeof(reason) = 'text'
+      AND reason IN ('transcript_replacement','user_correction','conflict_resolution')
+    ),
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    PRIMARY KEY(previous_id, next_id),
+    CHECK(previous_id <> next_id)
+  );
+  CREATE TABLE IF NOT EXISTS memory_conflict_groups (
+    id TEXT PRIMARY KEY,
+    slot_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(slot_key) = 'text' AND length(slot_key) = 64
+      AND slot_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK(typeof(state) = 'text' AND state IN ('open','resolved')),
+    selected_member_id TEXT REFERENCES memory_items_v2(id) ON DELETE SET NULL,
+    resolved_at INTEGER CHECK(
+      resolved_at IS NULL OR (typeof(resolved_at) = 'integer' AND resolved_at >= 0)
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+    CHECK(
+      (state = 'open' AND selected_member_id IS NULL AND resolved_at IS NULL)
+      OR (state = 'resolved' AND selected_member_id IS NOT NULL AND resolved_at IS NOT NULL)
+    )
+  );
+  CREATE TABLE IF NOT EXISTS memory_conflict_members (
+    group_id TEXT NOT NULL REFERENCES memory_conflict_groups(id) ON DELETE RESTRICT,
+    memory_item_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE RESTRICT,
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    PRIMARY KEY(group_id, memory_item_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS topics_v2 (
+    id TEXT PRIMARY KEY,
+    canonical_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(canonical_key) = 'text' AND length(canonical_key) = 64
+      AND canonical_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    name TEXT NOT NULL CHECK(typeof(name) = 'text' AND length(trim(name)) > 0),
+    canonical_algorithm TEXT NOT NULL CHECK(
+      typeof(canonical_algorithm) = 'text' AND canonical_algorithm = 'canonical-v1'
+    ),
+    lifecycle TEXT NOT NULL CHECK(
+      typeof(lifecycle) = 'text' AND lifecycle IN ('active','superseded','dismissed')
+    ),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('evidence_linked','legacy_unverified','source_deleted')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at)
+  );
+  CREATE TABLE IF NOT EXISTS topic_revisions (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics_v2(id) ON DELETE RESTRICT,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+    previous_revision_id TEXT REFERENCES topic_revisions(id) ON DELETE RESTRICT,
+    summary TEXT NOT NULL CHECK(typeof(summary) = 'text'),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('evidence_linked','legacy_unverified','source_deleted')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    UNIQUE(topic_id, revision)
+  );
+  CREATE TABLE IF NOT EXISTS topic_occurrences (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics_v2(id) ON DELETE RESTRICT,
+    topic_revision_id TEXT NOT NULL REFERENCES topic_revisions(id) ON DELETE RESTRICT,
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    legacy_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    occurrence_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(occurrence_key) = 'text' AND length(occurrence_key) = 64
+      AND occurrence_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_item_fingerprint TEXT NOT NULL CHECK(
+      typeof(candidate_item_fingerprint) = 'text' AND length(candidate_item_fingerprint) = 64
+      AND candidate_item_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK((analysis_input_id IS NULL) <> (legacy_session_id IS NULL))
+  );
+  CREATE TABLE IF NOT EXISTS topic_merge_suggestions (
+    id TEXT PRIMARY KEY,
+    left_topic_id TEXT NOT NULL REFERENCES topics_v2(id) ON DELETE RESTRICT,
+    right_topic_id TEXT NOT NULL REFERENCES topics_v2(id) ON DELETE RESTRICT,
+    pair_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(pair_key) = 'text' AND length(pair_key) = 64
+      AND pair_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    algorithm_version TEXT NOT NULL CHECK(
+      typeof(algorithm_version) = 'text' AND algorithm_version = 'dice-bigram-v1'
+    ),
+    score REAL NOT NULL CHECK(typeof(score) IN ('integer','real') AND score BETWEEN 0 AND 1),
+    state TEXT NOT NULL CHECK(typeof(state) = 'text' AND state IN ('proposed','accepted','dismissed')),
+    decided_at INTEGER CHECK(
+      decided_at IS NULL OR (typeof(decided_at) = 'integer' AND decided_at >= 0)
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+    UNIQUE(left_topic_id, right_topic_id, algorithm_version),
+    CHECK(left_topic_id < right_topic_id),
+    CHECK((state = 'proposed' AND decided_at IS NULL) OR (state <> 'proposed' AND decided_at IS NOT NULL))
+  );
+
+  CREATE TABLE IF NOT EXISTS todos_v2 (
+    id TEXT PRIMARY KEY,
+    canonical_base_key TEXT NOT NULL CHECK(
+      typeof(canonical_base_key) = 'text' AND length(canonical_base_key) = 64
+      AND canonical_base_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    instance_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(instance_key) = 'text' AND length(instance_key) = 64
+      AND instance_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    title TEXT NOT NULL CHECK(typeof(title) = 'text' AND length(trim(title)) > 0),
+    owner_subject_kind TEXT CHECK(
+      owner_subject_kind IS NULL OR (
+        typeof(owner_subject_kind) = 'text'
+        AND owner_subject_kind IN ('person','speaker_cluster')
+      )
+    ),
+    owner_subject_id TEXT CHECK(
+      owner_subject_id IS NULL OR (typeof(owner_subject_id) = 'text' AND length(owner_subject_id) > 0)
+    ),
+    status TEXT NOT NULL CHECK(typeof(status) = 'text' AND status IN ('open','completed','dismissed')),
+    completed_at INTEGER CHECK(
+      completed_at IS NULL OR (typeof(completed_at) = 'integer' AND completed_at >= 0)
+    ),
+    dismissed_at INTEGER CHECK(
+      dismissed_at IS NULL OR (typeof(dismissed_at) = 'integer' AND dismissed_at >= 0)
+    ),
+    recurrence_of_id TEXT REFERENCES todos_v2(id) ON DELETE SET NULL,
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('evidence_linked','legacy_unverified','suggestion','source_deleted')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+    CHECK((owner_subject_kind IS NULL) = (owner_subject_id IS NULL)),
+    CHECK(
+      (status = 'open' AND completed_at IS NULL AND dismissed_at IS NULL)
+      OR (status = 'completed' AND completed_at IS NOT NULL AND dismissed_at IS NULL)
+      OR (status = 'dismissed' AND dismissed_at IS NOT NULL AND completed_at IS NULL)
+    ),
+    CHECK(recurrence_of_id IS NULL OR recurrence_of_id <> id)
+  );
+  CREATE TABLE IF NOT EXISTS todo_revisions (
+    id TEXT PRIMARY KEY,
+    todo_instance_id TEXT NOT NULL REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+    previous_revision_id TEXT REFERENCES todo_revisions(id) ON DELETE RESTRICT,
+    title TEXT NOT NULL CHECK(typeof(title) = 'text' AND length(trim(title)) > 0),
+    due_text TEXT CHECK(due_text IS NULL OR typeof(due_text) = 'text'),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('evidence_linked','legacy_unverified','suggestion','source_deleted')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    UNIQUE(todo_instance_id, revision)
+  );
+  CREATE TABLE IF NOT EXISTS todo_occurrences (
+    id TEXT PRIMARY KEY,
+    todo_instance_id TEXT NOT NULL REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    todo_revision_id TEXT NOT NULL REFERENCES todo_revisions(id) ON DELETE RESTRICT,
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    legacy_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    occurrence_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(occurrence_key) = 'text' AND length(occurrence_key) = 64
+      AND occurrence_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_item_fingerprint TEXT NOT NULL CHECK(
+      typeof(candidate_item_fingerprint) = 'text' AND length(candidate_item_fingerprint) = 64
+      AND candidate_item_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    started_at INTEGER,
+    ended_at INTEGER,
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK((analysis_input_id IS NULL) <> (legacy_session_id IS NULL)),
+    CHECK(
+      (started_at IS NULL AND ended_at IS NULL)
+      OR (
+        typeof(started_at) = 'integer' AND typeof(ended_at) = 'integer'
+        AND started_at >= 0 AND ended_at >= started_at
+      )
+    )
+  );
+  CREATE TABLE IF NOT EXISTS todo_state_transitions (
+    id TEXT PRIMARY KEY,
+    todo_instance_id TEXT NOT NULL REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    from_status TEXT CHECK(
+      from_status IS NULL OR (typeof(from_status) = 'text' AND from_status IN ('open','completed','dismissed'))
+    ),
+    to_status TEXT NOT NULL CHECK(
+      typeof(to_status) = 'text' AND to_status IN ('open','completed','dismissed')
+    ),
+    reason TEXT NOT NULL CHECK(
+      typeof(reason) = 'text'
+      AND reason IN ('analysis_created','user_action','suggestion_acceptance','recurrence')
+    ),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    actor TEXT NOT NULL CHECK(typeof(actor) = 'text' AND actor IN ('system','user')),
+    occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at) = 'integer' AND occurred_at >= 0),
+    CHECK(from_status IS NULL OR from_status <> to_status)
+  );
+  CREATE TABLE IF NOT EXISTS todo_recurrences (
+    id TEXT PRIMARY KEY,
+    previous_todo_id TEXT NOT NULL UNIQUE REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    next_todo_id TEXT NOT NULL UNIQUE REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    source_occurrence_id TEXT NOT NULL UNIQUE REFERENCES todo_occurrences(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK(previous_todo_id <> next_todo_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS suggestions_v2 (
+    id TEXT PRIMARY KEY,
+    canonical_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(canonical_key) = 'text' AND length(canonical_key) = 64
+      AND canonical_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    title TEXT NOT NULL CHECK(typeof(title) = 'text' AND length(trim(title)) > 0),
+    rationale TEXT NOT NULL CHECK(typeof(rationale) = 'text' AND length(trim(rationale)) > 0),
+    state TEXT NOT NULL CHECK(typeof(state) = 'text' AND state IN ('proposed','accepted','dismissed')),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text'
+      AND provenance IN ('suggestion','legacy_unverified','source_deleted')
+    ),
+    decided_at INTEGER CHECK(
+      decided_at IS NULL OR (typeof(decided_at) = 'integer' AND decided_at >= 0)
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+    CHECK((state = 'proposed' AND decided_at IS NULL) OR (state <> 'proposed' AND decided_at IS NOT NULL))
+  );
+  CREATE TABLE IF NOT EXISTS suggestion_occurrences (
+    id TEXT PRIMARY KEY,
+    suggestion_id TEXT NOT NULL REFERENCES suggestions_v2(id) ON DELETE RESTRICT,
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    legacy_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    occurrence_key TEXT NOT NULL UNIQUE CHECK(
+      typeof(occurrence_key) = 'text' AND length(occurrence_key) = 64
+      AND occurrence_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    candidate_item_fingerprint TEXT NOT NULL CHECK(
+      typeof(candidate_item_fingerprint) = 'text' AND length(candidate_item_fingerprint) = 64
+      AND candidate_item_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK((analysis_input_id IS NULL) <> (legacy_session_id IS NULL))
+  );
+  CREATE TABLE IF NOT EXISTS suggestion_acceptances (
+    suggestion_id TEXT PRIMARY KEY REFERENCES suggestions_v2(id) ON DELETE RESTRICT,
+    todo_instance_id TEXT NOT NULL UNIQUE REFERENCES todos_v2(id) ON DELETE RESTRICT,
+    user_action_id TEXT NOT NULL UNIQUE CHECK(
+      typeof(user_action_id) = 'text' AND length(trim(user_action_id)) > 0
+    ),
+    actor TEXT NOT NULL CHECK(typeof(actor) = 'text' AND actor = 'user'),
+    accepted_at INTEGER NOT NULL CHECK(typeof(accepted_at) = 'integer' AND accepted_at >= 0)
+  );
+
+  CREATE TABLE IF NOT EXISTS session_summary_revisions (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+    previous_revision_id TEXT REFERENCES session_summary_revisions(id) ON DELETE RESTRICT,
+    completeness TEXT NOT NULL CHECK(
+      typeof(completeness) = 'text' AND completeness IN ('incremental','final')
+    ),
+    lifecycle TEXT NOT NULL CHECK(
+      typeof(lifecycle) = 'text' AND lifecycle IN ('active','superseded')
+    ),
+    content_json TEXT NOT NULL CHECK(typeof(content_json) = 'text' AND json_valid(content_json)),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    provenance TEXT NOT NULL CHECK(
+      typeof(provenance) = 'text' AND provenance IN ('evidence_linked','legacy_unverified')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    UNIQUE(session_id, revision)
+  );
+
+  CREATE TABLE IF NOT EXISTS daily_digests (
+    id TEXT PRIMARY KEY,
+    local_date TEXT NOT NULL CHECK(
+      typeof(local_date) = 'text' AND length(local_date) = 10
+      AND local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+    ),
+    timezone TEXT NOT NULL CHECK(typeof(timezone) = 'text' AND length(trim(timezone)) > 0),
+    revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+    completeness TEXT NOT NULL CHECK(typeof(completeness) = 'text' AND completeness IN ('partial','final')),
+    lifecycle TEXT NOT NULL CHECK(typeof(lifecycle) = 'text' AND lifecycle IN ('active','superseded')),
+    input_watermark_json TEXT NOT NULL CHECK(
+      typeof(input_watermark_json) = 'text' AND json_valid(input_watermark_json)
+    ),
+    content_json TEXT NOT NULL CHECK(typeof(content_json) = 'text' AND json_valid(content_json)),
+    previous_revision_id TEXT REFERENCES daily_digests(id) ON DELETE RESTRICT,
+    source_hash TEXT NOT NULL CHECK(
+      typeof(source_hash) = 'text' AND length(source_hash) = 64
+      AND source_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= created_at),
+    UNIQUE(local_date, timezone, revision),
+    UNIQUE(local_date, timezone, source_hash)
+  );
+
+  CREATE TABLE IF NOT EXISTS evidence_refs (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL CHECK(
+      typeof(entity_type) = 'text' AND entity_type IN (
+        'memory_occurrence','topic_occurrence','todo_occurrence',
+        'session_summary_revision','daily_digest','suggestion_occurrence'
+      )
+    ),
+    entity_id TEXT NOT NULL CHECK(typeof(entity_id) = 'text' AND length(entity_id) > 0),
+    source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    transcript_segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    audio_chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    track_id TEXT REFERENCES audio_tracks(id) ON DELETE SET NULL,
+    started_at INTEGER NOT NULL CHECK(typeof(started_at) = 'integer' AND started_at >= 0),
+    ended_at INTEGER NOT NULL CHECK(typeof(ended_at) = 'integer' AND ended_at >= started_at),
+    quote_text TEXT NOT NULL CHECK(typeof(quote_text) = 'text' AND length(quote_text) > 0),
+    audio_state TEXT NOT NULL CHECK(
+      typeof(audio_state) = 'text' AND audio_state IN ('available','expired','missing')
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    CHECK(
+      (audio_state = 'missing' AND audio_chunk_id IS NULL)
+      OR (audio_state IN ('available','expired') AND audio_chunk_id IS NOT NULL)
+    ),
+    UNIQUE(entity_type, entity_id, transcript_segment_id, started_at, ended_at)
+  );
+
+  CREATE TABLE IF NOT EXISTS legacy_import_runs (
+    id TEXT PRIMARY KEY,
+    importer_version TEXT NOT NULL CHECK(
+      typeof(importer_version) = 'text' AND length(trim(importer_version)) > 0
+    ),
+    status TEXT NOT NULL CHECK(typeof(status) = 'text' AND status IN ('running','completed','failed')),
+    started_at INTEGER NOT NULL CHECK(typeof(started_at) = 'integer' AND started_at >= 0),
+    completed_at INTEGER CHECK(
+      completed_at IS NULL OR (typeof(completed_at) = 'integer' AND completed_at >= started_at)
+    ),
+    imported_row_count INTEGER NOT NULL DEFAULT 0 CHECK(
+      typeof(imported_row_count) = 'integer' AND imported_row_count >= 0
+    ),
+    CHECK((status = 'running' AND completed_at IS NULL) OR (status <> 'running' AND completed_at IS NOT NULL))
+  );
+  CREATE TABLE IF NOT EXISTS legacy_import_map (
+    source_table TEXT NOT NULL CHECK(typeof(source_table) = 'text' AND length(trim(source_table)) > 0),
+    source_key TEXT NOT NULL CHECK(typeof(source_key) = 'text' AND length(source_key) > 0),
+    source_fingerprint TEXT NOT NULL CHECK(
+      typeof(source_fingerprint) = 'text' AND length(source_fingerprint) = 64
+      AND source_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_entity_type TEXT NOT NULL CHECK(
+      typeof(target_entity_type) = 'text'
+      AND target_entity_type IN ('memory','topic','todo','session_summary','suggestion','evidence')
+    ),
+    target_entity_id TEXT NOT NULL CHECK(
+      typeof(target_entity_id) = 'text' AND length(target_entity_id) > 0
+    ),
+    import_run_id TEXT NOT NULL REFERENCES legacy_import_runs(id) ON DELETE RESTRICT,
+    imported_at INTEGER NOT NULL CHECK(typeof(imported_at) = 'integer' AND imported_at >= 0),
+    PRIMARY KEY(source_table, source_key, source_fingerprint)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_analysis_inputs_session_created
+  ON analysis_inputs(session_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_memory_items_slot_lifecycle
+  ON memory_items_v2(canonical_slot_key, lifecycle);
+  CREATE INDEX IF NOT EXISTS idx_memory_occurrences_value_created
+  ON memory_occurrences(memory_value_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_occurrences_input_candidate
+  ON memory_occurrences(analysis_input_id, candidate_item_fingerprint)
+  WHERE analysis_input_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_topic_occurrences_topic_created
+  ON topic_occurrences(topic_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_topic_occurrences_input_candidate
+  ON topic_occurrences(analysis_input_id, candidate_item_fingerprint)
+  WHERE analysis_input_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_todo_occurrences_todo_created
+  ON todo_occurrences(todo_instance_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_occurrences_input_candidate
+  ON todo_occurrences(analysis_input_id, candidate_item_fingerprint)
+  WHERE analysis_input_id IS NOT NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestion_occurrences_input_candidate
+  ON suggestion_occurrences(analysis_input_id, candidate_item_fingerprint)
+  WHERE analysis_input_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_evidence_refs_entity
+  ON evidence_refs(entity_type, entity_id);
+  CREATE INDEX IF NOT EXISTS idx_evidence_refs_audio_state
+  ON evidence_refs(audio_chunk_id, audio_state)
+  WHERE audio_chunk_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_daily_digests_date_timezone
+  ON daily_digests(local_date, timezone, revision DESC);
+
+  CREATE TRIGGER IF NOT EXISTS analysis_inputs_immutable_update
+  BEFORE UPDATE OF id, session_id, transcript_revision, identity_revision, prompt_version, input_hash, created_at
+  ON analysis_inputs
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_inputs_candidate_cas
+  BEFORE UPDATE OF candidate_hash, applied_at ON analysis_inputs
+  WHEN NOT (
+    OLD.candidate_hash IS NULL AND OLD.applied_at IS NULL
+    AND NEW.candidate_hash IS NOT NULL AND NEW.applied_at IS NOT NULL
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input candidate CAS is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_inputs_immutable_delete
+  BEFORE DELETE ON analysis_inputs
+  WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_immutable_update
+  BEFORE UPDATE ON analysis_input_segments
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input manifest is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_immutable_delete
+  BEFORE DELETE ON analysis_input_segments
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input manifest is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_speaker_bindings_immutable_update
+  BEFORE UPDATE ON analysis_input_speaker_bindings
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker bindings are immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_speaker_bindings_immutable_delete
+  BEFORE DELETE ON analysis_input_speaker_bindings
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker bindings are immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_speaker_bindings_validate_target
+  BEFORE INSERT ON analysis_input_speaker_bindings
+  WHEN NOT (
+    (
+      NEW.subject_kind = 'person'
+      AND (
+        (
+          NEW.label = 'SELF'
+          AND EXISTS (
+            SELECT 1 FROM people WHERE id = NEW.subject_id AND is_self = 1
+          )
+        )
+        OR (
+          NEW.label <> 'SELF'
+          AND EXISTS (
+            SELECT 1 FROM people WHERE id = NEW.subject_id AND is_self = 0
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM speaker_clusters AS cluster
+            JOIN analysis_inputs AS input ON input.id = NEW.analysis_input_id
+            WHERE cluster.session_id = input.session_id
+              AND cluster.person_id = NEW.subject_id
+              AND cluster.link_state = 'confirmed'
+          )
+        )
+      )
+    )
+    OR (
+      NEW.subject_kind = 'speaker_cluster'
+      AND NEW.label <> 'SELF'
+      AND EXISTS (
+        SELECT 1
+        FROM speaker_clusters AS cluster
+        JOIN analysis_inputs AS input ON input.id = NEW.analysis_input_id
+        WHERE cluster.id = NEW.subject_id AND cluster.session_id = input.session_id
+      )
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker binding target is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_validate_source
+  BEFORE INSERT ON analysis_input_segments
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN transcript_segments AS segment ON segment.id = NEW.segment_id
+    WHERE input.id = NEW.analysis_input_id
+      AND segment.session_id = input.session_id
+      AND segment.result_kind = 'final'
+      AND segment.is_stable = 1
+      AND segment.superseded_by IS NULL
+      AND segment.duplicate_of IS NULL
+      AND segment.version = NEW.segment_version
+      AND segment.text = NEW.text_snapshot
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input segment is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_validate_ordinal
+  BEFORE INSERT ON analysis_input_segments
+  WHEN NEW.ordinal <> (
+    SELECT count(*) FROM analysis_input_segments
+    WHERE analysis_input_id = NEW.analysis_input_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input segment ordinal is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_update
+  BEFORE UPDATE OF session_id, started_at, ended_at, speaker_label, text, is_stable,
+    track_id, chunk_id, result_kind, version, superseded_by, duplicate_of
+  ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_input_segments WHERE segment_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_delete
+  BEFORE DELETE ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_segments AS manifest
+    JOIN analysis_inputs AS input ON input.id = manifest.analysis_input_id
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE manifest.segment_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_people_delete_guard
+  BEFORE DELETE ON people
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings
+    WHERE subject_kind = 'person' AND subject_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_people_update_guard
+  BEFORE UPDATE OF id, is_self ON people
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings
+    WHERE subject_kind = 'person' AND subject_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_cluster_delete_guard
+  BEFORE DELETE ON speaker_clusters
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings AS binding
+    JOIN analysis_inputs AS input ON input.id = binding.analysis_input_id
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE (
+      binding.subject_kind = 'speaker_cluster'
+      AND binding.subject_id = OLD.id
+    ) OR (
+      binding.subject_kind = 'person'
+      AND binding.subject_id = OLD.person_id
+      AND binding.label <> 'SELF'
+      AND input.session_id = OLD.session_id
+      AND OLD.link_state = 'confirmed'
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_binding_cluster_update_guard
+  BEFORE UPDATE OF id, session_id, person_id, link_state ON speaker_clusters
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_speaker_bindings AS binding
+    JOIN analysis_inputs AS input ON input.id = binding.analysis_input_id
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE (
+      binding.subject_kind = 'speaker_cluster'
+      AND binding.subject_id = OLD.id
+    ) OR (
+      binding.subject_kind = 'person'
+      AND binding.subject_id = OLD.person_id
+      AND binding.label <> 'SELF'
+      AND input.session_id = OLD.session_id
+      AND OLD.link_state = 'confirmed'
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis input speaker binding target is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON memory_items_v2
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE memory_items_v2 SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS topics_v2_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON topics_v2
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE topics_v2 SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON topic_revisions
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE topic_revisions SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON todos_v2
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE todos_v2 SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON todo_revisions
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE todo_revisions SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_source_deleted
+  AFTER UPDATE OF source_analysis_input_id ON suggestions_v2
+  WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
+  BEGIN
+    UPDATE suggestions_v2 SET provenance = 'source_deleted' WHERE id = NEW.id;
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_immutable_content
+  BEFORE UPDATE OF id, kind, canonical_slot_key, canonical_value_key, title, body,
+    confidence, created_at ON memory_items_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item content is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON memory_items_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_provenance_guard
+  BEFORE UPDATE OF provenance ON memory_items_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance = 'evidence_linked'
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item provenance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_terminal_lifecycle
+  BEFORE UPDATE OF lifecycle ON memory_items_v2
+  WHEN OLD.lifecycle <> 'active' AND NEW.lifecycle IS NOT OLD.lifecycle
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item lifecycle is terminal');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topics_v2_immutable_content
+  BEFORE UPDATE OF id, canonical_key, name, canonical_algorithm, created_at ON topics_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'topic identity is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topics_v2_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON topics_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topics_v2_provenance_guard
+  BEFORE UPDATE OF provenance ON topics_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance = 'evidence_linked'
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic provenance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topics_v2_terminal_lifecycle
+  BEFORE UPDATE OF lifecycle ON topics_v2
+  WHEN OLD.lifecycle <> 'active' AND NEW.lifecycle IS NOT OLD.lifecycle
+  BEGIN
+    SELECT RAISE(ABORT, 'topic lifecycle is terminal');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_immutable_content
+  BEFORE UPDATE OF id, canonical_base_key, instance_key, title, owner_subject_kind,
+    owner_subject_id, recurrence_of_id, created_at ON todos_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'todo content is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON todos_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_provenance_guard
+  BEFORE UPDATE OF provenance ON todos_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance IN ('evidence_linked','suggestion')
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo provenance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_immutable_content
+  BEFORE UPDATE OF id, canonical_key, title, rationale, created_at ON suggestions_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion content is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON suggestions_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_provenance_guard
+  BEFORE UPDATE OF provenance ON suggestions_v2
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance = 'suggestion'
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion provenance is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS memory_items_v2_no_delete
+  BEFORE DELETE ON memory_items_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item cannot be deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_occurrences_immutable_update
+  BEFORE UPDATE ON memory_occurrences
+  BEGIN
+    SELECT RAISE(ABORT, 'memory occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_occurrences_immutable_delete
+  BEFORE DELETE ON memory_occurrences
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  ) OR EXISTS (
+    SELECT 1 FROM sessions WHERE id = OLD.legacy_session_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_supersessions_immutable_update
+  BEFORE UPDATE ON memory_supersessions
+  BEGIN
+    SELECT RAISE(ABORT, 'memory supersession is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_supersessions_immutable_delete
+  BEFORE DELETE ON memory_supersessions
+  WHEN OLD.analysis_input_id IS NULL OR EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory supersession is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_no_delete
+  BEFORE DELETE ON memory_conflict_groups
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict group cannot be deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_immutable_identity
+  BEFORE UPDATE OF id, slot_key, created_at ON memory_conflict_groups
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict identity is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_members_immutable_update
+  BEFORE UPDATE ON memory_conflict_members
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict membership is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_members_immutable_delete
+  BEFORE DELETE ON memory_conflict_members
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict membership is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS topics_v2_no_delete
+  BEFORE DELETE ON topics_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'topic cannot be deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_immutable_update
+  BEFORE UPDATE OF id, topic_id, revision, previous_revision_id, summary, created_at
+  ON topic_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'topic revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON topic_revisions
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic revision source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_provenance_guard
+  BEFORE UPDATE OF provenance ON topic_revisions
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance = 'evidence_linked'
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic revision provenance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_immutable_delete
+  BEFORE DELETE ON topic_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'topic revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_occurrences_immutable_update
+  BEFORE UPDATE ON topic_occurrences
+  BEGIN
+    SELECT RAISE(ABORT, 'topic occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_occurrences_immutable_delete
+  BEFORE DELETE ON topic_occurrences
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  ) OR EXISTS (
+    SELECT 1 FROM sessions WHERE id = OLD.legacy_session_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_merge_suggestions_immutable_identity
+  BEFORE UPDATE OF id, left_topic_id, right_topic_id, pair_key, algorithm_version, score, created_at
+  ON topic_merge_suggestions
+  BEGIN
+    SELECT RAISE(ABORT, 'topic merge suggestion identity is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_merge_suggestions_terminal_state
+  BEFORE UPDATE OF state, decided_at ON topic_merge_suggestions
+  WHEN OLD.state IN ('accepted','dismissed') AND (
+    NEW.state IS NOT OLD.state OR NEW.decided_at IS NOT OLD.decided_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic merge suggestion terminal state is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_merge_suggestions_no_delete
+  BEFORE DELETE ON topic_merge_suggestions
+  BEGIN
+    SELECT RAISE(ABORT, 'topic merge suggestion cannot be deleted');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS todos_v2_no_delete
+  BEFORE DELETE ON todos_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'todo cannot be deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_immutable_update
+  BEFORE UPDATE OF id, todo_instance_id, revision, previous_revision_id, title, due_text, created_at
+  ON todo_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'todo revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_source_guard
+  BEFORE UPDATE OF source_analysis_input_id ON todo_revisions
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NOT NULL
+    AND NEW.source_analysis_input_id IS NULL
+    AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo revision source is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_provenance_guard
+  BEFORE UPDATE OF provenance ON todo_revisions
+  WHEN NOT (
+    OLD.source_analysis_input_id IS NULL
+    AND OLD.provenance IN ('evidence_linked','suggestion')
+    AND NEW.provenance = 'source_deleted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo revision provenance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_immutable_delete
+  BEFORE DELETE ON todo_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'todo revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_occurrences_immutable_update
+  BEFORE UPDATE ON todo_occurrences
+  BEGIN
+    SELECT RAISE(ABORT, 'todo occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_occurrences_immutable_delete
+  BEFORE DELETE ON todo_occurrences
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  ) OR EXISTS (
+    SELECT 1 FROM sessions WHERE id = OLD.legacy_session_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_immutable_update
+  BEFORE UPDATE ON todo_state_transitions
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state transition is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_immutable_delete
+  BEFORE DELETE ON todo_state_transitions
+  WHEN OLD.source_analysis_input_id IS NULL OR EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.source_analysis_input_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state transition is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_recurrences_immutable_update
+  BEFORE UPDATE ON todo_recurrences
+  BEGIN
+    SELECT RAISE(ABORT, 'todo recurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_recurrences_immutable_delete
+  BEFORE DELETE ON todo_recurrences
+  WHEN EXISTS (
+    SELECT 1
+    FROM todo_occurrences AS occurrence
+    JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE occurrence.id = OLD.source_occurrence_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo recurrence is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_no_delete
+  BEFORE DELETE ON suggestions_v2
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion cannot be deleted');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestion_occurrences_immutable_update
+  BEFORE UPDATE ON suggestion_occurrences
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestion_occurrences_immutable_delete
+  BEFORE DELETE ON suggestion_occurrences
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_inputs AS input
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE input.id = OLD.analysis_input_id
+  ) OR EXISTS (
+    SELECT 1 FROM sessions WHERE id = OLD.legacy_session_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion occurrence is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestion_acceptances_immutable_update
+  BEFORE UPDATE ON suggestion_acceptances
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion acceptance is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestion_acceptances_immutable_delete
+  BEFORE DELETE ON suggestion_acceptances
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion acceptance is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS session_summary_revisions_immutable_content
+  BEFORE UPDATE OF id, session_id, revision, previous_revision_id, completeness, content_json,
+    source_analysis_input_id, provenance, created_at
+  ON session_summary_revisions
+  BEGIN
+    SELECT RAISE(ABORT, 'session summary revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS session_summary_revisions_terminal_lifecycle
+  BEFORE UPDATE OF lifecycle ON session_summary_revisions
+  WHEN OLD.lifecycle = 'superseded' AND NEW.lifecycle IS NOT OLD.lifecycle
+  BEGIN
+    SELECT RAISE(ABORT, 'session summary lifecycle is terminal');
+  END;
+  CREATE TRIGGER IF NOT EXISTS session_summary_revisions_immutable_delete
+  BEFORE DELETE ON session_summary_revisions
+  WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'session summary revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS daily_digests_immutable_content
+  BEFORE UPDATE OF id, local_date, timezone, revision, completeness, input_watermark_json,
+    content_json, previous_revision_id, source_hash, created_at
+  ON daily_digests
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest revision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS daily_digests_terminal_lifecycle
+  BEFORE UPDATE OF lifecycle ON daily_digests
+  WHEN OLD.lifecycle = 'superseded' AND NEW.lifecycle IS NOT OLD.lifecycle
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest lifecycle is terminal');
+  END;
+  CREATE TRIGGER IF NOT EXISTS daily_digests_no_delete
+  BEFORE DELETE ON daily_digests
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest revision cannot be deleted');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_immutable_update
+  BEFORE UPDATE OF id, entity_type, entity_id, source_analysis_input_id, session_id,
+    transcript_segment_id, audio_chunk_id, track_id, started_at, ended_at, quote_text, created_at
+  ON evidence_refs
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence reference is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_audio_state_transition
+  BEFORE UPDATE OF audio_state ON evidence_refs
+  WHEN NOT (
+    OLD.audio_state = 'available' AND NEW.audio_state = 'expired'
+    AND EXISTS (
+      SELECT 1 FROM audio_chunks
+      WHERE id = NEW.audio_chunk_id AND deleted_at IS NOT NULL
+    )
+  ) AND NOT (
+    OLD.audio_state IN ('available','expired') AND NEW.audio_state = 'missing'
+    AND NEW.audio_chunk_id IS NULL
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence audio state transition is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_immutable_delete
+  BEFORE DELETE ON evidence_refs
+  WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence reference is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS topic_revisions_validate_predecessor
+  BEFORE INSERT ON topic_revisions
+  WHEN (
+    NEW.revision = 1 AND NEW.previous_revision_id IS NOT NULL
+  ) OR (
+    NEW.revision > 1 AND NOT EXISTS (
+      SELECT 1 FROM topic_revisions AS previous
+      WHERE previous.id = NEW.previous_revision_id
+        AND previous.topic_id = NEW.topic_id
+        AND previous.revision = NEW.revision - 1
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic revision predecessor is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS topic_occurrences_validate_revision_owner
+  BEFORE INSERT ON topic_occurrences
+  WHEN NOT EXISTS (
+    SELECT 1 FROM topic_revisions
+    WHERE id = NEW.topic_revision_id AND topic_id = NEW.topic_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'topic occurrence revision owner is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_revisions_validate_predecessor
+  BEFORE INSERT ON todo_revisions
+  WHEN (
+    NEW.revision = 1 AND NEW.previous_revision_id IS NOT NULL
+  ) OR (
+    NEW.revision > 1 AND NOT EXISTS (
+      SELECT 1 FROM todo_revisions AS previous
+      WHERE previous.id = NEW.previous_revision_id
+        AND previous.todo_instance_id = NEW.todo_instance_id
+        AND previous.revision = NEW.revision - 1
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo revision predecessor is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_occurrences_validate_revision_owner
+  BEFORE INSERT ON todo_occurrences
+  WHEN NOT EXISTS (
+    SELECT 1 FROM todo_revisions
+    WHERE id = NEW.todo_revision_id AND todo_instance_id = NEW.todo_instance_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo occurrence revision owner is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_recurrences_validate_relation
+  BEFORE INSERT ON todo_recurrences
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM todos_v2 AS previous
+    JOIN todos_v2 AS next ON next.id = NEW.next_todo_id
+    JOIN todo_occurrences AS occurrence ON occurrence.id = NEW.source_occurrence_id
+    WHERE previous.id = NEW.previous_todo_id
+      AND previous.status = 'completed'
+      AND next.recurrence_of_id = previous.id
+      AND occurrence.todo_instance_id = next.id
+      AND occurrence.started_at IS NOT NULL
+      AND occurrence.started_at > previous.completed_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo recurrence relation is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS session_summary_revisions_validate_predecessor
+  BEFORE INSERT ON session_summary_revisions
+  WHEN (
+    NEW.revision = 1 AND NEW.previous_revision_id IS NOT NULL
+  ) OR (
+    NEW.revision > 1 AND NOT EXISTS (
+      SELECT 1 FROM session_summary_revisions AS previous
+      WHERE previous.id = NEW.previous_revision_id
+        AND previous.session_id = NEW.session_id
+        AND previous.revision = NEW.revision - 1
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'session summary revision predecessor is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS daily_digests_validate_predecessor
+  BEFORE INSERT ON daily_digests
+  WHEN (
+    NEW.revision = 1 AND NEW.previous_revision_id IS NOT NULL
+  ) OR (
+    NEW.revision > 1 AND NOT EXISTS (
+      SELECT 1 FROM daily_digests AS previous
+      WHERE previous.id = NEW.previous_revision_id
+        AND previous.local_date = NEW.local_date
+        AND previous.timezone = NEW.timezone
+        AND previous.revision = NEW.revision - 1
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest predecessor is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_supersessions_validate_slot
+  BEFORE INSERT ON memory_supersessions
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM memory_items_v2 AS previous
+    JOIN memory_items_v2 AS next ON next.id = NEW.next_id
+    WHERE previous.id = NEW.previous_id
+      AND previous.canonical_slot_key = next.canonical_slot_key
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory supersession slot mismatch');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_members_validate_slot
+  BEFORE INSERT ON memory_conflict_members
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM memory_conflict_groups AS conflict
+    JOIN memory_items_v2 AS item ON item.id = NEW.memory_item_id
+    WHERE conflict.id = NEW.group_id
+      AND conflict.state = 'open'
+      AND conflict.slot_key = item.canonical_slot_key
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict slot mismatch');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_validate_resolution
+  BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
+  WHEN NEW.state = 'resolved' AND NOT EXISTS (
+    SELECT 1
+    FROM memory_conflict_members AS member
+    JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
+    WHERE member.group_id = NEW.id
+      AND member.memory_item_id = NEW.selected_member_id
+      AND item.canonical_slot_key = NEW.slot_key
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict resolution is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_terminal_resolution
+  BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
+  WHEN OLD.state = 'resolved' AND (
+    NEW.state IS NOT OLD.state
+    OR NEW.selected_member_id IS NOT OLD.selected_member_id
+    OR NEW.resolved_at IS NOT OLD.resolved_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict resolution is terminal');
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_conflict_groups_require_open_insert
+  BEFORE INSERT ON memory_conflict_groups
+  WHEN NEW.state <> 'open' OR NEW.selected_member_id IS NOT NULL OR NEW.resolved_at IS NOT NULL
+  BEGIN
+    SELECT RAISE(ABORT, 'memory conflict must be created open');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_terminal_state
+  BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+  WHEN OLD.status IN ('completed','dismissed') AND (
+    NEW.status IS NOT OLD.status
+    OR NEW.completed_at IS NOT OLD.completed_at
+    OR NEW.dismissed_at IS NOT OLD.dismissed_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo terminal state is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todos_v2_require_transition
+  BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM todo_state_transitions AS transition
+    WHERE transition.todo_instance_id = OLD.id
+      AND (
+        (
+          transition.from_status IS NULL
+          AND OLD.status = 'open'
+          AND NEW.status = 'open'
+          AND NEW.completed_at IS NULL
+          AND NEW.dismissed_at IS NULL
+        )
+        OR (
+          transition.from_status = OLD.status
+          AND OLD.status = 'open'
+          AND transition.to_status = NEW.status
+          AND (
+            (
+              NEW.status = 'completed'
+              AND NEW.completed_at = transition.occurred_at
+              AND NEW.dismissed_at IS NULL
+            )
+            OR (
+              NEW.status = 'dismissed'
+              AND NEW.dismissed_at = transition.occurred_at
+              AND NEW.completed_at IS NULL
+            )
+          )
+        )
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state change requires transition history');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_validate_insert
+  BEFORE INSERT ON todo_state_transitions
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM todos_v2 AS todo
+    WHERE todo.id = NEW.todo_instance_id
+      AND (
+        (
+          NEW.from_status IS NULL
+          AND NEW.to_status = 'open'
+          AND todo.status = 'open'
+        )
+        OR (
+          NEW.from_status = 'open'
+          AND todo.status = 'open'
+          AND NEW.to_status IN ('completed','dismissed')
+        )
+      )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'todo state transition is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS todo_state_transitions_apply
+  AFTER INSERT ON todo_state_transitions
+  BEGIN
+    UPDATE todos_v2
+    SET status = NEW.to_status,
+        completed_at = CASE WHEN NEW.to_status = 'completed' THEN NEW.occurred_at ELSE NULL END,
+        dismissed_at = CASE WHEN NEW.to_status = 'dismissed' THEN NEW.occurred_at ELSE NULL END,
+        updated_at = MAX(updated_at, NEW.occurred_at)
+    WHERE id = NEW.todo_instance_id;
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestions_v2_terminal_state
+  BEFORE UPDATE OF state, decided_at ON suggestions_v2
+  WHEN OLD.state IN ('accepted','dismissed') AND (
+    NEW.state IS NOT OLD.state OR NEW.decided_at IS NOT OLD.decided_at
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion terminal state is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS suggestion_acceptances_validate_state
+  BEFORE INSERT ON suggestion_acceptances
+  WHEN NOT EXISTS (
+    SELECT 1 FROM suggestions_v2
+    WHERE id = NEW.suggestion_id AND state = 'accepted'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'suggestion acceptance requires accepted suggestion');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_validate_lineage_insert
+  BEFORE INSERT ON evidence_refs
+  WHEN NOT EXISTS (
+    SELECT 1
+    FROM transcript_segments AS segment
+    LEFT JOIN audio_chunks AS chunk ON chunk.id = NEW.audio_chunk_id
+    LEFT JOIN audio_tracks AS track ON track.id = NEW.track_id
+    WHERE segment.id = NEW.transcript_segment_id
+      AND segment.session_id = NEW.session_id
+      AND segment.result_kind = 'final'
+      AND segment.is_stable = 1
+      AND segment.superseded_by IS NULL
+      AND segment.duplicate_of IS NULL
+      AND NEW.started_at >= segment.started_at
+      AND NEW.ended_at <= segment.ended_at
+      AND instr(segment.text, NEW.quote_text) > 0
+      AND NEW.track_id IS segment.track_id
+      AND (NEW.track_id IS NULL OR track.session_id = NEW.session_id)
+      AND (
+        (
+          NEW.audio_state = 'missing'
+          AND NEW.audio_chunk_id IS NULL
+          AND segment.chunk_id IS NULL
+        )
+        OR (
+          NEW.audio_state IN ('available','expired')
+          AND chunk.id IS NOT NULL
+          AND segment.chunk_id = chunk.id
+          AND chunk.session_id = NEW.session_id
+          AND chunk.track_id IS NEW.track_id
+          AND NEW.started_at >= chunk.started_at
+          AND NEW.ended_at <= chunk.ended_at
+          AND (
+            (NEW.audio_state = 'available' AND chunk.deleted_at IS NULL)
+            OR (NEW.audio_state = 'expired' AND chunk.deleted_at IS NOT NULL)
+          )
+        )
+      )
+      AND (
+        (
+          NEW.source_analysis_input_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM analysis_inputs AS input
+            JOIN analysis_input_segments AS manifest
+              ON manifest.analysis_input_id = input.id
+            WHERE input.id = NEW.source_analysis_input_id
+              AND input.session_id = NEW.session_id
+              AND manifest.segment_id = NEW.transcript_segment_id
+              AND manifest.segment_version = segment.version
+              AND manifest.text_snapshot = segment.text
+              AND instr(manifest.text_snapshot, NEW.quote_text) > 0
+          )
+        )
+        OR NEW.source_analysis_input_id IS NULL
+      )
+      AND CASE NEW.entity_type
+        WHEN 'memory_occurrence' THEN EXISTS (
+          SELECT 1 FROM memory_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id = NEW.source_analysis_input_id
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'topic_occurrence' THEN EXISTS (
+          SELECT 1 FROM topic_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id = NEW.source_analysis_input_id
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'todo_occurrence' THEN EXISTS (
+          SELECT 1 FROM todo_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id = NEW.source_analysis_input_id
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'suggestion_occurrence' THEN EXISTS (
+          SELECT 1 FROM suggestion_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id = NEW.source_analysis_input_id
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'session_summary_revision' THEN EXISTS (
+          SELECT 1 FROM session_summary_revisions
+          WHERE id = NEW.entity_id
+            AND session_id = NEW.session_id
+            AND source_analysis_input_id IS NEW.source_analysis_input_id
+        )
+        WHEN 'daily_digest' THEN EXISTS (
+          SELECT 1 FROM daily_digests WHERE id = NEW.entity_id
+        )
+        ELSE 0
+      END
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence lineage is invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_validate_target_insert
+  BEFORE INSERT ON evidence_refs
+  WHEN CASE NEW.entity_type
+    WHEN 'memory_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM memory_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'topic_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM topic_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'todo_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM todo_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'session_summary_revision' THEN NOT EXISTS (
+      SELECT 1 FROM session_summary_revisions WHERE id = NEW.entity_id
+    )
+    WHEN 'daily_digest' THEN NOT EXISTS (
+      SELECT 1 FROM daily_digests WHERE id = NEW.entity_id
+    )
+    WHEN 'suggestion_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM suggestion_occurrences WHERE id = NEW.entity_id
+    )
+    ELSE 1
+  END
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence target does not exist');
+  END;
+  CREATE TRIGGER IF NOT EXISTS evidence_refs_validate_target_update
+  BEFORE UPDATE OF entity_type, entity_id ON evidence_refs
+  WHEN CASE NEW.entity_type
+    WHEN 'memory_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM memory_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'topic_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM topic_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'todo_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM todo_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'session_summary_revision' THEN NOT EXISTS (
+      SELECT 1 FROM session_summary_revisions WHERE id = NEW.entity_id
+    )
+    WHEN 'daily_digest' THEN NOT EXISTS (
+      SELECT 1 FROM daily_digests WHERE id = NEW.entity_id
+    )
+    WHEN 'suggestion_occurrence' THEN NOT EXISTS (
+      SELECT 1 FROM suggestion_occurrences WHERE id = NEW.entity_id
+    )
+    ELSE 1
+  END
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence target does not exist');
+  END;
+`;
+
+const EVIDENCE_EXPIRY_TRIGGER = `
+  CREATE TRIGGER evidence_refs_expire_audio
+  AFTER UPDATE OF deleted_at ON audio_chunks
+  WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
+  BEGIN
+    UPDATE evidence_refs
+    SET audio_state = 'expired'
+    WHERE audio_chunk_id = NEW.id AND audio_state = 'available';
+  END;
+`;
+
 function disambiguateUnboundSpeakerClusters(db) {
   if (!tableExists(db, "speaker_clusters")) return;
   const duplicates = db
@@ -1023,6 +2696,10 @@ function deduplicateCompressionJobs(db) {
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
+    const violations = db.pragma("foreign_key_check");
+    if (violations.length > 0) {
+      throw new Error("schema migration would violate foreign keys");
+    }
     return { fromVersion, toVersion: fromVersion };
   }
 
@@ -1096,10 +2773,14 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         peak_level REAL
       );
     `);
-      if (fromVersion < 13) {
+      if (!tableExists(db, "transcript_segments")) {
+        db.exec(transcriptSegmentsSchema("transcript_segments", { ifNotExists: true }));
+        db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
+      }
+      if (fromVersion < 13 && !columns(db, "transcript_segments").has("superseded_by")) {
         rebuildTranscriptSegmentsV13(db, { preserveLineage: fromVersion >= 12 });
       }
-      if (fromVersion < 14) {
+      if (fromVersion < 14 && !columns(db, "transcript_segments").has("duplicate_of")) {
         rebuildTranscriptSegmentsV14(db);
       }
       addColumn(db, "audio_gaps", "restored_device_id TEXT");
@@ -1255,12 +2936,20 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         ON speaker_clusters(session_id, local_label)
         WHERE track_id IS NULL;
       `);
+      if (fromVersion < 23) {
+        const retainedLineageSchema =
+          tableExists(db, "analysis_inputs") && tableExists(db, "evidence_refs");
+        db.exec(MEMORY_LINEAGE_SCHEMA);
+        db.exec(
+          retainedLineageSchema
+            ? EVIDENCE_EXPIRY_TRIGGER.replace("CREATE TRIGGER", "CREATE TRIGGER IF NOT EXISTS")
+            : EVIDENCE_EXPIRY_TRIGGER
+        );
+      }
 
-      if (rebuildsTranscriptSegments) {
-        const violations = db.pragma("foreign_key_check");
-        if (violations.length > 0) {
-          throw new Error("transcript schema migration would violate foreign keys");
-        }
+      const violations = db.pragma("foreign_key_check");
+      if (violations.length > 0) {
+        throw new Error("schema migration would violate foreign keys");
       }
       db.pragma(`user_version = ${TARGET_VERSION}`);
     })();

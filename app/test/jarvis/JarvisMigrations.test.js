@@ -1313,7 +1313,7 @@ test("v15 leaves every genuine v14 transcript row and schema relationship unchan
         created_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL
       );
-      ${transcriptSegmentsSchema("transcript_segments")}
+      ${transcriptSegmentsSchema("transcript_segments", { ifNotExists: true })}
       ${TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS}
       CREATE TABLE segment_links (
         id TEXT PRIMARY KEY,
