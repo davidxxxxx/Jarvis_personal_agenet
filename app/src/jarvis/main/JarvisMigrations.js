@@ -1,4 +1,4 @@
-const TARGET_VERSION = 25;
+const TARGET_VERSION = 26;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -3002,6 +3002,248 @@ const ANALYSIS_BUDGET_SCHEMA = `
       'paygo_list_price_equivalent', 1784160000000);
 `;
 
+const AGENT_WORKLOAD_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS analysis_desired_heads (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    analysis_input_id TEXT NOT NULL UNIQUE
+      REFERENCES analysis_inputs(id) ON DELETE RESTRICT,
+    analysis_input_hash TEXT NOT NULL CHECK(
+      typeof(analysis_input_hash) = 'text' AND length(analysis_input_hash) = 64
+      AND analysis_input_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    desired_vector_json TEXT NOT NULL CHECK(
+      typeof(desired_vector_json) = 'text'
+      AND json_valid(desired_vector_json)
+      AND json_type(desired_vector_json) = 'object'
+      AND json_extract(desired_vector_json, '$.analysisInputId') = analysis_input_id
+      AND json_extract(desired_vector_json, '$.analysisInputHash') = analysis_input_hash
+      AND json_type(desired_vector_json, '$.segments') = 'array'
+    ),
+    desired_vector_hash TEXT NOT NULL CHECK(
+      typeof(desired_vector_hash) = 'text' AND length(desired_vector_hash) = 64
+      AND desired_vector_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    head_revision INTEGER NOT NULL CHECK(
+      typeof(head_revision) = 'integer' AND head_revision >= 1
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(
+      typeof(updated_at) = 'integer' AND updated_at >= created_at
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS analysis_response_candidates (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES processing_jobs(id) ON DELETE RESTRICT,
+    analysis_input_id TEXT NOT NULL REFERENCES analysis_inputs(id) ON DELETE RESTRICT,
+    budget_attempt_id TEXT NOT NULL UNIQUE
+      REFERENCES analysis_budget_attempts(request_id) ON DELETE RESTRICT,
+    desired_vector_hash TEXT NOT NULL CHECK(
+      typeof(desired_vector_hash) = 'text' AND length(desired_vector_hash) = 64
+      AND desired_vector_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    response_schema_version TEXT NOT NULL CHECK(
+      typeof(response_schema_version) = 'text'
+      AND length(trim(response_schema_version)) BETWEEN 1 AND 128
+    ),
+    candidate_json TEXT NOT NULL CHECK(
+      typeof(candidate_json) = 'text' AND json_valid(candidate_json)
+      AND json_type(candidate_json) = 'object'
+      AND json_extract(candidate_json, '$.schemaVersion') = response_schema_version
+    ),
+    candidate_bytes INTEGER NOT NULL CHECK(
+      typeof(candidate_bytes) = 'integer' AND candidate_bytes BETWEEN 2 AND 524288
+      AND length(CAST(candidate_json AS BLOB)) = candidate_bytes
+    ),
+    candidate_hash TEXT NOT NULL CHECK(
+      typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
+      AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL DEFAULT 'validated'
+      CHECK(state IN ('validated','applied','superseded')),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    disposition_at INTEGER CHECK(
+      disposition_at IS NULL OR (
+        typeof(disposition_at) = 'integer' AND disposition_at >= created_at
+      )
+    ),
+    CHECK(
+      (state = 'validated' AND disposition_at IS NULL)
+      OR (state IN ('applied','superseded') AND disposition_at IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_processing_jobs_cloud_claim
+  ON processing_jobs(lane, state, priority, next_retry_at, created_at, id)
+  WHERE lane = 'cloud' AND job_type IN ('analyze_session','generate_daily_digest');
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_global_input
+  ON processing_jobs(
+    job_type, input_hash, input_version, model_version,
+    COALESCE(desired_head_hash, '')
+  )
+  WHERE chunk_id IS NULL;
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_analysis_input
+  ON processing_jobs(analysis_input_id, desired_head_hash)
+  WHERE job_type = 'analyze_session' AND analysis_input_id IS NOT NULL;
+
+  CREATE INDEX IF NOT EXISTS idx_analysis_candidates_recovery
+  ON analysis_response_candidates(state, created_at, id);
+
+  CREATE TRIGGER IF NOT EXISTS processing_jobs_cloud_contract_insert
+  BEFORE INSERT ON processing_jobs
+  WHEN NEW.lane = 'cloud'
+    OR NEW.job_type IN ('analyze_session','generate_daily_digest')
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid cloud processing job')
+    WHERE NEW.lane <> 'cloud'
+      OR NEW.job_type NOT IN ('analyze_session','generate_daily_digest')
+      OR (NEW.job_type = 'analyze_session' AND NEW.priority <> 70)
+      OR (NEW.job_type = 'generate_daily_digest' AND NEW.priority <> 80)
+      OR (
+        NEW.job_type = 'analyze_session'
+        AND (NEW.analysis_input_id IS NULL OR NEW.desired_head_hash IS NULL)
+      )
+      OR (
+        NEW.job_type = 'analyze_session'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM analysis_desired_heads AS head
+          WHERE head.session_id = NEW.session_id
+            AND head.analysis_input_id = NEW.analysis_input_id
+            AND head.analysis_input_hash = NEW.input_hash
+            AND head.desired_vector_hash = NEW.desired_head_hash
+            AND json_extract(head.desired_vector_json, '$.modelVersion') = NEW.model_version
+        )
+      );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS processing_jobs_cloud_contract_update
+  BEFORE UPDATE OF job_type, lane, priority, analysis_input_id, desired_head_hash
+  ON processing_jobs
+  WHEN NEW.lane = 'cloud'
+    OR NEW.job_type IN ('analyze_session','generate_daily_digest')
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid cloud processing job')
+    WHERE NEW.lane <> 'cloud'
+      OR NEW.job_type NOT IN ('analyze_session','generate_daily_digest')
+      OR (NEW.job_type = 'analyze_session' AND NEW.priority <> 70)
+      OR (NEW.job_type = 'generate_daily_digest' AND NEW.priority <> 80)
+      OR (
+        NEW.job_type = 'analyze_session'
+        AND (NEW.analysis_input_id IS NULL OR NEW.desired_head_hash IS NULL)
+      )
+      OR (
+        NEW.job_type = 'analyze_session'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM analysis_desired_heads AS head
+          WHERE head.session_id = NEW.session_id
+            AND head.analysis_input_id = NEW.analysis_input_id
+            AND head.analysis_input_hash = NEW.input_hash
+            AND head.desired_vector_hash = NEW.desired_head_hash
+            AND json_extract(head.desired_vector_json, '$.modelVersion') = NEW.model_version
+        )
+      );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_desired_heads_validate_insert
+  BEFORE INSERT ON analysis_desired_heads
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis desired head does not match immutable input')
+    WHERE NOT EXISTS (
+      SELECT 1 FROM analysis_inputs AS input
+      WHERE input.id = NEW.analysis_input_id
+        AND input.session_id = NEW.session_id
+        AND input.input_hash = NEW.analysis_input_hash
+        AND input.transcript_revision = json_extract(
+          NEW.desired_vector_json, '$.transcriptRevision'
+        )
+        AND input.identity_revision = json_extract(
+          NEW.desired_vector_json, '$.identityRevision'
+        )
+        AND input.prompt_version = json_extract(NEW.desired_vector_json, '$.promptVersion')
+        AND input.cloud_payload_sha256 = json_extract(
+          NEW.desired_vector_json, '$.cloudPayloadHash'
+        )
+    );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_desired_heads_validate_update
+  BEFORE UPDATE ON analysis_desired_heads
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis desired head revision CAS is invalid')
+    WHERE NEW.session_id <> OLD.session_id
+      OR NEW.created_at <> OLD.created_at
+      OR NEW.head_revision <> OLD.head_revision + 1
+      OR NEW.updated_at < OLD.updated_at;
+    SELECT RAISE(ABORT, 'analysis desired head does not match immutable input')
+    WHERE NOT EXISTS (
+      SELECT 1 FROM analysis_inputs AS input
+      WHERE input.id = NEW.analysis_input_id
+        AND input.session_id = NEW.session_id
+        AND input.input_hash = NEW.analysis_input_hash
+        AND input.transcript_revision = json_extract(
+          NEW.desired_vector_json, '$.transcriptRevision'
+        )
+        AND input.identity_revision = json_extract(
+          NEW.desired_vector_json, '$.identityRevision'
+        )
+        AND input.prompt_version = json_extract(NEW.desired_vector_json, '$.promptVersion')
+        AND input.cloud_payload_sha256 = json_extract(
+          NEW.desired_vector_json, '$.cloudPayloadHash'
+        )
+    );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_response_candidates_validate_insert
+  BEFORE INSERT ON analysis_response_candidates
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis response candidate linkage is invalid')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM processing_jobs AS job
+      JOIN analysis_inputs AS input ON input.id = NEW.analysis_input_id
+      JOIN analysis_budget_attempts AS attempt
+        ON attempt.request_id = NEW.budget_attempt_id
+      WHERE job.id = NEW.job_id
+        AND job.job_type = 'analyze_session'
+        AND job.lane = 'cloud'
+        AND job.analysis_input_id = NEW.analysis_input_id
+        AND job.input_hash = input.input_hash
+        AND job.desired_head_hash = NEW.desired_vector_hash
+        AND attempt.job_id = job.id
+        AND attempt.state = 'reconciled'
+    );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_response_candidates_immutable_update
+  BEFORE UPDATE OF id, job_id, analysis_input_id, budget_attempt_id,
+    desired_vector_hash, response_schema_version, candidate_json,
+    candidate_bytes, candidate_hash, created_at
+  ON analysis_response_candidates
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis response candidate is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_response_candidates_immutable_delete
+  BEFORE DELETE ON analysis_response_candidates
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis response candidate is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS analysis_response_candidates_disposition_cas
+  BEFORE UPDATE OF state, disposition_at ON analysis_response_candidates
+  WHEN NOT (
+    OLD.state = 'validated' AND OLD.disposition_at IS NULL
+    AND NEW.state IN ('applied','superseded') AND NEW.disposition_at IS NOT NULL
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis response candidate disposition CAS is invalid');
+  END;
+`;
+
 const ANALYSIS_BUDGET_TABLE_COLUMNS = Object.freeze({
   analysis_budget_policy_revisions: [
     "revision",
@@ -3696,6 +3938,47 @@ function deduplicateCompressionJobs(db) {
   }
 }
 
+function upgradeAgentWorkloadV26(db) {
+  addColumn(
+    db,
+    "processing_jobs",
+    "lane TEXT NOT NULL DEFAULT 'local' CHECK(lane IN ('local','cloud'))"
+  );
+  addColumn(
+    db,
+    "processing_jobs",
+    "analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE RESTRICT"
+  );
+  addColumn(
+    db,
+    "processing_jobs",
+    `desired_head_hash TEXT CHECK(
+      desired_head_hash IS NULL OR (
+        typeof(desired_head_hash) = 'text' AND length(desired_head_hash) = 64
+        AND desired_head_hash NOT GLOB '*[^0-9a-f]*'
+      )
+    )`
+  );
+  db.exec(`
+    UPDATE processing_jobs
+    SET lane = 'cloud'
+    WHERE job_type IN ('analyze_session','generate_daily_digest');
+
+    UPDATE processing_jobs
+    SET priority = CASE
+      WHEN job_type = 'analyze_session' THEN 70
+      WHEN job_type = 'generate_daily_digest' THEN 80
+      ELSE priority
+    END
+    WHERE job_type IN ('analyze_session','generate_daily_digest')
+      AND completed_at IS NULL;
+
+    DROP INDEX IF EXISTS idx_processing_jobs_global_input;
+    DROP INDEX IF EXISTS idx_processing_jobs_analysis_input;
+  `);
+  db.exec(AGENT_WORKLOAD_SCHEMA);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -3956,6 +4239,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 25) {
         upgradeAnalysisBudgetAttemptPeriodTriggerV25(db);
       }
+      if (fromVersion < 26) {
+        upgradeAgentWorkloadV26(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -3980,4 +4266,6 @@ module.exports = {
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
   SPEAKER_IDENTITY_SCHEMA,
   SESSION_DIARIZATION_SCHEMA,
+  AGENT_WORKLOAD_SCHEMA,
+  upgradeAgentWorkloadV26,
 };

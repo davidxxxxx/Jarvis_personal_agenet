@@ -12,6 +12,16 @@ const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
 
 const { toPublicAudioChunk } = require("./AudioChunkPublicView");
 
+const LOCAL_PROCESSING_JOB_TYPES = Object.freeze([
+  "transcribe_chunk",
+  "preview_transcription",
+  "speaker",
+  "diarize_track",
+  "resolve_identities",
+  "compress_chunk",
+]);
+const CLOUD_PROCESSING_JOB_TYPES = Object.freeze(["analyze_session", "generate_daily_digest"]);
+
 class CaptureEvidenceStore {
   constructor(db, { createId, now = Date.now }) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
@@ -492,7 +502,12 @@ class CaptureEvidenceStore {
       `),
       listClaimableJobs: db.prepare(`
         SELECT * FROM processing_jobs
-        WHERE state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
+        WHERE lane = 'local'
+          AND job_type IN (
+            'transcribe_chunk','preview_transcription','speaker',
+            'diarize_track','resolve_identities','compress_chunk'
+          )
+          AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
           AND priority < @priorityBefore
@@ -508,6 +523,11 @@ class CaptureEvidenceStore {
             lease_owner = @owner,
             lease_expires_at = @leaseExpiresAt
         WHERE id = @id
+          AND lane = 'local'
+          AND job_type IN (
+            'transcribe_chunk','preview_transcription','speaker',
+            'diarize_track','resolve_identities','compress_chunk'
+          )
           AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
@@ -525,9 +545,88 @@ class CaptureEvidenceStore {
             execution_device = NULL,
             completed_at = NULL
         WHERE state = 'running'
+          AND lane = 'local'
+          AND job_type IN (
+            'transcribe_chunk','preview_transcription','speaker',
+            'diarize_track','resolve_identities','compress_chunk'
+          )
           AND completed_at IS NULL
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
+      `),
+      insertCloudJob: db.prepare(`
+        INSERT OR IGNORE INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state, priority,
+          input_hash, input_version, model_version, attempt_count,
+          lane, analysis_input_id, desired_head_hash, created_at
+        ) VALUES (
+          @id, @sessionId, NULL, NULL, @jobType, 'pending', @priority,
+          @inputHash, @inputVersion, @modelVersion, 0,
+          'cloud', @analysisInputId, @desiredHeadHash, @createdAt
+        )
+      `),
+      getCloudJobByIdentity: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = @jobType
+          AND input_hash = @inputHash
+          AND input_version = @inputVersion
+          AND model_version = @modelVersion
+          AND analysis_input_id IS @analysisInputId
+          AND desired_head_hash IS @desiredHeadHash
+          AND chunk_id IS NULL
+      `),
+      listClaimableCloudJobs: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE lane = 'cloud'
+          AND job_type IN ('analyze_session','generate_daily_digest')
+          AND state IN ('pending','retry')
+          AND completed_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at <= @at)
+          AND priority < @priorityBefore
+          AND (
+            job_type = 'generate_daily_digest'
+            OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
+          )
+        ORDER BY priority ASC, created_at ASC, id ASC
+        LIMIT @limit
+      `),
+      claimCloudJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'running',
+            attempt_count = attempt_count + 1,
+            lease_owner = @owner,
+            lease_expires_at = @leaseExpiresAt
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type IN ('analyze_session','generate_daily_digest')
+          AND state IN ('pending','retry')
+          AND completed_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at <= @at)
+          AND priority < @priorityBefore
+          AND (
+            job_type = 'generate_daily_digest'
+            OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
+          )
+      `),
+      listAgentAdmissionBacklog: db.prepare(`
+        SELECT job_type, state, priority, next_retry_at
+        FROM processing_jobs
+        WHERE lane = 'local'
+          AND job_type IN (
+            'transcribe_chunk','preview_transcription','speaker',
+            'diarize_track','resolve_identities','compress_chunk'
+          )
+          AND state IN ('pending','running','retry','retention_urgent','storage_recovery_compress')
+          AND completed_at IS NULL
+          AND priority < @priorityBefore
+        ORDER BY priority ASC, created_at ASC, id ASC
+      `),
+      countCloudLaneInFlight: db.prepare(`
+        SELECT count(*) AS count FROM processing_jobs
+        WHERE lane = 'cloud'
+          AND job_type IN ('analyze_session','generate_daily_digest')
+          AND state = 'running'
+          AND completed_at IS NULL
       `),
       recoverExpiredTranscriptionJobLeases: db.prepare(`
         UPDATE processing_jobs
@@ -670,6 +769,32 @@ class CaptureEvidenceStore {
         const claimed = [];
         for (const candidate of candidates) {
           const result = this.statements.claimJob.run({
+            id: candidate.id,
+            owner,
+            at,
+            leaseExpiresAt,
+            priorityBefore,
+          });
+          if (result.changes === 1) {
+            claimed.push({
+              ...this.statements.getProcessingJob.get(candidate.id),
+              claimed_from_state: candidate.state,
+            });
+          }
+        }
+        return claimed;
+      }
+    );
+    this.claimCloudJobsTransaction = db.transaction(
+      ({ owner, at, leaseExpiresAt, limit, priorityBefore }) => {
+        const candidates = this.statements.listClaimableCloudJobs.all({
+          at,
+          limit,
+          priorityBefore,
+        });
+        const claimed = [];
+        for (const candidate of candidates) {
+          const result = this.statements.claimCloudJob.run({
             id: candidate.id,
             owner,
             at,
@@ -1408,6 +1533,68 @@ class CaptureEvidenceStore {
     return this.statements.promoteCompressionJobsForStoragePressure.run({ at }).changes;
   }
 
+  enqueueCloudJob({
+    sessionId,
+    jobType,
+    analysisInputId = null,
+    desiredHeadHash = null,
+    inputHash,
+    inputVersion = 1,
+    modelVersion,
+  } = {}) {
+    this._assertIdentifier(sessionId, "sessionId");
+    if (!CLOUD_PROCESSING_JOB_TYPES.includes(jobType)) {
+      throw new TypeError("jobType must be a fixed cloud processing type");
+    }
+    this._assertHash(inputHash, "inputHash");
+    this._assertPositiveSafeInteger(inputVersion, "inputVersion");
+    this._assertText(modelVersion, "modelVersion", 128);
+    if (jobType === "analyze_session") {
+      this._assertIdentifier(analysisInputId, "analysisInputId");
+      this._assertHash(desiredHeadHash, "desiredHeadHash");
+    } else if (analysisInputId !== null || desiredHeadHash !== null) {
+      throw new TypeError("daily digest cloud jobs must not use an analysis input head");
+    }
+    const priority = jobType === "analyze_session" ? 70 : 80;
+    const createdAt = this.now();
+    this._assertNonNegativeSafeInteger(createdAt, "createdAt");
+    const id = this.createId(jobType === "analyze_session" ? "job_analysis" : "job_digest");
+    this._assertIdentifier(id, "jobId");
+    this.statements.insertCloudJob.run({
+      id,
+      sessionId,
+      jobType,
+      priority,
+      inputHash,
+      inputVersion,
+      modelVersion,
+      analysisInputId,
+      desiredHeadHash,
+      createdAt,
+    });
+    const row = this.statements.getCloudJobByIdentity.get({
+      jobType,
+      inputHash,
+      inputVersion,
+      modelVersion,
+      analysisInputId,
+      desiredHeadHash,
+    });
+    if (
+      !row ||
+      row.session_id !== sessionId ||
+      row.lane !== "cloud" ||
+      row.priority !== priority ||
+      row.analysis_input_id !== analysisInputId ||
+      row.desired_head_hash !== desiredHeadHash
+    ) {
+      const error = new Error("CLOUD_JOB_IDENTITY_COLLISION");
+      error.code = "CLOUD_JOB_IDENTITY_COLLISION";
+      throw error;
+    }
+    return row;
+  }
+
   claimJobs({ owner, at, leaseMs, limit, priorityBefore = Number.MAX_SAFE_INTEGER }) {
     this._assertIdentifier(owner, "owner");
     this._assertNonNegativeSafeInteger(at, "at");
@@ -1420,6 +1607,43 @@ class CaptureEvidenceStore {
       throw new RangeError("lease expiry must be a safe integer");
     }
     return this.claimJobsTransaction({ owner, at, leaseExpiresAt, limit, priorityBefore });
+  }
+
+  claimCloudJobs({ owner, at, leaseMs, limit = 1, priorityBefore = Number.MAX_SAFE_INTEGER }) {
+    this._assertIdentifier(owner, "owner");
+    this._assertNonNegativeSafeInteger(at, "at");
+    this._assertPositiveSafeInteger(leaseMs, "leaseMs");
+    this._assertPositiveSafeInteger(limit, "limit");
+    this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
+    if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
+    const leaseExpiresAt = at + leaseMs;
+    if (!Number.isSafeInteger(leaseExpiresAt)) {
+      throw new RangeError("lease expiry must be a safe integer");
+    }
+    return this.claimCloudJobsTransaction({
+      owner,
+      at,
+      leaseExpiresAt,
+      limit,
+      priorityBefore,
+    });
+  }
+
+  listAgentAdmissionBacklog({ priorityBefore = 70 } = {}) {
+    this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
+    return this.statements.listAgentAdmissionBacklog.all({ priorityBefore }).map((row) => ({
+      jobType: row.job_type,
+      lane: "local",
+      state: ["retention_urgent", "storage_recovery_compress"].includes(row.state)
+        ? "pending"
+        : row.state,
+      priority: row.priority,
+      nextRetryAt: row.next_retry_at,
+    }));
+  }
+
+  countCloudLaneInFlight() {
+    return this.statements.countCloudLaneInFlight.get().count;
   }
 
   recoverExpiredLeases(at) {
@@ -1565,6 +1789,18 @@ class CaptureEvidenceStore {
   _assertIdentifier(value, name) {
     if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
       throw new TypeError(`${name} must be a safe identifier`);
+    }
+  }
+
+  _assertHash(value, name) {
+    if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+      throw new TypeError(`${name} must be a lowercase SHA-256 hash`);
+    }
+  }
+
+  _assertText(value, name, maxLength) {
+    if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
+      throw new TypeError(`${name} must be non-empty text of at most ${maxLength} characters`);
     }
   }
 

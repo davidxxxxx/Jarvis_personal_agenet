@@ -142,7 +142,7 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
       ) VALUES
         ('j1', 's1', 't1', 'c1', 'transcribe_chunk', 'pending', 'same', 1, '', 20),
         ('j2', 's1', 't1', 'c2', 'transcribe_chunk', 'pending', 'same', 1, '', 30),
-        ('g1', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40);
+        ('g1', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 1, '', 40);
     `);
     assert.throws(() =>
       db
@@ -160,7 +160,7 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
           `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
-        ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 50)`
+        ) VALUES ('g2', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 1, '', 50)`
         )
         .run()
     );
@@ -168,7 +168,7 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
       `INSERT INTO processing_jobs (
         id, session_id, track_id, chunk_id, job_type, state,
         input_hash, input_version, model_version, created_at
-      ) VALUES ('g3', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, 'model-2', 60)`
+      ) VALUES ('g3', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 1, 'model-2', 60)`
     ).run();
   } finally {
     db.close();
@@ -601,7 +601,7 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
         id, session_id, track_id, chunk_id, job_type, state, input_hash, created_at
       ) VALUES
         ('j1', 's1', 't1', 'c1', 'transcribe_chunk', 'pending', 'same', 20),
-        ('g1', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 20);
+        ('g1', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 20);
       PRAGMA user_version = 1;
     `);
 
@@ -634,7 +634,7 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
           `INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
           input_hash, input_version, model_version, created_at
-        ) VALUES ('g2', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, '', 40)`
+        ) VALUES ('g2', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 1, '', 40)`
         )
         .run()
     );
@@ -642,7 +642,7 @@ test("upgrades v1 job identity and enforces track sequence uniqueness in the dat
       `INSERT INTO processing_jobs (
         id, session_id, track_id, chunk_id, job_type, state,
         input_hash, input_version, model_version, created_at
-      ) VALUES ('g3', 's1', NULL, NULL, 'analyze_session', 'pending', 'global', 1, 'model-2', 50)`
+      ) VALUES ('g3', 's1', NULL, NULL, 'future_global_job', 'pending', 'global', 1, 'model-2', 50)`
     ).run();
     assert.throws(
       () =>

@@ -185,11 +185,11 @@ function createRepresentativeV23Database() {
   return db;
 }
 
-test("v25 creates the durable analysis budget schema and reviewed MiniMax price rows", () => {
+test("latest migration retains the durable v25 budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 25);
-    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: 25 });
+    assert.equal(TARGET_VERSION, 26);
+    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: 26 });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 
     assert.deepEqual(
@@ -273,7 +273,7 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
         .all(),
       []
     );
-    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 25 });
+    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 26 });
     assert.deepEqual(db.prepare("SELECT id, status FROM sessions").get(), {
       id: "preserved-v23-session",
       status: "completed",
@@ -385,7 +385,7 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     const first = db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all();
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 25, toVersion: 25 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 26, toVersion: 26 });
     assert.deepEqual(
       db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all(),
       first
@@ -414,7 +414,7 @@ test("a base v24 database replaces the legacy period trigger before revised-poli
       /period\.policy_revision = NEW\.policy_revision/
     );
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 25 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 26 });
     const upgradedSql = db
       .prepare(
         `SELECT sql FROM sqlite_master

@@ -3,6 +3,8 @@ const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 const test = require("node:test");
 
+const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
+const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 
 const HASH_A = "a".repeat(64);
@@ -406,6 +408,63 @@ function createAlternativeInput(repository, text) {
   return repository.createAnalysisInput(validCreateInput({ cloudPayloadJson }));
 }
 
+function setDesiredHead(repository, input, overrides = {}) {
+  return repository.setAnalysisDesiredHead({
+    sessionId: "session-1",
+    analysisInputId: input.analysisInputId,
+    responseSchemaVersion: "jarvis-analysis-v2",
+    pseudonymBindingRevision: 1,
+    modelVersion: "MiniMax-M2.7",
+    segmentSubjectRevisions: [{ segmentId: "segment-1", subjectRevision: 1 }],
+    ...overrides,
+  });
+}
+
+function createCloudJob(db, head, overrides = {}) {
+  let ids = 0;
+  const store = new CaptureEvidenceStore(db, {
+    createId: (prefix) => `${prefix}-cloud-${++ids}`,
+    now: () => 7_000,
+  });
+  const job = store.enqueueCloudJob({
+    sessionId: "session-1",
+    jobType: "analyze_session",
+    analysisInputId: head.analysisInputId,
+    desiredHeadHash: head.desiredVectorHash,
+    inputHash: head.analysisInputHash,
+    inputVersion: 1,
+    modelVersion: head.modelVersion,
+    ...overrides,
+  });
+  return { store, job };
+}
+
+function reconcileBudgetAttempt(db, jobId, requestId = "budget-request-1") {
+  const at = Date.UTC(2026, 6, 16, 4);
+  const budget = new AnalysisBudgetRepository(db);
+  budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at });
+  assert.equal(
+    budget.reserve({
+      requestId,
+      jobId,
+      attemptNumber: 1,
+      provider: "minimax",
+      model: "MiniMax-M2.7",
+      operation: "session_analysis",
+      estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+      at: at + 1,
+    }).ok,
+    true
+  );
+  budget.markStarted({ requestId, at: at + 2 });
+  budget.reconcile({
+    requestId,
+    usage: { inputTokens: 100, outputTokens: 100 },
+    at: at + 3,
+  });
+  return requestId;
+}
+
 test("constructor requires a live database and dependency functions", () => {
   const MemoryRepository = loadMemoryRepository();
   const db = createFixture();
@@ -416,6 +475,363 @@ test("constructor requires a live database and dependency functions", () => {
     assert.throws(
       () => new MemoryRepository(db, { createId: () => "id", now: () => 1 }),
       /validateRedactedCloudPayload/i
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("durably advances one exact analysis desired head without mutating immutable inputs", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const first = setDesiredHead(repository, input);
+
+    assert.deepEqual(first, repository.getAnalysisDesiredHead("session-1"));
+    assert.equal(first.headRevision, 1);
+    assert.equal(first.analysisInputId, input.analysisInputId);
+    assert.equal(first.analysisInputHash, input.inputHash);
+    assert.equal(first.transcriptRevision, HASH_A);
+    assert.equal(first.identityRevision, HASH_B);
+    assert.equal(first.promptVersion, "jarvis-analysis-v2");
+    assert.equal(first.responseSchemaVersion, "jarvis-analysis-v2");
+    assert.equal(first.pseudonymBindingRevision, 1);
+    assert.equal(first.modelVersion, "MiniMax-M2.7");
+    assert.equal(first.cloudPayloadHash, expectedInputIdentity().cloudPayloadSha256);
+    assert.deepEqual(first.segments, [
+      {
+        ordinal: 0,
+        segmentId: "segment-1",
+        segmentVersion: 1,
+        textHash: sha256("durable evidence"),
+        subjectRevision: 1,
+      },
+    ]);
+    assert.match(first.desiredVectorHash, /^[0-9a-f]{64}$/);
+    assert.equal(setDesiredHead(repository, input).headRevision, 1);
+
+    const nextInput = createAlternativeInput(repository, "new redacted evidence");
+    const second = setDesiredHead(repository, nextInput);
+    assert.equal(second.headRevision, 2);
+    assert.equal(second.analysisInputId, nextInput.analysisInputId);
+    assert.notEqual(second.desiredVectorHash, first.desiredVectorHash);
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM analysis_inputs").get().count,
+      2,
+      "advancing the head must preserve immutable input history"
+    );
+
+    assert.throws(
+      () =>
+        setDesiredHead(repository, nextInput, {
+          segmentSubjectRevisions: [{ segmentId: "wrong-segment", subjectRevision: 2 }],
+        }),
+      /segmentSubjectRevisions/
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("cloud analysis enqueue accepts only the exact current desired head", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    assert.throws(
+      () => createCloudJob(db, head, { desiredHeadHash: HASH_C }),
+      /invalid cloud processing job/
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM processing_jobs").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("a changed desired vector can enqueue a replacement job for the same immutable input", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const firstHead = setDesiredHead(repository, input);
+    const { store, job: firstJob } = createCloudJob(db, firstHead);
+    const secondHead = setDesiredHead(repository, input, {
+      responseSchemaVersion: "jarvis-analysis-v3",
+    });
+    const secondJob = store.enqueueCloudJob({
+      sessionId: "session-1",
+      jobType: "analyze_session",
+      analysisInputId: secondHead.analysisInputId,
+      desiredHeadHash: secondHead.desiredVectorHash,
+      inputHash: secondHead.analysisInputHash,
+      inputVersion: 1,
+      modelVersion: secondHead.modelVersion,
+    });
+
+    assert.notEqual(secondHead.desiredVectorHash, firstHead.desiredVectorHash);
+    assert.notEqual(secondJob.id, firstJob.id);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT analysis_input_id, desired_head_hash FROM processing_jobs
+           WHERE job_type = 'analyze_session' ORDER BY created_at, id`
+        )
+        .all(),
+      [
+        {
+          analysis_input_id: input.analysisInputId,
+          desired_head_hash: firstHead.desiredVectorHash,
+        },
+        {
+          analysis_input_id: input.analysisInputId,
+          desired_head_hash: secondHead.desiredVectorHash,
+        },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("database rejects a validated candidate until its budget attempt is reconciled", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const at = Date.UTC(2026, 6, 16, 4);
+    const budget = new AnalysisBudgetRepository(db);
+    budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at });
+    assert.equal(
+      budget.reserve({
+        requestId: "budget-started-only",
+        jobId: job.id,
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+        at: at + 1,
+      }).ok,
+      true
+    );
+    budget.markStarted({ requestId: "budget-started-only", at: at + 2 });
+    const candidateJson = canonicalJson(validCandidate());
+
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO analysis_response_candidates (
+               id, job_id, analysis_input_id, budget_attempt_id, desired_vector_hash,
+               response_schema_version, candidate_json, candidate_bytes, candidate_hash,
+               state, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'validated', ?)`
+          )
+          .run(
+            "candidate-started-only",
+            job.id,
+            input.analysisInputId,
+            "budget-started-only",
+            head.desiredVectorHash,
+            "jarvis-analysis-v2",
+            candidateJson,
+            Buffer.byteLength(candidateJson, "utf8"),
+            sha256(candidateJson),
+            at + 3
+          ),
+      /analysis response candidate linkage is invalid/
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("persists a validated candidate linked to job input head and reconciled budget attempt", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    const [claimed] = store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    assert.equal(claimed.id, job.id);
+    const budgetAttemptId = reconcileBudgetAttempt(db, job.id);
+
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId,
+      candidate: validCandidate(),
+    });
+    assert.equal(persisted.state, "validated");
+    assert.match(persisted.candidateId, /^[A-Za-z0-9_-]+$/);
+    assert.match(persisted.candidateHash, /^[0-9a-f]{64}$/);
+    assert.deepEqual(
+      repository.persistValidatedAnalysisCandidate({
+        jobId: job.id,
+        analysisInputId: input.analysisInputId,
+        budgetAttemptId,
+        candidate: validCandidate(),
+      }),
+      { ...persisted, status: "existing" }
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("UPDATE analysis_response_candidates SET candidate_json = '{}' WHERE id = ?")
+          .run(persisted.candidateId),
+      /analysis response candidate is immutable/
+    );
+    assert.throws(
+      () =>
+        db
+          .prepare("DELETE FROM analysis_response_candidates WHERE id = ?")
+          .run(persisted.candidateId),
+      /analysis response candidate is immutable/
+    );
+
+    const recovery = repository.listRecoverableAnalysisCandidates({ limit: 10 });
+    assert.deepEqual(recovery, [
+      {
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        analysisInputId: input.analysisInputId,
+        budgetAttemptId,
+        desiredVectorHash: head.desiredVectorHash,
+        candidateHash: persisted.candidateHash,
+        candidateState: "validated",
+        jobState: "running",
+        leaseOwner: "cloud-worker",
+        leaseExpiresAt: 8_000,
+        budgetState: "reconciled",
+      },
+    ]);
+
+    assert.throws(
+      () =>
+        repository.applyStoredAnalysisCandidate({
+          candidateId: persisted.candidateId,
+          jobId: job.id,
+          owner: "wrong-worker",
+          at: 7_100,
+        }),
+      { code: "MEMORY_CANDIDATE_LEASE_LOST" }
+    );
+    const applied = repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+    assert.equal(applied.status, "applied");
+    assert.equal(
+      repository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: "cloud-worker",
+        at: 7_101,
+      }).status,
+      "already_applied"
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT state, disposition_at FROM analysis_response_candidates WHERE id = ?")
+        .get(persisted.candidateId),
+      { state: "applied", disposition_at: 7_100 }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("candidate apply CAS supersedes a stale desired head without visible writes", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const oldHead = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, oldHead);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const budgetAttemptId = reconcileBudgetAttempt(db, job.id, "budget-request-stale");
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId,
+      candidate: validCandidate(),
+    });
+
+    const nextInput = createAlternativeInput(repository, "new desired redacted evidence");
+    setDesiredHead(repository, nextInput);
+    assert.deepEqual(
+      repository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: "cloud-worker",
+        at: 7_100,
+      }),
+      {
+        status: "superseded",
+        analysisInputId: input.analysisInputId,
+        candidateHash: persisted.candidateHash,
+      }
+    );
+    assert.equal(
+      db
+        .prepare("SELECT candidate_hash FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId).candidate_hash,
+      null
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 0);
+    assert.equal(
+      db
+        .prepare("SELECT state FROM analysis_response_candidates WHERE id = ?")
+        .get(persisted.candidateId).state,
+      "superseded"
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("candidate apply fails closed when the current desired vector hash is inconsistent", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const budgetAttemptId = reconcileBudgetAttempt(db, job.id, "budget-request-corrupt-head");
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId,
+      candidate: validCandidate(),
+    });
+    db.prepare(
+      `UPDATE analysis_desired_heads
+       SET desired_vector_json = json_set(
+             desired_vector_json, '$.responseSchemaVersion', 'corrupt-schema'
+           ),
+           head_revision = head_revision + 1,
+           updated_at = updated_at + 1
+       WHERE session_id = 'session-1'`
+    ).run();
+
+    assert.throws(
+      () =>
+        repository.applyStoredAnalysisCandidate({
+          candidateId: persisted.candidateId,
+          jobId: job.id,
+          owner: "cloud-worker",
+          at: 7_100,
+        }),
+      { code: "MEMORY_DESIRED_HEAD_CORRUPT" }
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 0);
+    assert.equal(
+      db
+        .prepare("SELECT state FROM analysis_response_candidates WHERE id = ?")
+        .get(persisted.candidateId).state,
+      "validated"
     );
   } finally {
     db.close();

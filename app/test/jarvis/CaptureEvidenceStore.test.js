@@ -60,12 +60,12 @@ function seedProcessingJob(db, overrides = {}) {
       id, session_id, job_type, state, priority,
       input_hash, input_version, model_version, attempt_count,
       next_retry_at, lease_owner, lease_expires_at, error_code,
-      created_at, completed_at
+      lane, analysis_input_id, desired_head_hash, created_at, completed_at
     ) VALUES (
       @id, 's1', @jobType, @state, @priority,
       @inputHash, @inputVersion, @modelVersion, @attemptCount,
       @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
-      @createdAt, @completedAt
+      @lane, @analysisInputId, @desiredHeadHash, @createdAt, @completedAt
     )
   `
   ).run({
@@ -81,6 +81,9 @@ function seedProcessingJob(db, overrides = {}) {
     leaseOwner: null,
     leaseExpiresAt: null,
     errorCode: null,
+    lane: "local",
+    analysisInputId: null,
+    desiredHeadHash: null,
     createdAt: 100,
     completedAt: null,
     ...overrides,
@@ -2279,6 +2282,152 @@ test("claims by durable priority even when a lower-priority state was deferred",
     store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 2 }).map((job) => job.id),
     ["retention-first", "storage-second"]
   );
+});
+
+test("keeps local and cloud claims disjoint and accepts only fixed cloud job types", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    id: "local-final",
+    jobType: "transcribe_chunk",
+    priority: 30,
+    inputHash: "local-final",
+  });
+  seedProcessingJob(db, {
+    id: "cloud-digest",
+    jobType: "generate_daily_digest",
+    priority: 80,
+    inputHash: "cloud-digest",
+    lane: "cloud",
+  });
+  seedProcessingJob(db, {
+    id: "unknown-local",
+    jobType: "future_unknown_job",
+    priority: 5,
+    inputHash: "unknown-local",
+  });
+
+  assert.deepEqual(
+    store
+      .claimJobs({ owner: "local-worker", at: 500, leaseMs: 100, limit: 10 })
+      .map((job) => job.id),
+    ["local-final"]
+  );
+  assert.deepEqual(
+    store
+      .claimCloudJobs({ owner: "cloud-worker", at: 500, leaseMs: 100, limit: 10 })
+      .map((job) => job.id),
+    ["cloud-digest"]
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, lease_owner FROM processing_jobs
+         WHERE id IN ('cloud-digest','unknown-local') ORDER BY id`
+      )
+      .all(),
+    [
+      { id: "cloud-digest", state: "running", lease_owner: "cloud-worker" },
+      { id: "unknown-local", state: "pending", lease_owner: null },
+    ]
+  );
+});
+
+test("generic lease recovery never mutates cloud work", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    id: "local-expired",
+    state: "running",
+    leaseOwner: "local-old",
+    leaseExpiresAt: 200,
+    inputHash: "local-expired",
+  });
+  seedProcessingJob(db, {
+    id: "cloud-expired",
+    jobType: "generate_daily_digest",
+    state: "running",
+    priority: 80,
+    lane: "cloud",
+    leaseOwner: "cloud-old",
+    leaseExpiresAt: 200,
+    inputHash: "cloud-expired",
+  });
+
+  assert.equal(store.recoverExpiredLeases(200), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, lease_owner, error_code FROM processing_jobs
+         WHERE id IN ('local-expired','cloud-expired') ORDER BY id`
+      )
+      .all(),
+    [
+      { id: "cloud-expired", state: "running", lease_owner: "cloud-old", error_code: null },
+      { id: "local-expired", state: "retry", lease_owner: null, error_code: "LEASE_EXPIRED" },
+    ]
+  );
+});
+
+test("agent admission backlog includes running and future-retry local work only", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    id: "running-final",
+    state: "running",
+    priority: 30,
+    leaseOwner: "worker",
+    leaseExpiresAt: 900,
+    inputHash: "running-final",
+  });
+  seedProcessingJob(db, {
+    id: "future-compress",
+    jobType: "compress_chunk",
+    state: "retry",
+    priority: 60,
+    nextRetryAt: 9_999,
+    inputHash: "future-compress",
+  });
+  seedProcessingJob(db, {
+    id: "terminal-final",
+    state: "completed",
+    priority: 30,
+    completedAt: 400,
+    inputHash: "terminal-final",
+  });
+  seedProcessingJob(db, {
+    id: "cloud-digest",
+    jobType: "generate_daily_digest",
+    priority: 80,
+    lane: "cloud",
+    inputHash: "cloud-digest-backlog",
+  });
+  seedProcessingJob(db, {
+    id: "unknown-local",
+    jobType: "unknown_local",
+    priority: 1,
+    inputHash: "unknown-backlog",
+  });
+
+  assert.deepEqual(store.listAgentAdmissionBacklog({ priorityBefore: 70 }), [
+    {
+      jobType: "transcribe_chunk",
+      lane: "local",
+      state: "running",
+      priority: 30,
+      nextRetryAt: null,
+    },
+    {
+      jobType: "compress_chunk",
+      lane: "local",
+      state: "retry",
+      priority: 60,
+      nextRetryAt: 9_999,
+    },
+  ]);
+  assert.equal(store.countCloudLaneInFlight(), 0);
+  db.prepare(
+    `UPDATE processing_jobs SET state = 'running', lease_owner = 'cloud', lease_expires_at = 900
+     WHERE id = 'cloud-digest'`
+  ).run();
+  assert.equal(store.countCloudLaneInFlight(), 1);
 });
 
 test("atomically claims only durable jobs above the preview priority ceiling", (t) => {

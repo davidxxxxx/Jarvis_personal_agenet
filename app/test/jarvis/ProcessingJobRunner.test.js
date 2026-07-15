@@ -47,12 +47,12 @@ function seedJob(db, overrides = {}) {
       id, session_id, job_type, state, priority,
       input_hash, input_version, model_version, attempt_count,
       next_retry_at, lease_owner, lease_expires_at, error_code,
-      created_at, completed_at
+      lane, analysis_input_id, desired_head_hash, created_at, completed_at
     ) VALUES (
       @id, 's1', @jobType, @state, @priority,
       @inputHash, @inputVersion, @modelVersion, @attemptCount,
       @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
-      @createdAt, @completedAt
+      @lane, @analysisInputId, @desiredHeadHash, @createdAt, @completedAt
     )
   `
   ).run({
@@ -68,6 +68,9 @@ function seedJob(db, overrides = {}) {
     leaseOwner: null,
     leaseExpiresAt: null,
     errorCode: null,
+    lane: "local",
+    analysisInputId: null,
+    desiredHeadHash: null,
     createdAt: 100,
     completedAt: null,
     ...overrides,
@@ -344,27 +347,57 @@ test("permit draining preserves durable retry and resource deferral transitions"
   );
 });
 
-test("visibly blocks a claimed job when its handler is missing", async (t) => {
+test("local runner leaves unknown and cloud work unclaimed instead of classifying maintenance", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, { jobType: "unknown_job" });
+  seedJob(db, {
+    id: "cloud-digest",
+    jobType: "generate_daily_digest",
+    priority: 80,
+    lane: "cloud",
+    inputHash: "cloud-digest",
+  });
 
-  assert.equal(await runner.runOnce(), 1);
+  assert.throws(
+    () => runner.register("unknown_job", async () => {}),
+    /registered by the local processing runner/
+  );
+  assert.throws(
+    () => runner.register("analyze_session", async () => {}),
+    /registered by the local processing runner/
+  );
+  assert.throws(
+    () => runner.register("generate_daily_digest", async () => {}),
+    /registered by the local processing runner/
+  );
+  assert.equal(await runner.runOnce(), 0);
   assert.deepEqual(
     db
       .prepare(
         `
-      SELECT state, error_code, completed_at, lease_owner, lease_expires_at
-      FROM processing_jobs WHERE id = 'j1'
+      SELECT id, state, error_code, completed_at, lease_owner, lease_expires_at
+      FROM processing_jobs WHERE id IN ('j1','cloud-digest') ORDER BY id
     `
       )
-      .get(),
-    {
-      state: "blocked",
-      error_code: "HANDLER_MISSING",
-      completed_at: 2_000,
-      lease_owner: null,
-      lease_expires_at: null,
-    }
+      .all(),
+    [
+      {
+        id: "cloud-digest",
+        state: "pending",
+        error_code: null,
+        completed_at: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "j1",
+        state: "pending",
+        error_code: null,
+        completed_at: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+    ]
   );
 });
 

@@ -11,6 +11,14 @@ const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
 ]);
+const LOCAL_PROCESSING_JOB_TYPES = new Set([
+  "transcribe_chunk",
+  "preview_transcription",
+  "speaker",
+  "diarize_track",
+  "resolve_identities",
+  "compress_chunk",
+]);
 
 function normalizeErrorCode(error) {
   let code;
@@ -45,8 +53,8 @@ function defaultJobKind(job) {
   if (job.job_type === "transcribe_chunk") return "final_transcription";
   if (job.job_type === "preview_transcription") return "preview";
   if (["speaker", "diarize_track", "resolve_identities"].includes(job.job_type)) return "speaker";
-  if (job.job_type === "analyze_session") return "analysis";
-  return "maintenance";
+  if (job.job_type === "compress_chunk") return "maintenance";
+  throw codedError("JOB_TYPE_UNCLASSIFIED");
 }
 
 function defaultJobCapability(job) {
@@ -137,6 +145,9 @@ class ProcessingJobRunner {
   register(jobType, handler) {
     if (typeof jobType !== "string" || !ERROR_CODE_PATTERN.test(jobType)) {
       throw new TypeError("jobType must be a safe identifier");
+    }
+    if (!LOCAL_PROCESSING_JOB_TYPES.has(jobType)) {
+      throw new TypeError(`${jobType} is not registered by the local processing runner`);
     }
     if (typeof handler !== "function") throw new TypeError("handler must be a function");
     this.handlers.set(jobType, handler);

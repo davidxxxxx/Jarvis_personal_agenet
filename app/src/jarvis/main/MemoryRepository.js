@@ -8,6 +8,7 @@ const CANONICAL_INPUT_VERSION = "jarvis-analysis-input-canonical-v2";
 const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
 const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
 const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
+const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
 
 function codedError(code) {
   const error = new Error(code);
@@ -727,6 +728,419 @@ class MemoryRepository {
       };
     });
     return read.deferred();
+  }
+
+  _mapAnalysisDesiredHead(row) {
+    if (!row) return null;
+    let vector;
+    try {
+      vector = JSON.parse(row.desired_vector_json);
+    } catch {
+      throw codedError("MEMORY_DESIRED_HEAD_CORRUPT");
+    }
+    const expectedKeys = [
+      "analysisInputId",
+      "analysisInputHash",
+      "transcriptRevision",
+      "identityRevision",
+      "promptVersion",
+      "responseSchemaVersion",
+      "pseudonymBindingRevision",
+      "modelVersion",
+      "cloudPayloadHash",
+      "segments",
+    ];
+    const validSegments =
+      Array.isArray(vector?.segments) &&
+      vector.segments.length > 0 &&
+      vector.segments.every((segment) =>
+        hasExactKeys(segment, [
+          "ordinal",
+          "segmentId",
+          "segmentVersion",
+          "textHash",
+          "subjectRevision",
+        ])
+      );
+    if (
+      !hasExactKeys(vector, expectedKeys) ||
+      !validSegments ||
+      vector.analysisInputId !== row.analysis_input_id ||
+      !safeHashEqual(vector.analysisInputHash, row.analysis_input_hash) ||
+      !safeHashEqual(sha256(canonicalJson(vector)), row.desired_vector_hash)
+    ) {
+      throw codedError("MEMORY_DESIRED_HEAD_CORRUPT");
+    }
+    return {
+      ...vector,
+      desiredVectorHash: row.desired_vector_hash,
+      headRevision: row.head_revision,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  getAnalysisDesiredHead(sessionId) {
+    const id = assertId(sessionId, "sessionId");
+    const read = this.db.transaction(() =>
+      this._mapAnalysisDesiredHead(
+        this.db.prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?").get(id)
+      )
+    );
+    return read.deferred();
+  }
+
+  setAnalysisDesiredHead(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("analysis desired head is required");
+    }
+    const sessionId = assertId(input.sessionId, "sessionId");
+    const analysisInputId = assertId(input.analysisInputId, "analysisInputId");
+    const responseSchemaVersion = assertText(input.responseSchemaVersion, "responseSchemaVersion");
+    const pseudonymBindingRevision = assertTimestamp(
+      input.pseudonymBindingRevision,
+      "pseudonymBindingRevision"
+    );
+    const modelVersion = assertText(input.modelVersion, "modelVersion");
+    if (!Array.isArray(input.segmentSubjectRevisions)) {
+      throw new TypeError("segmentSubjectRevisions must be an array");
+    }
+
+    const transaction = this.db.transaction(() => {
+      const stored = this._loadStoredAnalysisInput(analysisInputId);
+      if (!stored) throw codedError("MEMORY_INPUT_NOT_FOUND");
+      if (stored.row.session_id !== sessionId) throw codedError("MEMORY_INPUT_MISMATCH");
+      if (input.segmentSubjectRevisions.length !== stored.prepared.segments.length) {
+        throw new TypeError("segmentSubjectRevisions must match the ordered input segments");
+      }
+      const subjectRevisionByOrdinal = input.segmentSubjectRevisions.map((revision, ordinal) => {
+        if (!hasExactKeys(revision, ["segmentId", "subjectRevision"])) {
+          throw new TypeError("segmentSubjectRevisions entries must have exact keys");
+        }
+        const segmentId = assertId(revision.segmentId, "segmentSubjectRevisions.segmentId");
+        const subjectRevision = assertTimestamp(
+          revision.subjectRevision,
+          "segmentSubjectRevisions.subjectRevision"
+        );
+        if (segmentId !== stored.prepared.segments[ordinal].segmentId) {
+          throw new TypeError("segmentSubjectRevisions must match the ordered input segments");
+        }
+        return subjectRevision;
+      });
+      const vector = {
+        analysisInputId,
+        analysisInputHash: stored.row.input_hash,
+        transcriptRevision: stored.row.transcript_revision,
+        identityRevision: stored.row.identity_revision,
+        promptVersion: stored.row.prompt_version,
+        responseSchemaVersion,
+        pseudonymBindingRevision,
+        modelVersion,
+        cloudPayloadHash: stored.row.cloud_payload_sha256,
+        segments: stored.prepared.segments.map((segment, ordinal) => ({
+          ordinal: segment.ordinal,
+          segmentId: segment.segmentId,
+          segmentVersion: segment.segmentVersion,
+          textHash: segment.textHash,
+          subjectRevision: subjectRevisionByOrdinal[ordinal],
+        })),
+      };
+      const desiredVectorJson = canonicalJson(vector);
+      const desiredVectorHash = sha256(desiredVectorJson);
+      const existing = this.db
+        .prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?")
+        .get(sessionId);
+      if (existing && safeHashEqual(existing.desired_vector_hash, desiredVectorHash)) {
+        return this._mapAnalysisDesiredHead(existing);
+      }
+      const updatedAt = assertTimestamp(this.now(), "updatedAt");
+      if (!existing) {
+        this.db
+          .prepare(
+            `INSERT INTO analysis_desired_heads (
+               session_id, analysis_input_id, analysis_input_hash, desired_vector_json,
+               desired_vector_hash, head_revision, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+          )
+          .run(
+            sessionId,
+            analysisInputId,
+            stored.row.input_hash,
+            desiredVectorJson,
+            desiredVectorHash,
+            updatedAt,
+            updatedAt
+          );
+      } else {
+        this.db
+          .prepare(
+            `UPDATE analysis_desired_heads
+             SET analysis_input_id = ?, analysis_input_hash = ?, desired_vector_json = ?,
+                 desired_vector_hash = ?, head_revision = head_revision + 1, updated_at = ?
+             WHERE session_id = ?`
+          )
+          .run(
+            analysisInputId,
+            stored.row.input_hash,
+            desiredVectorJson,
+            desiredVectorHash,
+            updatedAt,
+            sessionId
+          );
+      }
+      return this._mapAnalysisDesiredHead(
+        this.db.prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?").get(sessionId)
+      );
+    });
+    return transaction.immediate();
+  }
+
+  persistValidatedAnalysisCandidate(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("validated analysis candidate is required");
+    }
+    const jobId = assertId(input.jobId, "jobId");
+    const analysisInputId = assertId(input.analysisInputId, "analysisInputId");
+    const budgetAttemptId = assertId(input.budgetAttemptId, "budgetAttemptId");
+    assertJsonObject(input.candidate, "candidate");
+
+    const transaction = this.db.transaction(() => {
+      const stored = this._loadStoredAnalysisInput(analysisInputId);
+      if (!stored) throw codedError("MEMORY_INPUT_NOT_FOUND");
+      validateCandidate(input.candidate, {
+        allowedSegmentIds: new Set(stored.payload.selectedSegmentIds),
+        allowedOwnerLabels: new Set(stored.payload.selectedOwnerLabels),
+      });
+      const candidateJson = canonicalJson(input.candidate);
+      const candidateBytes = Buffer.byteLength(candidateJson, "utf8");
+      if (candidateBytes > MAX_ANALYSIS_CANDIDATE_BYTES) {
+        throw codedError("MEMORY_CANDIDATE_TOO_LARGE");
+      }
+      const candidateHash = sha256(candidateJson);
+      const job = this.db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(jobId);
+      if (
+        !job ||
+        job.job_type !== "analyze_session" ||
+        job.lane !== "cloud" ||
+        job.analysis_input_id !== analysisInputId ||
+        !safeHashEqual(job.input_hash, stored.row.input_hash) ||
+        typeof job.desired_head_hash !== "string" ||
+        !HASH_PATTERN.test(job.desired_head_hash)
+      ) {
+        throw codedError("MEMORY_CANDIDATE_JOB_MISMATCH");
+      }
+      const attempt = this.db
+        .prepare("SELECT job_id, state FROM analysis_budget_attempts WHERE request_id = ?")
+        .get(budgetAttemptId);
+      if (!attempt || attempt.job_id !== jobId || attempt.state !== "reconciled") {
+        throw codedError("MEMORY_CANDIDATE_BUDGET_UNRECONCILED");
+      }
+      const currentHead = this.db
+        .prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?")
+        .get(stored.row.session_id);
+      const mappedCurrentHead = this._mapAnalysisDesiredHead(currentHead);
+      if (
+        mappedCurrentHead &&
+        safeHashEqual(mappedCurrentHead.desiredVectorHash, job.desired_head_hash) &&
+        mappedCurrentHead.responseSchemaVersion !== input.candidate.schemaVersion
+      ) {
+        throw codedError("MEMORY_CANDIDATE_SCHEMA_MISMATCH");
+      }
+      const existing = this.db
+        .prepare("SELECT * FROM analysis_response_candidates WHERE job_id = ?")
+        .get(jobId);
+      if (existing) {
+        if (
+          existing.analysis_input_id !== analysisInputId ||
+          existing.budget_attempt_id !== budgetAttemptId ||
+          !safeHashEqual(existing.desired_vector_hash, job.desired_head_hash) ||
+          !safeHashEqual(existing.candidate_hash, candidateHash) ||
+          existing.candidate_json !== candidateJson
+        ) {
+          throw codedError("MEMORY_CANDIDATE_ALREADY_PERSISTED");
+        }
+        return {
+          status: "existing",
+          candidateId: existing.id,
+          candidateHash: existing.candidate_hash,
+          state: existing.state,
+        };
+      }
+      const candidateId = this._nextId("analysis_candidate");
+      const createdAt = assertTimestamp(this.now(), "createdAt");
+      this.db
+        .prepare(
+          `INSERT INTO analysis_response_candidates (
+             id, job_id, analysis_input_id, budget_attempt_id, desired_vector_hash,
+             response_schema_version, candidate_json, candidate_bytes, candidate_hash,
+             state, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'validated', ?)`
+        )
+        .run(
+          candidateId,
+          jobId,
+          analysisInputId,
+          budgetAttemptId,
+          job.desired_head_hash,
+          input.candidate.schemaVersion,
+          candidateJson,
+          candidateBytes,
+          candidateHash,
+          createdAt
+        );
+      return { status: "created", candidateId, candidateHash, state: "validated" };
+    });
+    return transaction.immediate();
+  }
+
+  listRecoverableAnalysisCandidates({ afterId = "", limit = 100 } = {}) {
+    if (typeof afterId !== "string" || Array.from(afterId).length > 512) {
+      throw new TypeError("afterId must be a bounded string");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RangeError("limit must be between 1 and 1000");
+    }
+    return this.db
+      .prepare(
+        `SELECT candidate.id AS candidate_id, candidate.job_id,
+                candidate.analysis_input_id, candidate.budget_attempt_id,
+                candidate.desired_vector_hash, candidate.candidate_hash,
+                candidate.state AS candidate_state, job.state AS job_state,
+                job.lease_owner, job.lease_expires_at, attempt.state AS budget_state
+         FROM analysis_response_candidates AS candidate
+         JOIN processing_jobs AS job ON job.id = candidate.job_id
+         JOIN analysis_budget_attempts AS attempt
+           ON attempt.request_id = candidate.budget_attempt_id
+         WHERE candidate.state = 'validated' AND candidate.id > ?
+         ORDER BY candidate.id LIMIT ?`
+      )
+      .all(afterId, limit)
+      .map((row) => ({
+        candidateId: row.candidate_id,
+        jobId: row.job_id,
+        analysisInputId: row.analysis_input_id,
+        budgetAttemptId: row.budget_attempt_id,
+        desiredVectorHash: row.desired_vector_hash,
+        candidateHash: row.candidate_hash,
+        candidateState: row.candidate_state,
+        jobState: row.job_state,
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: row.lease_expires_at,
+        budgetState: row.budget_state,
+      }));
+  }
+
+  applyStoredAnalysisCandidate(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("stored candidate application is required");
+    }
+    const candidateId = assertId(input.candidateId, "candidateId");
+    const jobId = assertId(input.jobId, "jobId");
+    const owner = assertText(input.owner, "owner");
+    const at = assertTimestamp(input.at, "at");
+    const transaction = this.db.transaction(() => {
+      const candidateRow = this.db
+        .prepare("SELECT * FROM analysis_response_candidates WHERE id = ?")
+        .get(candidateId);
+      if (!candidateRow || candidateRow.job_id !== jobId) {
+        throw codedError("MEMORY_CANDIDATE_NOT_FOUND");
+      }
+      const job = this.db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(jobId);
+      if (
+        !job ||
+        job.job_type !== "analyze_session" ||
+        job.lane !== "cloud" ||
+        job.state !== "running" ||
+        job.completed_at !== null ||
+        job.lease_owner !== owner ||
+        !Number.isSafeInteger(job.lease_expires_at) ||
+        job.lease_expires_at <= at
+      ) {
+        throw codedError("MEMORY_CANDIDATE_LEASE_LOST");
+      }
+      const attempt = this.db
+        .prepare("SELECT job_id, state FROM analysis_budget_attempts WHERE request_id = ?")
+        .get(candidateRow.budget_attempt_id);
+      if (!attempt || attempt.job_id !== jobId || attempt.state !== "reconciled") {
+        throw codedError("MEMORY_CANDIDATE_BUDGET_UNRECONCILED");
+      }
+      if (candidateRow.state === "applied") {
+        return {
+          status: "already_applied",
+          analysisInputId: candidateRow.analysis_input_id,
+          candidateHash: candidateRow.candidate_hash,
+        };
+      }
+      if (candidateRow.state === "superseded") {
+        return {
+          status: "superseded",
+          analysisInputId: candidateRow.analysis_input_id,
+          candidateHash: candidateRow.candidate_hash,
+        };
+      }
+      const inputRow = this.db
+        .prepare("SELECT session_id, input_hash FROM analysis_inputs WHERE id = ?")
+        .get(candidateRow.analysis_input_id);
+      const desiredHead = inputRow
+        ? this.db
+            .prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?")
+            .get(inputRow.session_id)
+        : null;
+      const mappedDesiredHead = this._mapAnalysisDesiredHead(desiredHead);
+      const isCurrent =
+        inputRow &&
+        mappedDesiredHead &&
+        mappedDesiredHead.analysisInputId === candidateRow.analysis_input_id &&
+        safeHashEqual(mappedDesiredHead.analysisInputHash, inputRow.input_hash) &&
+        safeHashEqual(mappedDesiredHead.desiredVectorHash, candidateRow.desired_vector_hash) &&
+        job.analysis_input_id === candidateRow.analysis_input_id &&
+        safeHashEqual(job.input_hash, inputRow.input_hash) &&
+        safeHashEqual(job.desired_head_hash, candidateRow.desired_vector_hash);
+      if (!isCurrent) {
+        this.db
+          .prepare(
+            `UPDATE analysis_response_candidates
+             SET state = 'superseded', disposition_at = ?
+             WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
+          )
+          .run(at, candidateId);
+        return {
+          status: "superseded",
+          analysisInputId: candidateRow.analysis_input_id,
+          candidateHash: candidateRow.candidate_hash,
+        };
+      }
+      if (
+        Buffer.byteLength(candidateRow.candidate_json, "utf8") !== candidateRow.candidate_bytes ||
+        !safeHashEqual(sha256(candidateRow.candidate_json), candidateRow.candidate_hash)
+      ) {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      let candidate;
+      try {
+        candidate = JSON.parse(candidateRow.candidate_json);
+      } catch {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      if (candidate.schemaVersion !== candidateRow.response_schema_version) {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      const result = this.applyCandidateAnalysis({
+        analysisInputId: candidateRow.analysis_input_id,
+        inputHash: inputRow.input_hash,
+        candidate,
+        claimedCandidateHash: candidateRow.candidate_hash,
+      });
+      this.db
+        .prepare(
+          `UPDATE analysis_response_candidates
+           SET state = 'applied', disposition_at = ?
+           WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
+        )
+        .run(at, candidateId);
+      return result;
+    });
+    return transaction.immediate();
   }
 
   _nextId(prefix) {
