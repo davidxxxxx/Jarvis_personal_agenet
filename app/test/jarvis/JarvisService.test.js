@@ -1594,7 +1594,7 @@ test("interruption persistence failure leaves the original writer live and state
   }
 });
 
-test("all-source interruption stays degraded and remains manually pausable", () => {
+test("all-source interruption stays degraded and remains manually pausable", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-sources-recovering-"));
   const repository = createRepository();
   const service = new JarvisService({
@@ -1624,7 +1624,7 @@ test("all-source interruption stays degraded and remains manually pausable", () 
     assert.equal(paused.status, "paused");
     assert.equal(repository.sessions.get("s1").status, "paused");
   } finally {
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });
