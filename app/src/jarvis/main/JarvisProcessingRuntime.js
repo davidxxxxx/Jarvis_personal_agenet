@@ -160,6 +160,7 @@ class JarvisProcessingRuntime {
     whisperController = null,
     startupBarrier = null,
     previewScheduler = null,
+    cloudDispatcher = null,
     speakerProcessingPolicy = null,
     prepareTranscriptionJobs = null,
   } = {}) {
@@ -211,6 +212,14 @@ class JarvisProcessingRuntime {
       throw new TypeError("previewScheduler must implement request, tick, and status");
     }
     if (
+      cloudDispatcher !== null &&
+      (typeof cloudDispatcher.start !== "function" ||
+        typeof cloudDispatcher.drainOnce !== "function" ||
+        typeof cloudDispatcher.stop !== "function")
+    ) {
+      throw new TypeError("cloudDispatcher must implement start, drainOnce, and stop");
+    }
+    if (
       speakerProcessingPolicy !== null &&
       (typeof speakerProcessingPolicy?.evaluate !== "function" ||
         !Object.isFrozen(speakerProcessingPolicy))
@@ -237,6 +246,7 @@ class JarvisProcessingRuntime {
     this.whisperController = whisperController;
     this.startupBarrier = startupBarrier;
     this.previewScheduler = previewScheduler;
+    this.cloudDispatcher = cloudDispatcher;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
@@ -245,6 +255,7 @@ class JarvisProcessingRuntime {
     this.startPromise = null;
     this.stopPromise = null;
     this.previewInFlight = null;
+    this.cloudInFlight = null;
     this.stopping = false;
     this.running = true;
     this.sessionCursor = null;
@@ -263,6 +274,7 @@ class JarvisProcessingRuntime {
       } catch (error) {
         this.log({ phase: "recovery", error });
       }
+      this._tickCloud({ startup: true });
       this.timer = this.setInterval(() => {
         void this.drainOnce().catch((error) => {
           this.log({ phase: "poll", error });
@@ -379,6 +391,20 @@ class JarvisProcessingRuntime {
     this.previewInFlight = wrapped;
   }
 
+  _tickCloud({ startup = false } = {}) {
+    if (!this.cloudDispatcher || this.cloudInFlight || this.stopping) return;
+    const operation = Promise.resolve(
+      startup ? this.cloudDispatcher.start() : this.cloudDispatcher.drainOnce()
+    ).catch((error) => {
+      this.log({ phase: "analysis_cloud", error });
+      return 0;
+    });
+    const wrapped = operation.finally(() => {
+      if (this.cloudInFlight === wrapped) this.cloudInFlight = null;
+    });
+    this.cloudInFlight = wrapped;
+  }
+
   async _runSessionPhase(sessions, startedAt, limit, visited) {
     let inspected = 0;
     for (const session of sessions) {
@@ -414,6 +440,7 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    this._tickCloud();
     if (this.prepareTranscriptionJobs) await this.prepareTranscriptionJobs();
     if (this.stopping || !this.running) return 0;
     const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
@@ -462,6 +489,7 @@ class JarvisProcessingRuntime {
     this.stopping = true;
     this.running = false;
     this.previewScheduler?.stop?.();
+    const cloudStop = Promise.resolve().then(() => this.cloudDispatcher?.stop?.());
     if (this.timer !== null) {
       this.clearInterval(this.timer);
       this.timer = null;
@@ -475,6 +503,12 @@ class JarvisProcessingRuntime {
       }
       try {
         await Promise.resolve(this.previewInFlight);
+      } catch (error) {
+        primaryError ??= error;
+      }
+      try {
+        await cloudStop;
+        await Promise.resolve(this.cloudInFlight);
       } catch (error) {
         primaryError ??= error;
       }

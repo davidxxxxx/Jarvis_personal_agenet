@@ -2167,6 +2167,59 @@ test("delayed sampling and a slow session phase cannot move preview ahead of urg
   await drain;
 });
 
+test("local processing remains disjoint from cloud work and shutdown joins the cloud dispatcher", async () => {
+  const cloudStarted = deferred();
+  const releaseCloud = deferred();
+  let cloudDrains = 0;
+  let cloudStops = 0;
+  let localRuns = 0;
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases() {},
+      async runOnce() {
+        localRuns += 1;
+        return localRuns === 1 ? 1 : 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    cloudDispatcher: {
+      start: async () => 0,
+      async drainOnce() {
+        cloudDrains += 1;
+        cloudStarted.resolve();
+        await releaseCloud.promise;
+        return 1;
+      },
+      async stop() {
+        cloudStops += 1;
+        await releaseCloud.promise;
+      },
+    },
+    now: () => 0,
+  });
+
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.equal(localRuns >= 2, true);
+  assert.equal(cloudDrains, 1);
+
+  let stopped = false;
+  const stopping = runtime.stop().then(() => {
+    stopped = true;
+  });
+  await Promise.resolve();
+  assert.equal(cloudStops, 1);
+  assert.equal(stopped, false);
+  releaseCloud.resolve();
+  await stopping;
+  assert.equal(stopped, true);
+});
+
 test("production live preview persists PCM coverage within a 30-second p95 at a five-second poll", async () => {
   const pollWaits = [0, 1_000, 2_500, 4_000, 4_999];
   const latencies = [];

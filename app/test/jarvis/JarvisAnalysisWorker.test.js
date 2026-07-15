@@ -1,0 +1,747 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const AgentWorkloadPolicy = require("../../src/jarvis/main/AgentWorkloadPolicy");
+const { validateCandidateAnalysis } = require("../../src/jarvis/main/JarvisAnalysisSchema");
+
+function loadWorker() {
+  return require("../../src/jarvis/main/JarvisAnalysisWorker");
+}
+
+function workerHarness({ applyResult = { status: "applied" } } = {}) {
+  const calls = [];
+  const store = {
+    completeJob(jobId, input) {
+      calls.push(["complete", jobId, input]);
+      return true;
+    },
+    deferJob() {
+      return true;
+    },
+    blockJob() {
+      return true;
+    },
+    recordJobExecutionDevice() {
+      return true;
+    },
+  };
+  const memoryRepository = {
+    applyStoredAnalysisCandidate(input) {
+      calls.push(["apply", input]);
+      return applyResult;
+    },
+    getAnalysisInputForCloud() {
+      throw new Error("recovery must not load a cloud request payload");
+    },
+    getAnalysisDesiredHead() {
+      throw new Error("recovery must not prepare a new request");
+    },
+    listRecoverableAnalysisCandidates() {
+      return [];
+    },
+    persistValidatedAnalysisCandidate() {
+      throw new Error("recovery must not persist a second candidate");
+    },
+  };
+  const client = {
+    async analyze() {
+      calls.push(["request"]);
+      throw new Error("recovery must not use the network client");
+    },
+  };
+  const budgetGuard = {
+    listAttemptDispositionsByJob() {
+      return [];
+    },
+    reserveNextAttempt() {
+      throw new Error("recovery must not reserve a new budget attempt");
+    },
+    markStarted() {
+      throw new Error("recovery must not start a budget attempt");
+    },
+    reconcile() {
+      throw new Error("recovery must not reconcile twice");
+    },
+    release() {
+      throw new Error("recovery must not release reconciled usage");
+    },
+    markUsageUnknown() {
+      throw new Error("recovery must preserve reconciled usage");
+    },
+  };
+  const policy = Object.freeze({
+    evaluate: () => ({ eligible: true, reason: null, priority: 70 }),
+  });
+  const JarvisAnalysisWorker = loadWorker();
+  const worker = new JarvisAnalysisWorker({
+    store,
+    memoryRepository,
+    budgetGuard,
+    workloadPolicy: policy,
+    loadAdmissionSnapshot: () => {
+      throw new Error("recovery must not evaluate new-request admission");
+    },
+    client,
+    owner: "cloud-worker",
+    model: "MiniMax-M2.7",
+    estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+    createRequestId: () => "budget-request-1",
+    now: () => 200,
+  });
+  return { worker, calls };
+}
+
+test("startup completes already-applied analysis candidate with zero client calls", () => {
+  const { worker, calls } = workerHarness();
+
+  assert.deepEqual(
+    worker.recoverCandidate({
+      jobId: "job-analysis-1",
+      candidateId: "candidate-1",
+      candidateState: "applied",
+      leaseOwner: "cloud-worker",
+      leaseExpiresAt: 500,
+    }),
+    { status: "already_applied", jobId: "job-analysis-1" }
+  );
+  assert.deepEqual(calls, [
+    ["complete", "job-analysis-1", { owner: "cloud-worker", at: 200, executionDevice: "cloud" }],
+  ]);
+});
+
+test("startup applies a validated candidate and completes it with zero client calls", () => {
+  const { worker, calls } = workerHarness();
+
+  assert.deepEqual(
+    worker.recoverCandidate({
+      jobId: "job-analysis-1",
+      candidateId: "candidate-1",
+      candidateState: "validated",
+      leaseOwner: "cloud-worker",
+      leaseExpiresAt: 500,
+    }),
+    { status: "applied", jobId: "job-analysis-1" }
+  );
+  assert.deepEqual(calls, [
+    [
+      "apply",
+      { candidateId: "candidate-1", jobId: "job-analysis-1", owner: "cloud-worker", at: 200 },
+    ],
+    ["complete", "job-analysis-1", { owner: "cloud-worker", at: 200, executionDevice: "cloud" }],
+  ]);
+});
+
+const INPUT_HASH = "a".repeat(64);
+const DESIRED_HASH = "b".repeat(64);
+const TRANSCRIPT_HASH = "c".repeat(64);
+const IDENTITY_HASH = "d".repeat(64);
+const PAYLOAD_HASH = "e".repeat(64);
+const TEXT_HASH = "f".repeat(64);
+
+function desiredHead(overrides = {}) {
+  return {
+    analysisInputId: "analysis-input-1",
+    analysisInputHash: INPUT_HASH,
+    transcriptRevision: TRANSCRIPT_HASH,
+    identityRevision: IDENTITY_HASH,
+    promptVersion: "jarvis-analysis-v2",
+    responseSchemaVersion: "jarvis-analysis-v2",
+    pseudonymBindingRevision: 1,
+    modelVersion: "MiniMax-M2.7",
+    cloudPayloadHash: PAYLOAD_HASH,
+    segments: [
+      {
+        ordinal: 0,
+        segmentId: "segment-1",
+        segmentVersion: 1,
+        textHash: TEXT_HASH,
+        subjectRevision: 1,
+      },
+    ],
+    desiredVectorHash: DESIRED_HASH,
+    headRevision: 1,
+    createdAt: 100,
+    updatedAt: 100,
+    ...overrides,
+  };
+}
+
+function validCandidate() {
+  return {
+    schemaVersion: "jarvis-analysis-v2",
+    sessionSummary: {
+      title: "Session title",
+      summary: "A durable session summary.",
+      evidenceSegmentIds: ["segment-1"],
+    },
+    memories: [
+      {
+        kind: "decision",
+        title: "Deployment choice",
+        body: "Use the local-first deployment.",
+        confidence: 0.9,
+        evidenceSegmentIds: ["segment-1"],
+      },
+    ],
+    topics: [
+      {
+        name: "Deployment",
+        summary: "Local-first architecture",
+        evidenceSegmentIds: ["segment-1"],
+      },
+    ],
+    todos: [
+      {
+        title: "Prepare the release",
+        ownerLabel: "SELF",
+        dueText: null,
+        evidenceSegmentIds: ["segment-1"],
+      },
+    ],
+    suggestions: [
+      {
+        title: "Review tomorrow",
+        rationale: "A later review may catch regressions.",
+        basedOnEvidenceSegmentIds: [],
+      },
+    ],
+  };
+}
+
+function clientResponse(overrides = {}) {
+  return {
+    result: validCandidate(),
+    usage: { inputTokens: 80, outputTokens: 40 },
+    model: "MiniMax-M2.7",
+    requestId: "provider-request-1",
+    inputHash: INPUT_HASH,
+    requestBytes: 800,
+    responseBytes: 400,
+    ...overrides,
+  };
+}
+
+function manifestFor(head) {
+  return {
+    manifestVersion: 1,
+    sessionId: "session-1",
+    sessionState: "ended",
+    processingState: "ready",
+    analysisInputId: head.analysisInputId,
+    analysisInputHash: head.analysisInputHash,
+    transcriptRevision: head.transcriptRevision,
+    identityRevision: head.identityRevision,
+    promptVersion: head.promptVersion,
+    responseSchemaVersion: head.responseSchemaVersion,
+    pseudonymBindingRevision: head.pseudonymBindingRevision,
+    modelVersion: head.modelVersion,
+    cloudPayloadHash: head.cloudPayloadHash,
+    segments: head.segments.map((segment) => ({
+      ...segment,
+      final: true,
+      stable: true,
+      current: true,
+      duplicate: false,
+      identityKind: "durable_subject",
+    })),
+  };
+}
+
+function admissionState(head, overrides = {}) {
+  return {
+    manifest: manifestFor(head),
+    backlog: [],
+    captureActive: false,
+    previewActive: false,
+    pressure: {
+      state: "normal",
+      reason: null,
+      cpuLoadPct: 20,
+      memoryLoadPct: 30,
+      onAcPower: true,
+      batteryLevelPct: 100,
+    },
+    cloudLaneInFlight: 0,
+    ...overrides,
+  };
+}
+
+function claimedJob(overrides = {}) {
+  return {
+    id: "job-analysis-1",
+    session_id: "session-1",
+    job_type: "analyze_session",
+    state: "running",
+    lane: "cloud",
+    input_hash: INPUT_HASH,
+    input_version: 1,
+    model_version: "MiniMax-M2.7",
+    analysis_input_id: "analysis-input-1",
+    desired_head_hash: DESIRED_HASH,
+    lease_owner: "cloud-worker",
+    lease_expires_at: 500,
+    error_code: null,
+    ...overrides,
+  };
+}
+
+function executionHarness({
+  initialHead = desiredHead(),
+  onReserve = null,
+  admissionStates = null,
+  reserveResult = {
+    ok: true,
+    requestId: "budget-request-1",
+    attemptNumber: 1,
+    state: "reserved",
+    reservedMicrousd: 100,
+    replayed: false,
+  },
+  response = clientResponse(),
+  clientError = null,
+  attempts = [],
+  applyResult = { status: "applied" },
+  executionDeviceRecorded = true,
+} = {}) {
+  const JarvisAnalysisWorker = loadWorker();
+  const calls = [];
+  let head = initialHead;
+  let admissionIndex = 0;
+  const cloudInput = {
+    inputHash: INPUT_HASH,
+    cloudPayloadJson: JSON.stringify({
+      inputVersion: "jarvis-analysis-input-v2",
+      segments: [
+        {
+          segmentId: "segment-1",
+          startedAt: 100,
+          endedAt: 200,
+          speakerLabel: "SELF",
+          text: "redacted evidence",
+        },
+      ],
+      omittedRanges: [],
+    }),
+    allowedSegmentIds: ["segment-1"],
+    allowedOwnerLabels: ["SELF"],
+  };
+  const store = {
+    completeJob(jobId, input) {
+      calls.push(["complete", jobId, input]);
+      return true;
+    },
+    deferJob(jobId, input) {
+      calls.push(["defer", jobId, input]);
+      return true;
+    },
+    blockJob(jobId, input) {
+      calls.push(["block", jobId, input]);
+      return true;
+    },
+    recordJobExecutionDevice(jobId, input) {
+      calls.push(["execution_device", jobId, input]);
+      return executionDeviceRecorded;
+    },
+  };
+  const memoryRepository = {
+    getAnalysisInputForCloud(id) {
+      calls.push(["load_input", id]);
+      return cloudInput;
+    },
+    getAnalysisDesiredHead(sessionId) {
+      calls.push(["load_head", sessionId]);
+      return head;
+    },
+    listRecoverableAnalysisCandidates() {
+      calls.push(["load_candidates"]);
+      return [];
+    },
+    persistValidatedAnalysisCandidate(input) {
+      calls.push(["persist", input]);
+      return {
+        status: "created",
+        candidateId: "candidate-1",
+        candidateHash: "1".repeat(64),
+        state: "validated",
+      };
+    },
+    applyStoredAnalysisCandidate(input) {
+      calls.push(["apply", input]);
+      return applyResult;
+    },
+  };
+  const budgetGuard = {
+    listAttemptDispositionsByJob(input) {
+      calls.push(["load_attempts", input]);
+      return attempts;
+    },
+    reserveNextAttempt(input) {
+      calls.push(["reserve", input]);
+      onReserve?.({ setHead: (next) => (head = next) });
+      return reserveResult;
+    },
+    markStarted(requestId) {
+      calls.push(["mark_started", requestId]);
+      return { ok: true, requestId, state: "started", replayed: false };
+    },
+    reconcile(input) {
+      calls.push(["reconcile", input]);
+      return { ok: true, requestId: input.requestId, state: "reconciled" };
+    },
+    release(input) {
+      calls.push(["release", input]);
+      return { ok: true, requestId: input.requestId, state: "released" };
+    },
+    markUsageUnknown(input) {
+      calls.push(["usage_unknown", input]);
+      return { ok: true, requestId: input.requestId, state: "usage_unknown" };
+    },
+  };
+  const snapshots = admissionStates ?? [() => admissionState(head), () => admissionState(head)];
+  const worker = new JarvisAnalysisWorker({
+    store,
+    memoryRepository,
+    budgetGuard,
+    workloadPolicy: new AgentWorkloadPolicy(),
+    loadAdmissionSnapshot(input) {
+      calls.push(["policy_snapshot", input.desiredHead.desiredVectorHash]);
+      const value = snapshots[Math.min(admissionIndex, snapshots.length - 1)];
+      admissionIndex += 1;
+      return typeof value === "function" ? value() : value;
+    },
+    client: {
+      async analyze(input) {
+        calls.push(["request", input]);
+        if (clientError) throw clientError;
+        return response;
+      },
+    },
+    owner: "cloud-worker",
+    model: "MiniMax-M2.7",
+    estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+    createRequestId: () => "budget-request-1",
+    validateCandidate(candidate, context) {
+      calls.push(["validate"]);
+      return validateCandidateAnalysis(candidate, context);
+    },
+    now: () => 200,
+  });
+  return { worker, calls, cloudInput, setHead: (next) => (head = next) };
+}
+
+test("executes the exact durable request ordering and applies through candidate CAS", async () => {
+  const { worker, calls, cloudInput } = executionHarness();
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "applied",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    [
+      "load_input",
+      "load_head",
+      "load_candidates",
+      "load_attempts",
+      "policy_snapshot",
+      "reserve",
+      "load_input",
+      "load_head",
+      "policy_snapshot",
+      "mark_started",
+      "request",
+      "execution_device",
+      "validate",
+      "reconcile",
+      "persist",
+      "apply",
+      "complete",
+    ]
+  );
+  assert.equal(calls.find(([name]) => name === "request")[1], cloudInput);
+});
+
+test("finishes a stale job before reserve without a paid attempt", async () => {
+  const { worker, calls } = executionHarness({
+    initialHead: desiredHead({ desiredVectorHash: "9".repeat(64) }),
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "superseded",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(
+    calls.some(([name]) => name === "reserve"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+});
+
+test("releases a reservation when the desired head becomes stale before send", async () => {
+  const { worker, calls } = executionHarness({
+    onReserve({ setHead }) {
+      setHead(desiredHead({ desiredVectorHash: "9".repeat(64) }));
+    },
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "superseded",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(calls.find(([name]) => name === "release")[1], {
+    requestId: "budget-request-1",
+    reasonCode: "superseded_before_transport",
+  });
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+});
+
+test("releases and defers when local-work admission is revoked after reserve", async () => {
+  const head = desiredHead();
+  const { worker, calls } = executionHarness({
+    admissionStates: [
+      admissionState(head),
+      admissionState(head, {
+        backlog: [
+          {
+            jobType: "transcribe_chunk",
+            lane: "local",
+            state: "pending",
+            priority: 30,
+            nextRetryAt: null,
+          },
+        ],
+      }),
+    ],
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "deferred",
+    reason: "higher_priority_backlog",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(calls.find(([name]) => name === "release")[1], {
+    requestId: "budget-request-1",
+    reasonCode: "admission_revoked",
+  });
+  assert.equal(
+    calls.find(([name]) => name === "defer")[2].reason,
+    "analysis_deferred_for_local_work"
+  );
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+});
+
+test("budget denial defers without deleting pending analysis work", async () => {
+  const { worker, calls } = executionHarness({
+    reserveResult: { ok: false, reason: "budget_exceeded" },
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "deferred",
+    reason: "budget_exceeded",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(calls.find(([name]) => name === "defer")[2].reason, "analysis_budget_denied");
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+});
+
+test("started timeout becomes usage-unknown and a restart never resends it", async () => {
+  const timeout = new Error("request timed out");
+  const first = executionHarness({ clientError: timeout });
+
+  assert.deepEqual(await first.worker.execute(claimedJob()), {
+    status: "blocked",
+    reason: "usage_unknown",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(first.calls.find(([name]) => name === "usage_unknown")[1], {
+    requestId: "budget-request-1",
+    reasonCode: "transport_ambiguous",
+  });
+  assert.equal(first.calls.filter(([name]) => name === "request").length, 1);
+
+  const restart = executionHarness({
+    attempts: [
+      {
+        requestId: "budget-request-1",
+        jobId: "job-analysis-1",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        state: "usage_unknown",
+      },
+    ],
+  });
+  assert.deepEqual(await restart.worker.execute(claimedJob()), {
+    status: "blocked",
+    reason: "usage_unknown",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(
+    restart.calls.some(([name]) => name === "reserve"),
+    false
+  );
+  assert.equal(
+    restart.calls.some(([name]) => name === "request"),
+    false
+  );
+});
+
+test("invalid response structure with authoritative usage reconciles then blocks", async () => {
+  const { worker, calls } = executionHarness({
+    response: clientResponse({ result: { schemaVersion: "jarvis-analysis-v2" } }),
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "blocked",
+    reason: "invalid_response",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(calls.find(([name]) => name === "reconcile")[1], {
+    requestId: "budget-request-1",
+    usage: { inputTokens: 80, outputTokens: 40 },
+  });
+  assert.equal(
+    calls.some(([name]) => name === "persist"),
+    false
+  );
+  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_invalid_response");
+});
+
+test("a head change after paid response reconciles cost but CAS causes no visible write", async () => {
+  const { worker, calls } = executionHarness({ applyResult: { status: "superseded" } });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "superseded",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(
+    calls.some(([name]) => name === "reconcile"),
+    true
+  );
+  assert.equal(
+    calls.some(([name]) => name === "persist"),
+    true
+  );
+  assert.equal(calls.filter(([name]) => name === "apply").length, 1);
+  assert.equal(
+    calls.findIndex(([name]) => name === "reconcile") <
+      calls.findIndex(([name]) => name === "apply"),
+    true
+  );
+});
+
+test("lease ownership loss before apply preserves reconciled candidate without visible write", async () => {
+  const { worker, calls } = executionHarness({ executionDeviceRecorded: false });
+
+  await assert.rejects(worker.execute(claimedJob()), { code: "JOB_LEASE_LOST" });
+  assert.equal(
+    calls.some(([name]) => name === "reconcile"),
+    true
+  );
+  assert.equal(
+    calls.some(([name]) => name === "persist"),
+    true
+  );
+  assert.equal(
+    calls.some(([name]) => name === "apply"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+});
+
+test("authoritative zero usage reconciles and durably permits one new attempt", async () => {
+  const zeroUsageFailure = Object.assign(new Error("not accepted"), {
+    authoritativeUsage: { inputTokens: 0, outputTokens: 0 },
+  });
+  const first = executionHarness({ clientError: zeroUsageFailure });
+
+  assert.deepEqual(await first.worker.execute(claimedJob()), {
+    status: "deferred",
+    reason: "authoritative_zero_usage",
+    jobId: "job-analysis-1",
+  });
+  assert.deepEqual(first.calls.find(([name]) => name === "reconcile")[1], {
+    requestId: "budget-request-1",
+    usage: { inputTokens: 0, outputTokens: 0 },
+  });
+  assert.equal(
+    first.calls.some(([name]) => name === "usage_unknown"),
+    false
+  );
+  assert.equal(
+    first.calls.find(([name]) => name === "defer")[2].reason,
+    "analysis_authoritative_zero_usage"
+  );
+
+  const retry = executionHarness({
+    attempts: [
+      {
+        requestId: "budget-request-1",
+        jobId: "job-analysis-1",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        state: "reconciled",
+      },
+    ],
+  });
+  assert.equal(
+    (
+      await retry.worker.execute(
+        claimedJob({ blocked_reason: "analysis_authoritative_zero_usage" })
+      )
+    ).status,
+    "applied"
+  );
+  assert.equal(retry.calls.filter(([name]) => name === "request").length, 1);
+});
+
+test("reconciled usage without a candidate cannot silently resend", async () => {
+  const { worker, calls } = executionHarness({
+    attempts: [
+      {
+        requestId: "budget-request-paid",
+        jobId: "job-analysis-1",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        state: "reconciled",
+      },
+    ],
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "blocked",
+    reason: "reconciled_without_candidate",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(
+    calls.some(([name]) => name === "reserve"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
+});

@@ -608,6 +608,51 @@ class CaptureEvidenceStore {
             OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
           )
       `),
+      recoverExpiredCloudCandidateLease: db.prepare(`
+        UPDATE processing_jobs
+        SET lease_owner = @owner,
+            lease_expires_at = @leaseExpiresAt
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'analyze_session'
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= @at
+          AND EXISTS (
+            SELECT 1
+            FROM analysis_response_candidates AS candidate
+            JOIN analysis_budget_attempts AS attempt
+              ON attempt.request_id = candidate.budget_attempt_id
+            WHERE candidate.job_id = processing_jobs.id
+              AND candidate.analysis_input_id = processing_jobs.analysis_input_id
+              AND candidate.desired_vector_hash = processing_jobs.desired_head_hash
+              AND candidate.state IN ('validated','applied')
+              AND attempt.job_id = processing_jobs.id
+              AND attempt.state = 'reconciled'
+          )
+      `),
+      listExpiredCloudCandidateLeases: db.prepare(`
+        SELECT job.id AS job_id, candidate.id AS candidate_id,
+               candidate.state AS candidate_state
+        FROM processing_jobs AS job
+        JOIN analysis_response_candidates AS candidate ON candidate.job_id = job.id
+        JOIN analysis_budget_attempts AS attempt
+          ON attempt.request_id = candidate.budget_attempt_id
+        WHERE job.lane = 'cloud'
+          AND job.job_type = 'analyze_session'
+          AND job.state = 'running'
+          AND job.completed_at IS NULL
+          AND job.lease_expires_at IS NOT NULL
+          AND job.lease_expires_at <= @at
+          AND candidate.analysis_input_id = job.analysis_input_id
+          AND candidate.desired_vector_hash = job.desired_head_hash
+          AND candidate.state IN ('validated','applied')
+          AND attempt.job_id = job.id
+          AND attempt.state = 'reconciled'
+        ORDER BY candidate.created_at ASC, candidate.id ASC
+        LIMIT @limit
+      `),
       listAgentAdmissionBacklog: db.prepare(`
         SELECT job_type, state, priority, next_retry_at
         FROM processing_jobs
@@ -809,6 +854,30 @@ class CaptureEvidenceStore {
           }
         }
         return claimed;
+      }
+    );
+    this.recoverExpiredCloudCandidateLeasesTransaction = db.transaction(
+      ({ owner, at, leaseExpiresAt, limit }) => {
+        const candidates = this.statements.listExpiredCloudCandidateLeases.all({ at, limit });
+        const recovered = [];
+        for (const candidate of candidates) {
+          const result = this.statements.recoverExpiredCloudCandidateLease.run({
+            id: candidate.job_id,
+            owner,
+            at,
+            leaseExpiresAt,
+          });
+          if (result.changes === 1) {
+            recovered.push({
+              jobId: candidate.job_id,
+              candidateId: candidate.candidate_id,
+              candidateState: candidate.candidate_state,
+              leaseOwner: owner,
+              leaseExpiresAt,
+            });
+          }
+        }
+        return recovered;
       }
     );
     this.clearRetiredArtifactTransaction = db.transaction((input) => {
@@ -1626,6 +1695,22 @@ class CaptureEvidenceStore {
       leaseExpiresAt,
       limit,
       priorityBefore,
+    });
+  }
+
+  recoverExpiredCloudCandidateLeases({ owner, at, leaseMs, limit = 100 } = {}) {
+    this._assertIdentifier(owner, "owner");
+    this._assertNonNegativeSafeInteger(at, "at");
+    this._assertPositiveSafeInteger(leaseMs, "leaseMs");
+    this._assertPositiveSafeInteger(limit, "limit");
+    if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
+    const leaseExpiresAt = at + leaseMs;
+    if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
+    return this.recoverExpiredCloudCandidateLeasesTransaction({
+      owner,
+      at,
+      leaseExpiresAt,
+      limit,
     });
   }
 

@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
@@ -88,6 +89,115 @@ function seedProcessingJob(db, overrides = {}) {
     completedAt: null,
     ...overrides,
   });
+}
+
+function seedCloudAnalysisRecovery(
+  db,
+  store,
+  { attemptState = "reconciled", candidateState = "validated" } = {}
+) {
+  const inputHash = "a".repeat(64);
+  const desiredHeadHash = "b".repeat(64);
+  const payloadHash = "c".repeat(64);
+  const candidateHash = "d".repeat(64);
+  const cloudPayloadJson = JSON.stringify({ inputVersion: "jarvis-analysis-input-v2" });
+  const desiredVectorJson = JSON.stringify({
+    analysisInputId: "analysis-input-recovery",
+    analysisInputHash: inputHash,
+    transcriptRevision: "e".repeat(64),
+    identityRevision: "f".repeat(64),
+    promptVersion: "jarvis-analysis-v2",
+    responseSchemaVersion: "jarvis-analysis-v2",
+    pseudonymBindingRevision: 1,
+    modelVersion: "MiniMax-M2.7",
+    cloudPayloadHash: payloadHash,
+    segments: [],
+  });
+  db.prepare(
+    `INSERT INTO analysis_inputs (
+       id, session_id, transcript_revision, identity_revision, prompt_version,
+       input_hash, input_contract_version, redaction_version, cloud_payload_json,
+       cloud_payload_bytes, cloud_payload_sha256, created_at
+     ) VALUES (?, 's1', ?, ?, 'jarvis-analysis-v2', ?, 'jarvis-analysis-input-v2',
+       'jarvis-redaction-v1', ?, ?, ?, 100)`
+  ).run(
+    "analysis-input-recovery",
+    "e".repeat(64),
+    "f".repeat(64),
+    inputHash,
+    cloudPayloadJson,
+    Buffer.byteLength(cloudPayloadJson, "utf8"),
+    payloadHash
+  );
+  db.prepare(
+    `INSERT INTO analysis_desired_heads (
+       session_id, analysis_input_id, analysis_input_hash, desired_vector_json,
+       desired_vector_hash, head_revision, created_at, updated_at
+     ) VALUES ('s1', 'analysis-input-recovery', ?, ?, ?, 1, 100, 100)`
+  ).run(inputHash, desiredVectorJson, desiredHeadHash);
+  const job = store.enqueueCloudJob({
+    sessionId: "s1",
+    jobType: "analyze_session",
+    analysisInputId: "analysis-input-recovery",
+    desiredHeadHash,
+    inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  store.claimCloudJobs({ owner: "dead-cloud-worker", at: 100, leaseMs: 100 });
+
+  const budgetAt = Date.UTC(2026, 6, 16, 4);
+  const budget = new AnalysisBudgetRepository(db);
+  budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at: budgetAt });
+  budget.reserve({
+    requestId: "analysis-request-recovery",
+    jobId: job.id,
+    attemptNumber: 1,
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    operation: "session_analysis",
+    estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+    at: budgetAt + 1,
+  });
+  budget.markStarted({ requestId: "analysis-request-recovery", at: budgetAt + 2 });
+  if (attemptState === "usage_unknown") {
+    budget.markUsageUnknown({
+      requestId: "analysis-request-recovery",
+      reasonCode: "process_recovery",
+      at: budgetAt + 3,
+    });
+  } else if (attemptState === "reconciled") {
+    budget.reconcile({
+      requestId: "analysis-request-recovery",
+      usage: { inputTokens: 100, outputTokens: 100 },
+      at: budgetAt + 3,
+    });
+    const candidateJson = JSON.stringify({ schemaVersion: "jarvis-analysis-v2" });
+    db.prepare(
+      `INSERT INTO analysis_response_candidates (
+         id, job_id, analysis_input_id, budget_attempt_id, desired_vector_hash,
+         response_schema_version, candidate_json, candidate_bytes, candidate_hash,
+         state, created_at, disposition_at
+       ) VALUES (
+         'analysis-candidate-recovery', ?, 'analysis-input-recovery',
+         'analysis-request-recovery', ?, 'jarvis-analysis-v2', ?, ?, ?, ?, 150, ?
+       )`
+    ).run(
+      job.id,
+      desiredHeadHash,
+      candidateJson,
+      Buffer.byteLength(candidateJson, "utf8"),
+      candidateHash,
+      candidateState,
+      candidateState === "validated" ? null : 175
+    );
+    if (candidateState === "applied") {
+      db.prepare(
+        `UPDATE analysis_inputs SET candidate_hash = ?, applied_at = 175 WHERE id = ?`
+      ).run(candidateHash, "analysis-input-recovery");
+    }
+  }
+  return job;
 }
 
 test("stores track state and gap lifecycle evidence", (t) => {
@@ -2365,6 +2475,125 @@ test("generic lease recovery never mutates cloud work", (t) => {
       { id: "local-expired", state: "retry", lease_owner: null, error_code: "LEASE_EXPIRED" },
     ]
   );
+});
+
+test("recovers only an expired cloud analysis lease backed by a reconciled candidate", (t) => {
+  const { db, store } = fixture(t);
+  const job = seedCloudAnalysisRecovery(db, store);
+
+  assert.deepEqual(
+    store.recoverExpiredCloudCandidateLeases({
+      owner: "restart-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+    }),
+    [
+      {
+        jobId: job.id,
+        candidateId: "analysis-candidate-recovery",
+        candidateState: "validated",
+        leaseOwner: "restart-cloud-worker",
+        leaseExpiresAt: 500,
+      },
+    ]
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, lease_owner, lease_expires_at, execution_device
+         FROM processing_jobs WHERE id = ?`
+      )
+      .get(job.id),
+    {
+      state: "running",
+      attempt_count: 1,
+      lease_owner: "restart-cloud-worker",
+      lease_expires_at: 500,
+      execution_device: null,
+    }
+  );
+});
+
+test("bounded cloud candidate recovery discovers applied work without a network claim", (t) => {
+  const { db, store } = fixture(t);
+  const job = seedCloudAnalysisRecovery(db, store, { candidateState: "applied" });
+
+  assert.deepEqual(
+    store.recoverExpiredCloudCandidateLeases({
+      owner: "restart-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+    }),
+    [
+      {
+        jobId: job.id,
+        candidateId: "analysis-candidate-recovery",
+        candidateState: "applied",
+        leaseOwner: "restart-cloud-worker",
+        leaseExpiresAt: 500,
+      },
+    ]
+  );
+  assert.equal(
+    db.prepare("SELECT attempt_count FROM processing_jobs WHERE id = ?").get(job.id).attempt_count,
+    1
+  );
+});
+
+test("cloud candidate lease recovery refuses live, ambiguous, and non-analysis work", (t) => {
+  const scenarios = [
+    {
+      name: "live analysis lease",
+      seed({ db, store }) {
+        const job = seedCloudAnalysisRecovery(db, store);
+        return { job, at: 199 };
+      },
+    },
+    {
+      name: "usage-unknown attempt without a candidate",
+      seed({ db, store }) {
+        const job = seedCloudAnalysisRecovery(db, store, { attemptState: "usage_unknown" });
+        return { job, at: 200 };
+      },
+    },
+    {
+      name: "daily digest",
+      seed({ store }) {
+        const job = store.enqueueCloudJob({
+          sessionId: "s1",
+          jobType: "generate_daily_digest",
+          inputHash: "9".repeat(64),
+          inputVersion: 1,
+          modelVersion: "MiniMax-M2.7",
+        });
+        store.claimCloudJobs({ owner: "dead-cloud-worker", at: 100, leaseMs: 100 });
+        return { job, at: 200 };
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const child = fixture(t);
+    const { job, at } = scenario.seed(child);
+    assert.deepEqual(
+      child.store.recoverExpiredCloudCandidateLeases({
+        owner: "restart-cloud-worker",
+        at,
+        leaseMs: 300,
+        limit: 1,
+      }),
+      [],
+      scenario.name
+    );
+    assert.equal(
+      child.db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(job.id)
+        .lease_owner,
+      "dead-cloud-worker",
+      scenario.name
+    );
+  }
 });
 
 test("agent admission backlog includes running and future-retry local work only", (t) => {

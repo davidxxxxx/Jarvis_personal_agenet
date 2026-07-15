@@ -58,7 +58,8 @@ class AnalysisScheduler {
     repository,
     memoryRepository = repository?.memoryRepository,
     inputBuilder,
-    client,
+    desiredIdentityProvider,
+    cloudQueue = repository?.captureEvidenceStore,
     cloudTransportEnabled = false,
     now = Date.now,
   } = {}) {
@@ -73,8 +74,7 @@ class AnalysisScheduler {
       for (const method of [
         "prepareAnalysisInput",
         "createAnalysisInput",
-        "getAnalysisInputForCloud",
-        "applyCandidateAnalysis",
+        "setAnalysisDesiredHead",
       ]) {
         if (!isCallable(memoryRepository, method)) {
           throw new TypeError("analysis memory repository is required");
@@ -83,12 +83,18 @@ class AnalysisScheduler {
       if (!isCallable(inputBuilder, "build")) {
         throw new TypeError("analysis input builder is required");
       }
-      if (!isCallable(client, "analyze")) throw new TypeError("analysis client is required");
+      if (!isCallable(cloudQueue, "enqueueCloudJob")) {
+        throw new TypeError("durable analysis cloud queue is required");
+      }
+      if (typeof desiredIdentityProvider !== "function") {
+        throw new TypeError("desiredIdentityProvider must be a function");
+      }
     }
     this.repository = repository;
     this.memoryRepository = memoryRepository;
     this.inputBuilder = inputBuilder;
-    this.client = client;
+    this.desiredIdentityProvider = desiredIdentityProvider;
+    this.cloudQueue = cloudQueue;
     this.cloudTransportEnabled = cloudTransportEnabled;
     this.now = now;
     this.inFlight = new Map();
@@ -128,25 +134,18 @@ class AnalysisScheduler {
     }
     let plan;
     try {
-      plan = this._prepare(id);
+      plan = this._prepare(id, kind);
     } catch (error) {
       this._setFailureStatus(id, error);
       throw error;
     }
     if (plan.status) return Promise.resolve(plan.status);
-    const key = plan.persisted.inputHash;
-    if (this.inFlight.has(key)) return this.inFlight.get(key);
-    if (plan.persisted.status === "existing") {
-      if (plan.persisted.candidateState === "applied") {
-        return Promise.resolve(this._setStatus(id, "ready", null, { reused: true }));
-      }
-      return Promise.resolve(
-        this._setStatus(id, "retry_needed", "analysis_input_pending", { reused: true })
-      );
+    try {
+      return Promise.resolve(this._enqueue(plan));
+    } catch (error) {
+      this._setFailureStatus(id, error);
+      throw error;
     }
-    const promise = this._execute(plan).finally(() => this.inFlight.delete(key));
-    this.inFlight.set(key, promise);
-    return promise;
   }
 
   async quiesce() {
@@ -169,7 +168,7 @@ class AnalysisScheduler {
     return this._setStatus(sessionId, state, errorCode);
   }
 
-  _prepare(sessionId) {
+  _prepare(sessionId, kind) {
     const detail = this.repository.getSessionDetail(sessionId);
     if (!detail) {
       const error = new Error("analysis session does not exist");
@@ -188,7 +187,7 @@ class AnalysisScheduler {
       promptVersion: PROMPT_VERSION,
       segmentIds: segments.map((segment) => segment.id),
     };
-    this._setStatus(sessionId, "analyzing");
+    this._setStatus(sessionId, "preparing");
     const prepared = this.memoryRepository.prepareAnalysisInput(request);
     const built = this.inputBuilder.build(prepared);
     if (!built?.sendable) {
@@ -215,28 +214,65 @@ class AnalysisScheduler {
       error.code = "analysis_input_state_invalid";
       throw error;
     }
-    return { sessionId, persisted };
+    return { sessionId, kind, persisted, prepared, segments, people };
   }
 
-  async _execute({ sessionId, persisted }) {
-    try {
-      const cloudInput = this.memoryRepository.getAnalysisInputForCloud(persisted.analysisInputId);
-      if (!cloudInput) {
-        const error = new Error("analysis input unavailable");
-        error.code = "analysis_input_unavailable";
-        throw error;
-      }
-      const response = await this.client.analyze(cloudInput);
-      this.memoryRepository.applyCandidateAnalysis({
-        analysisInputId: persisted.analysisInputId,
-        inputHash: persisted.inputHash,
-        candidate: response.result,
-      });
-      return this._setStatus(sessionId, "ready", null, { usage: response.usage });
-    } catch (error) {
-      this._setFailureStatus(sessionId, error);
+  _enqueue({ sessionId, kind, persisted, prepared, segments, people }) {
+    const identity = this.desiredIdentityProvider({
+      sessionId,
+      kind,
+      persisted,
+      prepared,
+      segments,
+      people,
+    });
+    if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
+      throw new TypeError("durable desired identity is required");
+    }
+    const head = this.memoryRepository.setAnalysisDesiredHead({
+      sessionId,
+      analysisInputId: persisted.analysisInputId,
+      responseSchemaVersion: identity.responseSchemaVersion,
+      pseudonymBindingRevision: identity.pseudonymBindingRevision,
+      modelVersion: identity.modelVersion,
+      segmentSubjectRevisions: identity.segmentSubjectRevisions,
+    });
+    if (
+      !head ||
+      head.analysisInputId !== persisted.analysisInputId ||
+      head.analysisInputHash !== persisted.inputHash ||
+      typeof head.desiredVectorHash !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(head.desiredVectorHash) ||
+      head.modelVersion !== identity.modelVersion
+    ) {
+      const error = new Error("analysis desired head unavailable");
+      error.code = "analysis_desired_head_invalid";
       throw error;
     }
+    const job = this.cloudQueue.enqueueCloudJob({
+      sessionId,
+      jobType: "analyze_session",
+      analysisInputId: persisted.analysisInputId,
+      desiredHeadHash: head.desiredVectorHash,
+      inputHash: persisted.inputHash,
+      inputVersion: 1,
+      modelVersion: identity.modelVersion,
+    });
+    if (!job || typeof job.id !== "string" || !job.id) {
+      const error = new Error("analysis cloud job unavailable");
+      error.code = "analysis_cloud_job_invalid";
+      throw error;
+    }
+    const reused = persisted.status === "existing";
+    const state =
+      reused && persisted.candidateState === "applied" && job.state === "completed"
+        ? "ready"
+        : "queued";
+    return this._setStatus(sessionId, state, null, {
+      jobId: job.id,
+      desiredVectorHash: head.desiredVectorHash,
+      reused,
+    });
   }
 }
 
