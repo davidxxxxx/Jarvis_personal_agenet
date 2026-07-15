@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   JarvisSession,
   JarvisSessionDetail,
+  JarvisRuntimeStatus,
   JarvisSessionTimeline,
   JarvisTranscriptSegment,
 } from "../../types";
@@ -41,6 +42,52 @@ const timeline: JarvisSessionTimeline = {
     completed: 0,
     total: 1,
   },
+};
+
+const runtimeStatus: JarvisRuntimeStatus = {
+  observedAt: 100_000,
+  capture: {
+    sessionId: session.id,
+    status: "recording",
+    captureMode: "mic",
+    retentionMode: "speech_triggered",
+    errorCode: null,
+  },
+  backend: { actualBackend: "cuda", cudaGpuUuid: "GPU-verified" },
+  resources: {
+    sampledAt: 99_000,
+    state: "busy",
+    reason: "external_gpu_busy",
+    cudaInstalled: true,
+    cudaVerified: true,
+    cudaQuarantined: false,
+  },
+  queue: {
+    pending: 1,
+    running: 0,
+    retry: 0,
+    blocked: 0,
+    total: 1,
+    byStage: {
+      final_transcription: { pending: 1, running: 0, retry: 0, blocked: 0, total: 1 },
+    },
+    backlogMinutes: 1,
+    oldestJobAgeMs: 30_000,
+    finalCoveragePct: 50,
+    provisionalCoveragePct: null,
+  },
+  preview: {
+    mode: "paused",
+    cadenceMs: null,
+    pending: 1,
+    running: 0,
+    pausedReason: "gpu_busy",
+    executionDevice: null,
+    lastError: null,
+    recordingContinues: true,
+  },
+  disk: { state: "ok", freeBytes: 10_000, remainingDays: 10, recoveryAction: null },
+  nextRecoveryAction: "wait_for_gpu",
 };
 
 const visibleSegment: JarvisTranscriptSegment = {
@@ -289,5 +336,62 @@ describe("MemoryView processing timeline", () => {
     expect(
       screen.queryByRole("heading", { name: new Date(session.started_at).toLocaleString("zh-CN") })
     ).not.toBeInTheDocument();
+  });
+
+  it("polls hidden runtime status at no more than 2 Hz and never overlaps IPC", async () => {
+    const originalHidden = Object.getOwnPropertyDescriptor(document, "hidden");
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    const pendingPoll = deferred<JarvisRuntimeStatus>();
+    const getRuntimeStatus = vi
+      .fn()
+      .mockResolvedValueOnce(runtimeStatus)
+      .mockImplementationOnce(() => pendingPoll.promise);
+    let runtimePoll: (() => void) | null = null;
+    const originalSetTimeout = window.setTimeout.bind(window);
+    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation((callback, delay) => {
+      if (delay === 2_000) {
+        runtimePoll = callback as () => void;
+        return 9 as unknown as ReturnType<typeof window.setTimeout>;
+      }
+      return originalSetTimeout(callback, delay);
+    });
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout").mockImplementation(() => undefined);
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => detailFor(session)),
+          getSessionTimeline: vi.fn(async () => timeline),
+          getRuntimeStatus,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    try {
+      render(<MemoryView />);
+      fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+      expect(await screen.findByText("正在监听")).toBeInTheDocument();
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 2_000);
+
+      act(() => runtimePoll?.());
+      act(() => runtimePoll?.());
+      expect(getRuntimeStatus).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        pendingPoll.resolve({ ...runtimeStatus, observedAt: 102_000 });
+        await Promise.resolve();
+      });
+      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 2_000);
+
+      fireEvent.click(screen.getByRole("button", { name: "返回记忆库" }));
+      expect(clearTimeoutSpy).toHaveBeenCalled();
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+      if (originalHidden) Object.defineProperty(document, "hidden", originalHidden);
+    }
   });
 });

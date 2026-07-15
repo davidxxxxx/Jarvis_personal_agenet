@@ -1,4 +1,9 @@
-import type { JarvisPreviewStatus, JarvisSessionTimeline } from "../types";
+import type {
+  JarvisPreviewStatus,
+  JarvisRuntimeRecoveryAction,
+  JarvisRuntimeStatus,
+  JarvisSessionTimeline,
+} from "../types";
 
 function previewLabel(status: JarvisPreviewStatus | null | undefined) {
   if (!status) return null;
@@ -10,7 +15,143 @@ function previewLabel(status: JarvisPreviewStatus | null | undefined) {
   return `实时预览每 ${seconds} 秒更新，录音继续`;
 }
 
-export default function ProcessingStatus({ timeline }: { timeline: JarvisSessionTimeline }) {
+const ACTION_LABELS: Record<JarvisRuntimeRecoveryAction, string> = {
+  wait_for_gpu: "等待 GPU",
+  check_cuda: "检查 CUDA",
+  free_disk: "释放磁盘",
+  restore_microphone: "检查麦克风",
+  retry_jobs: "重试任务",
+};
+
+const STAGE_LABELS: Record<string, string> = {
+  retention_urgent: "保留保护",
+  storage_recovery_compress: "磁盘恢复",
+  preview: "实时预览",
+  final_transcription: "最终转写",
+  compression: "音频压缩",
+  speaker: "说话人",
+  analysis: "分析",
+};
+
+function primaryRuntimeLabel(status: JarvisRuntimeStatus) {
+  const capture = status.capture;
+  if (capture.status === "degraded") return "正在恢复麦克风";
+  if (capture.status === "paused") return "已暂停";
+  if (capture.status === "finalizing") return "正在保存语音";
+  if (capture.status === "recording") {
+    return capture.retentionMode === "continuous" ? "重要会议" : "正在监听";
+  }
+  if (
+    status.queue.blocked > 0 ||
+    status.disk.state === "critical" ||
+    status.disk.state === "stopped"
+  ) {
+    return "需要处理";
+  }
+  if (status.queue.total > 0) return "后台处理中";
+  return "处理完成";
+}
+
+function activeWorkLabel(status: JarvisRuntimeStatus) {
+  if (status.resources.state === "busy") return "GPU 忙，已让路";
+  if (status.preview?.running && status.preview.executionDevice === "cuda") {
+    return "GPU 预览处理中";
+  }
+  if (status.queue.total > 0) return "后台处理中";
+  return null;
+}
+
+function formatMinutes(value: number) {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value);
+}
+
+function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
+  const primary = primaryRuntimeLabel(status);
+  const work = activeWorkLabel(status);
+  const recordingContinues =
+    status.capture.status === "recording" || status.capture.status === "degraded";
+  const backend =
+    status.backend.actualBackend === "cuda"
+      ? "CUDA"
+      : status.backend.actualBackend === "cpu"
+        ? "CPU"
+        : status.backend.actualBackend === "cloud"
+          ? "云端"
+          : "尚未运行";
+  const coverage = `${
+    status.queue.provisionalCoveragePct === null
+      ? "临时覆盖 --"
+      : `临时覆盖 ${status.queue.provisionalCoveragePct}%`
+  } · ${
+    status.queue.finalCoveragePct === null
+      ? "最终覆盖 --"
+      : `最终覆盖 ${status.queue.finalCoveragePct}%`
+  }`;
+  const stageRows = Object.entries(status.queue.byStage).filter(([, counts]) => counts.total > 0);
+  const action = status.nextRecoveryAction ? ACTION_LABELS[status.nextRecoveryAction] : null;
+  return (
+    <div className="space-y-3 text-sm">
+      <div>
+        <p role="status" className="font-medium text-foreground">
+          {primary}
+        </p>
+        {work && <p className="text-muted-foreground">{work}</p>}
+        {recordingContinues && work && <p className="text-muted-foreground">录音继续安全保存</p>}
+      </div>
+      <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
+        <p>
+          后端 {backend}
+          {status.backend.cudaGpuUuid ? ` · ${status.backend.cudaGpuUuid}` : null}
+        </p>
+        <p>
+          资源 {status.resources.state} · {status.resources.reason}
+        </p>
+        <p>
+          积压 {formatMinutes(status.queue.backlogMinutes)} 分钟
+          {status.queue.oldestJobAgeMs === null
+            ? null
+            : ` · 最久 ${formatMinutes(status.queue.oldestJobAgeMs / 60_000)} 分钟`}
+        </p>
+        <p>{coverage}</p>
+        <p>
+          {status.preview?.cadenceMs
+            ? `预览延迟约 ${Math.max(1, Math.round(status.preview.cadenceMs / 1_000))} 秒`
+            : status.preview?.mode === "paused"
+              ? "预览已暂停"
+              : "预览尚无数据"}
+        </p>
+        <p>
+          磁盘 {status.disk.state}
+          {status.disk.remainingDays === null ? null : ` · 预计 ${status.disk.remainingDays} 天`}
+        </p>
+      </div>
+      {stageRows.length > 0 && (
+        <ul className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          {stageRows.map(([stage, counts]) => (
+            <li key={stage}>
+              {STAGE_LABELS[stage] ?? stage}：待 {counts.pending} / 运行 {counts.running} / 重试{" "}
+              {counts.retry} / 受阻 {counts.blocked}
+            </li>
+          ))}
+        </ul>
+      )}
+      {action && (
+        <p className="rounded-lg bg-primary/10 px-3 py-2 text-primary">
+          建议操作：<span className="font-medium">{action}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+export default function ProcessingStatus({
+  timeline,
+  runtimeStatus,
+}: {
+  timeline: JarvisSessionTimeline;
+  runtimeStatus?: JarvisRuntimeStatus | null;
+}) {
+  if (runtimeStatus) return <RuntimeProcessingStatus status={runtimeStatus} />;
   const counts = timeline.processing_counts;
   const captureLabel =
     timeline.status === "recording"

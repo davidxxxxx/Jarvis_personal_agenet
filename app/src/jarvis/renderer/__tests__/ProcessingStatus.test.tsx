@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { JarvisSessionTimeline } from "../../types";
+import type { JarvisRuntimeStatus, JarvisSessionTimeline } from "../../types";
 import ProcessingStatus from "../ProcessingStatus";
 
 function timeline(overrides: Partial<JarvisSessionTimeline> = {}): JarvisSessionTimeline {
@@ -25,6 +25,55 @@ function timeline(overrides: Partial<JarvisSessionTimeline> = {}): JarvisSession
       completed: 0,
       total: 0,
     },
+    ...overrides,
+  };
+}
+
+function runtime(overrides: Partial<JarvisRuntimeStatus> = {}): JarvisRuntimeStatus {
+  return {
+    observedAt: 100_000,
+    capture: {
+      sessionId: "session-1",
+      status: "recording",
+      captureMode: "dual",
+      retentionMode: "speech_triggered",
+      errorCode: null,
+    },
+    backend: { actualBackend: "cuda", cudaGpuUuid: "GPU-verified" },
+    resources: {
+      sampledAt: 99_000,
+      state: "busy",
+      reason: "external_gpu_busy",
+      cudaInstalled: true,
+      cudaVerified: true,
+      cudaQuarantined: false,
+    },
+    queue: {
+      pending: 4,
+      running: 0,
+      retry: 0,
+      blocked: 0,
+      total: 4,
+      byStage: {
+        final_transcription: { pending: 4, running: 0, retry: 0, blocked: 0, total: 4 },
+      },
+      backlogMinutes: 18,
+      oldestJobAgeMs: 90_000,
+      finalCoveragePct: 72,
+      provisionalCoveragePct: null,
+    },
+    preview: {
+      mode: "paused",
+      cadenceMs: null,
+      pending: 1,
+      running: 0,
+      pausedReason: "gpu_busy",
+      executionDevice: null,
+      lastError: null,
+      recordingContinues: true,
+    },
+    disk: { state: "warning", freeBytes: 2_000_000_000, remainingDays: 3, recoveryAction: null },
+    nextRecoveryAction: "wait_for_gpu",
     ...overrides,
   };
 }
@@ -121,6 +170,44 @@ describe("ProcessingStatus", () => {
       expect(screen.queryByText("处理完成")).not.toBeInTheDocument();
     }
   );
+
+  it("shows that recording continues while GPU work waits", () => {
+    render(
+      <ProcessingStatus timeline={timeline({ status: "recording" })} runtimeStatus={runtime()} />
+    );
+
+    expect(screen.getByText("正在监听")).toBeVisible();
+    expect(screen.getByText("GPU 忙，已让路")).toBeVisible();
+    expect(screen.getByText(/录音继续/)).toBeVisible();
+    expect(screen.getByText(/积压 18 分钟/)).toBeVisible();
+    expect(screen.getByText(/最终覆盖 72%/)).toBeVisible();
+    expect(screen.getByText(/CUDA · GPU-verified/)).toBeVisible();
+    expect(screen.getByText("等待 GPU")).toBeVisible();
+  });
+
+  it.each([
+    [
+      "important meeting",
+      runtime({ capture: { ...runtime().capture, retentionMode: "continuous" } }),
+      "重要会议",
+    ],
+    [
+      "saving",
+      runtime({ capture: { ...runtime().capture, status: "finalizing" } }),
+      "正在保存语音",
+    ],
+    [
+      "recovering microphone",
+      runtime({
+        capture: { ...runtime().capture, status: "degraded", errorCode: "MIC_DISCONNECTED" },
+      }),
+      "正在恢复麦克风",
+    ],
+    ["paused", runtime({ capture: { ...runtime().capture, status: "paused" } }), "已暂停"],
+  ] as const)("renders the %s primary capture state", (_name, status, label) => {
+    render(<ProcessingStatus timeline={timeline()} runtimeStatus={status} />);
+    expect(screen.getByText(label)).toBeVisible();
+  });
 
   it.each([
     ["normal", 30_000, null, /实时预览每 30 秒更新，录音继续/],

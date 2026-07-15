@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Clock3, Search } from "lucide-react";
-import type { JarvisSession, JarvisSessionDetail, JarvisSessionTimeline } from "../types";
+import type {
+  JarvisRuntimeStatus,
+  JarvisSession,
+  JarvisSessionDetail,
+  JarvisSessionTimeline,
+} from "../types";
 import { useJarvisStore } from "./jarvisStore";
 import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
 import ProcessingStatus from "./ProcessingStatus";
@@ -26,6 +31,7 @@ export default function MemoryView() {
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<JarvisSessionDetail | null>(null);
   const [timeline, setTimeline] = useState<JarvisSessionTimeline | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<JarvisRuntimeStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const detailRequestGeneration = useRef(0);
@@ -63,6 +69,54 @@ export default function MemoryView() {
     };
   }, [detail?.session.id, timeline]);
 
+  useEffect(() => {
+    const sessionId = detail?.session.id;
+    const getRuntimeStatus = window.electronAPI?.jarvis?.getRuntimeStatus;
+    if (!sessionId || typeof getRuntimeStatus !== "function") return;
+    let cancelled = false;
+    let requestInFlight = false;
+    let timer: number | null = null;
+    const delay = () => (document.hidden || !document.hasFocus() ? 2_000 : 1_000);
+    const schedule = () => {
+      if (cancelled || requestInFlight || timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void refresh();
+      }, delay());
+    };
+    const refresh = async () => {
+      if (cancelled || requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const next = await getRuntimeStatus();
+        if (!cancelled) setRuntimeStatus(next);
+      } catch {
+        // A transient IPC failure must not disable later status refreshes.
+      } finally {
+        requestInFlight = false;
+        schedule();
+      }
+    };
+    const reschedule = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      schedule();
+    };
+    schedule();
+    document.addEventListener("visibilitychange", reschedule);
+    window.addEventListener("focus", reschedule);
+    window.addEventListener("blur", reschedule);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", reschedule);
+      window.removeEventListener("focus", reschedule);
+      window.removeEventListener("blur", reschedule);
+    };
+  }, [detail?.session.id]);
+
   const groups = useMemo(() => {
     const map = new Map<string, JarvisSession[]>();
     for (const session of sessions) {
@@ -89,13 +143,19 @@ export default function MemoryView() {
     setLoading(true);
     setError(null);
     try {
-      const [nextDetail, nextTimeline] = await Promise.all([
+      const runtimeRequest =
+        typeof window.electronAPI?.jarvis?.getRuntimeStatus === "function"
+          ? window.electronAPI.jarvis.getRuntimeStatus()
+          : Promise.resolve(null);
+      const [nextDetail, nextTimeline, nextRuntimeStatus] = await Promise.all([
         window.electronAPI.jarvis.getSessionDetail(sessionId),
         window.electronAPI.jarvis.getSessionTimeline(sessionId),
+        runtimeRequest,
       ]);
       if (generation !== detailRequestGeneration.current) return;
       setDetail(nextDetail);
       setTimeline(nextTimeline);
+      setRuntimeStatus(nextRuntimeStatus);
     } catch {
       if (generation !== detailRequestGeneration.current) return;
       setError("无法读取这次录音。");
@@ -142,6 +202,7 @@ export default function MemoryView() {
             setLoading(false);
             setDetail(null);
             setTimeline(null);
+            setRuntimeStatus(null);
           }}
           className="mb-5 flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
         >
@@ -159,22 +220,22 @@ export default function MemoryView() {
           </div>
           {!detail.summary &&
             (detail.segments.length > 0 || (timeline?.segments.length ?? 0) > 0) && (
-            <button
-              type="button"
-              onClick={() => void analyze()}
-              disabled={loading}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
-            >
-              {loading ? "正在分析…" : "生成总结"}
-            </button>
-          )}
+              <button
+                type="button"
+                onClick={() => void analyze()}
+                disabled={loading}
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+              >
+                {loading ? "正在分析…" : "生成总结"}
+              </button>
+            )}
         </div>
         {error && (
           <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
         )}
         {timeline && (
           <div className="mt-4 rounded-xl border border-border/50 bg-card p-4">
-            <ProcessingStatus timeline={timeline} />
+            <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
           </div>
         )}
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
