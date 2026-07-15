@@ -3,6 +3,8 @@ const TERMINAL_OBSOLETE_ERRORS = new Set([
   "DIARIZATION_STALE_INPUT",
   "DIARIZATION_AUDIO_EXPIRED",
   "DIARIZATION_SUPERSEDED",
+  "IDENTITY_RESOLUTION_STALE_INPUT",
+  "IDENTITY_RESOLUTION_SUPERSEDED",
 ]);
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
@@ -47,7 +49,9 @@ function defaultJobKind(job) {
 }
 
 function defaultJobCapability(job) {
-  return job.job_type === "diarize_track" ? { executionDevice: "cpu" } : undefined;
+  return ["diarize_track", "resolve_identities"].includes(job.job_type)
+    ? { executionDevice: "cpu" }
+    : undefined;
 }
 
 class ProcessingJobRunner {
@@ -244,7 +248,10 @@ class ProcessingJobRunner {
       if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
-      if (job.job_type === "diarize_track" && TERMINAL_OBSOLETE_ERRORS.has(errorCode)) {
+      if (
+        ["diarize_track", "resolve_identities"].includes(job.job_type) &&
+        TERMINAL_OBSOLETE_ERRORS.has(errorCode)
+      ) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,
           at: failedAt,

@@ -1,4 +1,4 @@
-const TARGET_VERSION = 21;
+const TARGET_VERSION = 22;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -402,6 +402,9 @@ const SPEAKER_IDENTITY_SCHEMA = `
     actor TEXT NOT NULL CHECK(actor IN ('user','system')),
     correction_kind TEXT NOT NULL DEFAULT 'link'
       CHECK(correction_kind IN ('link','merge')),
+    resolution_commit_sequence INTEGER CHECK(
+      resolution_commit_sequence IS NULL OR resolution_commit_sequence >= 0
+    ),
     created_at INTEGER NOT NULL,
     undone_at INTEGER
   );
@@ -518,6 +521,111 @@ const SESSION_DIARIZATION_SCHEMA = `
     ON speaker_turns(transcript_segment_id, run_id);
   CREATE INDEX IF NOT EXISTS idx_diarization_run_cluster_segments_segment
     ON speaker_diarization_run_cluster_segments(transcript_segment_id, run_id, cluster_id);
+`;
+
+const SPEAKER_IDENTITY_RESOLUTION_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS speaker_identity_resolution_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    diarization_revision TEXT NOT NULL CHECK(
+      length(diarization_revision) = 64 AND
+      diarization_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    profile_revision TEXT NOT NULL CHECK(
+      length(profile_revision) = 64 AND
+      profile_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    policy_id TEXT NOT NULL,
+    commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
+    expected_cluster_count INTEGER NOT NULL CHECK(expected_cluster_count >= 0),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+    UNIQUE(id, session_id, diarization_revision, profile_revision, policy_id),
+    UNIQUE(session_id, diarization_revision, profile_revision, policy_id)
+  );
+  CREATE TABLE IF NOT EXISTS speaker_identity_resolutions (
+    id TEXT PRIMARY KEY,
+    resolution_run_id TEXT NOT NULL
+      REFERENCES speaker_identity_resolution_runs(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    evidence_run_id TEXT NOT NULL,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    diarization_revision TEXT NOT NULL CHECK(
+      length(diarization_revision) = 64 AND
+      diarization_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    profile_revision TEXT NOT NULL CHECK(
+      length(profile_revision) = 64 AND
+      profile_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    policy_id TEXT NOT NULL,
+    candidate_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    candidate_person_ref TEXT,
+    resolution_state TEXT NOT NULL CHECK(
+      resolution_state IN ('unknown','suggested','confirmed','rejected','protected')
+    ),
+    match_score REAL CHECK(
+      match_score IS NULL OR (
+        typeof(match_score) IN ('integer','real') AND match_score BETWEEN -1 AND 1
+      )
+    ),
+    match_margin REAL CHECK(
+      match_margin IS NULL OR (
+        typeof(match_margin) IN ('integer','real') AND match_margin BETWEEN 0 AND 2
+      )
+    ),
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL CHECK(actor IN ('system','user')),
+    correction_id TEXT REFERENCES speaker_identity_corrections(id) ON DELETE CASCADE,
+    projection_applied INTEGER NOT NULL CHECK(projection_applied IN (0,1)),
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(evidence_run_id, cluster_id)
+      REFERENCES speaker_diarization_run_clusters(run_id, cluster_id) ON DELETE CASCADE,
+    FOREIGN KEY(
+      resolution_run_id, session_id, diarization_revision, profile_revision, policy_id
+    ) REFERENCES speaker_identity_resolution_runs(
+      id, session_id, diarization_revision, profile_revision, policy_id
+    ) ON DELETE CASCADE,
+    CHECK(candidate_person_id IS NULL OR candidate_person_ref IS NOT NULL),
+    CHECK(
+      resolution_state IN ('unknown','protected') OR candidate_person_ref IS NOT NULL
+    ),
+    CHECK(
+      (actor = 'system' AND resolution_state <> 'rejected' AND correction_id IS NULL) OR
+      (actor = 'user' AND resolution_state = 'rejected' AND correction_id IS NOT NULL)
+    )
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_identity_system_result
+    ON speaker_identity_resolutions(resolution_run_id, cluster_id)
+    WHERE actor = 'system';
+  CREATE INDEX IF NOT EXISTS idx_speaker_identity_resolution_cluster_revision
+    ON speaker_identity_resolutions(
+      cluster_id, diarization_revision, profile_revision, policy_id, created_at, id
+    );
+  CREATE INDEX IF NOT EXISTS idx_speaker_identity_resolution_session_time
+    ON speaker_identity_resolutions(session_id, created_at, id);
+  CREATE INDEX IF NOT EXISTS idx_speaker_identity_resolution_rejections
+    ON speaker_identity_resolutions(
+      cluster_id, diarization_revision, profile_revision, policy_id, candidate_person_ref
+    ) WHERE resolution_state = 'rejected';
+  CREATE TRIGGER IF NOT EXISTS validate_identity_resolution_evidence_session_insert
+  BEFORE INSERT ON speaker_identity_resolutions
+  BEGIN
+    SELECT RAISE(ABORT, 'identity resolution evidence session mismatch')
+    WHERE NOT EXISTS (
+      SELECT 1 FROM speaker_diarization_runs AS run
+      WHERE run.id = NEW.evidence_run_id AND run.session_id = NEW.session_id
+    );
+  END;
+  CREATE TRIGGER IF NOT EXISTS validate_identity_resolution_evidence_session_update
+  BEFORE UPDATE OF evidence_run_id, session_id ON speaker_identity_resolutions
+  BEGIN
+    SELECT RAISE(ABORT, 'identity resolution evidence session mismatch')
+    WHERE NOT EXISTS (
+      SELECT 1 FROM speaker_diarization_runs AS run
+      WHERE run.id = NEW.evidence_run_id AND run.session_id = NEW.session_id
+    );
+  END;
 `;
 
 function disambiguateUnboundSpeakerClusters(db) {
@@ -1102,12 +1210,18 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         migrateSessionDiarizationV21(db);
       }
       db.exec(SESSION_DIARIZATION_SCHEMA);
+      db.exec(SPEAKER_IDENTITY_RESOLUTION_SCHEMA);
       addColumn(db, "speaker_identity_corrections", "previous_person_ref TEXT");
       addColumn(db, "speaker_identity_corrections", "next_person_ref TEXT");
       addColumn(
         db,
         "speaker_identity_corrections",
         "correction_kind TEXT NOT NULL DEFAULT 'link' CHECK(correction_kind IN ('link','merge'))"
+      );
+      addColumn(
+        db,
+        "speaker_identity_corrections",
+        "resolution_commit_sequence INTEGER CHECK(resolution_commit_sequence IS NULL OR resolution_commit_sequence >= 0)"
       );
       db.exec(`
         UPDATE speaker_identity_corrections

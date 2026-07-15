@@ -1,6 +1,7 @@
 const ProcessingJobRunner = require("./ProcessingJobRunner");
 const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
 const SessionDiarizationWorker = require("./SessionDiarizationWorker");
+const SpeakerIdentityResolutionWorker = require("./SpeakerIdentityResolutionWorker");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const ResourceGovernor = require("./ResourceGovernor");
@@ -381,6 +382,9 @@ class JarvisProcessingRuntime {
           at: this.now(),
           policy: SESSION_DIARIZATION_POLICY,
         });
+        this.repository.enqueueSpeakerIdentityResolutionJob?.(session.id, {
+          at: this.now(),
+        });
         this.repository.refreshSessionReadiness(session.id, this.now());
       } catch (error) {
         this.log({ phase: "post_process", sessionId: session.id, error });
@@ -490,6 +494,7 @@ function createJarvisProcessingRuntime({
   previewScheduler = null,
   whisperController = null,
   sessionDiarizationWorker = null,
+  speakerIdentityResolutionWorker = null,
   speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
   ...runtimeOptions
 } = {}) {
@@ -507,6 +512,12 @@ function createJarvisProcessingRuntime({
   }
   if (sessionDiarizationWorker !== null && typeof sessionDiarizationWorker?.run !== "function") {
     throw new TypeError("sessionDiarizationWorker.run must be a function");
+  }
+  if (
+    speakerIdentityResolutionWorker !== null &&
+    typeof speakerIdentityResolutionWorker?.run !== "function"
+  ) {
+    throw new TypeError("speakerIdentityResolutionWorker.run must be a function");
   }
   const configuredModel = model.trim();
   const whisperManager = ipcHandlers.whisperManager || null;
@@ -560,6 +571,16 @@ function createJarvisProcessingRuntime({
           modelArtifactSha256: combinedDiarizationArtifactHash,
           clock: now,
         })
+      : null);
+  const canBuildIdentityResolutionWorker = [
+    "getSpeakerIdentityResolutionSnapshot",
+    "listRejectedSpeakerPersonIds",
+    "applySystemSpeakerResolutions",
+  ].every((method) => typeof repository[method] === "function");
+  const effectiveIdentityResolutionWorker =
+    speakerIdentityResolutionWorker ??
+    (canBuildIdentityResolutionWorker
+      ? new SpeakerIdentityResolutionWorker({ repository, clock: now })
       : null);
   const diarizationCapability = () => {
     if (sessionDiarizationWorker !== null) return { executionDevice: "cpu" };
@@ -626,7 +647,11 @@ function createJarvisProcessingRuntime({
     governor: effectiveGovernor,
     heavyGate: effectiveGate,
     classifyCapability: (job) =>
-      job.job_type === "diarize_track" ? diarizationCapability() : undefined,
+      job.job_type === "diarize_track"
+        ? diarizationCapability()
+        : job.job_type === "resolve_identities"
+          ? { executionDevice: "cpu" }
+          : undefined,
   });
   const effectivePreviewScheduler =
     previewScheduler ??
@@ -668,6 +693,12 @@ function createJarvisProcessingRuntime({
     if (effectiveDiarizationWorker) return effectiveDiarizationWorker.run(job, context);
     const error = new Error("DIARIZATION_RUNTIME_UNAVAILABLE");
     error.code = "DIARIZATION_RUNTIME_UNAVAILABLE";
+    throw error;
+  });
+  runner.register("resolve_identities", (job) => {
+    if (effectiveIdentityResolutionWorker) return effectiveIdentityResolutionWorker.run(job);
+    const error = new Error("IDENTITY_RESOLUTION_RUNTIME_UNAVAILABLE");
+    error.code = "IDENTITY_RESOLUTION_RUNTIME_UNAVAILABLE";
     throw error;
   });
   runner.register("compress_chunk", async (job) => {

@@ -9,6 +9,8 @@ const PROFILE_SAMPLE_QUALITY_GATE = Object.freeze({
 const SCOPES = new Set(["session", "persistent"]);
 const ACTORS = new Set(["user", "system"]);
 const PROFILE_SOURCE_KINDS = new Set(["enrollment", "user_confirmed"]);
+const RESOLUTION_STATES = new Set(["unknown", "suggested", "confirmed"]);
+const SHA256 = /^[0-9a-f]{64}$/;
 
 function assertId(value, name) {
   if (typeof value !== "string" || !value.trim()) {
@@ -42,6 +44,29 @@ function assertOptionalScore(value, name) {
 function assertEnum(value, allowed, name) {
   if (!allowed.has(value)) throw new TypeError(`invalid ${name}`);
   return value;
+}
+
+function assertRevision(value, name) {
+  if (typeof value !== "string" || !SHA256.test(value)) {
+    throw new TypeError(`${name} must be a lowercase SHA-256 digest`);
+  }
+  return value;
+}
+
+function assertResolutionScore(value, name, { maximum = 1, minimum = -1 } = {}) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} is outside the valid range`);
+  }
+  return value;
+}
+
+function deterministicResolutionId(...parts) {
+  return `speaker_resolution_${crypto
+    .createHash("sha256")
+    .update(parts.join("\0"))
+    .digest("hex")
+    .slice(0, 32)}`;
 }
 
 function encodeEmbedding(embedding) {
@@ -98,8 +123,31 @@ function mapCorrection(row) {
     scope: row.scope,
     actor: row.actor,
     correctionKind: row.correction_kind,
+    resolutionCommitSequence: row.resolution_commit_sequence,
     createdAt: row.created_at,
     undoneAt: row.undone_at,
+  };
+}
+
+function mapResolution(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    evidenceRunId: row.evidence_run_id,
+    clusterId: row.cluster_id,
+    diarizationRevision: row.diarization_revision,
+    profileRevision: row.profile_revision,
+    policyId: row.policy_id,
+    candidatePersonId: row.candidate_person_id,
+    candidatePersonRef: row.candidate_person_ref,
+    state: row.resolution_state,
+    score: row.match_score,
+    margin: row.match_margin,
+    reason: row.reason,
+    actor: row.actor,
+    projectionApplied: row.projection_applied === 1,
+    createdAt: row.created_at,
   };
 }
 
@@ -208,11 +256,11 @@ class SpeakerIdentityRepository {
         INSERT INTO speaker_identity_corrections (
           id, cluster_id, previous_person_id, next_person_id,
           previous_person_ref, next_person_ref, previous_state, next_state,
-          scope, actor, correction_kind, created_at
+          scope, actor, correction_kind, resolution_commit_sequence, created_at
         ) VALUES (
           @id, @clusterId, @previousPersonId, @nextPersonId,
           @previousPersonRef, @nextPersonRef, @previousState, @nextState,
-          @scope, @actor, @correctionKind, @createdAt
+          @scope, @actor, @correctionKind, @resolutionCommitSequence, @createdAt
         )
       `),
       updateClusterLink: db.prepare(`
@@ -231,6 +279,14 @@ class SpeakerIdentityRepository {
         WHERE cluster_id = ? AND undone_at IS NULL
         ORDER BY created_at DESC, rowid DESC LIMIT 1
       `),
+      getLatestActiveUserCorrection: db.prepare(`
+        SELECT * FROM (
+          SELECT * FROM speaker_identity_corrections
+          WHERE cluster_id = ? AND actor = 'user' AND undone_at IS NULL
+          ORDER BY created_at DESC, rowid DESC LIMIT 1
+        ) AS latest
+        WHERE correction_kind = 'merge' OR next_state IN ('confirmed','suggested')
+      `),
       markCorrectionUndone: db.prepare(`
         UPDATE speaker_identity_corrections SET undone_at = ?
         WHERE id = ? AND undone_at IS NULL
@@ -245,6 +301,124 @@ class SpeakerIdentityRepository {
         UNION ALL
         SELECT embedding FROM voice_profile_samples
         WHERE model_id = ?
+      `),
+      getResolutionEvidence: db.prepare(`
+        SELECT run.session_id, run_cluster.cluster_id
+        FROM speaker_diarization_run_clusters AS run_cluster
+        JOIN speaker_diarization_runs AS run ON run.id = run_cluster.run_id
+        WHERE run_cluster.run_id = ? AND run_cluster.cluster_id = ?
+      `),
+      listResolutionEvidenceForSession: db.prepare(`
+        SELECT run.id AS evidence_run_id, run.session_id, run_cluster.cluster_id
+        FROM speaker_diarization_runs AS run
+        JOIN speaker_diarization_run_clusters AS run_cluster ON run_cluster.run_id = run.id
+        WHERE run.session_id = ?
+        ORDER BY run.id, run_cluster.cluster_id
+      `),
+      getResolutionRun: db.prepare(`
+        SELECT * FROM speaker_identity_resolution_runs
+        WHERE session_id = @sessionId
+          AND diarization_revision = @diarizationRevision
+          AND profile_revision = @profileRevision
+          AND policy_id = @policyId
+      `),
+      insertResolutionRun: db.prepare(`
+        INSERT INTO speaker_identity_resolution_runs (
+          id, session_id, diarization_revision, profile_revision, policy_id,
+          commit_sequence, expected_cluster_count, created_at, completed_at
+        ) VALUES (
+          @id, @sessionId, @diarizationRevision, @profileRevision, @policyId,
+          @commitSequence, @expectedClusterCount, @createdAt, @completedAt
+        )
+      `),
+      nextResolutionCommitSequence: db.prepare(`
+        SELECT COALESCE(MAX(commit_sequence), 0) + 1 AS value
+        FROM speaker_identity_resolution_runs
+      `),
+      insertResolution: db.prepare(`
+        INSERT INTO speaker_identity_resolutions (
+          id, resolution_run_id, session_id, evidence_run_id, cluster_id,
+          diarization_revision, profile_revision, policy_id,
+          candidate_person_id, candidate_person_ref, resolution_state,
+          match_score, match_margin, reason, actor, correction_id,
+          projection_applied, created_at
+        ) VALUES (
+          @id, @resolutionRunId, @sessionId, @evidenceRunId, @clusterId,
+          @diarizationRevision, @profileRevision, @policyId,
+          @candidatePersonId, @candidatePersonRef, @state,
+          @score, @margin, @reason, @actor, @correctionId,
+          @projectionApplied, @createdAt
+        )
+      `),
+      getResolution: db.prepare("SELECT * FROM speaker_identity_resolutions WHERE id = ?"),
+      updateSystemResolution: db.prepare(`
+        UPDATE speaker_identity_resolutions
+        SET candidate_person_id = @candidatePersonId,
+            candidate_person_ref = @candidatePersonRef,
+            resolution_state = @state,
+            match_score = @score,
+            match_margin = @margin,
+            reason = @reason,
+            projection_applied = @projectionApplied
+        WHERE id = @id AND actor = 'system'
+      `),
+      listResolutionRunResults: db.prepare(`
+        SELECT * FROM speaker_identity_resolutions
+        WHERE resolution_run_id = ? AND actor = 'system'
+        ORDER BY cluster_id
+      `),
+      listResolutionHistory: db.prepare(`
+        SELECT * FROM speaker_identity_resolutions
+        WHERE cluster_id = ? ORDER BY created_at, rowid
+      `),
+      listRejectedPersonRefs: db.prepare(`
+        SELECT DISTINCT resolution.candidate_person_ref
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_corrections AS correction
+          ON correction.id = resolution.correction_id
+        WHERE resolution.cluster_id = @clusterId
+          AND resolution.diarization_revision = @diarizationRevision
+          AND resolution.profile_revision = @profileRevision
+          AND resolution.policy_id = @policyId
+          AND resolution.resolution_state = 'rejected'
+          AND resolution.candidate_person_ref IS NOT NULL
+          AND correction.undone_at IS NULL
+        ORDER BY candidate_person_ref
+      `),
+      getLatestSystemCandidateResolution: db.prepare(`
+        SELECT * FROM speaker_identity_resolutions
+        WHERE cluster_id = @clusterId
+          AND candidate_person_ref = @personId
+          AND actor = 'system'
+          AND resolution_state IN ('suggested','confirmed')
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+      `),
+      getLatestSystemResolutionAfter: db.prepare(`
+        SELECT resolution.*
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_resolution_runs AS run
+          ON run.id = resolution.resolution_run_id
+        WHERE resolution.cluster_id = @clusterId
+          AND resolution.actor = 'system'
+          AND run.commit_sequence > @minimumCommitSequence
+        ORDER BY run.commit_sequence DESC, resolution.rowid DESC LIMIT 1
+      `),
+      getLatestResolutionCommitSequence: db.prepare(`
+        SELECT COALESCE(MAX(run.commit_sequence), 0) AS value
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_resolution_runs AS run
+          ON run.id = resolution.resolution_run_id
+        WHERE resolution.cluster_id = ? AND resolution.actor = 'system'
+      `),
+      wakeResolvedSessionsForModel: db.prepare(`
+        UPDATE sessions
+        SET processing_state = 'processing', ready_at = NULL,
+            timeline_version = timeline_version + 1
+        WHERE status IN ('completed','recovered')
+          AND id IN (
+            SELECT DISTINCT session_id FROM speaker_clusters WHERE model_id = ?
+          )
+          AND (processing_state <> 'processing' OR ready_at IS NOT NULL)
       `),
     };
 
@@ -268,8 +442,9 @@ class SpeakerIdentityRepository {
       const cluster = this._requireCluster(input.clusterId);
       this._requirePerson(input.personId);
       const createdAt = this.now();
+      const correctionId = this.createId("speaker_correction");
       this.statements.insertCorrection.run({
-        id: this.createId("speaker_correction"),
+        id: correctionId,
         clusterId: cluster.id,
         previousPersonId: cluster.person_id,
         nextPersonId: input.personId,
@@ -280,6 +455,8 @@ class SpeakerIdentityRepository {
         scope: input.scope,
         actor: input.actor,
         correctionKind: "link",
+        resolutionCommitSequence: this.statements.getLatestResolutionCommitSequence.get(cluster.id)
+          .value,
         createdAt,
       });
       this.statements.updateClusterLink.run({
@@ -292,6 +469,7 @@ class SpeakerIdentityRepository {
       });
       if (input.scope === "persistent" && input.actor === "user") {
         this._syncConfirmedProfileSample({ ...cluster, person_id: input.personId }, createdAt);
+        this.statements.wakeResolvedSessionsForModel.run(cluster.model_id);
       }
     });
 
@@ -299,8 +477,9 @@ class SpeakerIdentityRepository {
       const cluster = this._requireCluster(input.clusterId);
       this._requirePerson(input.personId);
       const createdAt = this.now();
+      const correctionId = this.createId("speaker_correction");
       this.statements.insertCorrection.run({
-        id: this.createId("speaker_correction"),
+        id: correctionId,
         clusterId: cluster.id,
         previousPersonId: cluster.person_id,
         nextPersonId: input.personId,
@@ -311,6 +490,8 @@ class SpeakerIdentityRepository {
         scope: input.scope,
         actor: input.actor,
         correctionKind: "link",
+        resolutionCommitSequence: this.statements.getLatestResolutionCommitSequence.get(cluster.id)
+          .value,
         createdAt,
       });
       this.statements.updateClusterLink.run({
@@ -321,6 +502,172 @@ class SpeakerIdentityRepository {
         matchMargin: cluster.match_margin,
         updatedAt: createdAt,
       });
+      const resolution = this.statements.getLatestSystemCandidateResolution.get({
+        clusterId: cluster.id,
+        personId: input.personId,
+      });
+      if (resolution) {
+        this.statements.insertResolution.run({
+          id: deterministicResolutionId(resolution.id, correctionId, "rejected"),
+          resolutionRunId: resolution.resolution_run_id,
+          sessionId: resolution.session_id,
+          evidenceRunId: resolution.evidence_run_id,
+          clusterId: resolution.cluster_id,
+          diarizationRevision: resolution.diarization_revision,
+          profileRevision: resolution.profile_revision,
+          policyId: resolution.policy_id,
+          candidatePersonId: input.personId,
+          candidatePersonRef: input.personId,
+          state: "rejected",
+          score: resolution.match_score,
+          margin: resolution.match_margin,
+          reason: "user_rejected_candidate",
+          actor: "user",
+          correctionId,
+          projectionApplied: 1,
+          createdAt,
+        });
+      }
+    });
+
+    this._applySystemResolutions = db.transaction((input) => {
+      const existing = this.statements.getResolutionRun.get(input);
+      if (existing) {
+        const rows = this.statements.listResolutionRunResults.all(existing.id);
+        if (
+          rows.length !== existing.expected_cluster_count ||
+          input.results.length !== existing.expected_cluster_count
+        ) {
+          throw new Error("identity resolution run is incomplete");
+        }
+        const expectedPairs = new Set(
+          rows.map((row) => `${row.evidence_run_id}\0${row.cluster_id}`)
+        );
+        const actualPairs = new Set(
+          input.results.map((result) => `${result.evidenceRunId}\0${result.clusterId}`)
+        );
+        if (
+          actualPairs.size !== input.results.length ||
+          expectedPairs.size !== actualPairs.size ||
+          [...expectedPairs].some((pair) => !actualPairs.has(pair))
+        ) {
+          throw new Error("identity resolution batch must cover every evidence cluster exactly");
+        }
+        const byCluster = new Map(rows.map((row) => [row.cluster_id, row]));
+        for (const result of input.results) {
+          const row = byCluster.get(result.clusterId);
+          if (!row || row.evidence_run_id !== result.evidenceRunId) {
+            throw new Error("identity resolution retry changed immutable evidence");
+          }
+          if (result.candidatePersonId !== null) this._requirePerson(result.candidatePersonId);
+          const userCorrection = this.statements.getLatestActiveUserCorrection.get(
+            result.clusterId
+          );
+          const projectionApplied = userCorrection ? 0 : 1;
+          this.statements.updateSystemResolution.run({
+            id: row.id,
+            candidatePersonId: result.candidatePersonId,
+            candidatePersonRef: result.candidatePersonId,
+            state: result.state,
+            score: result.score,
+            margin: result.margin,
+            reason: result.reason,
+            projectionApplied,
+          });
+          if (projectionApplied === 1) {
+            this.statements.updateClusterLink.run({
+              clusterId: result.clusterId,
+              personId: result.state === "unknown" ? null : result.candidatePersonId,
+              linkState: result.state,
+              matchScore: result.score,
+              matchMargin: result.margin,
+              updatedAt: input.at,
+            });
+          }
+        }
+        return this.statements.listResolutionRunResults.all(existing.id);
+      }
+      const allowedRuns = new Set(input.evidenceRunIds);
+      const expectedEvidence = this.statements.listResolutionEvidenceForSession
+        .all(input.sessionId)
+        .filter((row) => allowedRuns.has(row.evidence_run_id));
+      const expectedPairs = new Set(
+        expectedEvidence.map((row) => `${row.evidence_run_id}\0${row.cluster_id}`)
+      );
+      const actualPairs = new Set(
+        input.results.map((result) => `${result.evidenceRunId}\0${result.clusterId}`)
+      );
+      if (
+        expectedPairs.size !== input.results.length ||
+        actualPairs.size !== input.results.length ||
+        [...expectedPairs].some((pair) => !actualPairs.has(pair))
+      ) {
+        throw new Error("identity resolution batch must cover every evidence cluster exactly");
+      }
+      for (const evidenceRunId of allowedRuns) {
+        const run = this.db
+          .prepare("SELECT session_id FROM speaker_diarization_runs WHERE id = ?")
+          .get(evidenceRunId);
+        if (!run || run.session_id !== input.sessionId) {
+          throw new Error("identity resolution evidence run belongs to another session");
+        }
+      }
+      for (const result of input.results) {
+        const cluster = this._requireCluster(result.clusterId);
+        if (cluster.session_id !== input.sessionId) {
+          throw new Error("identity resolution cluster belongs to another session");
+        }
+        if (result.candidatePersonId !== null) this._requirePerson(result.candidatePersonId);
+      }
+      this.statements.insertResolutionRun.run({
+        id: input.id,
+        sessionId: input.sessionId,
+        diarizationRevision: input.diarizationRevision,
+        profileRevision: input.profileRevision,
+        policyId: input.policyId,
+        commitSequence: this.statements.nextResolutionCommitSequence.get().value,
+        expectedClusterCount: input.results.length,
+        createdAt: input.at,
+        completedAt: input.at,
+      });
+      const rows = [];
+      for (const result of input.results) {
+        const userCorrection = this.statements.getLatestActiveUserCorrection.get(result.clusterId);
+        const projectionApplied = userCorrection ? 0 : 1;
+        const id = deterministicResolutionId(input.id, result.clusterId);
+        this.statements.insertResolution.run({
+          id,
+          resolutionRunId: input.id,
+          sessionId: input.sessionId,
+          evidenceRunId: result.evidenceRunId,
+          clusterId: result.clusterId,
+          diarizationRevision: input.diarizationRevision,
+          profileRevision: input.profileRevision,
+          policyId: input.policyId,
+          candidatePersonId: result.candidatePersonId,
+          candidatePersonRef: result.candidatePersonId,
+          state: result.state,
+          score: result.score,
+          margin: result.margin,
+          reason: result.reason,
+          actor: "system",
+          correctionId: null,
+          projectionApplied,
+          createdAt: input.at,
+        });
+        if (projectionApplied === 1) {
+          this.statements.updateClusterLink.run({
+            clusterId: result.clusterId,
+            personId: result.state === "unknown" ? null : result.candidatePersonId,
+            linkState: result.state,
+            matchScore: result.score,
+            matchMargin: result.margin,
+            updatedAt: input.at,
+          });
+        }
+        rows.push(this.statements.getResolution.get(id));
+      }
+      return rows;
     });
 
     this._undoLastCorrection = db.transaction((clusterId) => {
@@ -350,8 +697,26 @@ class SpeakerIdentityRepository {
           },
           undoneAt
         );
+        this.statements.wakeResolvedSessionsForModel.run(cluster.model_id);
       }
       this.statements.markCorrectionUndone.run(undoneAt, correction.id);
+      const newerSystemResolution = this.statements.getLatestSystemResolutionAfter.get({
+        clusterId,
+        minimumCommitSequence: correction.resolution_commit_sequence ?? Number.MAX_SAFE_INTEGER,
+      });
+      if (newerSystemResolution) {
+        this.statements.updateClusterLink.run({
+          clusterId,
+          personId:
+            newerSystemResolution.resolution_state === "unknown"
+              ? null
+              : newerSystemResolution.candidate_person_id,
+          linkState: newerSystemResolution.resolution_state,
+          matchScore: newerSystemResolution.match_score,
+          matchMargin: newerSystemResolution.match_margin,
+          updatedAt: undoneAt,
+        });
+      }
     });
 
     this._mergePeople = db.transaction((input) => {
@@ -359,6 +724,13 @@ class SpeakerIdentityRepository {
       if (source.is_self !== 0) throw new Error("self person cannot be merged into another person");
       const target = this._requirePerson(input.targetPersonId);
       const createdAt = this.now();
+      const affectedModels = db
+        .prepare(
+          `SELECT DISTINCT model_id FROM voice_profile_samples
+           WHERE person_id IN (?, ?) ORDER BY model_id`
+        )
+        .all(input.sourcePersonId, input.targetPersonId)
+        .map((row) => row.model_id);
       const clusters = db
         .prepare("SELECT * FROM speaker_clusters WHERE person_id = ? ORDER BY id")
         .all(input.sourcePersonId);
@@ -375,6 +747,9 @@ class SpeakerIdentityRepository {
           scope: "persistent",
           actor: input.actor,
           correctionKind: "merge",
+          resolutionCommitSequence: this.statements.getLatestResolutionCommitSequence.get(
+            cluster.id
+          ).value,
           createdAt,
         });
       }
@@ -411,6 +786,9 @@ class SpeakerIdentityRepository {
         }
       }
       db.prepare("DELETE FROM people WHERE id = ?").run(input.sourcePersonId);
+      for (const modelId of affectedModels) {
+        this.statements.wakeResolvedSessionsForModel.run(modelId);
+      }
       return target;
     });
 
@@ -418,6 +796,16 @@ class SpeakerIdentityRepository {
       this.statements.deleteEnrollmentProfiles.run(values.personId, values.modelId);
       for (const sample of values.samples) this.statements.insertProfile.run(sample);
       this.statements.upsertProfileAggregate.run(values.aggregate);
+      this.statements.wakeResolvedSessionsForModel.run(values.modelId);
+    });
+
+    this._insertProfileAndWake = db.transaction((values) => {
+      this.statements.insertProfile.run(values);
+      this.statements.wakeResolvedSessionsForModel.run(values.modelId);
+    });
+
+    this._wakeSessionsForModels = db.transaction((modelIds) => {
+      for (const modelId of modelIds) this.statements.wakeResolvedSessionsForModel.run(modelId);
     });
 
     this._importLegacyProfile = db.transaction((values) => {
@@ -425,6 +813,7 @@ class SpeakerIdentityRepository {
       this.statements.insertProfile.run(values.sample);
       this.statements.upsertProfileAggregate.run(values.aggregate);
       this.statements.insertImportMarker.run(values.markerKey, values.importedAt);
+      this.statements.wakeResolvedSessionsForModel.run(values.sample.modelId);
       return true;
     });
   }
@@ -661,7 +1050,7 @@ class SpeakerIdentityRepository {
       createdAt: assertNonNegativeInteger(input.createdAt ?? this.now(), "createdAt"),
     };
     this._requirePerson(values.personId);
-    this.statements.insertProfile.run(values);
+    this._insertProfileAndWake(values);
     return this._mapProfile(
       this.db.prepare("SELECT * FROM voice_profile_samples WHERE id = ?").get(values.id)
     );
@@ -793,6 +1182,124 @@ class SpeakerIdentityRepository {
     };
     this._rejectSuggestion(safe);
     return this.getCluster(safe.clusterId);
+  }
+
+  applySystemResolution(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("system resolution input is required");
+    }
+    const state = assertEnum(input.state, RESOLUTION_STATES, "resolution state");
+    const candidatePersonId =
+      input.candidatePersonId === null || input.candidatePersonId === undefined
+        ? null
+        : assertId(input.candidatePersonId, "candidatePersonId");
+    if (state !== "unknown" && candidatePersonId === null) {
+      throw new TypeError("suggested and confirmed resolutions require a candidate person");
+    }
+    const evidenceRunId = assertId(input.evidenceRunId, "evidenceRunId");
+    const clusterId = assertId(input.clusterId, "clusterId");
+    const evidence = this.statements.getResolutionEvidence.get(evidenceRunId, clusterId);
+    if (!evidence) throw new Error("identity resolution evidence was not found");
+    const identity = {
+      sessionId: evidence.session_id,
+      diarizationRevision: assertRevision(input.diarizationRevision, "diarizationRevision"),
+      profileRevision: assertRevision(input.profileRevision, "profileRevision"),
+      policyId: assertText(input.policyId, "policyId"),
+    };
+    const runId = deterministicResolutionId(
+      identity.sessionId,
+      identity.diarizationRevision,
+      identity.profileRevision,
+      identity.policyId
+    );
+    return this.applySystemResolutions({
+      id: runId,
+      ...identity,
+      evidenceRunIds: [evidenceRunId],
+      results: [
+        {
+          evidenceRunId,
+          clusterId,
+          candidatePersonId,
+          state,
+          score: input.score,
+          margin: input.margin,
+          reason: input.reason,
+        },
+      ],
+      at: input.at,
+    })[0];
+  }
+
+  applySystemResolutions(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("system resolution batch is required");
+    }
+    if (!Array.isArray(input.evidenceRunIds) || input.evidenceRunIds.length === 0) {
+      throw new TypeError("evidenceRunIds must be a non-empty array");
+    }
+    if (!Array.isArray(input.results)) throw new TypeError("resolution results must be an array");
+    const safe = {
+      id: assertId(input.id, "resolutionRunId"),
+      sessionId: assertId(input.sessionId, "sessionId"),
+      diarizationRevision: assertRevision(input.diarizationRevision, "diarizationRevision"),
+      profileRevision: assertRevision(input.profileRevision, "profileRevision"),
+      policyId: assertText(input.policyId, "policyId"),
+      evidenceRunIds: [...new Set(input.evidenceRunIds.map((id) => assertId(id, "evidenceRunId")))],
+      results: input.results.map((result) => {
+        const state = assertEnum(result?.state, RESOLUTION_STATES, "resolution state");
+        const candidatePersonId =
+          result.candidatePersonId === null || result.candidatePersonId === undefined
+            ? null
+            : assertId(result.candidatePersonId, "candidatePersonId");
+        if (state !== "unknown" && candidatePersonId === null) {
+          throw new TypeError("suggested and confirmed resolutions require a candidate person");
+        }
+        return {
+          evidenceRunId: assertId(result.evidenceRunId, "evidenceRunId"),
+          clusterId: assertId(result.clusterId, "clusterId"),
+          candidatePersonId,
+          state,
+          score: assertResolutionScore(result.score, "score"),
+          margin: assertResolutionScore(result.margin, "margin", {
+            minimum: 0,
+            maximum: 2,
+          }),
+          reason: assertText(result.reason, "reason"),
+        };
+      }),
+      at: assertNonNegativeInteger(input.at ?? this.now(), "at"),
+    };
+    return this._applySystemResolutions.immediate(safe).map(mapResolution);
+  }
+
+  listRejectedPersonIds(clusterId, revision) {
+    if (!revision || typeof revision !== "object" || Array.isArray(revision)) {
+      throw new TypeError("resolution revision is required");
+    }
+    return this.statements.listRejectedPersonRefs
+      .all({
+        clusterId: assertId(clusterId, "clusterId"),
+        diarizationRevision: assertRevision(revision.diarizationRevision, "diarizationRevision"),
+        profileRevision: assertRevision(revision.profileRevision, "profileRevision"),
+        policyId: assertText(revision.policyId, "policyId"),
+      })
+      .map((row) => row.candidate_person_ref);
+  }
+
+  listResolutionHistory(clusterId) {
+    return this.statements.listResolutionHistory
+      .all(assertId(clusterId, "clusterId"))
+      .map(mapResolution);
+  }
+
+  wakeSessionsForModels(modelIds) {
+    if (!Array.isArray(modelIds)) throw new TypeError("modelIds must be an array");
+    const safeModelIds = [
+      ...new Set(modelIds.map((modelId) => assertText(modelId, "modelId"))),
+    ].sort();
+    this._wakeSessionsForModels(safeModelIds);
+    return safeModelIds.length;
   }
 
   undoLastCorrection(clusterId) {

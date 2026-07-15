@@ -460,6 +460,52 @@ test("obsolete diarization inputs become terminal while the runner continues oth
   );
 });
 
+test("obsolete identity resolution jobs block once and do not stop later work", async (t) => {
+  const { db, runner } = fixture(t);
+  const codes = ["IDENTITY_RESOLUTION_STALE_INPUT", "IDENTITY_RESOLUTION_SUPERSEDED"];
+  codes.forEach((code, index) =>
+    seedJob(db, {
+      id: `resolve-obsolete-${index}`,
+      jobType: "resolve_identities",
+      priority: 45,
+      inputHash: `resolve-obsolete-${index}`,
+      modelVersion: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@1",
+      createdAt: 100 + index,
+    })
+  );
+  seedJob(db, {
+    id: "after-resolve-obsolete",
+    jobType: "transcribe_chunk",
+    priority: 50,
+    inputHash: "after-resolve-obsolete",
+    createdAt: 200,
+  });
+  const completed = [];
+  runner.register("resolve_identities", async (job) => {
+    const code = codes[Number(job.id.slice(-1))];
+    const error = new Error(code);
+    error.code = code;
+    throw error;
+  });
+  runner.register("transcribe_chunk", async (job) => completed.push(job.id));
+
+  for (let index = 0; index < 3; index += 1) assert.equal(await runner.runOnce(), 1);
+  assert.equal(await runner.runOnce(), 0);
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT id, state, error_code FROM processing_jobs WHERE id LIKE 'resolve-obsolete-%' ORDER BY id"
+      )
+      .all(),
+    codes.map((code, index) => ({
+      id: `resolve-obsolete-${index}`,
+      state: "blocked",
+      error_code: code,
+    }))
+  );
+  assert.deepEqual(completed, ["after-resolve-obsolete"]);
+});
+
 test("diarization dependency deferrals use a long retry window without a claim storm", async (t) => {
   let now = 2_000;
   let available = false;

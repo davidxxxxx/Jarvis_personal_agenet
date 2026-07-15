@@ -75,7 +75,7 @@ test("v21 creates revisioned diarization evidence with constrained foreign keys"
   try {
     applyJarvisMigrations(db, { now: () => 100 });
 
-    assert.equal(TARGET_VERSION, 21);
+    assert.equal(TARGET_VERSION, 22);
     assert.deepEqual(columns(db, "speaker_diarization_runs"), [
       "id",
       "session_id",

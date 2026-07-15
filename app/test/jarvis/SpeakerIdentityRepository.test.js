@@ -54,6 +54,12 @@ function createCluster(identities, overrides = {}) {
 }
 
 function downgradeIdentitySchemaToV17(repository) {
+  repository.db.exec(`
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_update;
+    DROP TABLE IF EXISTS speaker_identity_resolutions;
+    DROP TABLE IF EXISTS speaker_identity_resolution_runs;
+  `);
   repository.db.exec("DROP INDEX IF EXISTS idx_speaker_clusters_unbound_label");
   const columns = new Set(
     repository.db
@@ -61,7 +67,12 @@ function downgradeIdentitySchemaToV17(repository) {
       .all()
       .map((column) => column.name)
   );
-  for (const column of ["correction_kind", "next_person_ref", "previous_person_ref"]) {
+  for (const column of [
+    "resolution_commit_sequence",
+    "correction_kind",
+    "next_person_ref",
+    "previous_person_ref",
+  ]) {
     if (columns.has(column)) {
       repository.db.exec(`ALTER TABLE speaker_identity_corrections DROP COLUMN ${column}`);
     }
@@ -527,6 +538,10 @@ test("identity migrations are idempotent and preserve existing data", (t) => {
   const db = new Database(dbPath);
   db.pragma("foreign_keys = ON");
   db.exec(`
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_update;
+    DROP TABLE IF EXISTS speaker_identity_resolutions;
+    DROP TABLE IF EXISTS speaker_identity_resolution_runs;
     DROP TRIGGER clear_deleted_person_speaker_links;
     DROP TABLE speaker_identity_corrections;
     DROP TABLE voice_profile_import_markers;

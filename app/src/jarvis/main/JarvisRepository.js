@@ -15,7 +15,14 @@ const {
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
 } = require("./JarvisMigrations");
 const { toPublicAudioChunk } = require("./AudioChunkPublicView");
-const { buildDiarizationJobKey } = require("./SessionDiarizationPolicy");
+const {
+  SESSION_DIARIZATION_POLICY,
+  buildDiarizationJobKey,
+} = require("./SessionDiarizationPolicy");
+const {
+  SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  buildIdentityResolutionJobKey,
+} = require("./SpeakerIdentityResolutionPolicy");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -722,6 +729,86 @@ class JarvisRepository {
           run_id, cluster_id, transcript_segment_id
         ) VALUES (@runId, @clusterId, @transcriptSegmentId)
       `),
+      listIdentityResolutionRunClusters: this.db.prepare(`
+        SELECT run_cluster.*, run.embedding_model_id
+        FROM speaker_diarization_run_clusters AS run_cluster
+        JOIN speaker_diarization_runs AS run ON run.id = run_cluster.run_id
+        WHERE run_cluster.run_id = ?
+        ORDER BY run_cluster.first_appearance_at, run_cluster.cluster_id
+      `),
+      getLatestIdentityDiarizationRun: this.db.prepare(`
+        SELECT * FROM speaker_diarization_runs
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND policy_id = @policyId
+          AND embedding_model_id = @modelId
+        ORDER BY commit_sequence DESC LIMIT 1
+      `),
+      listIdentityDiarizationJobs: this.db.prepare(`
+        SELECT rowid AS job_sequence, * FROM processing_jobs
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND job_type = 'diarize_track'
+        ORDER BY rowid
+      `),
+      getIdentityDiarizationJobByIdentity: this.db.prepare(`
+        SELECT rowid AS job_sequence, * FROM processing_jobs
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND input_hash = @inputHash
+          AND input_version = @inputVersion
+          AND model_version = @modelVersion
+      `),
+      listIdentityResolutionProfiles: this.db.prepare(`
+        SELECT sample.*, person.is_self
+        FROM voice_profile_samples AS sample
+        JOIN people AS person ON person.id = sample.person_id
+        WHERE sample.model_id = ?
+        ORDER BY sample.person_id, sample.id
+      `),
+      insertIdentityResolutionJob: this.db.prepare(`
+        INSERT OR IGNORE INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state, priority,
+          input_hash, input_version, model_version, created_at
+        ) VALUES (
+          @id, @sessionId, NULL, NULL, 'resolve_identities', 'pending', 45,
+          @inputHash, 1, @policyId, @createdAt
+        )
+      `),
+      getIdentityResolutionJob: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = 'resolve_identities'
+          AND input_hash = @inputHash
+          AND input_version = 1
+          AND model_version = @policyId
+      `),
+      requeueIdentityResolutionJob: this.db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'pending', attempt_count = 0, next_retry_at = NULL,
+            lease_owner = NULL, lease_expires_at = NULL, error_code = NULL,
+            blocked_reason = NULL, execution_device = NULL, completed_at = NULL
+        WHERE job_type = 'resolve_identities'
+          AND input_hash = @inputHash
+          AND input_version = 1
+          AND model_version = @policyId
+          AND state = 'completed'
+      `),
+      getIdentityResolutionRun: this.db.prepare(`
+        SELECT * FROM speaker_identity_resolution_runs
+        WHERE session_id = @sessionId
+          AND diarization_revision = @diarizationRevision
+          AND profile_revision = @profileRevision
+          AND policy_id = @policyId
+      `),
+      countSessionDiarizationJobs: this.db.prepare(`
+        SELECT count(*) AS count FROM processing_jobs
+        WHERE session_id = ? AND job_type = 'diarize_track'
+      `),
+      countIdentityResolutionSystemResults: this.db.prepare(`
+        SELECT count(*) AS count FROM speaker_identity_resolutions
+        WHERE resolution_run_id = ? AND actor = 'system'
+      `),
       markSessionProcessing: this.db.prepare(`
         UPDATE sessions
         SET processing_state = 'processing', ready_at = NULL,
@@ -899,6 +986,20 @@ class JarvisRepository {
         WHERE id = @chunkId AND write_state = 'committed' AND deleted_at IS NULL
       `),
       clearSelf: this.db.prepare("UPDATE people SET is_self = 0 WHERE is_self <> 0"),
+      listSelfProfileModels: this.db.prepare(`
+        SELECT DISTINCT sample.model_id
+        FROM voice_profile_samples AS sample
+        JOIN people AS person ON person.id = sample.person_id
+        WHERE person.is_self = 1
+        ORDER BY sample.model_id
+      `),
+      listPersonProfileModels: this.db.prepare(`
+        SELECT DISTINCT model_id FROM voice_profile_samples
+        WHERE person_id = ? ORDER BY model_id
+      `),
+      countOtherSelfPeople: this.db.prepare(`
+        SELECT count(*) AS count FROM people WHERE is_self = 1 AND id <> ?
+      `),
       renamePerson: this.db.prepare(`
         INSERT INTO people (
           id, display_name, is_self, voice_profile_id, created_at, last_seen_at
@@ -1405,6 +1506,9 @@ class JarvisRepository {
     this._renamePerson = this.db.transaction((input) => {
       if (input.isSelf) this.statements.clearSelf.run();
       this.statements.renamePerson.run(input);
+      if (input.wakeModelIds.length > 0) {
+        this.speakerIdentityRepository.wakeSessionsForModels(input.wakeModelIds);
+      }
     });
 
     this._recoverOpenSessions = this.db.transaction((at) => {
@@ -1606,8 +1710,40 @@ class JarvisRepository {
 
     this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
       const { session, complete, isFinalized } = this._inspectSessionTranscriptReadiness(sessionId);
-      const processingState = complete ? "ready" : isFinalized ? "processing" : "pending";
-      const readyAt = complete ? (session.ready_at ?? at) : null;
+      let fullyProcessed = complete;
+      if (complete && this.statements.countSessionDiarizationJobs.get(sessionId).count > 0) {
+        const snapshot = this.getSpeakerIdentityResolutionSnapshot({
+          sessionId,
+          at,
+          policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+        });
+        fullyProcessed = false;
+        if (snapshot.eligible) {
+          const inputHash = buildIdentityResolutionJobKey({
+            sessionId,
+            diarizationRevision: snapshot.diarizationRevision,
+            profileRevision: snapshot.profileRevision,
+            policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+          });
+          const job = this.statements.getIdentityResolutionJob.get({
+            inputHash,
+            policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+          });
+          const run = this.statements.getIdentityResolutionRun.get({
+            sessionId,
+            diarizationRevision: snapshot.diarizationRevision,
+            profileRevision: snapshot.profileRevision,
+            policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+          });
+          fullyProcessed =
+            job?.state === "completed" &&
+            Boolean(run) &&
+            this.statements.countIdentityResolutionSystemResults.get(run.id).count ===
+              run.expected_cluster_count;
+        }
+      }
+      const processingState = fullyProcessed ? "ready" : isFinalized ? "processing" : "pending";
+      const readyAt = fullyProcessed ? (session.ready_at ?? at) : null;
       this.statements.setSessionReadiness.run({ sessionId, processingState, readyAt });
       return this.statements.getSession.get(sessionId);
     });
@@ -2292,6 +2428,183 @@ class JarvisRepository {
     return { enqueued, jobs, skipped };
   }
 
+  getSpeakerIdentityResolutionSnapshot({
+    sessionId,
+    at = Date.now(),
+    policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
+    diarizationPolicy = SESSION_DIARIZATION_POLICY,
+  } = {}) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    assertNonNegativeInteger(at, "at");
+    if (
+      !policy ||
+      policy.modelId !== SPEAKER_IDENTITY_RESOLUTION_POLICY.modelId ||
+      typeof policy.id !== "string"
+    ) {
+      throw new TypeError("an exact-model identity resolution policy is required");
+    }
+    const session = this.statements.getSession.get(safeSessionId);
+    if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
+      return { eligible: false, reason: "session_not_terminal" };
+    }
+    const tracks = this.statements.listSessionReadinessTracks.all(safeSessionId);
+    if (tracks.length === 0) return { eligible: false, reason: "no_tracks" };
+    const evidenceRuns = [];
+    const clusters = [];
+    for (const track of tracks) {
+      const run = this.statements.getLatestIdentityDiarizationRun.get({
+        sessionId: safeSessionId,
+        trackId: track.id,
+        policyId: diarizationPolicy.policyId,
+        modelId: policy.modelId,
+      });
+      if (!run) return { eligible: false, reason: "diarization_incomplete" };
+      const inputHash = buildDiarizationJobKey({
+        sessionId: safeSessionId,
+        trackId: track.id,
+        transcriptRevision: run.transcript_revision,
+        policyId: diarizationPolicy.policyId,
+      });
+      const job = this.statements.getIdentityDiarizationJobByIdentity.get({
+        sessionId: safeSessionId,
+        trackId: track.id,
+        inputHash,
+        inputVersion: diarizationPolicy.inputVersion,
+        modelVersion: diarizationPolicy.policyId,
+      });
+      if (!run || !job || job.state !== "completed") {
+        return { eligible: false, reason: "diarization_incomplete" };
+      }
+      const unfinished = this.statements.listIdentityDiarizationJobs
+        .all({ sessionId: safeSessionId, trackId: track.id })
+        .some(
+          (candidate) =>
+            candidate.job_sequence > job.job_sequence && candidate.state !== "completed"
+        );
+      if (unfinished) return { eligible: false, reason: "diarization_incomplete" };
+      if (run.embedding_model_id !== policy.modelId) {
+        return { eligible: false, reason: "diarization_model_mismatch" };
+      }
+      const runClusters = this.statements.listIdentityResolutionRunClusters.all(run.id);
+      evidenceRuns.push({
+        id: run.id,
+        trackId: track.id,
+        transcriptRevision: run.transcript_revision,
+        policyId: run.policy_id,
+        embeddingModelId: run.embedding_model_id,
+        modelArtifactSha256: run.model_artifact_sha256,
+        clusters: runClusters.map((cluster) => ({
+          clusterId: cluster.cluster_id,
+          embeddingSha256:
+            cluster.embedding === null
+              ? null
+              : crypto.createHash("sha256").update(cluster.embedding).digest("hex"),
+          speechMs: cluster.speech_ms,
+          windowCount: cluster.window_count,
+          qualityScore: cluster.quality_score,
+        })),
+      });
+      for (const cluster of runClusters) {
+        let embedding = null;
+        try {
+          embedding =
+            cluster.embedding === null
+              ? null
+              : SpeakerIdentityRepository.decodeEmbedding(cluster.embedding, 512);
+        } catch {
+          embedding = null;
+        }
+        clusters.push({
+          evidenceRunId: run.id,
+          clusterId: cluster.cluster_id,
+          modelId: run.embedding_model_id,
+          embedding,
+          speechMs: cluster.speech_ms,
+          windowCount: cluster.window_count,
+          qualityScore: cluster.quality_score,
+        });
+      }
+    }
+    evidenceRuns.sort((left, right) => left.trackId.localeCompare(right.trackId));
+    clusters.sort(
+      (left, right) =>
+        left.evidenceRunId.localeCompare(right.evidenceRunId) ||
+        left.clusterId.localeCompare(right.clusterId)
+    );
+    const diarizationRevision = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(evidenceRuns))
+      .digest("hex");
+    const rawProfiles = this.statements.listIdentityResolutionProfiles.all(policy.modelId);
+    const profileRevisionInput = rawProfiles.map((sample) => ({
+      id: sample.id,
+      personId: sample.person_id,
+      isSelf: sample.is_self === 1,
+      modelId: sample.model_id,
+      embeddingSha256: crypto.createHash("sha256").update(sample.embedding).digest("hex"),
+      sourceClusterId: sample.source_cluster_id,
+      sourceKind: sample.source_kind,
+      speechMs: sample.speech_ms,
+      windowCount: sample.window_count,
+      createdAt: sample.created_at,
+    }));
+    const profileRevision = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(profileRevisionInput))
+      .digest("hex");
+    const samples = rawProfiles.map((sample) => {
+      let embedding = null;
+      try {
+        embedding = SpeakerIdentityRepository.decodeEmbedding(sample.embedding, 512);
+      } catch {
+        embedding = null;
+      }
+      return {
+        id: sample.id,
+        personId: sample.person_id,
+        isSelf: sample.is_self === 1,
+        modelId: sample.model_id,
+        embedding,
+      };
+    });
+    return {
+      eligible: true,
+      reason: null,
+      sessionId: safeSessionId,
+      diarizationRevision,
+      profileRevision,
+      evidenceRunIds: evidenceRuns.map((run) => run.id),
+      clusters,
+      samples,
+    };
+  }
+
+  enqueueSpeakerIdentityResolutionJob(
+    sessionId,
+    { at = Date.now(), policy = SPEAKER_IDENTITY_RESOLUTION_POLICY } = {}
+  ) {
+    const safeAt = assertNonNegativeInteger(at, "at");
+    const snapshot = this.getSpeakerIdentityResolutionSnapshot({ sessionId, at: safeAt, policy });
+    if (!snapshot.eligible) return { enqueued: 0, job: null, reason: snapshot.reason };
+    const inputHash = buildIdentityResolutionJobKey({
+      sessionId: snapshot.sessionId,
+      diarizationRevision: snapshot.diarizationRevision,
+      profileRevision: snapshot.profileRevision,
+      policyId: policy.id,
+    });
+    const values = {
+      id: derivedId("job_resolve_identities", inputHash),
+      sessionId: snapshot.sessionId,
+      inputHash,
+      policyId: policy.id,
+      createdAt: safeAt,
+    };
+    const inserted = this.statements.insertIdentityResolutionJob.run(values).changes;
+    const job = this.statements.getIdentityResolutionJob.get(values);
+    if (!job) throw new Error("identity resolution job insert was not durable");
+    return { enqueued: inserted, job, reason: null, snapshot };
+  }
+
   commitDiarizationRun(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new TypeError("diarization commit input is required");
@@ -2586,7 +2899,23 @@ class JarvisRepository {
         : (existing?.voice_profile_id ?? null),
       now: Date.now(),
     };
-    this._renamePerson(update);
+    let wakeModelIds = [];
+    if (hasIsSelf) {
+      const selfActuallyChanges = input.isSelf
+        ? existing?.is_self !== 1 ||
+          this.statements.countOtherSelfPeople.get(safePersonId).count > 0
+        : existing?.is_self === 1;
+      if (selfActuallyChanges) {
+        const models = new Set(
+          this.statements.listPersonProfileModels.all(safePersonId).map((row) => row.model_id)
+        );
+        if (input.isSelf) {
+          for (const row of this.statements.listSelfProfileModels.all()) models.add(row.model_id);
+        }
+        wakeModelIds = [...models].sort();
+      }
+    }
+    this._renamePerson({ ...update, wakeModelIds });
     return this.statements.getPerson.get(safePersonId);
   }
 
@@ -3535,7 +3864,40 @@ class JarvisRepository {
   }
 
   rejectSpeakerSuggestion(input) {
-    return this.speakerIdentityRepository.rejectSuggestion(input);
+    const cluster = this.speakerIdentityRepository.rejectSuggestion(input);
+    const rejection = this.speakerIdentityRepository
+      .listResolutionHistory(input.clusterId)
+      .findLast((row) => row.actor === "user" && row.state === "rejected");
+    if (rejection) {
+      const inputHash = buildIdentityResolutionJobKey({
+        sessionId: rejection.sessionId,
+        diarizationRevision: rejection.diarizationRevision,
+        profileRevision: rejection.profileRevision,
+        policyId: rejection.policyId,
+      });
+      this.statements.requeueIdentityResolutionJob.run({
+        inputHash,
+        policyId: rejection.policyId,
+      });
+      this.statements.markSessionProcessing.run(rejection.sessionId);
+    }
+    return cluster;
+  }
+
+  applySystemSpeakerResolution(input) {
+    return this.speakerIdentityRepository.applySystemResolution(input);
+  }
+
+  applySystemSpeakerResolutions(input) {
+    return this.speakerIdentityRepository.applySystemResolutions(input);
+  }
+
+  listRejectedSpeakerPersonIds(clusterId, revision) {
+    return this.speakerIdentityRepository.listRejectedPersonIds(clusterId, revision);
+  }
+
+  listSpeakerResolutionHistory(clusterId) {
+    return this.speakerIdentityRepository.listResolutionHistory(clusterId);
   }
 
   undoSpeakerCorrection(clusterId) {

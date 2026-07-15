@@ -189,6 +189,10 @@ function rebuildAsLegacyV20DiarizationSchema(
   const commitSequenceColumn = hasCommitSequence ? ", commit_sequence" : "";
   db.pragma("foreign_keys = OFF");
   db.exec(`
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
+    DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_update;
+    DROP TABLE IF EXISTS speaker_identity_resolutions;
+    DROP TABLE IF EXISTS speaker_identity_resolution_runs;
     DROP INDEX IF EXISTS idx_diarization_run_revision;
     DROP INDEX IF EXISTS idx_diarization_runs_session_sequence;
     DROP INDEX IF EXISTS idx_diarization_run_clusters_cluster;
@@ -820,8 +824,8 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   db = null;
 
   repo = new JarvisRepository(databasePath);
-  assert.equal(TARGET_VERSION, 21);
-  assert.equal(repo.db.pragma("user_version", { simple: true }), 21);
+  assert.equal(TARGET_VERSION, 22);
+  assert.equal(repo.db.pragma("user_version", { simple: true }), TARGET_VERSION);
   assert.equal(repo.db.pragma("foreign_keys", { simple: true }), 1);
   assert.deepEqual(repo.db.pragma("foreign_key_check"), []);
   assert.deepEqual(
@@ -941,7 +945,7 @@ test("partial v20 diarization schemas all migrate without losing provenance", as
       db = null;
 
       repo = new JarvisRepository(databasePath);
-      assert.equal(repo.db.pragma("user_version", { simple: true }), 21);
+      assert.equal(repo.db.pragma("user_version", { simple: true }), TARGET_VERSION);
       assert.equal(repo.db.pragma("foreign_keys", { simple: true }), 1);
       assert.deepEqual(repo.db.pragma("foreign_key_check"), []);
       assert.deepEqual(
@@ -1026,7 +1030,7 @@ test("a failed partial v20 migration rolls back cleanly and can be retried", (t)
       ELSE 2
     END;
   `);
-  assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 20, toVersion: 21 });
+  assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 20, toVersion: TARGET_VERSION });
   assert.deepEqual(db.pragma("foreign_key_check"), []);
   assert.deepEqual(
     db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_v21'").all(),
