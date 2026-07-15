@@ -16,6 +16,10 @@ const HASH_C = "c".repeat(64);
 const HASH_D = "d".repeat(64);
 const HASH_E = "e".repeat(64);
 const HASH_F = "f".repeat(64);
+const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
+const REDACTION_VERSION = "jarvis-redaction-v1";
+const CLOUD_PAYLOAD_JSON = JSON.stringify({ inputVersion: INPUT_CONTRACT_VERSION });
+const CLOUD_PAYLOAD_BYTES = Buffer.byteLength(CLOUD_PAYLOAD_JSON, "utf8");
 
 const LINEAGE_TABLES = [
   "analysis_inputs",
@@ -199,9 +203,21 @@ function seedAnalysisInput(db, { sessionId = "session-1", inputId = "input-1" } 
   db.prepare(
     `INSERT INTO analysis_inputs (
        id, session_id, transcript_revision, identity_revision, prompt_version,
-       input_hash, created_at
-     ) VALUES (?, ?, ?, ?, 'jarvis-analysis-v2', ?, 6000)`
-  ).run(inputId, sessionId, HASH_A, HASH_B, HASH_C);
+       input_hash, input_contract_version, redaction_version, cloud_payload_json,
+       cloud_payload_bytes, cloud_payload_sha256, created_at
+     ) VALUES (?, ?, ?, ?, 'jarvis-analysis-v2', ?, ?, ?, ?, ?, ?, 6000)`
+  ).run(
+    inputId,
+    sessionId,
+    HASH_A,
+    HASH_B,
+    HASH_C,
+    INPUT_CONTRACT_VERSION,
+    REDACTION_VERSION,
+    CLOUD_PAYLOAD_JSON,
+    CLOUD_PAYLOAD_BYTES,
+    HASH_F
+  );
   db.prepare(
     `INSERT INTO analysis_input_speaker_bindings (
        analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
@@ -339,6 +355,127 @@ test("v22 migration preserves populated transcript, audio, and speaker rows", ()
   }
 });
 
+test("analysis input cloud payload contract validates exact redacted JSON and UTF-8 bytes", () => {
+  const db = createPreviousVersionDatabase();
+  try {
+    seedCaptureLineage(db);
+    applyJarvisMigrations(db);
+    const insertInput = ({
+      id,
+      inputHash,
+      payload = CLOUD_PAYLOAD_JSON,
+      payloadBytes = Buffer.byteLength(payload, "utf8"),
+      contractVersion = INPUT_CONTRACT_VERSION,
+      redactionVersion = REDACTION_VERSION,
+      payloadHash = HASH_F,
+    }) =>
+      db
+        .prepare(
+          `INSERT INTO analysis_inputs (
+             id, session_id, transcript_revision, identity_revision, prompt_version,
+             input_hash, input_contract_version, redaction_version, cloud_payload_json,
+             cloud_payload_bytes, cloud_payload_sha256, created_at
+           ) VALUES (?, 'session-1', ?, ?, 'jarvis-analysis-v2', ?, ?, ?, ?, ?, ?, 6000)`
+        )
+        .run(
+          id,
+          HASH_A,
+          HASH_B,
+          inputHash,
+          contractVersion,
+          redactionVersion,
+          payload,
+          payloadBytes,
+          payloadHash
+        );
+
+    assert.equal(insertInput({ id: "input-cloud-valid", inputHash: HASH_C }).changes, 1);
+    assert.equal(
+      insertInput({ id: "input-cloud-shared-payload-hash", inputHash: "0".repeat(64) }).changes,
+      1
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT input_contract_version, redaction_version, cloud_payload_json,
+                  cloud_payload_bytes, cloud_payload_sha256
+           FROM analysis_inputs
+           WHERE id = 'input-cloud-valid'`
+        )
+        .get(),
+      {
+        input_contract_version: INPUT_CONTRACT_VERSION,
+        redaction_version: REDACTION_VERSION,
+        cloud_payload_json: CLOUD_PAYLOAD_JSON,
+        cloud_payload_bytes: CLOUD_PAYLOAD_BYTES,
+        cloud_payload_sha256: HASH_F,
+      }
+    );
+
+    for (const invalid of [
+      { id: "input-cloud-malformed", inputHash: HASH_D, payload: "{not-json" },
+      {
+        id: "input-cloud-nonobject",
+        inputHash: HASH_E,
+        payload: JSON.stringify([INPUT_CONTRACT_VERSION]),
+      },
+      {
+        id: "input-cloud-wrong-version",
+        inputHash: HASH_F,
+        payload: JSON.stringify({ inputVersion: "jarvis-analysis-input-v1" }),
+      },
+      {
+        id: "input-cloud-wrong-contract-version",
+        inputHash: "3".repeat(64),
+        contractVersion: "jarvis-analysis-input-v1",
+      },
+      {
+        id: "input-cloud-wrong-redaction-version",
+        inputHash: "4".repeat(64),
+        redactionVersion: "jarvis-redaction-v2",
+      },
+      {
+        id: "input-cloud-invalid-payload-hash",
+        inputHash: "5".repeat(64),
+        payloadHash: "A".repeat(64),
+      },
+    ]) {
+      assert.throws(() => insertInput(invalid), { code: "SQLITE_CONSTRAINT_CHECK" });
+    }
+
+    const utf8Payload = JSON.stringify({
+      inputVersion: INPUT_CONTRACT_VERSION,
+      transcript: "你好",
+    });
+    assert.throws(
+      () =>
+        insertInput({
+          id: "input-cloud-utf8-mismatch",
+          inputHash: "1".repeat(64),
+          payload: utf8Payload,
+          payloadBytes: utf8Payload.length,
+        }),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
+    );
+
+    const oversizedPayload = JSON.stringify({
+      inputVersion: INPUT_CONTRACT_VERSION,
+      padding: "x".repeat(98_304),
+    });
+    assert.throws(
+      () =>
+        insertInput({
+          id: "input-cloud-oversized",
+          inputHash: "2".repeat(64),
+          payload: oversizedPayload,
+        }),
+      { code: "SQLITE_CONSTRAINT_CHECK" }
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("analysis input CAS and immutable manifests reject hostile writes but allow session cascade", () => {
   const db = createPreviousVersionDatabase();
   try {
@@ -392,6 +529,22 @@ test("analysis input CAS and immutable manifests reject hostile writes but allow
       () => db.prepare("DELETE FROM analysis_inputs").run(),
       /analysis input is immutable/
     );
+    for (const [column, value] of [
+      ["input_contract_version", "jarvis-analysis-input-v1"],
+      ["redaction_version", "jarvis-redaction-v2"],
+      [
+        "cloud_payload_json",
+        JSON.stringify({ inputVersion: INPUT_CONTRACT_VERSION, changed: true }),
+      ],
+      ["cloud_payload_bytes", CLOUD_PAYLOAD_BYTES + 1],
+      ["cloud_payload_sha256", HASH_E],
+    ]) {
+      assert.throws(
+        () => db.prepare(`UPDATE analysis_inputs SET ${column} = ?`).run(value),
+        /analysis input is immutable/,
+        column
+      );
+    }
     assert.throws(
       () => db.prepare("UPDATE analysis_inputs SET candidate_hash = ?").run(HASH_A),
       /analysis input candidate CAS is invalid/
@@ -449,9 +602,22 @@ test("speaker bindings require durable targets and exact session scope", () => {
     db.prepare(
       `INSERT INTO analysis_inputs (
          id, session_id, transcript_revision, identity_revision, prompt_version,
-         input_hash, created_at
-       ) VALUES ('input-bindings', 'session-1', ?, ?, 'jarvis-analysis-v2', ?, 6000)`
-    ).run(HASH_A, HASH_B, HASH_C);
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'input-bindings', 'session-1', ?, ?, 'jarvis-analysis-v2',
+         ?, ?, ?, ?, ?, ?, 6000
+       )`
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_C,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
 
     for (const label of ["P0", "P01", "P1junk", "P", "P 1"]) {
       assert.throws(
@@ -636,9 +802,22 @@ test("analysis input segments accept only current final same-session manifest ev
     db.prepare(
       `INSERT INTO analysis_inputs (
          id, session_id, transcript_revision, identity_revision, prompt_version,
-         input_hash, created_at
-       ) VALUES ('input-segments', 'session-1', ?, ?, 'jarvis-analysis-v2', ?, 6000)`
-    ).run(HASH_A, HASH_B, HASH_C);
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'input-segments', 'session-1', ?, ?, 'jarvis-analysis-v2',
+         ?, ?, ?, ?, ?, ?, 6000
+       )`
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_C,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
     db.prepare(
       `INSERT INTO analysis_input_speaker_bindings (
          analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
@@ -1478,12 +1657,22 @@ test("todo transition reasons enforce the actor, source, and state-shape contrac
     db.prepare(
       `INSERT INTO analysis_inputs (
          id, session_id, transcript_revision, identity_revision, prompt_version,
-         input_hash, created_at
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
        ) VALUES (
          'input-transition-contract', 'session-transition-contract', ?, ?,
-         'jarvis-analysis-v2', ?, 6000
+         'jarvis-analysis-v2', ?, ?, ?, ?, ?, ?, 6000
        )`
-    ).run(HASH_A, HASH_B, HASH_C);
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_C,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
     db.prepare(
       `INSERT INTO todos_v2 (
          id, canonical_base_key, instance_key, title, status,
@@ -1731,9 +1920,22 @@ test("legacy occurrences retain session lineage without synthetic analysis input
     db.prepare(
       `INSERT INTO analysis_inputs (
          id, session_id, transcript_revision, identity_revision, prompt_version,
-         input_hash, created_at
-       ) VALUES ('input-source-check', 'session-1', ?, ?, 'jarvis-analysis-v2', ?, 6000)`
-    ).run(HASH_A, HASH_B, HASH_C);
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'input-source-check', 'session-1', ?, ?, 'jarvis-analysis-v2',
+         ?, ?, ?, ?, ?, ?, 6000
+       )`
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_C,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
     db.prepare(
       `INSERT INTO memory_items_v2 (
          id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
@@ -1823,9 +2025,22 @@ test("evidence references validate target input, manifest, capture lineage, boun
     db.prepare(
       `INSERT INTO analysis_inputs (
          id, session_id, transcript_revision, identity_revision, prompt_version,
-         input_hash, created_at
-       ) VALUES ('input-other', 'session-1', ?, ?, 'jarvis-analysis-v2', ?, 6001)`
-    ).run(HASH_A, HASH_B, HASH_D);
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'input-other', 'session-1', ?, ?, 'jarvis-analysis-v2',
+         ?, ?, ?, ?, ?, ?, 6001
+       )`
+    ).run(
+      HASH_A,
+      HASH_B,
+      HASH_D,
+      INPUT_CONTRACT_VERSION,
+      REDACTION_VERSION,
+      CLOUD_PAYLOAD_JSON,
+      CLOUD_PAYLOAD_BYTES,
+      HASH_F
+    );
     db.exec(`
       INSERT INTO analysis_input_speaker_bindings (
         analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot

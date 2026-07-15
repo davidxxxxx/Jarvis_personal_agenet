@@ -647,6 +647,34 @@ const MEMORY_LINEAGE_SCHEMA = `
       typeof(input_hash) = 'text' AND length(input_hash) = 64
       AND input_hash NOT GLOB '*[^0-9a-f]*'
     ),
+    input_contract_version TEXT NOT NULL CHECK(
+      typeof(input_contract_version) = 'text'
+      AND input_contract_version = 'jarvis-analysis-input-v2'
+    ),
+    redaction_version TEXT NOT NULL CHECK(
+      typeof(redaction_version) = 'text'
+      AND redaction_version = 'jarvis-redaction-v1'
+    ),
+    cloud_payload_json TEXT NOT NULL CHECK(
+      CASE
+        WHEN typeof(cloud_payload_json) = 'text' AND json_valid(cloud_payload_json)
+        THEN COALESCE(
+          json_type(cloud_payload_json) = 'object'
+          AND json_extract(cloud_payload_json, '$.inputVersion') = input_contract_version,
+          0
+        )
+        ELSE 0
+      END
+    ),
+    cloud_payload_bytes INTEGER NOT NULL CHECK(
+      typeof(cloud_payload_bytes) = 'integer'
+      AND cloud_payload_bytes BETWEEN 2 AND 98304
+      AND length(CAST(cloud_payload_json AS BLOB)) = cloud_payload_bytes
+    ),
+    cloud_payload_sha256 TEXT NOT NULL CHECK(
+      typeof(cloud_payload_sha256) = 'text' AND length(cloud_payload_sha256) = 64
+      AND cloud_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
     candidate_hash TEXT CHECK(
       candidate_hash IS NULL OR (
         typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
@@ -1182,7 +1210,9 @@ const MEMORY_LINEAGE_SCHEMA = `
   ON daily_digests(local_date, timezone, revision DESC);
 
   CREATE TRIGGER IF NOT EXISTS analysis_inputs_immutable_update
-  BEFORE UPDATE OF id, session_id, transcript_revision, identity_revision, prompt_version, input_hash, created_at
+  BEFORE UPDATE OF id, session_id, transcript_revision, identity_revision, prompt_version,
+    input_hash, input_contract_version, redaction_version, cloud_payload_json,
+    cloud_payload_bytes, cloud_payload_sha256, created_at
   ON analysis_inputs
   BEGIN
     SELECT RAISE(ABORT, 'analysis input is immutable');
