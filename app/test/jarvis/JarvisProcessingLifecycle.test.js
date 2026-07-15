@@ -105,6 +105,7 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   });
   t.after(async () => {
     await lifecycle.stop();
+    await service.previewAudioRing.waitUntilReady();
     if (repository.db?.open) repository.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
