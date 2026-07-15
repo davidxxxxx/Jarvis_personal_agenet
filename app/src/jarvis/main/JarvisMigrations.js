@@ -1,4 +1,4 @@
-const TARGET_VERSION = 20;
+const TARGET_VERSION = 21;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -579,6 +579,146 @@ function tableExists(db, table) {
   );
 }
 
+function migrateSessionDiarizationV21(db) {
+  if (!tableExists(db, "speaker_diarization_runs")) return;
+  if (
+    columns(db, "speaker_diarization_runs").has("commit_sequence") &&
+    tableExists(db, "speaker_diarization_run_cluster_segments")
+  ) {
+    return;
+  }
+
+  db.exec(`
+    DROP INDEX IF EXISTS idx_diarization_run_revision;
+    DROP INDEX IF EXISTS idx_diarization_runs_session_completed;
+    DROP INDEX IF EXISTS idx_diarization_runs_session_sequence;
+    DROP INDEX IF EXISTS idx_diarization_run_clusters_cluster;
+    DROP INDEX IF EXISTS idx_speaker_turns_run_time;
+    DROP INDEX IF EXISTS idx_speaker_turns_segment;
+    DROP INDEX IF EXISTS idx_diarization_run_cluster_segments_segment;
+
+    CREATE TABLE speaker_diarization_runs_v21 (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+      transcript_revision TEXT NOT NULL CHECK(
+        length(transcript_revision) = 64 AND
+        transcript_revision NOT GLOB '*[^0-9a-f]*'
+      ),
+      policy_id TEXT NOT NULL,
+      diarizer_model_id TEXT NOT NULL,
+      embedding_model_id TEXT NOT NULL,
+      model_artifact_sha256 TEXT NOT NULL CHECK(
+        length(model_artifact_sha256) = 64 AND
+        model_artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+      ),
+      embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
+      sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+      input_version INTEGER NOT NULL CHECK(input_version = 1),
+      execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+      commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+      UNIQUE(session_id, track_id, transcript_revision, policy_id)
+    );
+    CREATE TABLE speaker_diarization_run_clusters_v21 (
+      run_id TEXT NOT NULL REFERENCES speaker_diarization_runs_v21(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      local_label TEXT NOT NULL,
+      embedding BLOB CHECK(
+        embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      ),
+      speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
+      window_count INTEGER NOT NULL CHECK(window_count >= 0),
+      quality_score REAL CHECK(
+        quality_score IS NULL OR (
+          typeof(quality_score) IN ('integer','real') AND quality_score BETWEEN 0 AND 1
+        )
+      ),
+      first_appearance_at INTEGER NOT NULL,
+      PRIMARY KEY(run_id, local_label),
+      UNIQUE(run_id, cluster_id),
+      CHECK(
+        (window_count = 0 AND speech_ms = 0 AND embedding IS NULL AND quality_score IS NULL) OR
+        (window_count > 0 AND embedding IS NOT NULL AND quality_score IS NOT NULL)
+      )
+    );
+    CREATE TABLE speaker_turns_v21 (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES speaker_diarization_runs_v21(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+      transcript_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+      turn_index INTEGER NOT NULL CHECK(turn_index >= 0),
+      raw_label TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+      embedding BLOB CHECK(
+        embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      ),
+      echo_state TEXT NOT NULL DEFAULT 'none'
+        CHECK(echo_state IN ('none','possible','confirmed')),
+      duplicate_of_turn_id TEXT REFERENCES speaker_turns_v21(id) ON DELETE SET NULL,
+      excluded_from_centroid INTEGER NOT NULL DEFAULT 0 CHECK(excluded_from_centroid IN (0,1)),
+      created_at INTEGER NOT NULL,
+      UNIQUE(run_id, chunk_id, turn_index),
+      CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
+      CHECK((echo_state = 'confirmed') = (excluded_from_centroid = 1))
+    );
+    CREATE TABLE speaker_diarization_run_cluster_segments_v21 (
+      run_id TEXT NOT NULL,
+      cluster_id TEXT NOT NULL,
+      transcript_segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      PRIMARY KEY(run_id, cluster_id, transcript_segment_id),
+      FOREIGN KEY(run_id, cluster_id)
+        REFERENCES speaker_diarization_run_clusters_v21(run_id, cluster_id) ON DELETE CASCADE
+    );
+
+    INSERT INTO speaker_diarization_runs_v21 (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    )
+    SELECT id, session_id, track_id, transcript_revision, policy_id,
+           diarizer_model_id, embedding_model_id, model_artifact_sha256,
+           embedding_dimension, sample_rate, input_version, execution_device,
+           ROW_NUMBER() OVER (ORDER BY completed_at, id), created_at, completed_at
+    FROM speaker_diarization_runs;
+    INSERT INTO speaker_diarization_run_clusters_v21
+    SELECT * FROM speaker_diarization_run_clusters;
+    INSERT INTO speaker_turns_v21 (
+      id, run_id, cluster_id, chunk_id, transcript_segment_id, turn_index,
+      raw_label, started_at, ended_at, embedding, echo_state,
+      duplicate_of_turn_id, excluded_from_centroid, created_at
+    )
+    SELECT id, run_id, cluster_id, chunk_id, transcript_segment_id, turn_index,
+           raw_label, started_at, ended_at, embedding, echo_state,
+           duplicate_of_turn_id,
+           CASE WHEN echo_state = 'confirmed' THEN 1 ELSE 0 END,
+           created_at
+    FROM speaker_turns;
+    INSERT OR IGNORE INTO speaker_diarization_run_cluster_segments_v21
+    SELECT run_cluster.run_id, run_cluster.cluster_id, legacy.transcript_segment_id
+    FROM speaker_diarization_run_clusters_v21 AS run_cluster
+    JOIN speaker_cluster_segments AS legacy ON legacy.cluster_id = run_cluster.cluster_id;
+    INSERT OR IGNORE INTO speaker_diarization_run_cluster_segments_v21
+    SELECT turn.run_id, turn.cluster_id, turn.transcript_segment_id
+    FROM speaker_turns_v21 AS turn
+    WHERE turn.transcript_segment_id IS NOT NULL;
+
+    DROP TABLE speaker_turns;
+    DROP TABLE speaker_diarization_run_clusters;
+    DROP TABLE speaker_diarization_runs;
+    ALTER TABLE speaker_diarization_runs_v21 RENAME TO speaker_diarization_runs;
+    ALTER TABLE speaker_diarization_run_clusters_v21
+      RENAME TO speaker_diarization_run_clusters;
+    ALTER TABLE speaker_turns_v21 RENAME TO speaker_turns;
+    ALTER TABLE speaker_diarization_run_cluster_segments_v21
+      RENAME TO speaker_diarization_run_cluster_segments;
+  `);
+}
+
 function rebuildTranscriptSegmentsV13(db, { preserveLineage = false } = {}) {
   if (!tableExists(db, "transcript_segments")) return;
   const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
@@ -940,6 +1080,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       );
     `);
       db.exec(SPEAKER_IDENTITY_SCHEMA);
+      if (fromVersion < 21) {
+        migrateSessionDiarizationV21(db);
+      }
       db.exec(SESSION_DIARIZATION_SCHEMA);
       addColumn(db, "speaker_identity_corrections", "previous_person_ref TEXT");
       addColumn(db, "speaker_identity_corrections", "next_person_ref TEXT");

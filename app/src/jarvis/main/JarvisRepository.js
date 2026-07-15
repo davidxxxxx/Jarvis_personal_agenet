@@ -27,6 +27,7 @@ const CLOUD_RESERVATION_MICROUSD = 100_000;
 const TRANSCRIPT_PROMPT_CODE_POINT_LIMIT = 1_024;
 const TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT = 800;
 const STABLE_CLUSTER_REUSE_THRESHOLD = 0.82;
+const STABLE_CLUSTER_REUSE_MARGIN = 0.05;
 const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   recording: "active",
   finalizing: "active",
@@ -74,6 +75,31 @@ function compareStableIds(left, right) {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+function l2NormalizeEmbedding(embedding) {
+  let squaredNorm = 0;
+  for (const value of embedding) {
+    squaredNorm += value * value;
+  }
+  if (!Number.isFinite(squaredNorm) || squaredNorm <= Number.EPSILON) return null;
+  const norm = Math.sqrt(squaredNorm);
+  return Float64Array.from(embedding, (value) => value / norm);
+}
+
+function cosineSimilarity(left, right) {
+  let score = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    score += left[index] * right[index];
+  }
+  return score;
+}
+
+function hasStableReuseMargin(rankedPairs) {
+  return (
+    rankedPairs.length === 1 ||
+    rankedPairs[0].score - rankedPairs[1].score >= STABLE_CLUSTER_REUSE_MARGIN
+  );
 }
 
 function coveredDurationMs(rows, groupColumn) {
@@ -1615,23 +1641,60 @@ class JarvisRepository {
         .filter((candidate) => candidate.embedding !== null)
         .map((candidate) => ({
           ...candidate,
-          decodedEmbedding: SpeakerIdentityRepository.decodeEmbedding(candidate.embedding, 512),
-        }));
-      const incomingWithVoice = input.clusters.filter((cluster) => cluster.embedding !== null);
+          normalizedEmbedding: l2NormalizeEmbedding(
+            SpeakerIdentityRepository.decodeEmbedding(candidate.embedding, 512)
+          ),
+        }))
+        .filter((candidate) => candidate.normalizedEmbedding !== null);
+      const incomingWithVoice = input.clusters
+        .filter((cluster) => cluster.embedding !== null)
+        .map((cluster) => ({
+          ...cluster,
+          normalizedEmbedding: l2NormalizeEmbedding(
+            SpeakerIdentityRepository.decodeEmbedding(cluster.embedding, 512)
+          ),
+        }))
+        .filter((cluster) => cluster.normalizedEmbedding !== null);
       const pairs = [];
       for (const cluster of incomingWithVoice) {
-        const embedding = SpeakerIdentityRepository.decodeEmbedding(cluster.embedding, 512);
         for (const candidate of reusableCandidates) {
-          let score = 0;
-          for (let index = 0; index < embedding.length; index += 1) {
-            score += embedding[index] * candidate.decodedEmbedding[index];
-          }
-          if (score >= STABLE_CLUSTER_REUSE_THRESHOLD) {
-            pairs.push({ cluster, candidate, score });
-          }
+          const score = cosineSimilarity(
+            cluster.normalizedEmbedding,
+            candidate.normalizedEmbedding
+          );
+          pairs.push({ cluster, candidate, score });
         }
       }
-      pairs.sort(
+      const comparePairs = (left, right) =>
+        right.score - left.score ||
+        left.cluster.firstAppearanceAt - right.cluster.firstAppearanceAt ||
+        compareStableIds(left.cluster.localLabel, right.cluster.localLabel) ||
+        compareStableIds(left.candidate.id, right.candidate.id);
+      const pairsByIncoming = new Map();
+      const pairsByStable = new Map();
+      for (const pair of pairs) {
+        const incomingPairs = pairsByIncoming.get(pair.cluster.id) ?? [];
+        incomingPairs.push(pair);
+        pairsByIncoming.set(pair.cluster.id, incomingPairs);
+        const stablePairs = pairsByStable.get(pair.candidate.id) ?? [];
+        stablePairs.push(pair);
+        pairsByStable.set(pair.candidate.id, stablePairs);
+      }
+      for (const ranked of pairsByIncoming.values()) ranked.sort(comparePairs);
+      for (const ranked of pairsByStable.values()) ranked.sort(comparePairs);
+      const eligiblePairs = [];
+      for (const rankedIncoming of pairsByIncoming.values()) {
+        const best = rankedIncoming[0];
+        if (best.score < STABLE_CLUSTER_REUSE_THRESHOLD || !hasStableReuseMargin(rankedIncoming)) {
+          continue;
+        }
+        const rankedStable = pairsByStable.get(best.candidate.id);
+        if (rankedStable[0].cluster.id !== best.cluster.id || !hasStableReuseMargin(rankedStable)) {
+          continue;
+        }
+        eligiblePairs.push(best);
+      }
+      eligiblePairs.sort(
         (left, right) =>
           right.score - left.score ||
           left.cluster.firstAppearanceAt - right.cluster.firstAppearanceAt ||
@@ -1640,7 +1703,7 @@ class JarvisRepository {
       );
       const assignedIncoming = new Set();
       const assignedStable = new Set();
-      for (const pair of pairs) {
+      for (const pair of eligiblePairs) {
         if (assignedIncoming.has(pair.cluster.id) || assignedStable.has(pair.candidate.id))
           continue;
         assignedIncoming.add(pair.cluster.id);

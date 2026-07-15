@@ -72,6 +72,7 @@ class DiarizationManager {
     setTimeoutImpl = setTimeout,
     clearTimeoutImpl = clearTimeout,
     gracefulStopProcessImpl = gracefulStopProcess,
+    pidFileImpl = sidecarPidFile,
     timeoutMs = DIARIZATION_TIMEOUT_MS,
   } = {}) {
     if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
@@ -81,10 +82,18 @@ class DiarizationManager {
     if (typeof gracefulStopProcessImpl !== "function") {
       throw new TypeError("gracefulStopProcessImpl must be a function");
     }
+    if (
+      !pidFileImpl ||
+      typeof pidFileImpl.write !== "function" ||
+      typeof pidFileImpl.clear !== "function"
+    ) {
+      throw new TypeError("pidFileImpl must provide write and clear functions");
+    }
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       throw new RangeError("timeoutMs must be a positive safe integer");
     }
     this._process = null;
+    this._processState = "idle";
     this.currentDownloadProcess = null;
     this.cachedBinaryPath = null;
     this.modelArtifactHashPromise = null;
@@ -92,6 +101,7 @@ class DiarizationManager {
     this.setTimeoutImpl = setTimeoutImpl;
     this.clearTimeoutImpl = clearTimeoutImpl;
     this.gracefulStopProcessImpl = gracefulStopProcessImpl;
+    this.pidFileImpl = pidFileImpl;
     this.timeoutMs = timeoutMs;
   }
 
@@ -426,13 +436,24 @@ class DiarizationManager {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let timingOut = false;
       let proc;
       let timeout;
 
+      const clearTimer = () => {
+        if (timeout === undefined) return;
+        this.clearTimeoutImpl(timeout);
+        timeout = undefined;
+      };
+      const clearTrackedProcess = () => {
+        if (this._process !== proc) return;
+        this._process = null;
+        this._processState = "idle";
+        this.pidFileImpl.clear("diarization");
+      };
       const cleanup = () => {
-        if (timeout !== undefined) this.clearTimeoutImpl(timeout);
-        if (this._process === proc) this._process = null;
-        sidecarPidFile.clear("diarization");
+        clearTimer();
+        clearTrackedProcess();
       };
       const finishResolve = (value) => {
         if (settled) return;
@@ -461,12 +482,34 @@ class DiarizationManager {
       }
 
       this._process = proc;
-      sidecarPidFile.write("diarization", proc.pid);
+      this._processState = "running";
+      this.pidFileImpl.write("diarization", proc.pid);
 
       timeout = this.setTimeoutImpl(() => {
+        if (settled || timingOut) return;
+        timingOut = true;
+        this._processState = "timing_out";
+        clearTimer();
         debugLogger.warn("Diarization timed out", { timeoutMs: this.timeoutMs });
-        finishReject(diarizationError("DIARIZATION_SIDECAR_TIMEOUT"));
-        void Promise.resolve(this.gracefulStopProcessImpl(proc)).catch(() => {});
+        void (async () => {
+          try {
+            await this.gracefulStopProcessImpl(proc);
+          } catch (error) {
+            if (settled) return;
+            settled = true;
+            reject(
+              diarizationError(
+                "DIARIZATION_SIDECAR_STOP_FAILED",
+                error?.message || "Diarization sidecar could not be stopped after timeout"
+              )
+            );
+            return;
+          }
+          clearTrackedProcess();
+          if (settled) return;
+          settled = true;
+          reject(diarizationError("DIARIZATION_SIDECAR_TIMEOUT"));
+        })();
       }, this.timeoutMs);
 
       proc.stdout.on("data", (data) => {
@@ -478,6 +521,10 @@ class DiarizationManager {
       });
 
       proc.on("close", (code) => {
+        if (timingOut) {
+          clearTrackedProcess();
+          return;
+        }
         if (settled) return;
         if (code !== 0) {
           debugLogger.warn("Diarization process exited with error", {
@@ -503,7 +550,7 @@ class DiarizationManager {
       });
 
       proc.on("error", (err) => {
-        if (settled) return;
+        if (settled || timingOut) return;
         debugLogger.warn("Diarization process error", { error: err.message });
         finishReject(diarizationError("DIARIZATION_SIDECAR_SPAWN_FAILED", err.message));
       });
@@ -728,10 +775,13 @@ class DiarizationManager {
   }
 
   async shutdown() {
-    if (this._process) {
-      await gracefulStopProcess(this._process);
-      this._process = null;
-    }
+    const proc = this._process;
+    if (!proc) return;
+    await this.gracefulStopProcessImpl(proc);
+    if (this._process !== proc) return;
+    this._process = null;
+    this._processState = "idle";
+    this.pidFileImpl.clear("diarization");
   }
 }
 

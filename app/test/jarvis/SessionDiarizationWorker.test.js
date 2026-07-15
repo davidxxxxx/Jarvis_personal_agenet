@@ -69,13 +69,13 @@ function seedFinalEvidence(repo) {
   `);
 }
 
-test("v20 creates revisioned diarization evidence with constrained foreign keys", () => {
+test("v21 creates revisioned diarization evidence with constrained foreign keys", () => {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
   try {
     applyJarvisMigrations(db, { now: () => 100 });
 
-    assert.equal(TARGET_VERSION, 20);
+    assert.equal(TARGET_VERSION, 21);
     assert.deepEqual(columns(db, "speaker_diarization_runs"), [
       "id",
       "session_id",
@@ -163,7 +163,7 @@ test("v20 creates revisioned diarization evidence with constrained foreign keys"
   }
 });
 
-test("v20 upgrade preserves every v19 speaker cluster and transcript link", () => {
+test("v21 upgrade preserves every v19 speaker cluster and transcript link", () => {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
   try {
@@ -207,7 +207,7 @@ test("v20 upgrade preserves every v19 speaker cluster and transcript link", () =
 
     const result = applyJarvisMigrations(db, { now: () => 200 });
 
-    assert.deepEqual(result, { fromVersion: 19, toVersion: 20 });
+    assert.deepEqual(result, { fromVersion: 19, toVersion: TARGET_VERSION });
     assert.deepEqual(db.prepare("SELECT id, local_label, model_id FROM speaker_clusters").all(), [
       { id: "cluster1", local_label: "speaker_1", model_id: "legacy-model" },
     ]);

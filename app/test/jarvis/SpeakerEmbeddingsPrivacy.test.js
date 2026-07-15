@@ -282,6 +282,123 @@ test("strict diarization distinguishes dependency and sidecar failures while leg
     assert.equal(typeof timeoutCallback, "function");
   });
 
+  await t.test("failed timeout stop keeps process and pid until shutdown retries", async () => {
+    const child = new EventEmitter();
+    child.pid = 4242;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let trackedPid = null;
+    let stopCalls = 0;
+    const manager = new DiarizationManager({
+      spawnImpl: () => child,
+      setTimeoutImpl: (callback) => {
+        queueMicrotask(callback);
+        return 1;
+      },
+      clearTimeoutImpl: () => {},
+      gracefulStopProcessImpl: async () => {
+        stopCalls += 1;
+        if (stopCalls === 1) throw new Error("kill failed");
+      },
+      pidFileImpl: {
+        write: (_name, pid) => {
+          trackedPid = pid;
+        },
+        clear: () => {
+          trackedPid = null;
+        },
+      },
+    });
+    manager.getBinaryPath = () => "diarizer";
+    manager.isModelDownloaded = () => true;
+
+    await assert.rejects(manager.diarizeStrict(wavPath), {
+      code: "DIARIZATION_SIDECAR_STOP_FAILED",
+    });
+    assert.equal(stopCalls, 1);
+    assert.equal(manager._process, child);
+    assert.equal(trackedPid, 4242);
+
+    await manager.shutdown();
+    assert.equal(stopCalls, 2);
+    assert.equal(manager._process, null);
+    assert.equal(trackedPid, null);
+  });
+
+  await t.test("natural close after failed timeout stop clears stale tracking", async () => {
+    const child = new EventEmitter();
+    child.pid = 4244;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    let trackedPid = null;
+    const manager = new DiarizationManager({
+      spawnImpl: () => child,
+      setTimeoutImpl: (callback) => {
+        queueMicrotask(callback);
+        return 1;
+      },
+      clearTimeoutImpl: () => {},
+      gracefulStopProcessImpl: async () => {
+        throw new Error("kill failed");
+      },
+      pidFileImpl: {
+        write: (_name, pid) => {
+          trackedPid = pid;
+        },
+        clear: () => {
+          trackedPid = null;
+        },
+      },
+    });
+    manager.getBinaryPath = () => "diarizer";
+    manager.isModelDownloaded = () => true;
+
+    await assert.rejects(manager.diarizeStrict(wavPath), {
+      code: "DIARIZATION_SIDECAR_STOP_FAILED",
+    });
+    assert.equal(manager._process, child);
+    assert.equal(trackedPid, 4244);
+
+    child.emit("close", 0);
+    assert.equal(manager._process, null);
+    assert.equal(trackedPid, null);
+  });
+
+  await t.test(
+    "successful timeout stop ignores kill events then clears tracked process",
+    async () => {
+      const child = new EventEmitter();
+      child.pid = 4243;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      const pidEvents = [];
+      const manager = new DiarizationManager({
+        spawnImpl: () => child,
+        setTimeoutImpl: (callback) => {
+          queueMicrotask(callback);
+          return 1;
+        },
+        clearTimeoutImpl: () => {},
+        gracefulStopProcessImpl: async (processToStop) => {
+          processToStop.emit("error", new Error("kill transition"));
+          processToStop.emit("close", 1);
+        },
+        pidFileImpl: {
+          write: (_name, pid) => pidEvents.push(`write:${pid}`),
+          clear: () => pidEvents.push("clear"),
+        },
+      });
+      manager.getBinaryPath = () => "diarizer";
+      manager.isModelDownloaded = () => true;
+
+      await assert.rejects(manager.diarizeStrict(wavPath), {
+        code: "DIARIZATION_SIDECAR_TIMEOUT",
+      });
+      assert.equal(manager._process, null);
+      assert.deepEqual(pidEvents, ["write:4243", "clear"]);
+    }
+  );
+
   await t.test("legal empty output", async () => {
     const manager = new DiarizationManager({ spawnImpl: () => fakeSidecar() });
     manager.getBinaryPath = () => "diarizer";

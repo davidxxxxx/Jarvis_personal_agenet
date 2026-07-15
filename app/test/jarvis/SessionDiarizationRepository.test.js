@@ -1,6 +1,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const { TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
@@ -9,6 +14,19 @@ const {
 function vector(index) {
   const value = new Float32Array(512);
   value[index] = 1;
+  return value;
+}
+
+function scaledVector(index, scale) {
+  const value = vector(index);
+  value[index] = scale;
+  return value;
+}
+
+function nearVector(cosine) {
+  const value = new Float32Array(512);
+  value[0] = cosine;
+  value[1] = Math.sqrt(1 - cosine * cosine);
   return value;
 }
 
@@ -122,6 +140,146 @@ function commitInput(snapshot, suffix = "one") {
     ],
     segmentLinks: [{ clusterId, transcriptSegmentId: "segment-cas" }],
   };
+}
+
+function revisedCommitInput(repo, suffix, clusters) {
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run(`revision ${suffix}`, "segment-cas");
+  const snapshot = repo.getDiarizationEvidenceSnapshot({
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 6001,
+  });
+  const input = commitInput(snapshot, suffix);
+  input.validatedAt = 6001;
+  input.run.createdAt = 6001;
+  input.run.completedAt = 6001;
+  input.clusters = clusters;
+  input.turns = clusters.map((cluster, index) => ({
+    ...input.turns[index],
+    id: `speaker_turn_${suffix}_${index}`,
+    clusterId: cluster.id,
+    localLabel: cluster.localLabel,
+  }));
+  input.segmentLinks = clusters.map((cluster) => ({
+    clusterId: cluster.id,
+    transcriptSegmentId: "segment-cas",
+  }));
+  return input;
+}
+
+function rebuildAsLegacyV20DiarizationSchema(db) {
+  db.pragma("foreign_keys = OFF");
+  db.exec(`
+    DROP INDEX IF EXISTS idx_diarization_run_revision;
+    DROP INDEX IF EXISTS idx_diarization_runs_session_sequence;
+    DROP INDEX IF EXISTS idx_diarization_run_clusters_cluster;
+    DROP INDEX IF EXISTS idx_speaker_turns_run_time;
+    DROP INDEX IF EXISTS idx_speaker_turns_segment;
+    DROP INDEX IF EXISTS idx_diarization_run_cluster_segments_segment;
+    DROP TABLE speaker_diarization_run_cluster_segments;
+    ALTER TABLE speaker_turns RENAME TO speaker_turns_v21_fixture;
+    ALTER TABLE speaker_diarization_run_clusters
+      RENAME TO speaker_diarization_run_clusters_v21_fixture;
+    ALTER TABLE speaker_diarization_runs RENAME TO speaker_diarization_runs_v21_fixture;
+
+    CREATE TABLE speaker_diarization_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+      transcript_revision TEXT NOT NULL CHECK(
+        length(transcript_revision) = 64 AND
+        transcript_revision NOT GLOB '*[^0-9a-f]*'
+      ),
+      policy_id TEXT NOT NULL,
+      diarizer_model_id TEXT NOT NULL,
+      embedding_model_id TEXT NOT NULL,
+      model_artifact_sha256 TEXT NOT NULL CHECK(
+        length(model_artifact_sha256) = 64 AND
+        model_artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+      ),
+      embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
+      sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+      input_version INTEGER NOT NULL CHECK(input_version = 1),
+      execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+      UNIQUE(session_id, track_id, transcript_revision, policy_id)
+    );
+    CREATE TABLE speaker_diarization_run_clusters (
+      run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      local_label TEXT NOT NULL,
+      embedding BLOB CHECK(
+        embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      ),
+      speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
+      window_count INTEGER NOT NULL CHECK(window_count >= 0),
+      quality_score REAL CHECK(
+        quality_score IS NULL OR (
+          typeof(quality_score) IN ('integer','real') AND quality_score BETWEEN 0 AND 1
+        )
+      ),
+      first_appearance_at INTEGER NOT NULL,
+      PRIMARY KEY(run_id, local_label),
+      UNIQUE(run_id, cluster_id),
+      CHECK(
+        (window_count = 0 AND speech_ms = 0 AND embedding IS NULL AND quality_score IS NULL) OR
+        (window_count > 0 AND embedding IS NOT NULL AND quality_score IS NOT NULL)
+      )
+    );
+    CREATE TABLE speaker_turns (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+      transcript_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+      turn_index INTEGER NOT NULL CHECK(turn_index >= 0),
+      raw_label TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+      embedding BLOB CHECK(
+        embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      ),
+      echo_state TEXT NOT NULL DEFAULT 'none'
+        CHECK(echo_state IN ('none','possible','confirmed')),
+      duplicate_of_turn_id TEXT REFERENCES speaker_turns(id) ON DELETE SET NULL,
+      excluded_from_centroid INTEGER NOT NULL DEFAULT 0 CHECK(excluded_from_centroid IN (0,1)),
+      created_at INTEGER NOT NULL,
+      UNIQUE(run_id, chunk_id, turn_index),
+      CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
+      CHECK(echo_state = 'confirmed' OR excluded_from_centroid = 0)
+    );
+
+    INSERT INTO speaker_diarization_runs
+    SELECT id, session_id, track_id, transcript_revision, policy_id,
+           diarizer_model_id, embedding_model_id, model_artifact_sha256,
+           embedding_dimension, sample_rate, input_version, execution_device,
+           created_at, completed_at
+    FROM speaker_diarization_runs_v21_fixture;
+    INSERT INTO speaker_diarization_run_clusters
+    SELECT * FROM speaker_diarization_run_clusters_v21_fixture;
+    INSERT INTO speaker_turns
+    SELECT * FROM speaker_turns_v21_fixture;
+
+    DROP TABLE speaker_turns_v21_fixture;
+    DROP TABLE speaker_diarization_run_clusters_v21_fixture;
+    DROP TABLE speaker_diarization_runs_v21_fixture;
+    CREATE UNIQUE INDEX idx_diarization_run_revision
+      ON speaker_diarization_runs(session_id, track_id, transcript_revision, policy_id);
+    CREATE INDEX idx_diarization_runs_session_completed
+      ON speaker_diarization_runs(session_id, completed_at, id);
+    CREATE INDEX idx_diarization_run_clusters_cluster
+      ON speaker_diarization_run_clusters(cluster_id, run_id);
+    CREATE INDEX idx_speaker_turns_run_time
+      ON speaker_turns(run_id, started_at, ended_at, id);
+    CREATE INDEX idx_speaker_turns_segment
+      ON speaker_turns(transcript_segment_id, run_id);
+    PRAGMA user_version = 20;
+  `);
+  db.pragma("foreign_keys = ON");
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
 }
 
 test("atomic diarization commit is idempotent and preserves revision history", (t) => {
@@ -483,6 +641,289 @@ test("revision history retains run-scoped segment links as well as the latest pr
     repo.db.prepare("SELECT count(*) count FROM speaker_cluster_segments").get().count,
     1
   );
+});
+
+test("v20 diarization history migrates transactionally to v21 and remains writable", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-v20-"));
+  const databasePath = path.join(directory, "jarvis.db");
+  let repo = null;
+  let db = null;
+  t.after(() => {
+    repo?.close();
+    db?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  repo = new JarvisRepository(databasePath);
+  const firstSnapshot = seedFinalTrack(repo);
+  const first = commitInput(firstSnapshot, "z_history");
+  first.run.createdAt = 6000;
+  first.run.completedAt = 6000;
+  repo.commitDiarizationRun(first);
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('person-history', 'History', 0, 6000, 6000);
+    UPDATE speaker_clusters
+    SET person_id = 'person-history', link_state = 'confirmed'
+    WHERE id = 'speaker_cluster_session_cas_1';
+  `);
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("historical revision two", "segment-cas");
+  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 6001,
+  });
+  const second = commitInput(secondSnapshot, "a_history");
+  second.validatedAt = 6001;
+  second.run.createdAt = 6000;
+  second.run.completedAt = 6000;
+  repo.commitDiarizationRun(second);
+  repo.close();
+  repo = null;
+
+  db = new Database(databasePath);
+  rebuildAsLegacyV20DiarizationSchema(db);
+  db.prepare(
+    "UPDATE speaker_turns SET echo_state = 'confirmed', excluded_from_centroid = 0 WHERE id = ?"
+  ).run("speaker_turn_z_history_1");
+  assert.equal(db.pragma("user_version", { simple: true }), 20);
+  assert.equal(
+    db
+      .prepare("PRAGMA table_info(speaker_diarization_runs)")
+      .all()
+      .some((row) => row.name === "commit_sequence"),
+    false
+  );
+  assert.equal(
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'speaker_diarization_run_cluster_segments'"
+      )
+      .get(),
+    undefined
+  );
+  assert.match(
+    db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'speaker_turns'")
+      .get().sql,
+    /echo_state = 'confirmed' OR excluded_from_centroid = 0/
+  );
+
+  db.close();
+  db = null;
+
+  repo = new JarvisRepository(databasePath);
+  assert.equal(TARGET_VERSION, 21);
+  assert.equal(repo.db.pragma("user_version", { simple: true }), 21);
+  assert.equal(repo.db.pragma("foreign_keys", { simple: true }), 1);
+  assert.deepEqual(repo.db.pragma("foreign_key_check"), []);
+  assert.deepEqual(
+    repo.db
+      .prepare("SELECT id, commit_sequence FROM speaker_diarization_runs ORDER BY commit_sequence")
+      .all(),
+    [
+      { id: "diarization_run_a_history", commit_sequence: 1 },
+      { id: "diarization_run_z_history", commit_sequence: 2 },
+    ]
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT (SELECT count(*) FROM speaker_diarization_runs) AS runs,
+                (SELECT count(*) FROM speaker_diarization_run_clusters) AS clusters,
+                (SELECT count(*) FROM speaker_turns) AS turns,
+                (SELECT count(*) FROM speaker_cluster_segments) AS old_links,
+                (SELECT count(*) FROM speaker_diarization_run_cluster_segments) AS run_links`
+      )
+      .get(),
+    { runs: 2, clusters: 2, turns: 4, old_links: 1, run_links: 2 }
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare("SELECT echo_state, excluded_from_centroid FROM speaker_turns WHERE id = ?")
+      .get("speaker_turn_z_history_1"),
+    { echo_state: "confirmed", excluded_from_centroid: 1 }
+  );
+  assert.deepEqual(
+    repo.listDiarizationRuns("session-cas").map((run) => run.id),
+    ["diarization_run_a_history", "diarization_run_z_history"]
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        "SELECT person_id, link_state FROM speaker_clusters WHERE id = 'speaker_cluster_session_cas_1'"
+      )
+      .get(),
+    { person_id: "person-history", link_state: "confirmed" }
+  );
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("post migration revision", "segment-cas");
+  const thirdSnapshot = repo.getDiarizationEvidenceSnapshot({
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 7001,
+  });
+  const third = commitInput(thirdSnapshot, "post_migration");
+  third.validatedAt = 7001;
+  third.run.createdAt = 7001;
+  third.run.completedAt = 7001;
+  assert.deepEqual(repo.commitDiarizationRun(third), {
+    status: "completed",
+    runId: "diarization_run_post_migration",
+  });
+  assert.deepEqual(
+    repo.listDiarizationRuns("session-cas").map((run) => run.commit_sequence),
+    [1, 2, 3]
+  );
+});
+
+test("stable identity reuse is invariant to embedding scale", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "scale_origin"));
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('person-scale', 'Scale', 0, 6000, 6000);
+    UPDATE speaker_clusters
+    SET person_id = 'person-scale', link_state = 'confirmed'
+    WHERE id = 'speaker_cluster_session_cas_1';
+  `);
+  const scaled = revisedCommitInput(repo, "scale_revision", [
+    {
+      id: "incoming-scaled",
+      localLabel: "speaker_scaled",
+      embedding: scaledVector(0, 0.1),
+      speechMs: 1600,
+      windowCount: 1,
+      qualityScore: 1,
+      firstAppearanceAt: 1100,
+    },
+  ]);
+
+  repo.commitDiarizationRun(scaled);
+
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT run_cluster.cluster_id, stable.person_id, stable.link_state
+         FROM speaker_diarization_run_clusters AS run_cluster
+         JOIN speaker_clusters AS stable ON stable.id = run_cluster.cluster_id
+         WHERE run_cluster.run_id = 'diarization_run_scale_revision'`
+      )
+      .get(),
+    {
+      cluster_id: "speaker_cluster_session_cas_1",
+      person_id: "person-scale",
+      link_state: "confirmed",
+    }
+  );
+});
+
+test("incoming cosine ambiguity cannot inherit a confirmed identity", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "incoming_tie_origin"));
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('person-incoming-tie', 'Incoming Tie', 0, 6000, 6000);
+    UPDATE speaker_clusters
+    SET person_id = 'person-incoming-tie', link_state = 'confirmed'
+    WHERE id = 'speaker_cluster_session_cas_1';
+  `);
+  repo.statements.insertDiarizationStableCluster.run({
+    id: "stable-near-incoming",
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    localLabel: "speaker_near",
+    modelId: "3dspeaker-campplus-voxceleb-16k-v1",
+    embedding: Buffer.from(nearVector(0.99).buffer),
+    speechMs: 1600,
+    windowCount: 1,
+    qualityScore: 1,
+    at: 6000,
+  });
+  const ambiguous = revisedCommitInput(repo, "incoming_tie_revision", [
+    {
+      id: "incoming-tie",
+      localLabel: "speaker_tie",
+      embedding: vector(0),
+      speechMs: 1600,
+      windowCount: 1,
+      qualityScore: 1,
+      firstAppearanceAt: 1100,
+    },
+  ]);
+
+  repo.commitDiarizationRun(ambiguous);
+
+  const row = repo.db
+    .prepare(
+      `SELECT run_cluster.cluster_id, stable.person_id, stable.link_state
+       FROM speaker_diarization_run_clusters AS run_cluster
+       JOIN speaker_clusters AS stable ON stable.id = run_cluster.cluster_id
+       WHERE run_cluster.run_id = 'diarization_run_incoming_tie_revision'`
+    )
+    .get();
+  assert.notEqual(row.cluster_id, "speaker_cluster_session_cas_1");
+  assert.notEqual(row.cluster_id, "stable-near-incoming");
+  assert.deepEqual(
+    { person_id: row.person_id, link_state: row.link_state },
+    { person_id: null, link_state: "unknown" }
+  );
+});
+
+test("stable reverse cosine ambiguity cannot pass a confirmed identity to either incoming", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "reverse_tie_origin"));
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('person-reverse-tie', 'Reverse Tie', 0, 6000, 6000);
+    UPDATE speaker_clusters
+    SET person_id = 'person-reverse-tie', link_state = 'confirmed'
+    WHERE id = 'speaker_cluster_session_cas_1';
+  `);
+  const ambiguous = revisedCommitInput(repo, "reverse_tie_revision", [
+    {
+      id: "incoming-reverse-best",
+      localLabel: "speaker_best",
+      embedding: vector(0),
+      speechMs: 1600,
+      windowCount: 1,
+      qualityScore: 1,
+      firstAppearanceAt: 1100,
+    },
+    {
+      id: "incoming-reverse-near",
+      localLabel: "speaker_near",
+      embedding: nearVector(0.99),
+      speechMs: 1600,
+      windowCount: 1,
+      qualityScore: 1,
+      firstAppearanceAt: 2900,
+    },
+  ]);
+
+  repo.commitDiarizationRun(ambiguous);
+
+  const rows = repo.db
+    .prepare(
+      `SELECT run_cluster.cluster_id, stable.person_id, stable.link_state
+       FROM speaker_diarization_run_clusters AS run_cluster
+       JOIN speaker_clusters AS stable ON stable.id = run_cluster.cluster_id
+       WHERE run_cluster.run_id = 'diarization_run_reverse_tie_revision'
+       ORDER BY run_cluster.local_label`
+    )
+    .all();
+  assert.equal(rows.length, 2);
+  assert.ok(rows.every((row) => row.cluster_id !== "speaker_cluster_session_cas_1"));
+  assert.ok(rows.every((row) => row.person_id === null && row.link_state === "unknown"));
 });
 
 test("cross-revision stable clusters reuse voice one-to-one instead of local labels", (t) => {
