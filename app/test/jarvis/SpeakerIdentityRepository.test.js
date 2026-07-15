@@ -53,6 +53,22 @@ function createCluster(identities, overrides = {}) {
   });
 }
 
+function downgradeIdentitySchemaToV17(repository) {
+  repository.db.exec("DROP INDEX IF EXISTS idx_speaker_clusters_unbound_label");
+  const columns = new Set(
+    repository.db
+      .prepare("PRAGMA table_info(speaker_identity_corrections)")
+      .all()
+      .map((column) => column.name)
+  );
+  for (const column of ["correction_kind", "next_person_ref", "previous_person_ref"]) {
+    if (columns.has(column)) {
+      repository.db.exec(`ALTER TABLE speaker_identity_corrections DROP COLUMN ${column}`);
+    }
+  }
+  repository.db.pragma("user_version = 17");
+}
+
 test("encodes embeddings as explicit little-endian Float32 and validates dimensions", (t) => {
   const encoded = encodeEmbedding(new Float32Array([1, -2.5]));
   assert.equal(encoded.toString("hex"), "0000803f000020c0");
@@ -315,6 +331,165 @@ test("mergePeople moves current identity data and keeps correction rows", (t) =>
   assert.ok(identities.listCorrections("c1").length >= 1);
 });
 
+test("merge keeps immutable person provenance and cannot be undone as a link correction", (t) => {
+  const { repository, identities } = fixture(t);
+  addPerson(repository, "p-source", "Source");
+  addPerson(repository, "p-target", "Target");
+  createCluster(identities);
+  identities.confirmLink({
+    clusterId: "c1",
+    personId: "p-source",
+    actor: "user",
+    scope: "session",
+  });
+
+  identities.mergePeople({ sourcePersonId: "p-source", targetPersonId: "p-target" });
+
+  const corrections = identities.listCorrections("c1");
+  assert.equal(corrections[0].nextPersonId, null);
+  assert.equal(corrections[0].nextPersonRef, "p-source");
+  assert.equal(corrections[0].correctionKind, "link");
+  assert.equal(corrections[1].previousPersonId, null);
+  assert.equal(corrections[1].previousPersonRef, "p-source");
+  assert.equal(corrections[1].nextPersonRef, "p-target");
+  assert.equal(corrections[1].correctionKind, "merge");
+
+  identities.undoLastCorrection("c1");
+
+  assert.equal(identities.getCluster("c1").personId, "p-target");
+  assert.equal(identities.getCluster("c1").linkState, "confirmed");
+  assert.equal(identities.listCorrections("c1")[1].undoneAt, null);
+});
+
+test("mergePeople refuses to delete the reserved self person", (t) => {
+  const { repository, identities } = fixture(t);
+  repository.renamePerson({ personId: "self", displayName: "我", isSelf: true });
+  addPerson(repository, "p-target", "Target");
+  createCluster(identities);
+  identities.confirmLink({
+    clusterId: "c1",
+    personId: "self",
+    actor: "user",
+    scope: "session",
+  });
+
+  assert.throws(
+    () => identities.mergePeople({ sourcePersonId: "self", targetPersonId: "p-target" }),
+    /self person/
+  );
+  assert.equal(
+    repository.db.prepare("SELECT is_self FROM people WHERE id = 'self'").get().is_self,
+    1
+  );
+  assert.equal(identities.getCluster("c1").personId, "self");
+  assert.equal(identities.listCorrections("c1").length, 1);
+});
+
+test("unbound clusters remain unique by session and local label", (t) => {
+  const { identities } = fixture(t);
+  createCluster(identities, {
+    id: "unbound-1",
+    trackId: null,
+    localLabel: "speaker_unbound",
+  });
+
+  assert.throws(
+    () =>
+      createCluster(identities, {
+        id: "unbound-2",
+        trackId: null,
+        localLabel: "speaker_unbound",
+      }),
+    /UNIQUE/
+  );
+});
+
+test("public profile writes cannot bypass user-confirmed cluster quality", (t) => {
+  const { repository, identities } = fixture(t);
+  addPerson(repository, "p-zhang", "张三");
+  createCluster(identities, {
+    id: "low-quality",
+    localLabel: "speaker_low",
+    qualityScore: 0.4,
+  });
+  repository.db
+    .prepare("UPDATE speaker_clusters SET person_id = ?, link_state = 'confirmed' WHERE id = ?")
+    .run("p-zhang", "low-quality");
+
+  assert.throws(
+    () =>
+      identities.addProfileSample({
+        id: "bypass-low-quality",
+        personId: "p-zhang",
+        modelId: "campplus-v1",
+        embedding: new Float32Array([0.1, 0.2, 0.3, 0.4]),
+        sourceClusterId: "low-quality",
+        sourceKind: "user_confirmed",
+        speechMs: 18_000,
+        windowCount: 4,
+      }),
+    /quality gate/
+  );
+  assert.throws(
+    () =>
+      identities.addProfileSample({
+        id: "bypass-no-source",
+        personId: "p-zhang",
+        modelId: "campplus-v1",
+        embedding: new Float32Array([0.1, 0.2, 0.3, 0.4]),
+        sourceKind: "user_confirmed",
+        speechMs: 18_000,
+        windowCount: 4,
+      }),
+    /source cluster/
+  );
+
+  createCluster(identities, {
+    id: "good-quality",
+    localLabel: "speaker_good",
+  });
+  repository.db
+    .prepare("UPDATE speaker_clusters SET person_id = ?, link_state = 'confirmed' WHERE id = ?")
+    .run("p-zhang", "good-quality");
+  assert.throws(
+    () =>
+      identities.addProfileSample({
+        id: "bypass-wrong-vector",
+        personId: "p-zhang",
+        modelId: "campplus-v1",
+        embedding: new Float32Array([0.4, 0.3, 0.2, 0.1]),
+        sourceClusterId: "good-quality",
+        sourceKind: "user_confirmed",
+        speechMs: 18_000,
+        windowCount: 4,
+      }),
+    /cluster embedding/
+  );
+
+  const accepted = identities.addProfileSample({
+    id: "confirmed-valid",
+    personId: "p-zhang",
+    modelId: "campplus-v1",
+    embedding: new Float32Array([0.1, 0.2, 0.3, 0.4]),
+    sourceClusterId: "good-quality",
+    sourceKind: "user_confirmed",
+    speechMs: 18_000,
+    windowCount: 4,
+  });
+  assert.equal(accepted.sourceKind, "user_confirmed");
+
+  const enrollment = identities.addProfileSample({
+    id: "enrollment-unaffected",
+    personId: "p-zhang",
+    modelId: "another-model",
+    embedding: new Float32Array([1, 0]),
+    sourceKind: "enrollment",
+    speechMs: 1_000,
+    windowCount: 1,
+  });
+  assert.equal(enrollment.sourceKind, "enrollment");
+});
+
 test("deleting a person clears the link without deleting cluster evidence", (t) => {
   const { repository, identities } = fixture(t);
   addPerson(repository, "p-zhang", "张三");
@@ -383,4 +558,102 @@ test("identity migrations are idempotent and preserve existing data", (t) => {
     );
   }
   db.close();
+});
+
+test("v17 identity history migrates on reopen with snapshots and rolls back on failure", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-speaker-v17-"));
+  const successPath = path.join(directory, "success.db");
+  const failurePath = path.join(directory, "failure.db");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  for (const dbPath of [successPath, failurePath]) {
+    const repository = new JarvisRepository(dbPath);
+    repository.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+    repository.renamePerson({ personId: "p1", displayName: "Person" });
+    repository.createSpeakerCluster({
+      id: "c1",
+      sessionId: "s1",
+      trackId: null,
+      localLabel: "speaker_1",
+      modelId: "campplus-v1",
+      embedding: new Float32Array([1, 0]),
+      speechMs: 18_000,
+      windowCount: 3,
+      qualityScore: 0.9,
+    });
+    repository.confirmSpeakerLink({
+      clusterId: "c1",
+      personId: "p1",
+      actor: "user",
+      scope: "session",
+    });
+    downgradeIdentitySchemaToV17(repository);
+    if (dbPath === successPath) {
+      repository.createSpeakerCluster({
+        id: "c2",
+        sessionId: "s1",
+        trackId: null,
+        localLabel: "speaker_1",
+        modelId: "campplus-v1",
+        embedding: new Float32Array([1, 0]),
+        speechMs: 12_000,
+        windowCount: 3,
+        qualityScore: 0.8,
+      });
+    }
+    repository.close();
+  }
+
+  const reopened = new JarvisRepository(successPath);
+  assert.equal(reopened.db.pragma("user_version", { simple: true }), TARGET_VERSION);
+  assert.deepEqual(
+    reopened.db
+      .prepare("PRAGMA table_info(speaker_identity_corrections)")
+      .all()
+      .map((column) => column.name)
+      .filter((name) =>
+        ["previous_person_ref", "next_person_ref", "correction_kind"].includes(name)
+      ),
+    ["previous_person_ref", "next_person_ref", "correction_kind"]
+  );
+  assert.equal(reopened.listSpeakerCorrections("c1")[0].nextPersonRef, "p1");
+  const migratedClusters = reopened.listSessionSpeakerClusters("s1");
+  assert.equal(migratedClusters.length, 2);
+  assert.equal(new Set(migratedClusters.map((cluster) => cluster.localLabel)).size, 2);
+  assert.ok(
+    reopened.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .get("idx_speaker_clusters_unbound_label")
+  );
+  reopened.close();
+
+  const failing = new Database(failurePath);
+  failing.exec(`
+    CREATE TRIGGER abort_identity_history_backfill
+    BEFORE UPDATE ON speaker_identity_corrections
+    BEGIN
+      SELECT RAISE(ABORT, 'forced identity migration failure');
+    END;
+  `);
+  assert.throws(() => applyJarvisMigrations(failing), /forced identity migration failure/);
+  assert.equal(failing.pragma("user_version", { simple: true }), 17);
+  assert.deepEqual(
+    failing
+      .prepare("PRAGMA table_info(speaker_identity_corrections)")
+      .all()
+      .map((column) => column.name),
+    [
+      "id",
+      "cluster_id",
+      "previous_person_id",
+      "next_person_id",
+      "previous_state",
+      "next_state",
+      "scope",
+      "actor",
+      "created_at",
+      "undone_at",
+    ]
+  );
+  failing.close();
 });

@@ -91,10 +91,13 @@ function mapCorrection(row) {
     clusterId: row.cluster_id,
     previousPersonId: row.previous_person_id,
     nextPersonId: row.next_person_id,
+    previousPersonRef: row.previous_person_ref,
+    nextPersonRef: row.next_person_ref,
     previousState: row.previous_state,
     nextState: row.next_state,
     scope: row.scope,
     actor: row.actor,
+    correctionKind: row.correction_kind,
     createdAt: row.created_at,
     undoneAt: row.undone_at,
   };
@@ -175,10 +178,12 @@ class SpeakerIdentityRepository {
       insertCorrection: db.prepare(`
         INSERT INTO speaker_identity_corrections (
           id, cluster_id, previous_person_id, next_person_id,
-          previous_state, next_state, scope, actor, created_at
+          previous_person_ref, next_person_ref, previous_state, next_state,
+          scope, actor, correction_kind, created_at
         ) VALUES (
           @id, @clusterId, @previousPersonId, @nextPersonId,
-          @previousState, @nextState, @scope, @actor, @createdAt
+          @previousPersonRef, @nextPersonRef, @previousState, @nextState,
+          @scope, @actor, @correctionKind, @createdAt
         )
       `),
       updateClusterLink: db.prepare(`
@@ -192,7 +197,7 @@ class SpeakerIdentityRepository {
         SELECT * FROM speaker_identity_corrections
         WHERE cluster_id = ? ORDER BY created_at, rowid
       `),
-      getLastActiveCorrection: db.prepare(`
+      getLatestActiveCorrection: db.prepare(`
         SELECT * FROM speaker_identity_corrections
         WHERE cluster_id = ? AND undone_at IS NULL
         ORDER BY created_at DESC, rowid DESC LIMIT 1
@@ -239,10 +244,13 @@ class SpeakerIdentityRepository {
         clusterId: cluster.id,
         previousPersonId: cluster.person_id,
         nextPersonId: input.personId,
+        previousPersonRef: cluster.person_id,
+        nextPersonRef: input.personId,
         previousState: cluster.link_state,
         nextState: "confirmed",
         scope: input.scope,
         actor: input.actor,
+        correctionKind: "link",
         createdAt,
       });
       this.statements.updateClusterLink.run({
@@ -267,10 +275,13 @@ class SpeakerIdentityRepository {
         clusterId: cluster.id,
         previousPersonId: cluster.person_id,
         nextPersonId: input.personId,
+        previousPersonRef: cluster.person_id,
+        nextPersonRef: input.personId,
         previousState: cluster.link_state,
         nextState: "rejected",
         scope: input.scope,
         actor: input.actor,
+        correctionKind: "link",
         createdAt,
       });
       this.statements.updateClusterLink.run({
@@ -285,13 +296,19 @@ class SpeakerIdentityRepository {
 
     this._undoLastCorrection = db.transaction((clusterId) => {
       const cluster = this._requireCluster(clusterId);
-      const correction = this.statements.getLastActiveCorrection.get(clusterId);
-      if (!correction) return;
+      const correction = this.statements.getLatestActiveCorrection.get(clusterId);
+      if (!correction || correction.correction_kind !== "link") return;
       const undoneAt = this.now();
+      const previousPersonId = correction.previous_person_id;
+      const previousState =
+        previousPersonId === null &&
+        (correction.previous_state === "confirmed" || correction.previous_state === "suggested")
+          ? "unknown"
+          : correction.previous_state;
       this.statements.updateClusterLink.run({
         clusterId,
-        personId: correction.previous_person_id,
-        linkState: correction.previous_state,
+        personId: previousPersonId,
+        linkState: previousState,
         matchScore: cluster.match_score,
         matchMargin: cluster.match_margin,
         updatedAt: undoneAt,
@@ -300,8 +317,7 @@ class SpeakerIdentityRepository {
         this._syncConfirmedProfileSample(
           {
             ...cluster,
-            person_id:
-              correction.previous_state === "confirmed" ? correction.previous_person_id : null,
+            person_id: previousState === "confirmed" ? previousPersonId : null,
           },
           undoneAt
         );
@@ -310,7 +326,8 @@ class SpeakerIdentityRepository {
     });
 
     this._mergePeople = db.transaction((input) => {
-      this._requirePerson(input.sourcePersonId);
+      const source = this._requirePerson(input.sourcePersonId);
+      if (source.is_self !== 0) throw new Error("self person cannot be merged into another person");
       const target = this._requirePerson(input.targetPersonId);
       const createdAt = this.now();
       const clusters = db
@@ -322,10 +339,13 @@ class SpeakerIdentityRepository {
           clusterId: cluster.id,
           previousPersonId: input.sourcePersonId,
           nextPersonId: input.targetPersonId,
+          previousPersonRef: input.sourcePersonId,
+          nextPersonRef: input.targetPersonId,
           previousState: cluster.link_state,
           nextState: cluster.link_state,
           scope: "persistent",
           actor: input.actor,
+          correctionKind: "merge",
           createdAt,
         });
       }
@@ -533,18 +553,41 @@ class SpeakerIdentityRepository {
   addProfileSample(input) {
     if (!input || typeof input !== "object") throw new TypeError("profile sample is required");
     const modelId = assertText(input.modelId, "modelId");
+    const personId = assertId(input.personId, "personId");
+    const sourceKind = assertEnum(input.sourceKind, PROFILE_SOURCE_KINDS, "sourceKind");
     if (!(input.embedding instanceof Float32Array)) {
       throw new TypeError("embedding must be a non-empty Float32Array");
     }
     this._assertModelDimension(modelId, input.embedding);
+    const encodedEmbedding = encodeEmbedding(input.embedding);
     const sourceClusterId =
       input.sourceClusterId === null || input.sourceClusterId === undefined
         ? null
         : assertId(input.sourceClusterId, "sourceClusterId");
+    if (sourceKind === "user_confirmed" && sourceClusterId === null) {
+      throw new TypeError("user-confirmed profile sample requires a source cluster");
+    }
+    let sourceCluster = null;
     if (sourceClusterId !== null) {
-      const cluster = this._requireCluster(sourceClusterId);
-      if (cluster.model_id !== modelId) {
+      sourceCluster = this._requireCluster(sourceClusterId);
+      if (sourceCluster.model_id !== modelId) {
         throw new TypeError("profile sample model must match source cluster model");
+      }
+    }
+    const speechMs = assertNonNegativeInteger(input.speechMs, "speechMs");
+    const windowCount = assertNonNegativeInteger(input.windowCount, "windowCount");
+    if (sourceKind === "user_confirmed") {
+      if (sourceCluster.person_id !== personId || sourceCluster.link_state !== "confirmed") {
+        throw new Error("user-confirmed profile sample requires the cluster confirmed person");
+      }
+      if (!this._passesProfileSampleQuality(sourceCluster)) {
+        throw new Error("user-confirmed profile sample did not pass the quality gate");
+      }
+      if (!Buffer.from(sourceCluster.embedding).equals(encodedEmbedding)) {
+        throw new Error("user-confirmed profile sample must match the cluster embedding");
+      }
+      if (speechMs !== sourceCluster.speech_ms || windowCount !== sourceCluster.window_count) {
+        throw new Error("user-confirmed profile sample must match the cluster evidence counts");
       }
     }
     const values = {
@@ -552,13 +595,13 @@ class SpeakerIdentityRepository {
         input.id === undefined
           ? this.createId("voice_profile_sample")
           : assertId(input.id, "profileSampleId"),
-      personId: assertId(input.personId, "personId"),
+      personId,
       modelId,
-      embedding: encodeEmbedding(input.embedding),
+      embedding: encodedEmbedding,
       sourceClusterId,
-      sourceKind: assertEnum(input.sourceKind, PROFILE_SOURCE_KINDS, "sourceKind"),
-      speechMs: assertNonNegativeInteger(input.speechMs, "speechMs"),
-      windowCount: assertNonNegativeInteger(input.windowCount, "windowCount"),
+      sourceKind,
+      speechMs,
+      windowCount,
       createdAt: assertNonNegativeInteger(input.createdAt ?? this.now(), "createdAt"),
     };
     this._requirePerson(values.personId);

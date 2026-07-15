@@ -1,4 +1,4 @@
-const TARGET_VERSION = 17;
+const TARGET_VERSION = 18;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -376,12 +376,16 @@ const SPEAKER_IDENTITY_SCHEMA = `
     cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
     previous_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
     next_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+    previous_person_ref TEXT,
+    next_person_ref TEXT,
     previous_state TEXT NOT NULL
       CHECK(previous_state IN ('unknown','suggested','confirmed','rejected')),
     next_state TEXT NOT NULL
       CHECK(next_state IN ('unknown','suggested','confirmed','rejected')),
     scope TEXT NOT NULL CHECK(scope IN ('session','persistent')),
     actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+    correction_kind TEXT NOT NULL DEFAULT 'link'
+      CHECK(correction_kind IN ('link','merge')),
     created_at INTEGER NOT NULL,
     undone_at INTEGER
   );
@@ -405,6 +409,43 @@ const SPEAKER_IDENTITY_SCHEMA = `
     WHERE person_id = OLD.id;
   END;
 `;
+
+function disambiguateUnboundSpeakerClusters(db) {
+  if (!tableExists(db, "speaker_clusters")) return;
+  const duplicates = db
+    .prepare(
+      `SELECT session_id, local_label
+       FROM speaker_clusters
+       WHERE track_id IS NULL
+       GROUP BY session_id, local_label
+       HAVING count(*) > 1
+       ORDER BY session_id, local_label`
+    )
+    .all();
+  const list = db.prepare(
+    `SELECT id FROM speaker_clusters
+     WHERE session_id = ? AND track_id IS NULL AND local_label = ?
+     ORDER BY created_at, id`
+  );
+  const labelExists = db.prepare(
+    `SELECT 1 FROM speaker_clusters
+     WHERE session_id = ? AND track_id IS NULL AND local_label = ? AND id <> ?`
+  );
+  const rename = db.prepare("UPDATE speaker_clusters SET local_label = ? WHERE id = ?");
+  for (const duplicate of duplicates) {
+    const clusters = list.all(duplicate.session_id, duplicate.local_label);
+    for (const cluster of clusters.slice(1)) {
+      const base = `${duplicate.local_label}#migrated-${cluster.id}`;
+      let candidate = base;
+      let suffix = 1;
+      while (labelExists.get(duplicate.session_id, candidate, cluster.id)) {
+        suffix += 1;
+        candidate = `${base}-${suffix}`;
+      }
+      rename.run(candidate, cluster.id);
+    }
+  }
+}
 
 function columns(db, table) {
   return new Set(
@@ -789,6 +830,27 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       );
     `);
       db.exec(SPEAKER_IDENTITY_SCHEMA);
+      addColumn(db, "speaker_identity_corrections", "previous_person_ref TEXT");
+      addColumn(db, "speaker_identity_corrections", "next_person_ref TEXT");
+      addColumn(
+        db,
+        "speaker_identity_corrections",
+        "correction_kind TEXT NOT NULL DEFAULT 'link' CHECK(correction_kind IN ('link','merge'))"
+      );
+      db.exec(`
+        UPDATE speaker_identity_corrections
+        SET previous_person_ref = previous_person_id
+        WHERE previous_person_ref IS NULL AND previous_person_id IS NOT NULL;
+        UPDATE speaker_identity_corrections
+        SET next_person_ref = next_person_id
+        WHERE next_person_ref IS NULL AND next_person_id IS NOT NULL;
+      `);
+      disambiguateUnboundSpeakerClusters(db);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_speaker_clusters_unbound_label
+        ON speaker_clusters(session_id, local_label)
+        WHERE track_id IS NULL;
+      `);
 
       if (rebuildsTranscriptSegments) {
         const violations = db.pragma("foreign_key_check");
