@@ -7,7 +7,7 @@ const test = require("node:test");
 const AnalysisBudgetGuard = require("../../src/jarvis/main/AnalysisBudgetGuard");
 const { openAnalysisBudgetRepository } = require("../../src/jarvis/main/AnalysisBudgetRepository");
 
-const REPOSITORY_METHODS = [
+const LEGACY_REPOSITORY_METHODS = [
   "initialize",
   "getStatus",
   "setPolicy",
@@ -18,6 +18,13 @@ const REPOSITORY_METHODS = [
   "markUsageUnknown",
   "recover",
 ];
+const OPTIONAL_REPOSITORY_METHODS = [
+  "reserveNextAttempt",
+  "getAttemptDispositionByRequestId",
+  "listAttemptDispositionsByJob",
+  "listStartupRecoveryDispositions",
+];
+const REPOSITORY_METHODS = [...LEGACY_REPOSITORY_METHODS, ...OPTIONAL_REPOSITORY_METHODS];
 
 function fakeRepository(overrides = {}) {
   return Object.fromEntries(
@@ -38,6 +45,11 @@ function reservation(overrides = {}) {
   };
 }
 
+function nextReservation(overrides = {}) {
+  const { attemptNumber: _attemptNumber, ...input } = reservation(overrides);
+  return input;
+}
+
 function withRepository(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-budget-guard-"));
   const repository = openAnalysisBudgetRepository(path.join(directory, "jarvis.sqlite"));
@@ -50,7 +62,7 @@ function withRepository(run) {
 }
 
 test("guard requires the complete repository contract and a valid injected clock", () => {
-  for (const method of REPOSITORY_METHODS) {
+  for (const method of LEGACY_REPOSITORY_METHODS) {
     const repository = fakeRepository();
     delete repository[method];
     assert.throws(
@@ -75,6 +87,35 @@ test("guard requires the complete repository contract and a valid injected clock
       }),
     /canonical IANA/
   );
+});
+
+test("guard preserves legacy repository adapters and fails closed only when new capabilities run", () => {
+  const repository = fakeRepository();
+  for (const method of OPTIONAL_REPOSITORY_METHODS) delete repository[method];
+  const guard = new AnalysisBudgetGuard({
+    repository,
+    now: () => 100,
+    defaultTimezone: "Asia/Shanghai",
+  });
+
+  assert.equal(guard.reserve(reservation()).method, "reserve");
+  const missingCapabilities = [
+    ["reserveNextAttempt", () => guard.reserveNextAttempt(nextReservation())],
+    ["getAttemptDispositionByRequestId", () => guard.getAttemptDispositionByRequestId("request-1")],
+    [
+      "listAttemptDispositionsByJob",
+      () =>
+        guard.listAttemptDispositionsByJob({
+          jobId: "job-1",
+          provider: "minimax",
+          operation: "session_analysis",
+        }),
+    ],
+    ["listStartupRecoveryDispositions", () => guard.listStartupRecoveryDispositions()],
+  ];
+  for (const [method, call] of missingCapabilities) {
+    assert.throws(call, new TypeError(`repository.${method} must be a function`));
+  }
 });
 
 test("guard owns timestamps and delegates the complete lifecycle without exposing cost inputs", () => {
@@ -119,6 +160,15 @@ test("guard owns timestamps and delegates the complete lifecycle without exposin
   guard.markUsageUnknown({ requestId: "request-1", reasonCode: "usage_missing" });
   now += 1;
   guard.recoverIncompleteAttempts();
+  now += 1;
+  guard.reserveNextAttempt(nextReservation({ requestId: "request-2" }));
+  guard.getAttemptDispositionByRequestId("request-2");
+  guard.listAttemptDispositionsByJob({
+    jobId: "job-1",
+    provider: "minimax",
+    operation: "session_analysis",
+  });
+  guard.listStartupRecoveryDispositions();
 
   assert.deepEqual(calls, [
     [
@@ -166,6 +216,23 @@ test("guard owns timestamps and delegates the complete lifecycle without exposin
       },
     ],
     ["recover", { at: Date.UTC(2026, 6, 15, 4) + 9 }],
+    [
+      "reserveNextAttempt",
+      {
+        ...nextReservation({ requestId: "request-2" }),
+        at: Date.UTC(2026, 6, 15, 4) + 10,
+      },
+    ],
+    ["getAttemptDispositionByRequestId", "request-2"],
+    [
+      "listAttemptDispositionsByJob",
+      {
+        jobId: "job-1",
+        provider: "minimax",
+        operation: "session_analysis",
+      },
+    ],
+    ["listStartupRecoveryDispositions", undefined],
   ]);
 });
 
@@ -199,6 +266,19 @@ test("guard rejects malformed, extra, and unsafe public inputs before repository
         estimatedUsage: { inputTokens: 1, outputTokens: 1, usd: 1 },
       }),
     () => guard.reserve({ ...reservation(), estimatedUsd: 1 }),
+    () => guard.reserveNextAttempt({ ...nextReservation(), attemptNumber: 1 }),
+    () => guard.reserveNextAttempt({ ...nextReservation(), requestId: "" }),
+    () => guard.reserveNextAttempt({ ...nextReservation(), operation: "incremental_analysis" }),
+    () => guard.getAttemptDispositionByRequestId("bad id"),
+    () => guard.listAttemptDispositionsByJob({ jobId: "job-1", provider: "minimax" }),
+    () =>
+      guard.listAttemptDispositionsByJob({
+        jobId: "job-1",
+        provider: "minimax",
+        operation: "session_analysis",
+        extra: true,
+      }),
+    () => guard.listStartupRecoveryDispositions({ extra: true }),
     () => guard.markStarted("bad id"),
     () => guard.reconcile({ requestId: "request-1", usage: { inputTokens: 1.1, outputTokens: 1 } }),
     () =>
@@ -235,16 +315,31 @@ test("guard integrates default, zero, and ten-dollar policies with durable trans
     });
     now += 1;
     guard.setPolicy({ monthlyLimitMicrousd: 10_000_000, timezone: "Asia/Shanghai" });
-    const reserved = guard.reserve(reservation());
+    const reserved = guard.reserveNextAttempt(nextReservation());
     assert.equal(reserved.ok, true);
+    assert.equal(reserved.attemptNumber, 1);
+    assert.equal(
+      guard.getAttemptDispositionByRequestId("request-1").disposition,
+      "reserved_not_started"
+    );
+    assert.equal(guard.listStartupRecoveryDispositions().length, 1);
     now += 1;
     guard.markStarted("request-1");
+    assert.equal(
+      guard.listAttemptDispositionsByJob({
+        jobId: "job-1",
+        provider: "minimax",
+        operation: "session_analysis",
+      })[0].disposition,
+      "started_unreconciled"
+    );
     now += 1;
     guard.reconcile({
       requestId: "request-1",
       usage: { inputTokens: 1, outputTokens: 1 },
     });
     assert.equal(guard.getStatus().spentMicrousd, 3);
+    assert.equal(guard.listStartupRecoveryDispositions().length, 0);
     assert.deepEqual(guard.recoverIncompleteAttempts(), {
       releasedCount: 0,
       usageUnknownCount: 0,

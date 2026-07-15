@@ -33,6 +33,47 @@ function isBusyError(error) {
   return error?.code === "SQLITE_BUSY" || error?.code === "SQLITE_BUSY_SNAPSHOT";
 }
 
+const ATTEMPT_DISPOSITION = Object.freeze({
+  reserved: Object.freeze({
+    disposition: "reserved_not_started",
+    startupAction: "release_and_retry",
+  }),
+  started: Object.freeze({
+    disposition: "started_unreconciled",
+    startupAction: "mark_usage_unknown",
+  }),
+  reconciled: Object.freeze({ disposition: "reconciled", startupAction: "none" }),
+  released: Object.freeze({
+    disposition: "released",
+    startupAction: "retry_with_new_attempt",
+  }),
+  usage_unknown: Object.freeze({
+    disposition: "usage_unknown",
+    startupAction: "block_for_period",
+  }),
+});
+
+function toAttemptDisposition(attempt) {
+  if (!attempt) return null;
+  const mapping = ATTEMPT_DISPOSITION[attempt.state];
+  if (!mapping) throw codedError("BUDGET_INVALID_STORED_STATE");
+  return {
+    requestId: attempt.request_id,
+    jobId: attempt.job_id,
+    attemptNumber: attempt.attempt_number,
+    provider: attempt.provider,
+    model: attempt.model,
+    operation: attempt.operation,
+    state: attempt.state,
+    disposition: mapping.disposition,
+    startupAction: mapping.startupAction,
+    reasonCode: attempt.reason_code,
+    createdAt: attempt.created_at,
+    startedAt: attempt.started_at,
+    finalizedAt: attempt.finalized_at,
+  };
+}
+
 class AnalysisBudgetRepository {
   constructor(db, { ownsDatabase = false } = {}) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
@@ -269,14 +310,97 @@ class AnalysisBudgetRepository {
 
   _matchesReservation(attempt, input) {
     return (
-      attempt.job_id === input.jobId &&
       attempt.attempt_number === input.attemptNumber &&
+      this._matchesReservationIdentity(attempt, input)
+    );
+  }
+
+  _matchesReservationIdentity(attempt, input) {
+    return (
+      attempt.job_id === input.jobId &&
       attempt.provider === input.provider &&
       attempt.model === input.model &&
       attempt.operation === input.operation &&
       attempt.estimated_input_tokens === input.estimatedUsage.inputTokens &&
       attempt.estimated_output_tokens === input.estimatedUsage.outputTokens
     );
+  }
+
+  _reservationResult(attempt, { replayed, includeAttemptNumber }) {
+    return {
+      ok: true,
+      requestId: attempt.request_id,
+      ...(includeAttemptNumber ? { attemptNumber: attempt.attempt_number } : {}),
+      state: attempt.state,
+      reservedMicrousd: attempt.reserved_microusd,
+      replayed,
+    };
+  }
+
+  _reserveInTransaction(input, { includeAttemptNumber = false } = {}) {
+    const existing = this._attempt(input.requestId);
+    if (existing) {
+      if (!this._matchesReservation(existing, input)) {
+        throw codedError("BUDGET_REQUEST_ID_COLLISION");
+      }
+      return this._reservationResult(existing, { replayed: true, includeAttemptNumber });
+    }
+    const logicalAttempt = this.db
+      .prepare(
+        `SELECT request_id FROM analysis_budget_attempts
+         WHERE job_id = ? AND attempt_number = ? AND provider = ? AND operation = ?`
+      )
+      .get(input.jobId, input.attemptNumber, input.provider, input.operation);
+    if (logicalAttempt) throw codedError("BUDGET_ATTEMPT_COLLISION");
+
+    const context = this._ensureContext(input.at);
+    const policy = context.effectivePolicy;
+    const price = this._price(input);
+    if (!price) throw codedError("BUDGET_PRICE_NOT_FOUND");
+    const reservedMicrousd = calculateUsageCostMicrousd(input.estimatedUsage, {
+      inputPerMillionMicrousd: price.input_per_million_microusd,
+      outputPerMillionMicrousd: price.output_per_million_microusd,
+    });
+    const totals = this._periodTotals(context.period.id);
+    const committed = totals.spent_microusd + totals.held_microusd;
+    const limit = policy.monthly_limit_microusd;
+    if (totals.unknown_count > 0) return { ok: false, reason: "usage_unknown" };
+    if (committed > limit) return { ok: false, reason: "over_limit" };
+    if (committed >= limit || committed + reservedMicrousd > limit) {
+      return { ok: false, reason: "budget_exceeded" };
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO analysis_budget_attempts (
+           request_id, job_id, attempt_number, period_id, policy_revision,
+           provider, model, operation, price_version, currency,
+           input_per_million_microusd, output_per_million_microusd,
+           estimated_input_tokens, estimated_output_tokens, reserved_microusd,
+           state, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 'reserved', ?)`
+      )
+      .run(
+        input.requestId,
+        input.jobId,
+        input.attemptNumber,
+        context.period.id,
+        policy.revision,
+        input.provider,
+        input.model,
+        input.operation,
+        price.price_version,
+        price.input_per_million_microusd,
+        price.output_per_million_microusd,
+        input.estimatedUsage.inputTokens,
+        input.estimatedUsage.outputTokens,
+        reservedMicrousd,
+        input.at
+      );
+    return this._reservationResult(this._attempt(input.requestId), {
+      replayed: false,
+      includeAttemptNumber,
+    });
   }
 
   initialize({ monthlyLimitMicrousd = DEFAULT_MONTHLY_LIMIT_MICROUSD, timezone, at }) {
@@ -368,86 +492,76 @@ class AnalysisBudgetRepository {
   }
 
   reserve(input) {
-    const run = () => {
-      const existing = this._attempt(input.requestId);
-      if (existing) {
-        if (!this._matchesReservation(existing, input)) {
-          throw codedError("BUDGET_REQUEST_ID_COLLISION");
-        }
-        return {
-          ok: true,
-          requestId: existing.request_id,
-          state: existing.state,
-          reservedMicrousd: existing.reserved_microusd,
-          replayed: true,
-        };
-      }
-      const logicalAttempt = this.db
-        .prepare(
-          `SELECT request_id FROM analysis_budget_attempts
-           WHERE job_id = ? AND attempt_number = ? AND provider = ? AND operation = ?`
-        )
-        .get(input.jobId, input.attemptNumber, input.provider, input.operation);
-      if (logicalAttempt) throw codedError("BUDGET_ATTEMPT_COLLISION");
-
-      const context = this._ensureContext(input.at);
-      const policy = context.effectivePolicy;
-      const price = this._price(input);
-      if (!price) throw codedError("BUDGET_PRICE_NOT_FOUND");
-      const reservedMicrousd = calculateUsageCostMicrousd(input.estimatedUsage, {
-        inputPerMillionMicrousd: price.input_per_million_microusd,
-        outputPerMillionMicrousd: price.output_per_million_microusd,
-      });
-      const totals = this._periodTotals(context.period.id);
-      const committed = totals.spent_microusd + totals.held_microusd;
-      const limit = policy.monthly_limit_microusd;
-      if (totals.unknown_count > 0) return { ok: false, reason: "usage_unknown" };
-      if (committed > limit) return { ok: false, reason: "over_limit" };
-      if (committed >= limit || committed + reservedMicrousd > limit) {
-        return { ok: false, reason: "budget_exceeded" };
-      }
-
-      this.db
-        .prepare(
-          `INSERT INTO analysis_budget_attempts (
-             request_id, job_id, attempt_number, period_id, policy_revision,
-             provider, model, operation, price_version, currency,
-             input_per_million_microusd, output_per_million_microusd,
-             estimated_input_tokens, estimated_output_tokens, reserved_microusd,
-             state, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, 'reserved', ?)`
-        )
-        .run(
-          input.requestId,
-          input.jobId,
-          input.attemptNumber,
-          context.period.id,
-          policy.revision,
-          input.provider,
-          input.model,
-          input.operation,
-          price.price_version,
-          price.input_per_million_microusd,
-          price.output_per_million_microusd,
-          input.estimatedUsage.inputTokens,
-          input.estimatedUsage.outputTokens,
-          reservedMicrousd,
-          input.at
-        );
-      return {
-        ok: true,
-        requestId: input.requestId,
-        state: "reserved",
-        reservedMicrousd,
-        replayed: false,
-      };
-    };
     try {
-      return this._immediate(run);
+      return this._immediate(() => this._reserveInTransaction(input));
     } catch (error) {
       if (error?.code === "BUDGET_BUSY") return { ok: false, reason: "budget_busy" };
       throw error;
     }
+  }
+
+  reserveNextAttempt(input) {
+    try {
+      return this._immediate(() => {
+        const existing = this._attempt(input.requestId);
+        if (existing) {
+          if (!this._matchesReservationIdentity(existing, input)) {
+            throw codedError("BUDGET_REQUEST_ID_COLLISION");
+          }
+          return this._reservationResult(existing, {
+            replayed: true,
+            includeAttemptNumber: true,
+          });
+        }
+        const latest = this.db
+          .prepare(
+            `SELECT MAX(attempt_number) AS attempt_number
+             FROM analysis_budget_attempts
+             WHERE job_id = ? AND provider = ? AND operation = ?`
+          )
+          .get(input.jobId, input.provider, input.operation).attempt_number;
+        if (latest !== null && latest >= Number.MAX_SAFE_INTEGER) {
+          throw codedError("BUDGET_ATTEMPT_NUMBER_EXHAUSTED");
+        }
+        return this._reserveInTransaction(
+          { ...input, attemptNumber: (latest ?? 0) + 1 },
+          { includeAttemptNumber: true }
+        );
+      });
+    } catch (error) {
+      if (error?.code === "BUDGET_BUSY") return { ok: false, reason: "budget_busy" };
+      throw error;
+    }
+  }
+
+  getAttemptDispositionByRequestId(requestId) {
+    return toAttemptDisposition(this._attempt(requestId));
+  }
+
+  listAttemptDispositionsByJob({ jobId, provider, operation }) {
+    return this.db
+      .prepare(
+        `SELECT request_id, job_id, attempt_number, provider, model, operation,
+                state, reason_code, created_at, started_at, finalized_at
+         FROM analysis_budget_attempts
+         WHERE job_id = ? AND provider = ? AND operation = ?
+         ORDER BY attempt_number ASC`
+      )
+      .all(jobId, provider, operation)
+      .map(toAttemptDisposition);
+  }
+
+  listStartupRecoveryDispositions() {
+    return this.db
+      .prepare(
+        `SELECT request_id, job_id, attempt_number, provider, model, operation,
+                state, reason_code, created_at, started_at, finalized_at
+         FROM analysis_budget_attempts
+         WHERE state IN ('reserved', 'started')
+         ORDER BY created_at ASC, request_id ASC`
+      )
+      .all()
+      .map(toAttemptDisposition);
   }
 
   markStarted({ requestId, at }) {

@@ -118,6 +118,13 @@ class AnalysisBudgetGuard {
     return assertTimestamp(this.now());
   }
 
+  _invokeOptionalRepositoryMethod(method, ...args) {
+    if (typeof this.repository[method] !== "function") {
+      throw new TypeError(`repository.${method} must be a function`);
+    }
+    return this.repository[method](...args);
+  }
+
   initialize() {
     return this.repository.initialize({
       monthlyLimitMicrousd: DEFAULT_MONTHLY_LIMIT_MICROUSD,
@@ -149,34 +156,78 @@ class AnalysisBudgetGuard {
   }
 
   reserve(input) {
+    return this.repository.reserve({
+      ...this._normalizeReservation(input, { includeAttemptNumber: true }),
+      at: this._now(),
+    });
+  }
+
+  reserveNextAttempt(input) {
+    return this._invokeOptionalRepositoryMethod("reserveNextAttempt", {
+      ...this._normalizeReservation(input),
+      at: this._now(),
+    });
+  }
+
+  _normalizeReservation(input, { includeAttemptNumber = false } = {}) {
     assertPlainObject(input, "reservation input");
     const keys = new Set([
       "requestId",
       "jobId",
-      "attemptNumber",
       "provider",
       "model",
       "operation",
       "estimatedUsage",
     ]);
+    if (includeAttemptNumber) keys.add("attemptNumber");
     assertExactKeys(input, keys, "reservation input");
     assertRequiredKeys(input, keys, "reservation input");
-    if (!Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1) {
+    if (
+      includeAttemptNumber &&
+      (!Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1)
+    ) {
       throw new TypeError("attemptNumber must be a positive safe integer");
     }
     if (!OPERATIONS.has(input.operation)) {
       throw new TypeError("operation must be session_analysis or daily_digest");
     }
-    return this.repository.reserve({
+    return {
       requestId: assertId(input.requestId, "requestId"),
       jobId: assertId(input.jobId, "jobId"),
-      attemptNumber: input.attemptNumber,
+      ...(includeAttemptNumber ? { attemptNumber: input.attemptNumber } : {}),
       provider: assertBoundedText(input.provider, "provider"),
       model: assertBoundedText(input.model, "model"),
       operation: input.operation,
       estimatedUsage: normalizeUsage(input.estimatedUsage, "estimatedUsage"),
-      at: this._now(),
+    };
+  }
+
+  getAttemptDispositionByRequestId(requestId) {
+    return this._invokeOptionalRepositoryMethod(
+      "getAttemptDispositionByRequestId",
+      assertId(requestId, "requestId")
+    );
+  }
+
+  listAttemptDispositionsByJob(input) {
+    assertPlainObject(input, "job attempt query");
+    const keys = new Set(["jobId", "provider", "operation"]);
+    assertExactKeys(input, keys, "job attempt query");
+    assertRequiredKeys(input, keys, "job attempt query");
+    if (!OPERATIONS.has(input.operation)) {
+      throw new TypeError("operation must be session_analysis or daily_digest");
+    }
+    return this._invokeOptionalRepositoryMethod("listAttemptDispositionsByJob", {
+      jobId: assertId(input.jobId, "jobId"),
+      provider: assertBoundedText(input.provider, "provider"),
+      operation: input.operation,
     });
+  }
+
+  listStartupRecoveryDispositions(options = {}) {
+    assertPlainObject(options, "startup recovery query");
+    assertExactKeys(options, new Set(), "startup recovery query");
+    return this._invokeOptionalRepositoryMethod("listStartupRecoveryDispositions");
   }
 
   markStarted(requestId) {

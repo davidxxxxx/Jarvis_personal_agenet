@@ -30,6 +30,11 @@ function reservation(at, overrides = {}) {
   };
 }
 
+function nextReservation(at, overrides = {}) {
+  const { attemptNumber: _attemptNumber, ...input } = reservation(at, overrides);
+  return input;
+}
+
 function hasCode(code) {
   return (error) => error?.code === code;
 }
@@ -362,6 +367,124 @@ test("reservation is exact-idempotent and both request and logical attempt colli
   });
 });
 
+test("reserveNextAttempt allocates from the durable ledger independently of processing attempt_count", () => {
+  withDatabase((databasePath) => {
+    const at = Date.UTC(2026, 6, 15, 4);
+    let repository = openAnalysisBudgetRepository(databasePath);
+    try {
+      repository.initialize({ monthlyLimitMicrousd: 100, timezone: "Asia/Shanghai", at });
+      repository.db
+        .prepare(
+          `INSERT INTO sessions (id, started_at, status, created_at)
+           VALUES ('session-1', ?, 'completed', ?)`
+        )
+        .run(at, at);
+      repository.db
+        .prepare(
+          `INSERT INTO processing_jobs (
+             id, session_id, job_type, state, input_hash, attempt_count, created_at
+           ) VALUES ('job-1', 'session-1', 'analysis', 'pending', 'hash-1', 99, ?)`
+        )
+        .run(at);
+
+      assert.deepEqual(repository.reserveNextAttempt(nextReservation(at + 1)), {
+        ok: true,
+        requestId: "request-1",
+        attemptNumber: 1,
+        state: "reserved",
+        reservedMicrousd: 3,
+        replayed: false,
+      });
+      assert.deepEqual(repository.reserveNextAttempt(nextReservation(at + 2)), {
+        ok: true,
+        requestId: "request-1",
+        attemptNumber: 1,
+        state: "reserved",
+        reservedMicrousd: 3,
+        replayed: true,
+      });
+      assert.throws(
+        () =>
+          repository.reserveNextAttempt(
+            nextReservation(at + 2, {
+              estimatedUsage: { inputTokens: 2, outputTokens: 1 },
+            })
+          ),
+        hasCode("BUDGET_REQUEST_ID_COLLISION")
+      );
+
+      repository.release({
+        requestId: "request-1",
+        reasonCode: "local_preflight_failed",
+        at: at + 3,
+      });
+      assert.equal(
+        repository.reserveNextAttempt(nextReservation(at + 4, { requestId: "request-2" }))
+          .attemptNumber,
+        2
+      );
+      repository.close();
+
+      repository = openAnalysisBudgetRepository(databasePath);
+      repository.release({
+        requestId: "request-2",
+        reasonCode: "local_preflight_failed",
+        at: at + 5,
+      });
+      assert.equal(
+        repository.reserveNextAttempt(nextReservation(at + 6, { requestId: "request-3" }))
+          .attemptNumber,
+        3
+      );
+    } finally {
+      if (repository.db?.open) repository.close();
+    }
+  });
+});
+
+test("reserveNextAttempt serializes cross-connection budget and attempt allocation", () => {
+  withDatabase((databasePath) => {
+    const at = Date.UTC(2026, 6, 15, 4);
+    const first = openAnalysisBudgetRepository(databasePath, { busyTimeoutMs: 5 });
+    const second = openAnalysisBudgetRepository(databasePath, { busyTimeoutMs: 5 });
+    try {
+      first.initialize({ monthlyLimitMicrousd: 3, timezone: "Asia/Shanghai", at });
+      const firstResult = first.reserveNextAttempt(nextReservation(at + 1));
+      assert.equal(firstResult.attemptNumber, 1);
+      assert.deepEqual(
+        second.reserveNextAttempt(nextReservation(at + 2, { requestId: "request-2" })),
+        { ok: false, reason: "budget_exceeded" }
+      );
+      assert.deepEqual(second.reserveNextAttempt(nextReservation(at + 3)), {
+        ...firstResult,
+        replayed: true,
+      });
+      assert.deepEqual(
+        first.db
+          .prepare(
+            `SELECT request_id, attempt_number FROM analysis_budget_attempts
+             WHERE job_id = 'job-1' ORDER BY attempt_number`
+          )
+          .all(),
+        [{ request_id: "request-1", attempt_number: 1 }]
+      );
+
+      first.db.exec("BEGIN IMMEDIATE");
+      try {
+        assert.deepEqual(
+          second.reserveNextAttempt(nextReservation(at + 4, { requestId: "request-busy" })),
+          { ok: false, reason: "budget_busy" }
+        );
+      } finally {
+        first.db.exec("ROLLBACK");
+      }
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+});
+
 test("same-zone limit changes bind new reservations to the active admission policy", () => {
   withDatabase((databasePath) => {
     const at = Date.UTC(2026, 6, 15, 4);
@@ -622,6 +745,172 @@ test("lowering the active limit preserves held rows and raising it admits only n
       );
     } finally {
       repository.close();
+    }
+  });
+});
+
+test("durable attempt disposition queries distinguish every lifecycle and startup action", () => {
+  withDatabase((databasePath) => {
+    const at = Date.UTC(2026, 6, 15, 4);
+    let repository = openAnalysisBudgetRepository(databasePath);
+    try {
+      repository.initialize({ monthlyLimitMicrousd: 100, timezone: "Asia/Shanghai", at });
+      repository.reserveNextAttempt(nextReservation(at + 1, { requestId: "request-reserved" }));
+      repository.reserveNextAttempt(nextReservation(at + 2, { requestId: "request-started" }));
+      repository.markStarted({ requestId: "request-started", at: at + 3 });
+
+      repository.reserveNextAttempt(nextReservation(at + 4, { requestId: "request-reconciled" }));
+      repository.markStarted({ requestId: "request-reconciled", at: at + 5 });
+      repository.reconcile({
+        requestId: "request-reconciled",
+        usage: { inputTokens: 1, outputTokens: 1 },
+        at: at + 6,
+      });
+
+      repository.reserveNextAttempt(nextReservation(at + 7, { requestId: "request-released" }));
+      repository.release({
+        requestId: "request-released",
+        reasonCode: "local_preflight_failed",
+        at: at + 8,
+      });
+
+      repository.reserveNextAttempt(nextReservation(at + 9, { requestId: "request-unknown" }));
+      repository.markStarted({ requestId: "request-unknown", at: at + 10 });
+      repository.markUsageUnknown({
+        requestId: "request-unknown",
+        reasonCode: "usage_missing",
+        at: at + 11,
+      });
+
+      assert.deepEqual(repository.getAttemptDispositionByRequestId("request-reserved"), {
+        requestId: "request-reserved",
+        jobId: "job-1",
+        attemptNumber: 1,
+        provider: "minimax",
+        model: "MiniMax-M2.7",
+        operation: "session_analysis",
+        state: "reserved",
+        disposition: "reserved_not_started",
+        startupAction: "release_and_retry",
+        reasonCode: null,
+        createdAt: at + 1,
+        startedAt: null,
+        finalizedAt: null,
+      });
+      assert.equal(repository.getAttemptDispositionByRequestId("missing-request"), null);
+
+      const byJob = repository.listAttemptDispositionsByJob({
+        jobId: "job-1",
+        provider: "minimax",
+        operation: "session_analysis",
+      });
+      assert.deepEqual(
+        byJob.map(({ attemptNumber, state, disposition, startupAction, reasonCode }) => ({
+          attemptNumber,
+          state,
+          disposition,
+          startupAction,
+          reasonCode,
+        })),
+        [
+          {
+            attemptNumber: 1,
+            state: "reserved",
+            disposition: "reserved_not_started",
+            startupAction: "release_and_retry",
+            reasonCode: null,
+          },
+          {
+            attemptNumber: 2,
+            state: "started",
+            disposition: "started_unreconciled",
+            startupAction: "mark_usage_unknown",
+            reasonCode: null,
+          },
+          {
+            attemptNumber: 3,
+            state: "reconciled",
+            disposition: "reconciled",
+            startupAction: "none",
+            reasonCode: null,
+          },
+          {
+            attemptNumber: 4,
+            state: "released",
+            disposition: "released",
+            startupAction: "retry_with_new_attempt",
+            reasonCode: "local_preflight_failed",
+          },
+          {
+            attemptNumber: 5,
+            state: "usage_unknown",
+            disposition: "usage_unknown",
+            startupAction: "block_for_period",
+            reasonCode: "usage_missing",
+          },
+        ]
+      );
+      assert.deepEqual(
+        repository
+          .listStartupRecoveryDispositions()
+          .map(({ requestId, disposition, startupAction }) => ({
+            requestId,
+            disposition,
+            startupAction,
+          })),
+        [
+          {
+            requestId: "request-reserved",
+            disposition: "reserved_not_started",
+            startupAction: "release_and_retry",
+          },
+          {
+            requestId: "request-started",
+            disposition: "started_unreconciled",
+            startupAction: "mark_usage_unknown",
+          },
+        ]
+      );
+
+      repository.close();
+      repository = openAnalysisBudgetRepository(databasePath);
+      assert.equal(
+        repository.getAttemptDispositionByRequestId("request-started").disposition,
+        "started_unreconciled"
+      );
+      assert.deepEqual(repository.recover({ at: at + 12 }), {
+        releasedCount: 1,
+        usageUnknownCount: 1,
+      });
+      assert.deepEqual(repository.listStartupRecoveryDispositions(), []);
+      assert.deepEqual(
+        repository
+          .listAttemptDispositionsByJob({
+            jobId: "job-1",
+            provider: "minimax",
+            operation: "session_analysis",
+          })
+          .slice(0, 2)
+          .map(({ disposition, startupAction, reasonCode }) => ({
+            disposition,
+            startupAction,
+            reasonCode,
+          })),
+        [
+          {
+            disposition: "released",
+            startupAction: "retry_with_new_attempt",
+            reasonCode: "process_recovery",
+          },
+          {
+            disposition: "usage_unknown",
+            startupAction: "block_for_period",
+            reasonCode: "process_recovery",
+          },
+        ]
+      );
+    } finally {
+      if (repository.db?.open) repository.close();
     }
   });
 });
