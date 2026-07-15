@@ -1504,7 +1504,7 @@ for (const lifecycle of ["pauseCapture", "finishCapture"]) {
   });
 }
 
-test("disk loss during restoration safe-stops the session and preserves the recovering lane", () => {
+test("disk loss during restoration safe-stops the session and preserves the recovering lane", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-restore-disk-"));
   const repository = createRepository();
   let diskChecks = 0;
@@ -1548,7 +1548,7 @@ test("disk loss during restoration safe-stops the session and preserves the reco
     assert.equal(repository.sessions.get("s1").status, "paused");
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
   } finally {
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

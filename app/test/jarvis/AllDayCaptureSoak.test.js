@@ -72,7 +72,13 @@ function withTimeout(promise, label, timeoutMs = OPERATION_TIMEOUT_MS) {
   return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
 }
 
-function createGovernedSoakRuntime({ repository, service, now, owner = "soak-worker" }) {
+function createGovernedSoakRuntime({
+  repository,
+  service,
+  now,
+  owner = "soak-worker",
+  deferFinalTranscription = false,
+}) {
   return createJarvisProcessingRuntime({
     repository,
     service,
@@ -93,7 +99,10 @@ function createGovernedSoakRuntime({ repository, service, now, owner = "soak-wor
         selectedGpuUuid: null,
         restrictiveForMs: 0,
       }),
-      admit: () => ({ action: "run_cpu", reason: "bounded_soak" }),
+      admit: (kind) =>
+        deferFinalTranscription && kind === "final_transcription"
+          ? { action: "defer", reason: "simulated_external_gpu_busy" }
+          : { action: "run_cpu", reason: "bounded_soak" },
     },
     heavyGate: new HeavyJobGate(),
     maxJobsPerDrain: 100,
@@ -752,6 +761,7 @@ test(
       repository,
       service,
       now: clock.now,
+      deferFinalTranscription: true,
     });
     service.startCapture({
       sessionId,
@@ -1043,7 +1053,7 @@ test(
     for (const chunk of preMigrationIntegrity.chunks) {
       assert.equal(jobs.filter((job) => job.chunk_id === chunk.id).length, 2);
     }
-    assert.ok(jobs.filter((job) => job.state === "pending").length > 0);
+    assert.ok(jobs.filter((job) => job.state !== "completed").length > 0);
     assert.ok(broadcastCount <= 64);
     const sourceHashes = await nonDatabaseFileHashes(oldRoot);
 

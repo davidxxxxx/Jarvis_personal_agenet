@@ -71,11 +71,11 @@ test("creates and leases a Windows directory in one atomic operation", async (t)
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-directory-create-lease-"));
   const created = path.join(base, "created");
   const moved = path.join(base, "moved");
-  const baseline = windowsHelperCount();
+  const baseline = windowsHelperCount(process.pid);
   let lease = null;
   t.after(async () => {
     await lease?.release().catch(() => {});
-    await waitForHelperCount(baseline).catch(() => {});
+    await waitForHelperCount(baseline, process.pid).catch(() => {});
     await fsp.rm(base, { recursive: true, force: true });
   });
   const provider = new DirectoryLeaseProvider();
@@ -88,7 +88,7 @@ test("creates and leases a Windows directory in one atomic operation", async (t)
   await lease.release();
   lease = null;
   await fsp.rename(created, moved);
-  await waitForHelperCount(baseline);
+  await waitForHelperCount(baseline, process.pid);
 });
 
 test("platform-injected POSIX lease serializes real dev and ino identity", async (t) => {
@@ -158,11 +158,11 @@ test("acquisition timeout reaps the Windows helper and leaves no matching proces
   if (process.platform !== "win32") return t.skip("Windows helper lifecycle test");
   const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-directory-timeout-"));
   t.after(async () => fsp.rm(base, { recursive: true, force: true }));
-  const baseline = windowsHelperCount();
+  const baseline = windowsHelperCount(process.pid);
   const provider = new DirectoryLeaseProvider({ timeoutMs: 1 });
 
   await assert.rejects(provider.acquire(base), /directory lease acquisition failed/);
-  await waitForHelperCount(baseline);
+  await waitForHelperCount(baseline, process.pid);
 });
 
 test("release waits for a delayed clean helper exit and removes readiness listeners", async (t) => {
