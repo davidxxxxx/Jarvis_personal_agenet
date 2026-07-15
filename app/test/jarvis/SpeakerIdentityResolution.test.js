@@ -9,8 +9,10 @@ const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const SpeakerIdentityResolver = require("../../src/jarvis/main/SpeakerIdentityResolver");
+const { meetsMinimum } = SpeakerIdentityResolver;
 const {
   SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  assertExactIdentityResolutionPolicy,
   buildIdentityResolutionJobKey,
   parseIdentityResolutionJobKey,
 } = require("../../src/jarvis/main/SpeakerIdentityResolutionPolicy");
@@ -351,6 +353,98 @@ test("v21 upgrades in place to the v22 identity resolution schema", () => {
   }
 });
 
+test("v21 correction sequence backfill lets undo restore a post-upgrade system result", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-identity-v21-correction-"));
+  const databasePath = path.join(directory, "jarvis.db");
+  let repository = new JarvisRepository(databasePath);
+  t.after(() => {
+    repository?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  repository.createSession({ id: "legacy-session", startedAt: 1000, micDeviceId: "mic" });
+  repository.createTrack({
+    id: "legacy-track",
+    sessionId: "legacy-session",
+    sourceType: "mic",
+    sampleRate: 24000,
+    channels: 1,
+    startedAt: 1000,
+  });
+  repository.db.exec(`
+    UPDATE sessions SET status = 'completed', ended_at = 14000 WHERE id = 'legacy-session';
+    UPDATE audio_tracks SET state = 'ended', ended_at = 14000 WHERE id = 'legacy-track';
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, link_state, created_at, updated_at
+    ) VALUES (
+      'legacy-cluster', 'legacy-session', 'legacy-track', 'speaker_1', '${MODEL_ID}',
+      zeroblob(2048), 12000, 3, 0.9, 'unknown', 14000, 14000
+    );
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'legacy-run', 'legacy-session', 'legacy-track', '${"a".repeat(64)}',
+      'jarvis-session-diarization-v1', 'sherpa-segmentation+3dspeaker-campplus',
+      '${MODEL_ID}', '${"b".repeat(64)}', 512, 16000, 1, 'cpu', 1, 14000, 14000
+    );
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    ) VALUES (
+      'legacy-run', 'legacy-cluster', 'speaker_1', zeroblob(2048), 12000, 3, 0.9, 1000
+    );
+  `);
+  repository.renamePerson({ personId: "legacy-person-a", displayName: "Legacy A" });
+  repository.renamePerson({ personId: "legacy-person-b", displayName: "Legacy B" });
+  repository.confirmSpeakerLink({
+    clusterId: "legacy-cluster",
+    personId: "legacy-person-a",
+    scope: "session",
+    actor: "user",
+  });
+  repository.close();
+  repository = null;
+
+  const legacy = new Database(databasePath);
+  legacy.exec(`
+    DROP TABLE speaker_identity_resolutions;
+    DROP TABLE speaker_identity_resolution_runs;
+    ALTER TABLE speaker_identity_corrections DROP COLUMN resolution_commit_sequence;
+    PRAGMA user_version = 21;
+  `);
+  legacy.close();
+
+  repository = new JarvisRepository(databasePath);
+  assert.equal(
+    repository.db
+      .prepare("SELECT resolution_commit_sequence FROM speaker_identity_corrections")
+      .get().resolution_commit_sequence,
+    0
+  );
+  const protectedResult = repository.applySystemSpeakerResolution({
+    evidenceRunId: "legacy-run",
+    clusterId: "legacy-cluster",
+    candidatePersonId: "legacy-person-b",
+    state: "confirmed",
+    score: 0.9,
+    margin: 0.2,
+    reason: "auto_confirmed",
+    diarizationRevision: "c".repeat(64),
+    profileRevision: "d".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    at: 10_000,
+  });
+  assert.equal(protectedResult.projectionApplied, false);
+  assert.equal(repository.getSpeakerCluster("legacy-cluster").personId, "legacy-person-a");
+
+  repository.undoSpeakerCorrection("legacy-cluster");
+  assert.equal(repository.getSpeakerCluster("legacy-cluster").personId, "legacy-person-b");
+  assert.equal(repository.getSpeakerCluster("legacy-cluster").linkState, "confirmed");
+});
+
 test("schema rejects cross-session evidence even when individual foreign keys exist", (t) => {
   const repository = fixture(t);
   repository.db.exec(`
@@ -559,6 +653,286 @@ test("same-revision user rejection is durable and exact-revision scoped", (t) =>
   assert.equal(rejected.candidatePersonRef, "person-a");
 });
 
+test("rejection targets the current monotonic resolution revision despite decreasing clocks", (t) => {
+  const repository = fixture(t);
+  addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  const first = {
+    diarizationRevision: "1".repeat(64),
+    profileRevision: "2".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  const current = {
+    diarizationRevision: "3".repeat(64),
+    profileRevision: "4".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  for (const [revision, at] of [
+    [first, 30_000],
+    [current, 10_000],
+  ]) {
+    repository.applySystemSpeakerResolution({
+      evidenceRunId: "run-resolution",
+      clusterId: "cluster-resolution",
+      candidatePersonId: "person-a",
+      state: "suggested",
+      score: 0.75,
+      margin: 0.2,
+      reason: "suggested",
+      ...revision,
+      at,
+    });
+    const inputHash = buildIdentityResolutionJobKey({
+      sessionId: "session-resolution",
+      ...revision,
+    });
+    repository.db
+      .prepare(
+        `
+        INSERT INTO processing_jobs (
+          id, session_id, job_type, state, priority, input_hash,
+          input_version, model_version, attempt_count, created_at, completed_at
+        ) VALUES (?, 'session-resolution', 'resolve_identities', 'completed', 45,
+          ?, 1, ?, 1, ?, ?)
+      `
+      )
+      .run(`job-${revision.profileRevision[0]}`, inputHash, revision.policyId, at, at);
+  }
+
+  repository.rejectSpeakerSuggestion({
+    clusterId: "cluster-resolution",
+    personId: "person-a",
+    scope: "session",
+    actor: "user",
+  });
+  const rejection = repository
+    .listSpeakerResolutionHistory("cluster-resolution")
+    .find((row) => row.actor === "user" && row.state === "rejected");
+  assert.equal(rejection.diarizationRevision, current.diarizationRevision);
+  assert.equal(rejection.profileRevision, current.profileRevision);
+  assert.deepEqual(
+    repository
+      .listSpeakerResolutionHistory("cluster-resolution")
+      .filter((row) => row.actor === "system")
+      .map((row) => row.diarizationRevision),
+    [first.diarizationRevision, current.diarizationRevision]
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        "SELECT id, state FROM processing_jobs WHERE job_type = 'resolve_identities' ORDER BY id"
+      )
+      .all(),
+    [
+      { id: "job-2", state: "completed" },
+      { id: "job-4", state: "pending" },
+    ]
+  );
+});
+
+test("rejection ignores a newer protected candidate that was never projected", (t) => {
+  const repository = fixture(t);
+  addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  const projected = {
+    diarizationRevision: "7".repeat(64),
+    profileRevision: "8".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  const protectedRevision = {
+    diarizationRevision: "9".repeat(64),
+    profileRevision: "a".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  repository.applySystemSpeakerResolution({
+    evidenceRunId: "run-resolution",
+    clusterId: "cluster-resolution",
+    candidatePersonId: "person-a",
+    state: "suggested",
+    score: 0.75,
+    margin: 0.2,
+    reason: "suggested",
+    ...projected,
+    at: 20_000,
+  });
+  repository.confirmSpeakerLink({
+    clusterId: "cluster-resolution",
+    personId: "person-a",
+    scope: "session",
+    actor: "user",
+  });
+  const protectedResult = repository.applySystemSpeakerResolution({
+    evidenceRunId: "run-resolution",
+    clusterId: "cluster-resolution",
+    candidatePersonId: "person-a",
+    state: "confirmed",
+    score: 0.9,
+    margin: 0.2,
+    reason: "auto_confirmed",
+    ...protectedRevision,
+    at: 21_000,
+  });
+  assert.equal(protectedResult.projectionApplied, false);
+
+  repository.rejectSpeakerSuggestion({
+    clusterId: "cluster-resolution",
+    personId: "person-a",
+    scope: "session",
+    actor: "user",
+  });
+  const rejection = repository
+    .listSpeakerResolutionHistory("cluster-resolution")
+    .find((row) => row.actor === "user" && row.state === "rejected");
+  assert.equal(rejection.diarizationRevision, projected.diarizationRevision);
+  assert.equal(rejection.profileRevision, projected.profileRevision);
+});
+
+test("rejection, exact-job requeue, and session wake are atomic across restart", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-identity-rejection-atomic-"));
+  const databasePath = path.join(directory, "jarvis.db");
+  let repository = new JarvisRepository(databasePath);
+  t.after(() => {
+    repository?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  repository.createSession({ id: "atomic-session", startedAt: 1000, micDeviceId: "mic" });
+  repository.createTrack({
+    id: "atomic-track",
+    sessionId: "atomic-session",
+    sourceType: "mic",
+    sampleRate: 24000,
+    channels: 1,
+    startedAt: 1000,
+  });
+  repository.db.exec(`
+    UPDATE sessions SET status = 'completed', ended_at = 14000 WHERE id = 'atomic-session';
+    UPDATE audio_tracks SET state = 'ended', ended_at = 14000 WHERE id = 'atomic-track';
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, link_state, created_at, updated_at
+    ) VALUES (
+      'atomic-cluster', 'atomic-session', 'atomic-track', 'speaker_1', '${MODEL_ID}',
+      zeroblob(2048), 12000, 3, 0.9, 'unknown', 14000, 14000
+    );
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'atomic-run', 'atomic-session', 'atomic-track', '${"e".repeat(64)}',
+      'jarvis-session-diarization-v1', 'sherpa-segmentation+3dspeaker-campplus',
+      '${MODEL_ID}', '${"f".repeat(64)}', 512, 16000, 1, 'cpu', 1, 14000, 14000
+    );
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    ) VALUES (
+      'atomic-run', 'atomic-cluster', 'speaker_1', zeroblob(2048), 12000, 3, 0.9, 1000
+    );
+  `);
+  repository.renamePerson({ personId: "atomic-person", displayName: "Atomic" });
+  const revision = {
+    diarizationRevision: "5".repeat(64),
+    profileRevision: "6".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  repository.applySystemSpeakerResolution({
+    evidenceRunId: "atomic-run",
+    clusterId: "atomic-cluster",
+    candidatePersonId: "atomic-person",
+    state: "suggested",
+    score: 0.75,
+    margin: 0.2,
+    reason: "suggested",
+    ...revision,
+    at: 15_000,
+  });
+  const inputHash = buildIdentityResolutionJobKey({ sessionId: "atomic-session", ...revision });
+  repository.db
+    .prepare(
+      `
+      INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash,
+        input_version, model_version, attempt_count, created_at, completed_at
+      ) VALUES (
+        'atomic-resolve-job', 'atomic-session', 'resolve_identities', 'completed', 45,
+        ?, 1, ?, 1, 15000, 15000
+      )
+    `
+    )
+    .run(inputHash, revision.policyId);
+  repository.db.exec(`
+    UPDATE sessions SET processing_state = 'ready', ready_at = 15000
+    WHERE id = 'atomic-session';
+    CREATE TRIGGER reject_atomic_identity_wake
+    BEFORE UPDATE OF processing_state ON sessions
+    WHEN NEW.id = 'atomic-session' AND NEW.processing_state = 'processing'
+    BEGIN
+      SELECT RAISE(ABORT, 'atomic identity wake rejected');
+    END;
+  `);
+
+  assert.throws(
+    () =>
+      repository.rejectSpeakerSuggestion({
+        clusterId: "atomic-cluster",
+        personId: "atomic-person",
+        scope: "session",
+        actor: "user",
+      }),
+    /atomic identity wake rejected/
+  );
+  repository.close();
+  repository = new JarvisRepository(databasePath);
+  assert.equal(repository.getSpeakerCluster("atomic-cluster").linkState, "suggested");
+  assert.equal(
+    repository.db.prepare("SELECT state FROM processing_jobs WHERE id = 'atomic-resolve-job'").get()
+      .state,
+    "completed"
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT processing_state, ready_at FROM sessions WHERE id = 'atomic-session'")
+      .get(),
+    { processing_state: "ready", ready_at: 15000 }
+  );
+  assert.equal(
+    repository.db
+      .prepare(
+        "SELECT count(*) AS count FROM speaker_identity_corrections WHERE cluster_id = 'atomic-cluster'"
+      )
+      .get().count,
+    0
+  );
+  assert.equal(
+    repository.listSpeakerResolutionHistory("atomic-cluster").filter((row) => row.actor === "user")
+      .length,
+    0
+  );
+
+  repository.db.exec("DROP TRIGGER reject_atomic_identity_wake");
+  repository.rejectSpeakerSuggestion({
+    clusterId: "atomic-cluster",
+    personId: "atomic-person",
+    scope: "session",
+    actor: "user",
+  });
+  repository.close();
+  repository = new JarvisRepository(databasePath);
+  assert.equal(repository.getSpeakerCluster("atomic-cluster").linkState, "rejected");
+  assert.equal(
+    repository.db.prepare("SELECT state FROM processing_jobs WHERE id = 'atomic-resolve-job'").get()
+      .state,
+    "pending"
+  );
+  assert.equal(repository.getSession("atomic-session").processing_state, "processing");
+  assert.equal(
+    repository
+      .listSpeakerResolutionHistory("atomic-cluster")
+      .filter((row) => row.actor === "user" && row.state === "rejected").length,
+    1
+  );
+});
+
 test("policy and immutable job key are exact and restart parseable", () => {
   assert.deepEqual(SPEAKER_IDENTITY_RESOLUTION_POLICY, {
     id: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@1",
@@ -582,6 +956,61 @@ test("policy and immutable job key are exact and restart parseable", () => {
     `resolve_identities:session-resolution:${"1".repeat(64)}:${"2".repeat(64)}:${SPEAKER_IDENTITY_RESOLUTION_POLICY.id}`
   );
   assert.deepEqual(parseIdentityResolutionJobKey(key), identity);
+});
+
+test("every exact policy field and every production seam reject same-id alterations", (t) => {
+  assert.equal(typeof assertExactIdentityResolutionPolicy, "function");
+  const alteredValues = {
+    id: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@2",
+    modelId: "different-model",
+    minimumSpeechMs: 11_999,
+    minimumWindows: 2,
+    minimumQualityScore: 0.77,
+    autoConfirmSimilarity: 0.81,
+    suggestSimilarity: 0.71,
+    minimumMargin: 0.04,
+  };
+  for (const field of Object.keys(SPEAKER_IDENTITY_RESOLUTION_POLICY)) {
+    const altered = Object.freeze({
+      ...SPEAKER_IDENTITY_RESOLUTION_POLICY,
+      [field]: alteredValues[field],
+    });
+    assert.throws(() => assertExactIdentityResolutionPolicy(altered), /exact identity policy/);
+  }
+  const exactClone = Object.freeze({ ...SPEAKER_IDENTITY_RESOLUTION_POLICY });
+  assert.equal(assertExactIdentityResolutionPolicy(exactClone), exactClone);
+
+  const repository = fixture(t);
+  const altered = Object.freeze({
+    ...SPEAKER_IDENTITY_RESOLUTION_POLICY,
+    minimumSpeechMs: 1,
+  });
+  assert.throws(() => new SpeakerIdentityResolver({ policy: altered }), /exact identity policy/);
+  assert.throws(
+    () =>
+      repository.getSpeakerIdentityResolutionSnapshot({
+        sessionId: "session-resolution",
+        policy: altered,
+      }),
+    /exact identity policy/
+  );
+  assert.throws(
+    () => repository.enqueueSpeakerIdentityResolutionJob("session-resolution", { policy: altered }),
+    /exact identity policy/
+  );
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  assert.throws(
+    () => new SpeakerIdentityResolutionWorker({ repository, policy: altered }),
+    /exact identity policy/
+  );
+  assert.throws(
+    () =>
+      new SpeakerIdentityResolutionWorker({
+        repository,
+        resolver: { policy: altered, resolveCluster() {} },
+      }),
+    /exact identity policy/
+  );
 });
 
 test("resolver groups samples by person centroid rather than max single sample", () => {
@@ -931,10 +1360,26 @@ test("the latest user rejection releases older confirmation protection", (t) => 
 });
 
 test("resolver applies speech, windows, quality, score, and margin boundaries in order", () => {
-  const resolve = ({ cluster = {}, samples = [], policy = {} } = {}) =>
-    new SpeakerIdentityResolver({
-      policy: Object.freeze({ ...SPEAKER_IDENTITY_RESOLUTION_POLICY, ...policy }),
-    }).resolveCluster({
+  assert.equal(typeof meetsMinimum, "function");
+  for (const threshold of [
+    SPEAKER_IDENTITY_RESOLUTION_POLICY.minimumQualityScore,
+    SPEAKER_IDENTITY_RESOLUTION_POLICY.suggestSimilarity,
+    SPEAKER_IDENTITY_RESOLUTION_POLICY.autoConfirmSimilarity,
+    SPEAKER_IDENTITY_RESOLUTION_POLICY.minimumMargin,
+  ]) {
+    assert.equal(meetsMinimum(adjacentFloat64(threshold, -1), threshold), false);
+    assert.equal(meetsMinimum(threshold, threshold), true);
+    assert.equal(meetsMinimum(adjacentFloat64(threshold, 1), threshold), true);
+  }
+  assert.equal(meetsMinimum(11_999, 12_000), false);
+  assert.equal(meetsMinimum(12_000, 12_000), true);
+  assert.equal(meetsMinimum(2, 3), false);
+  assert.equal(meetsMinimum(3, 3), true);
+  assert.equal(meetsMinimum(Number.NaN, 0), false);
+
+  const resolver = new SpeakerIdentityResolver();
+  const resolve = ({ cluster = {}, samples = [] } = {}) =>
+    resolver.resolveCluster({
       cluster: {
         id: "c",
         modelId: MODEL_ID,
@@ -972,86 +1417,19 @@ test("resolver applies speech, windows, quality, score, and margin boundaries in
     "no_candidate"
   );
 
-  const suggestInput = [sample("a", 0.72)];
-  const suggestScore = resolve({ samples: suggestInput }).score;
-  const suggestPolicy = { autoConfirmSimilarity: 1 };
   assert.equal(
-    resolve({
-      samples: suggestInput,
-      policy: { ...suggestPolicy, suggestSimilarity: adjacentFloat64(suggestScore, 1) },
-    }).reason,
+    resolve({ samples: [sample("a", adjacentFloat32(0.72, -1))] }).reason,
     "below_suggest_similarity"
   );
+  assert.equal(resolve({ samples: [sample("a", adjacentFloat32(0.72, 1))] }).state, "suggested");
+  assert.equal(resolve({ samples: [sample("a", adjacentFloat32(0.82, -1))] }).state, "suggested");
+  assert.equal(resolve({ samples: [sample("a", adjacentFloat32(0.82, 1))] }).state, "confirmed");
   assert.equal(
-    resolve({
-      samples: suggestInput,
-      policy: { ...suggestPolicy, suggestSimilarity: suggestScore },
-    }).state,
-    "suggested"
-  );
-  assert.equal(
-    resolve({
-      samples: suggestInput,
-      policy: { ...suggestPolicy, suggestSimilarity: adjacentFloat64(suggestScore, -1) },
-    }).state,
-    "suggested"
-  );
-
-  const autoInput = [sample("a", 0.82)];
-  const autoScore = resolve({ samples: autoInput }).score;
-  const autoPolicy = { suggestSimilarity: -1 };
-  assert.equal(
-    resolve({
-      samples: autoInput,
-      policy: { ...autoPolicy, autoConfirmSimilarity: adjacentFloat64(autoScore, 1) },
-    }).state,
-    "suggested"
-  );
-  assert.equal(
-    resolve({ samples: autoInput, policy: { ...autoPolicy, autoConfirmSimilarity: autoScore } })
-      .state,
-    "confirmed"
-  );
-  assert.equal(
-    resolve({
-      samples: autoInput,
-      policy: { ...autoPolicy, autoConfirmSimilarity: adjacentFloat64(autoScore, -1) },
-    }).state,
-    "confirmed"
-  );
-
-  const marginInput = [sample("a", 1), sample("b", 0.95)];
-  const measuredMargin = resolve({
-    samples: marginInput,
-    policy: { suggestSimilarity: -1, autoConfirmSimilarity: -1, minimumMargin: 0 },
-  }).margin;
-  assert.equal(
-    resolve({
-      samples: marginInput,
-      policy: {
-        suggestSimilarity: -1,
-        autoConfirmSimilarity: -1,
-        minimumMargin: adjacentFloat64(measuredMargin, 1),
-      },
-    }).reason,
+    resolve({ samples: [sample("a", 1), sample("b", adjacentFloat32(0.95, 1))] }).reason,
     "insufficient_margin"
   );
   assert.equal(
-    resolve({
-      samples: marginInput,
-      policy: { suggestSimilarity: -1, autoConfirmSimilarity: -1, minimumMargin: measuredMargin },
-    }).state,
-    "confirmed"
-  );
-  assert.equal(
-    resolve({
-      samples: marginInput,
-      policy: {
-        suggestSimilarity: -1,
-        autoConfirmSimilarity: -1,
-        minimumMargin: adjacentFloat64(measuredMargin, -1),
-      },
-    }).state,
+    resolve({ samples: [sample("a", 1), sample("b", adjacentFloat32(0.95, -1))] }).state,
     "confirmed"
   );
 
@@ -1066,10 +1444,10 @@ test("resolver applies speech, windows, quality, score, and margin boundaries in
   assert.equal(resolve({ samples: [sample("a", 0.75)] }).margin > 0.7, true);
 });
 
-test("self candidates use identical exact and adjacent score and margin thresholds", () => {
-  const withPolicy = (input) => {
-    const policy = Object.freeze({ ...SPEAKER_IDENTITY_RESOLUTION_POLICY, ...input.policy });
-    return new SpeakerIdentityResolver({ policy }).resolveCluster({
+test("self candidates use the exact production policy without relaxed gates", () => {
+  const resolver = new SpeakerIdentityResolver();
+  const resolveSelf = ({ score, secondScore }) =>
+    resolver.resolveCluster({
       cluster: {
         id: "self-cluster",
         modelId: MODEL_ID,
@@ -1084,76 +1462,29 @@ test("self candidates use identical exact and adjacent score and margin threshol
           personId: "self",
           isSelf: true,
           modelId: MODEL_ID,
-          embedding: vector(input.score, Math.sqrt(1 - input.score * input.score)),
+          embedding: vector(score, Math.sqrt(1 - score * score)),
         },
-        ...(input.secondScore === undefined
+        ...(secondScore === undefined
           ? []
           : [
               {
                 id: "other-sample",
                 personId: "other",
                 modelId: MODEL_ID,
-                embedding: vector(
-                  input.secondScore,
-                  Math.sqrt(1 - input.secondScore * input.secondScore)
-                ),
+                embedding: vector(secondScore, Math.sqrt(1 - secondScore * secondScore)),
               },
             ]),
       ],
       rejectedPersonIds: [],
     });
-  };
 
-  const suggestProbe = withPolicy({ score: 0.72, policy: {} });
-  for (const [threshold, expectedState] of [
-    [adjacentFloat64(suggestProbe.score, 1), "unknown"],
-    [suggestProbe.score, "suggested"],
-    [adjacentFloat64(suggestProbe.score, -1), "suggested"],
-  ]) {
-    assert.equal(
-      withPolicy({
-        score: 0.72,
-        policy: { suggestSimilarity: threshold, autoConfirmSimilarity: 1 },
-      }).state,
-      expectedState
-    );
-  }
-
-  const autoProbe = withPolicy({ score: 0.82, policy: {} });
-  for (const [threshold, expectedState] of [
-    [adjacentFloat64(autoProbe.score, 1), "suggested"],
-    [autoProbe.score, "confirmed"],
-    [adjacentFloat64(autoProbe.score, -1), "confirmed"],
-  ]) {
-    assert.equal(
-      withPolicy({
-        score: 0.82,
-        policy: { suggestSimilarity: -1, autoConfirmSimilarity: threshold },
-      }).state,
-      expectedState
-    );
-  }
-
-  const marginProbe = withPolicy({
-    score: 1,
-    secondScore: 0.95,
-    policy: { suggestSimilarity: -1, autoConfirmSimilarity: -1, minimumMargin: 0 },
-  });
-  assert.equal(marginProbe.candidatePersonId, "self");
-  for (const [threshold, expectedState] of [
-    [adjacentFloat64(marginProbe.margin, 1), "unknown"],
-    [marginProbe.margin, "confirmed"],
-    [adjacentFloat64(marginProbe.margin, -1), "confirmed"],
-  ]) {
-    assert.equal(
-      withPolicy({
-        score: 1,
-        secondScore: 0.95,
-        policy: { suggestSimilarity: -1, autoConfirmSimilarity: -1, minimumMargin: threshold },
-      }).state,
-      expectedState
-    );
-  }
+  assert.equal(resolveSelf({ score: 0.71 }).state, "unknown");
+  assert.equal(resolveSelf({ score: 0.75 }).state, "suggested");
+  assert.equal(resolveSelf({ score: 0.83 }).state, "confirmed");
+  assert.equal(resolveSelf({ score: 1, secondScore: 0.96 }).reason, "insufficient_margin");
+  const confirmed = resolveSelf({ score: 1, secondScore: 0.94 });
+  assert.equal(confirmed.candidatePersonId, "self");
+  assert.equal(confirmed.state, "confirmed");
 });
 
 test("resolver is deterministic across sample order, isolates models, and rejects invalid vectors", () => {
@@ -1699,6 +2030,7 @@ test("worker revalidates again before commit and writes no stale partial batch",
     repository,
     clock: () => 17000,
     resolver: {
+      policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
       resolveCluster(input) {
         const result = pure.resolveCluster(input);
         if (!changed) {
@@ -1788,6 +2120,7 @@ test("a rejection racing resolution aborts stale projection and the retry select
     repository,
     clock: () => 18000,
     resolver: {
+      policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
       resolveCluster(input) {
         const decision = pure.resolveCluster(input);
         if (!rejected) {

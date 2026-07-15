@@ -21,6 +21,7 @@ const {
 } = require("./SessionDiarizationPolicy");
 const {
   SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  assertExactIdentityResolutionPolicy,
   buildIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
 
@@ -1511,6 +1512,25 @@ class JarvisRepository {
       }
     });
 
+    this._rejectSpeakerSuggestion = this.db.transaction((input) => {
+      const { cluster, rejection } =
+        this.speakerIdentityRepository.rejectSuggestionWithResolution(input);
+      if (rejection) {
+        const inputHash = buildIdentityResolutionJobKey({
+          sessionId: rejection.sessionId,
+          diarizationRevision: rejection.diarizationRevision,
+          profileRevision: rejection.profileRevision,
+          policyId: rejection.policyId,
+        });
+        this.statements.requeueIdentityResolutionJob.run({
+          inputHash,
+          policyId: rejection.policyId,
+        });
+        this.statements.markSessionProcessing.run(rejection.sessionId);
+      }
+      return cluster;
+    });
+
     this._recoverOpenSessions = this.db.transaction((at) => {
       const openSessions = this.statements.listOpenSessions.all();
       for (const session of openSessions) {
@@ -2436,13 +2456,7 @@ class JarvisRepository {
   } = {}) {
     const safeSessionId = assertId(sessionId, "sessionId");
     assertNonNegativeInteger(at, "at");
-    if (
-      !policy ||
-      policy.modelId !== SPEAKER_IDENTITY_RESOLUTION_POLICY.modelId ||
-      typeof policy.id !== "string"
-    ) {
-      throw new TypeError("an exact-model identity resolution policy is required");
-    }
+    assertExactIdentityResolutionPolicy(policy);
     const session = this.statements.getSession.get(safeSessionId);
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
       return { eligible: false, reason: "session_not_terminal" };
@@ -2584,6 +2598,7 @@ class JarvisRepository {
     { at = Date.now(), policy = SPEAKER_IDENTITY_RESOLUTION_POLICY } = {}
   ) {
     const safeAt = assertNonNegativeInteger(at, "at");
+    assertExactIdentityResolutionPolicy(policy);
     const snapshot = this.getSpeakerIdentityResolutionSnapshot({ sessionId, at: safeAt, policy });
     if (!snapshot.eligible) return { enqueued: 0, job: null, reason: snapshot.reason };
     const inputHash = buildIdentityResolutionJobKey({
@@ -3864,24 +3879,7 @@ class JarvisRepository {
   }
 
   rejectSpeakerSuggestion(input) {
-    const cluster = this.speakerIdentityRepository.rejectSuggestion(input);
-    const rejection = this.speakerIdentityRepository
-      .listResolutionHistory(input.clusterId)
-      .findLast((row) => row.actor === "user" && row.state === "rejected");
-    if (rejection) {
-      const inputHash = buildIdentityResolutionJobKey({
-        sessionId: rejection.sessionId,
-        diarizationRevision: rejection.diarizationRevision,
-        profileRevision: rejection.profileRevision,
-        policyId: rejection.policyId,
-      });
-      this.statements.requeueIdentityResolutionJob.run({
-        inputHash,
-        policyId: rejection.policyId,
-      });
-      this.statements.markSessionProcessing.run(rejection.sessionId);
-    }
-    return cluster;
+    return this._rejectSpeakerSuggestion.immediate(input);
   }
 
   applySystemSpeakerResolution(input) {

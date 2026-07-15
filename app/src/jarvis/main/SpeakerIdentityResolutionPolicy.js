@@ -12,6 +12,24 @@ const SPEAKER_IDENTITY_RESOLUTION_POLICY = Object.freeze({
   suggestSimilarity: 0.72,
   minimumMargin: 0.05,
 });
+const EXACT_POLICY_FIELDS = Object.freeze(Object.keys(SPEAKER_IDENTITY_RESOLUTION_POLICY));
+
+function assertExactIdentityResolutionPolicy(policy) {
+  const keys =
+    policy && typeof policy === "object" && !Array.isArray(policy) ? Object.keys(policy) : [];
+  if (
+    !Object.isFrozen(policy) ||
+    keys.length !== EXACT_POLICY_FIELDS.length ||
+    EXACT_POLICY_FIELDS.some(
+      (field) =>
+        !Object.prototype.hasOwnProperty.call(policy, field) ||
+        policy[field] !== SPEAKER_IDENTITY_RESOLUTION_POLICY[field]
+    )
+  ) {
+    throw new TypeError("the exact identity policy is required");
+  }
+  return policy;
+}
 
 function safeId(value, name) {
   if (typeof value !== "string" || !SAFE_ID.test(value)) {
@@ -66,6 +84,7 @@ function parseIdentityResolutionJobKey(value) {
 
 module.exports = {
   SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  assertExactIdentityResolutionPolicy,
   buildIdentityResolutionJobKey,
   parseIdentityResolutionJobKey,
 };

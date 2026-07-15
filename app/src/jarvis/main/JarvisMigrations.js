@@ -1225,6 +1225,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       );
       db.exec(`
         UPDATE speaker_identity_corrections
+        SET resolution_commit_sequence = 0
+        WHERE resolution_commit_sequence IS NULL;
+        UPDATE speaker_identity_corrections
         SET previous_person_ref = previous_person_id
         WHERE previous_person_ref IS NULL AND previous_person_id IS NOT NULL;
         UPDATE speaker_identity_corrections

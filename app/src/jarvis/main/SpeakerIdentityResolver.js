@@ -1,4 +1,17 @@
-const { SPEAKER_IDENTITY_RESOLUTION_POLICY } = require("./SpeakerIdentityResolutionPolicy");
+const {
+  SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  assertExactIdentityResolutionPolicy,
+} = require("./SpeakerIdentityResolutionPolicy");
+
+function meetsMinimum(value, minimum) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    typeof minimum === "number" &&
+    Number.isFinite(minimum) &&
+    value >= minimum
+  );
+}
 
 function normalize(value, expectedDimension = 512) {
   if (!(value instanceof Float32Array) && !(value instanceof Float64Array)) return null;
@@ -68,10 +81,7 @@ function unknown(reason, { candidatePersonId = null, score = null, margin = null
 
 class SpeakerIdentityResolver {
   constructor({ policy = SPEAKER_IDENTITY_RESOLUTION_POLICY } = {}) {
-    if (!policy || typeof policy !== "object" || !Object.isFrozen(policy)) {
-      throw new TypeError("identity resolution policy must be immutable");
-    }
-    this.policy = policy;
+    this.policy = assertExactIdentityResolutionPolicy(policy);
   }
 
   resolveCluster({ cluster, samples, rejectedPersonIds = [] } = {}) {
@@ -81,13 +91,13 @@ class SpeakerIdentityResolver {
       throw new TypeError("rejectedPersonIds must be an array");
     }
     const policy = this.policy;
-    if (cluster.speechMs < policy.minimumSpeechMs) return unknown("insufficient_speech");
-    if (cluster.windowCount < policy.minimumWindows) return unknown("insufficient_windows");
-    if (
-      typeof cluster.qualityScore !== "number" ||
-      !Number.isFinite(cluster.qualityScore) ||
-      cluster.qualityScore < policy.minimumQualityScore
-    ) {
+    if (!meetsMinimum(cluster.speechMs, policy.minimumSpeechMs)) {
+      return unknown("insufficient_speech");
+    }
+    if (!meetsMinimum(cluster.windowCount, policy.minimumWindows)) {
+      return unknown("insufficient_windows");
+    }
+    if (!meetsMinimum(cluster.qualityScore, policy.minimumQualityScore)) {
       return unknown("low_quality");
     }
     if (cluster.modelId !== policy.modelId) return unknown("model_mismatch");
@@ -109,9 +119,13 @@ class SpeakerIdentityResolver {
     const rawMargin = top.score - secondScore;
     const margin = Math.abs(rawMargin) <= Number.EPSILON * 8 ? 0 : Math.max(0, rawMargin);
     const evidence = { candidatePersonId: top.personId, score: top.score, margin };
-    if (top.score < policy.suggestSimilarity) return unknown("below_suggest_similarity", evidence);
-    if (margin < policy.minimumMargin) return unknown("insufficient_margin", evidence);
-    if (top.score >= policy.autoConfirmSimilarity) {
+    if (!meetsMinimum(top.score, policy.suggestSimilarity)) {
+      return unknown("below_suggest_similarity", evidence);
+    }
+    if (!meetsMinimum(margin, policy.minimumMargin)) {
+      return unknown("insufficient_margin", evidence);
+    }
+    if (meetsMinimum(top.score, policy.autoConfirmSimilarity)) {
       return { state: "confirmed", ...evidence, reason: "auto_confirmed" };
     }
     return { state: "suggested", ...evidence, reason: "suggested" };
@@ -119,5 +133,6 @@ class SpeakerIdentityResolver {
 }
 
 module.exports = SpeakerIdentityResolver;
+module.exports.meetsMinimum = meetsMinimum;
 module.exports.normalizeEmbedding = normalize;
 module.exports.personCentroids = personCentroids;

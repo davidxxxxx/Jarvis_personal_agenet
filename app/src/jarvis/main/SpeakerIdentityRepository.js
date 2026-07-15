@@ -368,8 +368,12 @@ class SpeakerIdentityRepository {
         ORDER BY cluster_id
       `),
       listResolutionHistory: db.prepare(`
-        SELECT * FROM speaker_identity_resolutions
-        WHERE cluster_id = ? ORDER BY created_at, rowid
+        SELECT resolution.*
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_resolution_runs AS run
+          ON run.id = resolution.resolution_run_id
+        WHERE resolution.cluster_id = ?
+        ORDER BY run.commit_sequence, resolution.rowid
       `),
       listRejectedPersonRefs: db.prepare(`
         SELECT DISTINCT resolution.candidate_person_ref
@@ -386,12 +390,16 @@ class SpeakerIdentityRepository {
         ORDER BY candidate_person_ref
       `),
       getLatestSystemCandidateResolution: db.prepare(`
-        SELECT * FROM speaker_identity_resolutions
-        WHERE cluster_id = @clusterId
-          AND candidate_person_ref = @personId
-          AND actor = 'system'
-          AND resolution_state IN ('suggested','confirmed')
-        ORDER BY created_at DESC, rowid DESC LIMIT 1
+        SELECT resolution.*
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_resolution_runs AS run
+          ON run.id = resolution.resolution_run_id
+        WHERE resolution.cluster_id = @clusterId
+          AND resolution.candidate_person_ref = @personId
+          AND resolution.actor = 'system'
+          AND resolution.resolution_state IN ('suggested','confirmed')
+          AND resolution.projection_applied = 1
+        ORDER BY run.commit_sequence DESC, resolution.rowid DESC LIMIT 1
       `),
       getLatestSystemResolutionAfter: db.prepare(`
         SELECT resolution.*
@@ -476,8 +484,18 @@ class SpeakerIdentityRepository {
     this._rejectSuggestion = db.transaction((input) => {
       const cluster = this._requireCluster(input.clusterId);
       this._requirePerson(input.personId);
+      if (
+        cluster.person_id !== input.personId ||
+        !["suggested", "confirmed"].includes(cluster.link_state)
+      ) {
+        throw new Error("rejection must target the current projected candidate");
+      }
       const createdAt = this.now();
       const correctionId = this.createId("speaker_correction");
+      const resolution = this.statements.getLatestSystemCandidateResolution.get({
+        clusterId: cluster.id,
+        personId: input.personId,
+      });
       this.statements.insertCorrection.run({
         id: correctionId,
         clusterId: cluster.id,
@@ -502,13 +520,11 @@ class SpeakerIdentityRepository {
         matchMargin: cluster.match_margin,
         updatedAt: createdAt,
       });
-      const resolution = this.statements.getLatestSystemCandidateResolution.get({
-        clusterId: cluster.id,
-        personId: input.personId,
-      });
+      let rejection = null;
       if (resolution) {
+        const rejectionId = deterministicResolutionId(resolution.id, correctionId, "rejected");
         this.statements.insertResolution.run({
-          id: deterministicResolutionId(resolution.id, correctionId, "rejected"),
+          id: rejectionId,
           resolutionRunId: resolution.resolution_run_id,
           sessionId: resolution.session_id,
           evidenceRunId: resolution.evidence_run_id,
@@ -527,7 +543,9 @@ class SpeakerIdentityRepository {
           projectionApplied: 1,
           createdAt,
         });
+        rejection = this.statements.getResolution.get(rejectionId);
       }
+      return { clusterId: cluster.id, rejection };
     });
 
     this._applySystemResolutions = db.transaction((input) => {
@@ -702,7 +720,7 @@ class SpeakerIdentityRepository {
       this.statements.markCorrectionUndone.run(undoneAt, correction.id);
       const newerSystemResolution = this.statements.getLatestSystemResolutionAfter.get({
         clusterId,
-        minimumCommitSequence: correction.resolution_commit_sequence ?? Number.MAX_SAFE_INTEGER,
+        minimumCommitSequence: correction.resolution_commit_sequence ?? 0,
       });
       if (newerSystemResolution) {
         this.statements.updateClusterLink.run({
@@ -1173,6 +1191,10 @@ class SpeakerIdentityRepository {
   }
 
   rejectSuggestion(input) {
+    return this.rejectSuggestionWithResolution(input).cluster;
+  }
+
+  rejectSuggestionWithResolution(input) {
     if (!input || typeof input !== "object") throw new TypeError("rejection input is required");
     const safe = {
       clusterId: assertId(input.clusterId, "clusterId"),
@@ -1180,8 +1202,11 @@ class SpeakerIdentityRepository {
       scope: assertEnum(input.scope ?? "session", SCOPES, "scope"),
       actor: assertEnum(input.actor ?? "user", ACTORS, "actor"),
     };
-    this._rejectSuggestion(safe);
-    return this.getCluster(safe.clusterId);
+    const result = this._rejectSuggestion(safe);
+    return {
+      cluster: this.getCluster(result.clusterId),
+      rejection: mapResolution(result.rejection),
+    };
   }
 
   applySystemResolution(input) {

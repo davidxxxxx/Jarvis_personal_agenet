@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const SpeakerIdentityResolver = require("./SpeakerIdentityResolver");
 const {
   SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  assertExactIdentityResolutionPolicy,
   parseIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
 
@@ -37,9 +38,8 @@ class SpeakerIdentityResolutionWorker {
     if (!resolver || typeof resolver.resolveCluster !== "function") {
       throw new TypeError("resolver.resolveCluster is required");
     }
-    if (!policy || policy.id !== SPEAKER_IDENTITY_RESOLUTION_POLICY.id) {
-      throw new TypeError("the exact versioned identity policy is required");
-    }
+    assertExactIdentityResolutionPolicy(policy);
+    assertExactIdentityResolutionPolicy(resolver.policy);
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.repository = repository;
     this.resolver = resolver;
