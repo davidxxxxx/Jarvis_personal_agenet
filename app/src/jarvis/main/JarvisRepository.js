@@ -8,6 +8,7 @@ const {
   normalizeCapturePolicy,
 } = require("../shared/captureModes");
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
+const MemoryRepository = require("./MemoryRepository");
 const SpeakerIdentityRepository = require("./SpeakerIdentityRepository");
 const {
   applyJarvisMigrations,
@@ -368,12 +369,27 @@ function codedError(code) {
 }
 
 class JarvisRepository {
-  constructor(dbPath) {
+  constructor(dbPath, memoryDependencies = {}) {
     if (typeof dbPath !== "string" || dbPath.length === 0) {
       throw new TypeError("dbPath must be a non-empty string");
     }
+    if (
+      !memoryDependencies ||
+      typeof memoryDependencies !== "object" ||
+      Array.isArray(memoryDependencies)
+    ) {
+      throw new TypeError("memoryDependencies must be an object");
+    }
 
     this.dbPath = dbPath;
+    this.memoryDependencies = {
+      createId:
+        memoryDependencies.createId ??
+        ((prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`),
+      now: memoryDependencies.now ?? Date.now,
+      validateRedactedCloudPayload:
+        memoryDependencies.validateRedactedCloudPayload ?? (() => false),
+    };
     this._open(dbPath);
   }
 
@@ -389,6 +405,8 @@ class JarvisRepository {
       // procedure. Keep repository-only schema initialization atomic in its own step.
       applyJarvisMigrations(this.db);
       this.db.transaction(() => this.db.exec(SCHEMA))();
+      this.memoryRepository = new MemoryRepository(this.db, this.memoryDependencies);
+      this.memoryRepository.importLegacyAnalysis();
       this._prepareStatements();
       this.captureEvidenceStore = new CaptureEvidenceStore(this.db, {
         createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
@@ -2888,7 +2906,10 @@ class JarvisRepository {
       const existingRun = this.db
         .prepare("SELECT * FROM analysis_runs WHERE session_id = ? AND kind = ? AND input_hash = ?")
         .get(safe.sessionId, safe.kind, safe.inputHash);
-      if (existingRun?.status === "completed") return this.getSessionDetail(safe.sessionId);
+      if (existingRun?.status === "completed") {
+        this.memoryRepository.importLegacyAnalysis();
+        return this.getSessionDetail(safe.sessionId);
+      }
 
       const allowedSegments = new Set(
         this.listTranscriptSegments(safe.sessionId).map((segment) => segment.id)
@@ -3123,9 +3144,10 @@ class JarvisRepository {
             .run(id, segmentId, runId);
         }
       }
+      this.memoryRepository.importLegacyAnalysis();
       return this.getSessionDetail(safe.sessionId);
     });
-    return transaction();
+    return transaction.immediate();
   }
 
   getSessionDetail(id) {

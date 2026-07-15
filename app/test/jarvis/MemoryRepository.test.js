@@ -87,6 +87,134 @@ function createFixture() {
   return db;
 }
 
+function createLegacyAnalysisSchema(db) {
+  db.exec(`
+    CREATE TABLE analysis_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      window_start INTEGER NOT NULL,
+      window_end INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      model TEXT NOT NULL,
+      status TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at INTEGER,
+      response_json TEXT,
+      error_code TEXT,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER
+    );
+    CREATE TABLE session_summaries (
+      session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      summary TEXT NOT NULL,
+      decisions_json TEXT NOT NULL DEFAULT '[]',
+      suggestions_json TEXT NOT NULL DEFAULT '[]',
+      analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+      updated_at INTEGER NOT NULL,
+      is_final INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE topics (
+      id TEXT PRIMARY KEY,
+      canonical_title TEXT NOT NULL,
+      normalized_title TEXT NOT NULL UNIQUE,
+      description TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL
+    );
+    CREATE TABLE session_topics (
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+      analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+      PRIMARY KEY(session_id, topic_id)
+    );
+    CREATE TABLE todos (
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      normalized_content TEXT NOT NULL,
+      owner_person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+      topic_id TEXT REFERENCES topics(id) ON DELETE SET NULL,
+      due_at INTEGER,
+      status TEXT NOT NULL DEFAULT 'open',
+      confidence REAL NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      source_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+      analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE
+    );
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      normalized_content TEXT NOT NULL,
+      person_id TEXT REFERENCES people(id) ON DELETE SET NULL,
+      topic_id TEXT REFERENCES topics(id) ON DELETE SET NULL,
+      confidence REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL,
+      occurrence_count INTEGER NOT NULL DEFAULT 1,
+      needs_confirmation INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE memory_evidence (
+      memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+      segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+      PRIMARY KEY(memory_id, segment_id)
+    );
+  `);
+}
+
+function seedLegacyAnalysis(db, { malformedJson = false } = {}) {
+  db.exec(`
+    INSERT INTO analysis_runs (
+      id, session_id, kind, window_start, window_end, input_hash, model,
+      status, attempt_count, response_json, created_at, completed_at
+    ) VALUES (
+      'legacy-run-1', 'session-1', 'final', 1000, 5000, '${HASH_A}', 'legacy-model',
+      'completed', 1, '{}', 5000, 5100
+    );
+    INSERT INTO session_summaries (
+      session_id, summary, decisions_json, suggestions_json,
+      analysis_run_id, updated_at, is_final
+    ) VALUES (
+      'session-1', 'Legacy summary',
+      ${malformedJson ? "'not-json'" : "'[\"Keep the local database\"]'"},
+      ${malformedJson ? "'{bad-json'" : '\'[{"content":"Review the release","reason":"Catch regressions"}]\''},
+      'legacy-run-1', 5100, 1
+    );
+    INSERT INTO topics (
+      id, canonical_title, normalized_title, description, status, created_at, last_seen_at
+    ) VALUES (
+      'legacy-topic-1', 'Release', 'release', 'Release planning', 'active', 4000, 5100
+    );
+    INSERT INTO session_topics (session_id, topic_id, analysis_run_id)
+    VALUES ('session-1', 'legacy-topic-1', 'legacy-run-1');
+    INSERT INTO todos (
+      id, content, normalized_content, owner_person_id, topic_id, due_at, status,
+      confidence, created_at, updated_at, completed_at, source_session_id,
+      source_segment_id, analysis_run_id
+    ) VALUES (
+      'legacy-todo-1', 'Prepare the release', 'prepare the release', 'person-self',
+      'legacy-topic-1', 7000, 'open', 0.8, 4000, 5100, NULL,
+      'session-1', 'segment-1', 'legacy-run-1'
+    );
+    INSERT INTO memories (
+      id, type, content, normalized_content, person_id, topic_id, confidence, status,
+      first_seen_at, last_seen_at, occurrence_count, needs_confirmation
+    ) VALUES (
+      'legacy-memory-1', 'opinion', 'Local storage is preferable',
+      'local storage is preferable', 'person-self', 'legacy-topic-1', 0.85,
+      'active', 4000, 5100, 1, 0
+    );
+    INSERT INTO memory_evidence (memory_id, segment_id, analysis_run_id)
+    VALUES ('legacy-memory-1', 'segment-1', 'legacy-run-1');
+  `);
+}
+
 function validInput(overrides = {}) {
   return {
     sessionId: "session-1",
@@ -284,6 +412,599 @@ test("constructor requires a live database and dependency functions", () => {
       () => new MemoryRepository(db, { createId: () => "id", now: () => 1 }),
       /validateRedactedCloudPayload/i
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis imports the observable legacy snapshot once with append-only lineage", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const counters = { ids: 0, clocks: 0 };
+    const repository = createRepository(db, counters);
+
+    const first = repository.importLegacyAnalysis();
+    const countersAfterFirst = { ...counters };
+    const second = repository.importLegacyAnalysis();
+
+    assert.deepEqual(first, { status: "completed", importedRowCount: 8 });
+    assert.deepEqual(second, { status: "completed", importedRowCount: 0 });
+    assert.deepEqual(counters, countersAfterFirst);
+    assert.equal(db.prepare("SELECT count(*) count FROM legacy_import_map").get().count, 8);
+    assert.deepEqual(
+      db
+        .prepare(
+          "SELECT status, imported_row_count FROM legacy_import_runs ORDER BY started_at, id"
+        )
+        .all(),
+      [{ status: "completed", imported_row_count: 8 }]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT kind, provenance FROM memory_items_v2
+           ORDER BY kind, id`
+        )
+        .all(),
+      [
+        { kind: "decision", provenance: "legacy_unverified" },
+        { kind: "opinion", provenance: "evidence_linked" },
+      ]
+    );
+    assert.deepEqual(db.prepare(`SELECT provenance FROM topics_v2`).all(), [
+      { provenance: "legacy_unverified" },
+    ]);
+    assert.deepEqual(db.prepare(`SELECT status, provenance FROM todos_v2`).all(), [
+      { status: "open", provenance: "evidence_linked" },
+    ]);
+    assert.deepEqual(db.prepare(`SELECT state, provenance FROM suggestions_v2`).all(), [
+      { state: "proposed", provenance: "legacy_unverified" },
+    ]);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT session_id, completeness, lifecycle, provenance, content_json
+           FROM session_summary_revisions`
+        )
+        .all(),
+      [
+        {
+          session_id: "session-1",
+          completeness: "final",
+          lifecycle: "active",
+          provenance: "legacy_unverified",
+          content_json: canonicalJson({
+            summary: "Legacy summary",
+            decisions: ["Keep the local database"],
+            suggestions: [{ content: "Review the release", reason: "Catch regressions" }],
+          }),
+        },
+      ]
+    );
+    assert.equal(db.prepare("SELECT count(*) count FROM daily_digests").get().count, 0);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT entity_type, session_id, transcript_segment_id, quote_text, audio_state
+           FROM evidence_refs ORDER BY entity_type`
+        )
+        .all(),
+      [
+        {
+          entity_type: "memory_occurrence",
+          session_id: "session-1",
+          transcript_segment_id: "segment-1",
+          quote_text: "durable evidence",
+          audio_state: "available",
+        },
+        {
+          entity_type: "todo_occurrence",
+          session_id: "session-1",
+          transcript_segment_id: "segment-1",
+          quote_text: "durable evidence",
+          audio_state: "available",
+        },
+      ]
+    );
+    for (const table of [
+      "memory_occurrences",
+      "topic_occurrences",
+      "todo_occurrences",
+      "suggestion_occurrences",
+    ]) {
+      const rows = db.prepare(`SELECT analysis_input_id, legacy_session_id FROM ${table}`).all();
+      assert.ok(rows.length > 0, table);
+      assert.ok(
+        rows.every(
+          (row) => row.analysis_input_id === null && row.legacy_session_id === "session-1"
+        ),
+        table
+      );
+    }
+    const snapshot = repository.readPublicSnapshot();
+    for (const collection of [
+      snapshot.memories,
+      snapshot.topics,
+      snapshot.todos,
+      snapshot.suggestions,
+    ]) {
+      for (const item of collection) {
+        assert.ok(item.occurrences.every((occurrence) => occurrence.sessionId === "session-1"));
+      }
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis rolls back targets maps and run markers after an injected failure", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const repository = createRepository(db);
+    db.exec(`
+      CREATE TRIGGER fail_legacy_todo_map
+      BEFORE INSERT ON legacy_import_map
+      WHEN NEW.source_table = 'todos'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected legacy import failure');
+      END;
+    `);
+
+    assert.throws(() => repository.importLegacyAnalysis(), /injected legacy import failure/);
+    for (const table of [
+      "legacy_import_runs",
+      "legacy_import_map",
+      "memory_items_v2",
+      "memory_occurrences",
+      "topics_v2",
+      "topic_revisions",
+      "topic_occurrences",
+      "todos_v2",
+      "todo_revisions",
+      "todo_occurrences",
+      "suggestions_v2",
+      "suggestion_occurrences",
+      "session_summary_revisions",
+      "evidence_refs",
+    ]) {
+      assert.equal(db.prepare(`SELECT count(*) count FROM ${table}`).get().count, 0, table);
+    }
+
+    db.exec("DROP TRIGGER fail_legacy_todo_map");
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 8,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis treats malformed legacy arrays as empty without blocking startup", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db, { malformedJson: true });
+    const repository = createRepository(db);
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 6,
+    });
+    assert.equal(db.prepare("SELECT count(*) count FROM suggestions_v2").get().count, 0);
+    assert.deepEqual(
+      JSON.parse(
+        db.prepare("SELECT content_json FROM session_summary_revisions").get().content_json
+      ),
+      { decisions: [], suggestions: [], summary: "Legacy summary" }
+    );
+    assert.equal(
+      db.prepare("SELECT count(*) count FROM memory_items_v2 WHERE kind = 'decision'").get().count,
+      0
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis fingerprints live segment lineage and later adds newly verifiable evidence", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-late', 'session-1', 'late.wav', 2000, 2500, 500, '${HASH_C}', 9000,
+        'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-late', 'session-1', 2000, 2500, 'person-self', 'SELF',
+        'late evidence', 0.8, 0, 'pending', 'track-1', 'chunk-late', 'mic',
+        'provisional', 1, NULL, NULL
+      );
+      INSERT INTO analysis_runs (
+        id, session_id, kind, window_start, window_end, input_hash, model,
+        status, attempt_count, response_json, created_at, completed_at
+      ) VALUES (
+        'legacy-run-late', 'session-1', 'final', 2000, 2500, '${HASH_C}', 'legacy-model',
+        'completed', 1, '{}', 2500, 2600
+      );
+      INSERT INTO memories (
+        id, type, content, normalized_content, confidence, status,
+        first_seen_at, last_seen_at, occurrence_count, needs_confirmation
+      ) VALUES (
+        'legacy-memory-late', 'fact', 'Evidence arrives later', 'evidence arrives later',
+        0.8, 'active', 2500, 2600, 1, 0
+      );
+      INSERT INTO memory_evidence (memory_id, segment_id, analysis_run_id)
+      VALUES ('legacy-memory-late', 'segment-late', 'legacy-run-late');
+    `);
+    const repository = createRepository(db);
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 2,
+    });
+    assert.equal(db.prepare("SELECT count(*) count FROM evidence_refs").get().count, 0);
+    assert.equal(
+      db.prepare("SELECT provenance FROM memory_items_v2").get().provenance,
+      "legacy_unverified"
+    );
+
+    db.prepare(
+      `UPDATE transcript_segments
+       SET result_kind = 'final', is_stable = 1, analysis_state = 'analyzed',
+           model_version = 'whisper-v1', completed_at = 2700
+       WHERE id = 'segment-late'`
+    ).run();
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 2,
+    });
+    assert.equal(db.prepare("SELECT count(*) count FROM evidence_refs").get().count, 1);
+    assert.equal(
+      db.prepare("SELECT provenance FROM memory_items_v2").get().provenance,
+      "legacy_unverified"
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT target_entity_type FROM legacy_import_map
+           WHERE source_table = 'memory_evidence' ORDER BY imported_at, rowid`
+        )
+        .all(),
+      [{ target_entity_type: "memory" }, { target_entity_type: "evidence" }]
+    );
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 0,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis groups late memory evidence into one occurrence per legacy session", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    db.exec(`
+      INSERT INTO analysis_runs (
+        id, session_id, kind, window_start, window_end, input_hash, model,
+        status, attempt_count, response_json, created_at, completed_at
+      ) VALUES (
+        'legacy-run-cross-1', 'session-1', 'final', 1000, 5000, '${HASH_A}', 'legacy-model',
+        'completed', 1, '{}', 5000, 5100
+      );
+      INSERT INTO memories (
+        id, type, content, normalized_content, confidence, status,
+        first_seen_at, last_seen_at, occurrence_count, needs_confirmation
+      ) VALUES (
+        'legacy-memory-cross', 'fact', 'Seen in two sessions', 'seen in two sessions',
+        0.9, 'active', 5000, 5100, 1, 0
+      );
+      INSERT INTO memory_evidence (memory_id, segment_id, analysis_run_id)
+      VALUES ('legacy-memory-cross', 'segment-1', 'legacy-run-cross-1');
+    `);
+    const repository = createRepository(db);
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 2,
+    });
+
+    db.exec(`
+      INSERT INTO analysis_runs (
+        id, session_id, kind, window_start, window_end, input_hash, model,
+        status, attempt_count, response_json, created_at, completed_at
+      ) VALUES (
+        'legacy-run-cross-2', 'session-2', 'final', 6000, 9000, '${HASH_B}', 'legacy-model',
+        'completed', 1, '{}', 9000, 9100
+      );
+      INSERT INTO memory_evidence (memory_id, segment_id, analysis_run_id)
+      VALUES ('legacy-memory-cross', 'segment-other', 'legacy-run-cross-2');
+    `);
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 2,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT legacy_session_id, count(*) AS count
+           FROM memory_occurrences
+           GROUP BY legacy_session_id ORDER BY legacy_session_id`
+        )
+        .all(),
+      [
+        { legacy_session_id: "session-1", count: 1 },
+        { legacy_session_id: "session-2", count: 1 },
+      ]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT occurrence.legacy_session_id, evidence.session_id,
+                  evidence.transcript_segment_id
+           FROM evidence_refs AS evidence
+           JOIN memory_occurrences AS occurrence ON occurrence.id = evidence.entity_id
+           WHERE evidence.entity_type = 'memory_occurrence'
+           ORDER BY evidence.session_id`
+        )
+        .all(),
+      [
+        {
+          legacy_session_id: "session-1",
+          session_id: "session-1",
+          transcript_segment_id: "segment-1",
+        },
+        {
+          legacy_session_id: "session-2",
+          session_id: "session-2",
+          transcript_segment_id: "segment-other",
+        },
+      ]
+    );
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 0,
+    });
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count, 2);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis appends summary and topic revisions without overwriting history", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const repository = createRepository(db);
+    repository.importLegacyAnalysis();
+    db.exec(`
+      INSERT INTO analysis_runs (
+        id, session_id, kind, window_start, window_end, input_hash, model,
+        status, attempt_count, response_json, created_at, completed_at
+      ) VALUES (
+        'legacy-run-2', 'session-1', 'final', 1000, 5000, '${HASH_B}', 'legacy-model',
+        'completed', 1, '{}', 5200, 5300
+      );
+      UPDATE session_summaries
+      SET summary = 'Revised legacy summary', analysis_run_id = 'legacy-run-2', updated_at = 5300
+      WHERE session_id = 'session-1';
+      UPDATE topics
+      SET description = 'Revised release planning', last_seen_at = 5300
+      WHERE id = 'legacy-topic-1';
+      UPDATE session_topics
+      SET analysis_run_id = 'legacy-run-2'
+      WHERE session_id = 'session-1' AND topic_id = 'legacy-topic-1';
+    `);
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 5,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT revision, lifecycle, content_json
+           FROM session_summary_revisions ORDER BY revision`
+        )
+        .all()
+        .map((row) => ({ ...row, content: JSON.parse(row.content_json) }))
+        .map(({ content_json: _contentJson, ...row }) => row),
+      [
+        {
+          revision: 1,
+          lifecycle: "superseded",
+          content: {
+            decisions: ["Keep the local database"],
+            suggestions: [{ content: "Review the release", reason: "Catch regressions" }],
+            summary: "Legacy summary",
+          },
+        },
+        {
+          revision: 2,
+          lifecycle: "active",
+          content: {
+            decisions: ["Keep the local database"],
+            suggestions: [{ content: "Review the release", reason: "Catch regressions" }],
+            summary: "Revised legacy summary",
+          },
+        },
+      ]
+    );
+    assert.deepEqual(
+      db.prepare("SELECT revision, summary FROM topic_revisions ORDER BY revision").all(),
+      [
+        { revision: 1, summary: "Release planning" },
+        { revision: 2, summary: "Revised release planning" },
+      ]
+    );
+    assert.equal(db.prepare("SELECT count(*) count FROM topic_occurrences").get().count, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis completes a todo monotonically and never reopens it", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const repository = createRepository(db);
+    repository.importLegacyAnalysis();
+
+    db.prepare(
+      `UPDATE todos
+       SET status = 'completed', completed_at = 5200, updated_at = 5200
+       WHERE id = 'legacy-todo-1'`
+    ).run();
+    assert.equal(repository.importLegacyAnalysis().importedRowCount, 1);
+    assert.deepEqual(db.prepare("SELECT status, completed_at FROM todos_v2").get(), {
+      status: "completed",
+      completed_at: 5200,
+    });
+
+    db.prepare(
+      `UPDATE todos
+       SET status = 'open', completed_at = NULL, updated_at = 5300
+       WHERE id = 'legacy-todo-1'`
+    ).run();
+    assert.equal(repository.importLegacyAnalysis().importedRowCount, 1);
+    assert.deepEqual(db.prepare("SELECT status, completed_at FROM todos_v2").get(), {
+      status: "completed",
+      completed_at: 5200,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT from_status, to_status, reason, actor
+           FROM todo_state_transitions ORDER BY occurred_at, id`
+        )
+        .all(),
+      [
+        {
+          from_status: "open",
+          to_status: "completed",
+          reason: "user_action",
+          actor: "user",
+        },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("importLegacyAnalysis adds later todo evidence without mutating legacy provenance", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-todo-late', 'session-1', 'todo-late.wav', 2600, 2800, 200, '${HASH_C}', 9000,
+        'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-todo-late', 'session-1', 2600, 2800, 'person-self', 'SELF',
+        'todo evidence later', 0.8, 0, 'pending', 'track-1', 'chunk-todo-late', 'mic',
+        'provisional', 1, NULL, NULL
+      );
+      INSERT INTO analysis_runs (
+        id, session_id, kind, window_start, window_end, input_hash, model,
+        status, attempt_count, response_json, created_at, completed_at
+      ) VALUES (
+        'legacy-run-todo-late', 'session-1', 'final', 2600, 2800, '${HASH_C}', 'legacy-model',
+        'completed', 1, '{}', 2800, 2900
+      );
+      INSERT INTO todos (
+        id, content, normalized_content, status, confidence, created_at, updated_at,
+        source_session_id, source_segment_id, analysis_run_id
+      ) VALUES (
+        'legacy-todo-late', 'Follow late evidence', 'follow late evidence', 'open', 0.8,
+        2800, 2900, 'session-1', 'segment-todo-late', 'legacy-run-todo-late'
+      );
+    `);
+    const repository = createRepository(db);
+
+    assert.equal(repository.importLegacyAnalysis().importedRowCount, 1);
+    assert.equal(
+      db.prepare("SELECT provenance FROM todos_v2").get().provenance,
+      "legacy_unverified"
+    );
+    assert.equal(db.prepare("SELECT count(*) count FROM evidence_refs").get().count, 0);
+
+    db.prepare(
+      `UPDATE transcript_segments
+       SET result_kind = 'final', is_stable = 1, analysis_state = 'analyzed',
+           model_version = 'whisper-v1', completed_at = 3000
+       WHERE id = 'segment-todo-late'`
+    ).run();
+    assert.equal(repository.importLegacyAnalysis().importedRowCount, 1);
+    assert.equal(
+      db.prepare("SELECT provenance FROM todos_v2").get().provenance,
+      "legacy_unverified"
+    );
+    assert.equal(db.prepare("SELECT count(*) count FROM evidence_refs").get().count, 1);
+    assert.equal(db.prepare("SELECT count(*) count FROM todo_occurrences").get().count, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test("audio tombstoning expires imported evidence without creating another legacy occurrence", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const repository = createRepository(db);
+    repository.importLegacyAnalysis();
+    const baseline = {
+      maps: db.prepare("SELECT count(*) count FROM legacy_import_map").get().count,
+      memories: db.prepare("SELECT count(*) count FROM memory_occurrences").get().count,
+      todos: db.prepare("SELECT count(*) count FROM todo_occurrences").get().count,
+      evidence: db.prepare("SELECT count(*) count FROM evidence_refs").get().count,
+    };
+
+    db.prepare("UPDATE audio_chunks SET deleted_at = 7000 WHERE id = 'chunk-1'").run();
+
+    assert.deepEqual(repository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 0,
+    });
+    assert.deepEqual(
+      {
+        maps: db.prepare("SELECT count(*) count FROM legacy_import_map").get().count,
+        memories: db.prepare("SELECT count(*) count FROM memory_occurrences").get().count,
+        todos: db.prepare("SELECT count(*) count FROM todo_occurrences").get().count,
+        evidence: db.prepare("SELECT count(*) count FROM evidence_refs").get().count,
+      },
+      baseline
+    );
+    assert.deepEqual(db.prepare("SELECT DISTINCT audio_state FROM evidence_refs").all(), [
+      { audio_state: "expired" },
+    ]);
   } finally {
     db.close();
   }

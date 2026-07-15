@@ -7,7 +7,8 @@ const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { createStableSegmentId } = require("../../src/jarvis/shared/segmentIds.ts");
 
 function insertTranscriptLineageRow(db, overrides = {}) {
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO transcript_segments (
       id, session_id, started_at, ended_at, person_id, speaker_label,
       text, confidence, is_stable, analysis_state, track_id, chunk_id,
@@ -17,7 +18,8 @@ function insertTranscriptLineageRow(db, overrides = {}) {
       @text, @confidence, @isStable, 'pending', @trackId, @chunkId,
       @sourceType, @resultKind, @version, @modelVersion, @completedAt
     )
-  `).run({
+  `
+  ).run({
     id: "lineage-row",
     sessionId: "lineage-session",
     startedAt: 2_000,
@@ -35,6 +37,28 @@ function insertTranscriptLineageRow(db, overrides = {}) {
     completedAt: 4_000,
     ...overrides,
   });
+}
+
+function legacyAnalysisInput(overrides = {}) {
+  return {
+    runId: "legacy-run",
+    sessionId: "legacy-session",
+    kind: "final",
+    inputHash: "legacy-input-hash",
+    model: "legacy-model",
+    windowStart: 1_000,
+    windowEnd: 2_000,
+    completedAt: 2_100,
+    result: {
+      summary: "Legacy analysis summary",
+      decisions: [],
+      suggestions: [],
+      topics: [],
+      todos: [],
+      memories: [],
+    },
+    ...overrides,
+  };
 }
 
 test("persists the selected capture mode on session creation", (t) => {
@@ -196,12 +220,27 @@ test("session timeline returns deterministic source evidence, visible text, and 
 
   const timeline = repo.getSessionTimeline("timeline-session");
 
-  assert.deepEqual(timeline.tracks.map((track) => track.source_type), ["mic", "system"]);
-  assert.deepEqual(timeline.gaps.map((gap) => gap.id), ["gap-early", "gap-late"]);
-  assert.deepEqual(timeline.tracks[0].gaps.map((gap) => gap.id), ["gap-early"]);
-  assert.deepEqual(timeline.chunks.map((chunk) => chunk.id), chunks.map((chunk) => chunk[0]));
+  assert.deepEqual(
+    timeline.tracks.map((track) => track.source_type),
+    ["mic", "system"]
+  );
+  assert.deepEqual(
+    timeline.gaps.map((gap) => gap.id),
+    ["gap-early", "gap-late"]
+  );
+  assert.deepEqual(
+    timeline.tracks[0].gaps.map((gap) => gap.id),
+    ["gap-early"]
+  );
+  assert.deepEqual(
+    timeline.chunks.map((chunk) => chunk.id),
+    chunks.map((chunk) => chunk[0])
+  );
   assert.equal(timeline.chunks[2].deleted_at, 5_000);
-  assert.deepEqual(timeline.segments.map((segment) => segment.id), ["visible-mic", final.id]);
+  assert.deepEqual(
+    timeline.segments.map((segment) => segment.id),
+    ["visible-mic", final.id]
+  );
   assert.deepEqual(timeline.processing_counts, {
     pending: 1,
     leased: 1,
@@ -600,10 +639,16 @@ test("low-disk stop atomically persists paused tracks, reason, and durable bound
   assert.equal(paused.status, "paused");
   assert.equal(paused.stop_reason, "capture_stopped_low_disk");
   assert.equal(paused.durable_boundary_at, 2_000);
-  assert.equal(repo.db.prepare("SELECT state FROM audio_tracks WHERE id = ?").get("track-low-disk").state, "paused");
+  assert.equal(
+    repo.db.prepare("SELECT state FROM audio_tracks WHERE id = ?").get("track-low-disk").state,
+    "paused"
+  );
 
   const recovered = repo.recoverOpenSessions(5_000);
-  assert.equal(recovered.find((session) => session.id === "low-disk").stop_reason, "capture_stopped_low_disk");
+  assert.equal(
+    recovered.find((session) => session.id === "low-disk").stop_reason,
+    "capture_stopped_low_disk"
+  );
   assert.equal(repo.getSession("low-disk").status, "paused");
 
   repo.resumeCapture({
@@ -666,6 +711,259 @@ test("schema initialization is idempotent and file databases use WAL", () => {
     second.close();
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("repository startup imports pre-existing legacy analysis on the same live connection", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-legacy-startup-"));
+  const dbPath = path.join(directory, "jarvis.db");
+  let first = null;
+  let second = null;
+  try {
+    first = new JarvisRepository(dbPath);
+    first.createSession({ id: "legacy-session", startedAt: 1_000, micDeviceId: null });
+    first.db
+      .prepare(
+        `INSERT INTO analysis_runs (
+           id, session_id, kind, window_start, window_end, input_hash, model,
+           status, attempt_count, response_json, created_at, completed_at
+         ) VALUES (?, ?, 'final', 1000, 2000, ?, 'legacy-model',
+                   'completed', 1, '{}', 2000, 2100)`
+      )
+      .run("legacy-run", "legacy-session", "legacy-input-hash");
+    first.db
+      .prepare(
+        `INSERT INTO session_summaries (
+           session_id, summary, decisions_json, suggestions_json,
+           analysis_run_id, updated_at, is_final
+         ) VALUES (?, 'Startup legacy summary', '[]', '[]', ?, 2100, 1)`
+      )
+      .run("legacy-session", "legacy-run");
+    first.close();
+    first = null;
+
+    second = new JarvisRepository(dbPath);
+    assert.ok(second.memoryRepository);
+    assert.equal(second.memoryRepository.db, second.db);
+    assert.equal(second.memoryRepository.validateRedactedCloudPayload({}), false);
+    assert.deepEqual(
+      second.db
+        .prepare(
+          `SELECT session_id, provenance, completeness
+           FROM session_summary_revisions`
+        )
+        .get(),
+      {
+        session_id: "legacy-session",
+        provenance: "legacy_unverified",
+        completeness: "final",
+      }
+    );
+  } finally {
+    first?.close();
+    second?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy apply and import share one transaction and completed-run recovery still scans", () => {
+  const repo = new JarvisRepository(":memory:");
+  try {
+    repo.createSession({ id: "legacy-session", startedAt: 1_000, micDeviceId: null });
+    const baselineRuns = repo.db
+      .prepare("SELECT count(*) count FROM legacy_import_runs")
+      .get().count;
+    repo.db.exec(`
+      CREATE TRIGGER fail_legacy_summary_import
+      BEFORE INSERT ON legacy_import_map
+      WHEN NEW.source_table = 'session_summaries'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected repository legacy import failure');
+      END;
+    `);
+
+    assert.throws(
+      () => repo.applyAnalysisResult(legacyAnalysisInput()),
+      /injected repository legacy import failure/
+    );
+    assert.equal(repo.db.prepare("SELECT count(*) count FROM analysis_runs").get().count, 0);
+    assert.equal(repo.db.prepare("SELECT count(*) count FROM session_summaries").get().count, 0);
+    assert.equal(
+      repo.db.prepare("SELECT count(*) count FROM session_summary_revisions").get().count,
+      0
+    );
+    assert.equal(
+      repo.db.prepare("SELECT count(*) count FROM legacy_import_runs").get().count,
+      baselineRuns
+    );
+
+    repo.db.exec("DROP TRIGGER fail_legacy_summary_import");
+    repo.applyAnalysisResult(legacyAnalysisInput());
+    assert.equal(repo.db.prepare("SELECT count(*) count FROM analysis_runs").get().count, 1);
+    assert.equal(
+      repo.db.prepare("SELECT count(*) count FROM session_summary_revisions").get().count,
+      1
+    );
+    repo.db.exec(`
+      INSERT INTO topics (
+        id, canonical_title, normalized_title, description, status, created_at, last_seen_at
+      ) VALUES (
+        'late-legacy-topic', 'Late legacy topic', 'late legacy topic',
+        'Imported through completed-run recovery', 'active', 2000, 2200
+      );
+      INSERT INTO session_topics (session_id, topic_id, analysis_run_id)
+      VALUES ('legacy-session', 'late-legacy-topic', 'legacy-run');
+    `);
+
+    repo.applyAnalysisResult(legacyAnalysisInput());
+    assert.equal(repo.db.prepare("SELECT count(*) count FROM topics_v2").get().count, 1);
+    assert.equal(repo.db.prepare("SELECT count(*) count FROM topic_occurrences").get().count, 1);
+    assert.equal(
+      repo.db.prepare("SELECT count(*) count FROM legacy_import_runs").get().count,
+      baselineRuns + 2
+    );
+  } finally {
+    repo.close();
+  }
+});
+
+test("real legacy applies keep one imported memory occurrence per evidence session across restart", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-memory-session-import-"));
+  const dbPath = path.join(directory, "jarvis.db");
+  let repo = null;
+  try {
+    repo = new JarvisRepository(dbPath);
+    const addEvidenceSession = (suffix, startedAt) => {
+      const sessionId = `memory-session-${suffix}`;
+      const trackId = `memory-track-${suffix}`;
+      const chunkId = `memory-chunk-${suffix}`;
+      repo.createSession({
+        id: sessionId,
+        startedAt,
+        micDeviceId: `memory-mic-${suffix}`,
+        captureMode: "mic",
+      });
+      repo.createTrack({
+        id: trackId,
+        sessionId,
+        sourceType: "mic",
+        deviceId: `memory-mic-${suffix}`,
+        sampleRate: 24_000,
+        channels: 1,
+        startedAt,
+      });
+      repo.commitChunk({
+        id: chunkId,
+        sessionId,
+        trackId,
+        sourceType: "mic",
+        sequenceNumber: 0,
+        path: `${chunkId}.wav`,
+        startedAt: startedAt + 100,
+        endedAt: startedAt + 1_100,
+        durationMs: 1_000,
+        sha256: suffix.repeat(64),
+        expiresAt: startedAt + 10_000,
+      });
+      const segment = repo.commitChunkTranscript({
+        chunk: repo.getAudioChunk(chunkId),
+        result: { text: `memory evidence ${suffix}`, confidence: 0.95 },
+        modelVersion: "large-v3-turbo",
+        completedAt: startedAt + 1_200,
+      });
+      return { sessionId, segmentId: segment.id, startedAt };
+    };
+    const applyMemory = ({ sessionId, segmentId, startedAt }, suffix) =>
+      repo.applyAnalysisResult(
+        legacyAnalysisInput({
+          runId: `memory-run-${suffix}`,
+          sessionId,
+          inputHash: `memory-input-${suffix}`,
+          windowStart: startedAt,
+          windowEnd: startedAt + 1_100,
+          completedAt: startedAt + 1_300,
+          result: {
+            summary: `Memory summary ${suffix}`,
+            decisions: [],
+            suggestions: [],
+            topics: [],
+            todos: [],
+            memories: [
+              {
+                type: "fact",
+                content: "Stable memory across sessions",
+                personRef: null,
+                topicRef: null,
+                confidence: 0.9,
+                evidenceSegmentIds: [segmentId],
+              },
+            ],
+          },
+        })
+      );
+
+    applyMemory(addEvidenceSession("a", 1_000), "a");
+    applyMemory(addEvidenceSession("b", 20_000), "b");
+
+    const occurrenceCounts = () =>
+      repo.db
+        .prepare(
+          `SELECT legacy_session_id, count(*) AS count
+           FROM memory_occurrences
+           GROUP BY legacy_session_id ORDER BY legacy_session_id`
+        )
+        .all();
+    const evidenceCounts = () =>
+      repo.db
+        .prepare(
+          `SELECT occurrence.legacy_session_id, count(*) AS count
+           FROM evidence_refs AS evidence
+           JOIN memory_occurrences AS occurrence ON occurrence.id = evidence.entity_id
+           WHERE evidence.entity_type = 'memory_occurrence'
+           GROUP BY occurrence.legacy_session_id ORDER BY occurrence.legacy_session_id`
+        )
+        .all();
+    const expectedCounts = [
+      { legacy_session_id: "memory-session-a", count: 1 },
+      { legacy_session_id: "memory-session-b", count: 1 },
+    ];
+    assert.deepEqual(occurrenceCounts(), expectedCounts);
+    assert.deepEqual(evidenceCounts(), expectedCounts);
+
+    repo.close();
+    repo = new JarvisRepository(dbPath);
+    assert.deepEqual(repo.memoryRepository.importLegacyAnalysis(), {
+      status: "completed",
+      importedRowCount: 0,
+    });
+    assert.deepEqual(occurrenceCounts(), expectedCounts);
+    assert.deepEqual(evidenceCounts(), expectedCounts);
+  } finally {
+    repo?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reopen reconstructs MemoryRepository against only the replacement database", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-memory-reopen-"));
+  const firstPath = path.join(root, "first.db");
+  const secondPath = path.join(root, "second.db");
+  let repo = null;
+  try {
+    repo = new JarvisRepository(firstPath);
+    const previousMemoryRepository = repo.memoryRepository;
+    const previousDatabase = repo.db;
+
+    repo.reopen(secondPath);
+
+    assert.notEqual(repo.memoryRepository, previousMemoryRepository);
+    assert.notEqual(repo.db, previousDatabase);
+    assert.equal(previousDatabase.open, false);
+    assert.equal(repo.memoryRepository.db, repo.db);
+    assert.equal(repo.memoryRepository.db.open, true);
+  } finally {
+    repo?.close();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -1203,8 +1501,14 @@ test("checkpoints WAL and relocates every contained audio locator in one transac
     .run(retiredPath, "c1");
 
   repo.checkpointForMigration();
-  repo.relocateDataRoot({ fromRecordingsRoot: oldRecordingsRoot, toRecordingsRoot: newRecordingsRoot });
-  repo.relocateDataRoot({ fromRecordingsRoot: oldRecordingsRoot, toRecordingsRoot: newRecordingsRoot });
+  repo.relocateDataRoot({
+    fromRecordingsRoot: oldRecordingsRoot,
+    toRecordingsRoot: newRecordingsRoot,
+  });
+  repo.relocateDataRoot({
+    fromRecordingsRoot: oldRecordingsRoot,
+    toRecordingsRoot: newRecordingsRoot,
+  });
 
   const row = repo.db.prepare("SELECT path, retired_path FROM audio_chunks WHERE id = ?").get("c1");
   assert.equal(row.path, path.join(newRecordingsRoot, "s1", "mic", "chunk.wav"));

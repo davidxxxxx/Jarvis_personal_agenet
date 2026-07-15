@@ -5,6 +5,7 @@ const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
 const REDACTION_VERSION = "jarvis-redaction-v1";
 const CANONICAL_INPUT_VERSION = "jarvis-analysis-input-canonical-v2";
 const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
+const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
 const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
 
 function codedError(code) {
@@ -125,6 +126,32 @@ function assertTimezone(value) {
 
 function normalizedKey(value) {
   return value.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function parseLegacyArray(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function legacyText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function legacyConfidence(value) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+}
+
+function legacyDueText(value) {
+  if (!Number.isSafeInteger(value) || value < 0) return null;
+  try {
+    return new Date(value).toISOString().slice(0, 10);
+  } catch {
+    return null;
+  }
 }
 
 function validateCandidateText(value) {
@@ -1278,6 +1305,758 @@ class MemoryRepository {
     return transaction.immediate();
   }
 
+  importLegacyAnalysis() {
+    const transaction = this.db.transaction(() => {
+      let importedAt = null;
+      let importRunId = null;
+      const ensureImportRun = () => {
+        if (importRunId !== null) return;
+        importedAt = assertTimestamp(this.now(), "importedAt");
+        importRunId = this._nextId("legacy_import_run");
+        this.db
+          .prepare(
+            `INSERT INTO legacy_import_runs (
+               id, importer_version, status, started_at, completed_at, imported_row_count
+             ) VALUES (?, ?, 'running', ?, NULL, 0)`
+          )
+          .run(importRunId, LEGACY_IMPORTER_VERSION, importedAt);
+      };
+
+      const getMap = this.db.prepare(
+        `SELECT target_entity_type, target_entity_id
+         FROM legacy_import_map
+         WHERE source_table = ? AND source_key = ? AND source_fingerprint = ?`
+      );
+      const insertMap = this.db.prepare(
+        `INSERT INTO legacy_import_map (
+           source_table, source_key, source_fingerprint, target_entity_type,
+           target_entity_id, import_run_id, imported_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      let importedRowCount = 0;
+      const mapped = (sourceTable, sourceKey, fingerprint) =>
+        getMap.get(sourceTable, sourceKey, fingerprint) ?? null;
+      const recordMap = (sourceTable, sourceKey, fingerprint, targetType, targetId) => {
+        if (importRunId === null || importedAt === null) {
+          throw codedError("MEMORY_LEGACY_IMPORT_STATE_INVALID");
+        }
+        insertMap.run(
+          sourceTable,
+          sourceKey,
+          fingerprint,
+          targetType,
+          targetId,
+          importRunId,
+          importedAt
+        );
+        importedRowCount += 1;
+      };
+      const sourceKeyFor = (...parts) => canonicalJson(parts);
+      const fingerprintFor = (...parts) => sha256(canonicalJson(parts));
+      const occurrenceKeyFor = (sourceTable, sourceKey, fingerprint) =>
+        sha256(canonicalJson(["legacy", sourceTable, sourceKey, fingerprint]));
+
+      const resolveLegacyEvidence = (segmentId, expectedSessionId) => {
+        const segment = this.db
+          .prepare(
+            `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
+                    segment.version, segment.text, segment.result_kind, segment.is_stable,
+                    segment.superseded_by, segment.duplicate_of, segment.chunk_id,
+                    segment.track_id, chunk.session_id AS chunk_session_id,
+                    chunk.track_id AS chunk_track_id, chunk.started_at AS chunk_started_at,
+                    chunk.ended_at AS chunk_ended_at, chunk.deleted_at,
+                    track.session_id AS track_session_id
+             FROM transcript_segments AS segment
+             LEFT JOIN audio_chunks AS chunk ON chunk.id = segment.chunk_id
+             LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+             WHERE segment.id = ?`
+          )
+          .get(segmentId);
+        const lineageFingerprint = fingerprintFor(
+          segmentId,
+          expectedSessionId,
+          segment
+            ? {
+                id: segment.id,
+                sessionId: segment.session_id,
+                startedAt: segment.started_at,
+                endedAt: segment.ended_at,
+                version: segment.version,
+                text: segment.text,
+                resultKind: segment.result_kind,
+                isStable: segment.is_stable,
+                supersededBy: segment.superseded_by,
+                duplicateOf: segment.duplicate_of,
+                chunkId: segment.chunk_id,
+                trackId: segment.track_id,
+                chunkSessionId: segment.chunk_session_id,
+                chunkTrackId: segment.chunk_track_id,
+                chunkStartedAt: segment.chunk_started_at,
+                chunkEndedAt: segment.chunk_ended_at,
+                trackSessionId: segment.track_session_id,
+              }
+            : null
+        );
+        if (
+          !segment ||
+          segment.session_id !== expectedSessionId ||
+          segment.result_kind !== "final" ||
+          segment.is_stable !== 1 ||
+          segment.superseded_by !== null ||
+          segment.duplicate_of !== null ||
+          !legacyText(segment.text) ||
+          segment.chunk_id === null ||
+          segment.track_id === null ||
+          segment.chunk_session_id !== expectedSessionId ||
+          segment.chunk_track_id !== segment.track_id ||
+          segment.track_session_id !== expectedSessionId ||
+          segment.started_at < segment.chunk_started_at ||
+          segment.ended_at > segment.chunk_ended_at
+        ) {
+          return { valid: false, lineageFingerprint, segment };
+        }
+        return {
+          valid: true,
+          lineageFingerprint,
+          segment,
+          evidence: {
+            sessionId: expectedSessionId,
+            segmentId: segment.id,
+            audioChunkId: segment.chunk_id,
+            trackId: segment.track_id,
+            startedAt: segment.started_at,
+            endedAt: segment.ended_at,
+            quoteText: segment.text,
+            audioState: segment.deleted_at === null ? "available" : "expired",
+          },
+        };
+      };
+
+      const insertEvidence = (entityType, entityId, evidence) => {
+        const existing = this.db
+          .prepare(
+            `SELECT id FROM evidence_refs
+             WHERE entity_type = ? AND entity_id = ? AND transcript_segment_id = ?
+               AND started_at = ? AND ended_at = ?`
+          )
+          .get(entityType, entityId, evidence.segmentId, evidence.startedAt, evidence.endedAt);
+        if (existing) return existing.id;
+        const evidenceId = this._nextId("evidence");
+        this.db
+          .prepare(
+            `INSERT INTO evidence_refs (
+               id, entity_type, entity_id, source_analysis_input_id, session_id,
+               transcript_segment_id, audio_chunk_id, track_id, started_at, ended_at,
+               quote_text, audio_state, created_at
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            evidenceId,
+            entityType,
+            entityId,
+            evidence.sessionId,
+            evidence.segmentId,
+            evidence.audioChunkId,
+            evidence.trackId,
+            evidence.startedAt,
+            evidence.endedAt,
+            evidence.quoteText,
+            evidence.audioState,
+            importedAt
+          );
+        return evidenceId;
+      };
+
+      const legacyMemoryKeys = (kind, title, body) => {
+        const normalizedTitle = normalizedKey(title);
+        const slotKey = sha256(canonicalJson({ kind, title: normalizedTitle }));
+        return {
+          slotKey,
+          valueKey: sha256(canonicalJson({ slotKey, body: normalizedKey(body) })),
+        };
+      };
+
+      const ensureLegacyMemory = ({ kind, title, body, confidence, provenance }) => {
+        const { slotKey, valueKey } = legacyMemoryKeys(kind, title, body);
+        let row = this.db
+          .prepare("SELECT id, provenance FROM memory_items_v2 WHERE canonical_value_key = ?")
+          .get(valueKey);
+        if (!row) {
+          row = { id: this._nextId("memory"), provenance };
+          this.db
+            .prepare(
+              `INSERT INTO memory_items_v2 (
+                 id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+                 lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?, ?, ?)`
+            )
+            .run(
+              row.id,
+              kind,
+              slotKey,
+              valueKey,
+              title,
+              body,
+              confidence,
+              provenance,
+              importedAt,
+              importedAt
+            );
+        }
+        return row.id;
+      };
+
+      const summaryRows = this.db
+        .prepare(
+          `SELECT session_id, summary, decisions_json, suggestions_json,
+                  analysis_run_id, updated_at, is_final
+           FROM session_summaries ORDER BY updated_at, session_id`
+        )
+        .all();
+      for (const summary of summaryRows) {
+        const decisions = parseLegacyArray(summary.decisions_json);
+        const suggestions = parseLegacyArray(summary.suggestions_json);
+        const sourceKey = sourceKeyFor(summary.session_id, summary.analysis_run_id);
+        const fingerprint = fingerprintFor(
+          summary.session_id,
+          summary.summary,
+          summary.decisions_json,
+          summary.suggestions_json,
+          summary.analysis_run_id,
+          summary.updated_at,
+          summary.is_final
+        );
+        if (!mapped("session_summaries", sourceKey, fingerprint)) {
+          ensureImportRun();
+          const previous = this.db
+            .prepare(
+              `SELECT id, revision, completeness FROM session_summary_revisions
+               WHERE session_id = ? ORDER BY revision DESC LIMIT 1`
+            )
+            .get(summary.session_id);
+          if (previous) {
+            this.db
+              .prepare(
+                `UPDATE session_summary_revisions
+                 SET lifecycle = 'superseded' WHERE id = ? AND lifecycle = 'active'`
+              )
+              .run(previous.id);
+          }
+          const summaryId = this._nextId("session_summary_revision");
+          this.db
+            .prepare(
+              `INSERT INTO session_summary_revisions (
+                 id, session_id, revision, previous_revision_id, completeness, lifecycle,
+                 content_json, source_analysis_input_id, provenance, created_at
+               ) VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, 'legacy_unverified', ?)`
+            )
+            .run(
+              summaryId,
+              summary.session_id,
+              (previous?.revision ?? 0) + 1,
+              previous?.id ?? null,
+              previous?.completeness === "final" || summary.is_final === 1
+                ? "final"
+                : "incremental",
+              canonicalJson({
+                summary: typeof summary.summary === "string" ? summary.summary : "",
+                decisions,
+                suggestions,
+              }),
+              importedAt
+            );
+          recordMap("session_summaries", sourceKey, fingerprint, "session_summary", summaryId);
+        }
+
+        for (const [index, decisionValue] of decisions.entries()) {
+          const decision = legacyText(decisionValue);
+          if (!decision) continue;
+          const decisionSourceKey = sourceKeyFor(
+            summary.session_id,
+            summary.analysis_run_id,
+            index
+          );
+          const decisionFingerprint = fingerprintFor(decisionValue);
+          if (mapped("session_summary_decisions", decisionSourceKey, decisionFingerprint)) continue;
+          ensureImportRun();
+          const memoryId = ensureLegacyMemory({
+            kind: "decision",
+            title: decision,
+            body: decision,
+            confidence: 1,
+            provenance: "legacy_unverified",
+          });
+          const occurrenceId = this._nextId("memory_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO memory_occurrences (
+                 id, memory_value_id, analysis_input_id, legacy_session_id, occurrence_key,
+                 candidate_item_fingerprint, started_at, ended_at, confidence, created_at
+               ) VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, 1, ?)`
+            )
+            .run(
+              occurrenceId,
+              memoryId,
+              summary.session_id,
+              occurrenceKeyFor("session_summary_decisions", decisionSourceKey, decisionFingerprint),
+              decisionFingerprint,
+              importedAt
+            );
+          recordMap(
+            "session_summary_decisions",
+            decisionSourceKey,
+            decisionFingerprint,
+            "memory",
+            memoryId
+          );
+        }
+
+        for (const [index, suggestionValue] of suggestions.entries()) {
+          if (
+            !suggestionValue ||
+            typeof suggestionValue !== "object" ||
+            Array.isArray(suggestionValue)
+          ) {
+            continue;
+          }
+          const title = legacyText(suggestionValue.content ?? suggestionValue.title);
+          const rationale = legacyText(suggestionValue.reason ?? suggestionValue.rationale);
+          if (!title || !rationale) continue;
+          const suggestionSourceKey = sourceKeyFor(
+            summary.session_id,
+            summary.analysis_run_id,
+            index
+          );
+          const suggestionFingerprint = fingerprintFor(suggestionValue);
+          if (mapped("session_summary_suggestions", suggestionSourceKey, suggestionFingerprint)) {
+            continue;
+          }
+          ensureImportRun();
+          const canonicalKey = sha256(
+            canonicalJson({ title: normalizedKey(title), rationale: normalizedKey(rationale) })
+          );
+          let suggestionRow = this.db
+            .prepare("SELECT id FROM suggestions_v2 WHERE canonical_key = ?")
+            .get(canonicalKey);
+          if (!suggestionRow) {
+            suggestionRow = { id: this._nextId("suggestion") };
+            this.db
+              .prepare(
+                `INSERT INTO suggestions_v2 (
+                   id, canonical_key, title, rationale, state, source_analysis_input_id,
+                   provenance, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'proposed', NULL, 'legacy_unverified', ?, ?)`
+              )
+              .run(suggestionRow.id, canonicalKey, title, rationale, importedAt, importedAt);
+          }
+          const occurrenceId = this._nextId("suggestion_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO suggestion_occurrences (
+                 id, suggestion_id, analysis_input_id, legacy_session_id,
+                 occurrence_key, candidate_item_fingerprint, created_at
+               ) VALUES (?, ?, NULL, ?, ?, ?, ?)`
+            )
+            .run(
+              occurrenceId,
+              suggestionRow.id,
+              summary.session_id,
+              occurrenceKeyFor(
+                "session_summary_suggestions",
+                suggestionSourceKey,
+                suggestionFingerprint
+              ),
+              suggestionFingerprint,
+              importedAt
+            );
+          recordMap(
+            "session_summary_suggestions",
+            suggestionSourceKey,
+            suggestionFingerprint,
+            "suggestion",
+            suggestionRow.id
+          );
+        }
+      }
+
+      const legacyTopicTargets = new Map();
+      const topicRows = this.db.prepare("SELECT * FROM topics ORDER BY created_at, id").all();
+      for (const topic of topicRows) {
+        const name = legacyText(topic.canonical_title);
+        if (!name) continue;
+        const sourceKey = sourceKeyFor(topic.id);
+        const fingerprint = fingerprintFor(topic);
+        const existingMap = mapped("topics", sourceKey, fingerprint);
+        if (existingMap) {
+          legacyTopicTargets.set(topic.id, existingMap.target_entity_id);
+          continue;
+        }
+        ensureImportRun();
+        const canonicalKey = sha256(normalizedKey(name));
+        let topicRow = this.db
+          .prepare("SELECT id FROM topics_v2 WHERE canonical_key = ?")
+          .get(canonicalKey);
+        if (!topicRow) {
+          topicRow = { id: this._nextId("topic") };
+          this.db
+            .prepare(
+              `INSERT INTO topics_v2 (
+                 id, canonical_key, name, canonical_algorithm, lifecycle,
+                 source_analysis_input_id, provenance, created_at, updated_at
+               ) VALUES (?, ?, ?, 'canonical-v1', 'active', NULL, 'legacy_unverified', ?, ?)`
+            )
+            .run(topicRow.id, canonicalKey, name, importedAt, importedAt);
+        }
+        const previous = this.db
+          .prepare(
+            `SELECT id, revision, summary FROM topic_revisions
+             WHERE topic_id = ? ORDER BY revision DESC LIMIT 1`
+          )
+          .get(topicRow.id);
+        const description = typeof topic.description === "string" ? topic.description : "";
+        if (!previous || previous.summary !== description) {
+          this.db
+            .prepare(
+              `INSERT INTO topic_revisions (
+                 id, topic_id, revision, previous_revision_id, summary,
+                 source_analysis_input_id, provenance, created_at
+               ) VALUES (?, ?, ?, ?, ?, NULL, 'legacy_unverified', ?)`
+            )
+            .run(
+              this._nextId("topic_revision"),
+              topicRow.id,
+              (previous?.revision ?? 0) + 1,
+              previous?.id ?? null,
+              description,
+              importedAt
+            );
+        }
+        legacyTopicTargets.set(topic.id, topicRow.id);
+        recordMap("topics", sourceKey, fingerprint, "topic", topicRow.id);
+      }
+
+      const sessionTopicRows = this.db
+        .prepare(
+          `SELECT session_id, topic_id, analysis_run_id
+           FROM session_topics ORDER BY session_id, topic_id`
+        )
+        .all();
+      for (const relation of sessionTopicRows) {
+        const topicId = legacyTopicTargets.get(relation.topic_id);
+        if (!topicId) continue;
+        const sourceKey = sourceKeyFor(
+          relation.session_id,
+          relation.topic_id,
+          relation.analysis_run_id
+        );
+        const fingerprint = fingerprintFor(relation);
+        if (mapped("session_topics", sourceKey, fingerprint)) continue;
+        ensureImportRun();
+        const revision = this.db
+          .prepare(
+            `SELECT id FROM topic_revisions
+             WHERE topic_id = ? ORDER BY revision DESC LIMIT 1`
+          )
+          .get(topicId);
+        const occurrenceId = this._nextId("topic_occurrence");
+        this.db
+          .prepare(
+            `INSERT INTO topic_occurrences (
+               id, topic_id, topic_revision_id, analysis_input_id, legacy_session_id,
+               occurrence_key, candidate_item_fingerprint, created_at
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`
+          )
+          .run(
+            occurrenceId,
+            topicId,
+            revision.id,
+            relation.session_id,
+            occurrenceKeyFor("session_topics", sourceKey, fingerprint),
+            fingerprint,
+            importedAt
+          );
+        recordMap("session_topics", sourceKey, fingerprint, "topic", topicId);
+      }
+
+      const todoRows = this.db
+        .prepare(
+          `SELECT todo.*, person.display_name AS owner_display_name
+           FROM todos AS todo
+           LEFT JOIN people AS person ON person.id = todo.owner_person_id
+           ORDER BY todo.created_at, todo.id`
+        )
+        .all();
+      for (const todo of todoRows) {
+        const title = legacyText(todo.content);
+        if (!title) continue;
+        const sourceKey = sourceKeyFor(todo.id);
+        const evidence = todo.source_segment_id
+          ? resolveLegacyEvidence(todo.source_segment_id, todo.source_session_id)
+          : { valid: false, lineageFingerprint: fingerprintFor(null) };
+        const fingerprint = fingerprintFor(todo, evidence.lineageFingerprint);
+        if (mapped("todos", sourceKey, fingerprint)) continue;
+        ensureImportRun();
+        const baseKey = sha256(
+          canonicalJson({
+            title: normalizedKey(title),
+            ownerKind: todo.owner_person_id ? "person" : null,
+            ownerId: todo.owner_person_id ?? null,
+          })
+        );
+        const instanceKey = sha256(canonicalJson(["legacy-todo", todo.id]));
+        let todoRow = this.db
+          .prepare("SELECT * FROM todos_v2 WHERE instance_key = ?")
+          .get(instanceKey);
+        const completed = todo.status === "completed";
+        const completedAt = completed
+          ? Number.isSafeInteger(todo.completed_at)
+            ? todo.completed_at
+            : todo.updated_at
+          : null;
+        const provenance = evidence.valid ? "evidence_linked" : "legacy_unverified";
+        if (!todoRow) {
+          todoRow = { id: this._nextId("todo"), status: completed ? "completed" : "open" };
+          this.db
+            .prepare(
+              `INSERT INTO todos_v2 (
+                 id, canonical_base_key, instance_key, title, owner_subject_kind,
+                 owner_subject_id, owner_display_name_snapshot, status, completed_at,
+                 dismissed_at, source_analysis_input_id, provenance, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`
+            )
+            .run(
+              todoRow.id,
+              baseKey,
+              instanceKey,
+              title,
+              todo.owner_person_id ? "person" : null,
+              todo.owner_person_id ?? null,
+              todo.owner_person_id ? legacyText(todo.owner_display_name) : null,
+              todoRow.status,
+              completedAt,
+              provenance,
+              importedAt,
+              importedAt
+            );
+        } else {
+          if (todoRow.status === "open" && completed) {
+            this.db
+              .prepare(
+                `INSERT INTO todo_state_transitions (
+                   id, todo_instance_id, from_status, to_status, reason,
+                   source_analysis_input_id, actor, occurred_at
+                 ) VALUES (?, ?, 'open', 'completed', 'user_action', NULL, 'user', ?)`
+              )
+              .run(this._nextId("todo_transition"), todoRow.id, completedAt);
+            todoRow.status = "completed";
+          }
+        }
+        const previous = this.db
+          .prepare(
+            `SELECT id, revision, title, due_text FROM todo_revisions
+             WHERE todo_instance_id = ? ORDER BY revision DESC LIMIT 1`
+          )
+          .get(todoRow.id);
+        const dueText = legacyDueText(todo.due_at);
+        let revision = previous;
+        if (!previous || previous.title !== title || previous.due_text !== dueText) {
+          revision = { id: this._nextId("todo_revision"), revision: (previous?.revision ?? 0) + 1 };
+          this.db
+            .prepare(
+              `INSERT INTO todo_revisions (
+                 id, todo_instance_id, revision, previous_revision_id, title, due_text,
+                 source_analysis_input_id, provenance, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`
+            )
+            .run(
+              revision.id,
+              todoRow.id,
+              revision.revision,
+              previous?.id ?? null,
+              title,
+              dueText,
+              provenance,
+              importedAt
+            );
+        }
+        const occurrenceId = this._nextId("todo_occurrence");
+        this.db
+          .prepare(
+            `INSERT INTO todo_occurrences (
+               id, todo_instance_id, todo_revision_id, analysis_input_id, legacy_session_id,
+               occurrence_key, candidate_item_fingerprint, started_at, ended_at, created_at
+             ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            occurrenceId,
+            todoRow.id,
+            revision.id,
+            todo.source_session_id,
+            occurrenceKeyFor("todos", sourceKey, fingerprint),
+            fingerprint,
+            evidence.valid ? evidence.evidence.startedAt : null,
+            evidence.valid ? evidence.evidence.endedAt : null,
+            importedAt
+          );
+        if (evidence.valid) insertEvidence("todo_occurrence", occurrenceId, evidence.evidence);
+        recordMap("todos", sourceKey, fingerprint, "todo", todoRow.id);
+      }
+
+      const memoryTargets = new Map();
+      const memoryRows = this.db.prepare("SELECT * FROM memories ORDER BY first_seen_at, id").all();
+      for (const memory of memoryRows) {
+        const body = legacyText(memory.content);
+        if (!body) continue;
+        const evidenceRows = this.db
+          .prepare(
+            `SELECT evidence.segment_id, evidence.analysis_run_id,
+                    run.session_id AS run_session_id
+             FROM memory_evidence AS evidence
+             JOIN analysis_runs AS run ON run.id = evidence.analysis_run_id
+             WHERE evidence.memory_id = ?
+             ORDER BY run.completed_at, evidence.segment_id`
+          )
+          .all(memory.id);
+        const resolvedEvidence = evidenceRows.map((row) => ({
+          row,
+          resolved: resolveLegacyEvidence(row.segment_id, row.run_session_id),
+        }));
+        const evidenceBySession = new Map();
+        for (const item of resolvedEvidence) {
+          const sessionEvidence = evidenceBySession.get(item.row.run_session_id) ?? [];
+          sessionEvidence.push(item);
+          evidenceBySession.set(item.row.run_session_id, sessionEvidence);
+        }
+        const sourceKey = sourceKeyFor(memory.id);
+        const fingerprint = fingerprintFor(
+          memory,
+          resolvedEvidence.map(({ row, resolved }) => [
+            row.segment_id,
+            row.analysis_run_id,
+            resolved.lineageFingerprint,
+          ])
+        );
+        const existingMap = mapped("memories", sourceKey, fingerprint);
+        const firstValidEvidence = resolvedEvidence.find(({ resolved }) => resolved.valid);
+        const stableMemoryValueKey = legacyMemoryKeys(memory.type, body, body).valueKey;
+        let memoryId = existingMap?.target_entity_id ?? null;
+        if (!memoryId) {
+          ensureImportRun();
+          memoryId = ensureLegacyMemory({
+            kind: memory.type,
+            title: body,
+            body,
+            confidence: legacyConfidence(memory.confidence),
+            provenance: firstValidEvidence ? "evidence_linked" : "legacy_unverified",
+          });
+        }
+        const occurrenceIdsBySession = new Map();
+        for (const [legacySessionId, sessionEvidence] of evidenceBySession) {
+          const occurrenceFingerprint = fingerprintFor(
+            stableMemoryValueKey,
+            legacySessionId,
+            sessionEvidence.map(({ row, resolved }) => [
+              row.segment_id,
+              row.analysis_run_id,
+              resolved.lineageFingerprint,
+            ])
+          );
+          const occurrenceKey = occurrenceKeyFor(
+            "memories",
+            sourceKeyFor(memory.id, legacySessionId),
+            occurrenceFingerprint
+          );
+          let occurrenceId = this.db
+            .prepare("SELECT id FROM memory_occurrences WHERE occurrence_key = ?")
+            .get(occurrenceKey)?.id;
+          if (!occurrenceId) {
+            ensureImportRun();
+            occurrenceId = this._nextId("memory_occurrence");
+            const validEvidence = sessionEvidence
+              .filter(({ resolved }) => resolved.valid)
+              .map(({ resolved }) => resolved.evidence);
+            this.db
+              .prepare(
+                `INSERT INTO memory_occurrences (
+                   id, memory_value_id, analysis_input_id, legacy_session_id, occurrence_key,
+                   candidate_item_fingerprint, started_at, ended_at, confidence, created_at
+                 ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+              )
+              .run(
+                occurrenceId,
+                memoryId,
+                legacySessionId,
+                occurrenceKey,
+                occurrenceFingerprint,
+                validEvidence.length > 0
+                  ? Math.min(...validEvidence.map((item) => item.startedAt))
+                  : null,
+                validEvidence.length > 0
+                  ? Math.max(...validEvidence.map((item) => item.endedAt))
+                  : null,
+                legacyConfidence(memory.confidence),
+                importedAt
+              );
+            for (const evidence of validEvidence) {
+              insertEvidence("memory_occurrence", occurrenceId, evidence);
+            }
+          }
+          occurrenceIdsBySession.set(legacySessionId, occurrenceId);
+        }
+        memoryTargets.set(memory.id, { memoryId, occurrenceIdsBySession });
+        if (!existingMap) {
+          recordMap("memories", sourceKey, fingerprint, "memory", memoryId);
+        }
+      }
+
+      const legacyEvidenceRows = this.db
+        .prepare(
+          `SELECT evidence.memory_id, evidence.segment_id, evidence.analysis_run_id,
+                  run.session_id AS run_session_id
+           FROM memory_evidence AS evidence
+           JOIN analysis_runs AS run ON run.id = evidence.analysis_run_id
+           ORDER BY evidence.memory_id, evidence.segment_id, evidence.analysis_run_id`
+        )
+        .all();
+      for (const legacyEvidence of legacyEvidenceRows) {
+        const target = memoryTargets.get(legacyEvidence.memory_id);
+        if (!target) continue;
+        const resolved = resolveLegacyEvidence(
+          legacyEvidence.segment_id,
+          legacyEvidence.run_session_id
+        );
+        const sourceKey = sourceKeyFor(
+          legacyEvidence.memory_id,
+          legacyEvidence.segment_id,
+          legacyEvidence.analysis_run_id
+        );
+        const fingerprint = fingerprintFor(legacyEvidence, resolved.lineageFingerprint);
+        if (mapped("memory_evidence", sourceKey, fingerprint)) continue;
+        ensureImportRun();
+        let targetType = "memory";
+        let targetId = target.memoryId;
+        const occurrenceId = target.occurrenceIdsBySession.get(legacyEvidence.run_session_id);
+        if (resolved.valid && occurrenceId) {
+          targetType = "evidence";
+          targetId = insertEvidence("memory_occurrence", occurrenceId, resolved.evidence);
+        }
+        recordMap("memory_evidence", sourceKey, fingerprint, targetType, targetId);
+      }
+
+      if (importRunId !== null) {
+        this.db
+          .prepare(
+            `UPDATE legacy_import_runs
+             SET status = 'completed', completed_at = ?, imported_row_count = ?
+             WHERE id = ? AND status = 'running'`
+          )
+          .run(importedAt, importedRowCount, importRunId);
+      }
+      return { status: "completed", importedRowCount };
+    });
+    return transaction.immediate();
+  }
+
   resolveMemoryConflict(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new TypeError("memory conflict resolution is required");
@@ -1479,9 +2258,13 @@ class MemoryRepository {
         }));
 
       const memoryOccurrences = this.db.prepare(
-        `SELECT id, started_at, ended_at, confidence, created_at
-         FROM memory_occurrences WHERE memory_value_id = ?
-         ORDER BY created_at, id`
+        `SELECT occurrence.id, occurrence.started_at, occurrence.ended_at,
+                occurrence.confidence, occurrence.created_at,
+                COALESCE(occurrence.legacy_session_id, input.session_id) AS session_id
+         FROM memory_occurrences AS occurrence
+         LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+         WHERE occurrence.memory_value_id = ?
+         ORDER BY occurrence.created_at, occurrence.id`
       );
       const memories = this.db
         .prepare(
@@ -1502,6 +2285,7 @@ class MemoryRepository {
           updatedAt: row.updated_at,
           occurrences: memoryOccurrences.all(row.id).map((occurrence) => ({
             id: occurrence.id,
+            sessionId: occurrence.session_id,
             startedAt: occurrence.started_at,
             endedAt: occurrence.ended_at,
             confidence: occurrence.confidence,
@@ -1515,8 +2299,11 @@ class MemoryRepository {
          FROM topic_revisions WHERE topic_id = ? ORDER BY revision`
       );
       const topicOccurrences = this.db.prepare(
-        `SELECT id, topic_revision_id, created_at
-         FROM topic_occurrences WHERE topic_id = ? ORDER BY created_at, id`
+        `SELECT occurrence.id, occurrence.topic_revision_id, occurrence.created_at,
+                COALESCE(occurrence.legacy_session_id, input.session_id) AS session_id
+         FROM topic_occurrences AS occurrence
+         LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+         WHERE occurrence.topic_id = ? ORDER BY occurrence.created_at, occurrence.id`
       );
       const topics = this.db
         .prepare(
@@ -1540,6 +2327,7 @@ class MemoryRepository {
           })),
           occurrences: topicOccurrences.all(row.id).map((occurrence) => ({
             id: occurrence.id,
+            sessionId: occurrence.session_id,
             revisionId: occurrence.topic_revision_id,
             createdAt: occurrence.created_at,
             evidence: evidenceFor("topic_occurrence", occurrence.id),
@@ -1551,8 +2339,13 @@ class MemoryRepository {
          FROM todo_revisions WHERE todo_instance_id = ? ORDER BY revision`
       );
       const todoOccurrences = this.db.prepare(
-        `SELECT id, todo_revision_id, started_at, ended_at, created_at
-         FROM todo_occurrences WHERE todo_instance_id = ? ORDER BY created_at, id`
+        `SELECT occurrence.id, occurrence.todo_revision_id, occurrence.started_at,
+                occurrence.ended_at, occurrence.created_at,
+                COALESCE(occurrence.legacy_session_id, input.session_id) AS session_id
+         FROM todo_occurrences AS occurrence
+         LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+         WHERE occurrence.todo_instance_id = ?
+         ORDER BY occurrence.created_at, occurrence.id`
       );
       const todoTransitions = this.db.prepare(
         `SELECT id, from_status, to_status, reason, actor, occurred_at
@@ -1587,6 +2380,7 @@ class MemoryRepository {
           })),
           occurrences: todoOccurrences.all(row.id).map((occurrence) => ({
             id: occurrence.id,
+            sessionId: occurrence.session_id,
             revisionId: occurrence.todo_revision_id,
             startedAt: occurrence.started_at,
             endedAt: occurrence.ended_at,
@@ -1604,8 +2398,12 @@ class MemoryRepository {
         }));
 
       const suggestionOccurrences = this.db.prepare(
-        `SELECT id, created_at FROM suggestion_occurrences
-         WHERE suggestion_id = ? ORDER BY created_at, id`
+        `SELECT occurrence.id, occurrence.created_at,
+                COALESCE(occurrence.legacy_session_id, input.session_id) AS session_id
+         FROM suggestion_occurrences AS occurrence
+         LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+         WHERE occurrence.suggestion_id = ?
+         ORDER BY occurrence.created_at, occurrence.id`
       );
       const suggestions = this.db
         .prepare(
@@ -1624,6 +2422,7 @@ class MemoryRepository {
           updatedAt: row.updated_at,
           occurrences: suggestionOccurrences.all(row.id).map((occurrence) => ({
             id: occurrence.id,
+            sessionId: occurrence.session_id,
             createdAt: occurrence.created_at,
             evidence: evidenceFor("suggestion_occurrence", occurrence.id),
           })),
