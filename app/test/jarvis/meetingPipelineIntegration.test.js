@@ -149,7 +149,7 @@ test("main routes exact mic and system PCM once before every derived consumer", 
     "processSystemBuffer",
     "processMeetingMicWithAec",
     "analyzeMicChunk",
-    "feedAudio",
+    "routeLegacyMeetingAudio",
     "writeMeetingDiarizationPcm",
     "dispatchMeetingAudioBuffer",
   ]) {

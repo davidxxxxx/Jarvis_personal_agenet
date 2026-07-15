@@ -32,9 +32,13 @@ function defaultJobKind(job) {
   }
   if (job.job_type === "transcribe_chunk") return "final_transcription";
   if (job.job_type === "preview_transcription") return "preview";
-  if (job.job_type === "speaker") return "speaker";
+  if (job.job_type === "speaker" || job.job_type === "diarize_track") return "speaker";
   if (job.job_type === "analyze_session") return "analysis";
   return "maintenance";
+}
+
+function defaultJobCapability(job) {
+  return job.job_type === "diarize_track" ? { executionDevice: "cpu" } : undefined;
 }
 
 class ProcessingJobRunner {
@@ -48,10 +52,14 @@ class ProcessingJobRunner {
     governor = null,
     heavyGate = null,
     classifyJob = defaultJobKind,
+    classifyCapability = defaultJobCapability,
+    setIntervalImpl = setInterval,
+    clearIntervalImpl = clearInterval,
   } = {}) {
     const requiredMethods = [
       "claimJobs",
       "recoverExpiredLeases",
+      "renewJobLease",
       "completeJob",
       "retryJob",
       "blockJob",
@@ -84,6 +92,12 @@ class ProcessingJobRunner {
       }
     }
     if (typeof classifyJob !== "function") throw new TypeError("classifyJob must be a function");
+    if (typeof classifyCapability !== "function") {
+      throw new TypeError("classifyCapability must be a function");
+    }
+    if (typeof setIntervalImpl !== "function" || typeof clearIntervalImpl !== "function") {
+      throw new TypeError("interval functions are required");
+    }
 
     this.store = store;
     this.owner = owner;
@@ -94,6 +108,9 @@ class ProcessingJobRunner {
     this.governor = governor;
     this.heavyGate = heavyGate;
     this.classifyJob = classifyJob;
+    this.classifyCapability = classifyCapability;
+    this.setInterval = setIntervalImpl;
+    this.clearInterval = clearIntervalImpl;
     this.handlers = new Map();
   }
 
@@ -122,14 +139,15 @@ class ProcessingJobRunner {
       return 1;
     }
 
-    let context = null;
+    let context = {};
     const kind = this.classifyJob(job);
+    const capability = this.classifyCapability(job, kind);
     if (this.governor) {
       let snapshot;
       let admission;
       try {
         snapshot = await this.governor.sample();
-        admission = this.governor.admit(kind, snapshot);
+        admission = this.governor.admit(kind, snapshot, capability);
       } catch {
         admission = { action: "defer", reason: "telemetry_unavailable" };
       }
@@ -152,6 +170,38 @@ class ProcessingJobRunner {
       };
     }
 
+    let leaseLost = false;
+    const renewLease = () => {
+      if (leaseLost) throw codedError("JOB_LEASE_LOST");
+      const renewed = this.store.renewJobLease(job.id, {
+        owner: this.owner,
+        at: this.now(),
+        leaseMs: this.leaseMs,
+      });
+      if (!renewed) {
+        leaseLost = true;
+        throw codedError("JOB_LEASE_LOST");
+      }
+      return true;
+    };
+    Object.defineProperty(context, "renewLease", {
+      value: renewLease,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    const heartbeat = this.setInterval(
+      () => {
+        try {
+          renewLease();
+        } catch {
+          leaseLost = true;
+        }
+      },
+      Math.max(1, Math.floor(this.leaseMs / 3))
+    );
+    heartbeat?.unref?.();
+
     try {
       const invoke = () => handler(job, context);
       let result;
@@ -160,8 +210,9 @@ class ProcessingJobRunner {
       } else {
         result = this.heavyGate ? await this.heavyGate.run(kind, invoke) : await invoke();
       }
-      const executionDevice = context ? result?.executionDevice : null;
-      if (context && executionDevice !== context.device) {
+      if (leaseLost) throw codedError("JOB_LEASE_LOST");
+      const executionDevice = this.governor ? result?.executionDevice : null;
+      if (this.governor && executionDevice !== context.device) {
         throw codedError("EXECUTION_DEVICE_MISMATCH");
       }
       const completed = this.store.completeJob(job.id, {
@@ -184,6 +235,8 @@ class ProcessingJobRunner {
         errorCode,
       });
       if (!retried) throw codedError("JOB_LEASE_LOST");
+    } finally {
+      this.clearInterval(heartbeat);
     }
     return 1;
   }

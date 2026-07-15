@@ -68,6 +68,7 @@ class JarvisTranscriptionWorker {
   }
 
   async handle(job, executionContext = null) {
+    const resourceContext = executionContext?.device ? executionContext : null;
     const chunkId = job?.chunk_id;
     let chunk;
     try {
@@ -98,7 +99,7 @@ class JarvisTranscriptionWorker {
           path: verifiedPath,
           language: null,
           initialPrompt,
-          executionContext,
+          executionContext: resourceContext,
         });
       });
     } catch (error) {
@@ -115,7 +116,7 @@ class JarvisTranscriptionWorker {
       throw codedError("TRANSCRIPTION_FAILED");
     }
 
-    if (executionContext && rawResult?.executionDevice !== executionContext.device) {
+    if (resourceContext && rawResult?.executionDevice !== resourceContext.device) {
       throw codedError("EXECUTION_DEVICE_MISMATCH");
     }
     const result = normalizeResult(rawResult);
@@ -125,7 +126,7 @@ class JarvisTranscriptionWorker {
       modelVersion: this.modelVersion,
       completedAt: this.now(),
     });
-    return executionContext ? { executionDevice: rawResult.executionDevice } : undefined;
+    return resourceContext ? { executionDevice: rawResult.executionDevice } : undefined;
   }
 }
 

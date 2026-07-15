@@ -85,6 +85,63 @@ test("external GPU work immediately defers final work and pauses preview", () =>
   });
 });
 
+test("CPU-only speaker capability is truthful and still yields under resource pressure", () => {
+  const governor = new ResourceGovernor();
+  const base = {
+    state: "available",
+    externalGpuBusy: false,
+    batterySaver: false,
+    previewEnabled: true,
+    cpuLoadPct: 20,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
+  };
+  const capability = { executionDevice: "cpu" };
+
+  assert.deepEqual(governor.admit("speaker", base, capability), {
+    action: "run_cpu",
+    reason: "cpu_backend",
+  });
+  assert.deepEqual(governor.admit("speaker", { ...base, state: "unavailable" }, capability), {
+    action: "run_cpu",
+    reason: "cuda_unavailable_cpu_backend",
+  });
+  assert.deepEqual(
+    governor.admit("speaker", { ...base, state: "busy", externalGpuBusy: true }, capability),
+    { action: "defer", reason: "external_gpu_busy" }
+  );
+  assert.deepEqual(
+    governor.admit(
+      "speaker",
+      { ...base, state: "constrained", reason: "cpu_load_high", cpuLoadPct: 95 },
+      capability
+    ),
+    { action: "defer", reason: "cpu_load_high" }
+  );
+});
+
+test("unavailable local diarization models defer durably before resource admission", () => {
+  const governor = new ResourceGovernor();
+  const available = {
+    state: "available",
+    externalGpuBusy: false,
+    batterySaver: false,
+    previewEnabled: true,
+    cpuLoadPct: 20,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
+  };
+
+  assert.deepEqual(
+    governor.admit("speaker", available, {
+      executionDevice: "cpu",
+      available: false,
+      unavailableReason: "diarization_model_unavailable",
+    }),
+    { action: "defer", reason: "diarization_model_unavailable" }
+  );
+});
+
 test("a sampled external process makes the selected GPU busy in one sampling interval", async () => {
   let at = 1_000;
   const governor = new ResourceGovernor({

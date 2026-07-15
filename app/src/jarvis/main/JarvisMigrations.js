@@ -1,4 +1,4 @@
-const TARGET_VERSION = 19;
+const TARGET_VERSION = 20;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -426,6 +426,89 @@ const SPEAKER_IDENTITY_SCHEMA = `
   END;
 `;
 
+const SESSION_DIARIZATION_SCHEMA = `
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_diarization_identity
+    ON processing_jobs(job_type, session_id, track_id, input_hash, input_version, model_version)
+    WHERE job_type = 'diarize_track';
+  CREATE TABLE IF NOT EXISTS speaker_diarization_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    transcript_revision TEXT NOT NULL CHECK(
+      length(transcript_revision) = 64 AND
+      transcript_revision NOT GLOB '*[^0-9a-f]*'
+    ),
+    policy_id TEXT NOT NULL,
+    diarizer_model_id TEXT NOT NULL,
+    embedding_model_id TEXT NOT NULL,
+    model_artifact_sha256 TEXT NOT NULL CHECK(
+      length(model_artifact_sha256) = 64 AND
+      model_artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
+    sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+    input_version INTEGER NOT NULL CHECK(input_version = 1),
+    execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+    UNIQUE(session_id, track_id, transcript_revision, policy_id)
+  );
+  CREATE TABLE IF NOT EXISTS speaker_diarization_run_clusters (
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    local_label TEXT NOT NULL,
+    embedding BLOB CHECK(
+      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+    ),
+    speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
+    window_count INTEGER NOT NULL CHECK(window_count >= 0),
+    quality_score REAL CHECK(
+      quality_score IS NULL OR (
+        typeof(quality_score) IN ('integer','real') AND quality_score BETWEEN 0 AND 1
+      )
+    ),
+    first_appearance_at INTEGER NOT NULL,
+    PRIMARY KEY(run_id, local_label),
+    UNIQUE(run_id, cluster_id),
+    CHECK(
+      (window_count = 0 AND speech_ms = 0 AND embedding IS NULL AND quality_score IS NULL) OR
+      (window_count > 0 AND embedding IS NOT NULL AND quality_score IS NOT NULL)
+    )
+  );
+  CREATE TABLE IF NOT EXISTS speaker_turns (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    transcript_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+    turn_index INTEGER NOT NULL CHECK(turn_index >= 0),
+    raw_label TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    embedding BLOB CHECK(
+      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+    ),
+    echo_state TEXT NOT NULL DEFAULT 'none'
+      CHECK(echo_state IN ('none','possible','confirmed')),
+    duplicate_of_turn_id TEXT REFERENCES speaker_turns(id) ON DELETE SET NULL,
+    excluded_from_centroid INTEGER NOT NULL DEFAULT 0 CHECK(excluded_from_centroid IN (0,1)),
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, chunk_id, turn_index),
+    CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
+    CHECK(echo_state = 'confirmed' OR excluded_from_centroid = 0)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_diarization_run_revision
+    ON speaker_diarization_runs(session_id, track_id, transcript_revision, policy_id);
+  CREATE INDEX IF NOT EXISTS idx_diarization_runs_session_completed
+    ON speaker_diarization_runs(session_id, completed_at, id);
+  CREATE INDEX IF NOT EXISTS idx_diarization_run_clusters_cluster
+    ON speaker_diarization_run_clusters(cluster_id, run_id);
+  CREATE INDEX IF NOT EXISTS idx_speaker_turns_run_time
+    ON speaker_turns(run_id, started_at, ended_at, id);
+  CREATE INDEX IF NOT EXISTS idx_speaker_turns_segment
+    ON speaker_turns(transcript_segment_id, run_id);
+`;
+
 function disambiguateUnboundSpeakerClusters(db) {
   if (!tableExists(db, "speaker_clusters")) return;
   const duplicates = db
@@ -846,6 +929,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       );
     `);
       db.exec(SPEAKER_IDENTITY_SCHEMA);
+      db.exec(SESSION_DIARIZATION_SCHEMA);
       addColumn(db, "speaker_identity_corrections", "previous_person_ref TEXT");
       addColumn(db, "speaker_identity_corrections", "next_person_ref TEXT");
       addColumn(
@@ -907,4 +991,5 @@ module.exports = {
   transcriptSegmentsSchema,
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
   SPEAKER_IDENTITY_SCHEMA,
+  SESSION_DIARIZATION_SCHEMA,
 };

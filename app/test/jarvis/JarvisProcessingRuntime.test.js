@@ -8,7 +8,12 @@ const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
+const ResourceGovernor = require("../../src/jarvis/main/ResourceGovernor");
 const WhisperCudaManager = require("../../src/helpers/whisperCudaManager");
+const {
+  SESSION_DIARIZATION_POLICY,
+  buildDiarizationJobKey,
+} = require("../../src/jarvis/main/SessionDiarizationPolicy");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
@@ -386,6 +391,7 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
       listProcessingSessions: () => [{ id: "bad" }, { id: "good" }],
       isSessionReadyForPostProcessing: () => true,
       markSessionProcessing: (id) => order.push(`processing:${id}`),
+      enqueueDiarizationJobs: (id) => order.push(`diarize:${id}`),
       refreshSessionReadiness: (id) => order.push(`ready:${id}`),
     },
     reconciler: {
@@ -406,6 +412,7 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
     "processing:good",
     "reconcile:good",
     "dedupe:good",
+    "diarize:good",
     "ready:good",
   ]);
 });
@@ -555,6 +562,256 @@ test("production composition binds transcribe and compression handlers to curren
     ]
   );
   assert.equal(repository.getSession("s1").processing_state, "ready");
+});
+
+test("production composition registers diarize_track as CPU speaker work", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  const revision = "a".repeat(64);
+  const jobKey = buildDiarizationJobKey({
+    sessionId: "s1",
+    trackId: "track-mic",
+    transcriptRevision: revision,
+  });
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
+        input_hash, input_version, model_version, created_at
+      ) VALUES (
+        'diarize-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
+        ?, 1, ?, 100
+      )`
+    )
+    .run(jobKey, SESSION_DIARIZATION_POLICY.policyId);
+  const calls = [];
+  const capabilities = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: { withVerifiedWav: async (_chunk, consume) => consume("verified.wav") },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    sessionDiarizationWorker: {
+      run: async (job, context) => {
+        calls.push(job.id);
+        assert.equal(typeof context.renewLease, "function");
+        return { executionDevice: "cpu" };
+      },
+    },
+    model: "large-v3-turbo",
+    owner: "speaker-worker",
+    now: () => 2000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        selectedGpuUuid: "GPU-a",
+        cpuLoadPct: 10,
+        cpuTelemetryAvailable: true,
+        powerTelemetryAvailable: true,
+        batterySaver: false,
+      }),
+      admit: (kind, _snapshot, capability) => {
+        capabilities.push({ kind, capability });
+        return { action: "run_cpu", reason: "cpu_backend" };
+      },
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(calls, ["diarize-job"]);
+  assert.deepEqual(capabilities, [{ kind: "speaker", capability: { executionDevice: "cpu" } }]);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT state, execution_device FROM processing_jobs WHERE id = 'diarize-job'")
+      .get(),
+    { state: "completed", execution_device: "cpu" }
+  );
+});
+
+test("production composition builds the durable diarization worker from local managers", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { endedAt: 4_000 });
+  insertTrack(repository, { endedAt: 4_000 });
+  repository.db.prepare("UPDATE audio_tracks SET state = 'ended' WHERE id = 'track-mic'").run();
+  insertChunk(repository, { startedAt: 100, endedAt: 4_000 });
+  insertJob(repository, { state: "completed", completedAt: 4_200 });
+  repository.db
+    .prepare("UPDATE processing_jobs SET model_version = 'large-v3-turbo' WHERE id = 'job-mic'")
+    .run();
+  insertFinalCoverage(repository, "chunk-mic", 4_200);
+  const snapshot = repository.getDiarizationEvidenceSnapshot({
+    sessionId: "s1",
+    trackId: "track-mic",
+    at: 5_000,
+  });
+  assert.equal(snapshot.eligible, true);
+  let modelsAvailable = true;
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
+        input_hash, input_version, model_version, created_at
+      ) VALUES (
+        'default-diarize-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
+        ?, 1, ?, 4_300
+      )`
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "s1",
+        trackId: "track-mic",
+        transcriptRevision: snapshot.transcriptRevision,
+      }),
+      SESSION_DIARIZATION_POLICY.policyId
+    );
+  const calls = [];
+  const capabilities = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: {
+        withVerifiedWav: async (_chunk, consume) => consume("verified-final.wav"),
+      },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+      diarizationManager: {
+        isAvailable: () => modelsAvailable,
+        diarize: async (wavPath) => {
+          calls.push(["diarize", wavPath]);
+          return [{ start: 0, end: 2, speaker: "speaker-a" }];
+        },
+        getModelArtifactSha256: async () => "b".repeat(64),
+      },
+    },
+    speakerEmbeddingHelper: {
+      isAvailable: () => true,
+      extractEmbedding: async (wavPath, startSec, endSec) => {
+        calls.push(["embed", wavPath, startSec, endSec]);
+        const embedding = new Float32Array(512);
+        embedding[0] = 1;
+        return embedding;
+      },
+    },
+    model: "large-v3-turbo",
+    owner: "default-speaker-worker",
+    now: () => 5_000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        cpuLoadPct: 10,
+        cpuTelemetryAvailable: true,
+        powerTelemetryAvailable: true,
+        batterySaver: false,
+      }),
+      admit: (kind, _snapshot, capability) => {
+        capabilities.push({ kind, capability });
+        return { action: "run_cpu", reason: "cpu_backend" };
+      },
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(capabilities, [
+    {
+      kind: "speaker",
+      capability: { executionDevice: "cpu", available: true },
+    },
+  ]);
+  assert.deepEqual(calls, [
+    ["diarize", "verified-final.wav"],
+    ["embed", "verified-final.wav", 0, 2],
+  ]);
+  assert.equal(repository.listDiarizationRuns("s1").length, 1);
+  modelsAvailable = false;
+  assert.deepEqual(runtime.runner.classifyCapability({ job_type: "diarize_track" }), {
+    executionDevice: "cpu",
+    available: false,
+    unavailableReason: "diarization_model_unavailable",
+  });
+});
+
+test("missing local diarization dependencies defer instead of producing HANDLER_MISSING", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  const revision = "c".repeat(64);
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+        id, session_id, track_id, chunk_id, job_type, state, priority,
+        input_hash, input_version, model_version, created_at
+      ) VALUES (
+        'unavailable-diarize-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
+        ?, 1, ?, 100
+      )`
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "s1",
+        trackId: "track-mic",
+        transcriptRevision: revision,
+      }),
+      SESSION_DIARIZATION_POLICY.policyId
+    );
+  const resourceGovernor = new ResourceGovernor();
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: {
+      audioEvidenceReader: { withVerifiedWav: async () => assert.fail("audio was read") },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    },
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    owner: "unavailable-speaker-worker",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({
+        state: "available",
+        cpuLoadPct: 10,
+        cpuTelemetryAvailable: true,
+        powerTelemetryAvailable: true,
+        batterySaver: false,
+      }),
+      admit: resourceGovernor.admit.bind(resourceGovernor),
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(runtime.runner.handlers.has("diarize_track"), true);
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        "SELECT state, attempt_count, blocked_reason, error_code FROM processing_jobs WHERE id = 'unavailable-diarize-job'"
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      blocked_reason: "diarization_runtime_unavailable",
+      error_code: null,
+    }
+  );
 });
 
 test("transcription and storage compression share one heavy-work concurrency permit", async () => {

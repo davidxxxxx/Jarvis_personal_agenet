@@ -731,3 +731,195 @@ test("reports ownership loss when resource deferral cannot release the recovered
     { state: "retry", error_code: "LEASE_EXPIRED", blocked_reason: null }
   );
 });
+
+test("classifies diarize_track as CPU speaker work without claiming CUDA", async (t) => {
+  const admissions = [];
+  const governor = {
+    sample: async () => ({
+      state: "available",
+      selectedGpuUuid: "GPU-a",
+      cpuLoadPct: 20,
+      cpuTelemetryAvailable: true,
+      powerTelemetryAvailable: true,
+      batterySaver: false,
+    }),
+    admit: (kind, _snapshot, capability) => {
+      admissions.push({ kind, capability });
+      return { action: "run_cpu", reason: "cpu_backend" };
+    },
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+  seedJob(db, { jobType: "diarize_track", priority: 40 });
+  runner.register("diarize_track", async (_job, context) => {
+    assert.equal(context.device, "cpu");
+    return { executionDevice: "cpu" };
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(admissions, [{ kind: "speaker", capability: { executionDevice: "cpu" } }]);
+  assert.equal(
+    db.prepare("SELECT execution_device FROM processing_jobs WHERE id = 'j1'").get()
+      .execution_device,
+    "cpu"
+  );
+});
+
+test("final transcription and durable diarization share one heavy-work permit", async (t) => {
+  const gate = new HeavyJobGate();
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  let active = 0;
+  let peak = 0;
+  const order = [];
+  const governor = {
+    sample: async () => ({ state: "available", selectedGpuUuid: null }),
+    admit: () => ({ action: "run_cpu", reason: "test_cpu" }),
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: gate });
+  seedJob(db, { id: "transcribe-final", priority: 30, inputHash: "final-pcm" });
+  seedJob(db, {
+    id: "diarize-final",
+    jobType: "diarize_track",
+    priority: 40,
+    inputHash: "diarize-key",
+  });
+  const run = async (job) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    order.push(`${job.job_type}:start`);
+    if (job.job_type === "transcribe_chunk") {
+      firstStarted.resolve();
+      await releaseFirst.promise;
+    }
+    order.push(`${job.job_type}:end`);
+    active -= 1;
+    return { executionDevice: "cpu" };
+  };
+  runner.register("transcribe_chunk", run);
+  runner.register("diarize_track", run);
+
+  const first = runner.runOnce();
+  const second = runner.runOnce();
+  await firstStarted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(gate.getState(), { activeKind: "final_transcription", queueLength: 1 });
+  releaseFirst.resolve();
+  await Promise.all([first, second]);
+
+  assert.equal(peak, 1);
+  assert.deepEqual(order, [
+    "transcribe_chunk:start",
+    "transcribe_chunk:end",
+    "diarize_track:start",
+    "diarize_track:end",
+  ]);
+  assert.deepEqual(
+    db
+      .prepare("SELECT id, state, execution_device FROM processing_jobs ORDER BY priority, id")
+      .all(),
+    [
+      { id: "transcribe-final", state: "completed", execution_device: "cpu" },
+      { id: "diarize-final", state: "completed", execution_device: "cpu" },
+    ]
+  );
+});
+
+test("renews a long job lease with a bounded heartbeat and clears the timer", async (t) => {
+  let now = 2_000;
+  let heartbeat = null;
+  let heartbeatMs = null;
+  const cleared = [];
+  const timer = { unref() {} };
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    leaseMs: 90,
+    setIntervalImpl: (callback, interval) => {
+      heartbeat = callback;
+      heartbeatMs = interval;
+      return timer;
+    },
+    clearIntervalImpl: (value) => cleared.push(value),
+  });
+  seedJob(db);
+  runner.register("transcribe_chunk", async (_job, context) => {
+    now = 2_050;
+    heartbeat();
+    assert.equal(
+      db.prepare("SELECT lease_expires_at FROM processing_jobs WHERE id = 'j1'").get()
+        .lease_expires_at,
+      2_140
+    );
+    now = 2_120;
+    assert.equal(context.renewLease(), true);
+  });
+
+  assert.equal(await runner.runOnce(2_000), 1);
+  assert.equal(heartbeatMs, 30);
+  assert.deepEqual(cleared, [timer]);
+  assert.equal(
+    db.prepare("SELECT state FROM processing_jobs WHERE id = 'j1'").get().state,
+    "completed"
+  );
+});
+
+test("heartbeat ownership loss aborts completion and still clears its timer", async (t) => {
+  let now = 2_000;
+  let heartbeat = null;
+  const cleared = [];
+  const timer = { unref() {} };
+  const { db, store, runner } = fixture(t, {
+    now: () => now,
+    leaseMs: 90,
+    setIntervalImpl: (callback) => {
+      heartbeat = callback;
+      return timer;
+    },
+    clearIntervalImpl: (value) => cleared.push(value),
+  });
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    now = 2_090;
+    assert.equal(store.recoverExpiredLeases(now), 1);
+    heartbeat();
+  });
+
+  await assert.rejects(runner.runOnce(2_000), { code: "JOB_LEASE_LOST" });
+  assert.deepEqual(cleared, [timer]);
+  assert.deepEqual(
+    db.prepare("SELECT state, error_code, lease_owner FROM processing_jobs WHERE id = 'j1'").get(),
+    { state: "retry", error_code: "LEASE_EXPIRED", lease_owner: null }
+  );
+});
+
+test("a final heartbeat before completion cannot race the owner transition", async (t) => {
+  let now = 2_000;
+  let heartbeat = null;
+  const cleared = [];
+  const timer = { unref() {} };
+  const { db, store, runner } = fixture(t, {
+    now: () => now,
+    leaseMs: 90,
+    setIntervalImpl: (callback) => {
+      heartbeat = callback;
+      return timer;
+    },
+    clearIntervalImpl: (value) => cleared.push(value),
+  });
+  seedJob(db);
+  const complete = store.completeJob.bind(store);
+  store.completeJob = (id, input) => {
+    now = 2_050;
+    heartbeat();
+    return complete(id, { ...input, at: now });
+  };
+  runner.register("transcribe_chunk", async () => undefined);
+
+  assert.equal(await runner.runOnce(2_000), 1);
+  assert.deepEqual(cleared, [timer]);
+  assert.deepEqual(
+    db
+      .prepare("SELECT state, completed_at, lease_owner FROM processing_jobs WHERE id = 'j1'")
+      .get(),
+    { state: "completed", completed_at: 2_050, lease_owner: null }
+  );
+});

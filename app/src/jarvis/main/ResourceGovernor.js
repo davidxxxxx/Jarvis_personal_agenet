@@ -413,9 +413,19 @@ class ResourceGovernor {
     return snapshot;
   }
 
-  admit(kind, snapshot = this.latestSnapshot) {
+  admit(kind, snapshot = this.latestSnapshot, capability = undefined) {
     if (!snapshot || !RESOURCE_STATES.includes(snapshot.state)) {
       throw new Error("resource snapshot is required");
+    }
+    if (kind === "speaker" && capability?.available === false) {
+      const reason = capability.unavailableReason;
+      return {
+        action: "defer",
+        reason:
+          typeof reason === "string" && /^[a-z0-9_]{1,128}$/.test(reason)
+            ? reason
+            : "diarization_model_unavailable",
+      };
     }
     const storageCritical = new Set(["retention_urgent", "storage_recovery_compress"]);
     const cpuReadingValid =
@@ -425,6 +435,7 @@ class ResourceGovernor {
     const cpuTelemetryKnown = snapshot.cpuTelemetryAvailable === true && cpuReadingValid;
     const cpuSafe = cpuReadingValid && snapshot.cpuLoadPct < CPU_UNSAFE_LOAD_PCT;
     const powerKnown = snapshot.powerTelemetryAvailable === true;
+    const cpuOnlySpeaker = kind === "speaker" && capability?.executionDevice === "cpu";
     if (snapshot.batterySaver === true) {
       if (kind === "storage_recovery_compress" && cpuSafe && powerKnown) {
         return { action: "run_cpu", reason: "storage_critical" };
@@ -463,7 +474,21 @@ class ResourceGovernor {
         if (!cpuSafe) return { action: "pause_preview", reason: "cpu_load_high" };
         return { action: "run_cpu", reason: "cuda_unavailable" };
       }
+      if (cpuOnlySpeaker) {
+        if (!cpuTelemetryKnown || !powerKnown || snapshot.batterySaver !== false) {
+          return { action: "defer", reason: "telemetry_unavailable" };
+        }
+        if (!cpuSafe) return { action: "defer", reason: "cpu_load_high" };
+        return { action: "run_cpu", reason: "cuda_unavailable_cpu_backend" };
+      }
       return { action: "defer", reason: "cuda_unavailable" };
+    }
+    if (cpuOnlySpeaker) {
+      if (!cpuTelemetryKnown || !powerKnown || snapshot.batterySaver !== false) {
+        return { action: "defer", reason: "telemetry_unavailable" };
+      }
+      if (!cpuSafe) return { action: "defer", reason: "cpu_load_high" };
+      return { action: "run_cpu", reason: "cpu_backend" };
     }
     if (["preview", "final_transcription", "speaker"].includes(kind)) {
       return { action: "run_cuda", reason: "resources_available" };

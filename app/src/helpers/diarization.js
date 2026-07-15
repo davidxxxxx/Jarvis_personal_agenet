@@ -1,5 +1,6 @@
 const fs = require("fs");
 const fsPromises = require("fs").promises;
+const crypto = require("node:crypto");
 const path = require("path");
 const { spawn } = require("child_process");
 const debugLogger = require("./debugLogger");
@@ -64,6 +65,7 @@ class DiarizationManager {
     this._process = null;
     this.currentDownloadProcess = null;
     this.cachedBinaryPath = null;
+    this.modelArtifactHashPromise = null;
   }
 
   getBinaryPath() {
@@ -126,6 +128,41 @@ class DiarizationManager {
     return processWriteGate.runWithWriteLease("diarization-model-download", () =>
       this._downloadModels(progressCallback)
     );
+  }
+
+  getModelArtifacts() {
+    return Object.freeze([
+      Object.freeze({
+        id: "sherpa-pyannote-segmentation-3.0",
+        path: this._resolveModelPath(SEGMENTATION_ONNX),
+      }),
+      Object.freeze({
+        id: "3dspeaker-campplus-voxceleb-16k-v1",
+        path: this._resolveModelPath(EMBEDDING_ONNX),
+      }),
+    ]);
+  }
+
+  getModelArtifactSha256() {
+    if (this.modelArtifactHashPromise) return this.modelArtifactHashPromise;
+    this.modelArtifactHashPromise = (async () => {
+      const hash = crypto.createHash("sha256");
+      for (const artifact of this.getModelArtifacts()) {
+        hash.update(`${artifact.id}\0`);
+        await new Promise((resolve, reject) => {
+          const stream = fs.createReadStream(artifact.path);
+          stream.on("data", (chunk) => hash.update(chunk));
+          stream.on("error", reject);
+          stream.on("end", resolve);
+        });
+        hash.update("\0");
+      }
+      return hash.digest("hex");
+    })().catch((error) => {
+      this.modelArtifactHashPromise = null;
+      throw error;
+    });
+    return this.modelArtifactHashPromise;
   }
 
   async _downloadModels(progressCallback = null) {
@@ -591,6 +628,7 @@ class DiarizationManager {
   async resume() {}
 
   async _deleteModels() {
+    this.modelArtifactHashPromise = null;
     const modelsDir = this.getModelsDir();
     const segDir = path.join(modelsDir, SEGMENTATION_DIR);
     const embPath = path.join(modelsDir, EMBEDDING_ONNX);

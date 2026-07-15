@@ -249,6 +249,20 @@ test("passes admission context through verified evidence and returns only the pr
   assert.equal(secondRepository.listTranscriptSegments("session-1").length, 0);
 });
 
+test("lease-only runner context preserves legacy no-governor transcription semantics", async (t) => {
+  const repository = seedChunk(t);
+  let input;
+  const { worker } = workerFixture(repository, async (value) => {
+    input = value;
+    return { text: "legacy local result", confidence: 0.8 };
+  });
+  const leaseOnlyContext = { renewLease: () => true };
+
+  assert.equal(await worker.handle({ chunk_id: "chunk-1" }, leaseOnlyContext), undefined);
+  assert.equal(input.executionContext, null);
+  assert.equal(repository.getAudioChunk("chunk-1").transcription_status, "completed");
+});
+
 test("the IPC adapter keeps verified WAV bytes local and uses auto language", async () => {
   const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
   const originalLoad = Module._load;

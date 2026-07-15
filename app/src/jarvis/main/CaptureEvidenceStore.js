@@ -441,6 +441,16 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
       `),
+      renewLeasedJob: db.prepare(`
+        UPDATE processing_jobs
+        SET lease_expires_at = @leaseExpiresAt
+        WHERE id = @id
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > @at
+      `),
       completeLeasedJob: db.prepare(`
         UPDATE processing_jobs
         SET state = 'completed',
@@ -1249,6 +1259,14 @@ class CaptureEvidenceStore {
   recoverExpiredLeases(at) {
     this._assertNonNegativeSafeInteger(at, "at");
     return this.statements.recoverExpiredJobLeases.run({ at }).changes;
+  }
+
+  renewJobLease(id, { owner, at, leaseMs }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    this._assertPositiveSafeInteger(leaseMs, "leaseMs");
+    const leaseExpiresAt = at + leaseMs;
+    if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
+    return this.statements.renewLeasedJob.run({ ...input, leaseExpiresAt }).changes === 1;
   }
 
   completeJob(id, { owner, at, executionDevice = null }) {

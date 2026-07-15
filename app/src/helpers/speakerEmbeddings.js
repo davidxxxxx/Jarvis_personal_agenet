@@ -1,4 +1,5 @@
 const fs = require("fs");
+const crypto = require("node:crypto");
 const path = require("path");
 const debugLogger = require("./debugLogger");
 const { getModelsDirForService } = require("./modelDirUtils");
@@ -20,6 +21,7 @@ class SpeakerEmbeddings {
     }
     this.workerClient = workerClient;
     this.loadPromise = null;
+    this.artifactHashPromise = null;
   }
 
   getModelPath() {
@@ -35,6 +37,22 @@ class SpeakerEmbeddings {
 
   isAvailable() {
     return fs.existsSync(this.getModelPath());
+  }
+
+  getModelArtifactSha256() {
+    if (this.artifactHashPromise) return this.artifactHashPromise;
+    const modelPath = this.getModelPath();
+    this.artifactHashPromise = new Promise((resolve, reject) => {
+      const hash = crypto.createHash("sha256");
+      const stream = fs.createReadStream(modelPath);
+      stream.on("data", (chunk) => hash.update(chunk));
+      stream.on("error", reject);
+      stream.on("end", () => resolve(hash.digest("hex")));
+    }).catch((error) => {
+      this.artifactHashPromise = null;
+      throw error;
+    });
+    return this.artifactHashPromise;
   }
 
   _ensureLoaded() {

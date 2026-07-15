@@ -1,5 +1,6 @@
 const ProcessingJobRunner = require("./ProcessingJobRunner");
 const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
+const SessionDiarizationWorker = require("./SessionDiarizationWorker");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const ResourceGovernor = require("./ResourceGovernor");
@@ -7,6 +8,8 @@ const { JOB_PRIORITY } = ResourceGovernor;
 const HeavyJobGate = require("./HeavyJobGate");
 const PreviewTranscriptionScheduler = require("./PreviewTranscriptionScheduler");
 const { createHash } = require("node:crypto");
+const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
+const defaultSpeakerEmbeddingHelper = require("../../helpers/speakerEmbeddings");
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
@@ -374,6 +377,10 @@ class JarvisProcessingRuntime {
         this.repository.markSessionProcessing?.(session.id);
         await this.reconciler.reconcileSession(session.id);
         await this.deduper.dedupe(session.id);
+        this.repository.enqueueDiarizationJobs?.(session.id, {
+          at: this.now(),
+          policy: SESSION_DIARIZATION_POLICY,
+        });
         this.repository.refreshSessionReadiness(session.id, this.now());
       } catch (error) {
         this.log({ phase: "post_process", sessionId: session.id, error });
@@ -482,6 +489,8 @@ function createJarvisProcessingRuntime({
   previewPersist = null,
   previewScheduler = null,
   whisperController = null,
+  sessionDiarizationWorker = null,
+  speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
   ...runtimeOptions
 } = {}) {
   if (!repository?.captureEvidenceStore) {
@@ -496,9 +505,60 @@ function createJarvisProcessingRuntime({
   if (typeof model !== "string" || !model.trim()) {
     throw new TypeError("configured Jarvis Whisper model is required");
   }
+  if (sessionDiarizationWorker !== null && typeof sessionDiarizationWorker?.run !== "function") {
+    throw new TypeError("sessionDiarizationWorker.run must be a function");
+  }
   const configuredModel = model.trim();
   const whisperManager = ipcHandlers.whisperManager || null;
   const cudaManager = ipcHandlers.whisperCudaManager || null;
+  const diarizationManager = ipcHandlers.diarizationManager || null;
+  const canBuildDiarizationWorker = Boolean(
+    diarizationManager &&
+    typeof diarizationManager.diarize === "function" &&
+    typeof diarizationManager.getModelArtifactSha256 === "function" &&
+    speakerEmbeddingHelper &&
+    typeof speakerEmbeddingHelper.extractEmbedding === "function"
+  );
+  const effectiveDiarizationWorker =
+    sessionDiarizationWorker ??
+    (canBuildDiarizationWorker
+      ? new SessionDiarizationWorker({
+          repository,
+          audioEvidenceReader: service.audioEvidenceReader,
+          diarizeAudio: ({ wavPath }) => diarizationManager.diarize(wavPath),
+          embedWindow: ({ wavPath, turn }) =>
+            speakerEmbeddingHelper.extractEmbedding(
+              wavPath,
+              turn.embeddingStartMs / 1_000,
+              turn.embeddingEndMs / 1_000
+            ),
+          modelArtifactSha256: () => diarizationManager.getModelArtifactSha256(),
+          clock: now,
+        })
+      : null);
+  const diarizationCapability = () => {
+    if (sessionDiarizationWorker !== null) return { executionDevice: "cpu" };
+    if (!canBuildDiarizationWorker) {
+      return {
+        executionDevice: "cpu",
+        available: false,
+        unavailableReason: "diarization_runtime_unavailable",
+      };
+    }
+    let available = false;
+    try {
+      available =
+        diarizationManager.isAvailable?.() === true &&
+        speakerEmbeddingHelper.isAvailable?.() === true;
+    } catch {
+      available = false;
+    }
+    return {
+      executionDevice: "cpu",
+      available,
+      ...(available ? {} : { unavailableReason: "diarization_model_unavailable" }),
+    };
+  };
   const effectiveGovernor =
     governor ??
     new ResourceGovernor({
@@ -540,6 +600,8 @@ function createJarvisProcessingRuntime({
     now,
     governor: effectiveGovernor,
     heavyGate: effectiveGate,
+    classifyCapability: (job) =>
+      job.job_type === "diarize_track" ? diarizationCapability() : undefined,
   });
   const effectivePreviewScheduler =
     previewScheduler ??
@@ -577,6 +639,12 @@ function createJarvisProcessingRuntime({
     now,
   });
   runner.register("transcribe_chunk", (job, context) => worker.handle(job, context));
+  runner.register("diarize_track", (job, context) => {
+    if (effectiveDiarizationWorker) return effectiveDiarizationWorker.run(job, context);
+    const error = new Error("DIARIZATION_RUNTIME_UNAVAILABLE");
+    error.code = "DIARIZATION_RUNTIME_UNAVAILABLE";
+    throw error;
+  });
   runner.register("compress_chunk", async (job) => {
     await service.flacCompressionWorker.run(job, { owner });
     return { executionDevice: "cpu" };

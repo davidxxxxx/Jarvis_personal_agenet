@@ -6378,9 +6378,11 @@ class IPCHandlers {
             }
             flushPendingMeetingMicChunks();
 
-            if (meetingLiveSpeakerActive) {
-              void liveSpeakerIdentifier.feedAudio(derivedBuffer);
-            }
+            void liveSpeakerIdentifier.routeLegacyMeetingAudio({
+              jarvisSessionActive: Boolean(activeJarvisSessionId),
+              meetingLiveSpeakerActive,
+              pcmBuffer: derivedBuffer,
+            });
 
             writeMeetingDiarizationPcm(derivedBuffer, receivedAt);
             dispatchMeetingAudioBuffer(derivedBuffer, "system");
@@ -6389,9 +6391,11 @@ class IPCHandlers {
 
           if (persistedSource === "mic") {
             if (activeMeetingCaptureMode.micOnly) {
-              if (meetingLiveSpeakerActive) {
-                void liveSpeakerIdentifier.feedAudio(derivedBuffer);
-              }
+              void liveSpeakerIdentifier.routeLegacyMeetingAudio({
+                jarvisSessionActive: Boolean(activeJarvisSessionId),
+                meetingLiveSpeakerActive,
+                pcmBuffer: derivedBuffer,
+              });
               writeMeetingDiarizationPcm(derivedBuffer, Date.now());
               dispatchMeetingAudioBuffer(derivedBuffer, "mic", { preserveExactInput: true });
               return true;

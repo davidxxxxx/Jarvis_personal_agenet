@@ -15,6 +15,7 @@ const {
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
 } = require("./JarvisMigrations");
 const { toPublicAudioChunk } = require("./AudioChunkPublicView");
+const { buildDiarizationJobKey } = require("./SessionDiarizationPolicy");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -297,6 +298,34 @@ function takeCodePointTail(value, limit) {
   return points.slice(Math.max(0, points.length - limit)).join("");
 }
 
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function encodeDiarizationEmbedding(value) {
+  if (!(value instanceof Float32Array) || value.length !== 512) {
+    throw new TypeError("diarization embedding must be a 512D Float32Array");
+  }
+  return SpeakerIdentityRepository.encodeEmbedding(value);
+}
+
+function assertOptionalUnitScore(value, name) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new RangeError(`${name} must be between 0 and 1 or null`);
+  }
+  return value;
+}
+
+function assertDiarizationModelId(value, name) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.+:-]{1,200}$/.test(value)) {
+    throw new TypeError(`${name} must be a versioned model identifier`);
+  }
+  return value;
+}
+
 function codedError(code) {
   const error = new Error(code);
   error.code = code;
@@ -511,6 +540,143 @@ class JarvisRepository {
         SELECT * FROM transcript_segments
         WHERE session_id = ? AND result_kind = 'final'
         ORDER BY started_at, id
+      `),
+      getDiarizationTrack: this.db.prepare(`
+        SELECT * FROM audio_tracks
+        WHERE id = @trackId AND session_id = @sessionId
+      `),
+      listDiarizationChunks: this.db.prepare(`
+        SELECT * FROM audio_chunks
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND write_state = 'committed'
+          AND deleted_at IS NULL
+          AND expires_at > @at
+          AND path NOT LIKE 'tombstone:%'
+        ORDER BY started_at, ended_at, sequence_number, id
+      `),
+      getLatestChunkTranscriptionJob: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE chunk_id = ? AND job_type = 'transcribe_chunk'
+        ORDER BY input_version DESC, created_at DESC, id DESC
+        LIMIT 1
+      `),
+      listDiarizationFinalSegments: this.db.prepare(`
+        SELECT * FROM transcript_segments
+        WHERE chunk_id = @chunkId
+          AND track_id = @trackId
+          AND source_type = @sourceType
+          AND result_kind = 'final'
+          AND is_stable = 1
+          AND model_version = @modelVersion
+        ORDER BY started_at, ended_at, id
+      `),
+      getDiarizationRun: this.db.prepare(`
+        SELECT * FROM speaker_diarization_runs
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND transcript_revision = @transcriptRevision
+          AND policy_id = @policyId
+      `),
+      listDiarizationRuns: this.db.prepare(`
+        SELECT * FROM speaker_diarization_runs
+        WHERE session_id = ?
+        ORDER BY completed_at, id
+      `),
+      listDiarizationEchoCandidates: this.db.prepare(`
+        SELECT turn.*
+        FROM speaker_turns AS turn
+        JOIN speaker_diarization_runs AS run ON run.id = turn.run_id
+        WHERE run.session_id = @sessionId
+          AND run.track_id <> @excludeTrackId
+          AND run.policy_id = @policyId
+          AND turn.embedding IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM speaker_diarization_runs AS newer
+            WHERE newer.session_id = run.session_id
+              AND newer.track_id = run.track_id
+              AND newer.policy_id = run.policy_id
+              AND (
+                newer.completed_at > run.completed_at
+                OR (newer.completed_at = run.completed_at AND newer.id > run.id)
+              )
+          )
+        ORDER BY turn.started_at, turn.ended_at, turn.id
+      `),
+      insertDiarizationRun: this.db.prepare(`
+        INSERT INTO speaker_diarization_runs (
+          id, session_id, track_id, transcript_revision, policy_id,
+          diarizer_model_id, embedding_model_id, model_artifact_sha256,
+          embedding_dimension, sample_rate, input_version, execution_device,
+          created_at, completed_at
+        ) VALUES (
+          @id, @sessionId, @trackId, @transcriptRevision, @policyId,
+          @diarizerModelId, @embeddingModelId, @modelArtifactSha256,
+          @embeddingDimension, @sampleRate, @inputVersion, @executionDevice,
+          @createdAt, @completedAt
+        )
+      `),
+      insertDiarizationJob: this.db.prepare(`
+        INSERT OR IGNORE INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state, priority,
+          input_hash, input_version, model_version, created_at
+        ) VALUES (
+          @id, @sessionId, @trackId, NULL, 'diarize_track', 'pending', 40,
+          @inputHash, @inputVersion, @modelVersion, @createdAt
+        )
+      `),
+      getDiarizationJobByIdentity: this.db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND input_hash = @inputHash
+          AND input_version = @inputVersion
+          AND model_version = @modelVersion
+      `),
+      insertDiarizationStableCluster: this.db.prepare(`
+        INSERT OR IGNORE INTO speaker_clusters (
+          id, session_id, track_id, local_label, model_id, embedding,
+          speech_ms, window_count, quality_score, link_state, created_at, updated_at
+        ) VALUES (
+          @id, @sessionId, @trackId, @localLabel, @modelId, @embedding,
+          @speechMs, @windowCount, @qualityScore, 'unknown', @at, @at
+        )
+      `),
+      getDiarizationStableCluster: this.db.prepare(`
+        SELECT * FROM speaker_clusters
+        WHERE session_id = @sessionId AND track_id = @trackId AND local_label = @localLabel
+      `),
+      promoteDiarizationStableCluster: this.db.prepare(`
+        UPDATE speaker_clusters
+        SET embedding = @embedding, speech_ms = @speechMs,
+            window_count = @windowCount, quality_score = @qualityScore,
+            updated_at = @at
+        WHERE id = @id AND embedding IS NULL AND @embedding IS NOT NULL
+      `),
+      insertDiarizationRunCluster: this.db.prepare(`
+        INSERT INTO speaker_diarization_run_clusters (
+          run_id, cluster_id, local_label, embedding, speech_ms,
+          window_count, quality_score, first_appearance_at
+        ) VALUES (
+          @runId, @clusterId, @localLabel, @embedding, @speechMs,
+          @windowCount, @qualityScore, @firstAppearanceAt
+        )
+      `),
+      insertSpeakerTurn: this.db.prepare(`
+        INSERT INTO speaker_turns (
+          id, run_id, cluster_id, chunk_id, transcript_segment_id,
+          turn_index, raw_label, started_at, ended_at, embedding,
+          echo_state, duplicate_of_turn_id, excluded_from_centroid, created_at
+        ) VALUES (
+          @id, @runId, @clusterId, @chunkId, @transcriptSegmentId,
+          @turnIndex, @rawLabel, @startedAt, @endedAt, @embedding,
+          @echoState, @duplicateOfTurnId, @excludedFromCentroid, @createdAt
+        )
+      `),
+      insertDiarizationSegmentLink: this.db.prepare(`
+        INSERT OR IGNORE INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+        VALUES (@clusterId, @transcriptSegmentId)
       `),
       markSessionProcessing: this.db.prepare(`
         UPDATE sessions
@@ -1402,6 +1568,112 @@ class JarvisRepository {
       return this.statements.getSession.get(sessionId);
     });
 
+    this._commitDiarizationRun = this.db.transaction((input) => {
+      const existing = this.statements.getDiarizationRun.get({
+        sessionId: input.run.sessionId,
+        trackId: input.run.trackId,
+        transcriptRevision: input.expectedRevision,
+        policyId: input.run.policyId,
+      });
+      if (existing) return { status: "already_completed", runId: existing.id };
+
+      const current = this.getDiarizationEvidenceSnapshot({
+        sessionId: input.run.sessionId,
+        trackId: input.run.trackId,
+        at: input.validatedAt,
+      });
+      if (!current.eligible || current.transcriptRevision !== input.expectedRevision) {
+        throw codedError("DIARIZATION_STALE_INPUT");
+      }
+      this.statements.insertDiarizationRun.run(input.run);
+      const persistedClusterIds = new Map();
+      for (const cluster of input.clusters) {
+        this.statements.insertDiarizationStableCluster.run({
+          id: cluster.id,
+          sessionId: input.run.sessionId,
+          trackId: input.run.trackId,
+          localLabel: cluster.localLabel,
+          modelId: input.run.embeddingModelId,
+          embedding: cluster.embedding,
+          speechMs: cluster.speechMs,
+          windowCount: cluster.windowCount,
+          qualityScore: cluster.qualityScore,
+          at: input.run.completedAt,
+        });
+        const stable = this.statements.getDiarizationStableCluster.get({
+          sessionId: input.run.sessionId,
+          trackId: input.run.trackId,
+          localLabel: cluster.localLabel,
+        });
+        if (!stable || stable.model_id !== input.run.embeddingModelId) {
+          throw codedError("DIARIZATION_CLUSTER_MODEL_MISMATCH");
+        }
+        this.statements.promoteDiarizationStableCluster.run({
+          id: stable.id,
+          embedding: cluster.embedding,
+          speechMs: cluster.speechMs,
+          windowCount: cluster.windowCount,
+          qualityScore: cluster.qualityScore,
+          at: input.run.completedAt,
+        });
+        persistedClusterIds.set(cluster.id, stable.id);
+        this.statements.insertDiarizationRunCluster.run({
+          runId: input.run.id,
+          clusterId: stable.id,
+          localLabel: cluster.localLabel,
+          embedding: cluster.embedding,
+          speechMs: cluster.speechMs,
+          windowCount: cluster.windowCount,
+          qualityScore: cluster.qualityScore,
+          firstAppearanceAt: cluster.firstAppearanceAt,
+        });
+      }
+
+      const chunks = new Map(current.chunks.map((chunk) => [chunk.id, chunk]));
+      const segmentIdsByChunk = new Map(
+        current.chunks.map((chunk) => [
+          chunk.id,
+          new Set(chunk.finalSegments.map((segment) => segment.id)),
+        ])
+      );
+      const segmentIds = new Set(
+        current.chunks.flatMap((chunk) => chunk.finalSegments.map((segment) => segment.id))
+      );
+      for (const turn of input.turns) {
+        const chunk = chunks.get(turn.chunkId);
+        const clusterId = persistedClusterIds.get(turn.clusterId);
+        if (
+          !chunk ||
+          !clusterId ||
+          turn.startedAt < chunk.started_at ||
+          turn.endedAt > chunk.ended_at ||
+          (turn.transcriptSegmentId !== null &&
+            !segmentIdsByChunk.get(turn.chunkId)?.has(turn.transcriptSegmentId))
+        ) {
+          throw codedError("DIARIZATION_INVALID_COMMIT");
+        }
+        this.statements.insertSpeakerTurn.run({
+          ...turn,
+          runId: input.run.id,
+          clusterId,
+          excludedFromCentroid: turn.excludedFromCentroid ? 1 : 0,
+          createdAt: input.run.completedAt,
+        });
+      }
+      for (const link of input.segmentLinks) {
+        const clusterId = persistedClusterIds.get(link.clusterId);
+        if (!clusterId || !segmentIds.has(link.transcriptSegmentId)) {
+          throw codedError("DIARIZATION_INVALID_COMMIT");
+        }
+        this.statements.insertDiarizationSegmentLink.run({
+          clusterId,
+          transcriptSegmentId: link.transcriptSegmentId,
+        });
+      }
+      return { status: "completed", runId: input.run.id };
+    });
+    this._commitDiarizationRun = this._commitDiarizationRun.immediate;
+
     this._backfillLegacyMicChunks = this.db.transaction(
       ({ sessionId, deterministicTrackId, chunkIds, createdAt }) => {
         const session = this.statements.getSession.get(sessionId);
@@ -1657,6 +1929,361 @@ class JarvisRepository {
 
   listPendingJobs(sessionId) {
     return this.statements.listPendingJobs.all(assertId(sessionId, "sessionId"));
+  }
+
+  getDiarizationEvidenceSnapshot({ sessionId, trackId, at = Date.now() } = {}) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeTrackId = assertId(trackId, "trackId");
+    const safeAt = assertNonNegativeInteger(at, "at");
+    const session = this.statements.getSession.get(safeSessionId);
+    const track = this.statements.getDiarizationTrack.get({
+      sessionId: safeSessionId,
+      trackId: safeTrackId,
+    });
+    const ineligible = (reason, chunks = []) =>
+      deepFreeze({
+        eligible: false,
+        reason,
+        transcriptRevision: null,
+        session: session ?? null,
+        track: track ?? null,
+        chunks,
+      });
+
+    if (!session || !track) return ineligible("final_audio_pending");
+    if (
+      !["completed", "recovered"].includes(session.status) ||
+      !Number.isSafeInteger(session.ended_at) ||
+      !["ended", "recovered"].includes(track.state) ||
+      !Number.isSafeInteger(track.ended_at)
+    ) {
+      return ineligible("final_audio_pending");
+    }
+
+    const authoritative = this.statements.listDiarizationChunks.all({
+      sessionId: safeSessionId,
+      trackId: safeTrackId,
+      at: safeAt,
+    });
+    if (authoritative.length === 0) return ineligible("final_audio_pending");
+
+    const chunks = [];
+    for (const chunk of authoritative) {
+      const job = this.statements.getLatestChunkTranscriptionJob.get(chunk.id);
+      if (!job || job.state !== "completed") {
+        return ineligible("final_transcript_pending", chunks);
+      }
+      if (job.session_id !== safeSessionId || job.track_id !== safeTrackId) {
+        return ineligible("final_transcript_pending", chunks);
+      }
+      if (chunk.transcription_status === "no_speech") {
+        chunks.push({
+          ...chunk,
+          transcriptionResult: "no_speech",
+          transcriptionJob: job,
+          finalSegments: [],
+        });
+        continue;
+      }
+      if (chunk.transcription_status !== "completed") {
+        return ineligible("final_transcript_pending", chunks);
+      }
+      const finalSegments = this.statements.listDiarizationFinalSegments.all({
+        chunkId: chunk.id,
+        trackId: safeTrackId,
+        sourceType: chunk.source_type,
+        modelVersion: job.model_version,
+      });
+      if (finalSegments.length === 0) {
+        return ineligible("final_transcript_pending", chunks);
+      }
+      chunks.push({
+        ...chunk,
+        transcriptionResult: "final",
+        transcriptionJob: job,
+        finalSegments,
+      });
+    }
+
+    const revisionInput = {
+      version: 1,
+      session: {
+        id: session.id,
+        startedAt: session.started_at,
+        endedAt: session.ended_at,
+        status: session.status,
+      },
+      track: {
+        id: track.id,
+        sourceType: track.source_type,
+        startedAt: track.started_at,
+        endedAt: track.ended_at,
+        state: track.state,
+      },
+      chunks: chunks.map((chunk) => ({
+        id: chunk.id,
+        sourceType: chunk.source_type,
+        sequenceNumber: chunk.sequence_number,
+        startedAt: chunk.started_at,
+        endedAt: chunk.ended_at,
+        durationMs: chunk.duration_ms,
+        pcmSha256: chunk.sha256,
+        transcriptionStatus: chunk.transcription_status,
+        result: chunk.transcriptionResult,
+        job: {
+          inputHash: chunk.transcriptionJob.input_hash,
+          inputVersion: chunk.transcriptionJob.input_version,
+          modelVersion: chunk.transcriptionJob.model_version,
+        },
+        segments: chunk.finalSegments.map((segment) => ({
+          id: segment.id,
+          startedAt: segment.started_at,
+          endedAt: segment.ended_at,
+          sourceType: segment.source_type,
+          text: segment.text,
+          confidence: segment.confidence,
+          version: segment.version,
+          modelVersion: segment.model_version,
+          echoScore: segment.echo_score,
+          duplicateOf: segment.duplicate_of,
+        })),
+      })),
+    };
+    const transcriptRevision = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(revisionInput))
+      .digest("hex");
+    return deepFreeze({
+      eligible: true,
+      reason: null,
+      transcriptRevision,
+      session,
+      track,
+      chunks,
+    });
+  }
+
+  getDiarizationRun({ sessionId, trackId, transcriptRevision, policyId } = {}) {
+    if (typeof transcriptRevision !== "string" || !/^[0-9a-f]{64}$/.test(transcriptRevision)) {
+      throw new TypeError("transcriptRevision must be a lowercase SHA-256 digest");
+    }
+    return (
+      this.statements.getDiarizationRun.get({
+        sessionId: assertId(sessionId, "sessionId"),
+        trackId: assertId(trackId, "trackId"),
+        transcriptRevision,
+        policyId: assertId(policyId, "policyId"),
+      }) ?? null
+    );
+  }
+
+  listDiarizationRuns(sessionId) {
+    return this.statements.listDiarizationRuns.all(assertId(sessionId, "sessionId"));
+  }
+
+  listDiarizationEchoCandidates({ sessionId, excludeTrackId, policyId } = {}) {
+    return this.statements.listDiarizationEchoCandidates
+      .all({
+        sessionId: assertId(sessionId, "sessionId"),
+        excludeTrackId: assertId(excludeTrackId, "excludeTrackId"),
+        policyId: assertId(policyId, "policyId"),
+      })
+      .map((row) => ({
+        ...row,
+        embedding: SpeakerIdentityRepository.decodeEmbedding(row.embedding, 512),
+      }));
+  }
+
+  enqueueDiarizationJobs(sessionId, { at = Date.now(), policy } = {}) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeAt = assertNonNegativeInteger(at, "at");
+    if (
+      !policy ||
+      typeof policy !== "object" ||
+      typeof policy.policyId !== "string" ||
+      policy.inputVersion !== 1
+    ) {
+      throw new TypeError("a versioned diarization policy is required");
+    }
+    const tracks = this.statements.listSessionReadinessTracks.all(safeSessionId);
+    const jobs = [];
+    const skipped = [];
+    let enqueued = 0;
+    const enqueue = this.db.transaction(() => {
+      for (const track of tracks) {
+        const snapshot = this.getDiarizationEvidenceSnapshot({
+          sessionId: safeSessionId,
+          trackId: track.id,
+          at: safeAt,
+        });
+        if (!snapshot.eligible) {
+          skipped.push({ trackId: track.id, reason: snapshot.reason });
+          continue;
+        }
+        if (snapshot.chunks.every((chunk) => chunk.transcriptionResult === "no_speech")) {
+          skipped.push({ trackId: track.id, reason: "no_speech" });
+          continue;
+        }
+        const inputHash = buildDiarizationJobKey({
+          sessionId: safeSessionId,
+          trackId: track.id,
+          transcriptRevision: snapshot.transcriptRevision,
+          policyId: policy.policyId,
+        });
+        const identity = {
+          sessionId: safeSessionId,
+          trackId: track.id,
+          inputHash,
+          inputVersion: policy.inputVersion,
+          modelVersion: policy.policyId,
+        };
+        const result = this.statements.insertDiarizationJob.run({
+          id: derivedId("job_diarize", inputHash),
+          ...identity,
+          createdAt: safeAt,
+        });
+        enqueued += result.changes;
+        const job = this.statements.getDiarizationJobByIdentity.get(identity);
+        if (!job) throw new Error("diarization job insert was not durable");
+        jobs.push(job);
+      }
+    });
+    enqueue.immediate();
+    return { enqueued, jobs, skipped };
+  }
+
+  commitDiarizationRun(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("diarization commit input is required");
+    }
+    if (
+      typeof input.expectedRevision !== "string" ||
+      !/^[0-9a-f]{64}$/.test(input.expectedRevision)
+    ) {
+      throw new TypeError("expectedRevision must be a lowercase SHA-256 digest");
+    }
+    const validatedAt = assertNonNegativeInteger(input.validatedAt, "validatedAt");
+    const run = input.run;
+    if (!run || typeof run !== "object" || Array.isArray(run)) {
+      throw new TypeError("diarization run is required");
+    }
+    const normalizedRun = {
+      id: assertId(run.id, "run.id"),
+      sessionId: assertId(run.sessionId, "run.sessionId"),
+      trackId: assertId(run.trackId, "run.trackId"),
+      transcriptRevision: run.transcriptRevision,
+      policyId: assertId(run.policyId, "run.policyId"),
+      diarizerModelId: assertDiarizationModelId(run.diarizerModelId, "run.diarizerModelId"),
+      embeddingModelId: assertDiarizationModelId(run.embeddingModelId, "run.embeddingModelId"),
+      modelArtifactSha256: run.modelArtifactSha256,
+      embeddingDimension: run.embeddingDimension,
+      sampleRate: run.sampleRate,
+      inputVersion: run.inputVersion,
+      executionDevice: run.executionDevice,
+      createdAt: assertNonNegativeInteger(run.createdAt, "run.createdAt"),
+      completedAt: assertNonNegativeInteger(run.completedAt, "run.completedAt"),
+    };
+    if (
+      normalizedRun.transcriptRevision !== input.expectedRevision ||
+      !/^[0-9a-f]{64}$/.test(normalizedRun.transcriptRevision) ||
+      !/^[0-9a-f]{64}$/.test(normalizedRun.modelArtifactSha256) ||
+      normalizedRun.embeddingDimension !== 512 ||
+      normalizedRun.sampleRate !== 16_000 ||
+      normalizedRun.inputVersion !== 1 ||
+      normalizedRun.executionDevice !== "cpu" ||
+      normalizedRun.completedAt < normalizedRun.createdAt
+    ) {
+      throw new TypeError("invalid diarization run metadata");
+    }
+    if (!Array.isArray(input.clusters) || !Array.isArray(input.turns)) {
+      throw new TypeError("diarization clusters and turns must be arrays");
+    }
+    if (input.clusters.length === 0 && input.turns.length > 0) {
+      throw new TypeError("diarization turns require clusters");
+    }
+    const clusterLabels = new Map();
+    const clusters = input.clusters.map((cluster) => {
+      const id = assertId(cluster?.id, "cluster.id");
+      const localLabel = assertId(cluster?.localLabel, "cluster.localLabel");
+      const speechMs = assertNonNegativeInteger(cluster.speechMs, "cluster.speechMs");
+      const windowCount = assertNonNegativeInteger(cluster.windowCount, "cluster.windowCount");
+      const qualityScore = assertOptionalUnitScore(cluster.qualityScore, "cluster.qualityScore");
+      const embedding =
+        cluster.embedding === null ? null : encodeDiarizationEmbedding(cluster.embedding);
+      if (
+        (windowCount === 0 && (speechMs !== 0 || embedding !== null || qualityScore !== null)) ||
+        (windowCount > 0 && (embedding === null || qualityScore === null))
+      ) {
+        throw new TypeError("diarization cluster aggregate is inconsistent");
+      }
+      const normalized = {
+        id,
+        localLabel,
+        embedding,
+        speechMs,
+        windowCount,
+        qualityScore,
+        firstAppearanceAt: assertNonNegativeInteger(
+          cluster.firstAppearanceAt,
+          "cluster.firstAppearanceAt"
+        ),
+      };
+      if (clusterLabels.has(id) || [...clusterLabels.values()].includes(localLabel)) {
+        throw new TypeError("diarization clusters must be unique");
+      }
+      clusterLabels.set(id, localLabel);
+      return normalized;
+    });
+    const turnIds = new Set();
+    const turns = input.turns.map((turn) => {
+      const id = assertId(turn?.id, "turn.id");
+      const clusterId = assertId(turn?.clusterId, "turn.clusterId");
+      const localLabel = assertId(turn?.localLabel, "turn.localLabel");
+      if (turnIds.has(id) || clusterLabels.get(clusterId) !== localLabel) {
+        throw new TypeError("turn cluster identity is invalid");
+      }
+      turnIds.add(id);
+      if (!new Set(["none", "possible", "confirmed"]).has(turn.echoState)) {
+        throw new TypeError("invalid turn echo state");
+      }
+      if (turn.echoState !== "confirmed" && turn.excludedFromCentroid === true) {
+        throw new TypeError("only confirmed echo may be excluded from the centroid");
+      }
+      return {
+        id,
+        clusterId,
+        chunkId: assertId(turn.chunkId, "turn.chunkId"),
+        transcriptSegmentId:
+          turn.transcriptSegmentId === null
+            ? null
+            : assertId(turn.transcriptSegmentId, "turn.transcriptSegmentId"),
+        turnIndex: assertNonNegativeInteger(turn.turnIndex, "turn.turnIndex"),
+        rawLabel: assertId(turn.rawLabel, "turn.rawLabel"),
+        startedAt: assertNonNegativeInteger(turn.startedAt, "turn.startedAt"),
+        endedAt: assertNonNegativeInteger(turn.endedAt, "turn.endedAt"),
+        embedding: encodeDiarizationEmbedding(turn.embedding),
+        echoState: turn.echoState,
+        duplicateOfTurnId:
+          turn.duplicateOfTurnId === null
+            ? null
+            : assertId(turn.duplicateOfTurnId, "turn.duplicateOfTurnId"),
+        excludedFromCentroid: turn.excludedFromCentroid === true,
+      };
+    });
+    const rawLinks = input.segmentLinks ?? [];
+    if (!Array.isArray(rawLinks)) throw new TypeError("segmentLinks must be an array");
+    const segmentLinks = rawLinks.map((link) => ({
+      clusterId: assertId(link?.clusterId, "link.clusterId"),
+      transcriptSegmentId: assertId(link?.transcriptSegmentId, "link.transcriptSegmentId"),
+    }));
+    return this._commitDiarizationRun({
+      expectedRevision: input.expectedRevision,
+      validatedAt,
+      run: normalizedRun,
+      clusters,
+      turns,
+      segmentLinks,
+    });
   }
 
   isSessionReadyForPostProcessing(sessionId) {
