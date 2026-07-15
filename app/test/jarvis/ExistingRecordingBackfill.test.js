@@ -84,6 +84,7 @@ function createRuntime(repository, recordingsRoot, owner) {
       now: () => NOW,
     }),
     transcribeWav: async () => ({ noSpeech: true }),
+    inputVersion: 1,
     modelVersion: TEST_TRANSCRIPTION_MODEL,
     now: () => NOW,
   });

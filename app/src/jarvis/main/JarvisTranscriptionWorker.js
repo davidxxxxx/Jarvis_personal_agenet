@@ -40,7 +40,14 @@ function normalizeResult(result) {
 }
 
 class JarvisTranscriptionWorker {
-  constructor({ repository, audioEvidenceReader, transcribeWav, modelVersion, now = Date.now }) {
+  constructor({
+    repository,
+    audioEvidenceReader,
+    transcribeWav,
+    inputVersion,
+    modelVersion,
+    now = Date.now,
+  }) {
     if (!repository || typeof repository.getAudioChunk !== "function") {
       throw new TypeError("repository.getAudioChunk must be a function");
     }
@@ -56,6 +63,9 @@ class JarvisTranscriptionWorker {
     if (typeof transcribeWav !== "function") {
       throw new TypeError("transcribeWav must be a function");
     }
+    if (!Number.isSafeInteger(inputVersion) || inputVersion < 1) {
+      throw new TypeError("inputVersion must be a positive safe integer");
+    }
     if (typeof modelVersion !== "string" || !modelVersion.trim() || modelVersion.length > 128) {
       throw new TypeError("modelVersion must be a non-empty string of at most 128 characters");
     }
@@ -63,12 +73,19 @@ class JarvisTranscriptionWorker {
     this.repository = repository;
     this.audioEvidenceReader = audioEvidenceReader;
     this.transcribeWav = transcribeWav;
+    this.inputVersion = inputVersion;
     this.modelVersion = modelVersion.trim();
     this.now = now;
   }
 
   async handle(job, executionContext = null) {
     const resourceContext = executionContext?.device ? executionContext : null;
+    if (
+      job?.input_version !== this.inputVersion ||
+      job?.model_version !== this.modelVersion
+    ) {
+      throw codedError("TRANSCRIPTION_LINEAGE_MISMATCH");
+    }
     const chunkId = job?.chunk_id;
     let chunk;
     try {

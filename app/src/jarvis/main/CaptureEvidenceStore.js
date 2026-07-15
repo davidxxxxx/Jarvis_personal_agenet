@@ -179,6 +179,8 @@ class CaptureEvidenceStore {
               AND active.job_type = 'transcribe_chunk'
               AND active.state = 'running'
               AND active.completed_at IS NULL
+              AND active.lease_expires_at IS NOT NULL
+              AND active.lease_expires_at > @at
           )
         ORDER BY chunk.ended_at, chunk.id
         LIMIT @limit
@@ -490,6 +492,21 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
       `),
+      recoverExpiredTranscriptionJobLeases: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            next_retry_at = @at,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'LEASE_EXPIRED',
+            blocked_reason = NULL,
+            execution_device = NULL,
+            completed_at = NULL
+        WHERE job_type = 'transcribe_chunk'
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND (lease_expires_at IS NULL OR lease_expires_at <= @at)
+      `),
       renewLeasedJob: db.prepare(`
         UPDATE processing_jobs
         SET lease_expires_at = @leaseExpiresAt
@@ -703,6 +720,7 @@ class CaptureEvidenceStore {
     });
     this.enqueueCurrentModelTranscriptionJobsTransaction = db.transaction(
       ({ inputVersion, modelVersion, at, limit }) => {
+        this.statements.recoverExpiredTranscriptionJobLeases.run({ at });
         const chunks = this.statements.listChunksMissingCurrentTranscription.all({
           inputVersion,
           modelVersion,

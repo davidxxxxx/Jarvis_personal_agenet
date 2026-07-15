@@ -403,6 +403,34 @@ test("records handler failure with backoff without losing durable input metadata
   );
 });
 
+test("blocks a transcription lineage mismatch instead of retrying obsolete work", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    const error = new Error("TRANSCRIPTION_LINEAGE_MISMATCH");
+    error.code = "TRANSCRIPTION_LINEAGE_MISMATCH";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "TRANSCRIPTION_LINEAGE_MISMATCH",
+      completed_at: 2_000,
+    }
+  );
+  assert.equal(await runner.runOnce(), 0);
+});
+
 test("obsolete diarization inputs become terminal while the runner continues other jobs", async (t) => {
   const { db, runner } = fixture(t);
   const obsoleteCodes = [

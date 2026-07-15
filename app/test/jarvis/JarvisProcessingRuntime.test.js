@@ -638,6 +638,77 @@ test("production composition binds transcribe and compression handlers to curren
   );
 });
 
+test("production startup replaces an expired old-model lease before any transcription runs", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository, { status: "recording" });
+  insertTrack(repository);
+  insertChunk(repository);
+  insertJob(repository, {
+    state: "running",
+    leaseOwner: "dead-worker",
+    leaseExpiresAt: 1_999,
+  });
+  repository.db
+    .prepare("UPDATE processing_jobs SET attempt_count = 1, model_version = 'old-model'")
+    .run();
+
+  const transcriptions = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: configurableService({
+      audioEvidenceReader: {
+        withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
+      },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    }),
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: ({ model }) => async () => {
+        transcriptions.push(model);
+        return { noSpeech: true, executionDevice: "cpu" };
+      },
+    },
+    model: "current-model",
+    owner: "startup-worker",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({ state: "available", restrictiveForMs: 0 }),
+      admit: () => ({ action: "run_cpu", reason: "resources_available" }),
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  });
+  t.after(() => runtime.stop());
+
+  assert.equal(await runtime.start(), 1);
+  assert.deepEqual(transcriptions, ["current-model"]);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT state, model_version, attempt_count, error_code
+         FROM processing_jobs ORDER BY model_version`
+      )
+      .all(),
+    [
+      {
+        state: "completed",
+        model_version: "current-model",
+        attempt_count: 1,
+        error_code: null,
+      },
+      {
+        state: "superseded",
+        model_version: "old-model",
+        attempt_count: 1,
+        error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+      },
+    ]
+  );
+});
+
 test("production composition registers diarize_track as CPU speaker work", async (t) => {
   const repository = new JarvisRepository(":memory:");
   t.after(() => repository.close());

@@ -1,5 +1,6 @@
 const ERROR_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const TERMINAL_OBSOLETE_ERRORS = new Set([
+  "TRANSCRIPTION_LINEAGE_MISMATCH",
   "DIARIZATION_STALE_INPUT",
   "DIARIZATION_AUDIO_EXPIRED",
   "DIARIZATION_SUPERSEDED",
@@ -259,10 +260,12 @@ class ProcessingJobRunner {
       if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
-      if (
-        ["diarize_track", "resolve_identities"].includes(job.job_type) &&
-        TERMINAL_OBSOLETE_ERRORS.has(errorCode)
-      ) {
+      const terminalObsoleteJob =
+        (job.job_type === "transcribe_chunk" &&
+          errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
+        (["diarize_track", "resolve_identities"].includes(job.job_type) &&
+          TERMINAL_OBSOLETE_ERRORS.has(errorCode));
+      if (terminalObsoleteJob) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,
           at: failedAt,

@@ -6,7 +6,17 @@ const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const JarvisTranscriptionWorker = require("../../src/jarvis/main/JarvisTranscriptionWorker");
 
 const MODEL_VERSION = "large-v3-turbo";
+const INPUT_VERSION = 1;
 const COMPLETED_AT = 500_000;
+
+function transcriptionJob(chunkId = "chunk-1", overrides = {}) {
+  return {
+    chunk_id: chunkId,
+    input_version: INPUT_VERSION,
+    model_version: MODEL_VERSION,
+    ...overrides,
+  };
+}
 
 function seedChunk(t, { format = "wav", sourceType = "system", id = "chunk-1" } = {}) {
   const repository = new JarvisRepository(":memory:");
@@ -61,6 +71,7 @@ function workerFixture(repository, transcribeWav, { reader } = {}) {
     repository,
     audioEvidenceReader,
     transcribeWav,
+    inputVersion: INPUT_VERSION,
     modelVersion: MODEL_VERSION,
     now: () => COMPLETED_AT,
   });
@@ -88,7 +99,7 @@ for (const format of ["wav", "flac"]) {
       return { text: "今天 review 一个 roadmap", confidence: 0.91 };
     });
 
-    await worker.handle({ chunk_id: "chunk-1" });
+    await worker.handle(transcriptionJob());
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].format, format);
@@ -138,8 +149,8 @@ test("keeps MIC lineage and replaying the same input and model is idempotent", a
     text: "Call Alice after standup",
   }));
 
-  await worker.handle({ chunk_id: "chunk-1" });
-  await worker.handle({ chunk_id: "chunk-1" });
+  await worker.handle(transcriptionJob());
+  await worker.handle(transcriptionJob());
 
   const rows = repository
     .listTranscriptSegments("session-1")
@@ -156,10 +167,43 @@ test("records explicit no-speech as a terminal chunk state without fabricated te
     message: "No audio detected",
   }));
 
-  await worker.handle({ chunk_id: "chunk-1" });
+  await worker.handle(transcriptionJob());
 
   assert.equal(repository.listTranscriptSegments("session-1").length, 0);
   assert.equal(repository.getAudioChunk("chunk-1").transcription_status, "no_speech");
+});
+
+test("rejects transcription lineage mismatches before reading durable audio", async (t) => {
+  const repository = seedChunk(t);
+  let readerCalls = 0;
+  let transcribeCalls = 0;
+  const { worker } = workerFixture(
+    repository,
+    async () => {
+      transcribeCalls += 1;
+      return { text: "must not run" };
+    },
+    {
+      reader: {
+        async withVerifiedWav() {
+          readerCalls += 1;
+          return { text: "must not run" };
+        },
+      },
+    }
+  );
+
+  await assert.rejects(
+    worker.handle(transcriptionJob("chunk-1", { model_version: "stale-model" })),
+    { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
+  );
+  await assert.rejects(
+    worker.handle(transcriptionJob("chunk-1", { input_version: INPUT_VERSION + 1 })),
+    { code: "TRANSCRIPTION_LINEAGE_MISMATCH" }
+  );
+  assert.equal(readerCalls, 0);
+  assert.equal(transcribeCalls, 0);
+  assert.equal(repository.listTranscriptSegments("session-1").length, 0);
 });
 
 test("rejects missing, tombstoned, and uncommitted evidence before transcription", async (t) => {
@@ -170,17 +214,17 @@ test("rejects missing, tombstoned, and uncommitted evidence before transcription
     return { text: "must not run" };
   });
 
-  await assert.rejects(worker.handle({ chunk_id: "missing" }), { code: "AUDIO_UNAVAILABLE" });
+  await assert.rejects(worker.handle(transcriptionJob("missing")), { code: "AUDIO_UNAVAILABLE" });
   repository.db
     .prepare("UPDATE audio_chunks SET deleted_at = ?, path = ? WHERE id = ?")
     .run(100, "tombstone:chunk-1", "chunk-1");
-  await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), { code: "AUDIO_UNAVAILABLE" });
+  await assert.rejects(worker.handle(transcriptionJob()), { code: "AUDIO_UNAVAILABLE" });
   repository.db
     .prepare(
       "UPDATE audio_chunks SET deleted_at = NULL, path = ?, write_state = 'writing' WHERE id = ?"
     )
     .run("chunk-1.wav", "chunk-1");
-  await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), { code: "AUDIO_UNAVAILABLE" });
+  await assert.rejects(worker.handle(transcriptionJob()), { code: "AUDIO_UNAVAILABLE" });
   assert.equal(transcribeCalls, 0);
 });
 
@@ -195,7 +239,7 @@ test("maps expired or unreadable verified evidence to a stable unavailable code"
     },
   });
 
-  await assert.rejects(worker.handle({ chunk_id: "chunk-1" }), {
+  await assert.rejects(worker.handle(transcriptionJob()), {
     code: "AUDIO_UNAVAILABLE",
   });
 });
@@ -203,7 +247,7 @@ test("maps expired or unreadable verified evidence to a stable unavailable code"
 test("rejects malformed and non-silence Whisper failures without committing a segment", async (t) => {
   const repository = seedChunk(t);
   const malformed = workerFixture(repository, async () => ({ success: true })).worker;
-  await assert.rejects(malformed.handle({ chunk_id: "chunk-1" }), {
+  await assert.rejects(malformed.handle(transcriptionJob()), {
     code: "TRANSCRIPTION_INVALID_RESULT",
   });
   assert.equal(repository.listTranscriptSegments("session-1").length, 0);
@@ -212,7 +256,7 @@ test("rejects malformed and non-silence Whisper failures without committing a se
     success: false,
     error: "local inference failed",
   })).worker;
-  await assert.rejects(failed.handle({ chunk_id: "chunk-1" }), {
+  await assert.rejects(failed.handle(transcriptionJob()), {
     code: "TRANSCRIPTION_FAILED",
   });
   assert.equal(repository.listTranscriptSegments("session-1").length, 0);
@@ -233,7 +277,7 @@ test("passes admission context through verified evidence and returns only the pr
     return { text: "local CPU result", confidence: 0.8, executionDevice: "cpu" };
   });
 
-  assert.deepEqual(await worker.handle({ chunk_id: "chunk-1" }, context), {
+  assert.deepEqual(await worker.handle(transcriptionJob(), context), {
     executionDevice: "cpu",
   });
   assert.deepEqual(input.executionContext, context);
@@ -243,7 +287,7 @@ test("passes admission context through verified evidence and returns only the pr
     text: "must not commit",
     executionDevice: "cuda",
   })).worker;
-  await assert.rejects(mismatched.handle({ chunk_id: "chunk-2" }, context), {
+  await assert.rejects(mismatched.handle(transcriptionJob("chunk-2"), context), {
     code: "EXECUTION_DEVICE_MISMATCH",
   });
   assert.equal(secondRepository.listTranscriptSegments("session-1").length, 0);
@@ -258,7 +302,7 @@ test("lease-only runner context preserves legacy no-governor transcription seman
   });
   const leaseOnlyContext = { renewLease: () => true };
 
-  assert.equal(await worker.handle({ chunk_id: "chunk-1" }, leaseOnlyContext), undefined);
+  assert.equal(await worker.handle(transcriptionJob(), leaseOnlyContext), undefined);
   assert.equal(input.executionContext, null);
   assert.equal(repository.getAudioChunk("chunk-1").transcription_status, "completed");
 });

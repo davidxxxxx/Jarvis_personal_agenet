@@ -1160,6 +1160,92 @@ test("current-model reconciliation supersedes an unstarted legacy job without re
   );
 });
 
+test("current-model reconciliation recovers an expired legacy lease before replacing it", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-v1" }));
+  const legacy = db
+    .prepare("SELECT * FROM processing_jobs WHERE job_type = 'transcribe_chunk'")
+    .get();
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', attempt_count = 1,
+         lease_owner = 'dead-worker', lease_expires_at = 99
+     WHERE id = ?`
+  ).run(legacy.id);
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-v2",
+      at: 100,
+    }),
+    { enqueued: 1, superseded: 1 }
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, model_version, attempt_count, error_code,
+                lease_owner, lease_expires_at
+         FROM processing_jobs
+         WHERE job_type = 'transcribe_chunk'
+         ORDER BY model_version`
+      )
+      .all(),
+    [
+      {
+        id: legacy.id,
+        state: "superseded",
+        model_version: "model-v1",
+        attempt_count: 1,
+        error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+      {
+        id: "job-2",
+        state: "pending",
+        model_version: "model-v2",
+        attempt_count: 0,
+        error_code: null,
+        lease_owner: null,
+        lease_expires_at: null,
+      },
+    ]
+  );
+});
+
+test("current-model reconciliation exempts only a live legacy lease", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-v1" }));
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'running', attempt_count = 1,
+         lease_owner = 'live-worker', lease_expires_at = 101
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-v2",
+      at: 100,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+  assert.equal(db.prepare("SELECT count(*) AS count FROM processing_jobs").get().count, 1);
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-v2",
+      at: 101,
+    }),
+    { enqueued: 1, superseded: 1 }
+  );
+});
+
 test("model changes append one current transcription revision and preserve completed identity", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);

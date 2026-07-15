@@ -716,6 +716,7 @@ function createJarvisProcessingRuntime({
     repository,
     audioEvidenceReader: service.audioEvidenceReader,
     transcribeWav,
+    inputVersion: speakerProcessingPolicy.transcriptionInputVersion,
     modelVersion: configuredModel,
     now,
   });
