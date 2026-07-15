@@ -154,6 +154,55 @@ class CaptureEvidenceStore {
           AND input_version = @inputVersion
           AND model_version = @modelVersion
       `),
+      listChunksMissingCurrentTranscription: db.prepare(`
+        SELECT chunk.*
+        FROM audio_chunks AS chunk
+        WHERE chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+          AND chunk.expires_at > @at
+          AND EXISTS (
+            SELECT 1 FROM processing_jobs AS historical
+            WHERE historical.chunk_id = chunk.id
+              AND historical.job_type = 'transcribe_chunk'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS current
+            WHERE current.chunk_id = chunk.id
+              AND current.job_type = 'transcribe_chunk'
+              AND current.input_hash = chunk.sha256
+              AND current.input_version = @inputVersion
+              AND current.model_version = @modelVersion
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active
+            WHERE active.chunk_id = chunk.id
+              AND active.job_type = 'transcribe_chunk'
+              AND active.state = 'running'
+              AND active.completed_at IS NULL
+          )
+        ORDER BY chunk.ended_at, chunk.id
+        LIMIT @limit
+      `),
+      supersedeStaleTranscriptionJobs: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            completed_at = @at,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'TRANSCRIPTION_MODEL_SUPERSEDED',
+            blocked_reason = NULL,
+            execution_device = NULL
+        WHERE chunk_id = @chunkId
+          AND job_type = 'transcribe_chunk'
+          AND completed_at IS NULL
+          AND state IN ('pending', 'retry', 'retention_urgent')
+          AND NOT (
+            input_hash = @inputHash
+            AND input_version = @inputVersion
+            AND model_version = @modelVersion
+          )
+      `),
       insertCompressionJob: db.prepare(`
         INSERT INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state,
@@ -641,6 +690,40 @@ class CaptureEvidenceStore {
       this.statements.invalidateSessionReadiness.run({ sessionId: chunk.sessionId });
       return inserted;
     });
+    this.enqueueCurrentModelTranscriptionJobsTransaction = db.transaction(
+      ({ inputVersion, modelVersion, at, limit }) => {
+        const chunks = this.statements.listChunksMissingCurrentTranscription.all({
+          inputVersion,
+          modelVersion,
+          at,
+          limit,
+        });
+        let enqueued = 0;
+        let superseded = 0;
+        for (const row of chunks) {
+          superseded += this.statements.supersedeStaleTranscriptionJobs.run({
+            chunkId: row.id,
+            inputHash: row.sha256,
+            inputVersion,
+            modelVersion,
+            at,
+          }).changes;
+          this.statements.insertTranscriptionJob.run({
+            id: this.createId("job"),
+            sessionId: row.session_id,
+            trackId: row.track_id,
+            chunkId: row.id,
+            inputHash: row.sha256,
+            inputVersion,
+            modelVersion,
+            createdAt: at,
+          });
+          this.statements.invalidateSessionReadiness.run({ sessionId: row.session_id });
+          enqueued += 1;
+        }
+        return { enqueued, superseded };
+      }
+    );
     this.promoteChunkToFlacTransaction = db.transaction((input) => {
       const chunk = this.statements.getChunk.get(input.chunkId);
       if (!chunk) throw new Error(`chunk ${input.chunkId} does not exist`);
@@ -1301,6 +1384,26 @@ class CaptureEvidenceStore {
 
   enqueueChunkTranscription(chunk) {
     return this.enqueueChunkTranscriptionTransaction(chunk);
+  }
+
+  enqueueCurrentModelTranscriptionJobs({
+    inputVersion = 1,
+    modelVersion,
+    at = this.now(),
+    limit = 1_000,
+  } = {}) {
+    this._assertPositiveSafeInteger(inputVersion, "inputVersion");
+    if (typeof modelVersion !== "string" || !modelVersion.trim() || modelVersion.length > 128) {
+      throw new TypeError("modelVersion must be a non-empty string of at most 128 characters");
+    }
+    this._assertNonNegativeSafeInteger(at, "at");
+    this._assertPositiveSafeInteger(limit, "limit");
+    return this.enqueueCurrentModelTranscriptionJobsTransaction({
+      inputVersion,
+      modelVersion: modelVersion.trim(),
+      at,
+      limit,
+    });
   }
 
   _insertChunkTranscription(chunk) {

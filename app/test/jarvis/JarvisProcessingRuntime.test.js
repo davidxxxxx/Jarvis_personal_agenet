@@ -36,6 +36,15 @@ function finalSpeakerPolicy(model = "large-v3-turbo") {
   });
 }
 
+function configurableService(service) {
+  return Object.assign(service, {
+    configureTranscriptionModelVersion(modelVersion) {
+      this.transcriptionModelVersion = modelVersion.trim();
+      return this.transcriptionModelVersion;
+    },
+  });
+}
+
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
   const componentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-runtime-cuda-"));
   t.after(() => fs.rmSync(componentRoot, { recursive: true, force: true }));
@@ -527,7 +536,7 @@ test("production composition binds transcribe and compression handlers to curren
         : { action: "run_cpu", reason: "resources_available" };
     },
   };
-  const service = {
+  const service = configurableService({
     audioEvidenceReader: {
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
     },
@@ -538,7 +547,7 @@ test("production composition binds transcribe and compression handlers to curren
       },
     },
     previewAudioRing: { withPreviewWav: async () => null },
-  };
+  });
   const ipcHandlers = {
     createJarvisTranscribeWavAdapter: ({ model }) => {
       calls.push(`model:${model}`);
@@ -564,13 +573,69 @@ test("production composition binds transcribe and compression handlers to curren
   assert.deepEqual(admissions, ["final_transcription", "maintenance"]);
   assert.deepEqual(compressionContexts, [{ owner: "production-worker" }]);
   assert.deepEqual(
-    repository.db.prepare("SELECT id, execution_device FROM processing_jobs ORDER BY id").all(),
+    repository.db
+      .prepare(
+        `SELECT state, model_version, attempt_count, execution_device, error_code
+         FROM processing_jobs
+         WHERE job_type = 'transcribe_chunk'
+         ORDER BY model_version`
+      )
+      .all(),
     [
-      { id: "compress-job", execution_device: "cpu" },
-      { id: "job-mic", execution_device: "cuda" },
+      {
+        state: "superseded",
+        model_version: "",
+        attempt_count: 0,
+        execution_device: null,
+        error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+      },
+      {
+        state: "completed",
+        model_version: "large-v3-turbo",
+        attempt_count: 1,
+        execution_device: "cuda",
+        error_code: null,
+      },
     ]
   );
+  assert.equal(
+    repository.db
+      .prepare("SELECT execution_device FROM processing_jobs WHERE id = 'compress-job'")
+      .get().execution_device,
+    "cpu"
+  );
   assert.equal(repository.getSession("s1").processing_state, "ready");
+  assert.equal(repository.listPendingJobs("s1").length, 0);
+  assert.equal(
+    repository.getDiarizationTrackEvidence({
+      sessionId: "s1",
+      trackId: "track-mic",
+      observedAt: 2_000,
+    }).chunks[0].latestTranscriptionJob.model_version,
+    "large-v3-turbo"
+  );
+  assert.deepEqual(
+    (({ pending, running, retry, blocked, total, backlogMs, oldestCreatedAt, deferrals }) => ({
+      pending,
+      running,
+      retry,
+      blocked,
+      total,
+      backlogMs,
+      oldestCreatedAt,
+      deferrals,
+    }))(repository.getRuntimeProcessingStatus()),
+    {
+      pending: 0,
+      running: 0,
+      retry: 0,
+      blocked: 0,
+      total: 0,
+      backlogMs: 0,
+      oldestCreatedAt: null,
+      deferrals: [],
+    }
+  );
 });
 
 test("production composition registers diarize_track as CPU speaker work", async (t) => {
@@ -599,11 +664,11 @@ test("production composition registers diarize_track as CPU speaker work", async
   const capabilities = [];
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: { withVerifiedWav: async (_chunk, consume) => consume("verified.wav") },
       flacCompressionWorker: { run: async () => {} },
       previewAudioRing: { withPreviewWav: async () => null },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
     },
@@ -696,13 +761,13 @@ test("production composition builds the durable diarization worker from local ma
   const capabilities = [];
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: {
         withVerifiedWav: async (_chunk, consume) => consume("verified-final.wav"),
       },
       flacCompressionWorker: { run: async () => {} },
       previewAudioRing: { withPreviewWav: async () => null },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
       diarizationManager: {
@@ -790,11 +855,11 @@ test("production composition passes CPU speaker lease context into identity reso
   const admissions = [];
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: { withVerifiedWav: async (_chunk, consume) => consume("verified.wav") },
       flacCompressionWorker: { run: async () => {} },
       previewAudioRing: { withPreviewWav: async () => null },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
     },
@@ -865,11 +930,11 @@ test("missing local diarization dependencies defer instead of producing HANDLER_
   const resourceGovernor = new ResourceGovernor();
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: { withVerifiedWav: async () => assert.fail("audio was read") },
       flacCompressionWorker: { run: async () => {} },
       previewAudioRing: { withPreviewWav: async () => null },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
     },
@@ -963,7 +1028,7 @@ test("two production drains serialize transcription and compression through the 
   let active = 0;
   let peak = 0;
   const compressionContexts = [];
-  const service = {
+  const service = configurableService({
     audioEvidenceReader: {
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
     },
@@ -976,7 +1041,7 @@ test("two production drains serialize transcription and compression through the 
       },
     },
     previewAudioRing: { withPreviewWav: async () => null },
-  };
+  });
   const ipcHandlers = {
     createJarvisTranscribeWavAdapter:
       () =>
@@ -1033,11 +1098,37 @@ test("two production drains serialize transcription and compression through the 
   assert.deepEqual(compressionContexts, [{ owner: "compression-worker" }]);
   assert.deepEqual(
     repository.db
-      .prepare("SELECT id, state, attempt_count, completed_at FROM processing_jobs ORDER BY id")
+      .prepare(
+        `SELECT job_type, state, model_version, attempt_count, completed_at, error_code
+         FROM processing_jobs
+         ORDER BY job_type, model_version`
+      )
       .all(),
     [
-      { id: "compress-job", state: "completed", attempt_count: 1, completed_at: 2_000 },
-      { id: "job-mic", state: "completed", attempt_count: 1, completed_at: 2_000 },
+      {
+        job_type: "compress_chunk",
+        state: "completed",
+        model_version: "flac-v1",
+        attempt_count: 1,
+        completed_at: 2_000,
+        error_code: null,
+      },
+      {
+        job_type: "transcribe_chunk",
+        state: "superseded",
+        model_version: "",
+        attempt_count: 0,
+        completed_at: 2_000,
+        error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+      },
+      {
+        job_type: "transcribe_chunk",
+        state: "completed",
+        model_version: "large-v3-turbo",
+        attempt_count: 1,
+        completed_at: 2_000,
+        error_code: null,
+      },
     ]
   );
 });
@@ -1051,14 +1142,14 @@ test("production runtime startup waits for FLAC authority recovery before claimi
   insertJob(repository);
   const recovery = deferred();
   const calls = [];
-  const service = {
+  const service = configurableService({
     waitForCompressionRecovery: () => recovery.promise,
     audioEvidenceReader: {
       withVerifiedWav: async (_chunk, callback) => callback("verified.wav"),
     },
     flacCompressionWorker: { run: async () => {} },
     previewAudioRing: { withPreviewWav: async () => null },
-  };
+  });
   const runtime = createJarvisProcessingRuntime({
     repository,
     service,
@@ -1119,11 +1210,11 @@ test("production admission uses the real CUDA status peak at the exact safety-ma
   let now = 1_000;
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: { withVerifiedWav: async () => ({}) },
       flacCompressionWorker: { run: async () => ({}) },
       previewAudioRing: { withPreviewWav: async () => null },
-    },
+    }),
     ipcHandlers: {
       whisperCudaManager: cudaManager,
       createJarvisTranscribeWavAdapter: () => async () => ({ text: "unused" }),
@@ -1693,10 +1784,10 @@ test("production runtime ticks an injected preview through the shared heavy gate
   };
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: { withVerifiedWav: async () => ({}) },
       flacCompressionWorker: { run: async () => {} },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
     },
@@ -1744,7 +1835,7 @@ test("production default preview path transcribes bounded committed audio as pro
   const ringCalls = [];
   const runtime = createJarvisProcessingRuntime({
     repository,
-    service: {
+    service: configurableService({
       audioEvidenceReader: {
         withVerifiedWav: async () => assert.fail("live preview read durable final evidence"),
       },
@@ -1761,7 +1852,7 @@ test("production default preview path transcribes bounded committed audio as pro
           });
         },
       },
-    },
+    }),
     ipcHandlers: {
       createJarvisTranscribeWavAdapter: () => async (input) => {
         adapterCalls.push(input);

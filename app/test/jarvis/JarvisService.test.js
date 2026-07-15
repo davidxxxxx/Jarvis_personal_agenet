@@ -1288,6 +1288,7 @@ test("degraded public state keeps the durable session open with real evidence st
   const service = new JarvisService({
     repository,
     userDataDir,
+    transcriptionModelVersion: "service-test-model",
     broadcast() {},
     now: () => 20,
     fsImpl: createSafeFs(),
@@ -1324,10 +1325,13 @@ test("degraded public state keeps the durable session open with real evidence st
     );
     assert.deepEqual(
       repository.db
-        .prepare("SELECT job_type FROM processing_jobs ORDER BY job_type")
+        .prepare("SELECT job_type, model_version FROM processing_jobs ORDER BY job_type")
         .all()
-        .map((job) => job.job_type),
-      ["compress_chunk", "transcribe_chunk"]
+        .map((job) => [job.job_type, job.model_version]),
+      [
+        ["compress_chunk", "ffmpeg-flac-v1"],
+        ["transcribe_chunk", "service-test-model"],
+      ]
     );
   } finally {
     service.shutdown();

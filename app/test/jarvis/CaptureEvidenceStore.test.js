@@ -1095,6 +1095,132 @@ test("enqueueChunkTranscription is idempotent by transcription input", (t) => {
   assert.equal(db.prepare("SELECT count(*) count FROM processing_jobs").get().count, 1);
 });
 
+test("current-model reconciliation supersedes an unstarted legacy job without rewriting history", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000 }));
+  const legacy = db
+    .prepare("SELECT * FROM processing_jobs WHERE job_type = 'transcribe_chunk'")
+    .get();
+  db.prepare("UPDATE sessions SET processing_state = 'ready', ready_at = 90 WHERE id = 's1'").run();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "current-model",
+      at: 100,
+    }),
+    { enqueued: 1, superseded: 1 }
+  );
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "current-model",
+      at: 100,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+
+  const jobs = db
+    .prepare(
+      `SELECT id, state, input_hash, input_version, model_version,
+              attempt_count, error_code, completed_at
+       FROM processing_jobs
+       WHERE job_type = 'transcribe_chunk'
+       ORDER BY model_version`
+    )
+    .all();
+  assert.deepEqual(jobs, [
+    {
+      id: legacy.id,
+      state: "superseded",
+      input_hash: legacy.input_hash,
+      input_version: legacy.input_version,
+      model_version: "",
+      attempt_count: 0,
+      error_code: "TRANSCRIPTION_MODEL_SUPERSEDED",
+      completed_at: 100,
+    },
+    {
+      id: "job-2",
+      state: "pending",
+      input_hash: legacy.input_hash,
+      input_version: 1,
+      model_version: "current-model",
+      attempt_count: 0,
+      error_code: null,
+      completed_at: null,
+    },
+  ]);
+  assert.deepEqual(
+    db
+      .prepare("SELECT processing_state, ready_at, timeline_version FROM sessions WHERE id = 's1'")
+      .get(),
+    { processing_state: "processing", ready_at: null, timeline_version: 2 }
+  );
+});
+
+test("model changes append one current transcription revision and preserve completed identity", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  store.commitChunk(chunk({ expiresAt: 1_000, modelVersion: "model-v1" }));
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 90, attempt_count = 1
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  const historical = db
+    .prepare("SELECT * FROM processing_jobs WHERE job_type = 'transcribe_chunk'")
+    .get();
+
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-v2",
+      at: 100,
+    }),
+    { enqueued: 1, superseded: 0 }
+  );
+  assert.deepEqual(
+    store.enqueueCurrentModelTranscriptionJobs({
+      inputVersion: 1,
+      modelVersion: "model-v2",
+      at: 100,
+    }),
+    { enqueued: 0, superseded: 0 }
+  );
+
+  const rows = db
+    .prepare(
+      `SELECT id, state, input_hash, input_version, model_version,
+              attempt_count, error_code, completed_at
+       FROM processing_jobs
+       WHERE job_type = 'transcribe_chunk'
+       ORDER BY model_version`
+    )
+    .all();
+  assert.deepEqual(rows[0], {
+    id: historical.id,
+    state: historical.state,
+    input_hash: historical.input_hash,
+    input_version: historical.input_version,
+    model_version: historical.model_version,
+    attempt_count: historical.attempt_count,
+    error_code: historical.error_code,
+    completed_at: historical.completed_at,
+  });
+  assert.deepEqual(rows[1], {
+    id: "job-2",
+    state: "pending",
+    input_hash: historical.input_hash,
+    input_version: 1,
+    model_version: "model-v2",
+    attempt_count: 0,
+    error_code: null,
+    completed_at: null,
+  });
+});
+
 test("rejects every transcription enqueue after a chunk is tombstoned", (t) => {
   const { store, db } = fixture(t);
   createTrack(store);

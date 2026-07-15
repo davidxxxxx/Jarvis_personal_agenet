@@ -285,6 +285,7 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
     userDataDir: newRoot,
     recordingsDir: path.join(newRoot, "recordings"),
     flacCompressionWorker: null,
+    transcriptionModelVersion: "recovery-test-model",
     broadcast() {},
     now: () => 3_000,
   });
@@ -294,6 +295,14 @@ test("relocates SQLite and recovery sidecar locators before the old root is dele
     ["s1"]
   );
   assert.equal(migrated.getAudioChunk("chunk-recovery").path, newRecoveryWav);
+  assert.equal(
+    migrated.db
+      .prepare(
+        "SELECT model_version FROM processing_jobs WHERE chunk_id = 'chunk-recovery' AND job_type = 'transcribe_chunk'"
+      )
+      .get().model_version,
+    "recovery-test-model"
+  );
   assert.equal(fs.existsSync(`${newRecoveryWav}.recovery.json`), false);
   service.shutdown();
   migrated.close();

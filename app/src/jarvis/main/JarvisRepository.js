@@ -535,7 +535,7 @@ class JarvisRepository {
                     SELECT 1 FROM processing_jobs AS job
                     WHERE job.chunk_id = chunk.id
                       AND job.job_type = 'transcribe_chunk'
-                      AND job.state <> 'completed'
+                      AND job.state NOT IN ('completed', 'superseded')
                   )
                   OR (
                     chunk.transcription_status = 'completed'
@@ -555,7 +555,7 @@ class JarvisRepository {
       `),
       listPendingJobs: this.db.prepare(`
         SELECT * FROM processing_jobs
-        WHERE session_id = ? AND state <> 'completed'
+        WHERE session_id = ? AND state NOT IN ('completed', 'superseded')
         ORDER BY created_at ASC, id ASC
       `),
       listSessionReadinessTracks: this.db.prepare(`
@@ -589,6 +589,7 @@ class JarvisRepository {
       getLatestChunkTranscriptionJob: this.db.prepare(`
         SELECT * FROM processing_jobs
         WHERE chunk_id = ? AND job_type = 'transcribe_chunk'
+          AND state <> 'superseded'
         ORDER BY input_version DESC, created_at DESC, id DESC
         LIMIT 1
       `),
@@ -1047,7 +1048,7 @@ class JarvisRepository {
           COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
           COUNT(*) AS total
         FROM processing_jobs
-        WHERE session_id = ?
+        WHERE session_id = ? AND state <> 'superseded'
       `),
       listRuntimeProcessingGroups: this.db.prepare(`
         SELECT
@@ -1058,7 +1059,7 @@ class JarvisRepository {
           COUNT(*) AS count,
           MIN(next_retry_at) AS next_retry_at
         FROM processing_jobs
-        WHERE state <> 'completed'
+        WHERE state NOT IN ('completed', 'superseded')
         GROUP BY job_type, state, priority, blocked_reason
         ORDER BY job_type ASC, state ASC, priority ASC, blocked_reason ASC
       `),
@@ -1071,13 +1072,13 @@ class JarvisRepository {
             SELECT 1 FROM processing_jobs AS job
             WHERE job.chunk_id = chunk.id
               AND job.job_type = 'transcribe_chunk'
-              AND job.state <> 'completed'
+              AND job.state NOT IN ('completed', 'superseded')
           )
       `),
       getRuntimeOldestProcessingJob: this.db.prepare(`
         SELECT MIN(created_at) AS oldest_created_at
         FROM processing_jobs
-        WHERE state <> 'completed'
+        WHERE state NOT IN ('completed', 'superseded')
       `),
       getActiveProcessingExecutionDevice: this.db.prepare(`
         SELECT execution_device
@@ -1099,6 +1100,7 @@ class JarvisRepository {
                 FROM processing_jobs AS current
                 WHERE current.chunk_id = chunk.id
                   AND current.job_type = 'transcribe_chunk'
+                  AND current.state <> 'superseded'
                 ORDER BY current.created_at DESC, current.id DESC
                 LIMIT 1
               )
@@ -1706,7 +1708,10 @@ class JarvisRepository {
             return false;
           }
           const chunkJobs = jobsByChunk.get(chunk.id) ?? [];
-          if (chunkJobs.length === 0 || chunkJobs.some((job) => job.state !== "completed")) {
+          if (
+            chunkJobs.length === 0 ||
+            chunkJobs.some((job) => !["completed", "superseded"].includes(job.state))
+          ) {
             return false;
           }
           if (chunk.transcription_status === "no_speech") return true;
@@ -3551,6 +3556,10 @@ class JarvisRepository {
 
   enqueueChunkTranscription(chunk) {
     return this.captureEvidenceStore.enqueueChunkTranscription(chunk);
+  }
+
+  enqueueCurrentModelTranscriptionJobs(input) {
+    return this.captureEvidenceStore.enqueueCurrentModelTranscriptionJobs(input);
   }
 
   insertAudioChunk(chunk) {

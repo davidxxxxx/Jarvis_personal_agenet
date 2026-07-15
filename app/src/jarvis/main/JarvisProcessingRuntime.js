@@ -161,6 +161,7 @@ class JarvisProcessingRuntime {
     startupBarrier = null,
     previewScheduler = null,
     speakerProcessingPolicy = null,
+    prepareTranscriptionJobs = null,
   } = {}) {
     if (
       !runner ||
@@ -216,6 +217,9 @@ class JarvisProcessingRuntime {
     ) {
       throw new TypeError("speakerProcessingPolicy must be immutable and implement evaluate");
     }
+    if (prepareTranscriptionJobs !== null && typeof prepareTranscriptionJobs !== "function") {
+      throw new TypeError("prepareTranscriptionJobs must be a function or null");
+    }
 
     this.runner = runner;
     this.repository = repository;
@@ -234,6 +238,7 @@ class JarvisProcessingRuntime {
     this.startupBarrier = startupBarrier;
     this.previewScheduler = previewScheduler;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
+    this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
     this.timer = null;
     this.inFlight = null;
@@ -409,6 +414,8 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    if (this.prepareTranscriptionJobs) await this.prepareTranscriptionJobs();
+    if (this.stopping || !this.running) return 0;
     const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
     if (this.stopping || !this.running) return 0;
     let processed = await this._runJobPhase(startedAt, {
@@ -504,6 +511,7 @@ function createJarvisProcessingRuntime({
   previewPersist = null,
   previewScheduler = null,
   whisperController = null,
+  prepareTranscriptionJobs = undefined,
   sessionDiarizationWorker = null,
   speakerIdentityResolutionWorker = null,
   speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
@@ -531,6 +539,13 @@ function createJarvisProcessingRuntime({
     throw new TypeError("speakerIdentityResolutionWorker.run must be a function");
   }
   const configuredModel = model.trim();
+  if (typeof service.configureTranscriptionModelVersion !== "function") {
+    throw new TypeError("service.configureTranscriptionModelVersion must be a function");
+  }
+  service.configureTranscriptionModelVersion(configuredModel);
+  if (service.transcriptionModelVersion !== configuredModel) {
+    throw new Error("Jarvis service transcription model does not match processing runtime");
+  }
   const speakerProcessingPolicy = new SpeakerProcessingPolicy({
     transcriptionInputVersion: 1,
     transcriptionModelVersion: configuredModel,
@@ -724,6 +739,14 @@ function createJarvisProcessingRuntime({
   });
   const startupBarrier =
     runtimeOptions.startupBarrier ?? service.waitForCompressionRecovery?.() ?? null;
+  const effectivePrepareTranscriptionJobs =
+    prepareTranscriptionJobs ??
+    (() =>
+      repository.enqueueCurrentModelTranscriptionJobs({
+        inputVersion: speakerProcessingPolicy.transcriptionInputVersion,
+        modelVersion: speakerProcessingPolicy.transcriptionModelVersion,
+        at: now(),
+      }));
   return new JarvisProcessingRuntime({
     runner,
     repository,
@@ -735,6 +758,7 @@ function createJarvisProcessingRuntime({
     whisperController: effectiveWhisperController,
     previewScheduler: effectivePreviewScheduler,
     speakerProcessingPolicy,
+    prepareTranscriptionJobs: effectivePrepareTranscriptionJobs,
     ...runtimeOptions,
     startupBarrier,
   });

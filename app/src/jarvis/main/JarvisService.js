@@ -70,6 +70,7 @@ class JarvisService {
     onChunkCommitted = () => {},
     previewAudioRing = undefined,
     onPreviewWatermark = () => {},
+    transcriptionModelVersion = "base",
   }) {
     if (!repository || typeof repository !== "object") {
       throw new TypeError("repository is required");
@@ -130,6 +131,8 @@ class JarvisService {
     }
 
     this.repository = repository;
+    this.transcriptionModelVersion = null;
+    this.configureTranscriptionModelVersion(transcriptionModelVersion);
     if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
       throw new TypeError("recordingsDir must be an absolute path");
     }
@@ -224,6 +227,16 @@ class JarvisService {
     this.completedRestorations = new Map();
     this.powerResumeToken = null;
     this.state = this._idleState();
+  }
+
+  configureTranscriptionModelVersion(modelVersion) {
+    if (typeof modelVersion !== "string" || !modelVersion.trim() || modelVersion.length > 128) {
+      throw new TypeError(
+        "transcriptionModelVersion must be a non-empty string of at most 128 characters"
+      );
+    }
+    this.transcriptionModelVersion = modelVersion.trim();
+    return this.transcriptionModelVersion;
   }
 
   startCapture(input) {
@@ -1695,6 +1708,7 @@ class JarvisService {
         if (this.closed) return null;
         const committed = this.repository.commitChunk({
           ...chunk,
+          modelVersion: this.transcriptionModelVersion,
           fileBytes: this.fs.statSync(chunk.path).size,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
           format: "wav",
@@ -1906,9 +1920,15 @@ class JarvisService {
       if (typeof this.repository.enqueueChunkTranscription !== "function") {
         throw new TypeError("repository.enqueueChunkTranscription must be a function");
       }
-      this.repository.enqueueChunkTranscription(chunk);
+      this.repository.enqueueChunkTranscription({
+        ...chunk,
+        modelVersion: this.transcriptionModelVersion,
+      });
     } else {
-      this.repository.commitChunk(chunk);
+      this.repository.commitChunk({
+        ...chunk,
+        modelVersion: this.transcriptionModelVersion,
+      });
     }
     this.fs.unlinkSync(sidecarRealPath);
   }

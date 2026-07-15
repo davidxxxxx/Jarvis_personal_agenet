@@ -102,6 +102,12 @@ function createRuntime(repository, recordingsRoot, owner) {
       transcriptionInputVersion: 1,
       transcriptionModelVersion: TEST_TRANSCRIPTION_MODEL,
     }),
+    prepareTranscriptionJobs: () =>
+      repository.enqueueCurrentModelTranscriptionJobs({
+        inputVersion: 1,
+        modelVersion: TEST_TRANSCRIPTION_MODEL,
+        at: NOW,
+      }),
     now: () => NOW,
     maxJobsPerDrain: 10,
     maxSessionsPerDrain: 10,
@@ -118,7 +124,8 @@ function assertTerminalAndTruthful(repository) {
              session.processing_state
       FROM audio_chunks AS chunk
       JOIN sessions AS session ON session.id = chunk.session_id
-      LEFT JOIN processing_jobs AS job ON job.chunk_id = chunk.id
+       LEFT JOIN processing_jobs AS job
+         ON job.chunk_id = chunk.id AND job.state <> 'superseded'
       ORDER BY chunk.id
     `
     )
@@ -191,7 +198,7 @@ function assertTerminalAndTruthful(repository) {
       JOIN processing_jobs AS job ON job.session_id = session.id
       WHERE session.processing_state = 'ready'
         AND job.chunk_id IS NOT NULL
-        AND job.state <> 'completed'
+        AND job.state NOT IN ('completed', 'superseded')
     `
     )
     .get().count;
@@ -248,11 +255,6 @@ test("a copied legacy database reaches terminal truthful transcription states id
   assert.deepEqual(backfill, { linked: 2, orphaned: [], jobsCreated: 2 });
   repository.db
     .prepare(
-      "UPDATE processing_jobs SET model_version = ? WHERE job_type = 'transcribe_chunk'"
-    )
-    .run(TEST_TRANSCRIPTION_MODEL);
-  repository.db
-    .prepare(
       `
       UPDATE processing_jobs
       SET job_type = 'test_unsupported_transcription'
@@ -271,7 +273,30 @@ test("a copied legacy database reaches terminal truthful transcription states id
   assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM audio_tracks").get().count, 2);
   assert.equal(
     repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count,
-    3
+    4
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT job_type, state, model_version
+         FROM processing_jobs
+         WHERE chunk_id = 'ready-chunk' OR job_type = 'diarize_track'
+         ORDER BY job_type, model_version`
+      )
+      .all(),
+    [
+      {
+        job_type: "diarize_track",
+        state: "blocked",
+        model_version: "jarvis-session-diarization-v1",
+      },
+      { job_type: "transcribe_chunk", state: "superseded", model_version: "" },
+      {
+        job_type: "transcribe_chunk",
+        state: "completed",
+        model_version: TEST_TRANSCRIPTION_MODEL,
+      },
+    ]
   );
   assert.equal(
     repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count,
@@ -290,7 +315,7 @@ test("a copied legacy database reaches terminal truthful transcription states id
   assert.equal(repository.db.prepare("SELECT COUNT(*) AS count FROM audio_tracks").get().count, 2);
   assert.equal(
     repository.db.prepare("SELECT COUNT(*) AS count FROM processing_jobs").get().count,
-    3
+    4
   );
   assert.equal(
     repository.db.prepare("SELECT COUNT(*) AS count FROM transcript_segments").get().count,

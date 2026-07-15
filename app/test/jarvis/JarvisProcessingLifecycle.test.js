@@ -44,6 +44,10 @@ test("migration stops the old runtime and rebuilds production handlers from reco
     audioEvidenceReader: makeReader("old-reader"),
     flacCompressionWorker: makeCompressionWorker("old-flac"),
     previewAudioRing: new PreviewAudioRing({ rootDir: path.join(oldRoot, ".preview") }),
+    configureTranscriptionModelVersion(modelVersion) {
+      this.transcriptionModelVersion = modelVersion.trim();
+      return this.transcriptionModelVersion;
+    },
     async prepareStorageMigration() {
       events.push("service-prepare");
       await this.previewAudioRing.waitForIdle();

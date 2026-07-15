@@ -622,21 +622,34 @@ test("bounded soak harness drains capture compression only through the governed 
   service.finishCapture("bounded-soak", clock.now());
   assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "wav");
 
-  repository.db
-    .prepare(
-      "UPDATE processing_jobs SET model_version = 'soak-model' WHERE job_type = 'transcribe_chunk'"
-    )
-    .run();
   assert.equal(await drainGovernedSoakRuntime(runtime, "bounded compression"), 3);
   assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "flac");
   assert.deepEqual(
     repository.db
-      .prepare("SELECT job_type, state, attempt_count FROM processing_jobs ORDER BY job_type")
+      .prepare(
+        `SELECT job_type, state, attempt_count, model_version
+         FROM processing_jobs ORDER BY job_type, model_version`
+      )
       .all(),
     [
-      { job_type: "compress_chunk", state: "completed", attempt_count: 1 },
-      { job_type: "diarize_track", state: "retry", attempt_count: 1 },
-      { job_type: "transcribe_chunk", state: "completed", attempt_count: 1 },
+      {
+        job_type: "compress_chunk",
+        state: "completed",
+        attempt_count: 1,
+        model_version: "ffmpeg-flac-v1",
+      },
+      {
+        job_type: "diarize_track",
+        state: "retry",
+        attempt_count: 1,
+        model_version: "jarvis-session-diarization-v1",
+      },
+      {
+        job_type: "transcribe_chunk",
+        state: "completed",
+        attempt_count: 1,
+        model_version: "soak-model",
+      },
     ]
   );
 });
