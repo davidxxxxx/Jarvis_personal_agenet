@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
-const { TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
+const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
@@ -169,7 +169,24 @@ function revisedCommitInput(repo, suffix, clusters) {
   return input;
 }
 
-function rebuildAsLegacyV20DiarizationSchema(db) {
+function rebuildAsLegacyV20DiarizationSchema(
+  db,
+  { hasCommitSequence = false, hasRunLinks = false, allowDuplicateCommitSequence = false } = {}
+) {
+  const existingRunLinks = hasRunLinks
+    ? db
+        .prepare(
+          `SELECT run_id, cluster_id, transcript_segment_id
+           FROM speaker_diarization_run_cluster_segments
+           ORDER BY run_id, cluster_id, transcript_segment_id`
+        )
+        .all()
+    : [];
+  const commitSequenceDefinition = hasCommitSequence
+    ? `commit_sequence INTEGER NOT NULL ${allowDuplicateCommitSequence ? "" : "UNIQUE"}
+       CHECK(commit_sequence > 0),`
+    : "";
+  const commitSequenceColumn = hasCommitSequence ? ", commit_sequence" : "";
   db.pragma("foreign_keys = OFF");
   db.exec(`
     DROP INDEX IF EXISTS idx_diarization_run_revision;
@@ -203,6 +220,7 @@ function rebuildAsLegacyV20DiarizationSchema(db) {
       sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
       input_version INTEGER NOT NULL CHECK(input_version = 1),
       execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+      ${commitSequenceDefinition}
       created_at INTEGER NOT NULL,
       completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
       UNIQUE(session_id, track_id, transcript_revision, policy_id)
@@ -252,10 +270,16 @@ function rebuildAsLegacyV20DiarizationSchema(db) {
       CHECK(echo_state = 'confirmed' OR excluded_from_centroid = 0)
     );
 
-    INSERT INTO speaker_diarization_runs
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device
+      ${commitSequenceColumn}, created_at, completed_at
+    )
     SELECT id, session_id, track_id, transcript_revision, policy_id,
            diarizer_model_id, embedding_model_id, model_artifact_sha256,
-           embedding_dimension, sample_rate, input_version, execution_device,
+           embedding_dimension, sample_rate, input_version, execution_device
+           ${commitSequenceColumn},
            created_at, completed_at
     FROM speaker_diarization_runs_v21_fixture;
     INSERT INTO speaker_diarization_run_clusters
@@ -278,8 +302,72 @@ function rebuildAsLegacyV20DiarizationSchema(db) {
       ON speaker_turns(transcript_segment_id, run_id);
     PRAGMA user_version = 20;
   `);
+  if (hasRunLinks) {
+    db.exec(`
+      CREATE TABLE speaker_diarization_run_cluster_segments (
+        run_id TEXT NOT NULL,
+        cluster_id TEXT NOT NULL,
+        transcript_segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+        PRIMARY KEY(run_id, cluster_id, transcript_segment_id),
+        FOREIGN KEY(run_id, cluster_id)
+          REFERENCES speaker_diarization_run_clusters(run_id, cluster_id) ON DELETE CASCADE
+      );
+    `);
+    const insertRunLink = db.prepare(`
+      INSERT INTO speaker_diarization_run_cluster_segments (
+        run_id, cluster_id, transcript_segment_id
+      ) VALUES (@run_id, @cluster_id, @transcript_segment_id)
+    `);
+    for (const runLink of existingRunLinks) insertRunLink.run(runLink);
+  }
   db.pragma("foreign_keys = ON");
   assert.deepEqual(db.pragma("foreign_key_check"), []);
+}
+
+function createPartialV20Fixture(databasePath, options) {
+  const repo = new JarvisRepository(databasePath);
+  const firstSnapshot = seedFinalTrack(repo);
+  const first = commitInput(firstSnapshot, "z_partial_history");
+  first.run.createdAt = 6000;
+  first.run.completedAt = 6000;
+  repo.commitDiarizationRun(first);
+  repo.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-partial-first', 'session-cas', 1000, 5000, 'mic',
+      'partial historical revision one', 0.9, 1, 'track-cas', 'chunk-cas',
+      'mic', 'final', 1, 'whisper-partial-v0', 5000
+    );
+    UPDATE speaker_turns
+    SET transcript_segment_id = 'segment-partial-first'
+    WHERE run_id = 'diarization_run_z_partial_history';
+    UPDATE speaker_diarization_run_cluster_segments
+    SET transcript_segment_id = 'segment-partial-first'
+    WHERE run_id = 'diarization_run_z_partial_history';
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('speaker_cluster_session_cas_1', 'segment-partial-first');
+  `);
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("partial historical revision two", "segment-cas");
+  const secondSnapshot = repo.getDiarizationEvidenceSnapshot({
+    sessionId: "session-cas",
+    trackId: "track-cas",
+    at: 6001,
+  });
+  const second = commitInput(secondSnapshot, "a_partial_history");
+  second.validatedAt = 6001;
+  second.run.createdAt = 6000;
+  second.run.completedAt = 6000;
+  repo.commitDiarizationRun(second);
+  repo.close();
+
+  const db = new Database(databasePath);
+  rebuildAsLegacyV20DiarizationSchema(db, options);
+  return db;
 }
 
 test("atomic diarization commit is idempotent and preserves revision history", (t) => {
@@ -661,6 +749,23 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   first.run.completedAt = 6000;
   repo.commitDiarizationRun(first);
   repo.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-history-first', 'session-cas', 1000, 5000, 'mic',
+      'historical revision one', 0.9, 1, 'track-cas', 'chunk-cas',
+      'mic', 'final', 1, 'whisper-history-v0', 5000
+    );
+    UPDATE speaker_turns
+    SET transcript_segment_id = 'segment-history-first'
+    WHERE run_id = 'diarization_run_z_history';
+    UPDATE speaker_diarization_run_cluster_segments
+    SET transcript_segment_id = 'segment-history-first'
+    WHERE run_id = 'diarization_run_z_history';
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('speaker_cluster_session_cas_1', 'segment-history-first');
     INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
     VALUES ('person-history', 'History', 0, 6000, 6000);
     UPDATE speaker_clusters
@@ -738,7 +843,23 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
                 (SELECT count(*) FROM speaker_diarization_run_cluster_segments) AS run_links`
       )
       .get(),
-    { runs: 2, clusters: 2, turns: 4, old_links: 1, run_links: 2 }
+    { runs: 2, clusters: 2, turns: 4, old_links: 2, run_links: 2 }
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT run_id, transcript_segment_id
+         FROM speaker_diarization_run_cluster_segments
+         ORDER BY run_id, transcript_segment_id`
+      )
+      .all(),
+    [
+      { run_id: "diarization_run_a_history", transcript_segment_id: "segment-cas" },
+      {
+        run_id: "diarization_run_z_history",
+        transcript_segment_id: "segment-history-first",
+      },
+    ]
   );
   assert.deepEqual(
     repo.db
@@ -777,6 +898,139 @@ test("v20 diarization history migrates transactionally to v21 and remains writab
   assert.deepEqual(
     repo.listDiarizationRuns("session-cas").map((run) => run.commit_sequence),
     [1, 2, 3]
+  );
+});
+
+test("partial v20 diarization schemas all migrate without losing provenance", async (t) => {
+  const variants = [
+    { name: "missing sequence and run links", hasCommitSequence: false, hasRunLinks: false },
+    { name: "existing sequence without run links", hasCommitSequence: true, hasRunLinks: false },
+    { name: "existing run links without sequence", hasCommitSequence: false, hasRunLinks: true },
+  ];
+
+  for (const variant of variants) {
+    await t.test(variant.name, (subtest) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-partial-"));
+      const databasePath = path.join(directory, "jarvis.db");
+      let db = createPartialV20Fixture(databasePath, variant);
+      let repo = null;
+      subtest.after(() => {
+        repo?.close();
+        db?.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+      });
+      assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
+      assert.equal(
+        db
+          .prepare("PRAGMA table_info(speaker_diarization_runs)")
+          .all()
+          .some((row) => row.name === "commit_sequence"),
+        variant.hasCommitSequence
+      );
+      assert.equal(
+        Boolean(
+          db
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'speaker_diarization_run_cluster_segments'"
+            )
+            .get()
+        ),
+        variant.hasRunLinks
+      );
+      db.close();
+      db = null;
+
+      repo = new JarvisRepository(databasePath);
+      assert.equal(repo.db.pragma("user_version", { simple: true }), 21);
+      assert.equal(repo.db.pragma("foreign_keys", { simple: true }), 1);
+      assert.deepEqual(repo.db.pragma("foreign_key_check"), []);
+      assert.deepEqual(
+        repo.db
+          .prepare(
+            `SELECT run_id, transcript_segment_id
+             FROM speaker_diarization_run_cluster_segments
+             ORDER BY run_id, transcript_segment_id`
+          )
+          .all(),
+        [
+          {
+            run_id: "diarization_run_a_partial_history",
+            transcript_segment_id: "segment-cas",
+          },
+          {
+            run_id: "diarization_run_z_partial_history",
+            transcript_segment_id: "segment-partial-first",
+          },
+        ]
+      );
+      assert.equal(
+        repo.db.prepare("SELECT count(*) AS count FROM speaker_cluster_segments").get().count,
+        2
+      );
+      assert.deepEqual(
+        repo.db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_v21'")
+          .all(),
+        []
+      );
+
+      repo.db
+        .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+        .run(`post migration ${variant.name}`, "segment-cas");
+      const snapshot = repo.getDiarizationEvidenceSnapshot({
+        sessionId: "session-cas",
+        trackId: "track-cas",
+        at: 7001,
+      });
+      const suffix = variant.name.replaceAll(" ", "_");
+      const third = commitInput(snapshot, suffix);
+      third.validatedAt = 7001;
+      third.run.createdAt = 7001;
+      third.run.completedAt = 7001;
+      assert.equal(repo.commitDiarizationRun(third).status, "completed");
+      assert.deepEqual(
+        repo.listDiarizationRuns("session-cas").map((run) => run.commit_sequence),
+        [1, 2, 3]
+      );
+    });
+  }
+});
+
+test("a failed partial v20 migration rolls back cleanly and can be retried", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-retry-"));
+  const databasePath = path.join(directory, "jarvis.db");
+  const db = createPartialV20Fixture(databasePath, {
+    hasCommitSequence: true,
+    hasRunLinks: false,
+    allowDuplicateCommitSequence: true,
+  });
+  t.after(() => {
+    db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  db.prepare("UPDATE speaker_diarization_runs SET commit_sequence = 1").run();
+
+  assert.throws(() => applyJarvisMigrations(db), { code: "SQLITE_CONSTRAINT_UNIQUE" });
+  assert.equal(db.pragma("user_version", { simple: true }), 20);
+  assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
+  assert.deepEqual(
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_v21'").all(),
+    []
+  );
+  assert.equal(db.prepare("SELECT count(*) AS count FROM speaker_diarization_runs").get().count, 2);
+
+  db.exec(`
+    UPDATE speaker_diarization_runs
+    SET commit_sequence = CASE id
+      WHEN 'diarization_run_z_partial_history' THEN 1
+      ELSE 2
+    END;
+  `);
+  assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 20, toVersion: 21 });
+  assert.deepEqual(db.pragma("foreign_key_check"), []);
+  assert.deepEqual(
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%_v21'").all(),
+    []
   );
 });
 

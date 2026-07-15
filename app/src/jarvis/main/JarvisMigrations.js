@@ -581,12 +581,12 @@ function tableExists(db, table) {
 
 function migrateSessionDiarizationV21(db) {
   if (!tableExists(db, "speaker_diarization_runs")) return;
-  if (
-    columns(db, "speaker_diarization_runs").has("commit_sequence") &&
-    tableExists(db, "speaker_diarization_run_cluster_segments")
-  ) {
-    return;
-  }
+  const hasCommitSequence = columns(db, "speaker_diarization_runs").has("commit_sequence");
+  const hasRunLinks = tableExists(db, "speaker_diarization_run_cluster_segments");
+  if (hasCommitSequence && hasRunLinks) return;
+  const commitSequenceExpression = hasCommitSequence
+    ? "commit_sequence"
+    : "ROW_NUMBER() OVER (ORDER BY completed_at, id)";
 
   db.exec(`
     DROP INDEX IF EXISTS idx_diarization_run_revision;
@@ -683,7 +683,7 @@ function migrateSessionDiarizationV21(db) {
     SELECT id, session_id, track_id, transcript_revision, policy_id,
            diarizer_model_id, embedding_model_id, model_artifact_sha256,
            embedding_dimension, sample_rate, input_version, execution_device,
-           ROW_NUMBER() OVER (ORDER BY completed_at, id), created_at, completed_at
+           ${commitSequenceExpression}, created_at, completed_at
     FROM speaker_diarization_runs;
     INSERT INTO speaker_diarization_run_clusters_v21
     SELECT * FROM speaker_diarization_run_clusters;
@@ -698,13 +698,31 @@ function migrateSessionDiarizationV21(db) {
            CASE WHEN echo_state = 'confirmed' THEN 1 ELSE 0 END,
            created_at
     FROM speaker_turns;
-    INSERT OR IGNORE INTO speaker_diarization_run_cluster_segments_v21
-    SELECT run_cluster.run_id, run_cluster.cluster_id, legacy.transcript_segment_id
-    FROM speaker_diarization_run_clusters_v21 AS run_cluster
-    JOIN speaker_cluster_segments AS legacy ON legacy.cluster_id = run_cluster.cluster_id;
+  `);
+
+  if (hasRunLinks) {
+    db.exec(`
+      INSERT OR IGNORE INTO speaker_diarization_run_cluster_segments_v21
+      SELECT existing.run_id, existing.cluster_id, existing.transcript_segment_id
+      FROM speaker_diarization_run_cluster_segments AS existing
+      JOIN speaker_diarization_run_clusters_v21 AS run_cluster
+        ON run_cluster.run_id = existing.run_id
+       AND run_cluster.cluster_id = existing.cluster_id
+      JOIN transcript_segments AS segment
+        ON segment.id = existing.transcript_segment_id;
+      DROP TABLE speaker_diarization_run_cluster_segments;
+    `);
+  }
+
+  db.exec(`
     INSERT OR IGNORE INTO speaker_diarization_run_cluster_segments_v21
     SELECT turn.run_id, turn.cluster_id, turn.transcript_segment_id
     FROM speaker_turns_v21 AS turn
+    JOIN speaker_diarization_run_clusters_v21 AS run_cluster
+      ON run_cluster.run_id = turn.run_id
+     AND run_cluster.cluster_id = turn.cluster_id
+    JOIN transcript_segments AS segment
+      ON segment.id = turn.transcript_segment_id
     WHERE turn.transcript_segment_id IS NOT NULL;
 
     DROP TABLE speaker_turns;

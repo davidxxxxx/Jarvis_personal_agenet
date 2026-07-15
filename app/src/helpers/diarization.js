@@ -398,6 +398,9 @@ class DiarizationManager {
 
   async diarizeStrict(wavPath, options = {}) {
     const { numSpeakers = -1, threshold = 0.55 } = options;
+    if (this._process) {
+      throw diarizationError("DIARIZATION_SIDECAR_BUSY", "A diarization sidecar is already active");
+    }
 
     const binaryPath = this.getBinaryPath();
     if (!binaryPath) {
