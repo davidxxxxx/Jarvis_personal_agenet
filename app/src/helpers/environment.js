@@ -67,6 +67,19 @@ const PERSISTED_KEYS = [
 // Module-level so writes are serialized across all instances — hotkeyManager
 // creates its own EnvironmentManager alongside the main.js singleton.
 let envWriteQueue = Promise.resolve();
+let miniMaxSecretQueue = Promise.resolve();
+
+function codedSecretError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function enqueueMiniMaxSecretOperation(operation) {
+  const pending = miniMaxSecretQueue.catch(() => {}).then(operation);
+  miniMaxSecretQueue = pending.catch(() => {});
+  return pending;
+}
 
 class EnvironmentManager {
   constructor() {
@@ -281,7 +294,55 @@ class EnvironmentManager {
   }
 
   saveMiniMaxKey(key) {
-    return this._saveKey("MINIMAX_API_KEY", key);
+    return enqueueMiniMaxSecretOperation(async () => {
+      if (typeof key !== "string" || !key.trim() || key.length > 512) {
+        throw codedSecretError("MINIMAX_KEY_INVALID");
+      }
+      if (!this._encryptionAvailable()) {
+        throw codedSecretError("MINIMAX_SECURE_STORAGE_UNAVAILABLE");
+      }
+
+      const directory = this._getSecureKeysDir();
+      const target = this._getSecretFilePath("MINIMAX_API_KEY");
+      const temporary = `${target}.tmp`;
+      try {
+        await fsPromises.mkdir(directory, { recursive: true });
+        const encrypted = secretCrypto.encrypt(key);
+        await fsPromises.writeFile(temporary, encrypted);
+        await fsPromises.rename(temporary, target);
+        process.env.MINIMAX_API_KEY = key;
+        return { success: true };
+      } catch {
+        try {
+          await fsPromises.unlink(temporary);
+        } catch {}
+        debugLogger.error(
+          "MiniMax secret persistence failed",
+          { code: "MINIMAX_SECRET_PERSIST_FAILED" },
+          "environment"
+        );
+        throw codedSecretError("MINIMAX_SECRET_PERSIST_FAILED");
+      }
+    });
+  }
+
+  clearMiniMaxKey() {
+    return enqueueMiniMaxSecretOperation(async () => {
+      try {
+        await fsPromises.unlink(this._getSecretFilePath("MINIMAX_API_KEY"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          debugLogger.error(
+            "MiniMax secret clear failed",
+            { code: "MINIMAX_SECRET_CLEAR_FAILED" },
+            "environment"
+          );
+          throw codedSecretError("MINIMAX_SECRET_CLEAR_FAILED");
+        }
+      }
+      delete process.env.MINIMAX_API_KEY;
+      return { success: true };
+    });
   }
 
   getAnthropicKey() {
