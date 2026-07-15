@@ -475,6 +475,19 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     }
   };
 
+  const releaseSessionPersistence = (sessionId: string): void => {
+    if (pendingPersistence?.sessionId === sessionId) {
+      pendingPersistence = null;
+      clearPersistTimer();
+    }
+    persistenceFloors.delete(sessionId);
+    persistedSegmentFingerprints.delete(sessionId);
+    void persistenceTail.finally(() => {
+      persistenceFloors.delete(sessionId);
+      persistedSegmentFingerprints.delete(sessionId);
+    });
+  };
+
   const persistSnapshot = (
     sessionId: string,
     sessionStartedAt: number,
@@ -518,6 +531,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     if (["starting", "recording", "paused", "finalizing"].includes(state.status)) {
       deps.setSessionState(reduceSession(state, { type: "FAILED", code }));
     }
+    if (state.id) releaseSessionPersistence(state.id);
     deps.onError(code);
   };
 
@@ -1063,6 +1077,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       }
       mainFinished = true;
       transition({ type: "COMPLETED" });
+      releaseSessionPersistence(state.id as string);
       await refreshSessions();
     } catch (error) {
       if (authoritativeStateHandled) throw error;
@@ -1247,6 +1262,12 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       activationGeneration += 1;
       disposed = true;
       pendingPersistence = null;
+      persistedSegmentFingerprints.clear();
+      persistenceFloors.clear();
+      void persistenceTail.finally(() => {
+        persistedSegmentFingerprints.clear();
+        persistenceFloors.clear();
+      });
       clearPersistTimer();
     },
   };

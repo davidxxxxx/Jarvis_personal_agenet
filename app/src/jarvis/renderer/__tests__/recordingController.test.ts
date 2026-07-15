@@ -1087,6 +1087,28 @@ describe("Jarvis recording controller", () => {
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "completed" });
   });
 
+  it("forgets terminal-session fingerprints after the final sync", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({ status: "recording", segments: [stableSegment] });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.finish();
+    harness.deps.setSessionState({
+      id: "s1",
+      status: "recording",
+      startedAt: 1_000,
+      activeSince: 1_000,
+      accumulatedMs: 0,
+      errorCode: null,
+    });
+    controller.handleSegmentsChanged([stableSegment]);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(harness.jarvis.upsertSegments).toHaveBeenCalledWith("s1", [
+      expect.objectContaining({ id: "s1__seg-1" }),
+    ]);
+  });
+
   it("debounces and upserts only changed stable segment ids during live recording", async () => {
     vi.useFakeTimers();
     const harness = createHarness({ status: "recording", segments: [stableSegment] });

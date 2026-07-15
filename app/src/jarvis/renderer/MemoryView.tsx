@@ -145,7 +145,7 @@ export default function MemoryView() {
     try {
       const runtimeRequest =
         typeof window.electronAPI?.jarvis?.getRuntimeStatus === "function"
-          ? window.electronAPI.jarvis.getRuntimeStatus()
+          ? window.electronAPI.jarvis.getRuntimeStatus().catch(() => null)
           : Promise.resolve(null);
       const [nextDetail, nextTimeline, nextRuntimeStatus] = await Promise.all([
         window.electronAPI.jarvis.getSessionDetail(sessionId),

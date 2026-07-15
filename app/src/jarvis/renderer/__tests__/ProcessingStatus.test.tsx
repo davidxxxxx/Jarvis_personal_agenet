@@ -209,6 +209,34 @@ describe("ProcessingStatus", () => {
     expect(screen.getByText(label)).toBeVisible();
   });
 
+  it("renders a failed capture as actionable instead of complete", () => {
+    render(
+      <ProcessingStatus
+        timeline={timeline()}
+        runtimeStatus={runtime({
+          capture: {
+            ...runtime().capture,
+            status: "failed",
+            errorCode: "MIC_DISCONNECTED",
+          },
+          resources: { ...runtime().resources, state: "available", reason: "within_limits" },
+          queue: {
+            ...runtime().queue,
+            pending: 0,
+            total: 0,
+            byStage: {},
+            backlogMinutes: 0,
+          },
+          nextRecoveryAction: "restore_microphone",
+        })}
+      />
+    );
+
+    expect(screen.getByText("需要处理")).toBeVisible();
+    expect(screen.getByText("检查麦克风")).toBeVisible();
+    expect(screen.queryByText("处理完成")).not.toBeInTheDocument();
+  });
+
   it.each([
     ["normal", 30_000, null, /实时预览每 30 秒更新，录音继续/],
     ["degraded", 60_000, null, /实时预览已降频.*每 60 秒.*录音继续/],

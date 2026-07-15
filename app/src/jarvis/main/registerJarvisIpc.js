@@ -99,7 +99,7 @@ function unavailableProcessingStatus() {
     byStage: {},
     backlogMs: 0,
     oldestCreatedAt: null,
-    latestExecutionDevice: null,
+    activeExecutionDevice: null,
     finalCoveragePct: null,
     provisionalCoveragePct: null,
   };
@@ -108,6 +108,11 @@ function unavailableProcessingStatus() {
 function nextRecoveryAction({ capture, resources, queue, disk }) {
   if (disk.state === "critical" || disk.state === "stopped") return "free_disk";
   if (capture.status === "degraded") return "restore_microphone";
+  if (capture.status === "failed") {
+    return typeof capture.errorCode === "string" && capture.errorCode.startsWith("MIC_")
+      ? "restore_microphone"
+      : "retry_jobs";
+  }
   if (resources.state === "busy") return "wait_for_gpu";
   if (resources.state === "unavailable") return "check_cuda";
   if (queue.blocked > 0 || queue.retry > 0) return "retry_jobs";
@@ -293,7 +298,10 @@ function registerJarvisIpc({
       recoveryAction: storage?.recoveryAction ?? null,
     };
     const backend = {
-      actualBackend: processing.latestExecutionDevice ?? preview?.executionDevice ?? null,
+      actualBackend:
+        preview?.running > 0 && preview.executionDevice
+          ? preview.executionDevice
+          : (processing.activeExecutionDevice ?? null),
       cudaGpuUuid:
         resourceSnapshot?.cudaVerified === true ? (resourceSnapshot.selectedGpuUuid ?? null) : null,
     };

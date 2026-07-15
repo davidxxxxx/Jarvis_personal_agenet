@@ -31,7 +31,7 @@ function repository(overrides = {}) {
       },
       backlogMs: 18 * 60_000,
       oldestCreatedAt: 10_000,
-      latestExecutionDevice: "cuda",
+      activeExecutionDevice: "cuda",
       finalCoveragePct: 72,
       provisionalCoveragePct: null,
     }),
@@ -43,7 +43,8 @@ function register(overrides = {}) {
   const handlers = new Map();
   let resourceSamples = 0;
   const runtime = {
-    previewStatus: () => ({
+    previewStatus: () =>
+      overrides.previewStatus ?? ({
       mode: "paused",
       cadenceMs: null,
       pending: 1,
@@ -92,7 +93,7 @@ function register(overrides = {}) {
       resumeCapture: () => null,
       finishCapture: () => null,
       failCapture: () => null,
-      getState: () => ({
+      getState: () => overrides.serviceState ?? ({
         sessionId: "session-1",
         status: "recording",
         captureMode: "dual",
@@ -198,7 +199,7 @@ test("runtime snapshot marks missing subsystems as unavailable instead of invent
         byStage: {},
         backlogMs: 0,
         oldestCreatedAt: null,
-        latestExecutionDevice: null,
+        activeExecutionDevice: null,
         finalCoveragePct: null,
         provisionalCoveragePct: null,
       }),
@@ -238,11 +239,11 @@ test("repository aggregates active work by runtime stage without double-counting
     const insertChunk = repo.db.prepare(
       `INSERT INTO audio_chunks (
         id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at
-      ) VALUES (?, 's1', ?, 1, 2, ?, ?, 999999)`
+      ) VALUES (?, 's1', ?, ?, ?, ?, ?, 999999)`
     );
-    insertChunk.run("c1", "c1.wav", 600_000, "hash-c1");
-    insertChunk.run("c2", "c2.wav", 480_000, "hash-c2");
-    insertChunk.run("c3", "c3.wav", 120_000, "hash-c3");
+    insertChunk.run("c1", "c1.wav", 0, 600_000, 600_000, "hash-c1");
+    insertChunk.run("c2", "c2.wav", 600_000, 1_080_000, 480_000, "hash-c2");
+    insertChunk.run("c3", "c3.wav", 1_080_000, 1_200_000, 120_000, "hash-c3");
     const insertJob = repo.db.prepare(
       `INSERT INTO processing_jobs (
         id, session_id, chunk_id, job_type, state, priority, input_hash,
@@ -305,6 +306,22 @@ test("repository aggregates active work by runtime stage without double-counting
       createdAt: 50_000,
       completedAt: 60_000,
     });
+    repo.db
+      .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'c3'")
+      .run();
+    repo.upsertTranscriptSegments("s1", [
+      {
+        id: "preview-1",
+        startedAt: 0,
+        endedAt: 240_000,
+        personId: null,
+        speakerLabel: "speaker",
+        text: "provisional",
+        confidence: 0.8,
+        isStable: true,
+        sourceType: "mic",
+      },
+    ]);
 
     assert.deepEqual(repo.getRuntimeProcessingStatus(), {
       pending: 1,
@@ -319,11 +336,60 @@ test("repository aggregates active work by runtime stage without double-counting
       },
       backlogMs: 1_080_000,
       oldestCreatedAt: 10_000,
-      latestExecutionDevice: "cpu",
+      activeExecutionDevice: "cuda",
       finalCoveragePct: 10,
-      provisionalCoveragePct: null,
+      provisionalCoveragePct: 20,
     });
+
+    insertJob.run({
+      id: "j6",
+      chunkId: "c3",
+      jobType: "transcribe_chunk",
+      state: "pending",
+      priority: 20,
+      hash: "j6",
+      executionDevice: null,
+      createdAt: 70_000,
+      completedAt: null,
+    });
+    assert.equal(repo.getRuntimeProcessingStatus().finalCoveragePct, 0);
   } finally {
     repo.close();
   }
+});
+
+test("runtime snapshot makes a failed microphone capture actionable", async () => {
+  const { handlers } = register({
+    serviceState: {
+      sessionId: "session-1",
+      status: "failed",
+      captureMode: "mic",
+      retentionMode: "speech_triggered",
+      errorCode: "MIC_DISCONNECTED",
+    },
+  });
+
+  const result = await handlers.get(CHANNELS.getRuntimeStatus)(null);
+
+  assert.equal(result.capture.status, "failed");
+  assert.equal(result.nextRecoveryAction, "restore_microphone");
+});
+
+test("runtime snapshot prefers the currently running preview backend", async () => {
+  const { handlers } = register({
+    previewStatus: {
+      mode: "normal",
+      cadenceMs: 30_000,
+      pending: 0,
+      running: 1,
+      pausedReason: null,
+      executionDevice: "cpu",
+      lastError: null,
+      recordingContinues: true,
+    },
+  });
+
+  const result = await handlers.get(CHANNELS.getRuntimeStatus)(null);
+
+  assert.equal(result.backend.actualBackend, "cpu");
 });

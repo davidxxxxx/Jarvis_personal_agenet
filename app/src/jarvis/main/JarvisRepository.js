@@ -73,6 +73,37 @@ function compareStableIds(left, right) {
   return 0;
 }
 
+function coveredDurationMs(rows, groupColumn) {
+  let total = 0;
+  let group = null;
+  let rangeStart = null;
+  let rangeEnd = null;
+  const flush = () => {
+    if (rangeStart !== null && rangeEnd !== null) total += Math.max(0, rangeEnd - rangeStart);
+  };
+  for (const row of rows) {
+    const nextGroup = row[groupColumn];
+    const startedAt = Number(row.started_at);
+    const endedAt = Number(row.ended_at);
+    if (nextGroup !== group) {
+      flush();
+      group = nextGroup;
+      rangeStart = startedAt;
+      rangeEnd = endedAt;
+      continue;
+    }
+    if (startedAt > rangeEnd) {
+      flush();
+      rangeStart = startedAt;
+      rangeEnd = endedAt;
+    } else {
+      rangeEnd = Math.max(rangeEnd, endedAt);
+    }
+  }
+  flush();
+  return total;
+}
+
 function normalizeSpeakerName(value) {
   if (typeof value !== "string") throw new TypeError("displayName must be a string");
   const trimmed = value.trim();
@@ -739,11 +770,11 @@ class JarvisRepository {
         FROM processing_jobs
         WHERE state <> 'completed'
       `),
-      getLatestProcessingExecutionDevice: this.db.prepare(`
+      getActiveProcessingExecutionDevice: this.db.prepare(`
         SELECT execution_device
         FROM processing_jobs
-        WHERE execution_device IS NOT NULL
-        ORDER BY COALESCE(completed_at, created_at) DESC, id DESC
+        WHERE state = 'running' AND execution_device IS NOT NULL
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
       `),
       getRuntimeFinalCoverage: this.db.prepare(`
@@ -754,9 +785,50 @@ class JarvisRepository {
             WHERE job.chunk_id = chunk.id
               AND job.job_type = 'transcribe_chunk'
               AND job.state = 'completed'
+              AND job.id = (
+                SELECT current.id
+                FROM processing_jobs AS current
+                WHERE current.chunk_id = chunk.id
+                  AND current.job_type = 'transcribe_chunk'
+                ORDER BY current.created_at DESC, current.id DESC
+                LIMIT 1
+              )
+              AND (
+                chunk.transcription_status = 'no_speech'
+                OR (
+                  chunk.transcription_status = 'completed'
+                  AND EXISTS (
+                    SELECT 1 FROM transcript_segments AS segment
+                    WHERE segment.chunk_id = chunk.id
+                      AND segment.result_kind = 'final'
+                      AND segment.model_version = job.model_version
+                      AND segment.started_at <= chunk.started_at
+                      AND segment.ended_at >= chunk.ended_at
+                  )
+                )
+              )
           ) THEN chunk.duration_ms ELSE 0 END), 0) AS final_ms
         FROM audio_chunks AS chunk
         WHERE chunk.write_state = 'committed' AND chunk.deleted_at IS NULL
+      `),
+      listRuntimeProvisionalCoverageRanges: this.db.prepare(`
+        SELECT
+          chunk.id AS chunk_id,
+          MAX(segment.started_at, chunk.started_at) AS started_at,
+          MIN(segment.ended_at, chunk.ended_at) AS ended_at
+        FROM transcript_segments AS segment
+        JOIN audio_chunks AS chunk
+          ON chunk.session_id = segment.session_id
+          AND chunk.source_type = segment.source_type
+          AND (segment.track_id IS NULL OR chunk.track_id = segment.track_id)
+          AND segment.started_at < chunk.ended_at
+          AND chunk.started_at < segment.ended_at
+        WHERE segment.result_kind = 'provisional'
+          AND segment.superseded_by IS NULL
+          AND segment.duplicate_of IS NULL
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+        ORDER BY chunk.id ASC, started_at ASC, ended_at ASC
       `),
       listExpiredAudioChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
@@ -2571,18 +2643,23 @@ class JarvisRepository {
     );
     const backlog = this.statements.getRuntimeTranscriptionBacklog.get();
     const oldest = this.statements.getRuntimeOldestProcessingJob.get();
-    const latest = this.statements.getLatestProcessingExecutionDevice.get();
+    const active = this.statements.getActiveProcessingExecutionDevice.get();
     const coverage = this.statements.getRuntimeFinalCoverage.get();
     const totalMs = Number(coverage.total_ms);
+    const provisionalMs = coveredDurationMs(
+      this.statements.listRuntimeProvisionalCoverageRanges.all(),
+      "chunk_id"
+    );
     return {
       ...totals,
       byStage,
       backlogMs: Number(backlog.backlog_ms),
       oldestCreatedAt: oldest.oldest_created_at ?? null,
-      latestExecutionDevice: latest?.execution_device ?? null,
+      activeExecutionDevice: active?.execution_device ?? null,
       finalCoveragePct:
         totalMs > 0 ? Math.round((Number(coverage.final_ms) / totalMs) * 100) : null,
-      provisionalCoveragePct: null,
+      provisionalCoveragePct:
+        totalMs > 0 ? Math.min(100, Math.round((provisionalMs / totalMs) * 100)) : null,
     };
   }
 

@@ -41,6 +41,7 @@ function primaryRuntimeLabel(status: JarvisRuntimeStatus) {
   if (capture.status === "recording") {
     return capture.retentionMode === "continuous" ? "重要会议" : "正在监听";
   }
+  if (capture.status === "failed") return "需要处理";
   if (
     status.queue.blocked > 0 ||
     status.disk.state === "critical" ||

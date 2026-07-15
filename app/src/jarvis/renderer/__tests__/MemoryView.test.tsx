@@ -242,6 +242,29 @@ describe("MemoryView processing timeline", () => {
     expect(await screen.findByText("处理完成")).toBeInTheDocument();
   });
 
+  it("opens memory detail when the optional runtime status request fails", async () => {
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => detailFor(session)),
+          getSessionTimeline: vi.fn(async () => timeline),
+          getRuntimeStatus: vi.fn(async () => {
+            throw new Error("temporary runtime status failure");
+          }),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect(await screen.findByText("正在处理")).toBeInTheDocument();
+    expect(screen.queryByText("无法读取这次录音。")).not.toBeInTheDocument();
+  });
+
   it("offers summary generation when polling publishes visible transcript segments", async () => {
     const readyTimeline = {
       ...timeline,
