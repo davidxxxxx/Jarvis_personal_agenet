@@ -844,6 +844,21 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
         UPDATE speaker_identity_corrections
         SET next_person_ref = next_person_id
         WHERE next_person_ref IS NULL AND next_person_id IS NOT NULL;
+        UPDATE speaker_identity_corrections
+        SET correction_kind = 'merge',
+            previous_person_ref = COALESCE(
+              previous_person_ref,
+              'legacy-source-unavailable:' || id
+            ),
+            next_person_ref = COALESCE(
+              next_person_ref,
+              'legacy-target-unavailable:' || id
+            )
+        WHERE correction_kind = 'link'
+          AND scope = 'persistent'
+          AND previous_person_id IS NULL
+          AND previous_state = next_state
+          AND previous_state IN ('confirmed','suggested');
       `);
       disambiguateUnboundSpeakerClusters(db);
       db.exec(`

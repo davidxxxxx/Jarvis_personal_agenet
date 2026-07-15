@@ -657,3 +657,129 @@ test("v17 identity history migrates on reopen with snapshots and rolls back on f
   );
   failing.close();
 });
+
+test("v17 legacy merges become non-undoable provenance while ordinary links stay undoable", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-legacy-merge-v17-"));
+  const dbPath = path.join(directory, "jarvis.db");
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+  const repository = new JarvisRepository(dbPath);
+  repository.createSession({ id: "s1", startedAt: 1_000, micDeviceId: null });
+  const addCluster = (id, localLabel) =>
+    repository.createSpeakerCluster({
+      id,
+      sessionId: "s1",
+      trackId: null,
+      localLabel,
+      modelId: "campplus-v1",
+      embedding: new Float32Array([1, 0]),
+      speechMs: 18_000,
+      windowCount: 3,
+      qualityScore: 0.9,
+    });
+
+  for (const [personId, name] of [
+    ["source-confirmed", "Source confirmed"],
+    ["target-confirmed", "Target confirmed"],
+    ["source-suggested", "Source suggested"],
+    ["target-suggested", "Target suggested"],
+    ["source-deleted-target", "Source deleted target"],
+    ["target-later-deleted", "Target later deleted"],
+    ["ordinary-link", "Ordinary link"],
+    ["ordinary-reject", "Ordinary reject"],
+  ]) {
+    repository.renamePerson({ personId, displayName: name });
+  }
+
+  addCluster("legacy-confirmed", "legacy_confirmed");
+  repository.confirmSpeakerLink({
+    clusterId: "legacy-confirmed",
+    personId: "source-confirmed",
+    actor: "user",
+    scope: "session",
+  });
+  repository.mergeSpeakerPeople({
+    sourcePersonId: "source-confirmed",
+    targetPersonId: "target-confirmed",
+  });
+
+  addCluster("legacy-suggested", "legacy_suggested");
+  repository.db
+    .prepare("UPDATE speaker_clusters SET person_id = ?, link_state = 'suggested' WHERE id = ?")
+    .run("source-suggested", "legacy-suggested");
+  repository.mergeSpeakerPeople({
+    sourcePersonId: "source-suggested",
+    targetPersonId: "target-suggested",
+  });
+
+  addCluster("legacy-target-deleted", "legacy_target_deleted");
+  repository.confirmSpeakerLink({
+    clusterId: "legacy-target-deleted",
+    personId: "source-deleted-target",
+    actor: "user",
+    scope: "session",
+  });
+  repository.mergeSpeakerPeople({
+    sourcePersonId: "source-deleted-target",
+    targetPersonId: "target-later-deleted",
+  });
+  repository.db.prepare("DELETE FROM people WHERE id = ?").run("target-later-deleted");
+
+  addCluster("ordinary-link-cluster", "ordinary_link");
+  repository.confirmSpeakerLink({
+    clusterId: "ordinary-link-cluster",
+    personId: "ordinary-link",
+    actor: "user",
+    scope: "persistent",
+  });
+
+  addCluster("ordinary-reject-cluster", "ordinary_reject");
+  repository.db
+    .prepare("UPDATE speaker_clusters SET person_id = ?, link_state = 'suggested' WHERE id = ?")
+    .run("ordinary-reject", "ordinary-reject-cluster");
+  repository.rejectSpeakerSuggestion({
+    clusterId: "ordinary-reject-cluster",
+    personId: "ordinary-reject",
+    actor: "user",
+    scope: "session",
+  });
+
+  downgradeIdentitySchemaToV17(repository);
+  repository.close();
+
+  const migrated = new JarvisRepository(dbPath);
+  const mergeCorrection = (clusterId) =>
+    migrated
+      .listSpeakerCorrections(clusterId)
+      .find(
+        (correction) =>
+          correction.previousState === correction.nextState &&
+          ["confirmed", "suggested"].includes(correction.previousState)
+      );
+  for (const [clusterId, expectedPersonId, expectedState] of [
+    ["legacy-confirmed", "target-confirmed", "confirmed"],
+    ["legacy-suggested", "target-suggested", "suggested"],
+    ["legacy-target-deleted", null, "unknown"],
+  ]) {
+    const correction = mergeCorrection(clusterId);
+    assert.equal(correction.correctionKind, "merge");
+    assert.equal(correction.previousPersonRef, `legacy-source-unavailable:${correction.id}`);
+    assert.ok(correction.nextPersonRef);
+    migrated.undoSpeakerCorrection(clusterId);
+    assert.equal(migrated.getSpeakerCluster(clusterId).personId, expectedPersonId);
+    assert.equal(migrated.getSpeakerCluster(clusterId).linkState, expectedState);
+  }
+
+  const ordinaryLink = migrated.listSpeakerCorrections("ordinary-link-cluster")[0];
+  assert.equal(ordinaryLink.correctionKind, "link");
+  migrated.undoSpeakerCorrection("ordinary-link-cluster");
+  assert.equal(migrated.getSpeakerCluster("ordinary-link-cluster").personId, null);
+  assert.equal(migrated.getSpeakerCluster("ordinary-link-cluster").linkState, "unknown");
+
+  const ordinaryReject = migrated.listSpeakerCorrections("ordinary-reject-cluster")[0];
+  assert.equal(ordinaryReject.correctionKind, "link");
+  migrated.undoSpeakerCorrection("ordinary-reject-cluster");
+  assert.equal(migrated.getSpeakerCluster("ordinary-reject-cluster").personId, "ordinary-reject");
+  assert.equal(migrated.getSpeakerCluster("ordinary-reject-cluster").linkState, "suggested");
+  migrated.close();
+});
