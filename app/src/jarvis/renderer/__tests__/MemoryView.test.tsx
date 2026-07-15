@@ -139,24 +139,17 @@ describe("MemoryView processing timeline", () => {
   let poll: (() => void) | null;
   let setIntervalSpy: ReturnType<typeof vi.spyOn>;
   let clearIntervalSpy: ReturnType<typeof vi.spyOn>;
-  let forwardedCollidingTimerClears: number;
+  let originalClearIntervalSpy: ReturnType<typeof vi.fn>;
   let timelinePollHandle: ReturnType<typeof window.setInterval>;
 
   beforeEach(() => {
     poll = null;
-    forwardedCollidingTimerClears = 0;
     timelinePollHandle = Symbol("timeline-poll") as unknown as ReturnType<
       typeof window.setInterval
     >;
     const originalSetInterval = window.setInterval.bind(window);
     const originalClearInterval = window.clearInterval.bind(window);
-    const forwardClearInterval = (timer: ReturnType<typeof window.setInterval>) => {
-      if (timer === 7) {
-        forwardedCollidingTimerClears += 1;
-        return;
-      }
-      originalClearInterval(timer);
-    };
+    originalClearIntervalSpy = vi.fn(originalClearInterval);
     setIntervalSpy = vi
       .spyOn(window, "setInterval")
       .mockImplementation((callback, delay, ...args) => {
@@ -167,7 +160,7 @@ describe("MemoryView processing timeline", () => {
         return originalSetInterval(callback, delay, ...args);
       });
     clearIntervalSpy = vi.spyOn(window, "clearInterval").mockImplementation((timer) => {
-      if (timer !== timelinePollHandle) forwardClearInterval(timer);
+      if (timer !== timelinePollHandle) originalClearIntervalSpy(timer);
     });
     useJarvisStore.setState({ sessions: [session] });
   });
@@ -179,7 +172,7 @@ describe("MemoryView processing timeline", () => {
 
   it("forwards a real timer clear even when its numeric id collides with the poll handle", () => {
     window.clearInterval(7 as unknown as ReturnType<typeof window.setInterval>);
-    expect(forwardedCollidingTimerClears).toBe(1);
+    expect(originalClearIntervalSpy).toHaveBeenCalledWith(7);
   });
 
   it("loads detail with its timeline, prevents overlapping polls, and cleans polling on close", async () => {
