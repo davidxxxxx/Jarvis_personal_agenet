@@ -7,6 +7,7 @@ const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
 const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
 const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const { createJarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 const {
   JarvisProcessingLifecycle,
@@ -23,6 +24,11 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   const events = [];
   const readerCalls = [];
   const compressionCalls = [];
+  const transcriptionModel = "large-v3-turbo";
+  const speakerProcessingPolicy = new SpeakerProcessingPolicy({
+    transcriptionInputVersion: 1,
+    transcriptionModelVersion: transcriptionModel,
+  });
   const makeReader = (name) => ({
     name,
     withVerifiedWav: async (_chunk, callback) => {
@@ -77,9 +83,10 @@ test("migration stops the old runtime and rebuilds production handlers from reco
           diarizeAudio: async () => assert.fail("no-speech evidence ran the diarizer"),
           embedWindow: async () => assert.fail("no-speech evidence ran embeddings"),
           modelArtifactSha256: "a".repeat(64),
+          speakerProcessingPolicy,
           clock: () => 2_000,
         }),
-        model: "large-v3-turbo",
+        model: transcriptionModel,
         owner: `migration-worker-${builds.length}`,
         now: () => 2_000,
         governor: {
@@ -170,6 +177,7 @@ test("migration stops the old runtime and rebuilds production handlers from reco
     durationMs: 700,
     sha256: "a".repeat(64),
     expiresAt: 999_999,
+    modelVersion: transcriptionModel,
     encoderVersion: "flac-v1",
   });
 

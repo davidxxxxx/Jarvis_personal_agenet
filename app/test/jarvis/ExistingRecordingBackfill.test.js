@@ -9,11 +9,13 @@ const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner")
 const AudioEvidenceReader = require("../../src/jarvis/main/AudioEvidenceReader");
 const JarvisTranscriptionWorker = require("../../src/jarvis/main/JarvisTranscriptionWorker");
 const { JarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
+const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const TranscriptReconciler = require("../../src/jarvis/main/TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("../../src/jarvis/main/DualTrackTranscriptDeduper");
 const { backfillLegacyRecordings } = require("../../src/jarvis/main/LegacyRecordingBackfill");
 
 const NOW = 2_000;
+const TEST_TRANSCRIPTION_MODEL = "fixture-no-speech";
 
 function addLegacyChunk(repository, { id, sessionId, filePath, startedAt, format }) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -82,7 +84,7 @@ function createRuntime(repository, recordingsRoot, owner) {
       now: () => NOW,
     }),
     transcribeWav: async () => ({ noSpeech: true }),
-    modelVersion: "fixture-no-speech",
+    modelVersion: TEST_TRANSCRIPTION_MODEL,
     now: () => NOW,
   });
   const runner = new ProcessingJobRunner({
@@ -96,6 +98,10 @@ function createRuntime(repository, recordingsRoot, owner) {
     repository,
     reconciler: new TranscriptReconciler({ repository }),
     deduper: new DualTrackTranscriptDeduper({ repository }),
+    speakerProcessingPolicy: new SpeakerProcessingPolicy({
+      transcriptionInputVersion: 1,
+      transcriptionModelVersion: TEST_TRANSCRIPTION_MODEL,
+    }),
     now: () => NOW,
     maxJobsPerDrain: 10,
     maxSessionsPerDrain: 10,
@@ -240,6 +246,11 @@ test("a copied legacy database reaches terminal truthful transcription states id
     recordingsRoot: copiedRecordingsRoot,
   });
   assert.deepEqual(backfill, { linked: 2, orphaned: [], jobsCreated: 2 });
+  repository.db
+    .prepare(
+      "UPDATE processing_jobs SET model_version = ? WHERE job_type = 'transcribe_chunk'"
+    )
+    .run(TEST_TRANSCRIPTION_MODEL);
   repository.db
     .prepare(
       `

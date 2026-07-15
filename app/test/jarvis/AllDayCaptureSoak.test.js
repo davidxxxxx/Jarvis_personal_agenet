@@ -622,6 +622,11 @@ test("bounded soak harness drains capture compression only through the governed 
   service.finishCapture("bounded-soak", clock.now());
   assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "wav");
 
+  repository.db
+    .prepare(
+      "UPDATE processing_jobs SET model_version = 'soak-model' WHERE job_type = 'transcribe_chunk'"
+    )
+    .run();
   assert.equal(await drainGovernedSoakRuntime(runtime, "bounded compression"), 3);
   assert.equal(repository.db.prepare("SELECT format FROM audio_chunks").get().format, "flac");
   assert.deepEqual(
