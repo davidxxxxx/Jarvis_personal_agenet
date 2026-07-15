@@ -44,6 +44,7 @@ describe("jarvisStore speaker correction state", () => {
       clustersBySession: {},
       speakerCorrectionBusyClusterId: null,
       speakerCorrectionError: null,
+      speakerCorrectionErrorClusterId: null,
       speakerCorrectionCandidates: [],
       speakerCorrectionCandidateClusterId: null,
       people: [],
@@ -137,6 +138,13 @@ describe("jarvisStore speaker correction state", () => {
     ).rejects.toThrow();
     expect(useJarvisStore.getState().clustersBySession["session-a"]).toEqual([after]);
     expect(useJarvisStore.getState().speakerCorrectionError?.length).toBeLessThanOrEqual(240);
+    expect(
+      (
+        useJarvisStore.getState() as unknown as {
+          speakerCorrectionErrorClusterId?: string | null;
+        }
+      ).speakerCorrectionErrorClusterId
+    ).toBe("cluster-a");
   });
 
   it("forces a post-merge cluster reload instead of reusing a pre-merge in-flight list", async () => {

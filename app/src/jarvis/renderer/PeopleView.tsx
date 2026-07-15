@@ -1,8 +1,47 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { UserRound } from "lucide-react";
-import type { JarvisPersonDetail, JarvisPersonOverview } from "../types";
+import type {
+  JarvisPersonDetail,
+  JarvisPersonOverview,
+  JarvisSpeakerCorrectionScope,
+  JarvisSpeakerLinkState,
+} from "../types";
 import { useJarvisStore } from "./jarvisStore";
+
+const PROFILE_SOURCE_KEYS = {
+  enrollment: "jarvis.peopleProfileSourceEnrollment",
+  user_confirmed: "jarvis.peopleProfileSourceUserConfirmed",
+} as const;
+
+const LINK_STATE_KEYS: Record<JarvisSpeakerLinkState, string> = {
+  unknown: "jarvis.peopleLinkStateUnknown",
+  suggested: "jarvis.peopleLinkStateSuggested",
+  confirmed: "jarvis.peopleLinkStateConfirmed",
+  rejected: "jarvis.peopleLinkStateRejected",
+};
+
+const CORRECTION_SCOPE_KEYS: Record<JarvisSpeakerCorrectionScope, string> = {
+  session: "jarvis.peopleCorrectionScopeSession",
+  persistent: "jarvis.peopleCorrectionScopePersistent",
+};
+
+const CORRECTION_ACTOR_KEYS = {
+  user: "jarvis.peopleCorrectionActorUser",
+  system: "jarvis.peopleCorrectionActorSystem",
+} as const;
+
+const CORRECTION_KIND_KEYS = {
+  link: "jarvis.peopleCorrectionKindLink",
+  merge: "jarvis.peopleCorrectionKindMerge",
+} as const;
+
+function identityDate(at: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(at);
+}
 
 function personName(
   person: Pick<JarvisPersonOverview, "is_self" | "display_name">,
@@ -135,7 +174,7 @@ export default function PeopleView() {
                   <li key={sample.id} className="rounded-lg bg-muted/30 p-3">
                     <span className="block font-medium text-foreground">{sample.modelId}</span>
                     {sample.speechMs.toLocaleString()} ms · {sample.windowCount} windows ·{" "}
-                    {sample.sourceKind}
+                    {t(PROFILE_SOURCE_KEYS[sample.sourceKind])}
                   </li>
                 ))}
               </ul>
@@ -148,7 +187,7 @@ export default function PeopleView() {
                     <span className="block font-medium text-foreground">
                       {appearance.sessionId}
                     </span>
-                    {appearance.localLabel} · {appearance.linkState}
+                    {appearance.localLabel} · {t(LINK_STATE_KEYS[appearance.linkState])}
                   </li>
                 ))}
               </ul>
@@ -158,7 +197,27 @@ export default function PeopleView() {
               <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
                 {detail.identity.corrections.map((correction) => (
                   <li key={correction.id} className="rounded-lg bg-muted/30 p-3">
-                    {correction.scope} · {correction.actor} · {correction.correctionKind}
+                    <span className="block font-medium text-foreground">
+                      {t(LINK_STATE_KEYS[correction.previousState])} →{" "}
+                      {t(LINK_STATE_KEYS[correction.nextState])}
+                    </span>
+                    <span className="block">
+                      {t(CORRECTION_SCOPE_KEYS[correction.scope])} ·{" "}
+                      {t(CORRECTION_ACTOR_KEYS[correction.actor])} ·{" "}
+                      {t(CORRECTION_KIND_KEYS[correction.correctionKind])}
+                    </span>
+                    <span className="block">
+                      {t("jarvis.peopleCorrectionCreated", {
+                        date: identityDate(correction.createdAt),
+                      })}
+                    </span>
+                    <span className="block">
+                      {correction.undoneAt === null
+                        ? t("jarvis.peopleCorrectionActive")
+                        : t("jarvis.peopleCorrectionUndone", {
+                            date: identityDate(correction.undoneAt),
+                          })}
+                    </span>
                   </li>
                 ))}
               </ul>

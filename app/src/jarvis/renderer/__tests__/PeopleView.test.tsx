@@ -64,6 +64,21 @@ function detail(value: JarvisPersonOverview): JarvisPersonDetail {
           actor: "user",
           correctionKind: "link",
           createdAt: 4,
+          undoneAt: 5,
+        },
+        {
+          id: "correction-2",
+          clusterId: "cluster-1",
+          previousPersonId: value.id,
+          nextPersonId: value.id,
+          previousPersonRef: value.id,
+          nextPersonRef: value.id,
+          previousState: "confirmed",
+          nextState: "confirmed",
+          scope: "session",
+          actor: "system",
+          correctionKind: "merge",
+          createdAt: 6,
           undoneAt: null,
         },
       ],
@@ -102,14 +117,24 @@ describe("PeopleView durable identity detail", () => {
     });
   });
 
-  it("renders sample metadata appearances and correction provenance without private data", async () => {
+  it("renders localized identity metadata and complete correction provenance without private data", async () => {
     render(<PeopleView />);
     fireEvent.click(await screen.findByRole("button", { name: /Source Person/ }));
 
     expect(await screen.findByText("campplus-v1")).toBeInTheDocument();
     expect(screen.getByText(/18,000 ms/)).toBeInTheDocument();
     expect(screen.getByText(/session-1/)).toBeInTheDocument();
-    expect(screen.getByText(/persistent.*user.*link/i)).toBeInTheDocument();
+    expect(screen.getByText(/User-confirmed/)).toBeInTheDocument();
+    expect(screen.getByText(/speaker_1.*Confirmed/)).toBeInTheDocument();
+    expect(screen.getByText("Unknown → Confirmed")).toBeInTheDocument();
+    expect(screen.getByText("Confirmed → Confirmed")).toBeInTheDocument();
+    expect(screen.getByText(/Persistent.*User.*Link/)).toBeInTheDocument();
+    expect(screen.getByText(/Session.*System.*Merge/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Created/)).toHaveLength(2);
+    expect(screen.getByText(/Undone/)).toBeInTheDocument();
+    expect(screen.getByText("Active")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("user_confirmed");
+    expect(document.body.textContent).not.toContain("persistent · user · link");
     expect(document.body.textContent).not.toMatch(/embedding|\.wav|[A-Z]:\\/i);
   });
 

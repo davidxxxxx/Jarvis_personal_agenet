@@ -21,9 +21,8 @@ export type JarvisView = "today" | "people" | "topics" | "todos" | "memory" | "s
 const speakerClusterLoads = new Map<string, Promise<void>>();
 const speakerClusterMutations = new Map<string, Promise<unknown>>();
 
-function boundedCorrectionError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.slice(0, 240);
+function safeCorrectionError(): string {
+  return "speaker_correction_failed";
 }
 
 function publicAmbiguousCandidates(error: unknown): JarvisSpeakerPersonSummary[] {
@@ -68,6 +67,7 @@ interface JarvisRendererState {
   clustersBySession: Record<string, JarvisSpeakerClusterView[]>;
   speakerCorrectionBusyClusterId: string | null;
   speakerCorrectionError: string | null;
+  speakerCorrectionErrorClusterId: string | null;
   speakerCorrectionCandidates: JarvisSpeakerPersonSummary[];
   speakerCorrectionCandidateClusterId: string | null;
   selectedView: JarvisView;
@@ -108,6 +108,7 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
   clustersBySession: {},
   speakerCorrectionBusyClusterId: null,
   speakerCorrectionError: null,
+  speakerCorrectionErrorClusterId: null,
   speakerCorrectionCandidates: [],
   speakerCorrectionCandidateClusterId: null,
   selectedView: "today",
@@ -148,7 +149,10 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
         }));
       })
       .catch((error) => {
-        set({ speakerCorrectionError: boundedCorrectionError(error) });
+        set({
+          speakerCorrectionError: safeCorrectionError(),
+          speakerCorrectionErrorClusterId: null,
+        });
         throw error;
       })
       .finally(() => {
@@ -176,6 +180,7 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
       set({
         speakerCorrectionBusyClusterId: input.clusterId,
         speakerCorrectionError: null,
+        speakerCorrectionErrorClusterId: null,
         speakerCorrectionCandidates: [],
         speakerCorrectionCandidateClusterId: null,
       });
@@ -186,7 +191,8 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
       } catch (error) {
         const candidates = publicAmbiguousCandidates(error);
         set({
-          speakerCorrectionError: boundedCorrectionError(error),
+          speakerCorrectionError: safeCorrectionError(),
+          speakerCorrectionErrorClusterId: input.clusterId,
           speakerCorrectionCandidates: candidates,
           speakerCorrectionCandidateClusterId: candidates.length > 0 ? input.clusterId : null,
         });
@@ -208,6 +214,7 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
       set({
         speakerCorrectionBusyClusterId: clusterId,
         speakerCorrectionError: null,
+        speakerCorrectionErrorClusterId: null,
         speakerCorrectionCandidates: [],
         speakerCorrectionCandidateClusterId: null,
       });
@@ -216,7 +223,10 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
         get().applyClusterView(cluster);
         return cluster;
       } catch (error) {
-        set({ speakerCorrectionError: boundedCorrectionError(error) });
+        set({
+          speakerCorrectionError: safeCorrectionError(),
+          speakerCorrectionErrorClusterId: clusterId,
+        });
         throw error;
       } finally {
         speakerClusterMutations.delete(clusterId);
@@ -235,6 +245,7 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
       set({
         speakerCorrectionBusyClusterId: clusterId,
         speakerCorrectionError: null,
+        speakerCorrectionErrorClusterId: null,
         speakerCorrectionCandidates: [],
         speakerCorrectionCandidateClusterId: null,
       });
@@ -243,7 +254,10 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
         get().applyClusterView(cluster);
         return cluster;
       } catch (error) {
-        set({ speakerCorrectionError: boundedCorrectionError(error) });
+        set({
+          speakerCorrectionError: safeCorrectionError(),
+          speakerCorrectionErrorClusterId: clusterId,
+        });
         throw error;
       } finally {
         speakerClusterMutations.delete(clusterId);
@@ -261,6 +275,7 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
   mergePeople: async (sourcePersonId, targetPersonId) => {
     set({
       speakerCorrectionError: null,
+      speakerCorrectionErrorClusterId: null,
       speakerCorrectionCandidates: [],
       speakerCorrectionCandidateClusterId: null,
     });
@@ -272,7 +287,10 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
       await Promise.all(cachedSessionIds.map((sessionId) => get().loadSessionClusters(sessionId)));
       return detail;
     } catch (error) {
-      set({ speakerCorrectionError: boundedCorrectionError(error) });
+      set({
+        speakerCorrectionError: safeCorrectionError(),
+        speakerCorrectionErrorClusterId: null,
+      });
       throw error;
     }
   },

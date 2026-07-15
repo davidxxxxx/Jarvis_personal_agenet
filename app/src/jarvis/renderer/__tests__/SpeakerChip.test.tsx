@@ -63,6 +63,7 @@ describe("SpeakerChip durable corrections", () => {
       ],
       speakerCorrectionBusyClusterId: null,
       speakerCorrectionError: null,
+      speakerCorrectionErrorClusterId: null,
       speakerCorrectionCandidates: [],
       speakerCorrectionCandidateClusterId: null,
     });
@@ -318,8 +319,35 @@ describe("SpeakerChip durable corrections", () => {
         );
       }
 
-      expect(await screen.findByRole("alert")).toHaveTextContent(`${operation} failed`);
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Speaker correction failed. Try again."
+      );
+      expect(screen.queryByText(`${operation} failed`)).not.toBeInTheDocument();
       expect(screen.getByText("Local label: speaker_1")).toBeInTheDocument();
     }
   );
+
+  it("never shows one cluster's internal correction failure on another cluster", async () => {
+    confirmSpeaker.mockRejectedValue(new Error("sensitive internal path C:\\private\\jarvis.db"));
+    render(
+      <>
+        <SpeakerChip cluster={cluster({ id: "cluster-a" })} localLabel="speaker_1" />
+        <SpeakerChip cluster={cluster({ id: "cluster-b" })} localLabel="speaker_2" />
+      </>
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Unknown speaker" })[0]);
+    fireEvent.change(screen.getByLabelText("New person name"), {
+      target: { value: "Alice" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm speaker" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Speaker correction failed. Try again."
+    );
+    expect(document.body.textContent).not.toContain("sensitive internal path");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Unknown speaker" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "Unknown speaker" })[1]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });

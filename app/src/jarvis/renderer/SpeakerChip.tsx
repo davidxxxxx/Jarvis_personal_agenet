@@ -36,6 +36,7 @@ export default function SpeakerChip({ cluster, localLabel }: SpeakerChipProps) {
   const people = useJarvisStore((state) => state.people);
   const busyClusterId = useJarvisStore((state) => state.speakerCorrectionBusyClusterId);
   const storeError = useJarvisStore((state) => state.speakerCorrectionError);
+  const storeErrorClusterId = useJarvisStore((state) => state.speakerCorrectionErrorClusterId);
   const ambiguousCandidates = useJarvisStore((state) => state.speakerCorrectionCandidates);
   const ambiguousCandidateClusterId = useJarvisStore(
     (state) => state.speakerCorrectionCandidateClusterId
@@ -257,9 +258,9 @@ export default function SpeakerChip({ cluster, localLabel }: SpeakerChipProps) {
             {outcome}
           </p>
         )}
-        {storeError && (
+        {storeError && storeErrorClusterId === cluster.id && (
           <p role="alert" className="text-xs text-destructive">
-            {storeError}
+            {t("jarvis.speakerCorrectionFailed")}
           </p>
         )}
       </PopoverContent>
