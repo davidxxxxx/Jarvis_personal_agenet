@@ -145,6 +145,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     claimControl: (id, rendererId) => ipcRenderer.invoke("jarvis:control:claim", id, rendererId),
     acknowledgeControl: (id, outcome, rendererId) =>
       ipcRenderer.send("jarvis:control:ack", id, outcome, rendererId),
+    onPowerResumeRequested: registerListener(
+      "jarvis:power-resume-request",
+      (callback) => (_event, request) => callback(request)
+    ),
+    acknowledgePowerResume: (id, outcome, payload) =>
+      ipcRenderer.send("jarvis:power-resume:ack", id, outcome, payload),
     onShutdownRequested: registerListener(
       "jarvis:shutdown-request",
       (callback) => (_event, request) => callback(request)

@@ -18,6 +18,9 @@ import type {
   JarvisCaptureMode,
   JarvisCaptureSourceInput,
   JarvisPerson,
+  JarvisPowerResumeRequest,
+  JarvisPowerResumeRestorations,
+  JarvisPowerResumeToken,
   JarvisRenamePersonInput,
   JarvisRetentionMode,
   JarvisRuntimeState,
@@ -33,6 +36,10 @@ import { createJarvisControlReceiver } from "./controlDelivery";
 import { useJarvisStore } from "./jarvisStore";
 import { hasRecordingConsent } from "./recordingConsent";
 import { reduceSession, type SessionEvent, type SessionState } from "./sessionMachine";
+import {
+  isDeniedAutomaticMicrophone,
+  orderMicrophoneRecoveryCandidates,
+} from "./microphoneRecoveryPolicy";
 
 const PERSIST_DEBOUNCE_MS = 500;
 const DEFAULT_CONFIDENCE = 0.5;
@@ -145,6 +152,7 @@ export interface RecordingController {
   setRetentionMode: (retentionMode: JarvisRetentionMode) => Promise<JarvisRuntimeState>;
   pause: () => Promise<void>;
   pauseForError: (code: "MIC_PERMISSION" | "MIC_DISCONNECTED") => Promise<void>;
+  suspendUpstreamForPower: () => Promise<void>;
   resume: () => Promise<void>;
   finish: () => Promise<void>;
   renameSpeaker: (personId: string, displayName: string, isSelf?: boolean) => Promise<JarvisPerson>;
@@ -196,10 +204,7 @@ export function mapStableSegments(
     const requestedStart = safeTimestamp(segment.startedAt, timestamp);
     const startedAt = Math.min(requestedStart, Number.MAX_SAFE_INTEGER - 1);
     const requestedEnd = safeTimestamp(segment.endedAt, startedAt + 1);
-    const endedAt = Math.min(
-      Number.MAX_SAFE_INTEGER,
-      Math.max(startedAt + 1, requestedEnd)
-    );
+    const endedAt = Math.min(Number.MAX_SAFE_INTEGER, Math.max(startedAt + 1, requestedEnd));
     const personId = safePersonId(segment.speaker);
     const echoScore =
       typeof segment.echoScore === "number" &&
@@ -243,6 +248,66 @@ function captureFailureCode(code: string): JarvisCaptureFailureCode {
     default:
       return "capture_start_failed";
   }
+}
+
+export function selectPowerResumeDevices(
+  token: JarvisPowerResumeToken,
+  devices: Pick<MediaDeviceInfo, "kind" | "deviceId" | "label">[]
+): JarvisPowerResumeRestorations {
+  const restorations: JarvisPowerResumeRestorations = {};
+  for (const [sourceType, source] of Object.entries(token.sources ?? {})) {
+    if (sourceType !== "mic") {
+      restorations[sourceType] = {
+        deviceId: source.deviceId ?? null,
+        deviceLabel: source.deviceLabel ?? null,
+        strategy: source.strategy ?? null,
+      };
+      continue;
+    }
+    const selectedDeviceId = getSettings().selectedMicDeviceId || null;
+    const physical = orderMicrophoneRecoveryCandidates(devices, selectedDeviceId)[0];
+    if (physical) {
+      restorations.mic = {
+        deviceId: physical.deviceId,
+        deviceLabel: physical.label,
+        strategy: "physical",
+      };
+      continue;
+    }
+    const fallback = devices.find(
+      (device) =>
+        device.kind === "audioinput" &&
+        device.deviceId === "default" &&
+        !isDeniedAutomaticMicrophone(device.label)
+    );
+    if (!fallback) throw new Error("No safe microphone is available after wake");
+    restorations.mic = {
+      deviceId: null,
+      deviceLabel: fallback.label,
+      strategy: "system-default",
+    };
+  }
+  return restorations;
+}
+
+export async function routePowerLifecycleRequest(
+  request: JarvisPowerResumeRequest,
+  handlers: {
+    suspendUpstream: () => Promise<void>;
+    resume: () => Promise<void>;
+    enumerateDevices: () => Promise<Pick<MediaDeviceInfo, "kind" | "deviceId" | "label">[]>;
+  }
+): Promise<JarvisPowerResumeRestorations | null> {
+  if (request.kind === "suspend") {
+    await handlers.suspendUpstream();
+    return null;
+  }
+  if (request.kind === "enumerate") {
+    const devices = await handlers.enumerateDevices();
+    return selectPowerResumeDevices(request.token, devices);
+  }
+  await handlers.resume();
+  return null;
 }
 
 export function recordingArgs(
@@ -632,6 +697,17 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     return pauseCapture(code);
   };
 
+  const suspendUpstreamForPower = async (): Promise<void> => {
+    if (disposed || shutdownPromise) {
+      throw new Error("recording controller is shutting down");
+    }
+    await stopUpstream();
+    const state = deps.getSessionState();
+    if (state.status === "recording") {
+      deps.setSessionState(reduceSession(state, { type: "PAUSED", at: deps.now() }));
+    }
+  };
+
   const resume = async (): Promise<void> => {
     if (disposed || shutdownPromise) {
       throw new Error("recording controller is shutting down");
@@ -932,6 +1008,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     setRetentionMode,
     pause,
     pauseForError,
+    suspendUpstreamForPower,
     resume,
     finish,
     renameSpeaker,
@@ -1128,6 +1205,27 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
 
   useEffect(
     () =>
+      window.electronAPI.jarvis.onPowerResumeRequested((request) => {
+        void (async () => {
+          try {
+            const restorations = await routePowerLifecycleRequest(request, {
+              suspendUpstream: controller.suspendUpstreamForPower,
+              resume: controller.resume,
+              enumerateDevices: () => navigator.mediaDevices.enumerateDevices(),
+            });
+            window.electronAPI.jarvis.acknowledgePowerResume(request.id, "ok", restorations);
+          } catch (error) {
+            window.electronAPI.jarvis.acknowledgePowerResume(request.id, "error", {
+              message: error instanceof Error ? error.message : "Power recovery failed",
+            });
+          }
+        })();
+      }),
+    [controller]
+  );
+
+  useEffect(
+    () =>
       window.electronAPI.jarvis.onShutdownRequested(({ id }) => {
         void controller.shutdown().then(
           () => window.electronAPI.jarvis.acknowledgeShutdown(id, "ok"),
@@ -1163,6 +1261,17 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
             state.retentionDegradedReason ?? null
           );
         if (state.errorCode) useJarvisStore.getState().setError(state.errorCode);
+        if (state.status === "paused") {
+          const current = useJarvisStore.getState().session;
+          if (current.id === state.sessionId && current.status === "recording") {
+            useJarvisStore.getState().setSession({
+              ...current,
+              status: "paused",
+              activeSince: null,
+              accumulatedMs: state.elapsedMs,
+            });
+          }
+        }
         if (state.status === "failed") {
           const current = useJarvisStore.getState().session;
           if (

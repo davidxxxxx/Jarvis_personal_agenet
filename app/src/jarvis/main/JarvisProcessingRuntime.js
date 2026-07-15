@@ -439,6 +439,7 @@ class JarvisProcessingRuntime {
     }
     this.stopPromise = Promise.resolve(this.inFlight)
       .then(() => Promise.resolve(this.previewInFlight))
+      .then(() => this.whisperController?.stop?.())
       .then(() => undefined);
     return this.stopPromise;
   }

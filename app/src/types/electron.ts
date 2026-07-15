@@ -6,6 +6,8 @@ import type {
   JarvisControlAction,
   JarvisControlEnvelope,
   JarvisPerson,
+  JarvisPowerResumeRequest,
+  JarvisPowerResumeRestorations,
   JarvisRenamePersonInput,
   JarvisRuntimeState,
   JarvisSession,
@@ -648,6 +650,14 @@ declare global {
             "claimed" | "not_ready" | "duplicate" | "expired" | "failed" | "in_flight" | "unknown";
         }>;
         acknowledgeControl: (id: string, outcome: "ok" | "error", rendererId: string) => void;
+        onPowerResumeRequested: (
+          callback: (request: JarvisPowerResumeRequest) => void
+        ) => () => void;
+        acknowledgePowerResume: (
+          id: string,
+          outcome: "ok" | "error",
+          payload: JarvisPowerResumeRestorations | { message: string } | null
+        ) => void;
         onShutdownRequested: (callback: (request: { id: string }) => void) => () => void;
         acknowledgeShutdown: (id: string, outcome: "ok" | "error") => void;
         onStateChanged: (callback: (state: JarvisRuntimeState) => void) => () => void;

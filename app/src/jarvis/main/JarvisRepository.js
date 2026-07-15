@@ -311,6 +311,63 @@ class JarvisRepository {
         WHERE id = @id
       `),
       getSession: this.db.prepare("SELECT * FROM sessions WHERE id = ?"),
+      getSessionContinuation: this.db.prepare(`
+        SELECT source_session_id, destination_session_id, reason, boundary_at,
+               destination_local_date
+        FROM session_continuations
+        WHERE source_session_id = @sourceSessionId
+          AND destination_local_date = @destinationLocalDate
+      `),
+      insertSessionContinuation: this.db.prepare(`
+        INSERT OR IGNORE INTO session_continuations (
+          source_session_id, destination_session_id, reason, boundary_at,
+          destination_local_date
+        ) VALUES (
+          @sourceSessionId, @destinationSessionId, 'local_midnight', @boundaryAt,
+          @destinationLocalDate
+        )
+      `),
+      listSessionContinuations: this.db.prepare(`
+        SELECT source_session_id, destination_session_id, reason, boundary_at,
+               destination_local_date
+        FROM session_continuations
+        WHERE source_session_id = ?
+        ORDER BY boundary_at, destination_session_id
+      `),
+      listRotationTracks: this.db.prepare(
+        "SELECT * FROM audio_tracks WHERE session_id = ? ORDER BY source_type"
+      ),
+      listRotationGaps: this.db.prepare(`
+        SELECT gap.* FROM audio_gaps AS gap
+        JOIN audio_tracks AS track ON track.id = gap.track_id
+        WHERE track.session_id = ? AND gap.ended_at IS NULL
+        ORDER BY gap.track_id, gap.id
+      `),
+      deleteRotationDestination: this.db.prepare("DELETE FROM sessions WHERE id = ?"),
+      restoreRotationSession: this.db.prepare(`
+        UPDATE sessions SET
+          status = @status,
+          ended_at = @ended_at,
+          stop_reason = @stop_reason,
+          durable_boundary_at = @durable_boundary_at,
+          processing_state = @processing_state,
+          finalized_at = @finalized_at,
+          ready_at = @ready_at,
+          timeline_version = @timeline_version
+        WHERE id = @id
+      `),
+      restoreRotationTrack: this.db.prepare(`
+        UPDATE audio_tracks SET state = @state, ended_at = @ended_at WHERE id = @id
+      `),
+      restoreRotationGap: this.db.prepare(`
+        UPDATE audio_gaps SET
+          ended_at = @ended_at,
+          recovery_attempts = @recovery_attempts,
+          restored_device_id = @restored_device_id,
+          restored_device_label = @restored_device_label,
+          restored_strategy = @restored_strategy
+        WHERE id = @id
+      `),
       listSessions: this.db.prepare(`
         SELECT * FROM sessions
         WHERE started_at >= @from AND started_at <= @to
@@ -1021,6 +1078,51 @@ class JarvisRepository {
       return openSessions.map((session) => this.statements.getSession.get(session.id));
     });
 
+    this._rotateCaptureAtLocalDate = this.db.transaction((input) => {
+      const existing = this.statements.getSessionContinuation.get(input);
+      if (existing) return { continuation: existing, rollback: null };
+      const session = this.statements.getSession.get(input.sourceSessionId);
+      if (!session) throw new Error(`session ${input.sourceSessionId} does not exist`);
+      const tracks = this.statements.listRotationTracks.all(input.sourceSessionId);
+      const gaps = this.statements.listRotationGaps.all(input.sourceSessionId);
+      this.captureEvidenceStore.finalizeCapture({
+        sessionId: input.sourceSessionId,
+        sources: tracks.map((track) => ({
+          trackId: track.id,
+          gapId: gaps.find((gap) => gap.track_id === track.id)?.id ?? null,
+        })),
+        trackState: "ended",
+        sessionStatus: "completed",
+        at: input.boundaryAt,
+      });
+      this.createSession(input.destinationSession);
+      const continuation = this.createSessionContinuation(input);
+      return { continuation, rollback: { session, tracks, gaps } };
+    });
+
+    this._rollbackCaptureAtLocalDate = this.db.transaction((input) => {
+      const continuation = this.statements.getSessionContinuation.get(input);
+      if (continuation && continuation.destination_session_id !== input.destinationSessionId) {
+        throw new Error("local-date continuation destination changed before rollback");
+      }
+      this.statements.deleteRotationDestination.run(input.destinationSessionId);
+      const restoredSession = this.statements.restoreRotationSession.run(input.rollback.session);
+      if (restoredSession.changes !== 1) {
+        throw new Error(`session ${input.sourceSessionId} could not be restored`);
+      }
+      for (const track of input.rollback.tracks) {
+        if (this.statements.restoreRotationTrack.run(track).changes !== 1) {
+          throw new Error(`track ${track.id} could not be restored`);
+        }
+      }
+      for (const gap of input.rollback.gaps) {
+        if (this.statements.restoreRotationGap.run(gap).changes !== 1) {
+          throw new Error(`gap ${gap.id} could not be restored`);
+        }
+      }
+      return this.statements.getSession.get(input.sourceSessionId);
+    });
+
     this._commitChunkTranscript = this.db.transaction(
       ({ chunk, result, modelVersion, completedAt }) => {
         const current = this.statements.getChunkForTranscriptCommit.get(chunk.id);
@@ -1274,6 +1376,86 @@ class JarvisRepository {
       capturePolicyJson: JSON.stringify(safeCapturePolicy),
     });
     return this.getSession(sessionId);
+  }
+
+  createSessionContinuation({
+    sourceSessionId,
+    destinationSessionId,
+    boundaryAt,
+    destinationLocalDate,
+  }) {
+    const input = {
+      sourceSessionId: assertId(sourceSessionId, "sourceSessionId"),
+      destinationSessionId: assertId(destinationSessionId, "destinationSessionId"),
+      boundaryAt: assertInteger(boundaryAt, "boundaryAt"),
+      destinationLocalDate,
+    };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(destinationLocalDate)) {
+      throw new TypeError("destinationLocalDate must be YYYY-MM-DD");
+    }
+    if (input.sourceSessionId === input.destinationSessionId) {
+      throw new TypeError("continuation sessions must be different");
+    }
+    this.statements.insertSessionContinuation.run(input);
+    const continuation = this.statements.getSessionContinuation.get(input);
+    if (!continuation) throw new Error("session continuation could not be persisted");
+    return continuation;
+  }
+
+  getSessionContinuation(sourceSessionId, destinationLocalDate) {
+    const input = {
+      sourceSessionId: assertId(sourceSessionId, "sourceSessionId"),
+      destinationLocalDate,
+    };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(destinationLocalDate)) {
+      throw new TypeError("destinationLocalDate must be YYYY-MM-DD");
+    }
+    return this.statements.getSessionContinuation.get(input) ?? null;
+  }
+
+  listSessionContinuations(sourceSessionId) {
+    return this.statements.listSessionContinuations.all(
+      assertId(sourceSessionId, "sourceSessionId")
+    );
+  }
+
+  rotateCaptureAtLocalDate({
+    sourceSessionId,
+    destinationSession,
+    boundaryAt,
+    destinationLocalDate,
+  }) {
+    if (!destinationSession || typeof destinationSession !== "object") {
+      throw new TypeError("destinationSession is required");
+    }
+    const input = {
+      sourceSessionId: assertId(sourceSessionId, "sourceSessionId"),
+      destinationSessionId: assertId(destinationSession.id, "destinationSessionId"),
+      destinationSession,
+      boundaryAt: assertInteger(boundaryAt, "boundaryAt"),
+      destinationLocalDate,
+    };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(destinationLocalDate)) {
+      throw new TypeError("destinationLocalDate must be YYYY-MM-DD");
+    }
+    return this._rotateCaptureAtLocalDate(input);
+  }
+
+  rollbackCaptureAtLocalDate({
+    sourceSessionId,
+    destinationSessionId,
+    destinationLocalDate,
+    rollback,
+  }) {
+    if (!rollback || typeof rollback !== "object") {
+      throw new TypeError("rotation rollback evidence is required");
+    }
+    return this._rollbackCaptureAtLocalDate({
+      sourceSessionId: assertId(sourceSessionId, "sourceSessionId"),
+      destinationSessionId: assertId(destinationSessionId, "destinationSessionId"),
+      destinationLocalDate,
+      rollback,
+    });
   }
 
   setSessionRetention(id, retentionMode, capturePolicy) {
@@ -2151,6 +2333,14 @@ class JarvisRepository {
 
   pauseCaptureForLowDisk(input) {
     return this.captureEvidenceStore.pauseCaptureForLowDisk(input);
+  }
+
+  suspendCaptureForPower(input) {
+    return this.captureEvidenceStore.suspendCaptureForPower(input);
+  }
+
+  resumeCaptureAfterPower(input) {
+    return this.captureEvidenceStore.resumeCaptureAfterPower(input);
   }
 
   resumeCapture(input) {

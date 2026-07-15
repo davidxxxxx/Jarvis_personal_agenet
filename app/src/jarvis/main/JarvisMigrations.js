@@ -1,4 +1,4 @@
-const TARGET_VERSION = 15;
+const TARGET_VERSION = 16;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -696,6 +696,17 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       ON audio_chunks(track_id, sequence_number);
       CREATE INDEX IF NOT EXISTS idx_audio_gaps_track_ended_started
       ON audio_gaps(track_id, ended_at, started_at);
+    `);
+      db.exec(`
+      CREATE TABLE IF NOT EXISTS session_continuations (
+        source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        destination_session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL CHECK(reason = 'local_midnight'),
+        boundary_at INTEGER NOT NULL CHECK(typeof(boundary_at) = 'integer' AND boundary_at >= 0),
+        destination_local_date TEXT NOT NULL CHECK(length(destination_local_date) = 10),
+        PRIMARY KEY(source_session_id, destination_local_date),
+        CHECK(source_session_id <> destination_session_id)
+      );
     `);
 
       if (rebuildsTranscriptSegments) {

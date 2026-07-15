@@ -854,6 +854,44 @@ test("sustained restrictive state releases only an idle Whisper server once per 
   assert.equal(stops, 2);
 });
 
+test("stop joins active work before releasing the owned Whisper server", async () => {
+  const entered = deferred();
+  const release = deferred();
+  const order = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        order.push("work-entered");
+        entered.resolve();
+        await release.promise;
+        order.push("work-finished");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => {},
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: { dedupe: () => {} },
+    whisperController: {
+      isIdle: () => false,
+      stop: async () => order.push("whisper-released"),
+    },
+  });
+
+  const draining = runtime.drainOnce();
+  await entered.promise;
+  const stopping = runtime.stop();
+  assert.deepEqual(order, ["work-entered"]);
+  release.resolve();
+  await Promise.all([draining, stopping]);
+
+  assert.deepEqual(order, ["work-entered", "work-finished", "whisper-released"]);
+});
+
 test("stop reached during the first handler prevents every later claim in the same drain", async () => {
   const entered = deferred();
   const release = deferred();

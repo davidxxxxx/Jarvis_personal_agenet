@@ -791,6 +791,82 @@ class CaptureEvidenceStore {
     };
     this.pauseCaptureTransaction = db.transaction((input) => pauseCapture(input, false));
     this.pauseCaptureForLowDiskTransaction = db.transaction((input) => pauseCapture(input, true));
+    this.suspendCaptureForPowerTransaction = db.transaction(({ sessionId, sources, at }) => {
+      const evidence = this._assertLifecycleTransition({
+        sessionId,
+        sources,
+        at,
+        sessionState: "recording",
+        sourceStates: new Set(["active", "recovering"]),
+      });
+      const suspendedSources = [];
+      for (const { track } of evidence) {
+        if (track.state !== "active") {
+          suspendedSources.push({ trackId: track.id, gapId: null, previouslyRecovering: true });
+          continue;
+        }
+        if (this.statements.getOpenGapForTrack.get(track.id)) {
+          throw new Error(`track ${track.id} already has an open gap`);
+        }
+        const gapId = this.createId("gap");
+        const updated = this.setTrackState(track.id, "recovering", at);
+        if (updated.changes !== 1) throw new Error(`track ${track.id} was not suspended`);
+        this.openGap({
+          id: gapId,
+          trackId: track.id,
+          startedAt: at,
+          reason: "system_suspend",
+          recoveryAttempts: 0,
+        });
+        suspendedSources.push({ trackId: track.id, gapId, previouslyRecovering: false });
+      }
+      const paused = this.statements.transitionSession.run({
+        sessionId,
+        status: "paused",
+        endedAt: null,
+      });
+      if (paused.changes !== 1) throw new Error(`session ${sessionId} was not suspended`);
+      return { sessionId, status: "paused", sources: suspendedSources };
+    });
+    this.resumeCaptureAfterPowerTransaction = db.transaction(
+      ({ sessionId, sources, restorations = {}, at }) => {
+        const evidence = this._assertLifecycleTransition({
+          sessionId,
+          sources,
+          at,
+          sessionState: "paused",
+          sourceStates: new Set(["recovering"]),
+        });
+        for (const { track, source } of evidence) {
+          if (source.gapId === null && track.state === "recovering") {
+            continue;
+          }
+          this._assertIdentifier(source.gapId, "suspend gapId");
+          const gap = this.statements.getGap.get(source.gapId);
+          if (!gap || gap.track_id !== track.id || gap.reason !== "system_suspend") {
+            throw new Error(`track ${track.id} does not have the requested suspend gap`);
+          }
+          if (gap.ended_at !== null) throw new Error(`gap ${source.gapId} is not open`);
+          const restored = restorations[track.source_type] ?? {};
+          const closed = this.closeGap(source.gapId, at, 1, {
+            deviceId: restored.deviceId === undefined ? track.device_id : restored.deviceId,
+            deviceLabel:
+              restored.deviceLabel === undefined ? track.device_label : restored.deviceLabel,
+            strategy: restored.strategy === undefined ? track.strategy : restored.strategy,
+          });
+          if (closed.changes !== 1) throw new Error(`gap ${source.gapId} was not closed`);
+          const updated = this.setTrackState(track.id, "active", null);
+          if (updated.changes !== 1) throw new Error(`track ${track.id} was not resumed`);
+        }
+        const resumed = this.statements.transitionSession.run({
+          sessionId,
+          status: "recording",
+          endedAt: null,
+        });
+        if (resumed.changes !== 1) throw new Error(`session ${sessionId} was not resumed`);
+        return { sessionId, status: "recording" };
+      }
+    );
     this.resumeCaptureTransaction = db.transaction(({ sessionId, sources, at }) => {
       const evidence = this._assertLifecycleTransition({
         sessionId,
@@ -979,6 +1055,14 @@ class CaptureEvidenceStore {
 
   pauseCaptureForLowDisk(input) {
     return this.pauseCaptureForLowDiskTransaction(input);
+  }
+
+  suspendCaptureForPower(input) {
+    return this.suspendCaptureForPowerTransaction(input);
+  }
+
+  resumeCaptureAfterPower(input) {
+    return this.resumeCaptureAfterPowerTransaction(input);
   }
 
   resumeCapture(input) {
@@ -1275,7 +1359,7 @@ class CaptureEvidenceStore {
       if (track.state !== "recovering" && openGap) {
         throw new Error(`non-recovering track ${track.id} must not have an open gap`);
       }
-      return { track, openGap };
+      return { track, openGap, source };
     });
     if (sessionTracks.some((track) => !seenTrackIds.has(track.id))) {
       throw new Error("transition must include every session track exactly once");

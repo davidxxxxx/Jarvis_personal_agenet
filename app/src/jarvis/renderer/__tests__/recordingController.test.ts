@@ -13,6 +13,8 @@ import {
   recordingArgs,
   resolveJarvisWhisperModel,
   routeJarvisControl,
+  routePowerLifecycleRequest,
+  selectPowerResumeDevices,
   type RecordingController,
   type RecordingDependencies,
 } from "../useJarvisRecording";
@@ -30,6 +32,94 @@ describe("Jarvis local Whisper model", () => {
     expect(resolveJarvisWhisperModel({ meetingWhisperModel: "small", whisperModel: "base" })).toBe(
       "small"
     );
+  });
+});
+
+describe("power resume device enumeration", () => {
+  const token = {
+    sessionId: "session-day-1",
+    sources: {
+      mic: {
+        sourceType: "mic" as const,
+        deviceId: "stale-mic",
+        deviceLabel: "Old Mic",
+        strategy: "physical",
+      },
+      system: {
+        sourceType: "system" as const,
+        deviceId: null,
+        deviceLabel: "System",
+        strategy: "wasapi-loopback",
+      },
+    },
+  };
+
+  it("returns newly enumerated physical metadata instead of the suspend token", () => {
+    const devices = [
+      {
+        kind: "audioinput",
+        deviceId: "fresh-mic",
+        label: "Microphone (Shure MV7)",
+      } as MediaDeviceInfo,
+    ];
+
+    expect(selectPowerResumeDevices(token, devices)).toEqual({
+      mic: {
+        deviceId: "fresh-mic",
+        deviceLabel: "Microphone (Shure MV7)",
+        strategy: "physical",
+      },
+      system: {
+        deviceId: null,
+        deviceLabel: "System",
+        strategy: "wasapi-loopback",
+      },
+    });
+  });
+
+  it("refuses a virtual-only default instead of silently binding Sonar", () => {
+    const devices = [
+      {
+        kind: "audioinput",
+        deviceId: "default",
+        label: "SteelSeries Sonar - Microphone",
+      } as MediaDeviceInfo,
+    ];
+
+    expect(() => selectPowerResumeDevices(token, devices)).toThrow(/No safe microphone/);
+  });
+
+  it("falls back to a safe system-default microphone when no physical device is available", () => {
+    const devices = [
+      {
+        kind: "audioinput",
+        deviceId: "default",
+        label: "Default Microphone",
+      } as MediaDeviceInfo,
+    ];
+
+    expect(selectPowerResumeDevices(token, devices).mic).toEqual({
+      deviceId: null,
+      deviceLabel: "Default Microphone",
+      strategy: "system-default",
+    });
+  });
+
+  it("routes a suspend request only to upstream teardown", async () => {
+    const suspendUpstream = vi.fn().mockResolvedValue(undefined);
+    const resume = vi.fn().mockResolvedValue(undefined);
+    const enumerateDevices = vi.fn().mockResolvedValue([]);
+
+    await expect(
+      routePowerLifecycleRequest(
+        { id: "power-1", kind: "suspend", token },
+        { suspendUpstream, resume, enumerateDevices }
+      )
+    ).resolves.toBeNull();
+
+    expect(suspendUpstream).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(enumerateDevices).not.toHaveBeenCalled();
   });
 });
 
@@ -594,6 +684,17 @@ describe("Jarvis recording controller", () => {
     await controller.pause();
 
     expect(harness.calls).toEqual(["upstream:stop", "jarvis:pause"]);
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "paused" });
+  });
+
+  it("stops only the renderer upstream for a durable main-process power suspend", async () => {
+    const harness = createHarness({ status: "recording" });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.suspendUpstreamForPower();
+
+    expect(harness.calls).toEqual(["upstream:stop"]);
+    expect(harness.jarvis.pauseCapture).not.toHaveBeenCalled();
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "paused" });
   });
 

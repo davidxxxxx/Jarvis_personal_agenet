@@ -15,6 +15,68 @@ function columnNames(db, table) {
     .map((row) => row.name);
 }
 
+test("v16 adds an idempotent local-midnight continuation relation", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES
+        ('day-1', 10, 'completed', 10),
+        ('day-2', 20, 'recording', 20);
+      DROP TABLE session_continuations;
+      PRAGMA user_version = 15;
+    `);
+
+    const result = applyJarvisMigrations(db, { now: () => 200 });
+
+    assert.equal(TARGET_VERSION, 16);
+    assert.deepEqual(result, { fromVersion: 15, toVersion: 16 });
+    db.prepare(
+      `INSERT INTO session_continuations (
+        source_session_id, destination_session_id, reason, boundary_at,
+        destination_local_date
+      ) VALUES ('day-1', 'day-2', 'local_midnight', 20, '2026-07-15')`
+    ).run();
+    assert.throws(() =>
+      db
+        .prepare(
+          `INSERT INTO session_continuations (
+          source_session_id, destination_session_id, reason, boundary_at,
+          destination_local_date
+        ) VALUES ('day-1', 'day-2', 'local_midnight', 21, '2026-07-15')`
+        )
+        .run()
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 300 }), {
+      fromVersion: 16,
+      toVersion: 16,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("clean v16 migration creates the continuation table with foreign keys", () => {
+  const db = new Database(":memory:");
+  try {
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 100 }), {
+      fromVersion: 0,
+      toVersion: 16,
+    });
+    assert.ok(
+      db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .get("session_continuations")
+    );
+    assert.equal(db.pragma("foreign_key_list(session_continuations)").length, 2);
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
 test("creates dual-track evidence schema idempotently in an empty database", () => {
   const db = new Database(":memory:");
 
@@ -114,7 +176,7 @@ test("creates dual-track evidence schema idempotently in an empty database", () 
   }
 });
 
-test("v15 adds nullable resource deferral and execution device metadata without rewriting jobs", () => {
+test("v16 preserves v15 resource metadata while adding session continuations", () => {
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 100 });
@@ -134,7 +196,7 @@ test("v15 adds nullable resource deferral and execution device metadata without 
       fromVersion: 14,
       toVersion: TARGET_VERSION,
     });
-    assert.equal(TARGET_VERSION, 15);
+    assert.equal(TARGET_VERSION, 16);
     assert.ok(columnNames(db, "processing_jobs").includes("blocked_reason"));
     assert.ok(columnNames(db, "processing_jobs").includes("execution_device"));
     assert.deepEqual(

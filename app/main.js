@@ -329,6 +329,8 @@ const {
   JarvisProcessingLifecycle,
   createJarvisRuntimeMigrationParticipant,
 } = require("./src/jarvis/main/JarvisProcessingLifecycle");
+const JarvisPowerLifecycle = require("./src/jarvis/main/JarvisPowerLifecycle");
+const { RendererPowerResumeHandshake } = JarvisPowerLifecycle;
 
 // Manager instances - initialized after app.whenReady()
 let debugLogger = null;
@@ -367,6 +369,9 @@ let openAiCorrectionService = null;
 let jarvisAnalysisScheduler = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
+let jarvisPowerLifecycle = null;
+let rendererPowerResumeHandshake = null;
+let jarvisLocalDateTimer = null;
 
 function buildJarvisProcessingRuntime() {
   const model = process.env.LOCAL_WHISPER_MODEL?.trim() || "base";
@@ -408,7 +413,6 @@ let jarvisDataRootConfig = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
-let wakeRewarmTimer = null;
 
 function parseAuthBridgePort() {
   const raw = (process.env.OPENWHISPR_AUTH_BRIDGE_PORT || "").trim();
@@ -663,12 +667,44 @@ async function initializeCoreManagers() {
     fetchImpl: (url, options) => net.fetch(url, options),
     log: (entry) => debugLogger.info("Jarvis cloud correction", entry, "jarvis"),
   });
-  const recovered = jarvisService.recoverOpenSessions(Date.now());
+  rendererPowerResumeHandshake = new RendererPowerResumeHandshake({
+    send: (request) => windowManager.sendToControlPanel("jarvis:power-resume-request", request),
+    isAvailable: () =>
+      isLiveWindow(windowManager?.controlPanelWindow) &&
+      !windowManager.controlPanelWindow.webContents.isCrashed(),
+  });
+  jarvisPowerLifecycle = new JarvisPowerLifecycle({
+    service: jarvisService,
+    processingLifecycle: jarvisProcessingLifecycle,
+    releaseWhisper: async () => {},
+    suspendUpstream: (token) => rendererPowerResumeHandshake.request("suspend", token),
+    resumeDevices: (token) => rendererPowerResumeHandshake.request("enumerate", token),
+    resumeUpstream: (token) => rendererPowerResumeHandshake.request("resume", token),
+    ensureGpuReady: async () => {
+      await new Promise((resolve) => setTimeout(resolve, WHISPER_WAKE_REWARM_DELAY_MS));
+      await whisperManager?.onWakeFromSleep();
+    },
+    createSessionId: () => `session_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
+  });
+  const recovery = await jarvisPowerLifecycle.recoverAfterLaunch(Date.now());
   debugLogger.info(
     "Jarvis interrupted-session recovery",
-    { recovered: recovered.length },
+    {
+      recovered: recovery.interruptedSessionIds.length,
+      interruptedSessionId: recovery.interruptedSessionId,
+    },
     "jarvis"
   );
+  await jarvisPowerLifecycle.onLocalDateChange(Date.now());
+  jarvisLocalDateTimer = setInterval(() => {
+    void jarvisPowerLifecycle?.onLocalDateChange(Date.now()).catch((error) => {
+      debugLogger?.warn(
+        "Jarvis local-day rotation failed",
+        { error: error?.message ?? String(error) },
+        "jarvis"
+      );
+    });
+  }, 30_000);
   registerJarvisIpc({
     ipcMain,
     repository: jarvisRepository,
@@ -706,6 +742,7 @@ async function initializeCoreManagers() {
   });
   windowManager.setControlPanelUnavailableHandler((reason) => {
     jarvisControlQueue?.markNotReady(reason);
+    rendererPowerResumeHandshake?.markUnavailable(reason);
     rendererShutdownHandshake?.markRendererGone();
   });
   const isControlPanelSender = (event) =>
@@ -725,6 +762,11 @@ async function initializeCoreManagers() {
   ipcMain.on("jarvis:control:ack", (event, id, outcome, rendererId) => {
     if (!isControlPanelSender(event)) return;
     jarvisControlQueue.acknowledge(id, outcome, rendererId);
+  });
+  ipcMain.on("jarvis:power-resume:ack", (event, id, outcome, payload) => {
+    if (!isControlPanelSender(event)) return;
+    if (outcome !== "ok" && outcome !== "error") return;
+    rendererPowerResumeHandshake?.acknowledge(id, outcome, payload);
   });
   ipcMain.on("jarvis:shutdown:ack", (event, id, outcome) => {
     if (!isControlPanelSender(event)) return;
@@ -1339,18 +1381,26 @@ async function startApp() {
   });
 
   const { powerMonitor } = require("electron");
+  powerMonitor.on("suspend", () => {
+    void jarvisPowerLifecycle?.onSuspend(Date.now()).catch((error) => {
+      debugLogger?.warn(
+        "Jarvis suspend transition failed",
+        { error: error?.message ?? String(error) },
+        "jarvis"
+      );
+    });
+  });
   powerMonitor.on("resume", () => {
     if (googleCalendarManager) {
       googleCalendarManager.onWakeFromSleep();
     }
-    // Sleep evicts the local GPU model from VRAM; reload it once the driver settles. See #766.
-    if (wakeRewarmTimer) clearTimeout(wakeRewarmTimer);
-    wakeRewarmTimer = setTimeout(() => {
-      wakeRewarmTimer = null;
-      whisperManager?.onWakeFromSleep().catch((err) => {
-        debugLogger.debug("whisper wake re-warm error (non-fatal)", { error: err.message });
-      });
-    }, WHISPER_WAKE_REWARM_DELAY_MS);
+    void jarvisPowerLifecycle?.onResume(Date.now()).catch((error) => {
+      debugLogger?.warn(
+        "Jarvis wake recovery remains safely paused",
+        { error: error?.message ?? String(error) },
+        "jarvis"
+      );
+    });
   });
 
   // Non-blocking server pre-warming
@@ -2040,8 +2090,11 @@ function performGracefulTeardown() {
     stopRuntime: [
       stopJarvisProcessingRuntime,
       () => {
-        if (wakeRewarmTimer) clearTimeout(wakeRewarmTimer);
-        wakeRewarmTimer = null;
+        if (jarvisLocalDateTimer) clearInterval(jarvisLocalDateTimer);
+        jarvisLocalDateTimer = null;
+        jarvisPowerLifecycle = null;
+        rendererPowerResumeHandshake?.markUnavailable("application shutting down");
+        rendererPowerResumeHandshake = null;
       },
       closeAuthBridge,
       () => {

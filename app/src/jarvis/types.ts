@@ -61,6 +61,26 @@ export interface JarvisCaptureInput {
   sources: JarvisCaptureSourceInput[];
 }
 
+export interface JarvisPowerResumeSource extends JarvisCaptureSourceInput {
+  state?: string;
+}
+
+export interface JarvisPowerResumeToken {
+  sessionId: string;
+  sources: Record<string, JarvisPowerResumeSource>;
+}
+
+export interface JarvisPowerResumeRequest {
+  id: string;
+  kind: "suspend" | "enumerate" | "resume";
+  token: JarvisPowerResumeToken;
+}
+
+export type JarvisPowerResumeRestorations = Record<
+  string,
+  Pick<JarvisCaptureSourceInput, "deviceId" | "deviceLabel" | "strategy">
+>;
+
 export interface JarvisSourceInterruptionInput {
   at: number;
   reason: string;

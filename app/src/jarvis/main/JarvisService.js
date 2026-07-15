@@ -222,6 +222,7 @@ class JarvisService {
     this.closing = false;
     this.closed = false;
     this.completedRestorations = new Map();
+    this.powerResumeToken = null;
     this.state = this._idleState();
   }
 
@@ -239,6 +240,7 @@ class JarvisService {
     ) {
       throw new Error("a capture session is already active");
     }
+    this.powerResumeToken = null;
     const session = this.repository.getSession(id);
     if (!session) throw new Error("capture session does not exist");
     if (session.capture_mode !== null && session.capture_mode !== undefined) {
@@ -715,10 +717,103 @@ class JarvisService {
     return this._publish(at);
   }
 
-  resumeCapture(sessionId, at = this.now()) {
+  suspendForPower(at = this.now()) {
     this._assertOpen();
-    this._assertActive(sessionId, "paused");
     this._assertTime(at, "at");
+    if (this.state.status === "paused" && this.powerResumeToken) {
+      return {
+        state: this._publicState(at),
+        resumeToken: structuredClone(this.powerResumeToken),
+        suspended: true,
+      };
+    }
+    this._assertActive(this.state.sessionId, ["recording", "degraded"]);
+    if (typeof this.repository.suspendCaptureForPower !== "function") {
+      throw new TypeError("repository.suspendCaptureForPower must be a function");
+    }
+    if (!this._flushRetentionBoundary(at)) {
+      const state =
+        this.state.status === "failed" ? this._publicState(at) : this._failForAudioWrite(at);
+      return { state, resumeToken: null, suspended: false };
+    }
+    const persistedSession = this.repository.getSession(this.state.sessionId);
+    const token = {
+      sessionId: this.state.sessionId,
+      startedAt: this.state.startedAt,
+      captureMode: this.state.captureMode,
+      retentionMode: this.state.retentionMode,
+      effectiveRetentionMode: this.state.effectiveRetentionMode,
+      capturePolicy: structuredClone(this.state.capturePolicy),
+      language: persistedSession?.language ?? "zh",
+      micDeviceId: persistedSession?.mic_device_id ?? null,
+      sources: structuredClone(this._publicState(at).sources),
+    };
+    try {
+      this.writer.closeAll(at);
+      for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+    } catch (error) {
+      const diskError = this._findDiskSpaceError(error);
+      const state = diskError ? this._failForDisk(diskError.code, at) : this._failForAudioWrite(at);
+      return { state, resumeToken: null, suspended: false };
+    }
+    let durable;
+    try {
+      durable = this.repository.suspendCaptureForPower({
+        sessionId: this.state.sessionId,
+        sources: Object.values(this.state.sources).map((source) => ({
+          trackId: source.trackId,
+          expectedState: source.state === "reconnecting" ? "recovering" : source.state,
+        })),
+        at,
+      });
+    } catch (error) {
+      for (const source of Object.values(this.state.sources)) {
+        if (source.state !== "active" || this.state.effectiveRetentionMode === "speech_triggered") {
+          continue;
+        }
+        try {
+          this.writer.reopenSource(source.sourceType, { id: source.trackId, startedAt: at });
+          source.writerOpen = true;
+        } catch {}
+      }
+      throw error;
+    }
+    const durableByTrack = new Map(durable.sources.map((source) => [source.trackId, source]));
+    for (const source of Object.values(this.state.sources)) {
+      const suspended = durableByTrack.get(source.trackId);
+      source.powerSuspendGapId = suspended?.gapId ?? null;
+      if (source.state === "active") source.state = "paused";
+    }
+    this._transitionSessionStatus("paused", at);
+    this.state.errorCode = null;
+    token.sources = structuredClone(this._publicState(at).sources);
+    this.powerResumeToken = token;
+    return {
+      state: this._publish(at),
+      resumeToken: structuredClone(token),
+      suspended: true,
+    };
+  }
+
+  resumeAfterPower(token, restorations = {}, at = this.now()) {
+    if (!token || typeof token !== "object" || token.sessionId !== this.state.sessionId) {
+      throw new Error("power resume token does not match the active session");
+    }
+    if (!this.powerResumeToken || this.powerResumeToken.sessionId !== token.sessionId) {
+      throw new Error("power resume token is no longer active");
+    }
+    return this.resumeCapture(token.sessionId, at, restorations);
+  }
+
+  resumeCapture(sessionId, at = this.now(), restorations = {}) {
+    this._assertOpen();
+    this._assertTime(at, "at");
+    const id = assertId(sessionId, "sessionId");
+    if (id === this.state.sessionId && this.state.status === "recording") {
+      return this._publish(at);
+    }
+    this._assertActive(id, "paused");
+    const isPowerResume = Boolean(this.powerResumeToken);
     if (!Object.values(this.state.sources).some((source) => source.state === "paused")) {
       throw new Error("capture has no paused sources to resume");
     }
@@ -744,14 +839,28 @@ class JarvisService {
           reopenedSourceTypes.push(source.sourceType);
         }
       }
-      this.repository.resumeCapture({
-        sessionId: this.state.sessionId,
-        sources: Object.values(this.state.sources).map((source) => ({
-          trackId: source.trackId,
-          expectedState: source.state === "reconnecting" ? "recovering" : source.state,
-        })),
-        at,
-      });
+      const sources = Object.values(this.state.sources).map((source) => ({
+        trackId: source.trackId,
+        expectedState: isPowerResume
+          ? "recovering"
+          : source.state === "reconnecting"
+            ? "recovering"
+            : source.state,
+        gapId: source.powerSuspendGapId ?? null,
+      }));
+      if (isPowerResume) {
+        if (typeof this.repository.resumeCaptureAfterPower !== "function") {
+          throw new TypeError("repository.resumeCaptureAfterPower must be a function");
+        }
+        this.repository.resumeCaptureAfterPower({
+          sessionId: this.state.sessionId,
+          sources,
+          restorations,
+          at,
+        });
+      } else {
+        this.repository.resumeCapture({ sessionId: this.state.sessionId, sources, at });
+      }
     } catch (error) {
       for (const sourceType of reopenedSourceTypes) {
         try {
@@ -762,12 +871,168 @@ class JarvisService {
       throw error;
     }
     for (const source of Object.values(this.state.sources)) {
-      if (source.state === "paused") source.state = "active";
+      if (source.state !== "paused") continue;
+      const restored = restorations[source.sourceType];
+      if (restored && typeof restored === "object") {
+        Object.assign(source, normalizeSource({ ...restored, sourceType: source.sourceType }));
+      }
+      source.state = "active";
+      source.powerSuspendGapId = null;
     }
     const status = this._deriveSessionStatus();
     this._transitionSessionStatus(status, at);
     this.state.errorCode = null;
+    if (isPowerResume) this.powerResumeToken = null;
     return this._publish(at);
+  }
+
+  rotateAtLocalDate({ sessionId, newSessionId, localDate, at }) {
+    this._assertOpen();
+    const sourceSessionId = assertId(sessionId, "sessionId");
+    const destinationSessionId = assertId(newSessionId, "newSessionId");
+    this._assertTime(at, "at");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(localDate)) {
+      throw new TypeError("localDate must be YYYY-MM-DD");
+    }
+    for (const method of [
+      "rotateCaptureAtLocalDate",
+      "rollbackCaptureAtLocalDate",
+      "getSessionContinuation",
+    ]) {
+      if (typeof this.repository[method] !== "function") {
+        throw new TypeError(`repository.${method} must be a function`);
+      }
+    }
+    const existing = this.repository.getSessionContinuation(sourceSessionId, localDate);
+    if (existing) {
+      return {
+        ...this._publicState(at),
+        previousSessionId: sourceSessionId,
+        sessionId: existing.destination_session_id,
+        localDate,
+      };
+    }
+    this._assertActive(sourceSessionId, ["recording", "degraded"]);
+    const previous = this.repository.getSession(sourceSessionId);
+    const previousWriter = this.writer;
+    const previousState = this.state;
+    const previousPowerResumeToken = this.powerResumeToken;
+    const previousLifecycle = {
+      status: this.state.status,
+      activeSince: this.state.activeSince,
+      accumulatedMs: this.state.accumulatedMs,
+      errorCode: this.state.errorCode,
+      sources: Object.fromEntries(
+        Object.entries(this.state.sources).map(([sourceType, source]) => [
+          sourceType,
+          {
+            state: source.state,
+            gapId: source.gapId,
+            writerOpen: source.writerOpen,
+            powerSuspendGapId: source.powerSuspendGapId ?? null,
+          },
+        ])
+      ),
+    };
+    const choices = {
+      captureMode: this.state.captureMode,
+      retentionMode: this.state.retentionMode,
+      capturePolicy: structuredClone(this.state.capturePolicy),
+      sources: Object.values(this._publicState(at).sources).map((source) => ({
+        sourceType: source.sourceType,
+        deviceId: source.deviceId,
+        deviceLabel: source.deviceLabel,
+        strategy: source.strategy,
+      })),
+    };
+    if (!this._flushRetentionBoundary(at)) {
+      throw new Error("capture could not commit the local-date boundary");
+    }
+    this.writer.closeAll(at);
+    for (const source of Object.values(this.state.sources)) source.writerOpen = false;
+    let rotation;
+    try {
+      rotation = this.repository.rotateCaptureAtLocalDate({
+        sourceSessionId,
+        destinationSession: {
+          id: destinationSessionId,
+          startedAt: at,
+          micDeviceId: previous.mic_device_id,
+          language: previous.language,
+          captureMode: choices.captureMode,
+          retentionMode: choices.retentionMode,
+          capturePolicy: choices.capturePolicy,
+        },
+        boundaryAt: at,
+        destinationLocalDate: localDate,
+      });
+    } catch (error) {
+      this._reopenRotationWriter(previousWriter, previousLifecycle, at);
+      throw error;
+    }
+    const continuation = rotation.continuation;
+    this.writer = null;
+    this.state = this._idleState();
+    this.powerResumeToken = null;
+    try {
+      this.startCapture({
+        sessionId: continuation.destination_session_id,
+        startedAt: at,
+        captureMode: choices.captureMode,
+        retentionMode: choices.retentionMode,
+        capturePolicy: choices.capturePolicy,
+        sources: choices.sources,
+      });
+    } catch (error) {
+      try {
+        this.repository.rollbackCaptureAtLocalDate({
+          sourceSessionId,
+          destinationSessionId: continuation.destination_session_id,
+          destinationLocalDate: localDate,
+          rollback: rotation.rollback,
+        });
+        this.state = previousState;
+        this.powerResumeToken = previousPowerResumeToken;
+        this._restoreRotationState(previousLifecycle);
+        this._reopenRotationWriter(previousWriter, previousLifecycle, at);
+        this._publish(at);
+      } catch (rollbackError) {
+        error.rotationRollbackError = rollbackError;
+      }
+      throw error;
+    }
+    this._schedulePreviewCleanup(sourceSessionId);
+    return {
+      ...this._publicState(at),
+      previousSessionId: sourceSessionId,
+      sessionId: continuation.destination_session_id,
+      localDate,
+    };
+  }
+
+  _restoreRotationState(previousLifecycle) {
+    this.state.status = previousLifecycle.status;
+    this.state.activeSince = previousLifecycle.activeSince;
+    this.state.accumulatedMs = previousLifecycle.accumulatedMs;
+    this.state.errorCode = previousLifecycle.errorCode;
+    for (const [sourceType, snapshot] of Object.entries(previousLifecycle.sources)) {
+      const source = this.state.sources[sourceType];
+      if (!source) continue;
+      source.state = snapshot.state;
+      source.gapId = snapshot.gapId;
+      source.writerOpen = false;
+      source.powerSuspendGapId = snapshot.powerSuspendGapId;
+    }
+  }
+
+  _reopenRotationWriter(writer, previousLifecycle, at) {
+    this.writer = writer;
+    for (const [sourceType, snapshot] of Object.entries(previousLifecycle.sources)) {
+      if (snapshot.state !== "active" || !snapshot.writerOpen) continue;
+      const source = this.state.sources[sourceType];
+      writer.reopenSource(sourceType, { id: source.trackId, startedAt: at });
+      source.writerOpen = true;
+    }
   }
 
   finishCapture(sessionId, at = this.now()) {
@@ -2050,6 +2315,7 @@ class JarvisService {
   }
 
   _finalizeCapture(at, { trackState, sessionStatus, errorCode, durableSources = null }) {
+    this.powerResumeToken = null;
     this._cancelAllVadWork();
     const sessionId = this.state.sessionId;
     this._resetVadSessionOnce(sessionId);
