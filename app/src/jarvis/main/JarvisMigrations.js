@@ -2824,6 +2824,7 @@ function upgradeMemoryConflictIntegrityV28(db, fromVersion) {
       throw new Error(`v28 repair requires v27 columns on ${table}`);
     }
   }
+  db.exec("DROP TRIGGER IF EXISTS memory_item_subjects_immutable_insert");
   backfillMemoryItemCanonicalSlots(db);
   installMemoryConflictIntegrityTriggers(db);
 }

@@ -480,6 +480,115 @@ test("v28 repairs a base-style v27 database with a missing post-v27 canonical br
   }
 });
 
+test("v28 drops a hostile wrong-target subject trigger before missing bridge backfill", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    const reviewedSubjectInsertTrigger = triggerSql(db, "memory_item_subjects_immutable_insert");
+    const expectedSlot = canonicalTupleHash([
+      "memory",
+      "fact",
+      canonicalizeText("Hostile trigger backfill"),
+      ["person-self"],
+    ]);
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body,
+        confidence, lifecycle, source_analysis_input_id, provenance,
+        created_at, updated_at
+      ) VALUES (
+        'memory-hostile-trigger', 'fact', '${HASH_B}', '${HASH_C}',
+        'Hostile trigger backfill', 'The missing bridge must be backfilled.', 0.9, 'active',
+        NULL, 'legacy_unverified', 2550, 2550
+      );
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-hostile-trigger', 'person', 'person-self');
+    `);
+    installBaseV27TriggerStubs(db);
+    db.exec(`
+      DROP TRIGGER memory_item_subjects_immutable_insert;
+      CREATE TRIGGER memory_item_subjects_immutable_insert
+      BEFORE INSERT ON memory_item_canonical_slots
+      BEGIN
+        SELECT RAISE(ABORT, 'hostile wrong-target subject trigger fired');
+      END;
+    `);
+    db.pragma("user_version = 27");
+
+    let migrationResult;
+    assert.doesNotThrow(() => {
+      migrationResult = applyJarvisMigrations(db);
+    });
+    assert.deepEqual(migrationResult, { fromVersion: 27, toVersion: 28 });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-hostile-trigger'`
+        )
+        .get(),
+      { canonical_slot_key: expectedSlot, algorithm: "canonical-v1" }
+    );
+    assert.equal(
+      triggerSql(db, "memory_item_subjects_immutable_insert"),
+      reviewedSubjectInsertTrigger
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("v28 rollback restores a hostile wrong-target subject trigger after bridge mismatch", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body,
+        confidence, lifecycle, source_analysis_input_id, provenance,
+        created_at, updated_at
+      ) VALUES (
+        'memory-hostile-rollback', 'fact', '${HASH_B}', '${HASH_C}',
+        'Hostile trigger rollback', 'The existing bridge deliberately disagrees.', 0.9,
+        'active', NULL, 'legacy_unverified', 2575, 2575
+      );
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-hostile-rollback', 'person', 'person-self');
+      INSERT INTO memory_item_canonical_slots (
+        memory_item_id, canonical_slot_key, algorithm
+      ) VALUES ('memory-hostile-rollback', '${HASH_F}', 'canonical-v1');
+    `);
+    installBaseV27TriggerStubs(db);
+    db.exec(`
+      DROP TRIGGER memory_item_subjects_immutable_insert;
+      CREATE TRIGGER memory_item_subjects_immutable_insert
+      BEFORE INSERT ON memory_item_canonical_slots
+      BEGIN
+        SELECT RAISE(ABORT, 'hostile wrong-target rollback trigger fired');
+      END;
+    `);
+    db.pragma("user_version = 27");
+    const hostileTriggerSql = triggerSql(db, "memory_item_subjects_immutable_insert");
+
+    assert.throws(() => applyJarvisMigrations(db), /canonical slot mismatch/);
+    assert.equal(db.pragma("user_version", { simple: true }), 27);
+    assert.equal(triggerSql(db, "memory_item_subjects_immutable_insert"), hostileTriggerSql);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-hostile-rollback'`
+        )
+        .get(),
+      { canonical_slot_key: HASH_F, algorithm: "canonical-v1" }
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("v28 migration rolls back when an existing canonical bridge disagrees", () => {
   const db = new Database(":memory:");
   try {
