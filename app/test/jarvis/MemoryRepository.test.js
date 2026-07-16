@@ -225,6 +225,70 @@ function seedLegacyAnalysis(db, { malformedJson = false } = {}) {
   `);
 }
 
+function seedSemanticConflictGroup(
+  db,
+  {
+    groupId,
+    groupSlotKey,
+    episode,
+    itemPrefix,
+    bodies,
+    title = "Deployment choice",
+    subjectIds = ["person-self"],
+  }
+) {
+  const canonicalSlotKey = canonicalTupleHash([
+    "memory",
+    "decision",
+    canonicalizeText(title),
+    [...new Set(subjectIds)].sort(),
+  ]);
+  const insertMemory = db.prepare(
+    `INSERT INTO memory_items_v2 (
+       id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+       lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+     ) VALUES (?, 'decision', ?, ?, ?, ?, 0.8, 'conflict', NULL,
+               'legacy_unverified', ?, ?)`
+  );
+  const insertSubject = db.prepare(
+    `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+     VALUES (?, 'person', ?)`
+  );
+  const insertBridge = db.prepare(
+    `INSERT INTO memory_item_canonical_slots (
+       memory_item_id, canonical_slot_key, algorithm
+     ) VALUES (?, ?, 'canonical-v1')`
+  );
+  const itemIds = bodies.map((body, index) => {
+    const id = `${itemPrefix}-${index + 1}`;
+    const at = 2_000 + index;
+    insertMemory.run(
+      id,
+      groupSlotKey,
+      sha256(`stored-value:${groupId}:${index}:${body}`),
+      title,
+      body,
+      at,
+      at
+    );
+    for (const subjectId of subjectIds) insertSubject.run(id, subjectId);
+    insertBridge.run(id, canonicalSlotKey);
+    return id;
+  });
+  db.prepare(
+    `INSERT INTO memory_conflict_groups (
+       id, slot_key, episode, state, selected_member_id, resolved_at,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, 'open', NULL, NULL, 2100, 2100)`
+  ).run(groupId, groupSlotKey, episode);
+  const insertMember = db.prepare(
+    `INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+     VALUES (?, ?, 2100)`
+  );
+  for (const itemId of itemIds) insertMember.run(groupId, itemId);
+  return { canonicalSlotKey, itemIds };
+}
+
 function validInput(overrides = {}) {
   return {
     sessionId: "session-1",
@@ -975,6 +1039,104 @@ test("every injected planner action-class failure rolls back the whole stored-ca
     } finally {
       db.close();
     }
+  }
+});
+
+test("stored candidate rolls back when a memory action has an unknown canonical key beside a valid id", () => {
+  const db = createFixture();
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const realMerger = new MemoryMerger();
+  let injectMismatchedReference = false;
+  let existingMemoryId;
+  try {
+    const { repository, input } = createStoredInput(db, undefined, {
+      memoryMerger: {
+        plan(plannerInput) {
+          const plan = realMerger.plan(plannerInput);
+          if (!injectMismatchedReference) return plan;
+          return {
+            ...plan,
+            occurrenceLinks: [
+              ...plan.occurrenceLinks,
+              {
+                entityKind: "memory",
+                mode: "create_occurrence",
+                memoryId: existingMemoryId,
+                canonicalValueKey: "f".repeat(64),
+                confidence: 0.9,
+                startedAt: 1000,
+                endedAt: 5000,
+                evidenceSegmentIds: ["segment-1"],
+              },
+            ],
+          };
+        },
+      },
+    });
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate(),
+    });
+    existingMemoryId = db.prepare("SELECT id FROM memory_items_v2").get().id;
+
+    const nextInput = createAlternativeInput(repository, "dual memory reference redaction");
+    const head = setDesiredHead(repository, nextInput);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: nextInput.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(db, job.id, "budget-request-dual-memory-ref"),
+      candidate: validCandidate(),
+    });
+    const before = db
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM memory_items_v2) AS memories,
+           (SELECT count(*) FROM memory_occurrences) AS occurrences,
+           (SELECT count(*) FROM evidence_refs) AS evidence,
+           (SELECT count(*) FROM session_summary_revisions) AS summaries`
+      )
+      .get();
+    injectMismatchedReference = true;
+
+    assert.throws(
+      () =>
+        repository.applyStoredAnalysisCandidate({
+          candidateId: persisted.candidateId,
+          jobId: job.id,
+          owner: "cloud-worker",
+          at: 7_100,
+        }),
+      { code: "MEMORY_PLAN_REFERENCE_UNRESOLVED" }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT state, disposition_at FROM analysis_response_candidates WHERE id = ?")
+        .get(persisted.candidateId),
+      { state: "validated", disposition_at: null }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+        .get(nextInput.analysisInputId),
+      { candidate_hash: null, applied_at: null }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM memory_items_v2) AS memories,
+             (SELECT count(*) FROM memory_occurrences) AS occurrences,
+             (SELECT count(*) FROM evidence_refs) AS evidence,
+             (SELECT count(*) FROM session_summary_revisions) AS summaries`
+        )
+        .get(),
+      before
+    );
+  } finally {
+    db.close();
   }
 });
 
@@ -1905,6 +2067,82 @@ test("importLegacyAnalysis imports the observable legacy snapshot once with appe
         assert.ok(item.occurrences.every((occurrence) => occurrence.sessionId === "session-1"));
       }
     }
+  } finally {
+    db.close();
+  }
+});
+
+test("post-v27 legacy memory imports persist a canonical-v1 bridge for later conflict relations", () => {
+  const db = createFixture();
+  try {
+    createLegacyAnalysisSchema(db);
+    seedLegacyAnalysis(db);
+    const repository = createRepository(db);
+
+    repository.importLegacyAnalysis();
+
+    const imported = db
+      .prepare(
+        `SELECT id, kind, canonical_slot_key, title
+         FROM memory_items_v2 WHERE body = 'Keep the local database'`
+      )
+      .get();
+    const canonicalSlotKey = canonicalTupleHash([
+      "memory",
+      imported.kind,
+      canonicalizeText(imported.title),
+      [],
+    ]);
+    assert.notEqual(imported.canonical_slot_key, canonicalSlotKey);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm
+           FROM memory_item_canonical_slots WHERE memory_item_id = ?`
+        )
+        .get(imported.id),
+      { canonical_slot_key: canonicalSlotKey, algorithm: "canonical-v1" }
+    );
+
+    const peerValueKey = canonicalTupleHash([
+      "memory_value",
+      canonicalSlotKey,
+      canonicalizeText("Keep a cloud fallback"),
+    ]);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (
+         'canonical-peer', 'decision', ?, ?, 'Keep the local database',
+         'Keep a cloud fallback', 0.8, 'active', NULL, 'legacy_unverified', 7000, 7000
+       )`
+    ).run(canonicalSlotKey, peerValueKey);
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('canonical-peer', ?, 'canonical-v1')`
+    ).run(canonicalSlotKey);
+    db.prepare(
+      `INSERT INTO memory_conflict_groups (
+         id, slot_key, episode, state, selected_member_id, resolved_at,
+         created_at, updated_at
+       ) VALUES ('post-import-group', ?, 1, 'open', NULL, NULL, 7000, 7000)`
+    ).run(canonicalSlotKey);
+    db.prepare(
+      `INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+       VALUES ('post-import-group', ?, 7000),
+              ('post-import-group', 'canonical-peer', 7000)`
+    ).run(imported.id);
+    assert.equal(
+      db
+        .prepare(
+          `SELECT count(*) AS count FROM memory_conflict_members
+           WHERE group_id = 'post-import-group'`
+        )
+        .get().count,
+      2
+    );
   } finally {
     db.close();
   }
@@ -2886,6 +3124,89 @@ test("applyCandidateAnalysis verifies claimed candidate hash and is exactly idem
   }
 });
 
+test("semantic retry rejects an extra candidate field before idempotency comparison", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const realMerger = new MemoryMerger();
+  let plannerCalls = 0;
+  try {
+    const { repository, input } = createStoredInput(db, counters, {
+      memoryMerger: {
+        plan(plannerInput) {
+          plannerCalls += 1;
+          return realMerger.plan(plannerInput);
+        },
+      },
+    });
+    const candidate = validCandidate();
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate,
+    });
+    const countersAfterApply = { ...counters };
+    const malformedRetry = { ...candidate, unexpectedField: "must be rejected" };
+    assert.equal(semanticCandidateHash(malformedRetry), semanticCandidateHash(candidate));
+
+    assert.throws(
+      () =>
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: malformedRetry,
+        }),
+      { code: "MEMORY_CANDIDATE_INVALID" }
+    );
+    assert.equal(plannerCalls, 1);
+    assert.deepEqual(counters, countersAfterApply);
+  } finally {
+    db.close();
+  }
+});
+
+test("semantic retry rejects out-of-scope evidence before hash mismatch handling", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const realMerger = new MemoryMerger();
+  let plannerCalls = 0;
+  try {
+    const { repository, input } = createStoredInput(db, counters, {
+      memoryMerger: {
+        plan(plannerInput) {
+          plannerCalls += 1;
+          return realMerger.plan(plannerInput);
+        },
+      },
+    });
+    const candidate = validCandidate();
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate,
+    });
+    const countersAfterApply = { ...counters };
+    const outOfScopeRetry = validCandidate({
+      memories: [{ ...validCandidate().memories[0], evidenceSegmentIds: ["segment-other"] }],
+    });
+
+    assert.throws(
+      () =>
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: outOfScopeRetry,
+        }),
+      { code: "MEMORY_EVIDENCE_OUT_OF_SCOPE" }
+    );
+    assert.equal(plannerCalls, 1);
+    assert.deepEqual(counters, countersAfterApply);
+  } finally {
+    db.close();
+  }
+});
+
 test("reordered semantic retry is read-only and consumes no planner clock or ID work", () => {
   const db = createFixture();
   const counters = { ids: 0, clocks: 0 };
@@ -3217,6 +3538,243 @@ test("contradictory memory values create an episode and resolution is terminal a
         reason: "conflict_resolution",
         analysis_input_id: null,
       }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a migrated raw-key open conflict is reused by a canonical-v1 candidate conflict", () => {
+  const db = createFixture();
+  try {
+    const { repository, input, counters } = createStoredInput(db);
+    const rawSlotKey = sha256("legacy raw open deployment slot");
+    const seeded = seedSemanticConflictGroup(db, {
+      groupId: "legacy-open-group",
+      groupSlotKey: rawSlotKey,
+      episode: 1,
+      itemPrefix: "legacy-open-memory",
+      bodies: ["Use the local-first deployment.", "Use the cloud-first deployment."],
+    });
+    assert.notEqual(rawSlotKey, seeded.canonicalSlotKey);
+
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+        topics: [],
+        todos: [],
+        suggestions: [],
+      }),
+    });
+
+    assert.deepEqual(
+      db.prepare("SELECT id, slot_key, episode, state FROM memory_conflict_groups").all(),
+      [{ id: "legacy-open-group", slot_key: rawSlotKey, episode: 1, state: "open" }]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT item.body
+           FROM memory_conflict_members AS member
+           JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
+           WHERE member.group_id = 'legacy-open-group' ORDER BY item.body`
+        )
+        .all()
+        .map((row) => row.body),
+      [
+        "Use the cloud-first deployment.",
+        "Use the hybrid deployment.",
+        "Use the local-first deployment.",
+      ]
+    );
+
+    const hybrid = db
+      .prepare("SELECT id FROM memory_items_v2 WHERE body = 'Use the hybrid deployment.'")
+      .get();
+    assert.deepEqual(
+      repository.resolveMemoryConflict({
+        conflictGroupId: "legacy-open-group",
+        selectedMemoryItemId: hybrid.id,
+      }),
+      {
+        status: "resolved",
+        conflictGroupId: "legacy-open-group",
+        selectedMemoryItemId: hybrid.id,
+      }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, slot_key, episode, state, selected_member_id
+           FROM memory_conflict_groups WHERE id = 'legacy-open-group'`
+        )
+        .get(),
+      {
+        id: "legacy-open-group",
+        slot_key: rawSlotKey,
+        episode: 1,
+        state: "resolved",
+        selected_member_id: hybrid.id,
+      }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT id, lifecycle FROM memory_items_v2 ORDER BY id")
+        .all()
+        .filter((item) => [...seeded.itemIds, hybrid.id].includes(item.id)),
+      [...seeded.itemIds]
+        .sort()
+        .map((id) => ({ id, lifecycle: "superseded" }))
+        .concat({ id: hybrid.id, lifecycle: "active" })
+        .sort((left, right) => left.id.localeCompare(right.id))
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT previous_id, next_id, reason, analysis_input_id
+           FROM memory_supersessions ORDER BY previous_id, next_id`
+        )
+        .all(),
+      [...seeded.itemIds].sort().map((previousId) => ({
+        previous_id: previousId,
+        next_id: hybrid.id,
+        reason: "conflict_resolution",
+        analysis_input_id: null,
+      }))
+    );
+
+    const countersAfterResolve = { ...counters };
+    assert.deepEqual(
+      repository.resolveMemoryConflict({
+        conflictGroupId: "legacy-open-group",
+        selectedMemoryItemId: hybrid.id,
+      }),
+      {
+        status: "already_resolved",
+        conflictGroupId: "legacy-open-group",
+        selectedMemoryItemId: hybrid.id,
+      }
+    );
+    assert.deepEqual(counters, countersAfterResolve);
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM memory_supersessions").get().count,
+      seeded.itemIds.length
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a resolved raw-key conflict advances the next semantic canonical-v1 episode", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const rawSlotKey = sha256("legacy raw resolved deployment slot");
+    const seeded = seedSemanticConflictGroup(db, {
+      groupId: "legacy-resolved-group",
+      groupSlotKey: rawSlotKey,
+      episode: 3,
+      itemPrefix: "legacy-resolved-memory",
+      bodies: ["Use the local-first deployment.", "Use the cloud-first deployment."],
+    });
+    repository.resolveMemoryConflict({
+      conflictGroupId: "legacy-resolved-group",
+      selectedMemoryItemId: seeded.itemIds[0],
+    });
+    const input = repository.createAnalysisInput(validCreateInput());
+
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+        topics: [],
+        todos: [],
+        suggestions: [],
+      }),
+    });
+
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT slot_key, episode, state FROM memory_conflict_groups
+           ORDER BY state, episode`
+        )
+        .all(),
+      [
+        { slot_key: seeded.canonicalSlotKey, episode: 4, state: "open" },
+        { slot_key: rawSlotKey, episode: 3, state: "resolved" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("multiple semantic open conflict groups fail closed and roll back candidate writes", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const rawSlotKey = sha256("legacy ambiguous deployment slot");
+    const seeded = seedSemanticConflictGroup(db, {
+      groupId: "legacy-ambiguous-group",
+      groupSlotKey: rawSlotKey,
+      episode: 1,
+      itemPrefix: "legacy-ambiguous-memory",
+      bodies: ["Use the local-first deployment.", "Use the cloud-first deployment."],
+    });
+    seedSemanticConflictGroup(db, {
+      groupId: "canonical-ambiguous-group",
+      groupSlotKey: seeded.canonicalSlotKey,
+      episode: 1,
+      itemPrefix: "canonical-ambiguous-memory",
+      bodies: ["Use the edge-first deployment."],
+    });
+    const before = db
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM memory_items_v2) AS memories,
+           (SELECT count(*) FROM memory_conflict_groups) AS groups,
+           (SELECT count(*) FROM memory_conflict_members) AS members,
+           (SELECT count(*) FROM session_summary_revisions) AS summaries,
+           (SELECT count(*) FROM evidence_refs) AS evidence`
+      )
+      .get();
+
+    assert.throws(
+      () =>
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: validCandidate({
+            memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+            topics: [],
+            todos: [],
+            suggestions: [],
+          }),
+        }),
+      { code: "MEMORY_CONFLICT_AMBIGUOUS" }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM memory_items_v2) AS memories,
+             (SELECT count(*) FROM memory_conflict_groups) AS groups,
+             (SELECT count(*) FROM memory_conflict_members) AS members,
+             (SELECT count(*) FROM session_summary_revisions) AS summaries,
+             (SELECT count(*) FROM evidence_refs) AS evidence`
+        )
+        .get(),
+      before
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId),
+      { candidate_hash: null, applied_at: null }
     );
   } finally {
     db.close();

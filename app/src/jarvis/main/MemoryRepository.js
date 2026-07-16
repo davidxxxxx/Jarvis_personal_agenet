@@ -1491,6 +1491,11 @@ class MemoryRepository {
         .get(analysisInputId);
       if (!inputRow) throw codedError("MEMORY_INPUT_NOT_FOUND");
       if (!safeHashEqual(inputHash, inputRow.input_hash)) throw codedError("MEMORY_INPUT_MISMATCH");
+      const storedInput = this._loadStoredAnalysisInput(analysisInputId);
+      const context = this._candidateContext(inputRow);
+      const allowedSegmentIds = new Set(storedInput.payload.selectedSegmentIds);
+      const allowedOwnerLabels = new Set(storedInput.payload.selectedOwnerLabels);
+      validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels });
       if (inputRow.candidate_hash !== null) {
         const retrySemanticHash = semanticCandidateHash(candidate);
         if (safeHashEqual(retrySemanticHash, inputRow.candidate_hash)) {
@@ -1505,11 +1510,6 @@ class MemoryRepository {
         throw codedError("MEMORY_CANDIDATE_ALREADY_APPLIED");
       }
 
-      const storedInput = this._loadStoredAnalysisInput(analysisInputId);
-      const context = this._candidateContext(inputRow);
-      const allowedSegmentIds = new Set(storedInput.payload.selectedSegmentIds);
-      const allowedOwnerLabels = new Set(storedInput.payload.selectedOwnerLabels);
-      validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels });
       const plannerInput = this._plannerSnapshot(inputRow, candidate, context);
       const plan = this.memoryMerger.plan(plannerInput);
       const semanticHash = assertHash(plan.semanticCandidateHash, "semanticCandidateHash");
@@ -1974,16 +1974,24 @@ class MemoryRepository {
       }
 
       const resolveMemoryId = ({ memoryId, canonicalValueKey }) => {
-        const byCanonical = canonicalValueKey
+        const hasMemoryId = memoryId !== undefined && memoryId !== null;
+        const hasCanonicalValueKey = canonicalValueKey !== undefined && canonicalValueKey !== null;
+        if (!hasMemoryId && !hasCanonicalValueKey) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        if (hasMemoryId && !memoryCanonicalSlotById.has(memoryId)) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const byCanonical = hasCanonicalValueKey
           ? memoryIdsByCanonicalValueKey.get(canonicalValueKey)
           : undefined;
-        if (memoryId && byCanonical && memoryId !== byCanonical) {
+        if (hasCanonicalValueKey && !byCanonical) {
           throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
         }
-        const resolved = memoryId ?? byCanonical;
-        if (!resolved || !memoryCanonicalSlotById.has(resolved)) {
+        if (hasMemoryId && hasCanonicalValueKey && memoryId !== byCanonical) {
           throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
         }
+        const resolved = hasMemoryId ? memoryId : byCanonical;
         return resolved;
       };
       const requireEvidence = (action) => {
@@ -2259,19 +2267,27 @@ class MemoryRepository {
         ) {
           throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
         }
-        let group = this.db
+        const semanticGroups = this.db
           .prepare(
-            `SELECT id FROM memory_conflict_groups
-             WHERE slot_key = ? AND state = 'open'`
+            `SELECT conflict.id, conflict.slot_key, conflict.episode, conflict.state
+             FROM memory_conflict_groups AS conflict
+             WHERE conflict.slot_key = ?
+                OR EXISTS (
+                  SELECT 1
+                  FROM memory_conflict_members AS member
+                  JOIN memory_item_canonical_slots AS slot
+                    ON slot.memory_item_id = member.memory_item_id
+                  WHERE member.group_id = conflict.id
+                    AND slot.canonical_slot_key = ?
+                )
+             ORDER BY conflict.id`
           )
-          .get(conflict.canonicalSlotKey);
+          .all(conflict.canonicalSlotKey, conflict.canonicalSlotKey);
+        const openGroups = semanticGroups.filter((row) => row.state === "open");
+        if (openGroups.length > 1) throw codedError("MEMORY_CONFLICT_AMBIGUOUS");
+        let group = openGroups[0];
         if (!group) {
-          const episode = this.db
-            .prepare(
-              `SELECT COALESCE(MAX(episode), 0) + 1 AS episode
-               FROM memory_conflict_groups WHERE slot_key = ?`
-            )
-            .get(conflict.canonicalSlotKey).episode;
+          const episode = Math.max(0, ...semanticGroups.map((row) => row.episode)) + 1;
           group = { id: this._nextId("memory_conflict") };
           this.db
             .prepare(
@@ -2661,6 +2677,16 @@ class MemoryRepository {
         };
       };
 
+      const durableMemorySubjectIds = this.db.prepare(
+        `SELECT subject_id FROM memory_item_subjects
+         WHERE memory_item_id = ? ORDER BY subject_id, subject_kind`
+      );
+      const insertCanonicalMemorySlot = this.db.prepare(
+        `INSERT INTO memory_item_canonical_slots (
+           memory_item_id, canonical_slot_key, algorithm
+         ) VALUES (?, ?, 'canonical-v1')`
+      );
+
       const ensureLegacyMemory = ({ kind, title, body, confidence, provenance }) => {
         const { slotKey, valueKey } = legacyMemoryKeys(kind, title, body);
         let row = this.db
@@ -2687,6 +2713,14 @@ class MemoryRepository {
               importedAt,
               importedAt
             );
+          const subjectIds = normalizeStringSet(
+            durableMemorySubjectIds.all(row.id).map((subject) => subject.subject_id),
+            "legacy.memory.relatedSubjectIds"
+          );
+          insertCanonicalMemorySlot.run(
+            row.id,
+            canonicalTupleHash(["memory", kind, canonicalizeText(title), subjectIds])
+          );
         }
         return row.id;
       };

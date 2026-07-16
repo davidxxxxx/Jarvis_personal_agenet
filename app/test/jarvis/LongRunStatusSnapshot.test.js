@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { CHANNELS } = require("../../src/jarvis/shared/contracts");
 const registerJarvisIpc = require("../../src/jarvis/main/registerJarvisIpc");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
@@ -324,20 +325,65 @@ test("repository aggregates active work by runtime stage without double-counting
       createdAt: 30_000,
       completedAt: null,
     });
-    insertJob.run({
-      id: "j4",
-      chunkId: null,
-      jobType: "generate_daily_digest",
-      state: "blocked",
-      priority: 80,
-      hash: "j4",
-      lane: "cloud",
-      executionDevice: null,
-      blockedReason: null,
-      nextRetryAt: null,
-      createdAt: 40_000,
-      completedAt: null,
+    const statusHash = (value) => crypto.createHash("sha256").update(value).digest("hex");
+    const analysisInputHash = statusHash("runtime status analysis input");
+    const cloudPayloadJson = JSON.stringify({
+      inputVersion: "jarvis-analysis-input-v2",
+      segments: [],
+      omittedRanges: [],
     });
+    const cloudPayloadHash = statusHash(cloudPayloadJson);
+    const analysisModelVersion = "runtime-status-model-v1";
+    repo.db
+      .prepare(
+        `INSERT INTO analysis_inputs (
+           id, session_id, transcript_revision, identity_revision, prompt_version,
+           input_hash, input_contract_version, redaction_version, cloud_payload_json,
+           cloud_payload_bytes, cloud_payload_sha256, created_at
+         ) VALUES (
+           'status-analysis-input', 's1', ?, ?, 'jarvis-analysis-v2', ?,
+           'jarvis-analysis-input-v2', 'jarvis-redaction-v1', ?, ?, ?, 39000
+         )`
+      )
+      .run(
+        statusHash("runtime status transcript"),
+        statusHash("runtime status identity"),
+        analysisInputHash,
+        cloudPayloadJson,
+        Buffer.byteLength(cloudPayloadJson, "utf8"),
+        cloudPayloadHash
+      );
+    const desiredVectorJson = JSON.stringify({
+      analysisInputId: "status-analysis-input",
+      analysisInputHash,
+      transcriptRevision: statusHash("runtime status transcript"),
+      identityRevision: statusHash("runtime status identity"),
+      promptVersion: "jarvis-analysis-v2",
+      cloudPayloadHash,
+      modelVersion: analysisModelVersion,
+      segments: [],
+    });
+    const desiredVectorHash = statusHash(desiredVectorJson);
+    repo.db
+      .prepare(
+        `INSERT INTO analysis_desired_heads (
+           session_id, analysis_input_id, analysis_input_hash, desired_vector_json,
+           desired_vector_hash, head_revision, created_at, updated_at
+         ) VALUES ('s1', 'status-analysis-input', ?, ?, ?, 1, 39000, 39000)`
+      )
+      .run(analysisInputHash, desiredVectorJson, desiredVectorHash);
+    repo.db
+      .prepare(
+        `INSERT INTO processing_jobs (
+           id, session_id, chunk_id, job_type, state, priority, input_hash, lane,
+           input_version, model_version, execution_device, blocked_reason, next_retry_at,
+           analysis_input_id, desired_head_hash, created_at, completed_at
+         ) VALUES (
+           'j4', 's1', NULL, 'analyze_session', 'blocked', 70, ?, 'cloud',
+           1, ?, NULL, NULL, NULL, 'status-analysis-input', ?, 40000, NULL
+         )`
+      )
+      .run(analysisInputHash, analysisModelVersion, desiredVectorHash);
     insertJob.run({
       id: "j5",
       chunkId: "c3",
@@ -418,7 +464,7 @@ test("repository aggregates active work by runtime stage without double-counting
       blocked: 2,
       total: 7,
       byStage: {
-        generate_daily_digest: { pending: 0, running: 0, retry: 0, blocked: 1, total: 1 },
+        analysis: { pending: 0, running: 0, retry: 0, blocked: 1, total: 1 },
         final_transcription: { pending: 1, running: 1, retry: 0, blocked: 0, total: 2 },
         speaker: { pending: 0, running: 0, retry: 3, blocked: 1, total: 4 },
       },

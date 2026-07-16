@@ -2584,6 +2584,14 @@ function upgradeMemoryItemSubjectsV27(db) {
         AND (
           conflict.slot_key = item.canonical_slot_key
           OR conflict.slot_key = slot.canonical_slot_key
+          OR EXISTS (
+            SELECT 1
+            FROM memory_conflict_members AS semantic_member
+            JOIN memory_item_canonical_slots AS semantic_slot
+              ON semantic_slot.memory_item_id = semantic_member.memory_item_id
+            WHERE semantic_member.group_id = conflict.id
+              AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
+          )
         )
     )
     BEGIN
@@ -2602,6 +2610,14 @@ function upgradeMemoryItemSubjectsV27(db) {
         AND (
           NEW.slot_key = item.canonical_slot_key
           OR NEW.slot_key = slot.canonical_slot_key
+          OR EXISTS (
+            SELECT 1
+            FROM memory_conflict_members AS semantic_member
+            JOIN memory_item_canonical_slots AS semantic_slot
+              ON semantic_slot.memory_item_id = semantic_member.memory_item_id
+            WHERE semantic_member.group_id = NEW.id
+              AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
+          )
         )
     )
     BEGIN
@@ -2625,6 +2641,14 @@ function upgradeMemoryItemSubjectsV27(db) {
            WHERE (
              conflict.slot_key = OLD.canonical_slot_key
              OR conflict.slot_key = slot.canonical_slot_key
+             OR EXISTS (
+               SELECT 1
+               FROM memory_conflict_members AS semantic_member
+               JOIN memory_item_canonical_slots AS semantic_slot
+                 ON semantic_slot.memory_item_id = semantic_member.memory_item_id
+               WHERE semantic_member.group_id = conflict.id
+                 AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
+             )
            )
             AND conflict.state = 'resolved'
             AND conflict.selected_member_id = OLD.id
@@ -2651,6 +2675,14 @@ function upgradeMemoryItemSubjectsV27(db) {
            WHERE (
              conflict.slot_key = OLD.canonical_slot_key
              OR conflict.slot_key = slot.canonical_slot_key
+             OR EXISTS (
+               SELECT 1
+               FROM memory_conflict_members AS semantic_member
+               JOIN memory_item_canonical_slots AS semantic_slot
+                 ON semantic_slot.memory_item_id = semantic_member.memory_item_id
+               WHERE semantic_member.group_id = conflict.id
+                 AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
+             )
            )
             AND conflict.state = 'resolved'
             AND conflict.selected_member_id <> OLD.id
