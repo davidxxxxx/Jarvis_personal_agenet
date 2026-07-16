@@ -10,6 +10,10 @@ const {
 const { resolveLocalDate } = require("./ZonedCalendar");
 const { compileRedactionTerms } = require("./AnalysisInputBuilder");
 const { MAX_DAILY_DIGEST_INPUT_BYTES } = require("./DailyDigestContractLimits");
+const {
+  DAILY_DIGEST_SCHEMA_VERSION,
+  validateCandidateDailyDigest,
+} = require("./DailyDigestSchema");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -19,6 +23,7 @@ const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
 const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
 const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
 const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
+const MAX_DAILY_DIGEST_CANDIDATE_BYTES = 512 * 1024;
 const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
 const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
 
@@ -1589,6 +1594,223 @@ class MemoryRepository {
         budgetAttemptId: row.budget_attempt_id,
         desiredVectorHash: row.desired_vector_hash,
         candidateHash: row.candidate_hash,
+        candidateState: row.candidate_state,
+        jobState: row.job_state,
+        leaseOwner: row.lease_owner,
+        leaseExpiresAt: row.lease_expires_at,
+        budgetState: row.budget_state,
+      }));
+  }
+
+  _dailyDigestCandidateContext(storedInput) {
+    const sections = storedInput?.cloudPayload?.sections;
+    if (!sections || typeof sections !== "object" || Array.isArray(sections)) {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    if (!Array.isArray(sections.sessions) || !Array.isArray(sections.peopleInteractions)) {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    const allowedSegmentIds = new Set();
+    const segmentSubjectById = new Map();
+    for (const session of sections.sessions) {
+      if (!session || typeof session !== "object" || !Array.isArray(session.segments)) {
+        throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+      }
+      for (const segment of session.segments) {
+        if (
+          !segment ||
+          typeof segment !== "object" ||
+          typeof segment.segmentId !== "string" ||
+          segment.segmentId.length === 0 ||
+          typeof segment.subjectRef !== "string" ||
+          segment.subjectRef.length === 0 ||
+          allowedSegmentIds.has(segment.segmentId)
+        ) {
+          throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+        }
+        allowedSegmentIds.add(segment.segmentId);
+        segmentSubjectById.set(segment.segmentId, segment.subjectRef);
+      }
+    }
+    const allowedSubjectRefs = new Set();
+    const subjectEvidenceByRef = new Map();
+    for (const interaction of sections.peopleInteractions) {
+      if (
+        !interaction ||
+        typeof interaction !== "object" ||
+        typeof interaction.subjectRef !== "string" ||
+        interaction.subjectRef.length === 0 ||
+        !Array.isArray(interaction.evidenceSegmentIds) ||
+        interaction.evidenceSegmentIds.length === 0 ||
+        allowedSubjectRefs.has(interaction.subjectRef)
+      ) {
+        throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+      }
+      const evidence = new Set();
+      for (const segmentId of interaction.evidenceSegmentIds) {
+        if (
+          typeof segmentId !== "string" ||
+          !allowedSegmentIds.has(segmentId) ||
+          segmentSubjectById.get(segmentId) !== interaction.subjectRef ||
+          evidence.has(segmentId)
+        ) {
+          throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+        }
+        evidence.add(segmentId);
+      }
+      allowedSubjectRefs.add(interaction.subjectRef);
+      subjectEvidenceByRef.set(interaction.subjectRef, evidence);
+    }
+    if (
+      allowedSegmentIds.size === 0 ||
+      [...segmentSubjectById].some(([segmentId, subjectRef]) =>
+        !subjectEvidenceByRef.get(subjectRef)?.has(segmentId)
+      )
+    ) {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    return {
+      allowedSegmentIds,
+      allowedSubjectRefs,
+      subjectEvidenceByRef,
+      completeness: storedInput.completeness,
+      transcriptCoverage: sections.transcriptCoverage,
+    };
+  }
+
+  persistValidatedDailyDigestCandidate(input) {
+    assertExactPlainObject(
+      input,
+      ["jobId", "digestInputId", "budgetAttemptId", "candidate"],
+      "validated daily digest candidate"
+    );
+    const jobId = assertId(input.jobId, "jobId");
+    const digestInputId = assertId(input.digestInputId, "digestInputId");
+    const budgetAttemptId = assertId(input.budgetAttemptId, "budgetAttemptId");
+    assertJsonObject(input.candidate, "candidate");
+
+    const transaction = this.db.transaction(() => {
+      const storedInput = this.getDailyDigestInput(digestInputId);
+      if (!storedInput) throw codedError("MEMORY_DAILY_DIGEST_INPUT_NOT_FOUND");
+      const candidate = validateCandidateDailyDigest(
+        input.candidate,
+        this._dailyDigestCandidateContext(storedInput)
+      );
+      const candidateJson = canonicalJson(candidate);
+      const candidateBytes = Buffer.byteLength(candidateJson, "utf8");
+      if (candidateBytes > MAX_DAILY_DIGEST_CANDIDATE_BYTES) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_TOO_LARGE");
+      }
+      const candidateHash = sha256(candidateJson);
+      const job = this.db.prepare("SELECT * FROM processing_jobs WHERE id = ?").get(jobId);
+      if (
+        !job ||
+        job.job_type !== "generate_daily_digest" ||
+        job.lane !== "cloud" ||
+        job.session_id !== null ||
+        job.analysis_input_id !== null ||
+        job.desired_head_hash !== null ||
+        job.digest_input_id !== digestInputId ||
+        !safeHashEqual(job.input_hash, storedInput.sourceHash) ||
+        job.input_version !== 1 ||
+        typeof job.model_version !== "string" ||
+        job.model_version.length === 0
+      ) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
+      }
+      const attempt = this.db
+        .prepare(
+          `SELECT job_id, provider, model, operation, state
+           FROM analysis_budget_attempts WHERE request_id = ?`
+        )
+        .get(budgetAttemptId);
+      if (
+        !attempt ||
+        attempt.job_id !== jobId ||
+        attempt.provider !== "minimax" ||
+        attempt.model !== job.model_version ||
+        attempt.operation !== "daily_digest" ||
+        attempt.state !== "reconciled"
+      ) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED");
+      }
+      const existing = this.db
+        .prepare("SELECT * FROM daily_digest_response_candidates WHERE job_id = ?")
+        .get(jobId);
+      if (existing) {
+        if (
+          existing.digest_input_id !== digestInputId ||
+          existing.budget_attempt_id !== budgetAttemptId ||
+          existing.response_schema_version !== DAILY_DIGEST_SCHEMA_VERSION ||
+          existing.candidate_bytes !== candidateBytes ||
+          !safeHashEqual(existing.candidate_hash, candidateHash) ||
+          existing.candidate_json !== candidateJson
+        ) {
+          throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_ALREADY_PERSISTED");
+        }
+        return {
+          status: "existing",
+          candidateId: existing.id,
+          candidateHash: existing.candidate_hash,
+          state: existing.state,
+        };
+      }
+      const candidateId = this._nextId("daily_digest_candidate");
+      const createdAt = assertTimestamp(this.now(), "createdAt");
+      this.db
+        .prepare(
+          `INSERT INTO daily_digest_response_candidates (
+             id, job_id, digest_input_id, budget_attempt_id, response_schema_version,
+             candidate_json, candidate_bytes, candidate_hash, state, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'validated', ?)`
+        )
+        .run(
+          candidateId,
+          jobId,
+          digestInputId,
+          budgetAttemptId,
+          DAILY_DIGEST_SCHEMA_VERSION,
+          candidateJson,
+          candidateBytes,
+          candidateHash,
+          createdAt
+        );
+      return { status: "created", candidateId, candidateHash, state: "validated" };
+    });
+    return transaction.immediate();
+  }
+
+  listRecoverableDailyDigestCandidates(input) {
+    assertExactPlainObject(
+      input,
+      ["afterId", "limit"],
+      "recoverable daily digest candidate query"
+    );
+    const { afterId, limit } = input;
+    if (typeof afterId !== "string" || Array.from(afterId).length > 512) {
+      throw new TypeError("afterId must be a bounded string");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RangeError("limit must be between 1 and 1000");
+    }
+    return this.db
+      .prepare(
+        `SELECT candidate.id AS candidate_id, candidate.job_id,
+                candidate.digest_input_id, candidate.state AS candidate_state,
+                job.state AS job_state, job.lease_owner, job.lease_expires_at,
+                attempt.state AS budget_state
+         FROM daily_digest_response_candidates AS candidate
+         JOIN processing_jobs AS job ON job.id = candidate.job_id
+         JOIN analysis_budget_attempts AS attempt
+           ON attempt.request_id = candidate.budget_attempt_id
+         WHERE candidate.state = 'validated' AND candidate.id > ?
+         ORDER BY candidate.id LIMIT ?`
+      )
+      .all(afterId, limit)
+      .map((row) => ({
+        candidateId: row.candidate_id,
+        jobId: row.job_id,
+        digestInputId: row.digest_input_id,
         candidateState: row.candidate_state,
         jobState: row.job_state,
         leaseOwner: row.lease_owner,
@@ -4026,7 +4248,41 @@ class MemoryRepository {
     return transaction.immediate();
   }
 
-  saveDigestRevision(input) {
+  _normalizeDigestEvidenceRows(evidenceSegmentIds) {
+    if (!Array.isArray(evidenceSegmentIds)) {
+      throw new TypeError("evidenceSegmentIds must be an array");
+    }
+    const ids = evidenceSegmentIds.map((id) => assertId(id, "evidenceSegmentId"));
+    if (new Set(ids).size !== ids.length) {
+      throw codedError("MEMORY_DIGEST_EVIDENCE_DUPLICATE");
+    }
+    const loadSegment = this.db.prepare(
+      `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
+              segment.text, segment.track_id, segment.chunk_id, segment.result_kind,
+              segment.is_stable, segment.superseded_by, segment.duplicate_of,
+              chunk.deleted_at
+       FROM transcript_segments AS segment
+       LEFT JOIN audio_chunks AS chunk ON chunk.id = segment.chunk_id
+       WHERE segment.id = ?`
+    );
+    return ids
+      .map((id) => {
+        const row = loadSegment.get(id);
+        if (
+          !row ||
+          row.result_kind !== "final" ||
+          row.is_stable !== 1 ||
+          row.superseded_by !== null ||
+          row.duplicate_of !== null
+        ) {
+          throw codedError("MEMORY_DIGEST_EVIDENCE_OUT_OF_SCOPE");
+        }
+        return row;
+      })
+      .sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  _normalizeDigestRevisionInput(input) {
     if (
       !hasExactKeys(input, [
         "localDate",
@@ -4035,6 +4291,7 @@ class MemoryRepository {
         "inputWatermark",
         "content",
         "completeness",
+        "evidenceSegmentIds",
       ])
     ) {
       throw codedError("MEMORY_DIGEST_INVALID");
@@ -4049,7 +4306,28 @@ class MemoryRepository {
     }
     const inputWatermarkJson = canonicalJson(input.inputWatermark);
     const contentJson = canonicalJson(input.content);
-    const transaction = this.db.transaction(() => {
+    const evidenceRows = this._normalizeDigestEvidenceRows(input.evidenceSegmentIds);
+    return {
+      localDate,
+      timezone,
+      sourceHash,
+      completeness: input.completeness,
+      inputWatermarkJson,
+      contentJson,
+      evidenceRows,
+    };
+  }
+
+  _saveDigestRevisionInTransaction(input, createdAt = null) {
+      const {
+        localDate,
+        timezone,
+        sourceHash,
+        completeness,
+        inputWatermarkJson,
+        contentJson,
+        evidenceRows,
+      } = input;
       const existing = this.db
         .prepare(
           `SELECT id, revision, completeness, input_watermark_json, content_json
@@ -4058,10 +4336,19 @@ class MemoryRepository {
         )
         .get(localDate, timezone, sourceHash);
       if (existing) {
+        const existingEvidenceIds = this.db
+          .prepare(
+            `SELECT transcript_segment_id FROM evidence_refs
+             WHERE entity_type = 'daily_digest' AND entity_id = ?
+             ORDER BY transcript_segment_id`
+          )
+          .all(existing.id)
+          .map((row) => row.transcript_segment_id);
         if (
-          existing.completeness !== input.completeness ||
+          existing.completeness !== completeness ||
           existing.input_watermark_json !== inputWatermarkJson ||
-          existing.content_json !== contentJson
+          existing.content_json !== contentJson ||
+          canonicalJson(existingEvidenceIds) !== canonicalJson(evidenceRows.map((row) => row.id))
         ) {
           throw codedError("MEMORY_DIGEST_HASH_COLLISION");
         }
@@ -4080,16 +4367,13 @@ class MemoryRepository {
            ORDER BY revision DESC LIMIT 1`
         )
         .get(localDate, timezone);
-      if (previous?.completeness === "final" && input.completeness === "partial") {
+      if (previous?.completeness === "final" && completeness === "partial") {
         throw codedError("MEMORY_DIGEST_COMPLETENESS_REGRESSION");
       }
       const digestId = this._nextId("daily_digest");
-      const createdAt = assertTimestamp(this.now(), "createdAt");
-      if (previous) {
-        this.db
-          .prepare("UPDATE daily_digests SET lifecycle = 'superseded', updated_at = ? WHERE id = ?")
-          .run(createdAt, previous.id);
-      }
+      const appliedAt = createdAt === null
+        ? assertTimestamp(this.now(), "createdAt")
+        : assertTimestamp(createdAt, "createdAt");
       const revision = (previous?.revision ?? 0) + 1;
       this.db
         .prepare(
@@ -4104,15 +4388,52 @@ class MemoryRepository {
           localDate,
           timezone,
           revision,
-          input.completeness,
+          completeness,
           inputWatermarkJson,
           contentJson,
           previous?.id ?? null,
           sourceHash,
-          createdAt,
-          createdAt
+          appliedAt,
+          appliedAt
         );
+      const insertEvidence = this.db.prepare(
+        `INSERT INTO evidence_refs (
+           id, entity_type, entity_id, source_analysis_input_id, session_id,
+           transcript_segment_id, audio_chunk_id, track_id, started_at, ended_at,
+           quote_text, audio_state, created_at
+         ) VALUES (?, 'daily_digest', ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const evidence of evidenceRows) {
+        insertEvidence.run(
+          this._nextId("evidence"),
+          digestId,
+          evidence.session_id,
+          evidence.id,
+          evidence.chunk_id,
+          evidence.track_id,
+          evidence.started_at,
+          evidence.ended_at,
+          evidence.text,
+          evidence.chunk_id === null
+            ? "missing"
+            : evidence.deleted_at === null
+              ? "available"
+              : "expired",
+          appliedAt
+        );
+      }
+      if (previous) {
+        this.db
+          .prepare("UPDATE daily_digests SET lifecycle = 'superseded', updated_at = ? WHERE id = ?")
+          .run(appliedAt, previous.id);
+      }
       return { status: "created", digestId, revision, sourceHash };
+  }
+
+  saveDigestRevision(input) {
+    const normalized = this._normalizeDigestRevisionInput(input);
+    const transaction = this.db.transaction(() => {
+      return this._saveDigestRevisionInTransaction(normalized);
     });
     return transaction.immediate();
   }
@@ -4352,6 +4673,7 @@ class MemoryRepository {
           content: parsePublicObject(row.content_json),
           createdAt: row.created_at,
           updatedAt: row.updated_at,
+          evidence: evidenceFor("daily_digest", row.id),
         }));
 
       const conflictMembers = this.db.prepare(
