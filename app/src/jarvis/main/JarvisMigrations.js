@@ -2454,6 +2454,17 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
 `;
 
+const MEMORY_ITEM_SUBJECTS_IMMUTABLE_INSERT_TRIGGER = `
+  CREATE TRIGGER IF NOT EXISTS memory_item_subjects_immutable_insert
+  BEFORE INSERT ON memory_item_subjects
+  WHEN EXISTS (
+    SELECT 1 FROM memory_item_canonical_slots WHERE memory_item_id = NEW.memory_item_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item subject is immutable');
+  END;
+`;
+
 const MEMORY_ITEM_SUBJECTS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS memory_item_subjects (
     memory_item_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE CASCADE,
@@ -2485,6 +2496,8 @@ const MEMORY_ITEM_SUBJECTS_SCHEMA = `
     ),
     algorithm TEXT NOT NULL CHECK(algorithm = 'canonical-v1')
   );
+
+  ${MEMORY_ITEM_SUBJECTS_IMMUTABLE_INSERT_TRIGGER}
 
   CREATE TRIGGER IF NOT EXISTS memory_item_canonical_slots_immutable_update
   BEFORE UPDATE ON memory_item_canonical_slots
@@ -2572,10 +2585,13 @@ function backfillMemoryItemCanonicalSlots(db) {
 
 function installMemoryConflictIntegrityTriggers(db) {
   db.exec(`
+    DROP TRIGGER IF EXISTS memory_item_subjects_immutable_insert;
     DROP TRIGGER IF EXISTS memory_supersessions_validate_slot;
     DROP TRIGGER IF EXISTS memory_conflict_members_validate_slot;
     DROP TRIGGER IF EXISTS memory_conflict_groups_validate_resolution;
     DROP TRIGGER IF EXISTS memory_items_v2_terminal_lifecycle;
+
+    ${MEMORY_ITEM_SUBJECTS_IMMUTABLE_INSERT_TRIGGER}
 
     CREATE TRIGGER memory_supersessions_validate_slot
     BEFORE INSERT ON memory_supersessions
@@ -2773,12 +2789,27 @@ function installMemoryConflictIntegrityTriggers(db) {
 
 function upgradeMemoryConflictIntegrityV28(db, fromVersion) {
   const requiredTables = new Map([
-    ["memory_items_v2", ["id", "kind", "title", "canonical_slot_key"]],
+    ["memory_items_v2", ["id", "kind", "canonical_slot_key", "title", "lifecycle"]],
     ["memory_item_subjects", ["memory_item_id", "subject_kind", "subject_id"]],
     ["memory_item_canonical_slots", ["memory_item_id", "canonical_slot_key", "algorithm"]],
-    ["memory_conflict_groups", ["id", "slot_key", "episode", "state"]],
-    ["memory_conflict_members", ["group_id", "memory_item_id"]],
-    ["memory_supersessions", ["previous_id", "next_id", "reason"]],
+    [
+      "memory_conflict_groups",
+      [
+        "id",
+        "slot_key",
+        "episode",
+        "state",
+        "selected_member_id",
+        "resolved_at",
+        "created_at",
+        "updated_at",
+      ],
+    ],
+    ["memory_conflict_members", ["group_id", "memory_item_id", "created_at"]],
+    [
+      "memory_supersessions",
+      ["previous_id", "next_id", "reason", "analysis_input_id", "created_at"],
+    ],
   ]);
   if (!tableExists(db, "memory_items_v2") && fromVersion < 27) {
     const hasPartialV27MemorySchema = [...requiredTables.keys()]

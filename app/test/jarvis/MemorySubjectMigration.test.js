@@ -355,6 +355,7 @@ test("v28 repairs a base-style v27 database with a missing post-v27 canonical br
   try {
     db.pragma("foreign_keys = ON");
     applyJarvisMigrations(db);
+    const reviewedSubjectInsertTrigger = triggerSql(db, "memory_item_subjects_immutable_insert");
     const expectedSlot = canonicalTupleHash([
       "memory",
       "fact",
@@ -375,6 +376,14 @@ test("v28 repairs a base-style v27 database with a missing post-v27 canonical br
       VALUES ('memory-post-v27', 'person', 'person-self');
     `);
     installBaseV27TriggerStubs(db);
+    db.exec(`
+      DROP TRIGGER memory_item_subjects_immutable_insert;
+      CREATE TRIGGER memory_item_subjects_immutable_insert
+      BEFORE INSERT ON memory_item_subjects
+      BEGIN
+        SELECT 1 /* base-v27-stale-subject-insert */;
+      END;
+    `);
     db.exec("DROP TRIGGER memory_supersessions_validate_slot");
     db.pragma("user_version = 27");
 
@@ -396,6 +405,10 @@ test("v28 repairs a base-style v27 database with a missing post-v27 canonical br
     ]) {
       assert.doesNotMatch(triggerSql(db, name), /base-v27-old/);
     }
+    assert.equal(
+      triggerSql(db, "memory_item_subjects_immutable_insert"),
+      reviewedSubjectInsertTrigger
+    );
     assert.match(
       triggerSql(db, "memory_conflict_members_validate_slot"),
       /existing_slot\.canonical_slot_key/
@@ -501,6 +514,334 @@ test("v28 migration rolls back when an existing canonical bridge disagrees", () 
       { canonical_slot_key: HASH_F, algorithm: "canonical-v1" }
     );
     assert.match(triggerSql(db, "memory_conflict_members_validate_slot"), /base-v27-old/);
+  } finally {
+    db.close();
+  }
+});
+
+test("v28 rejects a v27 schema missing selected_member_id before trigger replacement", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    db.exec(`
+      INSERT INTO memory_conflict_groups (
+        id, slot_key, episode, state, selected_member_id, resolved_at, created_at, updated_at
+      ) VALUES ('partial-v27-group', '${HASH_A}', 1, 'open', NULL, NULL, 2650, 2650);
+    `);
+    db.pragma("foreign_keys = OFF");
+    db.exec(`
+      DROP TRIGGER memory_conflict_groups_no_delete;
+      DROP TRIGGER memory_conflict_groups_immutable_identity;
+      DROP TRIGGER memory_conflict_groups_terminal_resolution;
+      DROP TRIGGER memory_conflict_groups_require_open_insert;
+      DROP TRIGGER memory_supersessions_validate_slot;
+      DROP TRIGGER memory_conflict_members_validate_slot;
+      DROP TRIGGER memory_conflict_groups_validate_resolution;
+      DROP TRIGGER memory_items_v2_terminal_lifecycle;
+      DROP INDEX idx_memory_conflict_groups_open_slot;
+      CREATE TABLE memory_conflict_groups_partial (
+        id TEXT PRIMARY KEY,
+        slot_key TEXT NOT NULL,
+        episode INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        resolved_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(slot_key, episode)
+      );
+      INSERT INTO memory_conflict_groups_partial (
+        id, slot_key, episode, state, resolved_at, created_at, updated_at
+      ) SELECT id, slot_key, episode, state, resolved_at, created_at, updated_at
+        FROM memory_conflict_groups;
+      DROP TABLE memory_conflict_groups;
+      ALTER TABLE memory_conflict_groups_partial RENAME TO memory_conflict_groups;
+      CREATE UNIQUE INDEX idx_memory_conflict_groups_open_slot
+        ON memory_conflict_groups(slot_key) WHERE state = 'open';
+    `);
+    installBaseV27TriggerStubs(db);
+    db.pragma("user_version = 27");
+    db.pragma("foreign_keys = ON");
+
+    const partialColumns = db.pragma("table_info(memory_conflict_groups)");
+    const partialRows = db.prepare("SELECT * FROM memory_conflict_groups ORDER BY id").all();
+    const originalTriggerSql = new Map(
+      [
+        "memory_supersessions_validate_slot",
+        "memory_conflict_members_validate_slot",
+        "memory_conflict_groups_validate_resolution",
+        "memory_items_v2_terminal_lifecycle",
+      ].map((name) => [name, triggerSql(db, name)])
+    );
+
+    assert.throws(
+      () => applyJarvisMigrations(db),
+      /v28 repair requires v27 columns on memory_conflict_groups/
+    );
+    assert.equal(db.pragma("user_version", { simple: true }), 27);
+    assert.deepEqual(db.pragma("table_info(memory_conflict_groups)"), partialColumns);
+    assert.deepEqual(
+      db.prepare("SELECT * FROM memory_conflict_groups ORDER BY id").all(),
+      partialRows
+    );
+    for (const [name, sql] of originalTriggerSql) {
+      assert.match(sql, /base-v27-old/);
+      assert.equal(triggerSql(db, name), sql);
+    }
+  } finally {
+    db.close();
+  }
+});
+
+test("fresh v28 rejects subject INSERT after canonical bridge creation", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    const canonicalSlot = canonicalTupleHash([
+      "memory",
+      "fact",
+      canonicalizeText("Frozen subject identity"),
+      ["person-self"],
+    ]);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body,
+         confidence, lifecycle, source_analysis_input_id, provenance,
+         created_at, updated_at
+       ) VALUES (
+         'memory-frozen-subjects', 'fact', ?, '${HASH_C}',
+         'Frozen subject identity', 'The durable subjects cannot drift.',
+         0.9, 'active', NULL, 'legacy_unverified', 2700, 2700
+       )`
+    ).run(canonicalSlot);
+    db.exec(`
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-frozen-subjects', 'person', 'person-self');
+    `);
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('memory-frozen-subjects', ?, 'canonical-v1')`
+    ).run(canonicalSlot);
+    const originalSubjects = db
+      .prepare(
+        `SELECT subject_kind, subject_id FROM memory_item_subjects
+         WHERE memory_item_id = 'memory-frozen-subjects' ORDER BY subject_kind, subject_id`
+      )
+      .all();
+    const originalBridge = db
+      .prepare(
+        `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+         WHERE memory_item_id = 'memory-frozen-subjects'`
+      )
+      .get();
+
+    assert.throws(
+      () =>
+        db
+          .prepare(
+            `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+             VALUES ('memory-frozen-subjects', 'person', 'person-other')`
+          )
+          .run(),
+      /memory item subject is immutable/
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT subject_kind, subject_id FROM memory_item_subjects
+           WHERE memory_item_id = 'memory-frozen-subjects' ORDER BY subject_kind, subject_id`
+        )
+        .all(),
+      originalSubjects
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-frozen-subjects'`
+        )
+        .get(),
+      originalBridge
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("fresh v28 permits subject-before-bridge construction", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    const canonicalSlot = canonicalTupleHash([
+      "memory",
+      "preference",
+      canonicalizeText("Construction order"),
+      ["person-self"],
+    ]);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body,
+         confidence, lifecycle, source_analysis_input_id, provenance,
+         created_at, updated_at
+       ) VALUES (
+         'memory-construction-order', 'preference', ?, '${HASH_D}',
+         'Construction order', 'Subjects are stored before the canonical bridge.',
+         0.9, 'active', NULL, 'legacy_unverified', 2800, 2800
+       )`
+    ).run(canonicalSlot);
+    db.exec(`
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-construction-order', 'person', 'person-self');
+    `);
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('memory-construction-order', ?, 'canonical-v1')`
+    ).run(canonicalSlot);
+
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT subject_kind, subject_id FROM memory_item_subjects
+           WHERE memory_item_id = 'memory-construction-order'`
+        )
+        .get(),
+      { subject_kind: "person", subject_id: "person-self" }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-construction-order'`
+        )
+        .get(),
+      { canonical_slot_key: canonicalSlot, algorithm: "canonical-v1" }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("subject INSERT freeze stops the direct-SQL conflict bypass before relation writes", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    const canonicalSlot = canonicalTupleHash([
+      "memory",
+      "fact",
+      canonicalizeText("Bypass guard"),
+      ["person-self"],
+    ]);
+    const insertMemory = db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body,
+         confidence, lifecycle, source_analysis_input_id, provenance,
+         created_at, updated_at
+       ) VALUES (?, 'fact', ?, ?, 'Bypass guard', ?, 0.9, 'active', NULL,
+         'legacy_unverified', 2900, 2900)`
+    );
+    const insertSubject = db.prepare(
+      `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+       VALUES (?, 'person', 'person-self')`
+    );
+    const insertBridge = db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES (?, ?, 'canonical-v1')`
+    );
+    for (const [id, valueKey, body] of [
+      ["memory-bypass-a", HASH_E, "First value."],
+      ["memory-bypass-b", HASH_F, "Second value."],
+    ]) {
+      insertMemory.run(id, canonicalSlot, valueKey, body);
+      insertSubject.run(id);
+      insertBridge.run(id, canonicalSlot);
+    }
+    const snapshot = {
+      subjects: db
+        .prepare(
+          `SELECT memory_item_id, subject_kind, subject_id FROM memory_item_subjects
+           WHERE memory_item_id LIKE 'memory-bypass-%'
+           ORDER BY memory_item_id, subject_kind, subject_id`
+        )
+        .all(),
+      bridges: db
+        .prepare(
+          `SELECT * FROM memory_item_canonical_slots
+           WHERE memory_item_id LIKE 'memory-bypass-%' ORDER BY memory_item_id`
+        )
+        .all(),
+      lifecycles: db
+        .prepare(
+          `SELECT id, lifecycle FROM memory_items_v2
+           WHERE id LIKE 'memory-bypass-%' ORDER BY id`
+        )
+        .all(),
+    };
+    const directSqlBypass = db.transaction(() => {
+      db.exec(`
+        INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+        VALUES ('memory-bypass-a', 'person', 'person-other');
+        INSERT INTO memory_conflict_groups (
+          id, slot_key, episode, state, selected_member_id, resolved_at, created_at, updated_at
+        ) VALUES ('bypass-group', '${canonicalSlot}', 1, 'open', NULL, NULL, 3000, 3000);
+        INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+        VALUES
+          ('bypass-group', 'memory-bypass-a', 3000),
+          ('bypass-group', 'memory-bypass-b', 3000);
+        UPDATE memory_items_v2 SET lifecycle = 'conflict', updated_at = 3000
+        WHERE id IN ('memory-bypass-a', 'memory-bypass-b');
+        UPDATE memory_conflict_groups
+        SET state = 'resolved', selected_member_id = 'memory-bypass-b',
+            resolved_at = 3100, updated_at = 3100
+        WHERE id = 'bypass-group';
+        INSERT INTO memory_supersessions (
+          previous_id, next_id, reason, analysis_input_id, created_at
+        ) VALUES (
+          'memory-bypass-a', 'memory-bypass-b', 'conflict_resolution', NULL, 3100
+        );
+      `);
+    });
+
+    assert.throws(directSqlBypass, /memory item subject is immutable/);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_conflict_groups").get().count, 0);
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM memory_conflict_members").get().count,
+      0
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_supersessions").get().count, 0);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT memory_item_id, subject_kind, subject_id FROM memory_item_subjects
+           WHERE memory_item_id LIKE 'memory-bypass-%'
+           ORDER BY memory_item_id, subject_kind, subject_id`
+        )
+        .all(),
+      snapshot.subjects
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT * FROM memory_item_canonical_slots
+           WHERE memory_item_id LIKE 'memory-bypass-%' ORDER BY memory_item_id`
+        )
+        .all(),
+      snapshot.bridges
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, lifecycle FROM memory_items_v2
+           WHERE id LIKE 'memory-bypass-%' ORDER BY id`
+        )
+        .all(),
+      snapshot.lifecycles
+    );
   } finally {
     db.close();
   }
