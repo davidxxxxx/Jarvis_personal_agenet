@@ -12,7 +12,8 @@
 
 - Write caches, temporary files, installers, and generated artifacts only under `G:\Jarvis`; every command must set `TEMP`, `TMP`, `npm_config_cache`, `ELECTRON_CACHE`, and `ELECTRON_BUILDER_CACHE` to the existing `G:\Jarvis\.runtime-cache` directories.
 - Use test-driven development: add a focused failing test, observe the intended failure, implement the smallest complete behavior, and rerun the focused plus named regression suite.
-- Never persist or send API keys, audio/device paths, raw speaker embeddings, real person names, or unrelated transcript history in a digest payload.
+- Never persist or send credentials, audio/device paths, raw speaker embeddings, confirmed local identity names, speaker/device identity metadata, or unrelated transcript history in a digest payload. Transcript free text remains necessary evidence and is deterministically scrubbed against the current local-day speaker/cluster/device vocabulary, the small confirmed-people dictionary, and generic credential/path patterns. This boundary does not claim that arbitrary unknown names in natural-language text are detected.
+- Future privacy hardening depends on a local-only NER implementation plus an evaluation gate before any unknown-name-detection claim; Task 5A must not substitute an unmeasured heuristic for that dependency.
 - Treat `[startsAt, endsAt)` as the only day-membership rule. Evidence exactly at local midnight belongs only to the new day.
 - `partial` and `final` are source properties, not renderer guesses. Retry counters, lease timestamps, and queue timing must not alter `sourceHash`.
 - Every factual digest item must reference evidence segment IDs from its immutable input. Suggestions must be explicitly typed and may only expose accept, dismiss, or convert-to-todo actions; this phase never creates a todo, calendar event, message, or external side effect.
@@ -87,7 +88,7 @@ In `DailyDigestInput.test.js`, seed multiple sessions including an open session 
 - the canonical source contains fixed sections `sessions`, `peopleInteractions`, `topics`, `decisions`, `commitments`, `todosCreated`, `todosCompleted`, `unresolvedConflicts`, and `transcriptCoverage`;
 - `inputWatermark` includes stable evidence/version/readiness facts but excludes retry count, lease owner, lease expiry, and next-attempt time;
 - explicit pending upstream work makes the input `partial`; no pending upstream work makes it `final`;
-- pseudonymous subject IDs are allowed, while names, audio paths, device IDs, embeddings, and secrets are rejected from `cloudPayload`;
+- pseudonymous subject IDs are allowed; confirmed local identity names, current-day speaker/cluster/device labels and IDs, audio paths, embeddings, and generic credential/path patterns are rejected from `cloudPayload`. Arbitrary unknown names inside evidence text are outside this phase's enforceable claim;
 - same canonical bytes reuse the same input/source hash; new evidence produces a new immutable input;
 - a restart can load the exact input bytes without rebuilding from mutable tables.
 

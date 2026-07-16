@@ -430,6 +430,11 @@ const DAILY_DIGEST_QUERY_INDEXES = `
     AND superseded_by IS NULL
     AND duplicate_of IS NULL;
 
+  CREATE INDEX idx_transcript_segments_digest_active_day
+  ON transcript_segments(started_at, ended_at, id)
+  WHERE superseded_by IS NULL
+    AND duplicate_of IS NULL;
+
   CREATE INDEX idx_evidence_refs_digest_day
   ON evidence_refs(entity_type, started_at, ended_at, transcript_segment_id, entity_id);
 `;
@@ -4700,6 +4705,7 @@ const V29_OWNED_OBJECT_TARGETS = new Map([
   ["daily_digest_response_candidates_validate_update", "daily_digest_response_candidates"],
   ["daily_digest_response_candidates_no_delete", "daily_digest_response_candidates"],
   ["idx_transcript_segments_digest_day", "transcript_segments"],
+  ["idx_transcript_segments_digest_active_day", "transcript_segments"],
   ["idx_evidence_refs_digest_day", "evidence_refs"],
   ["idx_processing_jobs_chunk_input", "processing_jobs"],
   ["idx_processing_jobs_compress_identity", "processing_jobs"],
@@ -4707,6 +4713,7 @@ const V29_OWNED_OBJECT_TARGETS = new Map([
   ["idx_processing_jobs_cloud_claim", "processing_jobs"],
   ["idx_processing_jobs_analysis_input", "processing_jobs"],
   ["idx_processing_jobs_digest_input", "processing_jobs"],
+  ["idx_processing_jobs_digest_pending_session", "processing_jobs"],
   ["processing_jobs_cloud_contract_insert", "processing_jobs"],
   ["processing_jobs_cloud_contract_update", "processing_jobs"],
 ]);
@@ -4806,6 +4813,10 @@ const PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS = `
   ON processing_jobs(digest_input_id)
   WHERE job_type = 'generate_daily_digest' AND digest_input_id IS NOT NULL;
 
+  CREATE INDEX idx_processing_jobs_digest_pending_session
+  ON processing_jobs(session_id, job_type, input_hash, input_version, model_version)
+  WHERE completed_at IS NULL;
+
   CREATE TRIGGER processing_jobs_cloud_contract_insert
   BEFORE INSERT ON processing_jobs
   WHEN NEW.lane = 'cloud'
@@ -4886,6 +4897,99 @@ function assertExactV29TableColumns(db, table, expected) {
   if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
     throw new Error(`v29 schema collision for ${table}`);
   }
+}
+
+function normalizeProcessingJobsTableSql(sql) {
+  return normalizeSchemaSql(sql).replace(
+    /^CREATE TABLE (?:processing_jobs_v29|"processing_jobs"|processing_jobs)/u,
+    "CREATE TABLE processing_jobs"
+  ).replace(/\s+([,)])/gu, "$1");
+}
+
+function reviewedProcessingJobsTableSql(db) {
+  const reference = new db.constructor(":memory:");
+  try {
+    reference.exec(PROCESSING_JOBS_SCHEMA);
+    addColumn(
+      reference,
+      "processing_jobs",
+      "lane TEXT NOT NULL DEFAULT 'local' CHECK(lane IN ('local','cloud'))"
+    );
+    addColumn(
+      reference,
+      "processing_jobs",
+      "analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE RESTRICT"
+    );
+    addColumn(
+      reference,
+      "processing_jobs",
+      `desired_head_hash TEXT CHECK(
+        desired_head_hash IS NULL OR (
+          typeof(desired_head_hash) = 'text' AND length(desired_head_hash) = 64
+          AND desired_head_hash NOT GLOB '*[^0-9a-f]*'
+        )
+      )`
+    );
+    const v28 = reference
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs'")
+      .get().sql;
+    reference.exec("DROP TABLE processing_jobs");
+    reference.exec(PROCESSING_JOBS_V29_SCHEMA);
+    const v29 = reference
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'")
+      .get().sql;
+    reference.exec(`
+      ALTER TABLE processing_jobs_v29 DROP COLUMN blocked_reason;
+      ALTER TABLE processing_jobs_v29 DROP COLUMN execution_device;
+    `);
+    addColumn(reference, "processing_jobs_v29", "blocked_reason TEXT");
+    addColumn(
+      reference,
+      "processing_jobs_v29",
+      "execution_device TEXT CHECK(execution_device IS NULL OR execution_device IN ('cuda','cpu','cloud'))"
+    );
+    const repairedLegacyV29 = reference
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'")
+      .get().sql;
+    return new Set([v28, v29, repairedLegacyV29].map(normalizeProcessingJobsTableSql));
+  } finally {
+    reference.close();
+  }
+}
+
+function validateV29CloudJobIdentities(db, processingColumns) {
+  if (processingColumns.has("digest_input_id")) {
+    const invalidDigest = db
+      .prepare(
+        `SELECT job.id
+         FROM processing_jobs AS job
+         LEFT JOIN daily_digest_inputs AS input ON input.id = job.digest_input_id
+         WHERE job.job_type = 'generate_daily_digest'
+           AND job.digest_input_id IS NOT NULL
+           AND (input.id IS NULL OR input.source_hash <> job.input_hash)
+         LIMIT 1`
+      )
+      .get();
+    if (invalidDigest) throw new Error("v29 cloud job identity mismatch");
+  }
+  const invalidAnalysis = db
+    .prepare(
+      `SELECT job.id
+       FROM processing_jobs AS job
+       WHERE job.job_type = 'analyze_session'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM analysis_desired_heads AS head
+           WHERE head.session_id = job.session_id
+             AND head.analysis_input_id = job.analysis_input_id
+             AND head.analysis_input_hash = job.input_hash
+             AND head.desired_vector_hash = job.desired_head_hash
+             AND json_extract(head.desired_vector_json, '$.modelVersion') = job.model_version
+         )
+       LIMIT 1`
+    )
+    .get();
+  if (invalidAnalysis) throw new Error("v29 cloud job identity mismatch");
 }
 
 function reviewedV29DailySchema(db) {
@@ -5038,6 +5142,16 @@ function upgradeDailyDigestV29(db) {
   if (requiredV28Columns.some((column) => !processingColumns.has(column))) {
     throw new Error("v29 processing_jobs schema collision");
   }
+  const processingTableSql = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs'")
+    .get()?.sql;
+  if (
+    !processingTableSql ||
+    !reviewedProcessingJobsTableSql(db).has(normalizeProcessingJobsTableSql(processingTableSql))
+  ) {
+    throw new Error("v29 processing_jobs schema collision");
+  }
+  validateV29CloudJobIdentities(db, processingColumns);
   const customObjects = db
     .prepare(
       `SELECT type, name, sql FROM sqlite_master

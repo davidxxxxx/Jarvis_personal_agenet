@@ -382,6 +382,46 @@ test("daily input applies the established identity and generic-secret redaction 
   assert.match(serialized, /\[(?:PERSON|DEVICE|SECRET|PATH)\]/);
 });
 
+test("daily redaction vocabulary is bounded to the local day plus confirmed people", (t) => {
+  const { db, repository } = fixture(t);
+  const { startsAt } = resolveLocalDate({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+  });
+  seedSession(db, { id: "historical-session", startedAt: startsAt - 2_000_000 });
+  for (let index = 0; index < 64; index += 1) {
+    const label = `OutOfDayAlias-${String(index).padStart(3, "0")}`;
+    seedSegment(db, {
+      id: `historical-segment-${index}`,
+      sessionId: "historical-session",
+      startedAt: startsAt - 2_000_000 + index * 1_000,
+      text: `historical text ${index}`,
+      speakerLabel: label,
+      ordinal: index,
+    });
+  }
+  seedSession(db, { id: "current-session", startedAt: startsAt + 1_000 });
+  seedSegment(db, {
+    id: "current-segment",
+    sessionId: "current-session",
+    startedAt: startsAt + 2_000,
+    text:
+      "Current Alias used Private microphone; the unrelated phrase OutOfDayAlias-063 remains ordinary text",
+    speakerLabel: "Current Alias",
+    ordinal: 0,
+  });
+
+  const result = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+
+  assert.equal(result.cloudPayloadJson.includes("Current Alias"), false);
+  assert.equal(result.cloudPayloadJson.includes("Private microphone"), false);
+  assert.equal(result.cloudPayloadJson.includes("OutOfDayAlias-063"), true);
+});
+
 test("daily evidence is a subset of one active overlapping segment manifest at midnight", (t) => {
   const { db, repository } = fixture(t);
   const day = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });

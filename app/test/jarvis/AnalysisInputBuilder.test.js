@@ -165,6 +165,24 @@ test("redacts local names devices credentials and absolute paths in the outbound
   assert.equal(source.segments[0].textSnapshot, privateText);
 });
 
+test("compiles reusable redaction matchers without changing established output", () => {
+  const { compileRedactionTerms, redactText } = AnalysisInputBuilder;
+  assert.equal(typeof compileRedactionTerms, "function");
+  const terms = prepared().redactionTerms;
+  const text =
+    "Local Self met Other Person and A+B using SteelSeries Sonar - Microphone " +
+    "with api_key=private-value at C:\\Users\\private\\note.txt";
+
+  const redact = compileRedactionTerms(terms);
+
+  assert.equal(redact(text), redactText(text, terms));
+  assert.equal(redact(text), redact(text));
+  assert.equal(
+    redact(text),
+    "SELF met P1 and [PERSON] using [DEVICE] with [SECRET] at [PATH]"
+  );
+});
+
 test("fails closed unless every prepared segment is final stable current and non-duplicate", () => {
   const builder = new AnalysisInputBuilder();
   const invalidStates = [

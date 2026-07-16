@@ -1603,6 +1603,10 @@ test("v29 repairs missing or modified same-target owned objects before accepting
     db.exec(`
       DROP TRIGGER daily_digest_inputs_immutable_update;
       DROP INDEX idx_daily_digest_candidates_recovery;
+      DROP INDEX idx_transcript_segments_digest_active_day;
+      CREATE INDEX idx_transcript_segments_digest_active_day
+      ON transcript_segments(ended_at);
+      DROP INDEX idx_processing_jobs_digest_pending_session;
       DROP TRIGGER daily_digest_response_candidates_validate_insert;
       CREATE TRIGGER daily_digest_response_candidates_validate_insert
       BEFORE INSERT ON daily_digest_response_candidates
@@ -1625,6 +1629,16 @@ test("v29 repairs missing or modified same-target owned objects before accepting
     assert.ok(
       db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_daily_digest_candidates_recovery'").get()
     );
+    const activeDayIndex = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_transcript_segments_digest_active_day'")
+      .get()?.sql;
+    const pendingSessionIndex = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_digest_pending_session'")
+      .get()?.sql;
+    assert.match(activeDayIndex ?? "", /started_at, ended_at, id/);
+    assert.match(activeDayIndex ?? "", /superseded_by IS NULL/);
+    assert.match(pendingSessionIndex ?? "", /session_id, job_type, input_hash/);
+    assert.match(pendingSessionIndex ?? "", /completed_at IS NULL/);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
     db.close();
@@ -1683,6 +1697,18 @@ test("v29 installs digest day-range indexes that the planner uses", () => {
       .all(2_000, 1_000)
       .map((row) => row.detail)
       .join(" ");
+    const incompletePlan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT count(*) FROM transcript_segments
+         WHERE started_at < ? AND ended_at > ?
+           AND superseded_by IS NULL
+           AND duplicate_of IS NULL
+           AND (result_kind <> 'final' OR is_stable <> 1)`
+      )
+      .all(2_000, 1_000)
+      .map((row) => row.detail)
+      .join(" ");
     const evidencePlan = db
       .prepare(
         `EXPLAIN QUERY PLAN
@@ -1693,8 +1719,229 @@ test("v29 installs digest day-range indexes that the planner uses", () => {
       .all("memory_occurrence", 2_000, 1_000)
       .map((row) => row.detail)
       .join(" ");
+    const pendingPlan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT session_id, job_type, input_hash, input_version, model_version
+         FROM processing_jobs
+         WHERE session_id IN (?)
+           AND job_type <> 'generate_daily_digest'
+           AND completed_at IS NULL
+           AND state NOT IN (
+             'completed','failed','cancelled','superseded','audio_expired_before_processing'
+           )
+         ORDER BY session_id, job_type, input_hash, input_version, model_version`
+      )
+      .all("session-1")
+      .map((row) => row.detail)
+      .join(" ");
     assert.match(transcriptPlan, /idx_transcript_segments_digest_day/);
+    assert.match(incompletePlan, /idx_transcript_segments_digest_active_day/);
     assert.match(evidencePlan, /idx_evidence_refs_digest_day/);
+    assert.match(pendingPlan, /idx_processing_jobs_digest_pending_session/);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 fails closed without dropping an extra constrained processing_jobs column or its data", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('custom-column-session', 1, 'recording', 1);
+      ALTER TABLE processing_jobs ADD COLUMN custom_tag TEXT NOT NULL DEFAULT 'kept'
+        CHECK(custom_tag = 'kept');
+      INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash, input_version,
+        model_version, lane, created_at, custom_tag
+      ) VALUES (
+        'custom-column-job', 'custom-column-session', 'transcribe_chunk', 'pending',
+        30, 'custom-column-input', 1, 'model-v1', 'local', 10, 'kept'
+      );
+      PRAGMA user_version = 28;
+    `);
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+    const dataBefore = db.prepare("SELECT * FROM processing_jobs").all();
+
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 2_000 }), /collision/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 rejects exact-column processing_jobs tables whose reviewed constraints were altered", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-v29-hostile-processing-"));
+  const filename = path.join(directory, "hostile.sqlite3");
+  let db = new Database(filename);
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('hostile-processing-session', 1, 'recording', 1);
+      INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash, input_version,
+        model_version, lane, created_at
+      ) VALUES (
+        'hostile-processing-job', 'hostile-processing-session', 'transcribe_chunk',
+        'pending', 30, 'hostile-input', 1, 'model-v1', 'local', 1
+      );
+    `);
+    db.unsafeMode(true);
+    db.pragma("writable_schema = ON");
+    db.prepare(
+      `UPDATE sqlite_master
+       SET sql = replace(sql, ?, ?)
+       WHERE type = 'table' AND name = 'processing_jobs'`
+    ).run("lane IN ('local','cloud')", "lane IN ('local','cloud','hostile')");
+    db.pragma("user_version = 28");
+    db.pragma("writable_schema = OFF");
+    db.close();
+    db = new Database(filename);
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+    const dataBefore = db.prepare("SELECT * FROM processing_jobs").all();
+
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 2_000 }), /collision/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
+  } finally {
+    if (db.open) db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("v29 rejects a partial digest job whose durable input hash disagrees with its input", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    const payload = JSON.stringify({ schemaVersion: "jarvis-daily-digest-input-v1" });
+    db.prepare(
+      `INSERT INTO daily_digest_inputs (
+         id, local_date, timezone, source_hash, contract_version, completeness,
+         input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+       ) VALUES (
+         'mismatch-digest-input', '2026-07-17', 'Asia/Shanghai', ?,
+         'jarvis-daily-digest-input-v1', 'final', '{}', ?, ?, 'Model-A', 1
+       )`
+    ).run("a".repeat(64), payload, Buffer.byteLength(payload));
+    db.exec("DROP TRIGGER processing_jobs_cloud_contract_insert");
+    db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, job_type, state, priority, input_hash, input_version,
+         model_version, lane, digest_input_id, created_at
+       ) VALUES (
+         'mismatch-digest-job', NULL, 'generate_daily_digest', 'pending', 80,
+         ?, 1, 'Model-B', 'cloud', 'mismatch-digest-input', 1
+       )`
+    ).run("b".repeat(64));
+    db.pragma("user_version = 28");
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+    const dataBefore = db.prepare("SELECT * FROM processing_jobs").all();
+
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 2_000 }), /identity/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 rejects a partial analysis job whose durable identity disagrees with its desired head", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    const inputHash = "c".repeat(64);
+    const payloadHash = "d".repeat(64);
+    const desiredHeadHash = "e".repeat(64);
+    const transcriptRevision = "a".repeat(64);
+    const identityRevision = "b".repeat(64);
+    const cloudPayloadJson = JSON.stringify({ inputVersion: "jarvis-analysis-input-v2" });
+    const desiredVectorJson = JSON.stringify({
+      analysisInputId: "mismatch-analysis-input",
+      analysisInputHash: inputHash,
+      transcriptRevision,
+      identityRevision,
+      promptVersion: "jarvis-analysis-v2",
+      responseSchemaVersion: "jarvis-analysis-v2",
+      pseudonymBindingRevision: 1,
+      modelVersion: "Model-A",
+      cloudPayloadHash: payloadHash,
+      segments: [],
+    });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, status, created_at)
+      VALUES ('mismatch-analysis-session', 1, 'recording', 1);
+    `);
+    db.prepare(
+      `INSERT INTO analysis_inputs (
+         id, session_id, transcript_revision, identity_revision, prompt_version,
+         input_hash, input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (
+         'mismatch-analysis-input', 'mismatch-analysis-session', ?, ?,
+         'jarvis-analysis-v2', ?, 'jarvis-analysis-input-v2', 'jarvis-redaction-v1',
+         ?, ?, ?, 1
+       )`
+    ).run(
+      transcriptRevision,
+      identityRevision,
+      inputHash,
+      cloudPayloadJson,
+      Buffer.byteLength(cloudPayloadJson),
+      payloadHash
+    );
+    db.prepare(
+      `INSERT INTO analysis_desired_heads (
+         session_id, analysis_input_id, analysis_input_hash, desired_vector_json,
+         desired_vector_hash, head_revision, created_at, updated_at
+       ) VALUES (
+         'mismatch-analysis-session', 'mismatch-analysis-input', ?, ?, ?, 1, 1, 1
+       )`
+    ).run(inputHash, desiredVectorJson, desiredHeadHash);
+    db.exec("DROP TRIGGER processing_jobs_cloud_contract_insert");
+    db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, job_type, state, priority, input_hash, input_version,
+         model_version, lane, analysis_input_id, desired_head_hash, created_at
+       ) VALUES (
+         'mismatch-analysis-job', 'mismatch-analysis-session', 'analyze_session',
+         'pending', 70, ?, 1, 'Model-B', 'cloud', 'mismatch-analysis-input', ?, 1
+       )`
+    ).run(inputHash, desiredHeadHash);
+    db.pragma("user_version = 28");
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+    const dataBefore = db.prepare("SELECT * FROM processing_jobs").all();
+
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 2_000 }), /identity/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+    assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
   } finally {
     db.close();
   }

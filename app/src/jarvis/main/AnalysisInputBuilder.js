@@ -37,16 +37,49 @@ function literalTerms(values) {
     );
 }
 
-function replaceLiterals(text, values, replacementFor) {
+function compileLiteralReplacements(values, replacementFor) {
+  return literalTerms(values).map((value) => ({
+    pattern: new RegExp(escapeRegExp(value), "giu"),
+    replacement: replacementFor(value),
+  }));
+}
+
+function applyReplacements(text, replacements) {
   let output = text;
-  for (const value of literalTerms(values)) {
-    output = output.replace(new RegExp(escapeRegExp(value), "giu"), replacementFor(value));
+  for (const { pattern, replacement } of replacements) {
+    pattern.lastIndex = 0;
+    output = output.replace(pattern, replacement);
   }
   return output;
 }
 
-function redactText(text, redactionTerms) {
-  let output = text;
+const GENERIC_REDACTION_REPLACEMENTS = Object.freeze([
+  Object.freeze({ pattern: /\bBearer\s+[^\s"'<>]+/giu, replacement: "[SECRET]" }),
+  Object.freeze({ pattern: /\bsk-(?:cp-)?[A-Za-z0-9_-]{8,}\b/giu, replacement: "[SECRET]" }),
+  Object.freeze({
+    pattern: /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu,
+    replacement: "[SECRET]",
+  }),
+  Object.freeze({
+    pattern:
+      /\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+    replacement: "[SECRET]",
+  }),
+  Object.freeze({
+    pattern: /(["'])(?:[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/gu,
+    replacement: "[PATH]",
+  }),
+  Object.freeze({
+    pattern: /(^|[\s(=])(?:[A-Za-z]:[\\/]|\\\\)[^"'<>\r\n,;)\]}]*/gu,
+    replacement: (_match, prefix) => `${prefix}[PATH]`,
+  }),
+  Object.freeze({
+    pattern: /(^|[\s(=])\/(?!\/)[^"'<>\r\n,;)\]}]*/gu,
+    replacement: (_match, prefix) => `${prefix}[PATH]`,
+  }),
+]);
+
+function compileRedactionTerms(redactionTerms) {
   const participants = Array.isArray(redactionTerms?.participants)
     ? redactionTerms.participants
     : [];
@@ -71,33 +104,28 @@ function redactText(text, redactionTerms) {
       left.name.localeCompare(right.name) ||
       left.label.localeCompare(right.label)
   );
-  for (const participant of participantNames) {
-    output = output.replace(new RegExp(escapeRegExp(participant.name), "giu"), participant.label);
-  }
-  output = replaceLiterals(output, redactionTerms?.otherPeople ?? [], () => "[PERSON]");
-  output = replaceLiterals(output, redactionTerms?.deviceLabels ?? [], () => "[DEVICE]");
+  const participantReplacements = participantNames.map((participant) => ({
+    pattern: new RegExp(escapeRegExp(participant.name), "giu"),
+    replacement: participant.label,
+  }));
+  const peopleReplacements = compileLiteralReplacements(
+    redactionTerms?.otherPeople ?? [],
+    () => "[PERSON]"
+  );
+  const deviceReplacements = compileLiteralReplacements(
+    redactionTerms?.deviceLabels ?? [],
+    () => "[DEVICE]"
+  );
+  return (text) => {
+    let output = applyReplacements(text, participantReplacements);
+    output = applyReplacements(output, peopleReplacements);
+    output = applyReplacements(output, deviceReplacements);
+    return applyReplacements(output, GENERIC_REDACTION_REPLACEMENTS);
+  };
+}
 
-  output = output.replace(/\bBearer\s+[^\s"'<>]+/giu, "[SECRET]");
-  output = output.replace(/\bsk-(?:cp-)?[A-Za-z0-9_-]{8,}\b/giu, "[SECRET]");
-  output = output.replace(
-    /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gu,
-    "[SECRET]"
-  );
-  output = output.replace(
-    /\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
-    "[SECRET]"
-  );
-
-  output = output.replace(/(["'])(?:[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/gu, "[PATH]");
-  output = output.replace(
-    /(^|[\s(=])(?:[A-Za-z]:[\\/]|\\\\)[^"'<>\r\n,;)\]}]*/gu,
-    (_match, prefix) => `${prefix}[PATH]`
-  );
-  output = output.replace(
-    /(^|[\s(=])\/(?!\/)[^"'<>\r\n,;)\]}]*/gu,
-    (_match, prefix) => `${prefix}[PATH]`
-  );
-  return output;
+function redactText(text, redactionTerms) {
+  return compileRedactionTerms(redactionTerms)(text);
 }
 
 function normalizeSegments(preparedSnapshot) {
@@ -108,6 +136,7 @@ function normalizeSegments(preparedSnapshot) {
     )
   );
   const ids = new Set();
+  const redact = compileRedactionTerms(preparedSnapshot.redactionTerms);
   const segments = preparedSnapshot.segments.map((segment) => {
     plainObject(segment, "segment");
     if (
@@ -136,7 +165,7 @@ function normalizeSegments(preparedSnapshot) {
       startedAt: segment.startedAt,
       endedAt: segment.endedAt,
       speakerLabel: segment.speakerBindingLabel,
-      text: redactText(segment.textSnapshot, preparedSnapshot.redactionTerms),
+      text: redact(segment.textSnapshot),
     };
   });
   return segments.sort(
@@ -281,3 +310,4 @@ module.exports.INPUT_CONTRACT_VERSION = INPUT_CONTRACT_VERSION;
 module.exports.REDACTION_VERSION = REDACTION_VERSION;
 module.exports.DEFAULT_MAX_PAYLOAD_BYTES = DEFAULT_MAX_PAYLOAD_BYTES;
 module.exports.redactText = redactText;
+module.exports.compileRedactionTerms = compileRedactionTerms;

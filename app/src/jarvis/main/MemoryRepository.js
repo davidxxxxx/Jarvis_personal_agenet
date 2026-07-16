@@ -8,7 +8,7 @@ const {
   semanticCandidateHash,
 } = require("./MemoryMerger");
 const { resolveLocalDate } = require("./ZonedCalendar");
-const { redactText: redactAnalysisText } = require("./AnalysisInputBuilder");
+const { compileRedactionTerms } = require("./AnalysisInputBuilder");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -43,23 +43,22 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function redactDigestText(value, redactionTerms) {
-  return redactAnalysisText(String(value), redactionTerms).replace(
-    /\[SECRET\]/gu,
-    "[REDACTED_SECRET]"
-  );
+function compileDigestRedactor(redactionTerms) {
+  const redactAnalysisText = compileRedactionTerms(redactionTerms);
+  return (value) =>
+    redactAnalysisText(String(value)).replace(/\[SECRET\]/gu, "[REDACTED_SECRET]");
 }
 
-function digestFreeTextIsRedacted(value, redactionTerms, textContext = false) {
+function digestFreeTextIsRedacted(value, redact, textContext = false) {
   if (typeof value === "string") {
-    return !textContext || redactDigestText(value, redactionTerms) === value;
+    return !textContext || redact(value) === value;
   }
   if (Array.isArray(value)) {
-    return value.every((item) => digestFreeTextIsRedacted(item, redactionTerms, textContext));
+    return value.every((item) => digestFreeTextIsRedacted(item, redact, textContext));
   }
   if (!value || typeof value !== "object") return true;
   return Object.entries(value).every(([key, item]) =>
-    digestFreeTextIsRedacted(item, redactionTerms, key === "text" || key === "alternatives")
+    digestFreeTextIsRedacted(item, redact, key === "text" || key === "alternatives")
   );
 }
 
@@ -690,34 +689,46 @@ class MemoryRepository {
     };
   }
 
-  _dailyDigestRedactionTerms() {
-    const peopleAndSpeakers = this.db
+  _dailyDigestRedactionTerms({ startsAt, endsAt }, segments) {
+    const confirmedPeople = this.db
       .prepare(
-        `SELECT display_name AS value FROM people WHERE length(trim(display_name)) > 0
-         UNION
-         SELECT local_label AS value FROM speaker_clusters WHERE length(trim(local_label)) > 0
-         UNION
-         SELECT speaker_label AS value FROM transcript_segments
-         WHERE speaker_label IS NOT NULL AND length(trim(speaker_label)) > 0
-         ORDER BY value`
+        `SELECT display_name AS value FROM people
+         WHERE length(trim(display_name)) > 0
+         ORDER BY display_name`
       )
       .all()
       .map((row) => row.value);
-    const deviceLabels = this.db
+    const localClusterLabels = this.db
       .prepare(
-        `SELECT device_label AS value FROM audio_tracks
-         WHERE device_label IS NOT NULL AND length(trim(device_label)) > 0
-         UNION
-         SELECT device_id AS value FROM audio_tracks
-         WHERE device_id IS NOT NULL AND length(trim(device_id)) > 0
-         ORDER BY value`
+        `WITH active_manifest AS (
+           SELECT id FROM transcript_segments
+           WHERE started_at < ? AND ended_at > ?
+             AND result_kind = 'final' AND is_stable = 1
+             AND superseded_by IS NULL AND duplicate_of IS NULL
+         )
+         SELECT DISTINCT cluster.local_label AS value
+         FROM active_manifest AS manifest
+         JOIN speaker_cluster_segments AS link
+           ON link.transcript_segment_id = manifest.id
+         JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+         WHERE length(trim(cluster.local_label)) > 0
+         ORDER BY cluster.local_label`
       )
-      .all()
+      .all(endsAt, startsAt)
       .map((row) => row.value);
-    return { participants: [], otherPeople: peopleAndSpeakers, deviceLabels };
+    const localSpeakerLabels = segments.map((segment) => segment.speaker_label);
+    const localDeviceLabels = segments.flatMap((segment) => [
+      segment.device_id,
+      segment.device_label,
+    ]);
+    return {
+      participants: [],
+      otherPeople: [...confirmedPeople, ...localClusterLabels, ...localSpeakerLabels],
+      deviceLabels: localDeviceLabels,
+    };
   }
 
-  _dailyEvidenceSections({ startsAt, endsAt }, allowedSegmentIds, redactionTerms) {
+  _dailyEvidenceSections({ startsAt, endsAt }, allowedSegmentIds, redact) {
     const grouped = (rows, mapper) => {
       const groups = new Map();
       for (const row of rows) {
@@ -765,7 +776,7 @@ class MemoryRepository {
     const memoryItems = grouped(memoryRows, (row, evidenceSegmentIds) => ({
       kind: row.kind,
       itemRef: pseudonymousRef("memory", row.item_id),
-      text: redactDigestText(`${row.title}: ${row.body}`, redactionTerms),
+      text: redact(`${row.title}: ${row.body}`),
       evidenceSegmentIds,
     }));
     const selectMemoryKind = (kind) =>
@@ -798,10 +809,7 @@ class MemoryRepository {
       .all(endsAt, startsAt, endsAt, startsAt);
     const topics = grouped(topicRows, (row, evidenceSegmentIds) => ({
       topicRef: pseudonymousRef("topic", row.topic_id),
-      text: redactDigestText(
-        row.summary ? `${row.name}: ${row.summary}` : row.name,
-        redactionTerms
-      ),
+      text: redact(row.summary ? `${row.name}: ${row.summary}` : row.name),
       evidenceSegmentIds,
     }));
 
@@ -828,10 +836,7 @@ class MemoryRepository {
       .all(endsAt, startsAt, endsAt, startsAt);
     const todos = grouped(todoRows, (row, evidenceSegmentIds) => ({
       todoRef: pseudonymousRef("todo", row.todo_id),
-      text: redactDigestText(
-        row.due_text ? `${row.title} (${row.due_text})` : row.title,
-        redactionTerms
-      ),
+      text: redact(row.due_text ? `${row.title} (${row.due_text})` : row.title),
       status: row.status,
       evidenceSegmentIds,
     }));
@@ -869,7 +874,7 @@ class MemoryRepository {
         };
         conflictsById.set(row.entity_id, conflict);
       }
-      const text = redactDigestText(`${row.title}: ${row.body}`, redactionTerms);
+      const text = redact(`${row.title}: ${row.body}`);
       if (!conflict.alternatives.includes(text)) conflict.alternatives.push(text);
       if (!conflict.evidenceSegmentIds.includes(row.transcript_segment_id)) {
         conflict.evidenceSegmentIds.push(row.transcript_segment_id);
@@ -907,16 +912,16 @@ class MemoryRepository {
     const boundary = resolveLocalDate({ localDate, timezone });
     const safeModelVersion = assertText(modelVersion, "modelVersion", 128);
     const transaction = this.db.transaction(() => {
-      const redactionTerms = this._dailyDigestRedactionTerms();
       const segments = this.db
         .prepare(
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
                   segment.text, segment.version, segment.person_id, segment.speaker_label,
                   person.is_self, session.processing_state, session.timeline_version,
-                  session.ready_at
+                  session.ready_at, track.device_id, track.device_label
            FROM transcript_segments AS segment
            JOIN sessions AS session ON session.id = segment.session_id
            LEFT JOIN people AS person ON person.id = segment.person_id
+           LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
            WHERE segment.started_at < ? AND segment.ended_at > ?
              AND segment.result_kind = 'final'
              AND segment.is_stable = 1
@@ -928,6 +933,8 @@ class MemoryRepository {
       if (segments.length === 0) {
         return { status: "empty", localDate: boundary.localDate, timezone: boundary.timezone };
       }
+      const redactionTerms = this._dailyDigestRedactionTerms(boundary, segments);
+      const redact = compileDigestRedactor(redactionTerms);
 
       const sessionsById = new Map();
       const interactionsByRef = new Map();
@@ -950,7 +957,7 @@ class MemoryRepository {
               "subject",
               segment.person_id ?? `${segment.session_id}:${segment.speaker_label}`
             );
-        const text = redactDigestText(segment.text, redactionTerms);
+        const text = redact(segment.text);
         session.segments.push({
           segmentId: segment.id,
           startedAt: segment.started_at,
@@ -1021,7 +1028,7 @@ class MemoryRepository {
       const evidenceSections = this._dailyEvidenceSections(
         boundary,
         allowedSegmentIds,
-        redactionTerms
+        redact
       );
       const sections = {
         sessions,
@@ -1068,7 +1075,7 @@ class MemoryRepository {
         completeness,
         sections,
       };
-      if (!digestFreeTextIsRedacted(cloudPayload, redactionTerms)) {
+      if (!digestFreeTextIsRedacted(cloudPayload, redact)) {
         throw codedError("DAILY_DIGEST_REDACTION_UNVERIFIED");
       }
       const inputWatermarkJson = canonicalJson(inputWatermark);
