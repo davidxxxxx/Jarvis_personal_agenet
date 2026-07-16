@@ -55,7 +55,8 @@ Merge base: `b0d1b96ab35c1bb77f87008a923f9c5db27b0a17`
 - Task 3: complete (commits `c3237627`, `07a6d25f`, `572675d2`; durable one-request analysis worker, restart-safe cloud dispatcher, authoritative budget recovery, enqueue-only scheduler, and zero-network candidate recovery; independent review clean after two fix rounds; final C0/I0/M0)
 - Task 4A pure planner: complete (commits `e2796836`, `244eb60e`, `b7f336d3`; canonical-v1 semantic planner, event clustering, topic similarity, conflict and recurrence lineage, deterministic convergence; independent review clean after two fix rounds; final C0/I0/M0)
 - Task 4B transactional repository: complete (commits `592f3059`, `1f44aa93`, `9cd6ae00`, `06c3f12a`, `eae44ec7`; deterministic one-transaction plan application, canonical-v1 bridge repair, heterogeneous conflict fail-closed, subject identity freeze, and tightened member/resolution/supersession/lifecycle guards; independent review clean after four fix rounds; final C0/I0/M0)
-- Tasks 5-6 and remaining Task 7/8 integration: pending
+- Task 5A durable daily-digest inputs: complete (commits `13da56a2`, `be784d99`, `5537b672`; v29 immutable input/candidate schema, sessionless digest job identity, deterministic local-day evidence snapshots, privacy boundary, migration rollback/identity audits, and indexed long-run queries; three independent review gates, final Spec PASS / Quality PASS / C0/I0/M0; final verifier superset 324/324)
+- Tasks 5B-6 and remaining Task 7/8 integration: pending
 
 ## Review Notes
 
