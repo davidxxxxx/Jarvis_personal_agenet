@@ -478,6 +478,47 @@ test("rejects secret and absolute-path text before reading credentials or sendin
   }
 });
 
+test("rejects secrets and paths in every outbound string field before credentials", async () => {
+  const cases = [
+    (payload) => { payload.sections.sessions[0].processingState = "MINIMAX_API_KEY=top-secret-value"; },
+    (payload) => { payload.sections.sessions[0].sessionRef = "C:\\private\\session"; },
+    (payload) => { payload.sections.sessions[0].segments[0].segmentId = "sk-cp-unitsecretvalue123"; },
+    (payload) => {
+      payload.sections.topics = [{
+        topicRef: "/private/topic/ref",
+        text: "Safe topic text",
+        evidenceSegmentIds: ["segment-1"],
+      }];
+    },
+  ];
+  for (const mutate of cases) {
+    const payload = cloudPayload();
+    mutate(payload);
+    const serializedPayload = JSON.stringify(payload);
+    let keyReads = 0;
+    let calls = 0;
+    const logs = [];
+    const client = new MiniMaxDailyDigestClient({
+      getApiKey: () => { keyReads += 1; return "secret"; },
+      fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+      logger: (record) => logs.push(record),
+    });
+
+    await assert.rejects(
+      () => client.generate(clientInput(payload)),
+      expectClientError("redaction_unverified")
+    );
+    assert.equal(keyReads, 0);
+    assert.equal(calls, 0);
+    const serializedLogs = JSON.stringify(logs);
+    assert.equal(serializedLogs.includes(serializedPayload), false);
+    assert.equal(serializedLogs.includes("top-secret-value"), false);
+    assert.equal(serializedLogs.includes("C:\\private"), false);
+    assert.equal(serializedLogs.includes("sk-cp-unitsecretvalue123"), false);
+    assert.equal(serializedLogs.includes("/private/topic/ref"), false);
+  }
+});
+
 test("accepts an all-day persisted input with more than one hundred evidence segments", async () => {
   const payload = cloudPayload();
   payload.sections.sessions[0].segments = Array.from({ length: 101 }, (_, index) => ({

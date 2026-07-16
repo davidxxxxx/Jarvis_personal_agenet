@@ -176,17 +176,15 @@ function validateEvidence(value, allowedSegmentIds, { min = 1 } = {}) {
   );
 }
 
-function cloudFreeTextIsRedacted(value, textContext = false) {
+function cloudAllStringsAreRedacted(value) {
   if (typeof value === "string") {
-    return !textContext || redactGenericCloudText(value) === value;
+    return redactGenericCloudText(value) === value;
   }
   if (Array.isArray(value)) {
-    return value.every((item) => cloudFreeTextIsRedacted(item, textContext));
+    return value.every((item) => cloudAllStringsAreRedacted(item));
   }
   if (!isPlainObject(value)) return true;
-  return Object.entries(value).every(([key, item]) =>
-    cloudFreeTextIsRedacted(item, key === "text" || key === "alternatives")
-  );
+  return Object.values(value).every((item) => cloudAllStringsAreRedacted(item));
 }
 
 function normalizeCloudPayload(cloudPayload) {
@@ -380,10 +378,10 @@ function normalizeInput(input) {
   } catch {
     throw clientError("invalid_json");
   }
-  const validationContext = normalizeCloudPayload(cloudPayload);
-  if (!cloudFreeTextIsRedacted(cloudPayload)) {
+  if (!cloudAllStringsAreRedacted(cloudPayload)) {
     throw clientError("redaction_unverified");
   }
+  const validationContext = normalizeCloudPayload(cloudPayload);
   return {
     cloudPayloadJson: input.cloudPayloadJson,
     inputHash: input.inputHash,

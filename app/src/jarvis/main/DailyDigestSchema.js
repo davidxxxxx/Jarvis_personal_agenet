@@ -58,24 +58,36 @@ function exactObject(value, requiredKeys, issueCode = "schema.object_type") {
 }
 
 function isAutomaticActionDirective(value) {
-  const actionAndTarget =
-    "(?:create|add|write|schedule|send|post)\\b[^.?!\\n]{0,160}\\b(?:todo|task|calendar|event|message|email)\\b";
-  const automaticPrefix = new RegExp(
-    `^(?:please\\s+)?(?:auto(?:matically)?|immediately)[-\\s]+${actionAndTarget}`,
-    "iu"
-  );
-  const automaticSuffix = new RegExp(
-    `^(?:please\\s+)?${actionAndTarget}[^.?!\\n]{0,80}` +
-      "(?:automatically|immediately|without\\s+asking|without\\s+(?:user\\s+)?confirmation)\\b",
-    "iu"
-  );
-  return (
-    automaticPrefix.test(value) ||
-    automaticSuffix.test(value) ||
-    /^(?:请)?(?:立即|自动)[^。\n]{0,40}(?:创建|添加|写入|安排|发送)[^。\n]{0,40}(?:待办|任务|日历|事件|消息|邮件)/u.test(
-      value
-    )
-  );
+  const sentences = value.split(/[.!?。！？;；]+/u).filter((sentence) => sentence.trim());
+  return sentences.some((sentence) => {
+    const englishAction = /\b(?:create|add|write|schedule|send|post|convert|update|delete|remove|complete|mark)\b[^\n]{0,180}\b(?:todos?|tasks?|calendars?|events?|messages?|emails?)\b/iu;
+    const englishMarker =
+      /\b(?:auto(?:matically)?|immediately)\b|\bwithout\s+(?:asking|(?:user\s+)?confirmation)\b/iu;
+    const englishActionIndex = sentence.search(
+      /\b(?:create|add|write|schedule|send|post|convert|update|delete|remove|complete|mark)\b/iu
+    );
+    if (englishAction.test(sentence) && englishMarker.test(sentence)) {
+      const beforeAction = englishActionIndex < 0 ? "" : sentence.slice(0, englishActionIndex);
+      const negated =
+        /\b(?:do\s+not|don't|never|must\s+not|should\s+not)\b/iu.test(beforeAction);
+      const descriptive =
+        /\b(?:document(?:ed|ing)?|describe(?:d|ing)?|explain(?:ed|ing)?|discuss(?:ed|ing)?|show(?:ed|ing)?|learn(?:ed|ing)?|teach(?:es|ing)?|taught|write|wrote)\b[^\n]{0,100}\bhow\s+to\b/iu.test(
+          beforeAction
+        );
+      if (!negated && !descriptive) return true;
+    }
+
+    const chineseAction = /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)[^\n]{0,80}(?:待办|任务|日历|事件|消息|邮件)/u;
+    const chineseMarker = /(?:自动|立即|无需(?:用户)?确认|未经(?:用户)?确认|无需询问)/u;
+    if (chineseAction.test(sentence) && chineseMarker.test(sentence)) {
+      const actionIndex = sentence.search(
+        /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)/u
+      );
+      const beforeAction = actionIndex < 0 ? "" : sentence.slice(0, actionIndex);
+      if (!/(?:不要|不得|切勿|禁止)/u.test(beforeAction)) return true;
+    }
+    return false;
+  });
 }
 
 function boundedString(value, maxCodePoints) {
