@@ -696,9 +696,9 @@ function validDailyDigestCandidate(input, overrides = {}) {
   };
 }
 
-function createStoredDailyDigestContext(db, suffix = "one") {
+function createStoredDailyDigestContext(db, suffix = "one", repositoryOverrides = {}) {
   const counters = { ids: 0, clocks: 0 };
-  const repository = createRepository(db, counters);
+  const repository = createRepository(db, counters, repositoryOverrides);
   const startsAt = Date.UTC(1971, 0, 2);
   const sessionId = `digest-session-${suffix}`;
   const trackId = `digest-track-${suffix}`;
@@ -769,11 +769,94 @@ function createStoredDailyDigestContext(db, suffix = "one") {
   );
   return {
     repository,
+    counters,
+    store,
     input,
     job,
     budgetAttemptId,
     candidate: validDailyDigestCandidate(input),
+    startsAt,
+    sessionId,
+    trackId,
+    chunkId,
   };
+}
+
+function appendDailyDigestSegment(db, context, suffix = "new") {
+  const segmentId = `digest-segment-${suffix}`;
+  const chunkId = `digest-chunk-${suffix}`;
+  const startedAt = context.startsAt + 100;
+  const sequenceNumber = db
+    .prepare("SELECT count(*) AS count FROM audio_chunks WHERE track_id = ?")
+    .get(context.trackId).count;
+  db.prepare(
+    `INSERT INTO audio_chunks (
+       id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+       transcription_status, track_id, source_type, sequence_number, write_state
+     ) VALUES (?, ?, ?, ?, ?, 500, ?, ?, 'completed', ?, 'mic', ?, 'committed')`
+  ).run(
+    chunkId,
+    context.sessionId,
+    `G:\\digest-${suffix}.flac`,
+    startedAt,
+    startedAt + 500,
+    HASH_C,
+    startedAt + 100_000,
+    context.trackId,
+    sequenceNumber
+  );
+  db.prepare(
+    `INSERT INTO transcript_segments (
+       id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+       is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+       version, model_version, completed_at
+     ) VALUES (?, ?, ?, ?, 'person-self', 'SELF', ?, 0.95,
+       1, 'ready', ?, ?, 'mic', 'final', 1, 'whisper-v1', ?)`
+  ).run(
+    segmentId,
+    context.sessionId,
+    startedAt,
+    startedAt + 500,
+    `later evidence ${suffix}`,
+    context.trackId,
+    chunkId,
+    startedAt + 600
+  );
+  return segmentId;
+}
+
+function persistDailyDigestCandidateForInput(db, context, input, suffix, candidate = null) {
+  let ids = 0;
+  const store = new CaptureEvidenceStore(db, {
+    createId: (prefix) => `${prefix}-${suffix}-${++ids}`,
+    now: () => 7_000,
+  });
+  const job = store.enqueueDailyDigestJob({
+    digestInputId: input.digestInputId,
+    inputHash: input.sourceHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  const [claimed] = store.claimCloudJobs({
+    owner: `digest-worker-${suffix}`,
+    at: 7_000,
+    leaseMs: 10_000,
+  });
+  assert.equal(claimed.id, job.id);
+  const budgetAttemptId = reconcileBudgetAttempt(
+    db,
+    job.id,
+    `digest-budget-${suffix}`,
+    "daily_digest"
+  );
+  const validatedCandidate = candidate ?? validDailyDigestCandidate(input);
+  const persisted = context.repository.persistValidatedDailyDigestCandidate({
+    jobId: job.id,
+    digestInputId: input.digestInputId,
+    budgetAttemptId,
+    candidate: validatedCandidate,
+  });
+  return { store, job, budgetAttemptId, candidate: validatedCandidate, persisted };
 }
 
 test("constructor requires a live database and dependency functions", () => {
@@ -5030,13 +5113,552 @@ test("lists recoverable daily digest candidates with safe status-only pagination
   }
 });
 
+test("atomically applies a validated daily digest candidate and replays read-only", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "apply");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    const applied = context.repository.applyValidatedDailyDigestCandidate({
+      candidateId: persisted.candidateId,
+      leaseOwner: "digest-worker-apply",
+    });
+    assert.equal(applied.status, "applied");
+    assert.equal(applied.revision, 1);
+    assert.equal(applied.sourceHash, context.input.sourceHash);
+    assert.deepEqual(
+      db.prepare(
+        `SELECT local_date, timezone, revision, completeness, lifecycle,
+                input_watermark_json, content_json, source_hash
+         FROM daily_digests WHERE id = ?`
+      ).get(applied.digestId),
+      {
+        local_date: context.input.localDate,
+        timezone: context.input.timezone,
+        revision: 1,
+        completeness: context.input.completeness,
+        lifecycle: "active",
+        input_watermark_json: context.input.inputWatermarkJson,
+        content_json: canonicalJson(context.candidate),
+        source_hash: context.input.sourceHash,
+      }
+    );
+    assert.deepEqual(
+      db.prepare(
+        `SELECT transcript_segment_id FROM evidence_refs
+         WHERE entity_type = 'daily_digest' AND entity_id = ?
+         ORDER BY transcript_segment_id`
+      ).all(applied.digestId),
+      [{ transcript_segment_id: `digest-segment-apply` }],
+      "duplicate evidence references across digest sections must collapse deterministically"
+    );
+    assert.deepEqual(
+      db.prepare(
+        "SELECT state, disposition_at FROM daily_digest_response_candidates WHERE id = ?"
+      ).get(persisted.candidateId),
+      { state: "applied", disposition_at: 6003 }
+    );
+
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "wrong-replay-worker",
+      }),
+      { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
+    );
+    assert.deepEqual(
+      context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-apply",
+      }),
+      { ...applied, status: "already_applied" }
+    );
+    assert.deepEqual(
+      context.repository.listRecoverableDailyDigestCandidates({ afterId: "", limit: 10 }),
+      [
+        {
+          candidateId: persisted.candidateId,
+          jobId: context.job.id,
+          digestInputId: context.input.digestInputId,
+          candidateState: "applied",
+          jobState: "running",
+          leaseOwner: "digest-worker-apply",
+          leaseExpiresAt: 17_000,
+          budgetState: "reconciled",
+        },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest apply rejects wrong or expired leases with zero visible writes", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "lease");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "wrong-worker",
+      }),
+      { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
+    );
+    db.prepare("UPDATE processing_jobs SET lease_expires_at = 6004 WHERE id = ?")
+      .run(context.job.id);
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-lease",
+      }),
+      { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
+    );
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-lease",
+        extra: true,
+      }),
+      /exact|keys|application/i
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
+        .get().count,
+      0
+    );
+    assert.deepEqual(
+      db.prepare("SELECT state, disposition_at FROM daily_digest_response_candidates").get(),
+      { state: "validated", disposition_at: null }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest candidate CAS failure rolls back revision evidence and prior supersession", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "cas");
+    context.repository.saveDigestRevision({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      sourceHash: HASH_B,
+      inputWatermark: { prior: true },
+      content: { summary: "prior active" },
+      completeness: "partial",
+      evidenceSegmentIds: ["digest-segment-cas"],
+    });
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    db.exec(`
+      CREATE TRIGGER reject_daily_digest_candidate_apply
+      BEFORE UPDATE OF state ON daily_digest_response_candidates
+      WHEN OLD.state = 'validated' AND NEW.state = 'applied'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected daily digest candidate CAS failure');
+      END;
+    `);
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-cas",
+      }),
+      /injected daily digest candidate CAS failure/
+    );
+    assert.deepEqual(
+      db.prepare("SELECT revision, lifecycle, source_hash FROM daily_digests").all(),
+      [{ revision: 1, lifecycle: "active", source_hash: HASH_B }]
+    );
+    assert.deepEqual(
+      db.prepare("SELECT state, disposition_at FROM daily_digest_response_candidates").get(),
+      { state: "validated", disposition_at: null }
+    );
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
+        .get().count,
+      1
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a paid candidate for an older immutable daily input becomes terminal superseded", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "late");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    appendDailyDigestSegment(db, context, "late-new");
+    const newerInput = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.notEqual(newerInput.digestInputId, context.input.digestInputId);
+
+    assert.deepEqual(
+      context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-late",
+      }),
+      {
+        status: "superseded",
+        candidateId: persisted.candidateId,
+        digestInputId: context.input.digestInputId,
+      }
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
+    assert.deepEqual(
+      db.prepare("SELECT state, disposition_at FROM daily_digest_response_candidates").get(),
+      { state: "superseded", disposition_at: 6004 }
+    );
+    assert.equal(
+      context.repository.listRecoverableDailyDigestCandidates({ afterId: "", limit: 10 })[0]
+        .candidateState,
+      "superseded"
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("latest daily input uses insertion order when immutable inputs share created_at", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "same-created-at", { now: () => 6_000 });
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    appendDailyDigestSegment(db, context, "same-created-at-new");
+    const newerInput = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(newerInput.createdAt, context.input.createdAt);
+    assert.equal(
+      context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-same-created-at",
+      }).status,
+      "superseded"
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest apply revalidates tampered evidence against the exact immutable input", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "tamper");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    const laterSegmentId = appendDailyDigestSegment(db, context, "tamper-later");
+    const tampered = {
+      ...context.candidate,
+      sections: {
+        ...context.candidate.sections,
+        today: [{ text: "Tampered later evidence.", evidenceSegmentIds: [laterSegmentId] }],
+      },
+    };
+    const candidateJson = canonicalJson(tampered);
+    db.exec("DROP TRIGGER daily_digest_response_candidates_validate_update");
+    db.prepare(
+      `UPDATE daily_digest_response_candidates
+       SET candidate_json = ?, candidate_bytes = ?, candidate_hash = ? WHERE id = ?`
+    ).run(
+      candidateJson,
+      Buffer.byteLength(candidateJson, "utf8"),
+      sha256(candidateJson),
+      persisted.candidateId
+    );
+
+    assert.throws(
+      () => context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: persisted.candidateId,
+        leaseOwner: "digest-worker-tamper",
+      }),
+      { code: "invalid_structure" }
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
+    assert.deepEqual(
+      db.prepare("SELECT state, disposition_at FROM daily_digest_response_candidates").get(),
+      { state: "validated", disposition_at: null }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest apply rejects terminal jobs and tampered job budget or input identity", async (t) => {
+  const cases = [
+    {
+      name: "terminal job",
+      mutate(db, context) {
+        assert.equal(
+          context.store.completeJob(context.job.id, {
+            owner: "digest-worker-terminal-job",
+            at: 7_100,
+          }),
+          true
+        );
+      },
+      code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST",
+    },
+    {
+      name: "job input hash",
+      mutate(db, context) {
+        db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
+          .run(HASH_C, context.job.id);
+      },
+      code: "MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH",
+    },
+    {
+      name: "job budget model mismatch",
+      mutate(db, context) {
+        db.prepare("UPDATE processing_jobs SET model_version = 'tampered-model' WHERE id = ?")
+          .run(context.job.id);
+      },
+      code: "MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED",
+    },
+    {
+      name: "immutable input payload",
+      mutate(db, context) {
+        db.exec("DROP TRIGGER daily_digest_inputs_immutable_update");
+        db.prepare(
+          "UPDATE daily_digest_inputs SET cloud_payload_json = '{}', input_bytes = 2 WHERE id = ?"
+        )
+          .run(context.input.digestInputId);
+      },
+      code: "DAILY_DIGEST_INPUT_CORRUPT",
+    },
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    await t.test(item.name, () => {
+      const db = createFixture();
+      try {
+        const context = createStoredDailyDigestContext(db, item.name.replaceAll(" ", "-"));
+        const persisted = context.repository.persistValidatedDailyDigestCandidate({
+          jobId: context.job.id,
+          digestInputId: context.input.digestInputId,
+          budgetAttemptId: context.budgetAttemptId,
+          candidate: context.candidate,
+        });
+        item.mutate(db, context, index);
+        assert.throws(
+          () => context.repository.applyValidatedDailyDigestCandidate({
+            candidateId: persisted.candidateId,
+            leaseOwner: `digest-worker-${item.name.replaceAll(" ", "-")}`,
+          }),
+          { code: item.code }
+        );
+        assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
+        assert.equal(
+          db.prepare(
+            "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'"
+          ).get().count,
+          0
+        );
+      } finally {
+        db.close();
+      }
+    });
+  }
+});
+
+test("a latest partial candidate cannot regress an active final digest", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "final-partial");
+    const first = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    const firstApplied = context.repository.applyValidatedDailyDigestCandidate({
+      candidateId: first.candidateId,
+      leaseOwner: "digest-worker-final-partial",
+    });
+    assert.equal(context.input.completeness, "final");
+    db.prepare(
+      "UPDATE sessions SET processing_state = 'processing', ready_at = NULL WHERE id = ?"
+    ).run(context.sessionId);
+    const partialInput = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(partialInput.completeness, "partial");
+    const partial = persistDailyDigestCandidateForInput(
+      db,
+      context,
+      partialInput,
+      "latest-partial"
+    );
+
+    assert.equal(
+      context.repository.applyValidatedDailyDigestCandidate({
+        candidateId: partial.persisted.candidateId,
+        leaseOwner: "digest-worker-latest-partial",
+      }).status,
+      "superseded"
+    );
+    assert.deepEqual(
+      db.prepare("SELECT id, revision, completeness, lifecycle FROM daily_digests").all(),
+      [{
+        id: firstApplied.digestId,
+        revision: 1,
+        completeness: "final",
+        lifecycle: "active",
+      }]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a newer final daily input appends one evidence-backed revision", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "next-final");
+    const first = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    context.repository.applyValidatedDailyDigestCandidate({
+      candidateId: first.candidateId,
+      leaseOwner: "digest-worker-next-final",
+    });
+    const addedSegmentId = appendDailyDigestSegment(db, context, "next-final-added");
+    const nextInput = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(nextInput.completeness, "final");
+    const nextCandidate = validDailyDigestCandidate(nextInput);
+    nextCandidate.sections.today.push({
+      text: "Captured the added evidence.",
+      evidenceSegmentIds: [addedSegmentId],
+    });
+    const next = persistDailyDigestCandidateForInput(
+      db,
+      context,
+      nextInput,
+      "next-final-job",
+      nextCandidate
+    );
+    const applied = context.repository.applyValidatedDailyDigestCandidate({
+      candidateId: next.persisted.candidateId,
+      leaseOwner: "digest-worker-next-final-job",
+    });
+
+    assert.equal(applied.status, "applied");
+    assert.equal(applied.revision, 2);
+    assert.deepEqual(
+      db.prepare("SELECT revision, lifecycle FROM daily_digests ORDER BY revision").all(),
+      [
+        { revision: 1, lifecycle: "superseded" },
+        { revision: 2, lifecycle: "active" },
+      ]
+    );
+    assert.deepEqual(
+      db.prepare(
+        `SELECT transcript_segment_id FROM evidence_refs
+         WHERE entity_type = 'daily_digest' AND entity_id = ? ORDER BY transcript_segment_id`
+      ).all(applied.digestId),
+      [
+        { transcript_segment_id: "digest-segment-next-final" },
+        { transcript_segment_id: addedSegmentId },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("two repositories applying one durable candidate converge on one revision", () => {
+  const filename = path.join(
+    "G:\\Jarvis\\.runtime-cache\\temp",
+    `jarvis-digest-apply-${process.pid}-${Date.now()}.sqlite`
+  );
+  const firstDb = createFixture(filename);
+  const secondDb = new Database(filename);
+  secondDb.pragma("foreign_keys = ON");
+  try {
+    const context = createStoredDailyDigestContext(firstDb, "two-connections");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    const secondRepository = createRepository(secondDb, { ids: 0, clocks: 0 });
+    const first = context.repository.applyValidatedDailyDigestCandidate({
+      candidateId: persisted.candidateId,
+      leaseOwner: "digest-worker-two-connections",
+    });
+    const second = secondRepository.applyValidatedDailyDigestCandidate({
+      candidateId: persisted.candidateId,
+      leaseOwner: "digest-worker-two-connections",
+    });
+    assert.equal(first.status, "applied");
+    assert.equal(second.status, "already_applied");
+    assert.equal(firstDb.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 1);
+    assert.equal(
+      firstDb.prepare(
+        "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'"
+      ).get().count,
+      1
+    );
+  } finally {
+    secondDb.close();
+    firstDb.close();
+    fs.rmSync(filename, { force: true });
+  }
+});
+
 test("saveDigestRevision is exactly idempotent for the same local source hash", () => {
   const db = createFixture();
   const counters = { ids: 0, clocks: 0 };
   try {
     const repository = createRepository(db, counters);
     const digest = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000, analysisInputIds: ["analysis_input-1"] },
@@ -5067,7 +5689,7 @@ test("saveDigestRevision is exactly idempotent for the same local source hash", 
         )
         .get(),
       {
-        local_date: "2026-07-16",
+        local_date: "1970-01-01",
         timezone: "Asia/Shanghai",
         revision: 1,
         completeness: "partial",
@@ -5088,7 +5710,7 @@ test("saveDigestRevision treats the complete evidence set as replay identity", (
   try {
     const repository = createRepository(db, counters);
     const digest = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 9000 },
@@ -5132,7 +5754,7 @@ test("saveDigestRevision rejects duplicate or out-of-scope evidence before durab
   try {
     const repository = createRepository(db, counters);
     const digest = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },
@@ -5147,6 +5769,10 @@ test("saveDigestRevision rejects duplicate or out-of-scope evidence before durab
     ]) {
       assert.throws(() => repository.saveDigestRevision({ ...digest, evidenceSegmentIds }));
     }
+    assert.throws(
+      () => repository.saveDigestRevision({ ...digest, localDate: "1970-01-02" }),
+      { code: "MEMORY_DIGEST_EVIDENCE_OUT_OF_SCOPE" }
+    );
     assert.deepEqual(counters, { ids: 0, clocks: 0 });
     assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
     assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 0);
@@ -5160,7 +5786,7 @@ test("saveDigestRevision rolls back the new revision and supersession when evide
   try {
     const repository = createRepository(db);
     const base = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },
@@ -5208,7 +5834,7 @@ test("saveDigestRevision rejects reuse of a source hash for different canonical 
   try {
     const repository = createRepository(db, counters);
     const digest = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },
@@ -5235,7 +5861,7 @@ test("saveDigestRevision appends partial-to-final history and rejects completene
   try {
     const repository = createRepository(db, counters);
     repository.saveDigestRevision({
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },
@@ -5245,7 +5871,7 @@ test("saveDigestRevision appends partial-to-final history and rejects completene
     });
     assert.deepEqual(
       repository.saveDigestRevision({
-        localDate: "2026-07-16",
+        localDate: "1970-01-01",
         timezone: "Asia/Shanghai",
         sourceHash: HASH_B,
         inputWatermark: { latestAppliedAt: 9000 },
@@ -5289,7 +5915,7 @@ test("saveDigestRevision appends partial-to-final history and rejects completene
     assert.throws(
       () =>
         repository.saveDigestRevision({
-          localDate: "2026-07-16",
+          localDate: "1970-01-01",
           timezone: "Asia/Shanghai",
           sourceHash: "c".repeat(64),
           inputWatermark: { latestAppliedAt: 10000 },
@@ -5311,7 +5937,7 @@ test("saveDigestRevision validates local identity and rolls back supersession on
   try {
     const repository = createRepository(db);
     const base = {
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },
@@ -5364,7 +5990,7 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
       candidate: validCandidate(),
     });
     repository.saveDigestRevision({
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_C,
       inputWatermark: {
@@ -5467,7 +6093,7 @@ test("readPublicSnapshot fails closed when durable JSON content is structurally 
   try {
     const repository = createRepository(db);
     repository.saveDigestRevision({
-      localDate: "2026-07-16",
+      localDate: "1970-01-01",
       timezone: "Asia/Shanghai",
       sourceHash: HASH_A,
       inputWatermark: { latestAppliedAt: 6000 },

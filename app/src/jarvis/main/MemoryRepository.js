@@ -1803,7 +1803,10 @@ class MemoryRepository {
          JOIN processing_jobs AS job ON job.id = candidate.job_id
          JOIN analysis_budget_attempts AS attempt
            ON attempt.request_id = candidate.budget_attempt_id
-         WHERE candidate.state = 'validated' AND candidate.id > ?
+         WHERE (
+           candidate.state = 'validated'
+           OR (candidate.state IN ('applied','superseded') AND job.completed_at IS NULL)
+         ) AND candidate.id > ?
          ORDER BY candidate.id LIMIT ?`
       )
       .all(afterId, limit)
@@ -1817,6 +1820,239 @@ class MemoryRepository {
         leaseExpiresAt: row.lease_expires_at,
         budgetState: row.budget_state,
       }));
+  }
+
+  _loadDailyDigestCandidateForApply(candidateId) {
+    const candidateRow = this.db
+      .prepare("SELECT * FROM daily_digest_response_candidates WHERE id = ?")
+      .get(candidateId);
+    if (!candidateRow) throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_NOT_FOUND");
+    const storedInput = this.getDailyDigestInput(candidateRow.digest_input_id);
+    if (!storedInput) throw codedError("MEMORY_DAILY_DIGEST_INPUT_NOT_FOUND");
+    let parsedCandidate;
+    try {
+      parsedCandidate = JSON.parse(candidateRow.candidate_json);
+      assertJsonObject(parsedCandidate, "daily digest candidate");
+    } catch {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
+    }
+    const candidate = validateCandidateDailyDigest(
+      parsedCandidate,
+      this._dailyDigestCandidateContext(storedInput)
+    );
+    const candidateJson = canonicalJson(candidate);
+    const candidateBytes = Buffer.byteLength(candidateJson, "utf8");
+    const candidateHash = sha256(candidateJson);
+    if (
+      candidateRow.response_schema_version !== DAILY_DIGEST_SCHEMA_VERSION ||
+      candidateRow.candidate_json !== candidateJson ||
+      candidateRow.candidate_bytes !== candidateBytes ||
+      candidateBytes > MAX_DAILY_DIGEST_CANDIDATE_BYTES ||
+      !safeHashEqual(candidateRow.candidate_hash, candidateHash)
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
+    }
+    const job = this.db
+      .prepare("SELECT * FROM processing_jobs WHERE id = ?")
+      .get(candidateRow.job_id);
+    if (
+      !job ||
+      job.job_type !== "generate_daily_digest" ||
+      job.lane !== "cloud" ||
+      job.session_id !== null ||
+      job.analysis_input_id !== null ||
+      job.desired_head_hash !== null ||
+      job.digest_input_id !== storedInput.digestInputId ||
+      !safeHashEqual(job.input_hash, storedInput.sourceHash) ||
+      job.input_version !== 1 ||
+      typeof job.model_version !== "string" ||
+      job.model_version.length === 0
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
+    }
+    const attempt = this.db
+      .prepare(
+        `SELECT job_id, provider, model, operation, state
+         FROM analysis_budget_attempts WHERE request_id = ?`
+      )
+      .get(candidateRow.budget_attempt_id);
+    if (
+      !attempt ||
+      attempt.job_id !== job.id ||
+      attempt.provider !== "minimax" ||
+      attempt.model !== job.model_version ||
+      attempt.operation !== "daily_digest" ||
+      attempt.state !== "reconciled"
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED");
+    }
+    const evidenceSegmentIds = [...new Set(
+      Object.values(candidate.sections).flatMap((items) =>
+        items.flatMap((item) => item.evidenceSegmentIds)
+      )
+    )].sort();
+    return {
+      candidateRow,
+      storedInput,
+      candidate,
+      candidateJson,
+      job,
+      evidenceSegmentIds,
+    };
+  }
+
+  _assertDailyDigestEvidenceLineage(storedInput, evidenceSegmentIds) {
+    const watermarkEvidence = new Map(
+      storedInput.inputWatermark.evidence.map((item) => [item.segmentId, item])
+    );
+    const loadSegment = this.db.prepare(
+      `SELECT id, version, text, started_at, ended_at, result_kind, is_stable,
+              superseded_by, duplicate_of
+       FROM transcript_segments WHERE id = ?`
+    );
+    for (const segmentId of evidenceSegmentIds) {
+      const expected = watermarkEvidence.get(segmentId);
+      const actual = loadSegment.get(segmentId);
+      if (
+        !expected ||
+        !actual ||
+        actual.result_kind !== "final" ||
+        actual.is_stable !== 1 ||
+        actual.superseded_by !== null ||
+        actual.duplicate_of !== null ||
+        actual.version !== expected.version ||
+        actual.started_at !== expected.startedAt ||
+        actual.ended_at !== expected.endedAt ||
+        !safeHashEqual(sha256(actual.text), expected.textHash)
+      ) {
+        throw codedError("MEMORY_DAILY_DIGEST_EVIDENCE_STALE");
+      }
+    }
+  }
+
+  _readAppliedDailyDigestReplay(storedInput, candidateJson, evidenceSegmentIds) {
+    const digest = this.db
+      .prepare(
+        `SELECT * FROM daily_digests
+         WHERE local_date = ? AND timezone = ? AND source_hash = ?`
+      )
+      .get(storedInput.localDate, storedInput.timezone, storedInput.sourceHash);
+    if (
+      !digest ||
+      digest.completeness !== storedInput.completeness ||
+      digest.input_watermark_json !== storedInput.inputWatermarkJson ||
+      digest.content_json !== candidateJson
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
+    }
+    const durableEvidenceIds = this.db
+      .prepare(
+        `SELECT transcript_segment_id FROM evidence_refs
+         WHERE entity_type = 'daily_digest' AND entity_id = ?
+         ORDER BY transcript_segment_id`
+      )
+      .all(digest.id)
+      .map((row) => row.transcript_segment_id);
+    if (canonicalJson(durableEvidenceIds) !== canonicalJson(evidenceSegmentIds)) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
+    }
+    return {
+      status: "already_applied",
+      digestId: digest.id,
+      revision: digest.revision,
+      sourceHash: digest.source_hash,
+    };
+  }
+
+  applyValidatedDailyDigestCandidate(input) {
+    assertExactPlainObject(
+      input,
+      ["candidateId", "leaseOwner"],
+      "validated daily digest candidate application"
+    );
+    const candidateId = assertId(input.candidateId, "candidateId");
+    const leaseOwner = assertText(input.leaseOwner, "leaseOwner");
+    const transaction = this.db.transaction(() => {
+      const loaded = this._loadDailyDigestCandidateForApply(candidateId);
+      const { candidateRow, storedInput, candidate, candidateJson, job, evidenceSegmentIds } = loaded;
+      const appliedAt = assertTimestamp(this.now(), "appliedAt");
+      if (
+        job.state !== "running" ||
+        job.completed_at !== null ||
+        job.lease_owner !== leaseOwner ||
+        !Number.isSafeInteger(job.lease_expires_at) ||
+        job.lease_expires_at <= appliedAt
+      ) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST");
+      }
+      if (candidateRow.state === "applied") {
+        return {
+          ...this._readAppliedDailyDigestReplay(storedInput, candidateJson, evidenceSegmentIds),
+          candidateId,
+        };
+      }
+      if (candidateRow.state === "superseded") {
+        return { status: "superseded", candidateId, digestInputId: storedInput.digestInputId };
+      }
+      if (candidateRow.state !== "validated" || candidateRow.disposition_at !== null) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
+      }
+      const latestInput = this.db
+        .prepare(
+          `SELECT id FROM daily_digest_inputs
+           WHERE local_date = ? AND timezone = ?
+           ORDER BY created_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(storedInput.localDate, storedInput.timezone);
+      const activeDigest = this.db
+        .prepare(
+          `SELECT completeness FROM daily_digests
+           WHERE local_date = ? AND timezone = ? AND lifecycle = 'active'
+           ORDER BY revision DESC LIMIT 1`
+        )
+        .get(storedInput.localDate, storedInput.timezone);
+      if (
+        latestInput?.id !== storedInput.digestInputId ||
+        (activeDigest?.completeness === "final" && storedInput.completeness === "partial")
+      ) {
+        const superseded = this.db
+          .prepare(
+            `UPDATE daily_digest_response_candidates
+             SET state = 'superseded', disposition_at = ?
+             WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
+          )
+          .run(appliedAt, candidateId);
+        if (superseded.changes !== 1) {
+          throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CAS_CONFLICT");
+        }
+        return { status: "superseded", candidateId, digestInputId: storedInput.digestInputId };
+      }
+      this._assertDailyDigestEvidenceLineage(storedInput, evidenceSegmentIds);
+      const digestResult = this._saveDigestRevisionInTransaction(
+        this._normalizeDigestRevisionInput({
+          localDate: storedInput.localDate,
+          timezone: storedInput.timezone,
+          sourceHash: storedInput.sourceHash,
+          inputWatermark: storedInput.inputWatermark,
+          content: candidate,
+          completeness: storedInput.completeness,
+          evidenceSegmentIds,
+        }),
+        appliedAt
+      );
+      const applied = this.db
+        .prepare(
+          `UPDATE daily_digest_response_candidates
+           SET state = 'applied', disposition_at = ?
+           WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
+        )
+        .run(appliedAt, candidateId);
+      if (applied.changes !== 1) {
+        throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CAS_CONFLICT");
+      }
+      return { ...digestResult, status: "applied", candidateId };
+    });
+    return transaction.immediate();
   }
 
   applyStoredAnalysisCandidate(input) {
@@ -4307,6 +4543,23 @@ class MemoryRepository {
     const inputWatermarkJson = canonicalJson(input.inputWatermark);
     const contentJson = canonicalJson(input.content);
     const evidenceRows = this._normalizeDigestEvidenceRows(input.evidenceSegmentIds);
+    const localDateAt = (timestamp) => {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(new Date(timestamp));
+      const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    };
+    for (const evidence of evidenceRows) {
+      const firstLocalDate = localDateAt(evidence.started_at);
+      const lastLocalDate = localDateAt(Math.max(evidence.started_at, evidence.ended_at - 1));
+      if (localDate < firstLocalDate || localDate > lastLocalDate) {
+        throw codedError("MEMORY_DIGEST_EVIDENCE_OUT_OF_SCOPE");
+      }
+    }
     return {
       localDate,
       timezone,
