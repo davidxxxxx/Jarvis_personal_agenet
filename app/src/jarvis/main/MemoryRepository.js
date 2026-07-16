@@ -1780,7 +1780,7 @@ class MemoryRepository {
     return transaction.immediate();
   }
 
-  listRecoverableDailyDigestCandidates(input) {
+  listRecoverableDailyDigestCandidates(input = { afterId: "", limit: 100 }) {
     assertExactPlainObject(
       input,
       ["afterId", "limit"],

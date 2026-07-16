@@ -290,6 +290,78 @@ function setPrestartRecoveryState(db, store, state) {
   });
 }
 
+function seedCloudDigestRecovery(
+  db,
+  store,
+  {
+    attemptState = "reconciled",
+    candidateState = "validated",
+    persistCandidate = true,
+    actualUsage = { inputTokens: 100, outputTokens: 100 },
+    suffix = "recovery",
+  } = {}
+) {
+  const input = seedDailyDigestInput(db, {
+    inputId: `digest-input-${suffix}`,
+    inputHash: "8".repeat(64),
+  });
+  const job = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  store.claimCloudJobs({ owner: "dead-cloud-worker", at: 100, leaseMs: 100 });
+
+  const budgetAt = Date.UTC(2026, 6, 16, 4);
+  const budget = new AnalysisBudgetRepository(db);
+  budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at: budgetAt });
+  if (attemptState === "none") return { job, input };
+  const requestId = `digest-request-${suffix}`;
+  budget.reserve({
+    requestId,
+    jobId: job.id,
+    attemptNumber: 1,
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    operation: "daily_digest",
+    estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+    at: budgetAt + 1,
+  });
+  if (attemptState === "reserved") return { job, input, requestId };
+  if (attemptState === "released") {
+    budget.release({ requestId, reasonCode: "shutdown_before_transport", at: budgetAt + 2 });
+    return { job, input, requestId };
+  }
+  budget.markStarted({ requestId, at: budgetAt + 2 });
+  if (attemptState === "started") return { job, input, requestId };
+  if (attemptState === "usage_unknown") {
+    budget.markUsageUnknown({ requestId, reasonCode: "process_recovery", at: budgetAt + 3 });
+    return { job, input, requestId };
+  }
+  budget.reconcile({ requestId, usage: actualUsage, at: budgetAt + 3 });
+  if (!persistCandidate) return { job, input, requestId };
+  const candidateId = `digest-candidate-${suffix}`;
+  const candidateJson = JSON.stringify({ schemaVersion: "jarvis-daily-digest-v1" });
+  db.prepare(
+    `INSERT INTO daily_digest_response_candidates (
+       id, job_id, digest_input_id, budget_attempt_id, response_schema_version,
+       candidate_json, candidate_bytes, candidate_hash, state, created_at, disposition_at
+     ) VALUES (?, ?, ?, ?, 'jarvis-daily-digest-v1', ?, ?, ?, ?, 150, ?)`
+  ).run(
+    candidateId,
+    job.id,
+    input.inputId,
+    requestId,
+    candidateJson,
+    Buffer.byteLength(candidateJson, "utf8"),
+    "7".repeat(64),
+    candidateState,
+    candidateState === "validated" ? null : 175
+  );
+  return { job, input, requestId, candidateId };
+}
+
 test("stores track state and gap lifecycle evidence", (t) => {
   const { db, store } = fixture(t);
 
@@ -2801,6 +2873,127 @@ test("restart recovery leases an exactly linked reconciled superseded candidate"
   );
 });
 
+test("digest candidate recovery renews validated applied and superseded unfinished work", (t) => {
+  for (const candidateState of ["validated", "applied", "superseded"]) {
+    const child = fixture(t);
+    const seeded = seedCloudDigestRecovery(child.db, child.store, {
+      candidateState,
+      suffix: candidateState,
+    });
+    assert.deepEqual(
+      child.store.recoverExpiredCloudCandidateLeases({
+        owner: "restart-digest-worker",
+        at: 200,
+        leaseMs: 300,
+        limit: 1,
+      }),
+      [{
+        jobId: seeded.job.id,
+        candidateId: seeded.candidateId,
+        candidateState,
+        leaseOwner: "restart-digest-worker",
+        leaseExpiresAt: 500,
+      }],
+      candidateState
+    );
+  }
+});
+
+test("digest candidate recovery rejects every mismatched input job budget and state link", async (t) => {
+  const scenarios = [
+    {
+      name: "job input hash",
+      corrupt(db, seeded) {
+        db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
+          .run("6".repeat(64), seeded.job.id);
+      },
+    },
+    {
+      name: "candidate input",
+      corrupt(db, seeded) {
+        seedDailyDigestInput(db, { inputId: "digest-input-forged", inputHash: "5".repeat(64) });
+        db.exec("DROP TRIGGER daily_digest_response_candidates_validate_update");
+        db.prepare(
+          "UPDATE daily_digest_response_candidates SET digest_input_id = ? WHERE id = ?"
+        ).run("digest-input-forged", seeded.candidateId);
+      },
+    },
+    {
+      name: "job budget model",
+      corrupt(db, seeded) {
+        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?")
+          .run(seeded.job.id);
+      },
+    },
+    {
+      name: "budget provider",
+      corrupt(db, seeded) {
+        db.exec(`
+          DROP TRIGGER analysis_budget_attempts_immutable_identity;
+          DROP TRIGGER analysis_budget_attempts_terminal;
+        `);
+        db.pragma("foreign_keys = OFF");
+        db.prepare("UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?")
+          .run(seeded.requestId);
+        db.pragma("foreign_keys = ON");
+      },
+    },
+    {
+      name: "budget operation",
+      corrupt(db, seeded) {
+        db.exec(`
+          DROP TRIGGER analysis_budget_attempts_immutable_identity;
+          DROP TRIGGER analysis_budget_attempts_terminal;
+          DROP TRIGGER analysis_budget_attempts_validate_actual_cost;
+        `);
+        db.pragma("foreign_keys = OFF");
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET operation = 'session_analysis' WHERE request_id = ?"
+        ).run(seeded.requestId);
+        db.pragma("foreign_keys = ON");
+      },
+    },
+    {
+      name: "budget state",
+      corrupt(db, seeded) {
+        db.exec(`
+          DROP TRIGGER analysis_budget_attempts_terminal;
+          DROP TRIGGER analysis_budget_attempts_transition;
+        `);
+        db.pragma("ignore_check_constraints = ON");
+        db.prepare("UPDATE analysis_budget_attempts SET state = 'started' WHERE request_id = ?")
+          .run(seeded.requestId);
+        db.pragma("ignore_check_constraints = OFF");
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, (childTest) => {
+      const child = fixture(childTest);
+      const seeded = seedCloudDigestRecovery(child.db, child.store, {
+        suffix: scenario.name.replaceAll(" ", "-"),
+      });
+      scenario.corrupt(child.db, seeded);
+      assert.deepEqual(
+        child.store.recoverExpiredCloudCandidateLeases({
+          owner: "restart-digest-worker",
+          at: 200,
+          leaseMs: 300,
+          limit: 1,
+        }),
+        []
+      );
+      assert.equal(
+        child.db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(seeded.job.id)
+          .lease_owner,
+        "dead-cloud-worker"
+      );
+    });
+  }
+});
+
 test("superseded candidate recovery rejects forged and unreconciled evidence", (t) => {
   const scenarios = [
     {
@@ -2925,6 +3118,161 @@ test("expired cloud pre-start recovery reassigns only absent released or zero-co
   }
 });
 
+test("expired digest pre-start recovery renews absent released and reconciled-zero attempts", (t) => {
+  const scenarios = [
+    { state: "none", actualUsage: undefined },
+    { state: "released", actualUsage: undefined },
+    { state: "reconciled", actualUsage: { inputTokens: 0, outputTokens: 0 } },
+  ];
+  for (const [index, scenario] of scenarios.entries()) {
+    const child = fixture(t);
+    const seeded = seedCloudDigestRecovery(child.db, child.store, {
+      attemptState: scenario.state,
+      persistCandidate: false,
+      actualUsage: scenario.actualUsage,
+      suffix: `prestart-${index}`,
+    });
+    const recovered = child.store.recoverExpiredCloudPrestartLeases({
+      owner: "restart-digest-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+    });
+    assert.equal(recovered.length, 1, scenario.state);
+    assert.equal(recovered[0].id, seeded.job.id, scenario.state);
+    assert.equal(recovered[0].lease_owner, "restart-digest-worker", scenario.state);
+    assert.equal(recovered[0].lease_expires_at, 500, scenario.state);
+  }
+});
+
+test("expired digest pre-start recovery refuses ambiguous or inexact work", async (t) => {
+  const scenarios = [
+    {
+      name: "started",
+      seed(db, store) {
+        return seedCloudDigestRecovery(db, store, {
+          attemptState: "started",
+          persistCandidate: false,
+          suffix: "prestart-started",
+        });
+      },
+    },
+    {
+      name: "usage unknown",
+      seed(db, store) {
+        return seedCloudDigestRecovery(db, store, {
+          attemptState: "usage_unknown",
+          persistCandidate: false,
+          suffix: "prestart-unknown",
+        });
+      },
+    },
+    {
+      name: "reconciled nonzero",
+      seed(db, store) {
+        return seedCloudDigestRecovery(db, store, {
+          attemptState: "reconciled",
+          persistCandidate: false,
+          suffix: "prestart-nonzero",
+        });
+      },
+    },
+    {
+      name: "candidate present",
+      seed(db, store) {
+        return seedCloudDigestRecovery(db, store, { suffix: "prestart-candidate" });
+      },
+    },
+    {
+      name: "input hash mismatch",
+      seed(db, store) {
+        const seeded = seedCloudDigestRecovery(db, store, {
+          attemptState: "none",
+          persistCandidate: false,
+          suffix: "prestart-hash",
+        });
+        db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
+          .run("4".repeat(64), seeded.job.id);
+        return seeded;
+      },
+    },
+    {
+      name: "job budget model mismatch",
+      seed(db, store) {
+        const seeded = seedCloudDigestRecovery(db, store, {
+          attemptState: "released",
+          persistCandidate: false,
+          suffix: "prestart-model",
+        });
+        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?")
+          .run(seeded.job.id);
+        return seeded;
+      },
+    },
+    {
+      name: "budget provider mismatch",
+      seed(db, store) {
+        const seeded = seedCloudDigestRecovery(db, store, {
+          attemptState: "released",
+          persistCandidate: false,
+          suffix: "prestart-provider",
+        });
+        db.exec(`
+          DROP TRIGGER analysis_budget_attempts_immutable_identity;
+          DROP TRIGGER analysis_budget_attempts_terminal;
+        `);
+        db.pragma("foreign_keys = OFF");
+        db.prepare("UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?")
+          .run(seeded.requestId);
+        db.pragma("foreign_keys = ON");
+        return seeded;
+      },
+    },
+    {
+      name: "budget operation mismatch",
+      seed(db, store) {
+        const seeded = seedCloudDigestRecovery(db, store, {
+          attemptState: "released",
+          persistCandidate: false,
+          suffix: "prestart-operation",
+        });
+        db.exec(`
+          DROP TRIGGER analysis_budget_attempts_immutable_identity;
+          DROP TRIGGER analysis_budget_attempts_terminal;
+        `);
+        db.pragma("foreign_keys = OFF");
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET operation = 'session_analysis' WHERE request_id = ?"
+        ).run(seeded.requestId);
+        db.pragma("foreign_keys = ON");
+        return seeded;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, (childTest) => {
+      const child = fixture(childTest);
+      const seeded = scenario.seed(child.db, child.store);
+      assert.deepEqual(
+        child.store.recoverExpiredCloudPrestartLeases({
+          owner: "restart-digest-worker",
+          at: 200,
+          leaseMs: 300,
+          limit: 1,
+        }),
+        []
+      );
+      assert.equal(
+        child.db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(seeded.job.id)
+          .lease_owner,
+        "dead-cloud-worker"
+      );
+    });
+  }
+});
+
 test("expired cloud pre-start recovery refuses ambiguous paid candidate and non-analysis work", async (t) => {
   const scenarios = [
     {
@@ -2946,20 +3294,6 @@ test("expired cloud pre-start recovery refuses ambiguous paid candidate and non-
     {
       name: "candidate present",
       seed: ({ db, store }) => seedCloudAnalysisRecovery(db, store),
-    },
-    {
-      name: "daily digest",
-      seed: ({ db, store }) => {
-        const digestInput = seedDailyDigestInput(db, { inputHash: "8".repeat(64) });
-        const job = store.enqueueDailyDigestJob({
-          digestInputId: digestInput.inputId,
-          inputHash: digestInput.inputHash,
-          inputVersion: 1,
-          modelVersion: "MiniMax-M2.7",
-        });
-        store.claimCloudJobs({ owner: "dead-cloud-worker", at: 100, leaseMs: 100 });
-        return job;
-      },
     },
     {
       name: "unknown cloud",

@@ -5090,6 +5090,7 @@ test("lists recoverable daily digest candidates with safe status-only pagination
         budgetState: "reconciled",
       },
     ]);
+    assert.deepEqual(repository.listRecoverableDailyDigestCandidates(), rows);
     assert.deepEqual(
       repository.listRecoverableDailyDigestCandidates({
         afterId: persisted.candidateId,

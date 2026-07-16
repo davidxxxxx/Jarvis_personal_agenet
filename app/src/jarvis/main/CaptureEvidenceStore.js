@@ -661,43 +661,101 @@ class CaptureEvidenceStore {
             lease_expires_at = @leaseExpiresAt
         WHERE id = @id
           AND lane = 'cloud'
-          AND job_type = 'analyze_session'
           AND state = 'running'
           AND completed_at IS NULL
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
-          AND EXISTS (
-            SELECT 1
-            FROM analysis_response_candidates AS candidate
-            JOIN analysis_budget_attempts AS attempt
-              ON attempt.request_id = candidate.budget_attempt_id
-            WHERE candidate.job_id = processing_jobs.id
-              AND candidate.analysis_input_id = processing_jobs.analysis_input_id
-              AND candidate.desired_vector_hash = processing_jobs.desired_head_hash
-              AND candidate.state IN ('validated','applied','superseded')
-              AND attempt.job_id = processing_jobs.id
-              AND attempt.state = 'reconciled'
+          AND (
+            (
+              job_type = 'analyze_session'
+              AND EXISTS (
+                SELECT 1
+                FROM analysis_response_candidates AS candidate
+                JOIN analysis_budget_attempts AS attempt
+                  ON attempt.request_id = candidate.budget_attempt_id
+                WHERE candidate.job_id = processing_jobs.id
+                  AND candidate.analysis_input_id = processing_jobs.analysis_input_id
+                  AND candidate.desired_vector_hash = processing_jobs.desired_head_hash
+                  AND candidate.state IN ('validated','applied','superseded')
+                  AND attempt.job_id = processing_jobs.id
+                  AND attempt.provider = 'minimax'
+                  AND attempt.model = processing_jobs.model_version
+                  AND attempt.operation = 'session_analysis'
+                  AND attempt.state = 'reconciled'
+              )
+            )
+            OR (
+              job_type = 'generate_daily_digest'
+              AND digest_input_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM daily_digest_response_candidates AS candidate
+                JOIN daily_digest_inputs AS input ON input.id = candidate.digest_input_id
+                JOIN analysis_budget_attempts AS attempt
+                  ON attempt.request_id = candidate.budget_attempt_id
+                WHERE candidate.job_id = processing_jobs.id
+                  AND candidate.digest_input_id = processing_jobs.digest_input_id
+                  AND input.id = processing_jobs.digest_input_id
+                  AND processing_jobs.input_hash = input.source_hash
+                  AND candidate.state IN ('validated','applied','superseded')
+                  AND attempt.job_id = processing_jobs.id
+                  AND attempt.provider = 'minimax'
+                  AND attempt.model = processing_jobs.model_version
+                  AND attempt.operation = 'daily_digest'
+                  AND attempt.state = 'reconciled'
+              )
+            )
           )
       `),
       listExpiredCloudCandidateLeases: db.prepare(`
-        SELECT job.id AS job_id, candidate.id AS candidate_id,
-               candidate.state AS candidate_state
-        FROM processing_jobs AS job
-        JOIN analysis_response_candidates AS candidate ON candidate.job_id = job.id
-        JOIN analysis_budget_attempts AS attempt
-          ON attempt.request_id = candidate.budget_attempt_id
-        WHERE job.lane = 'cloud'
-          AND job.job_type = 'analyze_session'
-          AND job.state = 'running'
-          AND job.completed_at IS NULL
-          AND job.lease_expires_at IS NOT NULL
-          AND job.lease_expires_at <= @at
-          AND candidate.analysis_input_id = job.analysis_input_id
-          AND candidate.desired_vector_hash = job.desired_head_hash
-          AND candidate.state IN ('validated','applied','superseded')
-          AND attempt.job_id = job.id
-          AND attempt.state = 'reconciled'
-        ORDER BY candidate.created_at ASC, candidate.id ASC
+        SELECT job_id, candidate_id, candidate_state
+        FROM (
+          SELECT job.id AS job_id, candidate.id AS candidate_id,
+                 candidate.state AS candidate_state, candidate.created_at
+          FROM processing_jobs AS job
+          JOIN analysis_response_candidates AS candidate ON candidate.job_id = job.id
+          JOIN analysis_budget_attempts AS attempt
+            ON attempt.request_id = candidate.budget_attempt_id
+          WHERE job.lane = 'cloud'
+            AND job.job_type = 'analyze_session'
+            AND job.state = 'running'
+            AND job.completed_at IS NULL
+            AND job.lease_expires_at IS NOT NULL
+            AND job.lease_expires_at <= @at
+            AND candidate.analysis_input_id = job.analysis_input_id
+            AND candidate.desired_vector_hash = job.desired_head_hash
+            AND candidate.state IN ('validated','applied','superseded')
+            AND attempt.job_id = job.id
+            AND attempt.provider = 'minimax'
+            AND attempt.model = job.model_version
+            AND attempt.operation = 'session_analysis'
+            AND attempt.state = 'reconciled'
+          UNION ALL
+          SELECT job.id AS job_id, candidate.id AS candidate_id,
+                 candidate.state AS candidate_state, candidate.created_at
+          FROM processing_jobs AS job
+          JOIN daily_digest_response_candidates AS candidate ON candidate.job_id = job.id
+          JOIN daily_digest_inputs AS input ON input.id = candidate.digest_input_id
+          JOIN analysis_budget_attempts AS attempt
+            ON attempt.request_id = candidate.budget_attempt_id
+          WHERE job.lane = 'cloud'
+            AND job.job_type = 'generate_daily_digest'
+            AND job.state = 'running'
+            AND job.completed_at IS NULL
+            AND job.lease_expires_at IS NOT NULL
+            AND job.lease_expires_at <= @at
+            AND job.digest_input_id IS NOT NULL
+            AND candidate.digest_input_id = job.digest_input_id
+            AND input.id = job.digest_input_id
+            AND job.input_hash = input.source_hash
+            AND candidate.state IN ('validated','applied','superseded')
+            AND attempt.job_id = job.id
+            AND attempt.provider = 'minimax'
+            AND attempt.model = job.model_version
+            AND attempt.operation = 'daily_digest'
+            AND attempt.state = 'reconciled'
+        )
+        ORDER BY created_at ASC, candidate_id ASC
         LIMIT @limit
       `),
       recoverExpiredCloudPrestartLease: db.prepare(`
@@ -706,41 +764,86 @@ class CaptureEvidenceStore {
             lease_expires_at = @leaseExpiresAt
         WHERE id = @id
           AND lane = 'cloud'
-          AND job_type = 'analyze_session'
           AND state = 'running'
           AND completed_at IS NULL
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
-          AND analysis_input_id IS NOT NULL
-          AND desired_head_hash IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM analysis_response_candidates AS candidate
-            WHERE candidate.job_id = processing_jobs.id
-          )
           AND (
-            NOT EXISTS (
-              SELECT 1 FROM analysis_budget_attempts AS attempt
-              WHERE attempt.job_id = processing_jobs.id
-            )
-            OR EXISTS (
-              SELECT 1 FROM analysis_budget_attempts AS latest
-              WHERE latest.job_id = processing_jobs.id
-                AND latest.attempt_number = (
-                  SELECT MAX(attempt.attempt_number)
-                  FROM analysis_budget_attempts AS attempt
+            (
+              job_type = 'analyze_session'
+              AND analysis_input_id IS NOT NULL
+              AND desired_head_hash IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM analysis_response_candidates AS candidate
+                WHERE candidate.job_id = processing_jobs.id
+              )
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS attempt
                   WHERE attempt.job_id = processing_jobs.id
                 )
-                AND latest.provider = 'minimax'
-                AND latest.operation = 'session_analysis'
-                AND (
-                  latest.state = 'released'
-                  OR (
-                    latest.state = 'reconciled'
-                    AND latest.actual_input_tokens = 0
-                    AND latest.actual_output_tokens = 0
-                    AND latest.actual_microusd = 0
-                  )
+                OR EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS latest
+                  WHERE latest.job_id = processing_jobs.id
+                    AND latest.attempt_number = (
+                      SELECT MAX(attempt.attempt_number)
+                      FROM analysis_budget_attempts AS attempt
+                      WHERE attempt.job_id = processing_jobs.id
+                    )
+                    AND latest.provider = 'minimax'
+                    AND latest.model = processing_jobs.model_version
+                    AND latest.operation = 'session_analysis'
+                    AND (
+                      latest.state = 'released'
+                      OR (
+                        latest.state = 'reconciled'
+                        AND latest.actual_input_tokens = 0
+                        AND latest.actual_output_tokens = 0
+                        AND latest.actual_microusd = 0
+                      )
+                    )
                 )
+              )
+            )
+            OR (
+              job_type = 'generate_daily_digest'
+              AND digest_input_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM daily_digest_inputs AS input
+                WHERE input.id = processing_jobs.digest_input_id
+                  AND input.source_hash = processing_jobs.input_hash
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM daily_digest_response_candidates AS candidate
+                WHERE candidate.job_id = processing_jobs.id
+              )
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS attempt
+                  WHERE attempt.job_id = processing_jobs.id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS latest
+                  WHERE latest.job_id = processing_jobs.id
+                    AND latest.attempt_number = (
+                      SELECT MAX(attempt.attempt_number)
+                      FROM analysis_budget_attempts AS attempt
+                      WHERE attempt.job_id = processing_jobs.id
+                    )
+                    AND latest.provider = 'minimax'
+                    AND latest.model = processing_jobs.model_version
+                    AND latest.operation = 'daily_digest'
+                    AND (
+                      latest.state = 'released'
+                      OR (
+                        latest.state = 'reconciled'
+                        AND latest.actual_input_tokens = 0
+                        AND latest.actual_output_tokens = 0
+                        AND latest.actual_microusd = 0
+                      )
+                    )
+                )
+              )
             )
           )
       `),
@@ -748,41 +851,86 @@ class CaptureEvidenceStore {
         SELECT job.id
         FROM processing_jobs AS job
         WHERE job.lane = 'cloud'
-          AND job.job_type = 'analyze_session'
           AND job.state = 'running'
           AND job.completed_at IS NULL
           AND job.lease_expires_at IS NOT NULL
           AND job.lease_expires_at <= @at
-          AND job.analysis_input_id IS NOT NULL
-          AND job.desired_head_hash IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM analysis_response_candidates AS candidate
-            WHERE candidate.job_id = job.id
-          )
           AND (
-            NOT EXISTS (
-              SELECT 1 FROM analysis_budget_attempts AS attempt
-              WHERE attempt.job_id = job.id
-            )
-            OR EXISTS (
-              SELECT 1 FROM analysis_budget_attempts AS latest
-              WHERE latest.job_id = job.id
-                AND latest.attempt_number = (
-                  SELECT MAX(attempt.attempt_number)
-                  FROM analysis_budget_attempts AS attempt
+            (
+              job.job_type = 'analyze_session'
+              AND job.analysis_input_id IS NOT NULL
+              AND job.desired_head_hash IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM analysis_response_candidates AS candidate
+                WHERE candidate.job_id = job.id
+              )
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS attempt
                   WHERE attempt.job_id = job.id
                 )
-                AND latest.provider = 'minimax'
-                AND latest.operation = 'session_analysis'
-                AND (
-                  latest.state = 'released'
-                  OR (
-                    latest.state = 'reconciled'
-                    AND latest.actual_input_tokens = 0
-                    AND latest.actual_output_tokens = 0
-                    AND latest.actual_microusd = 0
-                  )
+                OR EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS latest
+                  WHERE latest.job_id = job.id
+                    AND latest.attempt_number = (
+                      SELECT MAX(attempt.attempt_number)
+                      FROM analysis_budget_attempts AS attempt
+                      WHERE attempt.job_id = job.id
+                    )
+                    AND latest.provider = 'minimax'
+                    AND latest.model = job.model_version
+                    AND latest.operation = 'session_analysis'
+                    AND (
+                      latest.state = 'released'
+                      OR (
+                        latest.state = 'reconciled'
+                        AND latest.actual_input_tokens = 0
+                        AND latest.actual_output_tokens = 0
+                        AND latest.actual_microusd = 0
+                      )
+                    )
                 )
+              )
+            )
+            OR (
+              job.job_type = 'generate_daily_digest'
+              AND job.digest_input_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM daily_digest_inputs AS input
+                WHERE input.id = job.digest_input_id
+                  AND input.source_hash = job.input_hash
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM daily_digest_response_candidates AS candidate
+                WHERE candidate.job_id = job.id
+              )
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS attempt
+                  WHERE attempt.job_id = job.id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM analysis_budget_attempts AS latest
+                  WHERE latest.job_id = job.id
+                    AND latest.attempt_number = (
+                      SELECT MAX(attempt.attempt_number)
+                      FROM analysis_budget_attempts AS attempt
+                      WHERE attempt.job_id = job.id
+                    )
+                    AND latest.provider = 'minimax'
+                    AND latest.model = job.model_version
+                    AND latest.operation = 'daily_digest'
+                    AND (
+                      latest.state = 'released'
+                      OR (
+                        latest.state = 'reconciled'
+                        AND latest.actual_input_tokens = 0
+                        AND latest.actual_output_tokens = 0
+                        AND latest.actual_microusd = 0
+                      )
+                    )
+                )
+              )
             )
           )
         ORDER BY job.created_at ASC, job.id ASC
