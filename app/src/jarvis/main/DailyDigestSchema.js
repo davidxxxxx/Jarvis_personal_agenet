@@ -84,7 +84,13 @@ function isAutomaticActionDirective(value) {
         /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)/u
       );
       const beforeAction = actionIndex < 0 ? "" : sentence.slice(0, actionIndex);
-      if (!/(?:不要|不得|切勿|禁止)/u.test(beforeAction)) return true;
+      const negated = /(?:不会|不应|不能|不该|不可以|不要|不得|切勿|禁止)/u.test(
+        beforeAction
+      );
+      const descriptive = /(?:讨论|记录|描述|解释|说明|记载)[^\n]{0,60}如何/u.test(
+        beforeAction
+      );
+      if (!negated && !descriptive) return true;
     }
     return false;
   });
