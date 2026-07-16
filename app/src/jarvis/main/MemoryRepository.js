@@ -1989,10 +1989,16 @@ class MemoryRepository {
         return {
           ...this._readAppliedDailyDigestReplay(storedInput, candidateJson, evidenceSegmentIds),
           candidateId,
+          jobId: job.id,
         };
       }
       if (candidateRow.state === "superseded") {
-        return { status: "superseded", candidateId, digestInputId: storedInput.digestInputId };
+        return {
+          status: "superseded",
+          candidateId,
+          jobId: job.id,
+          digestInputId: storedInput.digestInputId,
+        };
       }
       if (candidateRow.state !== "validated" || candidateRow.disposition_at !== null) {
         throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CORRUPT");
@@ -2025,7 +2031,12 @@ class MemoryRepository {
         if (superseded.changes !== 1) {
           throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CAS_CONFLICT");
         }
-        return { status: "superseded", candidateId, digestInputId: storedInput.digestInputId };
+        return {
+          status: "superseded",
+          candidateId,
+          jobId: job.id,
+          digestInputId: storedInput.digestInputId,
+        };
       }
       this._assertDailyDigestEvidenceLineage(storedInput, evidenceSegmentIds);
       const digestResult = this._saveDigestRevisionInTransaction(
@@ -2050,7 +2061,7 @@ class MemoryRepository {
       if (applied.changes !== 1) {
         throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_CAS_CONFLICT");
       }
-      return { ...digestResult, status: "applied", candidateId };
+      return { ...digestResult, status: "applied", candidateId, jobId: job.id };
     });
     return transaction.immediate();
   }
@@ -4689,6 +4700,66 @@ class MemoryRepository {
       return this._saveDigestRevisionInTransaction(normalized);
     });
     return transaction.immediate();
+  }
+
+  getLatestDailyDigest(input) {
+    assertExactPlainObject(
+      input,
+      ["localDate", "timezone"],
+      "latest daily digest query"
+    );
+    const localDate = assertLocalDate(input.localDate);
+    const timezone = assertTimezone(input.timezone);
+    const row = this.db
+      .prepare(
+        `SELECT digest.id, digest.local_date, digest.timezone, digest.revision,
+                digest.completeness, digest.lifecycle, digest.content_json,
+                digest.created_at, digest.updated_at,
+                (
+                  SELECT COALESCE(json_group_array(json_object(
+                    'sessionId', ordered.session_id,
+                    'segmentId', ordered.transcript_segment_id,
+                    'startedAt', ordered.started_at,
+                    'endedAt', ordered.ended_at,
+                    'quote', ordered.quote_text,
+                    'audioState', ordered.audio_state
+                  )), json('[]'))
+                  FROM (
+                    SELECT session_id, transcript_segment_id, started_at, ended_at,
+                           quote_text, audio_state
+                    FROM evidence_refs
+                    WHERE entity_type = 'daily_digest' AND entity_id = digest.id
+                    ORDER BY started_at, ended_at, transcript_segment_id
+                  ) AS ordered
+                ) AS evidence_json
+         FROM daily_digests AS digest
+         WHERE digest.local_date = ? AND digest.timezone = ? AND digest.lifecycle = 'active'
+         ORDER BY digest.revision DESC LIMIT 1`
+      )
+      .get(localDate, timezone);
+    if (!row) return null;
+    let content;
+    let evidence;
+    try {
+      content = JSON.parse(row.content_json);
+      evidence = JSON.parse(row.evidence_json);
+      assertJsonObject(content, "daily digest content");
+      if (!Array.isArray(evidence)) throw new TypeError("daily digest evidence must be an array");
+    } catch {
+      throw codedError("MEMORY_PUBLIC_READ_CORRUPT");
+    }
+    return {
+      id: row.id,
+      localDate: row.local_date,
+      timezone: row.timezone,
+      revision: row.revision,
+      completeness: row.completeness,
+      lifecycle: row.lifecycle,
+      content,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      evidence,
+    };
   }
 
   readPublicSnapshot() {

@@ -5129,6 +5129,7 @@ test("atomically applies a validated daily digest candidate and replays read-onl
       leaseOwner: "digest-worker-apply",
     });
     assert.equal(applied.status, "applied");
+    assert.equal(applied.jobId, context.job.id);
     assert.equal(applied.revision, 1);
     assert.equal(applied.sourceHash, context.input.sourceHash);
     assert.deepEqual(
@@ -5325,6 +5326,7 @@ test("a paid candidate for an older immutable daily input becomes terminal super
       {
         status: "superseded",
         candidateId: persisted.candidateId,
+        jobId: context.job.id,
         digestInputId: context.input.digestInputId,
       }
     );
@@ -5976,6 +5978,69 @@ test("saveDigestRevision validates local identity and rolls back supersession on
     assert.deepEqual(db.prepare("SELECT revision, lifecycle FROM daily_digests").all(), [
       { revision: 1, lifecycle: "active" },
     ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("getLatestDailyDigest returns only the active public revision with fresh evidence", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const first = repository.saveDigestRevision({
+      localDate: "1970-01-01",
+      timezone: "Asia/Shanghai",
+      sourceHash: HASH_A,
+      inputWatermark: { privateInput: "first" },
+      content: { summary: "First active" },
+      completeness: "partial",
+      evidenceSegmentIds: ["segment-1"],
+    });
+    assert.equal(
+      repository.getLatestDailyDigest({
+        localDate: "1970-01-01",
+        timezone: "Asia/Shanghai",
+      }).id,
+      first.digestId
+    );
+    const second = repository.saveDigestRevision({
+      localDate: "1970-01-01",
+      timezone: "Asia/Shanghai",
+      sourceHash: HASH_B,
+      inputWatermark: { privateInput: "second" },
+      content: { summary: "Latest public" },
+      completeness: "final",
+      evidenceSegmentIds: ["segment-other"],
+    });
+    const latest = repository.getLatestDailyDigest({
+      localDate: "1970-01-01",
+      timezone: "Asia/Shanghai",
+    });
+    assert.equal(latest.id, second.digestId);
+    assert.equal(latest.lifecycle, "active");
+    assert.deepEqual(latest.content, { summary: "Latest public" });
+    assert.deepEqual(latest.evidence, [
+      {
+        sessionId: "session-2",
+        segmentId: "segment-other",
+        startedAt: 6000,
+        endedAt: 9000,
+        quote: "other session",
+        audioState: "available",
+      },
+    ]);
+    const serialized = JSON.stringify(latest);
+    for (const privateValue of [HASH_A, HASH_B, "privateInput", "candidate", "leaseOwner"]) {
+      assert.equal(serialized.includes(privateValue), false, privateValue);
+    }
+    assert.throws(
+      () => repository.getLatestDailyDigest({
+        localDate: "1970-01-01",
+        timezone: "Asia/Shanghai",
+        extra: true,
+      }),
+      /exact|keys|digest/i
+    );
   } finally {
     db.close();
   }
