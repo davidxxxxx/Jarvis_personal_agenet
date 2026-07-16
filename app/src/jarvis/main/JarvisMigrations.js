@@ -391,6 +391,7 @@ const DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA = `
         AND job.digest_input_id = NEW.digest_input_id
         AND attempt.job_id = job.id
         AND attempt.operation = 'daily_digest'
+        AND attempt.state = 'reconciled'
     );
   END;
 
@@ -419,6 +420,18 @@ const DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA = `
   BEGIN
     SELECT RAISE(ABORT, 'daily digest candidate history is immutable');
   END;
+`;
+
+const DAILY_DIGEST_QUERY_INDEXES = `
+  CREATE INDEX idx_transcript_segments_digest_day
+  ON transcript_segments(started_at, ended_at, id)
+  WHERE result_kind = 'final'
+    AND is_stable = 1
+    AND superseded_by IS NULL
+    AND duplicate_of IS NULL;
+
+  CREATE INDEX idx_evidence_refs_digest_day
+  ON evidence_refs(entity_type, started_at, ended_at, transcript_segment_id, entity_id);
 `;
 
 const MIGRATION_BASE_SCHEMA = `
@@ -4686,6 +4699,8 @@ const V29_OWNED_OBJECT_TARGETS = new Map([
   ["daily_digest_response_candidates_validate_insert", "daily_digest_response_candidates"],
   ["daily_digest_response_candidates_validate_update", "daily_digest_response_candidates"],
   ["daily_digest_response_candidates_no_delete", "daily_digest_response_candidates"],
+  ["idx_transcript_segments_digest_day", "transcript_segments"],
+  ["idx_evidence_refs_digest_day", "evidence_refs"],
   ["idx_processing_jobs_chunk_input", "processing_jobs"],
   ["idx_processing_jobs_compress_identity", "processing_jobs"],
   ["idx_processing_jobs_global_input", "processing_jobs"],
@@ -4815,7 +4830,6 @@ const PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS = `
         FROM daily_digest_inputs AS input
         WHERE input.id = NEW.digest_input_id
           AND input.source_hash = NEW.input_hash
-          AND input.model_version = NEW.model_version
       )
     );
   END;
@@ -4847,7 +4861,6 @@ const PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS = `
         FROM daily_digest_inputs AS input
         WHERE input.id = NEW.digest_input_id
           AND input.source_hash = NEW.input_hash
-          AND input.model_version = NEW.model_version
       )
     );
   END;
@@ -4872,6 +4885,81 @@ function assertExactV29TableColumns(db, table, expected) {
   const actual = [...columns(db, table)];
   if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
     throw new Error(`v29 schema collision for ${table}`);
+  }
+}
+
+function reviewedV29DailySchema(db) {
+  const reference = new db.constructor(":memory:");
+  try {
+    reference.exec(DAILY_DIGEST_INPUT_SCHEMA);
+    reference.exec(DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA);
+    reference.exec(`
+      CREATE TABLE transcript_segments (
+        id TEXT PRIMARY KEY,
+        started_at INTEGER,
+        ended_at INTEGER,
+        result_kind TEXT,
+        is_stable INTEGER,
+        superseded_by TEXT,
+        duplicate_of TEXT
+      );
+      CREATE TABLE evidence_refs (
+        entity_type TEXT,
+        started_at INTEGER,
+        ended_at INTEGER,
+        transcript_segment_id TEXT,
+        entity_id TEXT
+      );
+    `);
+    reference.exec(DAILY_DIGEST_QUERY_INDEXES);
+    return reference
+      .prepare(
+        `SELECT type, name, tbl_name, sql
+         FROM sqlite_master
+         WHERE sql IS NOT NULL
+           AND name IN (${[...V29_OWNED_OBJECT_TARGETS.keys()]
+             .filter((name) => !name.startsWith("processing_jobs_") && !name.startsWith("idx_processing_jobs_"))
+             .map(() => "?")
+             .join(",")}, 'daily_digest_inputs', 'daily_digest_response_candidates')
+         ORDER BY type, name`
+      )
+      .all(
+        ...[...V29_OWNED_OBJECT_TARGETS.keys()].filter(
+          (name) => !name.startsWith("processing_jobs_") && !name.startsWith("idx_processing_jobs_")
+        )
+      );
+  } finally {
+    reference.close();
+  }
+}
+
+function validateAndRepairV29DailySchema(db) {
+  const reviewed = reviewedV29DailySchema(db);
+  for (const canonical of reviewed.filter((object) => object.type === "table")) {
+    const actual = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(canonical.name);
+    if (!actual || normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(canonical.sql)) {
+      throw new Error(`v29 schema collision for ${canonical.name}`);
+    }
+  }
+  for (const canonical of reviewed.filter((object) => object.type !== "table")) {
+    const actual = db
+      .prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('index','trigger') AND name = ?"
+      )
+      .get(canonical.name);
+    if (actual && actual.tbl_name !== canonical.tbl_name) {
+      throw new Error(`v29 schema collision for ${canonical.name}`);
+    }
+    if (
+      !actual ||
+      actual.type !== canonical.type ||
+      normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(canonical.sql)
+    ) {
+      if (actual) db.exec(`DROP ${actual.type.toUpperCase()} ${actual.name}`);
+      db.exec(canonical.sql);
+    }
   }
 }
 
@@ -4973,7 +5061,10 @@ function upgradeDailyDigestV29(db) {
       created_at, completed_at, lane, analysis_input_id, desired_head_hash, digest_input_id
     )
     SELECT
-      id, session_id, track_id, chunk_id, job_type,
+      id, session_id,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE track_id END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE chunk_id END,
+      job_type,
       CASE WHEN ${legacyDigest} THEN 'superseded' ELSE state END,
       CASE WHEN ${legacyDigest} THEN 80 ELSE priority END,
       input_hash, input_version, model_version, attempt_count,
@@ -5005,6 +5096,7 @@ function upgradeDailyDigestV29(db) {
   db.exec(PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS);
   for (const object of customObjects) db.exec(object.sql);
   if (!hasCandidates) db.exec(DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA);
+  validateAndRepairV29DailySchema(db);
 }
 
 function applyJarvisMigrations(db, { now = Date.now } = {}) {

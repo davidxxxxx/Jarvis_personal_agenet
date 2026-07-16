@@ -21,6 +21,23 @@ const LOCAL_PROCESSING_JOB_TYPES = Object.freeze([
   "compress_chunk",
 ]);
 
+function assertExactPlainObject(value, expected, name) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${name} must be a plain object with exact keys`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const keys = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== wanted.length ||
+    keys.some((key, index) => key !== wanted[index])
+  ) {
+    throw new TypeError(`${name} must be a plain object with exact keys`);
+  }
+  return value;
+}
+
 class CaptureEvidenceStore {
   constructor(db, { createId, now = Date.now }) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
@@ -1813,13 +1830,19 @@ class CaptureEvidenceStore {
     return row;
   }
 
-  enqueueDailyDigestJob({ digestInputId, inputHash, inputVersion = 1, modelVersion } = {}) {
+  enqueueDailyDigestJob(inputRequest) {
+    assertExactPlainObject(
+      inputRequest,
+      ["digestInputId", "inputHash", "inputVersion", "modelVersion"],
+      "daily digest job input"
+    );
+    const { digestInputId, inputHash, inputVersion, modelVersion } = inputRequest;
     this._assertIdentifier(digestInputId, "digestInputId");
     this._assertHash(inputHash, "inputHash");
     this._assertPositiveSafeInteger(inputVersion, "inputVersion");
     this._assertText(modelVersion, "modelVersion", 128);
     const input = this.statements.getDailyDigestInputIdentity.get(digestInputId);
-    if (!input || input.source_hash !== inputHash || input.model_version !== modelVersion) {
+    if (!input || input.source_hash !== inputHash) {
       const error = new Error("DAILY_DIGEST_INPUT_IDENTITY_MISMATCH");
       error.code = "DAILY_DIGEST_INPUT_IDENTITY_MISMATCH";
       throw error;
@@ -1860,7 +1883,13 @@ class CaptureEvidenceStore {
     return this.statements.getDailyDigestJobByInput.get(digestInputId) ?? null;
   }
 
-  wakeDailyDigestJob({ digestInputId, at } = {}) {
+  wakeDailyDigestJob(inputRequest) {
+    assertExactPlainObject(
+      inputRequest,
+      ["digestInputId", "at"],
+      "daily digest wake input"
+    );
+    const { digestInputId, at } = inputRequest;
     this._assertIdentifier(digestInputId, "digestInputId");
     this._assertNonNegativeSafeInteger(at, "at");
     const existing = this.statements.getDailyDigestJobByInput.get(digestInputId);

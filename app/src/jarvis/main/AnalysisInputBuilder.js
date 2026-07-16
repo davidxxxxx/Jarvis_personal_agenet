@@ -84,7 +84,7 @@ function redactText(text, redactionTerms) {
     "[SECRET]"
   );
   output = output.replace(
-    /\b(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
+    /\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu,
     "[SECRET]"
   );
 
@@ -280,3 +280,4 @@ module.exports = AnalysisInputBuilder;
 module.exports.INPUT_CONTRACT_VERSION = INPUT_CONTRACT_VERSION;
 module.exports.REDACTION_VERSION = REDACTION_VERSION;
 module.exports.DEFAULT_MAX_PAYLOAD_BYTES = DEFAULT_MAX_PAYLOAD_BYTES;
+module.exports.redactText = redactText;

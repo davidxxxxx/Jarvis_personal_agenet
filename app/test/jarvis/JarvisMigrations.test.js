@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const Database = require("better-sqlite3");
 const {
   applyJarvisMigrations,
@@ -1463,6 +1466,14 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
         .on_delete,
       "RESTRICT"
     );
+    assert.match(
+      db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name = 'daily_digest_response_candidates_validate_insert'`
+      ).get().sql,
+      /attempt\.state = 'reconciled'/
+    );
 
     const watermark = JSON.stringify({ schemaVersion: "jarvis-daily-digest-watermark-v1" });
     const payload = JSON.stringify({
@@ -1585,6 +1596,110 @@ test("v29 preserves custom processing objects and rolls back hostile owned-name 
   }
 });
 
+test("v29 repairs missing or modified same-target owned objects before accepting an exact-column schema", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      DROP TRIGGER daily_digest_inputs_immutable_update;
+      DROP INDEX idx_daily_digest_candidates_recovery;
+      DROP TRIGGER daily_digest_response_candidates_validate_insert;
+      CREATE TRIGGER daily_digest_response_candidates_validate_insert
+      BEFORE INSERT ON daily_digest_response_candidates
+      BEGIN
+        SELECT 1;
+      END;
+      PRAGMA user_version = 28;
+    `);
+
+    applyJarvisMigrations(db, { now: () => 2_000 });
+
+    const immutable = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_inputs_immutable_update'")
+      .get()?.sql;
+    const candidateGuard = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_response_candidates_validate_insert'")
+      .get()?.sql;
+    assert.match(immutable ?? "", /RAISE\(ABORT, 'daily digest input is immutable'\)/);
+    assert.match(candidateGuard ?? "", /daily digest candidate identity mismatch/);
+    assert.ok(
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_daily_digest_candidates_recovery'").get()
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 rejects exact-column daily tables whose normalized SQL weakens checks or foreign keys", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-v29-hostile-table-"));
+  const filename = path.join(directory, "hostile.sqlite3");
+  let db = new Database(filename);
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.unsafeMode(true);
+    db.pragma("writable_schema = ON");
+    db.prepare(
+      `UPDATE sqlite_master
+       SET sql = replace(sql, ?, ?)
+       WHERE type = 'table' AND name = 'daily_digest_inputs'`
+    ).run(
+      "completeness IN ('partial','final')",
+      "completeness IN ('partial','final','hostile')"
+    );
+    db.pragma("user_version = 28");
+    db.pragma("writable_schema = OFF");
+    db.close();
+    db = new Database(filename);
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 2_000 }), /collision/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+  } finally {
+    if (db.open) db.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("v29 installs digest day-range indexes that the planner uses", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    const transcriptPlan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT id FROM transcript_segments
+         WHERE started_at < ? AND ended_at > ?
+           AND result_kind = 'final' AND is_stable = 1
+           AND superseded_by IS NULL AND duplicate_of IS NULL
+         ORDER BY started_at, id`
+      )
+      .all(2_000, 1_000)
+      .map((row) => row.detail)
+      .join(" ");
+    const evidencePlan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT transcript_segment_id FROM evidence_refs
+         WHERE entity_type = ? AND started_at < ? AND ended_at > ?
+         ORDER BY started_at, transcript_segment_id`
+      )
+      .all("memory_occurrence", 2_000, 1_000)
+      .map((row) => row.detail)
+      .join(" ");
+    assert.match(transcriptPlan, /idx_transcript_segments_digest_day/);
+    assert.match(evidencePlan, /idx_evidence_refs_digest_day/);
+  } finally {
+    db.close();
+  }
+});
+
 test("v29 preserves legacy session-anchored digest jobs as inert terminal history", () => {
   const db = new Database(":memory:");
   try {
@@ -1592,14 +1707,30 @@ test("v29 preserves legacy session-anchored digest jobs as inert terminal histor
     db.exec(`
       INSERT INTO sessions (id, started_at, ended_at, status, created_at)
       VALUES ('legacy-digest-session', 1, 2, 'completed', 1);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, strategy, sample_rate, channels, started_at, state
+      ) VALUES (
+        'legacy-digest-track', 'legacy-digest-session', 'mic', 'web-audio',
+        24000, 1, 1, 'ended'
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state,
+        format, file_sha256, sample_rate, channels
+      ) VALUES (
+        'legacy-digest-chunk', 'legacy-digest-session', 'G:\\legacy.flac', 1, 2, 1,
+        'legacy-pcm', 999, 'completed', 'legacy-digest-track', 'mic', 0, 'committed',
+        'flac', 'legacy-file', 24000, 1
+      );
       DROP TRIGGER processing_jobs_cloud_contract_insert;
       DROP TRIGGER processing_jobs_cloud_contract_update;
       PRAGMA ignore_check_constraints = ON;
       INSERT INTO processing_jobs (
-        id, session_id, job_type, state, priority, input_hash, input_version,
+        id, session_id, track_id, chunk_id, job_type, state, priority, input_hash, input_version,
         model_version, attempt_count, lane, created_at
       ) VALUES (
-        'legacy-digest-job', 'legacy-digest-session', 'generate_daily_digest',
+        'legacy-digest-job', 'legacy-digest-session', 'legacy-digest-track',
+        'legacy-digest-chunk', 'generate_daily_digest',
         'pending', 50, 'legacy-source-identity', 1, 'legacy-model', 0, 'local', 123
       );
       PRAGMA ignore_check_constraints = OFF;
@@ -1612,13 +1743,15 @@ test("v29 preserves legacy session-anchored digest jobs as inert terminal histor
     });
     assert.deepEqual(
       db.prepare(
-        `SELECT id, session_id, job_type, state, priority, input_hash, model_version,
+        `SELECT id, session_id, track_id, chunk_id, job_type, state, priority, input_hash, model_version,
                 lane, digest_input_id, error_code, completed_at
          FROM processing_jobs WHERE id = 'legacy-digest-job'`
       ).get(),
       {
         id: "legacy-digest-job",
         session_id: "legacy-digest-session",
+        track_id: null,
+        chunk_id: null,
         job_type: "generate_daily_digest",
         state: "superseded",
         priority: 80,

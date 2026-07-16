@@ -26,8 +26,7 @@
 
 **Files:**
 
-- Create: `app/src/jarvis/main/migrations/029-daily-digest-inputs.js`
-- Modify: the migration registry used by `app/src/jarvis/main/JarvisDatabase.js`
+- Modify: `app/src/jarvis/main/JarvisMigrations.js` (this repository keeps numbered schema upgrades in the central migration module rather than a `migrations/` directory)
 - Modify: `app/src/jarvis/main/ZonedCalendar.js`
 - Modify: `app/src/jarvis/main/CaptureEvidenceStore.js`
 - Modify: `app/src/jarvis/main/MemoryRepository.js`

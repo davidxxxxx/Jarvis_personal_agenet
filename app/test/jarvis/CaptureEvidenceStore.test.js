@@ -2540,6 +2540,88 @@ test("daily digest jobs are sessionless idempotent and wake by immutable input",
   );
 });
 
+test("daily digest job APIs enforce exact objects and keep model metadata out of source identity", (t) => {
+  const { db, store } = fixture(t);
+  const input = seedDailyDigestInput(db, {
+    inputHash: "2".repeat(64),
+    modelVersion: "Model-A",
+  });
+  const validEnqueue = {
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "Model-B",
+  };
+  const job = store.enqueueDailyDigestJob(validEnqueue);
+  assert.equal(job.model_version, "Model-B");
+  for (const invalid of [
+    null,
+    {},
+    { ...validEnqueue, unknown: true },
+    Object.assign(Object.create({ inherited: true }), validEnqueue),
+  ]) {
+    assert.throws(() => store.enqueueDailyDigestJob(invalid), /plain|exact|keys|input/i);
+  }
+  for (const invalid of [
+    null,
+    {},
+    { digestInputId: input.inputId, at: 100, unknown: true },
+    Object.assign(Object.create({ inherited: true }), { digestInputId: input.inputId, at: 100 }),
+  ]) {
+    assert.throws(() => store.wakeDailyDigestJob(invalid), /plain|exact|keys|input/i);
+  }
+});
+
+test("daily digest candidates require a reconciled daily-digest budget attempt", (t) => {
+  const { db, store } = fixture(t);
+  const input = seedDailyDigestInput(db, { inputHash: "1".repeat(64) });
+  const job = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  const at = Date.UTC(2026, 6, 16, 4);
+  const budget = new AnalysisBudgetRepository(db);
+  budget.initialize({ monthlyLimitMicrousd: 5_000_000, timezone: "Asia/Shanghai", at });
+  budget.reserve({
+    requestId: "digest-attempt",
+    jobId: job.id,
+    attemptNumber: 1,
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    operation: "daily_digest",
+    estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+    at: at + 1,
+  });
+  const candidateJson = JSON.stringify({ schemaVersion: "jarvis-daily-digest-v1" });
+  const insertCandidate = () =>
+    db.prepare(
+      `INSERT INTO daily_digest_response_candidates (
+         id, job_id, digest_input_id, budget_attempt_id, response_schema_version,
+         candidate_json, candidate_bytes, candidate_hash, state, created_at
+       ) VALUES (
+         'digest-candidate', ?, ?, 'digest-attempt', 'jarvis-daily-digest-v1',
+         ?, ?, ?, 'validated', ?
+       )`
+    ).run(
+      job.id,
+      input.inputId,
+      candidateJson,
+      Buffer.byteLength(candidateJson, "utf8"),
+      "3".repeat(64),
+      at + 4
+    );
+  assert.throws(insertCandidate, /identity|linkage|mismatch/i);
+  budget.markStarted({ requestId: "digest-attempt", at: at + 2 });
+  budget.reconcile({
+    requestId: "digest-attempt",
+    usage: { inputTokens: 100, outputTokens: 100 },
+    at: at + 3,
+  });
+  assert.doesNotThrow(insertCandidate);
+});
+
 test("keeps local and cloud claims disjoint and accepts only fixed cloud job types", (t) => {
   const { db, store } = fixture(t);
   seedProcessingJob(db, {

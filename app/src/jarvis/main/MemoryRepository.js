@@ -8,6 +8,7 @@ const {
   semanticCandidateHash,
 } = require("./MemoryMerger");
 const { resolveLocalDate } = require("./ZonedCalendar");
+const { redactText: redactAnalysisText } = require("./AnalysisInputBuilder");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -42,10 +43,24 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function redactDigestText(value) {
-  return String(value)
-    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_SECRET]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*\b/gi, "[REDACTED_SECRET]");
+function redactDigestText(value, redactionTerms) {
+  return redactAnalysisText(String(value), redactionTerms).replace(
+    /\[SECRET\]/gu,
+    "[REDACTED_SECRET]"
+  );
+}
+
+function digestFreeTextIsRedacted(value, redactionTerms, textContext = false) {
+  if (typeof value === "string") {
+    return !textContext || redactDigestText(value, redactionTerms) === value;
+  }
+  if (Array.isArray(value)) {
+    return value.every((item) => digestFreeTextIsRedacted(item, redactionTerms, textContext));
+  }
+  if (!value || typeof value !== "object") return true;
+  return Object.entries(value).every(([key, item]) =>
+    digestFreeTextIsRedacted(item, redactionTerms, key === "text" || key === "alternatives")
+  );
 }
 
 function pseudonymousRef(kind, value) {
@@ -91,6 +106,20 @@ function hasExactKeys(value, expected) {
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function assertExactPlainObject(value, expected, name) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${name} must be a plain object with exact keys`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${name} must be a plain object with exact keys`);
+  }
+  if (!hasExactKeys(value, expected)) {
+    throw new TypeError(`${name} must be a plain object with exact keys`);
+  }
+  return value;
 }
 
 function assertJsonObject(value, name) {
@@ -632,7 +661,6 @@ class MemoryRepository {
       completeness: row.completeness,
       inputWatermark,
       cloudPayload,
-      modelVersion: row.model_version,
     };
     const rebuiltHash = sha256(canonicalJson(tuple));
     if (
@@ -662,7 +690,34 @@ class MemoryRepository {
     };
   }
 
-  _dailyEvidenceSections({ startsAt, endsAt }) {
+  _dailyDigestRedactionTerms() {
+    const peopleAndSpeakers = this.db
+      .prepare(
+        `SELECT display_name AS value FROM people WHERE length(trim(display_name)) > 0
+         UNION
+         SELECT local_label AS value FROM speaker_clusters WHERE length(trim(local_label)) > 0
+         UNION
+         SELECT speaker_label AS value FROM transcript_segments
+         WHERE speaker_label IS NOT NULL AND length(trim(speaker_label)) > 0
+         ORDER BY value`
+      )
+      .all()
+      .map((row) => row.value);
+    const deviceLabels = this.db
+      .prepare(
+        `SELECT device_label AS value FROM audio_tracks
+         WHERE device_label IS NOT NULL AND length(trim(device_label)) > 0
+         UNION
+         SELECT device_id AS value FROM audio_tracks
+         WHERE device_id IS NOT NULL AND length(trim(device_id)) > 0
+         ORDER BY value`
+      )
+      .all()
+      .map((row) => row.value);
+    return { participants: [], otherPeople: peopleAndSpeakers, deviceLabels };
+  }
+
+  _dailyEvidenceSections({ startsAt, endsAt }, allowedSegmentIds, redactionTerms) {
     const grouped = (rows, mapper) => {
       const groups = new Map();
       for (const row of rows) {
@@ -675,27 +730,42 @@ class MemoryRepository {
           current.evidenceSegmentIds.push(row.transcript_segment_id);
         }
       }
-      return [...groups.values()]
+      const result = [...groups.values()]
         .sort((left, right) => left.row.entity_id.localeCompare(right.row.entity_id))
         .map(({ row, evidenceSegmentIds }) => mapper(row, evidenceSegmentIds.sort()));
+      for (const item of result) {
+        for (const segmentId of item.evidenceSegmentIds) {
+          if (!allowedSegmentIds.has(segmentId)) {
+            throw codedError("DAILY_DIGEST_EVIDENCE_OUT_OF_SCOPE");
+          }
+        }
+      }
+      return result;
     };
     const memoryRows = this.db
       .prepare(
-        `SELECT ref.entity_id, ref.transcript_segment_id,
+        `WITH active_manifest AS (
+           SELECT id FROM transcript_segments
+           WHERE started_at < ? AND ended_at > ?
+             AND result_kind = 'final' AND is_stable = 1
+             AND superseded_by IS NULL AND duplicate_of IS NULL
+         )
+         SELECT ref.entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.kind, item.title, item.body
          FROM evidence_refs AS ref
+         JOIN active_manifest AS manifest ON manifest.id = ref.transcript_segment_id
          JOIN memory_occurrences AS occurrence
            ON ref.entity_type = 'memory_occurrence' AND occurrence.id = ref.entity_id
          JOIN memory_items_v2 AS item ON item.id = occurrence.memory_value_id
-         WHERE ref.started_at >= ? AND ref.started_at < ?
+         WHERE ref.started_at < ? AND ref.ended_at > ?
            AND item.lifecycle IN ('active','conflict')
          ORDER BY ref.entity_id, ref.transcript_segment_id`
       )
-      .all(startsAt, endsAt);
+      .all(endsAt, startsAt, endsAt, startsAt);
     const memoryItems = grouped(memoryRows, (row, evidenceSegmentIds) => ({
       kind: row.kind,
       itemRef: pseudonymousRef("memory", row.item_id),
-      text: redactDigestText(`${row.title}: ${row.body}`),
+      text: redactDigestText(`${row.title}: ${row.body}`, redactionTerms),
       evidenceSegmentIds,
     }));
     const selectMemoryKind = (kind) =>
@@ -707,48 +777,74 @@ class MemoryRepository {
 
     const topicRows = this.db
       .prepare(
-        `SELECT ref.entity_id, ref.transcript_segment_id, topic.id AS topic_id,
+        `WITH active_manifest AS (
+           SELECT id FROM transcript_segments
+           WHERE started_at < ? AND ended_at > ?
+             AND result_kind = 'final' AND is_stable = 1
+             AND superseded_by IS NULL AND duplicate_of IS NULL
+         )
+         SELECT ref.entity_id, ref.transcript_segment_id, topic.id AS topic_id,
                 topic.name, revision.summary
          FROM evidence_refs AS ref
+         JOIN active_manifest AS manifest ON manifest.id = ref.transcript_segment_id
          JOIN topic_occurrences AS occurrence
            ON ref.entity_type = 'topic_occurrence' AND occurrence.id = ref.entity_id
          JOIN topics_v2 AS topic ON topic.id = occurrence.topic_id
          JOIN topic_revisions AS revision ON revision.id = occurrence.topic_revision_id
-         WHERE ref.started_at >= ? AND ref.started_at < ?
+         WHERE ref.started_at < ? AND ref.ended_at > ?
            AND topic.lifecycle = 'active'
          ORDER BY ref.entity_id, ref.transcript_segment_id`
       )
-      .all(startsAt, endsAt);
+      .all(endsAt, startsAt, endsAt, startsAt);
     const topics = grouped(topicRows, (row, evidenceSegmentIds) => ({
       topicRef: pseudonymousRef("topic", row.topic_id),
-      text: redactDigestText(row.summary ? `${row.name}: ${row.summary}` : row.name),
+      text: redactDigestText(
+        row.summary ? `${row.name}: ${row.summary}` : row.name,
+        redactionTerms
+      ),
       evidenceSegmentIds,
     }));
 
     const todoRows = this.db
       .prepare(
-        `SELECT ref.entity_id, ref.transcript_segment_id, todo.id AS todo_id,
+        `WITH active_manifest AS (
+           SELECT id FROM transcript_segments
+           WHERE started_at < ? AND ended_at > ?
+             AND result_kind = 'final' AND is_stable = 1
+             AND superseded_by IS NULL AND duplicate_of IS NULL
+         )
+         SELECT ref.entity_id, ref.transcript_segment_id, todo.id AS todo_id,
                 todo.status, revision.title, revision.due_text
          FROM evidence_refs AS ref
+         JOIN active_manifest AS manifest ON manifest.id = ref.transcript_segment_id
          JOIN todo_occurrences AS occurrence
            ON ref.entity_type = 'todo_occurrence' AND occurrence.id = ref.entity_id
          JOIN todos_v2 AS todo ON todo.id = occurrence.todo_instance_id
          JOIN todo_revisions AS revision ON revision.id = occurrence.todo_revision_id
-         WHERE ref.started_at >= ? AND ref.started_at < ?
+         WHERE ref.started_at < ? AND ref.ended_at > ?
            AND todo.status IN ('open','completed')
          ORDER BY ref.entity_id, ref.transcript_segment_id`
       )
-      .all(startsAt, endsAt);
+      .all(endsAt, startsAt, endsAt, startsAt);
     const todos = grouped(todoRows, (row, evidenceSegmentIds) => ({
       todoRef: pseudonymousRef("todo", row.todo_id),
-      text: redactDigestText(row.due_text ? `${row.title} (${row.due_text})` : row.title),
+      text: redactDigestText(
+        row.due_text ? `${row.title} (${row.due_text})` : row.title,
+        redactionTerms
+      ),
       status: row.status,
       evidenceSegmentIds,
     }));
 
     const conflictRows = this.db
       .prepare(
-        `SELECT conflict.id AS entity_id, ref.transcript_segment_id,
+        `WITH active_manifest AS (
+           SELECT id FROM transcript_segments
+           WHERE started_at < ? AND ended_at > ?
+             AND result_kind = 'final' AND is_stable = 1
+             AND superseded_by IS NULL AND duplicate_of IS NULL
+         )
+         SELECT conflict.id AS entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.title, item.body
          FROM memory_conflict_groups AS conflict
          JOIN memory_conflict_members AS member ON member.group_id = conflict.id
@@ -756,11 +852,12 @@ class MemoryRepository {
          JOIN memory_occurrences AS occurrence ON occurrence.memory_value_id = item.id
          JOIN evidence_refs AS ref
            ON ref.entity_type = 'memory_occurrence' AND ref.entity_id = occurrence.id
+         JOIN active_manifest AS manifest ON manifest.id = ref.transcript_segment_id
          WHERE conflict.state = 'open'
-           AND ref.started_at >= ? AND ref.started_at < ?
+           AND ref.started_at < ? AND ref.ended_at > ?
          ORDER BY conflict.id, item.id, ref.transcript_segment_id`
       )
-      .all(startsAt, endsAt);
+      .all(endsAt, startsAt, endsAt, startsAt);
     const conflictsById = new Map();
     for (const row of conflictRows) {
       let conflict = conflictsById.get(row.entity_id);
@@ -772,7 +869,7 @@ class MemoryRepository {
         };
         conflictsById.set(row.entity_id, conflict);
       }
-      const text = redactDigestText(`${row.title}: ${row.body}`);
+      const text = redactDigestText(`${row.title}: ${row.body}`, redactionTerms);
       if (!conflict.alternatives.includes(text)) conflict.alternatives.push(text);
       if (!conflict.evidenceSegmentIds.includes(row.transcript_segment_id)) {
         conflict.evidenceSegmentIds.push(row.transcript_segment_id);
@@ -783,6 +880,13 @@ class MemoryRepository {
       alternatives: conflict.alternatives.sort(),
       evidenceSegmentIds: conflict.evidenceSegmentIds.sort(),
     }));
+    for (const conflict of unresolvedConflicts) {
+      for (const segmentId of conflict.evidenceSegmentIds) {
+        if (!allowedSegmentIds.has(segmentId)) {
+          throw codedError("DAILY_DIGEST_EVIDENCE_OUT_OF_SCOPE");
+        }
+      }
+    }
     return {
       topics,
       decisions,
@@ -793,10 +897,17 @@ class MemoryRepository {
     };
   }
 
-  createDailyDigestInput({ localDate, timezone, modelVersion } = {}) {
+  createDailyDigestInput(input) {
+    assertExactPlainObject(
+      input,
+      ["localDate", "timezone", "modelVersion"],
+      "daily digest input"
+    );
+    const { localDate, timezone, modelVersion } = input;
     const boundary = resolveLocalDate({ localDate, timezone });
     const safeModelVersion = assertText(modelVersion, "modelVersion", 128);
     const transaction = this.db.transaction(() => {
+      const redactionTerms = this._dailyDigestRedactionTerms();
       const segments = this.db
         .prepare(
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
@@ -806,14 +917,14 @@ class MemoryRepository {
            FROM transcript_segments AS segment
            JOIN sessions AS session ON session.id = segment.session_id
            LEFT JOIN people AS person ON person.id = segment.person_id
-           WHERE segment.started_at >= ? AND segment.started_at < ?
+           WHERE segment.started_at < ? AND segment.ended_at > ?
              AND segment.result_kind = 'final'
              AND segment.is_stable = 1
              AND segment.superseded_by IS NULL
              AND segment.duplicate_of IS NULL
            ORDER BY segment.started_at, segment.id`
         )
-        .all(boundary.startsAt, boundary.endsAt);
+        .all(boundary.endsAt, boundary.startsAt);
       if (segments.length === 0) {
         return { status: "empty", localDate: boundary.localDate, timezone: boundary.timezone };
       }
@@ -839,7 +950,7 @@ class MemoryRepository {
               "subject",
               segment.person_id ?? `${segment.session_id}:${segment.speaker_label}`
             );
-        const text = redactDigestText(segment.text);
+        const text = redactDigestText(segment.text, redactionTerms);
         session.segments.push({
           segmentId: segment.id,
           startedAt: segment.started_at,
@@ -885,13 +996,14 @@ class MemoryRepository {
         .prepare(
           `SELECT count(*) AS count
            FROM transcript_segments
-           WHERE started_at >= ? AND started_at < ?
+           WHERE started_at < ? AND ended_at > ?
+             AND superseded_by IS NULL
+             AND duplicate_of IS NULL
              AND (
                result_kind <> 'final' OR is_stable <> 1
-               OR superseded_by IS NOT NULL OR duplicate_of IS NOT NULL
              )`
         )
-        .get(boundary.startsAt, boundary.endsAt).count;
+        .get(boundary.endsAt, boundary.startsAt).count;
       const completeness =
         pendingUpstreamRows.length > 0 ||
         incompleteSegmentCount > 0 ||
@@ -905,7 +1017,12 @@ class MemoryRepository {
         startsAt: Math.min(...segments.map((segment) => segment.started_at)),
         endsAt: Math.max(...segments.map((segment) => segment.ended_at)),
       };
-      const evidenceSections = this._dailyEvidenceSections(boundary);
+      const allowedSegmentIds = new Set(segments.map((segment) => segment.id));
+      const evidenceSections = this._dailyEvidenceSections(
+        boundary,
+        allowedSegmentIds,
+        redactionTerms
+      );
       const sections = {
         sessions,
         peopleInteractions,
@@ -951,6 +1068,9 @@ class MemoryRepository {
         completeness,
         sections,
       };
+      if (!digestFreeTextIsRedacted(cloudPayload, redactionTerms)) {
+        throw codedError("DAILY_DIGEST_REDACTION_UNVERIFIED");
+      }
       const inputWatermarkJson = canonicalJson(inputWatermark);
       const cloudPayloadJson = canonicalJson(cloudPayload);
       const inputBytes = Buffer.byteLength(cloudPayloadJson, "utf8");
@@ -965,13 +1085,25 @@ class MemoryRepository {
           completeness,
           inputWatermark,
           cloudPayload,
-          modelVersion: safeModelVersion,
         })
       );
       const existing = this.db
         .prepare("SELECT * FROM daily_digest_inputs WHERE source_hash = ?")
         .get(sourceHash);
-      if (existing) return this._mapDailyDigestInput(existing, "existing");
+      if (existing) {
+        if (
+          existing.local_date !== boundary.localDate ||
+          existing.timezone !== boundary.timezone ||
+          existing.contract_version !== DAILY_DIGEST_INPUT_CONTRACT_VERSION ||
+          existing.completeness !== completeness ||
+          existing.input_watermark_json !== inputWatermarkJson ||
+          existing.cloud_payload_json !== cloudPayloadJson ||
+          existing.input_bytes !== inputBytes
+        ) {
+          throw codedError("DAILY_DIGEST_SOURCE_HASH_COLLISION");
+        }
+        return this._mapDailyDigestInput(existing, "existing");
+      }
       const digestInputId = this._nextId("daily_digest_input");
       const createdAt = assertTimestamp(this.now(), "createdAt");
       this.db

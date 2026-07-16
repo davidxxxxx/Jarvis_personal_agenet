@@ -39,33 +39,48 @@ function seedSession(db, { id, startedAt, processingState = "ready", status = "c
 
 function seedSegment(
   db,
-  { id, sessionId, startedAt, text, personId = null, speakerLabel = "Private Name", ordinal = 0 }
+  {
+    id,
+    sessionId,
+    startedAt,
+    endedAt = startedAt + 500,
+    text,
+    personId = null,
+    speakerLabel = "Private Name",
+    ordinal = 0,
+    resultKind = "final",
+    isStable = 1,
+    supersededBy = null,
+    duplicateOf = null,
+    sourceType = "mic",
+    trackId = `track-${sessionId}`,
+  }
 ) {
-  const trackId = `track-${sessionId}`;
   db.prepare(
     `INSERT OR IGNORE INTO audio_tracks (
        id, session_id, source_type, device_id, device_label, strategy,
        sample_rate, channels, started_at, state
-     ) VALUES (?, ?, 'mic', 'private-device-id', 'Private microphone', 'web-audio',
+     ) VALUES (?, ?, ?, 'private-device-id', 'Private microphone', 'web-audio',
        24000, 1, ?, 'active')`
-  ).run(trackId, sessionId, startedAt - 1_000);
+  ).run(trackId, sessionId, sourceType, startedAt - 1_000);
   const chunkId = `chunk-${id}`;
   db.prepare(
     `INSERT INTO audio_chunks (
        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
        transcription_status, track_id, source_type, sequence_number, write_state,
        format, file_sha256, sample_rate, channels
-     ) VALUES (?, ?, ?, ?, ?, 500, ?, ?, 'completed', ?, 'mic', ?, 'committed',
+     ) VALUES (?, ?, ?, ?, ?, 500, ?, ?, 'completed', ?, ?, ?, 'committed',
        'flac', ?, 24000, 1)`
   ).run(
     chunkId,
     sessionId,
     `G:\\private-audio\\${id}.flac`,
     startedAt,
-    startedAt + 500,
+    endedAt,
     `${id}-pcm`,
     startedAt + 1_000_000,
     trackId,
+    sourceType,
     ordinal,
     `${id}-file`
   );
@@ -73,20 +88,25 @@ function seedSegment(
     `INSERT INTO transcript_segments (
        id, session_id, started_at, ended_at, person_id, speaker_label, text,
        confidence, is_stable, analysis_state, track_id, chunk_id, source_type,
-       result_kind, version, model_version, completed_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.95, 1, 'ready', ?, ?, 'mic',
-       'final', 2, 'whisper-v1', ?)`
+       result_kind, version, model_version, completed_at, superseded_by, duplicate_of
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, 0.95, ?, 'ready', ?, ?, ?,
+       ?, 2, 'whisper-v1', ?, ?, ?)`
   ).run(
     id,
     sessionId,
     startedAt,
-    startedAt + 500,
+    endedAt,
     personId,
     speakerLabel,
     text,
+    isStable,
     trackId,
     chunkId,
-    startedAt + 600
+    sourceType,
+    resultKind,
+    endedAt + 100,
+    supersededBy,
+    duplicateOf
   );
 }
 
@@ -100,7 +120,7 @@ function seedPerson(db, { id, displayName, isSelf = 0 }) {
 
 function seedLegacyMemoryEvidence(
   db,
-  { id, kind, title, body, sessionId, segmentIds, hashDigit }
+  { id, kind, title, body, sessionId, segmentIds, hashDigit, evidenceWindows = {} }
 ) {
   const slotHash = hashDigit.repeat(64);
   const valueHash = String((Number(hashDigit) + 1) % 10).repeat(64);
@@ -124,6 +144,10 @@ function seedLegacyMemoryEvidence(
   ).run(occurrenceId, id, sessionId, hashDigit.repeat(64), valueHash);
   for (const [index, segmentId] of segmentIds.entries()) {
     const segment = db.prepare("SELECT * FROM transcript_segments WHERE id = ?").get(segmentId);
+    const evidenceWindow = evidenceWindows[segmentId] ?? {
+      startedAt: segment.started_at,
+      endedAt: segment.ended_at,
+    };
     db.prepare(
       `INSERT INTO evidence_refs (
          id, entity_type, entity_id, source_analysis_input_id, session_id,
@@ -137,8 +161,8 @@ function seedLegacyMemoryEvidence(
       segmentId,
       `chunk-${segmentId}`,
       `track-${sessionId}`,
-      segment.started_at,
-      segment.ended_at,
+      evidenceWindow.startedAt,
+      evidenceWindow.endedAt,
       segment.text
     );
   }
@@ -307,6 +331,165 @@ test("daily input has fixed sections and leaks no identity device audio embeddin
   assert.match(serialized, /\[REDACTED_SECRET\]/);
 });
 
+test("daily input applies the established identity and generic-secret redaction to transcript and derived evidence text", (t) => {
+  const { db, repository } = fixture(t);
+  const { startsAt } = resolveLocalDate({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+  });
+  seedPerson(db, { id: "person-alice", displayName: "Alice Private" });
+  seedPerson(db, { id: "person-bob", displayName: "Bob Known" });
+  seedSession(db, { id: "session-private", startedAt: startsAt + 1_000 });
+  const sensitive =
+    "Alice Private told Bob Known on Private microphone MINIMAX_API_KEY=top-secret-value " +
+    "Bearer abcdefghijklmnop eyJabcdefghij.eyJklmnopqrst.eyJuvwxyzABCD " +
+    "at C:\\Users\\alice\\notes.txt";
+  seedSegment(db, {
+    id: "sensitive-segment",
+    sessionId: "session-private",
+    startedAt: startsAt + 2_000,
+    personId: "person-alice",
+    speakerLabel: "Alice Private",
+    text: sensitive,
+  });
+  seedLegacyMemoryEvidence(db, {
+    id: "sensitive-memory",
+    kind: "decision",
+    title: "Alice Private decision",
+    body: sensitive,
+    sessionId: "session-private",
+    segmentIds: ["sensitive-segment"],
+    hashDigit: "6",
+  });
+
+  const result = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+  const serialized = result.cloudPayloadJson;
+  for (const forbidden of [
+    "Alice Private",
+    "Bob Known",
+    "Private microphone",
+    "top-secret-value",
+    "abcdefghijklmnop",
+    "eyJabcdefghij",
+    "C:\\Users\\alice",
+  ]) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+  assert.match(serialized, /\[(?:PERSON|DEVICE|SECRET|PATH)\]/);
+});
+
+test("daily evidence is a subset of one active overlapping segment manifest at midnight", (t) => {
+  const { db, repository } = fixture(t);
+  const day = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });
+  seedSession(db, { id: "session-midnight", startedAt: day.startsAt - 1_000 });
+  seedSegment(db, {
+    id: "spanning-segment",
+    sessionId: "session-midnight",
+    startedAt: day.startsAt - 100,
+    endedAt: day.startsAt + 100,
+    text: "spanning evidence",
+    ordinal: 0,
+  });
+  seedSegment(db, {
+    id: "inside-segment",
+    sessionId: "session-midnight",
+    startedAt: day.startsAt + 1_000,
+    text: "inside evidence",
+    ordinal: 1,
+  });
+  seedLegacyMemoryEvidence(db, {
+    id: "midnight-decision",
+    kind: "decision",
+    title: "Midnight decision",
+    body: "spanning evidence",
+    sessionId: "session-midnight",
+    segmentIds: ["spanning-segment"],
+    evidenceWindows: {
+      "spanning-segment": { startedAt: day.startsAt, endedAt: day.startsAt + 50 },
+    },
+    hashDigit: "7",
+  });
+
+  const current = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+  const previous = repository.createDailyDigestInput({
+    localDate: "2026-07-16",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+  const allowed = new Set(current.inputWatermark.evidence.map((entry) => entry.segmentId));
+  assert.equal(allowed.has("spanning-segment"), true);
+  assert.deepEqual(current.cloudPayload.sections.decisions[0].evidenceSegmentIds, [
+    "spanning-segment",
+  ]);
+  for (const section of ["topics", "decisions", "commitments", "todosCreated", "todosCompleted", "unresolvedConflicts"]) {
+    for (const item of current.cloudPayload.sections[section]) {
+      for (const segmentId of item.evidenceSegmentIds) assert.equal(allowed.has(segmentId), true);
+    }
+  }
+  assert.equal(
+    previous.status === "empty" || previous.cloudPayload.sections.decisions.length === 0,
+    true
+  );
+});
+
+test("terminal superseded and duplicate transcript history does not make a final digest partial", (t) => {
+  const { db, repository } = fixture(t);
+  const { startsAt } = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });
+  seedSession(db, { id: "session-history", startedAt: startsAt + 1_000 });
+  seedSegment(db, {
+    id: "final-segment",
+    sessionId: "session-history",
+    startedAt: startsAt + 2_000,
+    text: "authoritative final",
+    ordinal: 0,
+  });
+  db.prepare(
+    `INSERT INTO transcript_segments (
+       id, session_id, started_at, ended_at, speaker_label, text, confidence,
+       is_stable, track_id, source_type, result_kind, superseded_by
+     ) VALUES (
+       'superseded-preview', 'session-history', ?, ?, 'Private Name', 'old preview',
+       0.4, 0, 'track-session-history', 'mic', 'provisional', 'final-segment'
+     )`
+  ).run(startsAt + 2_100, startsAt + 2_300);
+  seedSegment(db, {
+    id: "system-final",
+    sessionId: "session-history",
+    startedAt: startsAt + 2_050,
+    endedAt: startsAt + 2_450,
+    text: "system final",
+    speakerLabel: "system",
+    sourceType: "system",
+    trackId: "system-track-history",
+    ordinal: 3,
+  });
+  db.prepare(
+    `INSERT INTO transcript_segments (
+       id, session_id, started_at, ended_at, speaker_label, text, confidence,
+       is_stable, track_id, source_type, result_kind, echo_score, duplicate_of
+     ) VALUES (
+       'duplicate-final', 'session-history', ?, ?, 'Private Name', 'echoed system final',
+       0.4, 0, 'track-session-history', 'mic', 'provisional', 0.92, 'system-final'
+     )`
+  ).run(startsAt + 2_100, startsAt + 2_400);
+
+  const result = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+  assert.equal(result.completeness, "final");
+  assert.equal(result.cloudPayload.sections.transcriptCoverage.incompleteSegmentCount, 0);
+});
+
 test("daily input maps repeated evidence to the correct decision and commitment sections", (t) => {
   const { db, repository } = fixture(t);
   const { startsAt } = resolveLocalDate({
@@ -412,6 +595,60 @@ test("daily inputs are immutable idempotent revisions and reload exact persisted
   assert.notEqual(next.sourceHash, first.sourceHash);
   assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digest_inputs").get().count, 2);
   assert.equal(restarted.getDailyDigestInput(first.digestInputId).cloudPayloadJson, first.cloudPayloadJson);
+});
+
+test("daily source identity is model-independent and detects canonical hash collisions", (t) => {
+  const { db, repository } = fixture(t);
+  const { startsAt } = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });
+  seedSession(db, { id: "session-model-independent", startedAt: startsAt + 1_000 });
+  seedSegment(db, {
+    id: "model-independent-segment",
+    sessionId: "session-model-independent",
+    startedAt: startsAt + 2_000,
+    text: "same canonical evidence",
+  });
+  const first = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "Model-A",
+  });
+  const second = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "Model-B",
+  });
+  assert.equal(second.digestInputId, first.digestInputId);
+  assert.equal(second.sourceHash, first.sourceHash);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digest_inputs").get().count, 1);
+
+  db.exec("DROP TRIGGER daily_digest_inputs_immutable_update");
+  db.prepare("UPDATE daily_digest_inputs SET timezone = 'UTC' WHERE id = ?").run(first.digestInputId);
+  assert.throws(
+    () =>
+      repository.createDailyDigestInput({
+        localDate: "2026-07-17",
+        timezone: "Asia/Shanghai",
+        modelVersion: "Model-C",
+      }),
+    (error) => error?.code === "DAILY_DIGEST_SOURCE_HASH_COLLISION"
+  );
+});
+
+test("createDailyDigestInput enforces an exact plain-object contract", (t) => {
+  const { repository } = fixture(t);
+  const valid = {
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  };
+  for (const invalid of [
+    null,
+    {},
+    { ...valid, unknown: true },
+    Object.assign(Object.create({ inherited: true }), valid),
+  ]) {
+    assert.throws(() => repository.createDailyDigestInput(invalid), /plain|exact|keys|input/i);
+  }
 });
 
 test("empty local days return explicit empty without persisting cloud input", (t) => {
