@@ -11,6 +11,10 @@ const {
 const context = {
   allowedSegmentIds: new Set(["segment-1", "segment-2"]),
   allowedSubjectRefs: new Set(["SELF", "subject-0123456789abcdef"]),
+  subjectEvidenceByRef: new Map([
+    ["SELF", new Set(["segment-2"])],
+    ["subject-0123456789abcdef", new Set(["segment-1"])],
+  ]),
   completeness: "final",
   transcriptCoverage: {
     selectedSegmentCount: 2,
@@ -30,7 +34,7 @@ function candidate() {
         {
           subjectRef: "subject-0123456789abcdef",
           text: "Aligned on the launch plan.",
-          evidenceSegmentIds: ["segment-1", "segment-2"],
+          evidenceSegmentIds: ["segment-1"],
         },
       ],
       topicsAndDecisions: [],
@@ -107,6 +111,13 @@ test("requires interaction subjects to come from the immutable input", () => {
   );
 });
 
+test("requires interaction evidence to belong to that persisted subject", () => {
+  expectIssue(
+    (value) => { value.sections.interactions[0].evidenceSegmentIds = ["segment-2"]; },
+    "schema.interaction_evidence_out_of_scope"
+  );
+});
+
 test("rejects oversized strings, arrays, evidence lists, and response payloads", () => {
   expectIssue(
     (value) => { value.sections.today[0].text = "x".repeat(4_001); },
@@ -162,6 +173,10 @@ test("rejects automatic todo, calendar, and message directives in model text", (
     "Automatically create a todo for tomorrow.",
     "Auto-schedule this on the calendar.",
     "Automatically send a message to the team.",
+    "Create a todo automatically.",
+    "Please create a calendar event without asking.",
+    "Immediately send the message.",
+    "Immediately create a todo without user confirmation.",
     "自动创建一个待办并写入日历。",
   ]) {
     expectIssue(
@@ -169,6 +184,13 @@ test("rejects automatic todo, calendar, and message directives in model text", (
       "schema.automatic_action"
     );
   }
+});
+
+test("allows descriptive discussion of automatic actions without treating it as a directive", () => {
+  const payload = candidate();
+  payload.sections.today[0].text =
+    "We documented how to automatically create a todo in the app.";
+  assert.deepEqual(validateCandidateDailyDigest(payload, context), payload);
 });
 
 test("requires processing completeness to match the persisted input", () => {
@@ -208,6 +230,7 @@ test("rejects invalid validation context before trusting model output", () => {
     null,
     { ...context, allowedSegmentIds: ["segment-1"] },
     { ...context, allowedSubjectRefs: ["SELF"] },
+    { ...context, subjectEvidenceByRef: new Map([["SELF", new Set(["segment-2"]) ]]) },
     { ...context, completeness: "complete" },
     { ...context, transcriptCoverage: { ...context.transcriptCoverage, extra: true } },
   ]) {

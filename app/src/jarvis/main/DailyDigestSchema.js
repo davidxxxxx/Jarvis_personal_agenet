@@ -57,6 +57,27 @@ function exactObject(value, requiredKeys, issueCode = "schema.object_type") {
   return input;
 }
 
+function isAutomaticActionDirective(value) {
+  const actionAndTarget =
+    "(?:create|add|write|schedule|send|post)\\b[^.?!\\n]{0,160}\\b(?:todo|task|calendar|event|message|email)\\b";
+  const automaticPrefix = new RegExp(
+    `^(?:please\\s+)?(?:auto(?:matically)?|immediately)[-\\s]+${actionAndTarget}`,
+    "iu"
+  );
+  const automaticSuffix = new RegExp(
+    `^(?:please\\s+)?${actionAndTarget}[^.?!\\n]{0,80}` +
+      "(?:automatically|immediately|without\\s+asking|without\\s+(?:user\\s+)?confirmation)\\b",
+    "iu"
+  );
+  return (
+    automaticPrefix.test(value) ||
+    automaticSuffix.test(value) ||
+    /^(?:请)?(?:立即|自动)[^。\n]{0,40}(?:创建|添加|写入|安排|发送)[^。\n]{0,40}(?:待办|任务|日历|事件|消息|邮件)/u.test(
+      value
+    )
+  );
+}
+
 function boundedString(value, maxCodePoints) {
   if (
     typeof value !== "string" ||
@@ -67,12 +88,7 @@ function boundedString(value, maxCodePoints) {
   ) {
     fail("schema.string");
   }
-  if (
-    /\bauto(?:matically)?[-\s]*(?:create|add|write|schedule|send|post)\b[^.\n]{0,120}\b(?:todo|task|calendar|event|message|email)\b/iu.test(value) ||
-    /自动[^。\n]{0,40}(?:创建|添加|写入|安排|发送)[^。\n]{0,40}(?:待办|任务|日历|事件|消息|邮件)/u.test(value)
-  ) {
-    fail("schema.automatic_action");
-  }
+  if (isAutomaticActionDirective(value)) fail("schema.automatic_action");
   return value;
 }
 
@@ -120,7 +136,13 @@ function normalizeContext(context) {
   try {
     input = exactObject(
       context,
-      ["allowedSegmentIds", "allowedSubjectRefs", "completeness", "transcriptCoverage"],
+      [
+        "allowedSegmentIds",
+        "allowedSubjectRefs",
+        "subjectEvidenceByRef",
+        "completeness",
+        "transcriptCoverage",
+      ],
       "schema.validation_context"
     );
   } catch (error) {
@@ -130,10 +152,20 @@ function normalizeContext(context) {
   if (
     !(input.allowedSegmentIds instanceof Set) ||
     !(input.allowedSubjectRefs instanceof Set) ||
+    !(input.subjectEvidenceByRef instanceof Map) ||
     input.allowedSegmentIds.size < 1 ||
     input.allowedSubjectRefs.size < 1 ||
+    input.subjectEvidenceByRef.size !== input.allowedSubjectRefs.size ||
     ![...input.allowedSegmentIds].every((id) => typeof id === "string" && id.length > 0) ||
     ![...input.allowedSubjectRefs].every((id) => typeof id === "string" && id.length > 0) ||
+    [...input.subjectEvidenceByRef].some(
+      ([subjectRef, evidence]) =>
+        !input.allowedSubjectRefs.has(subjectRef) ||
+        !(evidence instanceof Set) ||
+        evidence.size < 1 ||
+        [...evidence].some((segmentId) => !input.allowedSegmentIds.has(segmentId))
+    ) ||
+    [...input.allowedSubjectRefs].some((subjectRef) => !input.subjectEvidenceByRef.has(subjectRef)) ||
     !new Set(["partial", "final"]).has(input.completeness)
   ) {
     fail("schema.validation_context");
@@ -154,6 +186,7 @@ function normalizeContext(context) {
   return {
     allowedSegmentIds: input.allowedSegmentIds,
     allowedSubjectRefs: input.allowedSubjectRefs,
+    subjectEvidenceByRef: input.subjectEvidenceByRef,
     completeness: input.completeness,
     transcriptCoverage,
   };
@@ -211,13 +244,18 @@ function validateCandidateDailyDigest(payload, context) {
       ) {
         fail("schema.subject_out_of_scope");
       }
+      const normalizedEvidence = evidenceIds(item.evidenceSegmentIds, {
+        required: true,
+        allowedSegmentIds: normalizedContext.allowedSegmentIds,
+      });
+      const subjectEvidence = normalizedContext.subjectEvidenceByRef.get(item.subjectRef);
+      if (normalizedEvidence.some((segmentId) => !subjectEvidence.has(segmentId))) {
+        fail("schema.interaction_evidence_out_of_scope");
+      }
       return {
         subjectRef: item.subjectRef,
         text: boundedString(item.text, 4_000),
-        evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
-          required: true,
-          allowedSegmentIds: normalizedContext.allowedSegmentIds,
-        }),
+        evidenceSegmentIds: normalizedEvidence,
       };
     }),
     topicsAndDecisions: factualItems(

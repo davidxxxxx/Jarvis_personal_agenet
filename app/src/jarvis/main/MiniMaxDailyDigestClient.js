@@ -4,13 +4,18 @@ const {
   DailyDigestSchemaError,
   validateCandidateDailyDigest,
 } = require("./DailyDigestSchema");
+const { compileRedactionTerms } = require("./AnalysisInputBuilder");
+const {
+  DEFAULT_DAILY_DIGEST_REQUEST_BYTES,
+  MAX_DAILY_DIGEST_COLLECTION_ITEMS,
+  MAX_DAILY_DIGEST_INPUT_BYTES,
+  MAX_DAILY_DIGEST_RESPONSE_BYTES,
+} = require("./DailyDigestContractLimits");
 
 const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
-const DEFAULT_MAX_REQUEST_BYTES = 128 * 1024;
-const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
-const MAX_PERSISTED_PAYLOAD_BYTES = 96 * 1024;
-const MAX_INPUT_ITEMS = 4_096;
+const DEFAULT_MAX_REQUEST_BYTES = DEFAULT_DAILY_DIGEST_REQUEST_BYTES;
+const DEFAULT_MAX_RESPONSE_BYTES = MAX_DAILY_DIGEST_RESPONSE_BYTES;
 const OFFICIAL_HOSTS = new Set(["api.minimaxi.com", "api.minimax.io"]);
 const LOG_KEYS = new Set([
   "requestId",
@@ -42,6 +47,11 @@ const COVERAGE_KEYS = Object.freeze([
   "startsAt",
   "endsAt",
 ]);
+const redactGenericCloudText = compileRedactionTerms({
+  participants: [],
+  otherPeople: [],
+  deviceLabels: [],
+});
 
 class DailyDigestClientError extends Error {
   constructor(code, { retryable = false, issueCode } = {}) {
@@ -105,16 +115,18 @@ function validText(value, maxCodePoints = 8_000) {
   );
 }
 
-function validPayloadText(value, maxCodePoints = 8_000) {
+function validPayloadText(value) {
   return (
     typeof value === "string" &&
     value.length > 0 &&
-    Array.from(value).length <= maxCodePoints &&
     !/[\u0000\u007f]/u.test(value)
   );
 }
 
-function validUniquePayloadStrings(value, { min = 0, max = MAX_INPUT_ITEMS } = {}) {
+function validUniquePayloadStrings(
+  value,
+  { min = 0, max = MAX_DAILY_DIGEST_COLLECTION_ITEMS } = {}
+) {
   return (
     Array.isArray(value) &&
     value.length >= min &&
@@ -144,7 +156,10 @@ function validInteger(value, { positive = false } = {}) {
   return Number.isSafeInteger(value) && (positive ? value > 0 : value >= 0);
 }
 
-function validUniqueStrings(value, { min = 0, max = MAX_INPUT_ITEMS } = {}) {
+function validUniqueStrings(
+  value,
+  { min = 0, max = MAX_DAILY_DIGEST_COLLECTION_ITEMS } = {}
+) {
   return (
     Array.isArray(value) &&
     value.length >= min &&
@@ -158,6 +173,19 @@ function validateEvidence(value, allowedSegmentIds, { min = 1 } = {}) {
   return (
     validUniqueStrings(value, { min }) &&
     value.every((segmentId) => allowedSegmentIds.has(segmentId))
+  );
+}
+
+function cloudFreeTextIsRedacted(value, textContext = false) {
+  if (typeof value === "string") {
+    return !textContext || redactGenericCloudText(value) === value;
+  }
+  if (Array.isArray(value)) {
+    return value.every((item) => cloudFreeTextIsRedacted(item, textContext));
+  }
+  if (!isPlainObject(value)) return true;
+  return Object.entries(value).every(([key, item]) =>
+    cloudFreeTextIsRedacted(item, key === "text" || key === "alternatives")
   );
 }
 
@@ -176,12 +204,13 @@ function normalizeCloudPayload(cloudPayload) {
   if (
     !Array.isArray(sections.sessions) ||
     sections.sessions.length < 1 ||
-    sections.sessions.length > MAX_INPUT_ITEMS
+    sections.sessions.length > MAX_DAILY_DIGEST_COLLECTION_ITEMS
   ) {
     throw clientError("invalid_structure");
   }
   const allowedSegmentIds = new Set();
   const allowedSubjectRefs = new Set();
+  const segmentSubjectById = new Map();
   const sessionRefs = new Set();
   for (const session of sections.sessions) {
     if (
@@ -199,7 +228,7 @@ function normalizeCloudPayload(cloudPayload) {
       (session.readyAt !== null && !validInteger(session.readyAt)) ||
       !Array.isArray(session.segments) ||
       session.segments.length < 1 ||
-      session.segments.length > MAX_INPUT_ITEMS
+      session.segments.length > MAX_DAILY_DIGEST_COLLECTION_ITEMS
     ) {
       throw clientError("invalid_structure");
     }
@@ -225,16 +254,18 @@ function normalizeCloudPayload(cloudPayload) {
       }
       allowedSegmentIds.add(segment.segmentId);
       allowedSubjectRefs.add(segment.subjectRef);
+      segmentSubjectById.set(segment.segmentId, segment.subjectRef);
     }
   }
 
   if (
     !Array.isArray(sections.peopleInteractions) ||
-    sections.peopleInteractions.length > MAX_INPUT_ITEMS
+    sections.peopleInteractions.length > MAX_DAILY_DIGEST_COLLECTION_ITEMS
   ) {
     throw clientError("invalid_structure");
   }
   const interactionRefs = new Set();
+  const subjectEvidenceByRef = new Map();
   for (const interaction of sections.peopleInteractions) {
     if (
       !exactKeys(interaction, ["subjectRef", "sessionRefs", "evidenceSegmentIds"]) ||
@@ -242,11 +273,15 @@ function normalizeCloudPayload(cloudPayload) {
       interactionRefs.has(interaction.subjectRef) ||
       !validUniqueStrings(interaction.sessionRefs, { min: 1 }) ||
       interaction.sessionRefs.some((ref) => !sessionRefs.has(ref)) ||
-      !validateEvidence(interaction.evidenceSegmentIds, allowedSegmentIds)
+      !validateEvidence(interaction.evidenceSegmentIds, allowedSegmentIds) ||
+      interaction.evidenceSegmentIds.some(
+        (segmentId) => segmentSubjectById.get(segmentId) !== interaction.subjectRef
+      )
     ) {
       throw clientError("invalid_structure");
     }
     interactionRefs.add(interaction.subjectRef);
+    subjectEvidenceByRef.set(interaction.subjectRef, new Set(interaction.evidenceSegmentIds));
   }
   if (
     interactionRefs.size !== allowedSubjectRefs.size ||
@@ -256,7 +291,7 @@ function normalizeCloudPayload(cloudPayload) {
   }
 
   const validateEvidenceSection = (items, refKey, extraKeys = [], extraCheck = () => true) => {
-    if (!Array.isArray(items) || items.length > MAX_INPUT_ITEMS) {
+    if (!Array.isArray(items) || items.length > MAX_DAILY_DIGEST_COLLECTION_ITEMS) {
       throw clientError("invalid_structure");
     }
     for (const item of items) {
@@ -288,7 +323,7 @@ function normalizeCloudPayload(cloudPayload) {
   );
   if (
     !Array.isArray(sections.unresolvedConflicts) ||
-    sections.unresolvedConflicts.length > MAX_INPUT_ITEMS
+    sections.unresolvedConflicts.length > MAX_DAILY_DIGEST_COLLECTION_ITEMS
   ) {
     throw clientError("invalid_structure");
   }
@@ -322,6 +357,7 @@ function normalizeCloudPayload(cloudPayload) {
   return {
     allowedSegmentIds,
     allowedSubjectRefs,
+    subjectEvidenceByRef,
     completeness: cloudPayload.completeness,
     transcriptCoverage: { ...coverage },
   };
@@ -331,10 +367,12 @@ function normalizeInput(input) {
   if (
     !exactKeys(input, ["cloudPayloadJson", "inputHash"]) ||
     typeof input.cloudPayloadJson !== "string" ||
-    Buffer.byteLength(input.cloudPayloadJson, "utf8") > MAX_PERSISTED_PAYLOAD_BYTES ||
     !/^[0-9a-f]{64}$/u.test(input.inputHash)
   ) {
     throw clientError("invalid_structure");
+  }
+  if (Buffer.byteLength(input.cloudPayloadJson, "utf8") > MAX_DAILY_DIGEST_INPUT_BYTES) {
+    throw clientError("input_too_large");
   }
   let cloudPayload;
   try {
@@ -343,6 +381,9 @@ function normalizeInput(input) {
     throw clientError("invalid_json");
   }
   const validationContext = normalizeCloudPayload(cloudPayload);
+  if (!cloudFreeTextIsRedacted(cloudPayload)) {
+    throw clientError("redaction_unverified");
+  }
   return {
     cloudPayloadJson: input.cloudPayloadJson,
     inputHash: input.inputHash,
@@ -373,12 +414,17 @@ function extractCandidate(body) {
   if (!isPlainObject(body) || !Array.isArray(body.choices) || body.choices.length !== 1) {
     throw clientError("invalid_structure");
   }
-  const message = body.choices[0]?.message;
+  const choice = body.choices[0];
+  const message = choice?.message;
   if (!isPlainObject(message) || Object.prototype.hasOwnProperty.call(message, "function_call")) {
     throw clientError("invalid_structure");
   }
+  const hasFinishReason = Object.prototype.hasOwnProperty.call(choice, "finish_reason");
   const toolCalls = message.tool_calls;
   if (toolCalls !== undefined && (!Array.isArray(toolCalls) || toolCalls.length > 0)) {
+    if (hasFinishReason && choice.finish_reason !== "tool_calls") {
+      throw clientError("invalid_structure");
+    }
     if (!Array.isArray(toolCalls) || toolCalls.length !== 1) {
       throw clientError("invalid_structure");
     }
@@ -394,6 +440,9 @@ function extractCandidate(body) {
     }
     return parseJsonObject(call.function.arguments);
   }
+  if (hasFinishReason && choice.finish_reason !== "stop") {
+    throw clientError("invalid_structure");
+  }
   if (typeof message.content !== "string") throw clientError("invalid_structure");
   const content = message.content.trim();
   if (content.startsWith("```")) {
@@ -405,15 +454,30 @@ function extractCandidate(body) {
   return parseJsonObject(content, { ambiguityIsStructure: true });
 }
 
-function safeTokenCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+function authoritativeTokenCount(usage, primaryKey, aliasKey) {
+  const hasPrimary = Object.prototype.hasOwnProperty.call(usage, primaryKey);
+  const hasAlias = Object.prototype.hasOwnProperty.call(usage, aliasKey);
+  if (!hasPrimary && !hasAlias) throw clientError("usage_unknown");
+  const primary = hasPrimary ? usage[primaryKey] : undefined;
+  const alias = hasAlias ? usage[aliasKey] : undefined;
+  if (
+    (hasPrimary && (!Number.isSafeInteger(primary) || primary < 0)) ||
+    (hasAlias && (!Number.isSafeInteger(alias) || alias < 0)) ||
+    (hasPrimary && hasAlias && primary !== alias)
+  ) {
+    throw clientError("usage_unknown");
+  }
+  return hasPrimary ? primary : alias;
 }
 
 function extractUsage(body) {
+  if (!isPlainObject(body?.usage)) throw clientError("usage_unknown");
   return {
-    inputTokens: safeTokenCount(body?.usage?.prompt_tokens ?? body?.usage?.input_tokens),
-    outputTokens: safeTokenCount(
-      body?.usage?.completion_tokens ?? body?.usage?.output_tokens
+    inputTokens: authoritativeTokenCount(body.usage, "prompt_tokens", "input_tokens"),
+    outputTokens: authoritativeTokenCount(
+      body.usage,
+      "completion_tokens",
+      "output_tokens"
     ),
   };
 }
@@ -429,9 +493,7 @@ async function readResponseBytes(response, maxBytes, controller) {
     }
   }
   if (!response.body || typeof response.body.getReader !== "function") {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > maxBytes) throw clientError("response_too_large");
-    return bytes;
+    throw clientError("response_stream_required");
   }
   const reader = response.body.getReader();
   const chunks = [];

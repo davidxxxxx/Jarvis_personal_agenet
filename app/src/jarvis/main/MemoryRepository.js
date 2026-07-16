@@ -9,6 +9,7 @@ const {
 } = require("./MemoryMerger");
 const { resolveLocalDate } = require("./ZonedCalendar");
 const { compileRedactionTerms } = require("./AnalysisInputBuilder");
+const { MAX_DAILY_DIGEST_INPUT_BYTES } = require("./DailyDigestContractLimits");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -20,7 +21,6 @@ const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
 const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
 const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
 const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
-const MAX_DAILY_DIGEST_INPUT_BYTES = 1024 * 1024;
 
 function codedError(code) {
   const error = new Error(code);
