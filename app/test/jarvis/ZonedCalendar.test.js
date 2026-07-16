@@ -3,7 +3,9 @@ const assert = require("node:assert/strict");
 
 const {
   assertCanonicalIanaTimezone,
+  localDateAt,
   monthKeyAt,
+  resolveLocalDate,
   resolveLocalMonth,
 } = require("../../src/jarvis/main/ZonedCalendar");
 
@@ -46,6 +48,64 @@ test("DST spring and fall months use 23-hour and 25-hour transition days", () =>
   assert.equal(fall.startsAt, Date.UTC(2026, 10, 1, 7));
   assert.equal(fall.endsAt, Date.UTC(2026, 11, 1, 8));
   assert.equal(fall.durationMs, (30 * 24 + 1) * HOUR_MS);
+});
+
+test("local dates resolve to exact half-open boundaries in Shanghai", () => {
+  const boundary = resolveLocalDate({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+  });
+
+  assert.deepEqual(boundary, {
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    startsAt: Date.UTC(2026, 6, 16, 16),
+    endsAt: Date.UTC(2026, 6, 17, 16),
+  });
+  assert.equal(
+    localDateAt({ at: boundary.startsAt - 1, timezone: "Asia/Shanghai" }),
+    "2026-07-16"
+  );
+  assert.equal(localDateAt({ at: boundary.startsAt, timezone: "Asia/Shanghai" }), "2026-07-17");
+  assert.equal(localDateAt({ at: boundary.endsAt - 1, timezone: "Asia/Shanghai" }), "2026-07-17");
+  assert.equal(localDateAt({ at: boundary.endsAt, timezone: "Asia/Shanghai" }), "2026-07-18");
+});
+
+test("local date resolution preserves DST day lengths", () => {
+  const spring = resolveLocalDate({
+    localDate: "2026-03-08",
+    timezone: "America/Los_Angeles",
+  });
+  const fall = resolveLocalDate({
+    localDate: "2026-11-01",
+    timezone: "America/Los_Angeles",
+  });
+
+  assert.equal(spring.startsAt, Date.UTC(2026, 2, 8, 8));
+  assert.equal(spring.endsAt, Date.UTC(2026, 2, 9, 7));
+  assert.equal(spring.endsAt - spring.startsAt, 23 * HOUR_MS);
+  assert.equal(fall.startsAt, Date.UTC(2026, 10, 1, 7));
+  assert.equal(fall.endsAt, Date.UTC(2026, 10, 2, 8));
+  assert.equal(fall.endsAt - fall.startsAt, 25 * HOUR_MS);
+});
+
+test("local dates reject normalization aliases and invalid calendar dates", () => {
+  for (const localDate of [
+    "2026-02-29",
+    "2026-00-01",
+    "2026-13-01",
+    "2026-07-32",
+    "2026-7-01",
+    "2026-07-1",
+    "2026-07-01T00:00:00Z",
+    20260701,
+  ]) {
+    assert.throws(() => resolveLocalDate({ localDate, timezone: "UTC" }), /localDate/i);
+  }
+  assert.throws(
+    () => resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Calcutta" }),
+    /canonical/i
+  );
 });
 
 test("month keys and timestamps reject normalization and unsafe values", () => {

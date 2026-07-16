@@ -7,6 +7,7 @@ const {
   normalizeStringSet,
   semanticCandidateHash,
 } = require("./MemoryMerger");
+const { resolveLocalDate } = require("./ZonedCalendar");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -16,6 +17,9 @@ const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
 const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
 const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
 const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
+const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
+const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
+const MAX_DAILY_DIGEST_INPUT_BYTES = 1024 * 1024;
 
 function codedError(code) {
   const error = new Error(code);
@@ -36,6 +40,16 @@ function canonicalJson(value) {
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function redactDigestText(value) {
+  return String(value)
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_SECRET]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*\b/gi, "[REDACTED_SECRET]");
+}
+
+function pseudonymousRef(kind, value) {
+  return `${kind}-${sha256(`${kind}:${value}`).slice(0, 16)}`;
 }
 
 function safeHashEqual(left, right) {
@@ -597,6 +611,409 @@ class MemoryRepository {
       throw codedError("MEMORY_INPUT_CORRUPT");
     }
     return { row, prepared, payload, tuple };
+  }
+
+  _mapDailyDigestInput(row, status = "existing") {
+    if (!row) return null;
+    let inputWatermark;
+    let cloudPayload;
+    try {
+      inputWatermark = JSON.parse(row.input_watermark_json);
+      cloudPayload = JSON.parse(row.cloud_payload_json);
+    } catch {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    const canonicalWatermark = canonicalJson(inputWatermark);
+    const canonicalPayload = canonicalJson(cloudPayload);
+    const tuple = {
+      contractVersion: row.contract_version,
+      localDate: row.local_date,
+      timezone: row.timezone,
+      completeness: row.completeness,
+      inputWatermark,
+      cloudPayload,
+      modelVersion: row.model_version,
+    };
+    const rebuiltHash = sha256(canonicalJson(tuple));
+    if (
+      row.contract_version !== DAILY_DIGEST_INPUT_CONTRACT_VERSION ||
+      canonicalWatermark !== row.input_watermark_json ||
+      canonicalPayload !== row.cloud_payload_json ||
+      Buffer.byteLength(row.cloud_payload_json, "utf8") !== row.input_bytes ||
+      !safeHashEqual(rebuiltHash, row.source_hash)
+    ) {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    return {
+      status,
+      digestInputId: row.id,
+      localDate: row.local_date,
+      timezone: row.timezone,
+      sourceHash: row.source_hash,
+      contractVersion: row.contract_version,
+      completeness: row.completeness,
+      inputWatermark,
+      inputWatermarkJson: row.input_watermark_json,
+      cloudPayload,
+      cloudPayloadJson: row.cloud_payload_json,
+      inputBytes: row.input_bytes,
+      modelVersion: row.model_version,
+      createdAt: row.created_at,
+    };
+  }
+
+  _dailyEvidenceSections({ startsAt, endsAt }) {
+    const grouped = (rows, mapper) => {
+      const groups = new Map();
+      for (const row of rows) {
+        let current = groups.get(row.entity_id);
+        if (!current) {
+          current = { row, evidenceSegmentIds: [] };
+          groups.set(row.entity_id, current);
+        }
+        if (!current.evidenceSegmentIds.includes(row.transcript_segment_id)) {
+          current.evidenceSegmentIds.push(row.transcript_segment_id);
+        }
+      }
+      return [...groups.values()]
+        .sort((left, right) => left.row.entity_id.localeCompare(right.row.entity_id))
+        .map(({ row, evidenceSegmentIds }) => mapper(row, evidenceSegmentIds.sort()));
+    };
+    const memoryRows = this.db
+      .prepare(
+        `SELECT ref.entity_id, ref.transcript_segment_id,
+                item.id AS item_id, item.kind, item.title, item.body
+         FROM evidence_refs AS ref
+         JOIN memory_occurrences AS occurrence
+           ON ref.entity_type = 'memory_occurrence' AND occurrence.id = ref.entity_id
+         JOIN memory_items_v2 AS item ON item.id = occurrence.memory_value_id
+         WHERE ref.started_at >= ? AND ref.started_at < ?
+           AND item.lifecycle IN ('active','conflict')
+         ORDER BY ref.entity_id, ref.transcript_segment_id`
+      )
+      .all(startsAt, endsAt);
+    const memoryItems = grouped(memoryRows, (row, evidenceSegmentIds) => ({
+      kind: row.kind,
+      itemRef: pseudonymousRef("memory", row.item_id),
+      text: redactDigestText(`${row.title}: ${row.body}`),
+      evidenceSegmentIds,
+    }));
+    const selectMemoryKind = (kind) =>
+      memoryItems
+        .filter((item) => item.kind === kind)
+        .map(({ kind: _kind, ...item }) => item);
+    const decisions = selectMemoryKind("decision");
+    const commitments = selectMemoryKind("commitment");
+
+    const topicRows = this.db
+      .prepare(
+        `SELECT ref.entity_id, ref.transcript_segment_id, topic.id AS topic_id,
+                topic.name, revision.summary
+         FROM evidence_refs AS ref
+         JOIN topic_occurrences AS occurrence
+           ON ref.entity_type = 'topic_occurrence' AND occurrence.id = ref.entity_id
+         JOIN topics_v2 AS topic ON topic.id = occurrence.topic_id
+         JOIN topic_revisions AS revision ON revision.id = occurrence.topic_revision_id
+         WHERE ref.started_at >= ? AND ref.started_at < ?
+           AND topic.lifecycle = 'active'
+         ORDER BY ref.entity_id, ref.transcript_segment_id`
+      )
+      .all(startsAt, endsAt);
+    const topics = grouped(topicRows, (row, evidenceSegmentIds) => ({
+      topicRef: pseudonymousRef("topic", row.topic_id),
+      text: redactDigestText(row.summary ? `${row.name}: ${row.summary}` : row.name),
+      evidenceSegmentIds,
+    }));
+
+    const todoRows = this.db
+      .prepare(
+        `SELECT ref.entity_id, ref.transcript_segment_id, todo.id AS todo_id,
+                todo.status, revision.title, revision.due_text
+         FROM evidence_refs AS ref
+         JOIN todo_occurrences AS occurrence
+           ON ref.entity_type = 'todo_occurrence' AND occurrence.id = ref.entity_id
+         JOIN todos_v2 AS todo ON todo.id = occurrence.todo_instance_id
+         JOIN todo_revisions AS revision ON revision.id = occurrence.todo_revision_id
+         WHERE ref.started_at >= ? AND ref.started_at < ?
+           AND todo.status IN ('open','completed')
+         ORDER BY ref.entity_id, ref.transcript_segment_id`
+      )
+      .all(startsAt, endsAt);
+    const todos = grouped(todoRows, (row, evidenceSegmentIds) => ({
+      todoRef: pseudonymousRef("todo", row.todo_id),
+      text: redactDigestText(row.due_text ? `${row.title} (${row.due_text})` : row.title),
+      status: row.status,
+      evidenceSegmentIds,
+    }));
+
+    const conflictRows = this.db
+      .prepare(
+        `SELECT conflict.id AS entity_id, ref.transcript_segment_id,
+                item.id AS item_id, item.title, item.body
+         FROM memory_conflict_groups AS conflict
+         JOIN memory_conflict_members AS member ON member.group_id = conflict.id
+         JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
+         JOIN memory_occurrences AS occurrence ON occurrence.memory_value_id = item.id
+         JOIN evidence_refs AS ref
+           ON ref.entity_type = 'memory_occurrence' AND ref.entity_id = occurrence.id
+         WHERE conflict.state = 'open'
+           AND ref.started_at >= ? AND ref.started_at < ?
+         ORDER BY conflict.id, item.id, ref.transcript_segment_id`
+      )
+      .all(startsAt, endsAt);
+    const conflictsById = new Map();
+    for (const row of conflictRows) {
+      let conflict = conflictsById.get(row.entity_id);
+      if (!conflict) {
+        conflict = {
+          conflictRef: pseudonymousRef("conflict", row.entity_id),
+          alternatives: [],
+          evidenceSegmentIds: [],
+        };
+        conflictsById.set(row.entity_id, conflict);
+      }
+      const text = redactDigestText(`${row.title}: ${row.body}`);
+      if (!conflict.alternatives.includes(text)) conflict.alternatives.push(text);
+      if (!conflict.evidenceSegmentIds.includes(row.transcript_segment_id)) {
+        conflict.evidenceSegmentIds.push(row.transcript_segment_id);
+      }
+    }
+    const unresolvedConflicts = [...conflictsById.values()].map((conflict) => ({
+      ...conflict,
+      alternatives: conflict.alternatives.sort(),
+      evidenceSegmentIds: conflict.evidenceSegmentIds.sort(),
+    }));
+    return {
+      topics,
+      decisions,
+      commitments,
+      todosCreated: todos.filter((todo) => todo.status === "open"),
+      todosCompleted: todos.filter((todo) => todo.status === "completed"),
+      unresolvedConflicts,
+    };
+  }
+
+  createDailyDigestInput({ localDate, timezone, modelVersion } = {}) {
+    const boundary = resolveLocalDate({ localDate, timezone });
+    const safeModelVersion = assertText(modelVersion, "modelVersion", 128);
+    const transaction = this.db.transaction(() => {
+      const segments = this.db
+        .prepare(
+          `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
+                  segment.text, segment.version, segment.person_id, segment.speaker_label,
+                  person.is_self, session.processing_state, session.timeline_version,
+                  session.ready_at
+           FROM transcript_segments AS segment
+           JOIN sessions AS session ON session.id = segment.session_id
+           LEFT JOIN people AS person ON person.id = segment.person_id
+           WHERE segment.started_at >= ? AND segment.started_at < ?
+             AND segment.result_kind = 'final'
+             AND segment.is_stable = 1
+             AND segment.superseded_by IS NULL
+             AND segment.duplicate_of IS NULL
+           ORDER BY segment.started_at, segment.id`
+        )
+        .all(boundary.startsAt, boundary.endsAt);
+      if (segments.length === 0) {
+        return { status: "empty", localDate: boundary.localDate, timezone: boundary.timezone };
+      }
+
+      const sessionsById = new Map();
+      const interactionsByRef = new Map();
+      for (const segment of segments) {
+        const sessionRef = pseudonymousRef("session", segment.session_id);
+        let session = sessionsById.get(segment.session_id);
+        if (!session) {
+          session = {
+            sessionRef,
+            processingState: segment.processing_state,
+            timelineVersion: segment.timeline_version,
+            readyAt: segment.ready_at,
+            segments: [],
+          };
+          sessionsById.set(segment.session_id, session);
+        }
+        const subjectRef = segment.is_self === 1
+          ? "SELF"
+          : pseudonymousRef(
+              "subject",
+              segment.person_id ?? `${segment.session_id}:${segment.speaker_label}`
+            );
+        const text = redactDigestText(segment.text);
+        session.segments.push({
+          segmentId: segment.id,
+          startedAt: segment.started_at,
+          endedAt: segment.ended_at,
+          subjectRef,
+          text,
+        });
+        let interaction = interactionsByRef.get(subjectRef);
+        if (!interaction) {
+          interaction = { subjectRef, sessionRefs: [], evidenceSegmentIds: [] };
+          interactionsByRef.set(subjectRef, interaction);
+        }
+        if (!interaction.sessionRefs.includes(sessionRef)) interaction.sessionRefs.push(sessionRef);
+        interaction.evidenceSegmentIds.push(segment.id);
+      }
+      const sessions = [...sessionsById.values()].sort((left, right) =>
+        left.sessionRef.localeCompare(right.sessionRef)
+      );
+      const peopleInteractions = [...interactionsByRef.values()]
+        .sort((left, right) => left.subjectRef.localeCompare(right.subjectRef))
+        .map((interaction) => ({
+          ...interaction,
+          sessionRefs: interaction.sessionRefs.sort(),
+          evidenceSegmentIds: interaction.evidenceSegmentIds.sort(),
+        }));
+
+      const rawSessionIds = [...sessionsById.keys()].sort();
+      const placeholders = rawSessionIds.map(() => "?").join(",");
+      const pendingUpstreamRows = this.db
+        .prepare(
+          `SELECT session_id, job_type, input_hash, input_version, model_version
+           FROM processing_jobs
+           WHERE session_id IN (${placeholders})
+             AND job_type <> 'generate_daily_digest'
+             AND completed_at IS NULL
+             AND state NOT IN (
+               'completed','failed','cancelled','superseded','audio_expired_before_processing'
+             )
+           ORDER BY session_id, job_type, input_hash, input_version, model_version`
+        )
+        .all(...rawSessionIds);
+      const incompleteSegmentCount = this.db
+        .prepare(
+          `SELECT count(*) AS count
+           FROM transcript_segments
+           WHERE started_at >= ? AND started_at < ?
+             AND (
+               result_kind <> 'final' OR is_stable <> 1
+               OR superseded_by IS NOT NULL OR duplicate_of IS NOT NULL
+             )`
+        )
+        .get(boundary.startsAt, boundary.endsAt).count;
+      const completeness =
+        pendingUpstreamRows.length > 0 ||
+        incompleteSegmentCount > 0 ||
+        sessions.some((session) => session.processingState !== "ready")
+          ? "partial"
+          : "final";
+      const transcriptCoverage = {
+        selectedSegmentCount: segments.length,
+        incompleteSegmentCount,
+        sessionCount: sessions.length,
+        startsAt: Math.min(...segments.map((segment) => segment.started_at)),
+        endsAt: Math.max(...segments.map((segment) => segment.ended_at)),
+      };
+      const evidenceSections = this._dailyEvidenceSections(boundary);
+      const sections = {
+        sessions,
+        peopleInteractions,
+        topics: evidenceSections.topics,
+        decisions: evidenceSections.decisions,
+        commitments: evidenceSections.commitments,
+        todosCreated: evidenceSections.todosCreated,
+        todosCompleted: evidenceSections.todosCompleted,
+        unresolvedConflicts: evidenceSections.unresolvedConflicts,
+        transcriptCoverage,
+      };
+      const inputWatermark = {
+        schemaVersion: DAILY_DIGEST_WATERMARK_VERSION,
+        localDate: boundary.localDate,
+        timezone: boundary.timezone,
+        startsAt: boundary.startsAt,
+        endsAt: boundary.endsAt,
+        evidence: segments.map((segment) => ({
+          segmentId: segment.id,
+          version: segment.version,
+          textHash: sha256(segment.text),
+          startedAt: segment.started_at,
+          endedAt: segment.ended_at,
+        })),
+        sessionStates: sessions.map((session) => ({
+          sessionRef: session.sessionRef,
+          processingState: session.processingState,
+          timelineVersion: session.timelineVersion,
+          readyAt: session.readyAt,
+        })),
+        pendingUpstreamJobs: pendingUpstreamRows.map((job) => ({
+          sessionRef: pseudonymousRef("session", job.session_id),
+          jobType: job.job_type,
+          inputHash: job.input_hash,
+          inputVersion: job.input_version,
+          modelVersion: job.model_version,
+        })),
+      };
+      const cloudPayload = {
+        schemaVersion: DAILY_DIGEST_INPUT_CONTRACT_VERSION,
+        localDate: boundary.localDate,
+        timezone: boundary.timezone,
+        completeness,
+        sections,
+      };
+      const inputWatermarkJson = canonicalJson(inputWatermark);
+      const cloudPayloadJson = canonicalJson(cloudPayload);
+      const inputBytes = Buffer.byteLength(cloudPayloadJson, "utf8");
+      if (inputBytes > MAX_DAILY_DIGEST_INPUT_BYTES) {
+        throw codedError("DAILY_DIGEST_INPUT_TOO_LARGE");
+      }
+      const sourceHash = sha256(
+        canonicalJson({
+          contractVersion: DAILY_DIGEST_INPUT_CONTRACT_VERSION,
+          localDate: boundary.localDate,
+          timezone: boundary.timezone,
+          completeness,
+          inputWatermark,
+          cloudPayload,
+          modelVersion: safeModelVersion,
+        })
+      );
+      const existing = this.db
+        .prepare("SELECT * FROM daily_digest_inputs WHERE source_hash = ?")
+        .get(sourceHash);
+      if (existing) return this._mapDailyDigestInput(existing, "existing");
+      const digestInputId = this._nextId("daily_digest_input");
+      const createdAt = assertTimestamp(this.now(), "createdAt");
+      this.db
+        .prepare(
+          `INSERT INTO daily_digest_inputs (
+             id, local_date, timezone, source_hash, contract_version, completeness,
+             input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          digestInputId,
+          boundary.localDate,
+          boundary.timezone,
+          sourceHash,
+          DAILY_DIGEST_INPUT_CONTRACT_VERSION,
+          completeness,
+          inputWatermarkJson,
+          cloudPayloadJson,
+          inputBytes,
+          safeModelVersion,
+          createdAt
+        );
+      return this._mapDailyDigestInput(
+        this.db.prepare("SELECT * FROM daily_digest_inputs WHERE id = ?").get(digestInputId),
+        "created"
+      );
+    });
+    return transaction.immediate();
+  }
+
+  getDailyDigestInput(inputId) {
+    const id = assertId(inputId, "digestInputId");
+    return this._mapDailyDigestInput(
+      this.db.prepare("SELECT * FROM daily_digest_inputs WHERE id = ?").get(id)
+    );
+  }
+
+  getDailyDigestInputBySourceHash(sourceHash) {
+    const hash = assertHash(sourceHash, "sourceHash");
+    return this._mapDailyDigestInput(
+      this.db.prepare("SELECT * FROM daily_digest_inputs WHERE source_hash = ?").get(hash)
+    );
   }
 
   createAnalysisInput(input) {

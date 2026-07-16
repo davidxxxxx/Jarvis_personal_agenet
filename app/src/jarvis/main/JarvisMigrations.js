@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 28;
+const TARGET_VERSION = 29;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -282,6 +282,143 @@ const PROCESSING_JOBS_INDEXES = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_global_input
   ON processing_jobs(job_type, input_hash, input_version, model_version)
   WHERE chunk_id IS NULL;
+`;
+
+const DAILY_DIGEST_INPUT_SCHEMA = `
+  CREATE TABLE daily_digest_inputs (
+    id TEXT PRIMARY KEY,
+    local_date TEXT NOT NULL CHECK(
+      typeof(local_date) = 'text'
+      AND local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+    ),
+    timezone TEXT NOT NULL CHECK(
+      typeof(timezone) = 'text' AND length(trim(timezone)) BETWEEN 1 AND 64
+    ),
+    source_hash TEXT NOT NULL UNIQUE CHECK(
+      typeof(source_hash) = 'text' AND length(source_hash) = 64
+      AND source_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    contract_version TEXT NOT NULL CHECK(
+      contract_version = 'jarvis-daily-digest-input-v1'
+    ),
+    completeness TEXT NOT NULL CHECK(completeness IN ('partial','final')),
+    input_watermark_json TEXT NOT NULL CHECK(
+      typeof(input_watermark_json) = 'text'
+      AND json_valid(input_watermark_json)
+      AND json_type(input_watermark_json) = 'object'
+    ),
+    cloud_payload_json TEXT NOT NULL CHECK(
+      typeof(cloud_payload_json) = 'text'
+      AND json_valid(cloud_payload_json)
+      AND json_type(cloud_payload_json) = 'object'
+    ),
+    input_bytes INTEGER NOT NULL CHECK(
+      typeof(input_bytes) = 'integer' AND input_bytes BETWEEN 2 AND 1048576
+      AND length(CAST(cloud_payload_json AS BLOB)) = input_bytes
+    ),
+    model_version TEXT NOT NULL CHECK(
+      typeof(model_version) = 'text' AND length(trim(model_version)) BETWEEN 1 AND 128
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    UNIQUE(local_date, timezone, source_hash)
+  );
+
+  CREATE TRIGGER daily_digest_inputs_immutable_update
+  BEFORE UPDATE ON daily_digest_inputs
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest input is immutable');
+  END;
+
+  CREATE TRIGGER daily_digest_inputs_immutable_delete
+  BEFORE DELETE ON daily_digest_inputs
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest input is immutable');
+  END;
+`;
+
+const DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA = `
+  CREATE TABLE daily_digest_response_candidates (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES processing_jobs(id) ON DELETE RESTRICT,
+    digest_input_id TEXT NOT NULL REFERENCES daily_digest_inputs(id) ON DELETE RESTRICT,
+    budget_attempt_id TEXT NOT NULL UNIQUE
+      REFERENCES analysis_budget_attempts(request_id) ON DELETE RESTRICT,
+    response_schema_version TEXT NOT NULL CHECK(
+      typeof(response_schema_version) = 'text'
+      AND length(trim(response_schema_version)) BETWEEN 1 AND 128
+    ),
+    candidate_json TEXT NOT NULL CHECK(
+      typeof(candidate_json) = 'text' AND json_valid(candidate_json)
+      AND json_type(candidate_json) = 'object'
+      AND json_extract(candidate_json, '$.schemaVersion') = response_schema_version
+    ),
+    candidate_bytes INTEGER NOT NULL CHECK(
+      typeof(candidate_bytes) = 'integer' AND candidate_bytes BETWEEN 2 AND 524288
+      AND length(CAST(candidate_json AS BLOB)) = candidate_bytes
+    ),
+    candidate_hash TEXT NOT NULL CHECK(
+      typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
+      AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL DEFAULT 'validated'
+      CHECK(state IN ('validated','applied','superseded')),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    disposition_at INTEGER CHECK(
+      disposition_at IS NULL OR (
+        typeof(disposition_at) = 'integer' AND disposition_at >= created_at
+      )
+    ),
+    CHECK(
+      (state = 'validated' AND disposition_at IS NULL)
+      OR (state IN ('applied','superseded') AND disposition_at IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX idx_daily_digest_candidates_recovery
+  ON daily_digest_response_candidates(state, created_at, id);
+
+  CREATE TRIGGER daily_digest_response_candidates_validate_insert
+  BEFORE INSERT ON daily_digest_response_candidates
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest candidate identity mismatch')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM processing_jobs AS job
+      JOIN analysis_budget_attempts AS attempt
+        ON attempt.request_id = NEW.budget_attempt_id
+      WHERE job.id = NEW.job_id
+        AND job.job_type = 'generate_daily_digest'
+        AND job.digest_input_id = NEW.digest_input_id
+        AND attempt.job_id = job.id
+        AND attempt.operation = 'daily_digest'
+    );
+  END;
+
+  CREATE TRIGGER daily_digest_response_candidates_validate_update
+  BEFORE UPDATE ON daily_digest_response_candidates
+  WHEN NEW.id IS NOT OLD.id
+    OR NEW.job_id IS NOT OLD.job_id
+    OR NEW.digest_input_id IS NOT OLD.digest_input_id
+    OR NEW.budget_attempt_id IS NOT OLD.budget_attempt_id
+    OR NEW.response_schema_version IS NOT OLD.response_schema_version
+    OR NEW.candidate_json IS NOT OLD.candidate_json
+    OR NEW.candidate_bytes IS NOT OLD.candidate_bytes
+    OR NEW.candidate_hash IS NOT OLD.candidate_hash
+    OR NEW.created_at IS NOT OLD.created_at
+    OR NOT (
+      OLD.state = 'validated'
+      AND NEW.state IN ('applied','superseded')
+      AND NEW.disposition_at IS NOT NULL
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest candidate transition is invalid');
+  END;
+
+  CREATE TRIGGER daily_digest_response_candidates_no_delete
+  BEFORE DELETE ON daily_digest_response_candidates
+  BEGIN
+    SELECT RAISE(ABORT, 'daily digest candidate history is immutable');
+  END;
 `;
 
 const MIGRATION_BASE_SCHEMA = `
@@ -4542,6 +4679,334 @@ function upgradeAgentWorkloadV26(db) {
   db.exec(AGENT_WORKLOAD_SCHEMA);
 }
 
+const V29_OWNED_OBJECT_TARGETS = new Map([
+  ["daily_digest_inputs_immutable_update", "daily_digest_inputs"],
+  ["daily_digest_inputs_immutable_delete", "daily_digest_inputs"],
+  ["idx_daily_digest_candidates_recovery", "daily_digest_response_candidates"],
+  ["daily_digest_response_candidates_validate_insert", "daily_digest_response_candidates"],
+  ["daily_digest_response_candidates_validate_update", "daily_digest_response_candidates"],
+  ["daily_digest_response_candidates_no_delete", "daily_digest_response_candidates"],
+  ["idx_processing_jobs_chunk_input", "processing_jobs"],
+  ["idx_processing_jobs_compress_identity", "processing_jobs"],
+  ["idx_processing_jobs_global_input", "processing_jobs"],
+  ["idx_processing_jobs_cloud_claim", "processing_jobs"],
+  ["idx_processing_jobs_analysis_input", "processing_jobs"],
+  ["idx_processing_jobs_digest_input", "processing_jobs"],
+  ["processing_jobs_cloud_contract_insert", "processing_jobs"],
+  ["processing_jobs_cloud_contract_update", "processing_jobs"],
+]);
+
+const PROCESSING_JOBS_V29_SCHEMA = `
+  CREATE TABLE processing_jobs_v29 (
+    id TEXT PRIMARY KEY,
+    session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+    track_id TEXT REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    chunk_id TEXT REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    job_type TEXT NOT NULL,
+    state TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    input_hash TEXT NOT NULL,
+    input_version INTEGER NOT NULL DEFAULT 1,
+    model_version TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    error_code TEXT,
+    blocked_reason TEXT,
+    execution_device TEXT CHECK(
+      execution_device IS NULL OR execution_device IN ('cuda','cpu','cloud')
+    ),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    lane TEXT NOT NULL DEFAULT 'local' CHECK(lane IN ('local','cloud')),
+    analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE RESTRICT,
+    desired_head_hash TEXT CHECK(
+      desired_head_hash IS NULL OR (
+        typeof(desired_head_hash) = 'text' AND length(desired_head_hash) = 64
+        AND desired_head_hash NOT GLOB '*[^0-9a-f]*'
+      )
+    ),
+    digest_input_id TEXT REFERENCES daily_digest_inputs(id) ON DELETE RESTRICT,
+    CHECK(
+      (
+        job_type = 'generate_daily_digest'
+        AND session_id IS NULL AND track_id IS NULL AND chunk_id IS NULL
+        AND lane = 'cloud' AND priority = 80
+        AND digest_input_id IS NOT NULL
+        AND analysis_input_id IS NULL AND desired_head_hash IS NULL
+      )
+      OR (
+        job_type = 'analyze_session'
+        AND session_id IS NOT NULL AND track_id IS NULL AND chunk_id IS NULL
+        AND lane = 'cloud' AND priority = 70
+        AND digest_input_id IS NULL
+        AND analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL
+      )
+      OR (
+        job_type = 'generate_daily_digest'
+        AND session_id IS NOT NULL AND track_id IS NULL AND chunk_id IS NULL
+        AND lane = 'cloud' AND priority = 80
+        AND digest_input_id IS NULL
+        AND analysis_input_id IS NULL AND desired_head_hash IS NULL
+        AND state = 'superseded'
+        AND error_code = 'LEGACY_DIGEST_IDENTITY_UNAVAILABLE'
+        AND completed_at IS NOT NULL
+      )
+      OR (
+        job_type NOT IN ('analyze_session','generate_daily_digest')
+        AND session_id IS NOT NULL AND lane = 'local'
+        AND digest_input_id IS NULL
+        AND analysis_input_id IS NULL AND desired_head_hash IS NULL
+      )
+    )
+  );
+`;
+
+const PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS = `
+  CREATE UNIQUE INDEX idx_processing_jobs_chunk_input
+  ON processing_jobs(job_type, chunk_id, input_hash, input_version, model_version)
+  WHERE chunk_id IS NOT NULL AND job_type <> 'compress_chunk';
+
+  CREATE UNIQUE INDEX idx_processing_jobs_compress_identity
+  ON processing_jobs(chunk_id, model_version)
+  WHERE chunk_id IS NOT NULL AND job_type = 'compress_chunk';
+
+  CREATE UNIQUE INDEX idx_processing_jobs_global_input
+  ON processing_jobs(
+    job_type, input_hash, input_version, model_version,
+    COALESCE(desired_head_hash, ''), COALESCE(digest_input_id, '')
+  )
+  WHERE chunk_id IS NULL;
+
+  CREATE INDEX idx_processing_jobs_cloud_claim
+  ON processing_jobs(lane, state, priority, next_retry_at, created_at, id)
+  WHERE lane = 'cloud' AND job_type IN ('analyze_session','generate_daily_digest');
+
+  CREATE UNIQUE INDEX idx_processing_jobs_analysis_input
+  ON processing_jobs(analysis_input_id, desired_head_hash)
+  WHERE job_type = 'analyze_session' AND analysis_input_id IS NOT NULL;
+
+  CREATE UNIQUE INDEX idx_processing_jobs_digest_input
+  ON processing_jobs(digest_input_id)
+  WHERE job_type = 'generate_daily_digest' AND digest_input_id IS NOT NULL;
+
+  CREATE TRIGGER processing_jobs_cloud_contract_insert
+  BEFORE INSERT ON processing_jobs
+  WHEN NEW.lane = 'cloud'
+    OR NEW.job_type IN ('analyze_session','generate_daily_digest')
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid cloud processing job')
+    WHERE (
+      NEW.job_type = 'analyze_session'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM analysis_desired_heads AS head
+        WHERE head.session_id = NEW.session_id
+          AND head.analysis_input_id = NEW.analysis_input_id
+          AND head.analysis_input_hash = NEW.input_hash
+          AND head.desired_vector_hash = NEW.desired_head_hash
+          AND json_extract(head.desired_vector_json, '$.modelVersion') = NEW.model_version
+      )
+    ) OR (
+      NEW.job_type = 'generate_daily_digest'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM daily_digest_inputs AS input
+        WHERE input.id = NEW.digest_input_id
+          AND input.source_hash = NEW.input_hash
+          AND input.model_version = NEW.model_version
+      )
+    );
+  END;
+
+  CREATE TRIGGER processing_jobs_cloud_contract_update
+  BEFORE UPDATE OF session_id, track_id, chunk_id, job_type, lane, priority,
+    input_hash, input_version, model_version, analysis_input_id, desired_head_hash,
+    digest_input_id
+  ON processing_jobs
+  WHEN NEW.lane = 'cloud'
+    OR NEW.job_type IN ('analyze_session','generate_daily_digest')
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid cloud processing job')
+    WHERE (
+      NEW.job_type = 'analyze_session'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM analysis_desired_heads AS head
+        WHERE head.session_id = NEW.session_id
+          AND head.analysis_input_id = NEW.analysis_input_id
+          AND head.analysis_input_hash = NEW.input_hash
+          AND head.desired_vector_hash = NEW.desired_head_hash
+          AND json_extract(head.desired_vector_json, '$.modelVersion') = NEW.model_version
+      )
+    ) OR (
+      NEW.job_type = 'generate_daily_digest'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM daily_digest_inputs AS input
+        WHERE input.id = NEW.digest_input_id
+          AND input.source_hash = NEW.input_hash
+          AND input.model_version = NEW.model_version
+      )
+    );
+  END;
+`;
+
+function assertV29OwnedObjectTargets(db) {
+  for (const [name, expectedTarget] of V29_OWNED_OBJECT_TARGETS) {
+    const object = db
+      .prepare(
+        `SELECT type, tbl_name FROM sqlite_master
+         WHERE name = ? AND type IN ('index','trigger')`
+      )
+      .get(name);
+    if (object && object.tbl_name !== expectedTarget) {
+      throw new Error(`v29 schema collision for ${name}`);
+    }
+  }
+}
+
+function assertExactV29TableColumns(db, table, expected) {
+  if (!tableExists(db, table)) throw new Error(`v29 schema collision for ${table}`);
+  const actual = [...columns(db, table)];
+  if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
+    throw new Error(`v29 schema collision for ${table}`);
+  }
+}
+
+function upgradeDailyDigestV29(db) {
+  for (const dependency of [
+    "sessions",
+    "processing_jobs",
+    "analysis_inputs",
+    "analysis_desired_heads",
+    "analysis_budget_attempts",
+  ]) {
+    if (!tableExists(db, dependency)) {
+      throw new Error(`v29 daily digest foundation is missing ${dependency}`);
+    }
+  }
+  assertV29OwnedObjectTargets(db);
+  const hasInputs = tableExists(db, "daily_digest_inputs");
+  const hasCandidates = tableExists(db, "daily_digest_response_candidates");
+  if (hasInputs !== hasCandidates) throw new Error("v29 daily digest schema collision");
+  if (hasInputs) {
+    assertExactV29TableColumns(db, "daily_digest_inputs", [
+      "id",
+      "local_date",
+      "timezone",
+      "source_hash",
+      "contract_version",
+      "completeness",
+      "input_watermark_json",
+      "cloud_payload_json",
+      "input_bytes",
+      "model_version",
+      "created_at",
+    ]);
+    assertExactV29TableColumns(db, "daily_digest_response_candidates", [
+      "id",
+      "job_id",
+      "digest_input_id",
+      "budget_attempt_id",
+      "response_schema_version",
+      "candidate_json",
+      "candidate_bytes",
+      "candidate_hash",
+      "state",
+      "created_at",
+      "disposition_at",
+    ]);
+  } else {
+    db.exec(DAILY_DIGEST_INPUT_SCHEMA);
+  }
+
+  const processingColumns = columns(db, "processing_jobs");
+  const requiredV28Columns = [
+    "id",
+    "session_id",
+    "track_id",
+    "chunk_id",
+    "job_type",
+    "state",
+    "priority",
+    "input_hash",
+    "input_version",
+    "model_version",
+    "attempt_count",
+    "next_retry_at",
+    "lease_owner",
+    "lease_expires_at",
+    "error_code",
+    "blocked_reason",
+    "execution_device",
+    "created_at",
+    "completed_at",
+    "lane",
+    "analysis_input_id",
+    "desired_head_hash",
+  ];
+  if (requiredV28Columns.some((column) => !processingColumns.has(column))) {
+    throw new Error("v29 processing_jobs schema collision");
+  }
+  const customObjects = db
+    .prepare(
+      `SELECT type, name, sql FROM sqlite_master
+       WHERE tbl_name = 'processing_jobs'
+         AND type IN ('index','trigger')
+         AND sql IS NOT NULL
+       ORDER BY type, name`
+    )
+    .all()
+    .filter((object) => !V29_OWNED_OBJECT_TARGETS.has(object.name));
+  const hasDigestColumn = processingColumns.has("digest_input_id");
+  const copyDigestInput = hasDigestColumn ? "digest_input_id" : "NULL";
+  const legacyDigest = `job_type = 'generate_daily_digest' AND ${copyDigestInput} IS NULL`;
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.exec(PROCESSING_JOBS_V29_SCHEMA);
+  db.exec(`
+    INSERT INTO processing_jobs_v29 (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, next_retry_at,
+      lease_owner, lease_expires_at, error_code, blocked_reason, execution_device,
+      created_at, completed_at, lane, analysis_input_id, desired_head_hash, digest_input_id
+    )
+    SELECT
+      id, session_id, track_id, chunk_id, job_type,
+      CASE WHEN ${legacyDigest} THEN 'superseded' ELSE state END,
+      CASE WHEN ${legacyDigest} THEN 80 ELSE priority END,
+      input_hash, input_version, model_version, attempt_count,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE next_retry_at END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE lease_owner END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE lease_expires_at END,
+      CASE WHEN ${legacyDigest}
+        THEN 'LEGACY_DIGEST_IDENTITY_UNAVAILABLE' ELSE error_code END,
+      CASE WHEN ${legacyDigest}
+        THEN 'legacy digest input identity unavailable' ELSE blocked_reason END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE execution_device END,
+      created_at,
+      CASE WHEN ${legacyDigest} THEN COALESCE(completed_at, created_at) ELSE completed_at END,
+      CASE WHEN ${legacyDigest} THEN 'cloud' ELSE lane END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE analysis_input_id END,
+      CASE WHEN ${legacyDigest} THEN NULL ELSE desired_head_hash END,
+      ${copyDigestInput}
+    FROM processing_jobs;
+  `);
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP TABLE processing_jobs;
+      ALTER TABLE processing_jobs_v29 RENAME TO processing_jobs;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(PROCESSING_JOBS_V29_INDEXES_AND_TRIGGERS);
+  for (const object of customObjects) db.exec(object.sql);
+  if (!hasCandidates) db.exec(DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -4812,6 +5277,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 28) {
         upgradeMemoryConflictIntegrityV28(db, fromVersion);
       }
+      if (fromVersion < 29) {
+        upgradeDailyDigestV29(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -4838,4 +5306,5 @@ module.exports = {
   SESSION_DIARIZATION_SCHEMA,
   AGENT_WORKLOAD_SCHEMA,
   upgradeAgentWorkloadV26,
+  upgradeDailyDigestV29,
 };

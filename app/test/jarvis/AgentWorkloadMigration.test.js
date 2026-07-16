@@ -21,8 +21,8 @@ test("v26 creates durable desired-head, candidate, and explicit processing-lane 
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.equal(TARGET_VERSION, 28);
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 28 });
+    assert.equal(TARGET_VERSION, 29);
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: TARGET_VERSION });
 
     const tables = schemaNames(db, "table");
     assert.ok(tables.includes("analysis_desired_heads"));
@@ -70,6 +70,7 @@ test("v26 migrates only unfinished cloud priorities and leaves unknown work loca
       VALUES ('session-v25', 1, 2, 'completed', 1);
       DROP TRIGGER processing_jobs_cloud_contract_insert;
       DROP TRIGGER processing_jobs_cloud_contract_update;
+      PRAGMA ignore_check_constraints = ON;
     `);
     const insert = db.prepare(`
       INSERT INTO processing_jobs (
@@ -83,6 +84,7 @@ test("v26 migrates only unfinished cloud priorities and leaves unknown work loca
     insert.run("unknown-open", "future_job", "pending", 7, "unknown-open", null);
 
     upgradeAgentWorkloadV26(db);
+    db.pragma("ignore_check_constraints = OFF");
     assert.deepEqual(
       db
         .prepare(

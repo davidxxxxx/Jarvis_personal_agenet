@@ -188,8 +188,8 @@ function createRepresentativeV23Database() {
 test("latest migration retains the durable v25 budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 28);
-    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: 28 });
+    assert.equal(TARGET_VERSION, 29);
+    assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 
     assert.deepEqual(
@@ -273,7 +273,7 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
         .all(),
       []
     );
-    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: 28 });
+    assert.deepEqual(migrate(db), { fromVersion: 23, toVersion: TARGET_VERSION });
     assert.deepEqual(db.prepare("SELECT id, status FROM sessions").get(), {
       id: "preserved-v23-session",
       status: "completed",
@@ -385,7 +385,10 @@ test("a v23 database upgrades once and the latest reopen is a no-op", () => {
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     const first = db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all();
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 28, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
+    });
     assert.deepEqual(
       db.prepare("SELECT name, type, sql FROM sqlite_master ORDER BY type, name").all(),
       first
@@ -414,7 +417,7 @@ test("a base v24 database replaces the legacy period trigger before revised-poli
       /period\.policy_revision = NEW\.policy_revision/
     );
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 24, toVersion: TARGET_VERSION });
     const upgradedSql = db
       .prepare(
         `SELECT sql FROM sqlite_master
@@ -454,7 +457,7 @@ test("a base v24 database replaces the legacy period trigger before revised-poli
   }
 });
 
-test("analysis budget migration preserves the separate OpenAI correction ledger", () => {
+test("v29 rejects an incomplete v23 foundation without mutating the OpenAI correction ledger", () => {
   const db = new Database(":memory:");
   try {
     db.exec(`
@@ -474,7 +477,8 @@ test("analysis budget migration preserves the separate OpenAI correction ledger"
       PRAGMA user_version = 23;
     `);
 
-    migrate(db, 23);
+    assert.throws(() => migrate(db, 23), /v29 daily digest foundation/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 23);
 
     assert.deepEqual(db.prepare("SELECT * FROM cloud_budget_settings").get(), {
       provider: "openai",

@@ -219,8 +219,8 @@ test("v27 fresh schema creates stable immutable memory subject identity", () => 
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.equal(TARGET_VERSION, 28);
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 28 });
+    assert.equal(TARGET_VERSION, 29);
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     assert.ok(schemaNames(db, "table").includes("memory_item_subjects"));
     assert.ok(schemaNames(db, "table").includes("memory_item_canonical_slots"));
     assert.deepEqual(
@@ -267,7 +267,7 @@ test("v27 backfills exact immutable subjects once and retains them after source 
     stripV27(db);
     seedV26SubjectLineage(db);
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 26, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 26, toVersion: TARGET_VERSION });
     assert.deepEqual(
       db.prepare("SELECT * FROM memory_item_subjects ORDER BY memory_item_id").all(),
       [
@@ -331,7 +331,10 @@ test("v27 backfills exact immutable subjects once and retains them after source 
     db.close();
     db = new Database(filename);
     db.pragma("foreign_keys = ON");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 28, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
+    });
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_item_subjects").get().count, 1);
 
     db.prepare("DELETE FROM sessions WHERE id = 'session-subject'").run();
@@ -387,7 +390,7 @@ test("v28 repairs a base-style v27 database with a missing post-v27 canonical br
     db.exec("DROP TRIGGER memory_supersessions_validate_slot");
     db.pragma("user_version = 27");
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 27, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 27, toVersion: TARGET_VERSION });
     assert.deepEqual(
       db
         .prepare(
@@ -520,7 +523,7 @@ test("v28 drops a hostile wrong-target subject trigger before missing bridge bac
     assert.doesNotThrow(() => {
       migrationResult = applyJarvisMigrations(db);
     });
-    assert.deepEqual(migrationResult, { fromVersion: 27, toVersion: 28 });
+    assert.deepEqual(migrationResult, { fromVersion: 27, toVersion: TARGET_VERSION });
     assert.deepEqual(
       db
         .prepare(
@@ -956,13 +959,16 @@ test("subject INSERT freeze stops the direct-SQL conflict bypass before relation
   }
 });
 
-test("v28 reopen is a no-op", () => {
+test("latest reopen is a no-op while retaining v28 conflict triggers", () => {
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     const memberTrigger = triggerSql(db, "memory_conflict_members_validate_slot");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 28, toVersion: 28 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
+    });
     assert.equal(triggerSql(db, "memory_conflict_members_validate_slot"), memberTrigger);
   } finally {
     db.close();

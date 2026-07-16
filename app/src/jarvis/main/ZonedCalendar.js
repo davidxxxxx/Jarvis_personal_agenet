@@ -60,6 +60,33 @@ function parseMonthKey(value) {
   return { year, month: Number(match[2]) };
 }
 
+function parseLocalDate(value) {
+  if (typeof value !== "string") throw new TypeError("localDate must use YYYY-MM-DD");
+  const match = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.exec(value);
+  if (!match || Number(match[1]) === 0) {
+    throw new TypeError("localDate must use YYYY-MM-DD");
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < MIN_SUPPORTED_YEAR || year > MAX_SUPPORTED_YEAR) {
+    throw new RangeError(
+      `localDate must use a supported year ${MIN_SUPPORTED_YEAR}-${MAX_SUPPORTED_YEAR}`
+    );
+  }
+  const candidate = new Date(0);
+  candidate.setUTCHours(0, 0, 0, 0);
+  candidate.setUTCFullYear(year, month - 1, day);
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day
+  ) {
+    throw new TypeError("localDate must be a valid calendar date");
+  }
+  return { year, month, day };
+}
+
 function formatterFor(timezone) {
   let formatter = formatterCache.get(timezone);
   if (!formatter) {
@@ -127,6 +154,33 @@ function monthKeyAt({ at, timezone }) {
   return monthKey;
 }
 
+function localDateAt({ at, timezone }) {
+  const safeAt = assertSafeTimestamp(at);
+  const safeTimezone = assertCanonicalIanaTimezone(timezone);
+  const localDate = dateKeyAt(safeAt, safeTimezone);
+  const year = Number(localDate.slice(0, 4));
+  if (year < MIN_SUPPORTED_YEAR || year > MAX_SUPPORTED_YEAR) {
+    throw new RangeError("at is outside the supported range");
+  }
+  return localDate;
+}
+
+function resolveLocalDate({ localDate, timezone }) {
+  const { year, month, day } = parseLocalDate(localDate);
+  const safeTimezone = assertCanonicalIanaTimezone(timezone);
+  const following = new Date(0);
+  following.setUTCHours(0, 0, 0, 0);
+  following.setUTCFullYear(year, month - 1, day + 1);
+  const startsAt = firstInstantOfLocalDate({ year, month, day, timezone: safeTimezone });
+  const endsAt = firstInstantOfLocalDate({
+    year: following.getUTCFullYear(),
+    month: following.getUTCMonth() + 1,
+    day: following.getUTCDate(),
+    timezone: safeTimezone,
+  });
+  return { localDate, timezone: safeTimezone, startsAt, endsAt };
+}
+
 function resolveLocalMonth({ monthKey, timezone }) {
   const { year, month } = parseMonthKey(monthKey);
   const safeTimezone = assertCanonicalIanaTimezone(timezone);
@@ -150,6 +204,8 @@ function resolveLocalMonth({ monthKey, timezone }) {
 
 module.exports = {
   assertCanonicalIanaTimezone,
+  localDateAt,
   monthKeyAt,
+  resolveLocalDate,
   resolveLocalMonth,
 };

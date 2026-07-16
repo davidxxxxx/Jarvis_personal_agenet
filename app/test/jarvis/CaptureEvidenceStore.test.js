@@ -61,16 +61,17 @@ function seedProcessingJob(db, overrides = {}) {
       id, session_id, job_type, state, priority,
       input_hash, input_version, model_version, attempt_count,
       next_retry_at, lease_owner, lease_expires_at, error_code,
-      lane, analysis_input_id, desired_head_hash, created_at, completed_at
+      lane, analysis_input_id, desired_head_hash, digest_input_id, created_at, completed_at
     ) VALUES (
-      @id, 's1', @jobType, @state, @priority,
+      @id, @sessionId, @jobType, @state, @priority,
       @inputHash, @inputVersion, @modelVersion, @attemptCount,
       @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
-      @lane, @analysisInputId, @desiredHeadHash, @createdAt, @completedAt
+      @lane, @analysisInputId, @desiredHeadHash, @digestInputId, @createdAt, @completedAt
     )
   `
   ).run({
     id: "lease-job",
+    sessionId: "s1",
     jobType: "transcribe_chunk",
     state: "pending",
     priority: 0,
@@ -85,10 +86,44 @@ function seedProcessingJob(db, overrides = {}) {
     lane: "local",
     analysisInputId: null,
     desiredHeadHash: null,
+    digestInputId: null,
     createdAt: 100,
     completedAt: null,
     ...overrides,
   });
+}
+
+function seedDailyDigestInput(db, overrides = {}) {
+  const inputHash = overrides.inputHash ?? "9".repeat(64);
+  const inputId = overrides.inputId ?? `digest-input-${inputHash.slice(0, 8)}`;
+  const payload = JSON.stringify({
+    schemaVersion: "jarvis-daily-digest-input-v1",
+    sessions: [],
+    peopleInteractions: [],
+    topics: [],
+    decisions: [],
+    commitments: [],
+    todosCreated: [],
+    todosCompleted: [],
+    unresolvedConflicts: [],
+    transcriptCoverage: { segmentCount: 0 },
+  });
+  db.prepare(
+    `INSERT OR IGNORE INTO daily_digest_inputs (
+       id, local_date, timezone, source_hash, contract_version, completeness,
+       input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+     ) VALUES (
+       ?, '2026-07-17', 'Asia/Shanghai', ?, 'jarvis-daily-digest-input-v1', 'final',
+       '{"schemaVersion":"jarvis-daily-digest-watermark-v1"}', ?, ?, ?, 100
+     )`
+  ).run(
+    inputId,
+    inputHash,
+    payload,
+    Buffer.byteLength(payload, "utf8"),
+    overrides.modelVersion ?? "MiniMax-M2.7"
+  );
+  return { inputId, inputHash };
 }
 
 function seedCloudAnalysisRecovery(
@@ -2449,6 +2484,62 @@ test("claims by durable priority even when a lower-priority state was deferred",
   );
 });
 
+test("daily digest jobs are sessionless idempotent and wake by immutable input", (t) => {
+  const { db, store } = fixture(t, { createId: (prefix) => `${prefix}-fixed` });
+  const input = seedDailyDigestInput(db, { inputHash: "4".repeat(64) });
+  const first = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  const replay = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+
+  assert.equal(first.id, replay.id);
+  assert.equal(first.session_id, null);
+  assert.equal(first.digest_input_id, input.inputId);
+  assert.equal(first.priority, 80);
+  assert.equal(first.lane, "cloud");
+  assert.equal(store.getDailyDigestJobByInput(input.inputId).id, first.id);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM processing_jobs").get().count, 1);
+
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'retry', next_retry_at = 999, error_code = 'OFFLINE'
+     WHERE id = ?`
+  ).run(first.id);
+  const woken = store.wakeDailyDigestJob({ digestInputId: input.inputId, at: 500 });
+  assert.equal(woken.id, first.id);
+  assert.equal(woken.state, "retry");
+  assert.equal(woken.next_retry_at, 500);
+
+  assert.throws(
+    () =>
+      store.enqueueDailyDigestJob({
+        digestInputId: input.inputId,
+        inputHash: "3".repeat(64),
+        inputVersion: 1,
+        modelVersion: "MiniMax-M2.7",
+      }),
+    /identity|mismatch/i
+  );
+  assert.throws(
+    () =>
+      store.enqueueCloudJob({
+        sessionId: "s1",
+        jobType: "generate_daily_digest",
+        inputHash: input.inputHash,
+        modelVersion: "MiniMax-M2.7",
+      }),
+    /fixed cloud|analysis/i
+  );
+});
+
 test("keeps local and cloud claims disjoint and accepts only fixed cloud job types", (t) => {
   const { db, store } = fixture(t);
   seedProcessingJob(db, {
@@ -2457,12 +2548,16 @@ test("keeps local and cloud claims disjoint and accepts only fixed cloud job typ
     priority: 30,
     inputHash: "local-final",
   });
+  const digestInput = seedDailyDigestInput(db, { inputHash: "7".repeat(64) });
   seedProcessingJob(db, {
     id: "cloud-digest",
+    sessionId: null,
     jobType: "generate_daily_digest",
     priority: 80,
-    inputHash: "cloud-digest",
+    inputHash: digestInput.inputHash,
+    modelVersion: "MiniMax-M2.7",
     lane: "cloud",
+    digestInputId: digestInput.inputId,
   });
   seedProcessingJob(db, {
     id: "unknown-local",
@@ -2506,15 +2601,19 @@ test("generic lease recovery never mutates cloud work", (t) => {
     leaseExpiresAt: 200,
     inputHash: "local-expired",
   });
+  const digestInput = seedDailyDigestInput(db, { inputHash: "6".repeat(64) });
   seedProcessingJob(db, {
     id: "cloud-expired",
+    sessionId: null,
     jobType: "generate_daily_digest",
     state: "running",
     priority: 80,
     lane: "cloud",
     leaseOwner: "cloud-old",
     leaseExpiresAt: 200,
-    inputHash: "cloud-expired",
+    inputHash: digestInput.inputHash,
+    modelVersion: "MiniMax-M2.7",
+    digestInputId: digestInput.inputId,
   });
 
   assert.equal(store.recoverExpiredLeases(200), 1);
@@ -2688,11 +2787,11 @@ test("cloud candidate lease recovery refuses live, ambiguous, and non-analysis w
     },
     {
       name: "daily digest",
-      seed({ store }) {
-        const job = store.enqueueCloudJob({
-          sessionId: "s1",
-          jobType: "generate_daily_digest",
-          inputHash: "9".repeat(64),
+      seed({ db, store }) {
+        const digestInput = seedDailyDigestInput(db, { inputHash: "9".repeat(64) });
+        const job = store.enqueueDailyDigestJob({
+          digestInputId: digestInput.inputId,
+          inputHash: digestInput.inputHash,
           inputVersion: 1,
           modelVersion: "MiniMax-M2.7",
         });
@@ -2768,11 +2867,11 @@ test("expired cloud pre-start recovery refuses ambiguous paid candidate and non-
     },
     {
       name: "daily digest",
-      seed: ({ store }) => {
-        const job = store.enqueueCloudJob({
-          sessionId: "s1",
-          jobType: "generate_daily_digest",
-          inputHash: "8".repeat(64),
+      seed: ({ db, store }) => {
+        const digestInput = seedDailyDigestInput(db, { inputHash: "8".repeat(64) });
+        const job = store.enqueueDailyDigestJob({
+          digestInputId: digestInput.inputId,
+          inputHash: digestInput.inputHash,
           inputVersion: 1,
           modelVersion: "MiniMax-M2.7",
         });
@@ -2886,12 +2985,16 @@ test("agent admission backlog includes running and future-retry local work only"
     completedAt: 400,
     inputHash: "terminal-final",
   });
+  const digestInput = seedDailyDigestInput(db, { inputHash: "5".repeat(64) });
   seedProcessingJob(db, {
     id: "cloud-digest",
+    sessionId: null,
     jobType: "generate_daily_digest",
     priority: 80,
     lane: "cloud",
-    inputHash: "cloud-digest-backlog",
+    inputHash: digestInput.inputHash,
+    modelVersion: "MiniMax-M2.7",
+    digestInputId: digestInput.inputId,
   });
   seedProcessingJob(db, {
     id: "unknown-local",

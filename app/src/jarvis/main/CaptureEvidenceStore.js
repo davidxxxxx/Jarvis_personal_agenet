@@ -20,7 +20,6 @@ const LOCAL_PROCESSING_JOB_TYPES = Object.freeze([
   "resolve_identities",
   "compress_chunk",
 ]);
-const CLOUD_PROCESSING_JOB_TYPES = Object.freeze(["analyze_session", "generate_daily_digest"]);
 
 class CaptureEvidenceStore {
   constructor(db, { createId, now = Date.now }) {
@@ -558,11 +557,11 @@ class CaptureEvidenceStore {
         INSERT OR IGNORE INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state, priority,
           input_hash, input_version, model_version, attempt_count,
-          lane, analysis_input_id, desired_head_hash, created_at
+          lane, analysis_input_id, desired_head_hash, digest_input_id, created_at
         ) VALUES (
           @id, @sessionId, NULL, NULL, @jobType, 'pending', @priority,
           @inputHash, @inputVersion, @modelVersion, 0,
-          'cloud', @analysisInputId, @desiredHeadHash, @createdAt
+          'cloud', @analysisInputId, @desiredHeadHash, NULL, @createdAt
         )
       `),
       getCloudJobByIdentity: db.prepare(`
@@ -573,7 +572,38 @@ class CaptureEvidenceStore {
           AND model_version = @modelVersion
           AND analysis_input_id IS @analysisInputId
           AND desired_head_hash IS @desiredHeadHash
+          AND digest_input_id IS NULL
           AND chunk_id IS NULL
+      `),
+      getDailyDigestInputIdentity: db.prepare(`
+        SELECT id, source_hash, model_version
+        FROM daily_digest_inputs
+        WHERE id = ?
+      `),
+      insertDailyDigestJob: db.prepare(`
+        INSERT OR IGNORE INTO processing_jobs (
+          id, session_id, track_id, chunk_id, job_type, state, priority,
+          input_hash, input_version, model_version, attempt_count,
+          lane, analysis_input_id, desired_head_hash, digest_input_id, created_at
+        ) VALUES (
+          @id, NULL, NULL, NULL, 'generate_daily_digest', 'pending', 80,
+          @inputHash, @inputVersion, @modelVersion, 0,
+          'cloud', NULL, NULL, @digestInputId, @createdAt
+        )
+      `),
+      getDailyDigestJobByInput: db.prepare(`
+        SELECT * FROM processing_jobs
+        WHERE job_type = 'generate_daily_digest'
+          AND digest_input_id = ?
+      `),
+      wakeDailyDigestJob: db.prepare(`
+        UPDATE processing_jobs
+        SET next_retry_at = @at
+        WHERE job_type = 'generate_daily_digest'
+          AND digest_input_id = @digestInputId
+          AND state IN ('pending','retry')
+          AND completed_at IS NULL
+          AND (next_retry_at IS NULL OR next_retry_at > @at)
       `),
       listClaimableCloudJobs: db.prepare(`
         SELECT * FROM processing_jobs
@@ -584,7 +614,7 @@ class CaptureEvidenceStore {
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
           AND priority < @priorityBefore
           AND (
-            job_type = 'generate_daily_digest'
+            (job_type = 'generate_daily_digest' AND digest_input_id IS NOT NULL)
             OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
           )
         ORDER BY priority ASC, created_at ASC, id ASC
@@ -604,7 +634,7 @@ class CaptureEvidenceStore {
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
           AND priority < @priorityBefore
           AND (
-            job_type = 'generate_daily_digest'
+            (job_type = 'generate_daily_digest' AND digest_input_id IS NOT NULL)
             OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
           )
       `),
@@ -1735,22 +1765,18 @@ class CaptureEvidenceStore {
     modelVersion,
   } = {}) {
     this._assertIdentifier(sessionId, "sessionId");
-    if (!CLOUD_PROCESSING_JOB_TYPES.includes(jobType)) {
-      throw new TypeError("jobType must be a fixed cloud processing type");
+    if (jobType !== "analyze_session") {
+      throw new TypeError("enqueueCloudJob accepts only fixed cloud analysis work");
     }
     this._assertHash(inputHash, "inputHash");
     this._assertPositiveSafeInteger(inputVersion, "inputVersion");
     this._assertText(modelVersion, "modelVersion", 128);
-    if (jobType === "analyze_session") {
-      this._assertIdentifier(analysisInputId, "analysisInputId");
-      this._assertHash(desiredHeadHash, "desiredHeadHash");
-    } else if (analysisInputId !== null || desiredHeadHash !== null) {
-      throw new TypeError("daily digest cloud jobs must not use an analysis input head");
-    }
-    const priority = jobType === "analyze_session" ? 70 : 80;
+    this._assertIdentifier(analysisInputId, "analysisInputId");
+    this._assertHash(desiredHeadHash, "desiredHeadHash");
+    const priority = 70;
     const createdAt = this.now();
     this._assertNonNegativeSafeInteger(createdAt, "createdAt");
-    const id = this.createId(jobType === "analyze_session" ? "job_analysis" : "job_digest");
+    const id = this.createId("job_analysis");
     this._assertIdentifier(id, "jobId");
     this.statements.insertCloudJob.run({
       id,
@@ -1785,6 +1811,62 @@ class CaptureEvidenceStore {
       throw error;
     }
     return row;
+  }
+
+  enqueueDailyDigestJob({ digestInputId, inputHash, inputVersion = 1, modelVersion } = {}) {
+    this._assertIdentifier(digestInputId, "digestInputId");
+    this._assertHash(inputHash, "inputHash");
+    this._assertPositiveSafeInteger(inputVersion, "inputVersion");
+    this._assertText(modelVersion, "modelVersion", 128);
+    const input = this.statements.getDailyDigestInputIdentity.get(digestInputId);
+    if (!input || input.source_hash !== inputHash || input.model_version !== modelVersion) {
+      const error = new Error("DAILY_DIGEST_INPUT_IDENTITY_MISMATCH");
+      error.code = "DAILY_DIGEST_INPUT_IDENTITY_MISMATCH";
+      throw error;
+    }
+    const createdAt = this.now();
+    this._assertNonNegativeSafeInteger(createdAt, "createdAt");
+    const id = this.createId("job_digest");
+    this._assertIdentifier(id, "jobId");
+    this.statements.insertDailyDigestJob.run({
+      id,
+      digestInputId,
+      inputHash,
+      inputVersion,
+      modelVersion,
+      createdAt,
+    });
+    const row = this.statements.getDailyDigestJobByInput.get(digestInputId);
+    if (
+      !row ||
+      row.session_id !== null ||
+      row.input_hash !== inputHash ||
+      row.input_version !== inputVersion ||
+      row.model_version !== modelVersion ||
+      row.lane !== "cloud" ||
+      row.priority !== 80 ||
+      row.analysis_input_id !== null ||
+      row.desired_head_hash !== null
+    ) {
+      const error = new Error("DAILY_DIGEST_JOB_IDENTITY_COLLISION");
+      error.code = "DAILY_DIGEST_JOB_IDENTITY_COLLISION";
+      throw error;
+    }
+    return row;
+  }
+
+  getDailyDigestJobByInput(digestInputId) {
+    this._assertIdentifier(digestInputId, "digestInputId");
+    return this.statements.getDailyDigestJobByInput.get(digestInputId) ?? null;
+  }
+
+  wakeDailyDigestJob({ digestInputId, at } = {}) {
+    this._assertIdentifier(digestInputId, "digestInputId");
+    this._assertNonNegativeSafeInteger(at, "at");
+    const existing = this.statements.getDailyDigestJobByInput.get(digestInputId);
+    if (!existing) throw new Error(`daily digest job for ${digestInputId} does not exist`);
+    this.statements.wakeDailyDigestJob.run({ digestInputId, at });
+    return this.statements.getDailyDigestJobByInput.get(digestInputId);
   }
 
   claimJobs({ owner, at, leaseMs, limit, priorityBefore = Number.MAX_SAFE_INTEGER }) {

@@ -1418,3 +1418,220 @@ test("v15 leaves every genuine v14 transcript row and schema relationship unchan
     db.close();
   }
 });
+
+test("v29 creates immutable digest inputs candidates and sessionless digest job identity", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db, { now: () => 1_000 });
+
+    assert.equal(TARGET_VERSION, 29);
+    assert.deepEqual(columnNames(db, "daily_digest_inputs"), [
+      "id",
+      "local_date",
+      "timezone",
+      "source_hash",
+      "contract_version",
+      "completeness",
+      "input_watermark_json",
+      "cloud_payload_json",
+      "input_bytes",
+      "model_version",
+      "created_at",
+    ]);
+    assert.deepEqual(columnNames(db, "daily_digest_response_candidates"), [
+      "id",
+      "job_id",
+      "digest_input_id",
+      "budget_attempt_id",
+      "response_schema_version",
+      "candidate_json",
+      "candidate_bytes",
+      "candidate_hash",
+      "state",
+      "created_at",
+      "disposition_at",
+    ]);
+    assert.ok(columnNames(db, "processing_jobs").includes("digest_input_id"));
+    assert.equal(
+      db.pragma("foreign_key_list(daily_digest_response_candidates)").find((fk) => fk.from === "job_id")
+        .on_delete,
+      "RESTRICT"
+    );
+    assert.equal(
+      db.pragma("foreign_key_list(processing_jobs)").find((fk) => fk.from === "digest_input_id")
+        .on_delete,
+      "RESTRICT"
+    );
+
+    const watermark = JSON.stringify({ schemaVersion: "jarvis-daily-digest-watermark-v1" });
+    const payload = JSON.stringify({
+      schemaVersion: "jarvis-daily-digest-input-v1",
+      sessions: [],
+      peopleInteractions: [],
+      topics: [],
+      decisions: [],
+      commitments: [],
+      todosCreated: [],
+      todosCompleted: [],
+      unresolvedConflicts: [],
+      transcriptCoverage: { segmentCount: 0 },
+    });
+    db.prepare(
+      `INSERT INTO daily_digest_inputs (
+         id, local_date, timezone, source_hash, contract_version, completeness,
+         input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+       ) VALUES (?, '2026-07-17', 'Asia/Shanghai', ?,
+         'jarvis-daily-digest-input-v1', 'final', ?, ?, ?, 'MiniMax-M2.7', 1000)`
+    ).run("digest-input-1", "a".repeat(64), watermark, payload, Buffer.byteLength(payload));
+    db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, job_type, state, priority, input_hash, input_version,
+         model_version, attempt_count, lane, digest_input_id, created_at
+       ) VALUES (
+         'digest-job-1', NULL, 'generate_daily_digest', 'pending', 80, ?, 1,
+         'MiniMax-M2.7', 0, 'cloud', 'digest-input-1', 1000
+       )`
+    ).run("a".repeat(64));
+    assert.deepEqual(
+      db.prepare(
+        `SELECT session_id, lane, priority, digest_input_id, analysis_input_id, desired_head_hash
+         FROM processing_jobs WHERE id = 'digest-job-1'`
+      ).get(),
+      {
+        session_id: null,
+        lane: "cloud",
+        priority: 80,
+        digest_input_id: "digest-input-1",
+        analysis_input_id: null,
+        desired_head_hash: null,
+      }
+    );
+    assert.throws(
+      () => db.prepare("UPDATE daily_digest_inputs SET completeness = 'partial' WHERE id = ?").run("digest-input-1"),
+      /immutable/i
+    );
+    assert.throws(
+      () => db.prepare("DELETE FROM daily_digest_inputs WHERE id = ?").run("digest-input-1"),
+      /immutable|foreign key/i
+    );
+    assert.throws(
+      () =>
+        db.prepare(
+          `INSERT INTO processing_jobs (
+             id, session_id, job_type, state, priority, input_hash, input_version,
+             model_version, lane, digest_input_id, created_at
+           ) VALUES ('bad-digest-session', 'missing', 'generate_daily_digest', 'pending', 80,
+             ?, 1, 'MiniMax-M2.7', 'cloud', 'digest-input-1', 1000)`
+        ).run("a".repeat(64)),
+      /invalid|foreign key|check constraint/i
+    );
+    assert.throws(
+      () =>
+        db.prepare(
+          `INSERT INTO processing_jobs (
+             id, session_id, job_type, state, priority, input_hash, input_version,
+             model_version, lane, created_at
+           ) VALUES ('bad-local-session', NULL, 'transcribe_chunk', 'pending', 30,
+             'local-input', 1, 'model', 'local', 1000)`
+        ).run(),
+      /invalid|not null|constraint/i
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 preserves custom processing objects and rolls back hostile owned-name collisions", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      CREATE INDEX custom_processing_state ON processing_jobs(state, created_at);
+      CREATE TRIGGER custom_processing_guard
+      BEFORE UPDATE OF id ON processing_jobs
+      BEGIN
+        SELECT RAISE(ABORT, 'custom processing identity is immutable');
+      END;
+      PRAGMA user_version = 28;
+    `);
+    applyJarvisMigrations(db, { now: () => 2_000 });
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='custom_processing_state'").get());
+    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='custom_processing_guard'").get());
+
+    db.exec(`
+      CREATE TABLE hostile_trigger_owner (id INTEGER PRIMARY KEY);
+      DROP TRIGGER daily_digest_inputs_immutable_update;
+      CREATE TRIGGER daily_digest_inputs_immutable_update
+      BEFORE INSERT ON hostile_trigger_owner
+      BEGIN
+        SELECT RAISE(ABORT, 'hostile same-name trigger');
+      END;
+      PRAGMA user_version = 28;
+    `);
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+      .all();
+    assert.throws(() => applyJarvisMigrations(db, { now: () => 3_000 }), /collision/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 28);
+    assert.deepEqual(
+      db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all(),
+      schemaBefore
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v29 preserves legacy session-anchored digest jobs as inert terminal history", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('legacy-digest-session', 1, 2, 'completed', 1);
+      DROP TRIGGER processing_jobs_cloud_contract_insert;
+      DROP TRIGGER processing_jobs_cloud_contract_update;
+      PRAGMA ignore_check_constraints = ON;
+      INSERT INTO processing_jobs (
+        id, session_id, job_type, state, priority, input_hash, input_version,
+        model_version, attempt_count, lane, created_at
+      ) VALUES (
+        'legacy-digest-job', 'legacy-digest-session', 'generate_daily_digest',
+        'pending', 50, 'legacy-source-identity', 1, 'legacy-model', 0, 'local', 123
+      );
+      PRAGMA ignore_check_constraints = OFF;
+      PRAGMA user_version = 28;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 28,
+      toVersion: 29,
+    });
+    assert.deepEqual(
+      db.prepare(
+        `SELECT id, session_id, job_type, state, priority, input_hash, model_version,
+                lane, digest_input_id, error_code, completed_at
+         FROM processing_jobs WHERE id = 'legacy-digest-job'`
+      ).get(),
+      {
+        id: "legacy-digest-job",
+        session_id: "legacy-digest-session",
+        job_type: "generate_daily_digest",
+        state: "superseded",
+        priority: 80,
+        input_hash: "legacy-source-identity",
+        model_version: "legacy-model",
+        lane: "cloud",
+        digest_input_id: null,
+        error_code: "LEGACY_DIGEST_IDENTITY_UNAVAILABLE",
+        completed_at: 123,
+      }
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
