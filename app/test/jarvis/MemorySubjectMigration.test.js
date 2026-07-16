@@ -25,6 +25,41 @@ function schemaNames(db, type) {
     .map(({ name }) => name);
 }
 
+function triggerSql(db, name) {
+  return db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name)
+    ?.sql;
+}
+
+function installBaseV27TriggerStubs(db) {
+  db.exec(`
+    DROP TRIGGER IF EXISTS memory_supersessions_validate_slot;
+    DROP TRIGGER IF EXISTS memory_conflict_members_validate_slot;
+    DROP TRIGGER IF EXISTS memory_conflict_groups_validate_resolution;
+    DROP TRIGGER IF EXISTS memory_items_v2_terminal_lifecycle;
+
+    CREATE TRIGGER memory_supersessions_validate_slot
+    BEFORE INSERT ON memory_supersessions
+    BEGIN
+      SELECT 1 /* base-v27-old */;
+    END;
+    CREATE TRIGGER memory_conflict_members_validate_slot
+    BEFORE INSERT ON memory_conflict_members
+    BEGIN
+      SELECT 1 /* base-v27-old */;
+    END;
+    CREATE TRIGGER memory_conflict_groups_validate_resolution
+    BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
+    BEGIN
+      SELECT 1 /* base-v27-old */;
+    END;
+    CREATE TRIGGER memory_items_v2_terminal_lifecycle
+    BEFORE UPDATE OF lifecycle ON memory_items_v2
+    BEGIN
+      SELECT 1 /* base-v27-old */;
+    END;
+  `);
+}
+
 function stripV27(db) {
   const lineageTrigger = db
     .prepare(
@@ -184,8 +219,8 @@ test("v27 fresh schema creates stable immutable memory subject identity", () => 
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.equal(TARGET_VERSION, 27);
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 27 });
+    assert.equal(TARGET_VERSION, 28);
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 28 });
     assert.ok(schemaNames(db, "table").includes("memory_item_subjects"));
     assert.ok(schemaNames(db, "table").includes("memory_item_canonical_slots"));
     assert.deepEqual(
@@ -232,7 +267,7 @@ test("v27 backfills exact immutable subjects once and retains them after source 
     stripV27(db);
     seedV26SubjectLineage(db);
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 26, toVersion: 27 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 26, toVersion: 28 });
     assert.deepEqual(
       db.prepare("SELECT * FROM memory_item_subjects ORDER BY memory_item_id").all(),
       [
@@ -296,7 +331,7 @@ test("v27 backfills exact immutable subjects once and retains them after source 
     db.close();
     db = new Database(filename);
     db.pragma("foreign_keys = ON");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 27, toVersion: 27 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 28, toVersion: 28 });
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_item_subjects").get().count, 1);
 
     db.prepare("DELETE FROM sessions WHERE id = 'session-subject'").run();
@@ -312,6 +347,175 @@ test("v27 backfills exact immutable subjects once and retains them after source 
   } finally {
     if (db.open) db.close();
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("v28 repairs a base-style v27 database with a missing post-v27 canonical bridge", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    const expectedSlot = canonicalTupleHash([
+      "memory",
+      "fact",
+      canonicalizeText("Post-v27 preference"),
+      ["person-self"],
+    ]);
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body,
+        confidence, lifecycle, source_analysis_input_id, provenance,
+        created_at, updated_at
+      ) VALUES (
+        'memory-post-v27', 'fact', '${HASH_B}', '${HASH_C}',
+        'Post-v27 preference', 'Prefer the local runtime.', 0.9, 'active',
+        NULL, 'legacy_unverified', 2200, 2200
+      );
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-post-v27', 'person', 'person-self');
+    `);
+    installBaseV27TriggerStubs(db);
+    db.exec("DROP TRIGGER memory_supersessions_validate_slot");
+    db.pragma("user_version = 27");
+
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 27, toVersion: 28 });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-post-v27'`
+        )
+        .get(),
+      { canonical_slot_key: expectedSlot, algorithm: "canonical-v1" }
+    );
+    for (const name of [
+      "memory_supersessions_validate_slot",
+      "memory_conflict_members_validate_slot",
+      "memory_conflict_groups_validate_resolution",
+      "memory_items_v2_terminal_lifecycle",
+    ]) {
+      assert.doesNotMatch(triggerSql(db, name), /base-v27-old/);
+    }
+    assert.match(
+      triggerSql(db, "memory_conflict_members_validate_slot"),
+      /existing_slot\.canonical_slot_key/
+    );
+    assert.match(
+      triggerSql(db, "memory_conflict_groups_validate_resolution"),
+      /member_slot\.canonical_slot_key/
+    );
+
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body,
+         confidence, lifecycle, source_analysis_input_id, provenance,
+         created_at, updated_at
+       ) VALUES (
+         'memory-post-v27-peer', 'fact', ?, '${HASH_D}',
+         'Post-v27 preference', 'Prefer the hybrid runtime.', 0.8, 'active',
+         NULL, 'legacy_unverified', 2300, 2300
+       )`
+    ).run(expectedSlot);
+    db.exec(`
+      INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+      VALUES ('memory-post-v27-peer', 'person', 'person-self');
+    `);
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('memory-post-v27-peer', ?, 'canonical-v1')`
+    ).run(expectedSlot);
+    db.exec(`
+      INSERT INTO memory_conflict_groups (
+        id, slot_key, episode, state, selected_member_id, resolved_at,
+        created_at, updated_at
+      ) VALUES ('post-v27-group', '${HASH_B}', 1, 'open', NULL, NULL, 2400, 2400);
+      INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+      VALUES
+        ('post-v27-group', 'memory-post-v27', 2400),
+        ('post-v27-group', 'memory-post-v27-peer', 2400);
+      UPDATE memory_items_v2 SET lifecycle = 'conflict', updated_at = 2400
+      WHERE id IN ('memory-post-v27', 'memory-post-v27-peer');
+      UPDATE memory_conflict_groups
+      SET state = 'resolved', selected_member_id = 'memory-post-v27-peer',
+          resolved_at = 2500, updated_at = 2500
+      WHERE id = 'post-v27-group';
+      INSERT INTO memory_supersessions (
+        previous_id, next_id, reason, analysis_input_id, created_at
+      ) VALUES (
+        'memory-post-v27', 'memory-post-v27-peer', 'conflict_resolution', NULL, 2500
+      );
+      UPDATE memory_items_v2 SET lifecycle = 'superseded', updated_at = 2500
+      WHERE id = 'memory-post-v27';
+      UPDATE memory_items_v2 SET lifecycle = 'active', updated_at = 2500
+      WHERE id = 'memory-post-v27-peer';
+    `);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT id, lifecycle FROM memory_items_v2
+           WHERE id LIKE 'memory-post-v27%' ORDER BY id`
+        )
+        .all(),
+      [
+        { id: "memory-post-v27", lifecycle: "superseded" },
+        { id: "memory-post-v27-peer", lifecycle: "active" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("v28 migration rolls back when an existing canonical bridge disagrees", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    applyJarvisMigrations(db);
+    db.exec(`
+      INSERT INTO memory_items_v2 (
+        id, kind, canonical_slot_key, canonical_value_key, title, body,
+        confidence, lifecycle, source_analysis_input_id, provenance,
+        created_at, updated_at
+      ) VALUES (
+        'memory-mismatched-bridge', 'fact', '${HASH_B}', '${HASH_C}',
+        'Mismatch', 'The bridge is wrong.', 0.7, 'active', NULL,
+        'legacy_unverified', 2600, 2600
+      );
+      INSERT INTO memory_item_canonical_slots (
+        memory_item_id, canonical_slot_key, algorithm
+      ) VALUES ('memory-mismatched-bridge', '${HASH_F}', 'canonical-v1');
+    `);
+    installBaseV27TriggerStubs(db);
+    db.pragma("user_version = 27");
+
+    assert.throws(() => applyJarvisMigrations(db), /canonical slot/i);
+    assert.equal(db.pragma("user_version", { simple: true }), 27);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm FROM memory_item_canonical_slots
+           WHERE memory_item_id = 'memory-mismatched-bridge'`
+        )
+        .get(),
+      { canonical_slot_key: HASH_F, algorithm: "canonical-v1" }
+    );
+    assert.match(triggerSql(db, "memory_conflict_members_validate_slot"), /base-v27-old/);
+  } finally {
+    db.close();
+  }
+});
+
+test("v28 reopen is a no-op", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: 28 });
+    const memberTrigger = triggerSql(db, "memory_conflict_members_validate_slot");
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 28, toVersion: 28 });
+    assert.equal(triggerSql(db, "memory_conflict_members_validate_slot"), memberTrigger);
+  } finally {
+    db.close();
   }
 });
 

@@ -289,6 +289,105 @@ function seedSemanticConflictGroup(
   return { canonicalSlotKey, itemIds };
 }
 
+function seedHeterogeneousRawConflictGroup(
+  db,
+  {
+    groupId = "legacy-heterogeneous-group",
+    groupSlotKey = sha256("legacy heterogeneous deployment slot"),
+    title = "Deployment choice",
+  } = {}
+) {
+  const memberTriggerSql = db
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'trigger' AND name = 'memory_conflict_members_validate_slot'`
+    )
+    .get().sql;
+  const definitions = [
+    {
+      id: "legacy-heterogeneous-self",
+      subjectId: "person-self",
+      body: "Use the local-first deployment.",
+    },
+    {
+      id: "legacy-heterogeneous-other",
+      subjectId: "person-other",
+      body: "Use the cloud-first deployment.",
+    },
+  ].map((definition) => ({
+    ...definition,
+    canonicalSlotKey: canonicalTupleHash([
+      "memory",
+      "decision",
+      canonicalizeText(title),
+      [definition.subjectId],
+    ]),
+  }));
+  const insertMemory = db.prepare(
+    `INSERT INTO memory_items_v2 (
+       id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+       lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (?, 'decision', ?, ?, ?, ?, 0.8, 'conflict',
+               NULL, 'legacy_unverified', 2200, 2200)`
+  );
+  const insertSubject = db.prepare(
+    `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+     VALUES (?, 'person', ?)`
+  );
+  const insertBridge = db.prepare(
+    `INSERT INTO memory_item_canonical_slots (
+       memory_item_id, canonical_slot_key, algorithm
+     ) VALUES (?, ?, 'canonical-v1')`
+  );
+  for (const definition of definitions) {
+    insertMemory.run(
+      definition.id,
+      groupSlotKey,
+      sha256(`heterogeneous-value:${definition.id}:${definition.body}`),
+      title,
+      definition.body
+    );
+    insertSubject.run(definition.id, definition.subjectId);
+    insertBridge.run(definition.id, definition.canonicalSlotKey);
+  }
+  db.prepare(
+    `INSERT INTO memory_conflict_groups (
+       id, slot_key, episode, state, selected_member_id, resolved_at,
+       created_at, updated_at
+     ) VALUES (?, ?, 1, 'open', NULL, NULL, 2300, 2300)`
+  ).run(groupId, groupSlotKey);
+  db.exec("DROP TRIGGER memory_conflict_members_validate_slot");
+  try {
+    const insertMember = db.prepare(
+      `INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+       VALUES (?, ?, 2300)`
+    );
+    for (const definition of definitions) insertMember.run(groupId, definition.id);
+  } finally {
+    db.exec(memberTriggerSql);
+  }
+  return {
+    groupId,
+    groupSlotKey,
+    itemIds: definitions.map((definition) => definition.id),
+    canonicalSlotKeys: definitions.map((definition) => definition.canonicalSlotKey),
+  };
+}
+
+function captureSqlRejection(db, operation) {
+  db.exec("SAVEPOINT expected_rejection");
+  let error = null;
+  try {
+    operation();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    db.exec("ROLLBACK TO expected_rejection");
+    db.exec("RELEASE expected_rejection");
+  }
+  return error;
+}
+
 function validInput(overrides = {}) {
   return {
     sessionId: "session-1",
@@ -3775,6 +3874,315 @@ test("multiple semantic open conflict groups fail closed and roll back candidate
         .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
         .get(input.analysisInputId),
       { candidate_hash: null, applied_at: null }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("a heterogeneous raw-key conflict group fails closed before candidate application work", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  try {
+    const { repository, input } = createStoredInput(db, counters);
+    seedHeterogeneousRawConflictGroup(db);
+    const before = db
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM memory_items_v2) AS memories,
+           (SELECT count(*) FROM memory_item_subjects) AS subjects,
+           (SELECT count(*) FROM memory_item_canonical_slots) AS slots,
+           (SELECT count(*) FROM memory_occurrences) AS occurrences,
+           (SELECT count(*) FROM memory_conflict_groups) AS groups,
+           (SELECT count(*) FROM memory_conflict_members) AS members,
+           (SELECT count(*) FROM session_summary_revisions) AS summaries,
+           (SELECT count(*) FROM evidence_refs) AS evidence,
+           (SELECT candidate_hash FROM analysis_inputs WHERE id = ?) AS candidate_hash,
+           (SELECT applied_at FROM analysis_inputs WHERE id = ?) AS applied_at`
+      )
+      .get(input.analysisInputId, input.analysisInputId);
+    const countersBefore = { ...counters };
+
+    assert.throws(
+      () =>
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: validCandidate({
+            memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+            topics: [],
+            todos: [],
+            suggestions: [],
+          }),
+        }),
+      { code: "MEMORY_CONFLICT_AMBIGUOUS" }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM memory_items_v2) AS memories,
+             (SELECT count(*) FROM memory_item_subjects) AS subjects,
+             (SELECT count(*) FROM memory_item_canonical_slots) AS slots,
+             (SELECT count(*) FROM memory_occurrences) AS occurrences,
+             (SELECT count(*) FROM memory_conflict_groups) AS groups,
+             (SELECT count(*) FROM memory_conflict_members) AS members,
+             (SELECT count(*) FROM session_summary_revisions) AS summaries,
+             (SELECT count(*) FROM evidence_refs) AS evidence,
+             (SELECT candidate_hash FROM analysis_inputs WHERE id = ?) AS candidate_hash,
+             (SELECT applied_at FROM analysis_inputs WHERE id = ?) AS applied_at`
+        )
+        .get(input.analysisInputId, input.analysisInputId),
+      before
+    );
+    assert.deepEqual(counters, countersBefore);
+  } finally {
+    db.close();
+  }
+});
+
+test("a literal conflict slot that disagrees with homogeneous member semantics fails closed", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  try {
+    const { repository, input } = createStoredInput(db, counters);
+    const candidateSlotKey = canonicalTupleHash([
+      "memory",
+      "decision",
+      canonicalizeText("Deployment choice"),
+      ["person-self"],
+    ]);
+    const seeded = seedSemanticConflictGroup(db, {
+      groupId: "literal-slot-mismatch-group",
+      groupSlotKey: candidateSlotKey,
+      episode: 1,
+      itemPrefix: "literal-slot-mismatch-memory",
+      bodies: ["Use the cloud-first deployment."],
+      subjectIds: ["person-other"],
+    });
+    assert.notEqual(seeded.canonicalSlotKey, candidateSlotKey);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (
+         'literal-slot-control-memory', 'decision', ?, ?, 'Deployment choice',
+         'Use the local-first deployment.', 0.8, 'active', NULL,
+         'legacy_unverified', 2250, 2250
+       )`
+    ).run(candidateSlotKey, sha256("literal-slot-control-value"));
+    db.prepare(
+      `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+       VALUES ('literal-slot-control-memory', 'person', 'person-self')`
+    ).run();
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('literal-slot-control-memory', ?, 'canonical-v1')`
+    ).run(candidateSlotKey);
+    const countersBefore = { ...counters };
+
+    assert.throws(
+      () =>
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: validCandidate({
+            memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+            topics: [],
+            todos: [],
+            suggestions: [],
+          }),
+        }),
+      { code: "MEMORY_EXISTING_SNAPSHOT_CORRUPT" }
+    );
+    assert.deepEqual(counters, countersBefore);
+    assert.deepEqual(db.prepare("SELECT id, slot_key, state FROM memory_conflict_groups").all(), [
+      {
+        id: "literal-slot-mismatch-group",
+        slot_key: candidateSlotKey,
+        state: "open",
+      },
+    ]);
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId),
+      { candidate_hash: null, applied_at: null }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("an unrelated heterogeneous raw group does not block another semantic conflict slot", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const unrelated = seedHeterogeneousRawConflictGroup(db, {
+      groupId: "unrelated-heterogeneous-group",
+      groupSlotKey: sha256("unrelated heterogeneous travel slot"),
+      title: "Travel plan",
+    });
+    const candidateSlotKey = canonicalTupleHash([
+      "memory",
+      "decision",
+      canonicalizeText("Deployment choice"),
+      ["person-self"],
+    ]);
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (
+         'unrelated-control-memory', 'decision', ?, ?, 'Deployment choice',
+         'Use the local-first deployment.', 0.8, 'active', NULL,
+         'legacy_unverified', 2250, 2250
+       )`
+    ).run(candidateSlotKey, sha256("unrelated-control-value"));
+    db.prepare(
+      `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+       VALUES ('unrelated-control-memory', 'person', 'person-self')`
+    ).run();
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES ('unrelated-control-memory', ?, 'canonical-v1')`
+    ).run(candidateSlotKey);
+
+    assert.equal(
+      repository.applyCandidateAnalysis({
+        analysisInputId: input.analysisInputId,
+        inputHash: input.inputHash,
+        candidate: validCandidate({
+          memories: [{ ...validCandidate().memories[0], body: "Use the hybrid deployment." }],
+          topics: [],
+          todos: [],
+          suggestions: [],
+        }),
+      }).status,
+      "applied"
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT id, state FROM memory_conflict_groups ORDER BY id")
+        .all()
+        .find((group) => group.id === unrelated.groupId),
+      { id: unrelated.groupId, state: "open" }
+    );
+    assert.equal(
+      db
+        .prepare("SELECT count(*) AS count FROM memory_conflict_groups WHERE slot_key = ?")
+        .get(candidateSlotKey).count,
+      1
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("resolveMemoryConflict rejects a heterogeneous raw-key group before clock or writes", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  try {
+    const seeded = seedHeterogeneousRawConflictGroup(db);
+    const repository = createRepository(db, counters);
+    const before = {
+      group: db.prepare("SELECT * FROM memory_conflict_groups WHERE id = ?").get(seeded.groupId),
+      members: db
+        .prepare("SELECT * FROM memory_conflict_members WHERE group_id = ? ORDER BY memory_item_id")
+        .all(seeded.groupId),
+      lifecycles: db
+        .prepare("SELECT id, lifecycle, updated_at FROM memory_items_v2 ORDER BY id")
+        .all(),
+      supersessions: db.prepare("SELECT * FROM memory_supersessions ORDER BY previous_id").all(),
+    };
+
+    assert.throws(
+      () =>
+        repository.resolveMemoryConflict({
+          conflictGroupId: seeded.groupId,
+          selectedMemoryItemId: seeded.itemIds[0],
+        }),
+      { code: "MEMORY_CONFLICT_AMBIGUOUS" }
+    );
+    assert.deepEqual(counters, { ids: 0, clocks: 0 });
+    assert.deepEqual(
+      {
+        group: db.prepare("SELECT * FROM memory_conflict_groups WHERE id = ?").get(seeded.groupId),
+        members: db
+          .prepare(
+            "SELECT * FROM memory_conflict_members WHERE group_id = ? ORDER BY memory_item_id"
+          )
+          .all(seeded.groupId),
+        lifecycles: db
+          .prepare("SELECT id, lifecycle, updated_at FROM memory_items_v2 ORDER BY id")
+          .all(),
+        supersessions: db.prepare("SELECT * FROM memory_supersessions ORDER BY previous_id").all(),
+      },
+      before
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("v28 triggers reject heterogeneous conflict member, resolution, and supersession writes", () => {
+  const db = createFixture();
+  try {
+    const seeded = seedHeterogeneousRawConflictGroup(db);
+    const thirdId = "legacy-heterogeneous-third";
+    db.prepare(
+      `INSERT INTO memory_items_v2 (
+         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+       ) VALUES (?, 'decision', ?, ?, 'Deployment choice', 'Use the hybrid deployment.',
+                 0.8, 'conflict', NULL, 'legacy_unverified', 2400, 2400)`
+    ).run(thirdId, seeded.groupSlotKey, sha256("heterogeneous-value:third"));
+    db.prepare(
+      `INSERT INTO memory_item_subjects (memory_item_id, subject_kind, subject_id)
+       VALUES (?, 'person', 'person-self')`
+    ).run(thirdId);
+    db.prepare(
+      `INSERT INTO memory_item_canonical_slots (
+         memory_item_id, canonical_slot_key, algorithm
+       ) VALUES (?, ?, 'canonical-v1')`
+    ).run(thirdId, seeded.canonicalSlotKeys[0]);
+
+    assert.match(
+      captureSqlRejection(db, () =>
+        db
+          .prepare(
+            `INSERT INTO memory_conflict_members (group_id, memory_item_id, created_at)
+             VALUES (?, ?, 2500)`
+          )
+          .run(seeded.groupId, thirdId)
+      )?.message ?? "",
+      /memory conflict slot mismatch/
+    );
+    assert.match(
+      captureSqlRejection(db, () =>
+        db
+          .prepare(
+            `UPDATE memory_conflict_groups
+             SET state = 'resolved', selected_member_id = ?, resolved_at = 2500,
+                 updated_at = 2500 WHERE id = ?`
+          )
+          .run(seeded.itemIds[0], seeded.groupId)
+      )?.message ?? "",
+      /memory conflict resolution is invalid/
+    );
+    assert.match(
+      captureSqlRejection(db, () =>
+        db
+          .prepare(
+            `INSERT INTO memory_supersessions (
+               previous_id, next_id, reason, analysis_input_id, created_at
+             ) VALUES (?, ?, 'conflict_resolution', NULL, 2500)`
+          )
+          .run(seeded.itemIds[0], seeded.itemIds[1])
+      )?.message ?? "",
+      /memory supersession slot mismatch/
     );
   } finally {
     db.close();

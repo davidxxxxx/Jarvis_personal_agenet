@@ -1226,6 +1226,82 @@ class MemoryRepository {
     );
   }
 
+  _canonicalMemorySlotIdentity(memoryItemId) {
+    const memory = this.db
+      .prepare(
+        `SELECT item.id, item.kind, item.title,
+                slot.canonical_slot_key, slot.algorithm
+         FROM memory_items_v2 AS item
+         LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
+         WHERE item.id = ?`
+      )
+      .get(memoryItemId);
+    if (!memory) throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+    const subjectIds = [
+      ...new Set(
+        this.db
+          .prepare(
+            `SELECT subject_id FROM memory_item_subjects
+             WHERE memory_item_id = ? ORDER BY subject_id, subject_kind`
+          )
+          .all(memoryItemId)
+          .map((subject) => subject.subject_id)
+      ),
+    ];
+    const canonicalSlotKey = canonicalTupleHash([
+      "memory",
+      memory.kind,
+      canonicalizeText(memory.title),
+      subjectIds,
+    ]);
+    if (memory.algorithm !== "canonical-v1" || memory.canonical_slot_key !== canonicalSlotKey) {
+      throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+    }
+    return canonicalSlotKey;
+  }
+
+  _validateConflictGroupSemanticIdentity(conflictGroupId) {
+    const members = this.db
+      .prepare(
+        `SELECT memory_item_id FROM memory_conflict_members
+         WHERE group_id = ? ORDER BY memory_item_id`
+      )
+      .all(conflictGroupId);
+    if (members.length === 0) throw codedError("MEMORY_CONFLICT_AMBIGUOUS");
+    const semanticSlots = new Set(
+      members.map((member) => this._canonicalMemorySlotIdentity(member.memory_item_id))
+    );
+    if (semanticSlots.size !== 1) throw codedError("MEMORY_CONFLICT_AMBIGUOUS");
+    return semanticSlots.values().next().value;
+  }
+
+  _validatedSemanticConflictGroups(canonicalSlotKey) {
+    assertHash(canonicalSlotKey, "canonicalSlotKey");
+    const groups = this.db
+      .prepare(
+        `SELECT conflict.id, conflict.slot_key, conflict.episode, conflict.state
+         FROM memory_conflict_groups AS conflict
+         WHERE conflict.slot_key = ?
+            OR EXISTS (
+              SELECT 1
+              FROM memory_conflict_members AS member
+              JOIN memory_item_canonical_slots AS slot
+                ON slot.memory_item_id = member.memory_item_id
+              WHERE member.group_id = conflict.id
+                AND slot.canonical_slot_key = ?
+            )
+         ORDER BY conflict.id`
+      )
+      .all(canonicalSlotKey, canonicalSlotKey);
+    return groups.filter((group) => {
+      const semanticSlotKey = this._validateConflictGroupSemanticIdentity(group.id);
+      if (group.slot_key === canonicalSlotKey && semanticSlotKey !== canonicalSlotKey) {
+        throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+      }
+      return semanticSlotKey === canonicalSlotKey;
+    });
+  }
+
   _existingPlannerSnapshot() {
     const memories = this.db
       .prepare(
@@ -1513,6 +1589,15 @@ class MemoryRepository {
       const plannerInput = this._plannerSnapshot(inputRow, candidate, context);
       const plan = this.memoryMerger.plan(plannerInput);
       const semanticHash = assertHash(plan.semanticCandidateHash, "semanticCandidateHash");
+      const semanticConflictGroupsBySlot = new Map();
+      for (const conflict of plan.conflicts) {
+        if (!semanticConflictGroupsBySlot.has(conflict.canonicalSlotKey)) {
+          semanticConflictGroupsBySlot.set(
+            conflict.canonicalSlotKey,
+            this._validatedSemanticConflictGroups(conflict.canonicalSlotKey)
+          );
+        }
+      }
       const appliedAt = assertTimestamp(this.now(), "appliedAt");
 
       const evidenceStatement = this.db.prepare(
@@ -2267,22 +2352,8 @@ class MemoryRepository {
         ) {
           throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
         }
-        const semanticGroups = this.db
-          .prepare(
-            `SELECT conflict.id, conflict.slot_key, conflict.episode, conflict.state
-             FROM memory_conflict_groups AS conflict
-             WHERE conflict.slot_key = ?
-                OR EXISTS (
-                  SELECT 1
-                  FROM memory_conflict_members AS member
-                  JOIN memory_item_canonical_slots AS slot
-                    ON slot.memory_item_id = member.memory_item_id
-                  WHERE member.group_id = conflict.id
-                    AND slot.canonical_slot_key = ?
-                )
-             ORDER BY conflict.id`
-          )
-          .all(conflict.canonicalSlotKey, conflict.canonicalSlotKey);
+        const semanticGroups = semanticConflictGroupsBySlot.get(conflict.canonicalSlotKey);
+        if (!semanticGroups) throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
         const openGroups = semanticGroups.filter((row) => row.state === "open");
         if (openGroups.length > 1) throw codedError("MEMORY_CONFLICT_AMBIGUOUS");
         let group = openGroups[0];
@@ -3331,6 +3402,7 @@ class MemoryRepository {
         .prepare("SELECT * FROM memory_conflict_groups WHERE id = ?")
         .get(conflictGroupId);
       if (!conflict) throw codedError("MEMORY_CONFLICT_NOT_FOUND");
+      this._validateConflictGroupSemanticIdentity(conflictGroupId);
       if (conflict.state === "resolved") {
         if (conflict.selected_member_id === selectedMemoryItemId) {
           return {

@@ -8,6 +8,7 @@ const {
   transcriptSegmentsSchema,
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
 } = require("../../src/jarvis/main/JarvisMigrations");
+const { canonicalTupleHash, canonicalizeText } = require("../../src/jarvis/main/MemoryMerger");
 
 const PREVIOUS_VERSION = 22;
 const HASH_A = "a".repeat(64);
@@ -20,6 +21,21 @@ const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
 const REDACTION_VERSION = "jarvis-redaction-v1";
 const CLOUD_PAYLOAD_JSON = JSON.stringify({ inputVersion: INPUT_CONTRACT_VERSION });
 const CLOUD_PAYLOAD_BYTES = Buffer.byteLength(CLOUD_PAYLOAD_JSON, "utf8");
+
+function insertMemoryCanonicalBridge(db, { memoryItemId, kind, title, subjectIds = [] }) {
+  const canonicalSlotKey = canonicalTupleHash([
+    "memory",
+    kind,
+    canonicalizeText(title),
+    [...new Set(subjectIds)].sort(),
+  ]);
+  db.prepare(
+    `INSERT INTO memory_item_canonical_slots (
+       memory_item_id, canonical_slot_key, algorithm
+     ) VALUES (?, ?, 'canonical-v1')`
+  ).run(memoryItemId, canonicalSlotKey);
+  return canonicalSlotKey;
+}
 
 const LINEAGE_TABLES = [
   "analysis_inputs",
@@ -245,6 +261,11 @@ function seedEvidenceOwner(db) {
        'active', 'input-1', 'evidence_linked', 6000, 6000
      )`
   ).run(HASH_A, HASH_B);
+  insertMemoryCanonicalBridge(db, {
+    memoryItemId: "memory-1",
+    kind: "fact",
+    title: "Fact",
+  });
   db.prepare(
     `INSERT INTO memory_occurrences (
        id, memory_value_id, analysis_input_id, occurrence_key,
@@ -1353,6 +1374,11 @@ test("relation guards enforce predecessor, slot, conflict, terminal, and polymor
          'active', 'input-1', 'evidence_linked', 6000, 6000
        )`
     ).run(HASH_C, "d".repeat(64));
+    insertMemoryCanonicalBridge(db, {
+      memoryItemId: "memory-other-slot",
+      kind: "fact",
+      title: "Other",
+    });
     assert.throws(
       () =>
         db
@@ -1693,12 +1719,29 @@ test("resolved conflict membership authorizes only the selected and superseded l
         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
       ) VALUES
-        ('memory-selected', 'fact', '${HASH_A}', '${HASH_B}', 'Selected', 'Selected', 0.9,
+        ('memory-selected', 'fact', '${HASH_A}', '${HASH_B}', 'Conflict lifecycle', 'Selected', 0.9,
          'conflict', 'input-1', 'evidence_linked', 6000, 6000),
-        ('memory-loser', 'fact', '${HASH_A}', '${HASH_C}', 'Loser', 'Loser', 0.8,
+        ('memory-loser', 'fact', '${HASH_A}', '${HASH_C}', 'Conflict lifecycle', 'Loser', 0.8,
          'conflict', 'input-1', 'evidence_linked', 6000, 6000),
         ('memory-dismissed', 'fact', '${HASH_A}', '${HASH_D}', 'Dismissed', 'Dismissed', 0.7,
          'dismissed', 'input-1', 'evidence_linked', 6000, 6000);
+    `);
+    insertMemoryCanonicalBridge(db, {
+      memoryItemId: "memory-selected",
+      kind: "fact",
+      title: "Conflict lifecycle",
+    });
+    insertMemoryCanonicalBridge(db, {
+      memoryItemId: "memory-loser",
+      kind: "fact",
+      title: "Conflict lifecycle",
+    });
+    insertMemoryCanonicalBridge(db, {
+      memoryItemId: "memory-dismissed",
+      kind: "fact",
+      title: "Dismissed",
+    });
+    db.exec(`
       INSERT INTO memory_conflict_groups (
         id, slot_key, episode, state, created_at, updated_at
       ) VALUES ('conflict-lifecycle-1', '${HASH_A}', 1, 'open', 6000, 6000);
@@ -1802,9 +1845,17 @@ test("resolved conflict membership authorizes only the selected and superseded l
         id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
         lifecycle, source_analysis_input_id, provenance, created_at, updated_at
       ) VALUES (
-        'memory-challenger', 'fact', '${HASH_A}', '${HASH_E}', 'Challenger', 'Challenger', 0.85,
+        'memory-challenger', 'fact', '${HASH_A}', '${HASH_E}',
+        'Conflict lifecycle', 'Challenger', 0.85,
         'conflict', 'input-1', 'evidence_linked', 8000, 8000
       );
+    `);
+    insertMemoryCanonicalBridge(db, {
+      memoryItemId: "memory-challenger",
+      kind: "fact",
+      title: "Conflict lifecycle",
+    });
+    db.exec(`
       INSERT INTO memory_conflict_groups (
         id, slot_key, episode, state, created_at, updated_at
       ) VALUES ('conflict-lifecycle-2', '${HASH_A}', 2, 'open', 8000, 8000);

@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 27;
+const TARGET_VERSION = 28;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -2526,10 +2526,19 @@ function upgradeMemoryItemSubjectsV27(db) {
     WHERE evidence.source_analysis_input_id IS NOT NULL
     ORDER BY occurrence.memory_value_id, binding.subject_kind, binding.subject_id;
   `);
+  backfillMemoryItemCanonicalSlots(db);
+  installMemoryConflictIntegrityTriggers(db);
+}
+
+function backfillMemoryItemCanonicalSlots(db) {
   const insertCanonicalSlot = db.prepare(
-    `INSERT OR IGNORE INTO memory_item_canonical_slots (
+    `INSERT INTO memory_item_canonical_slots (
        memory_item_id, canonical_slot_key, algorithm
      ) VALUES (?, ?, 'canonical-v1')`
+  );
+  const existingCanonicalSlot = db.prepare(
+    `SELECT canonical_slot_key, algorithm
+     FROM memory_item_canonical_slots WHERE memory_item_id = ?`
   );
   const subjectsForMemory = db.prepare(
     `SELECT subject_id FROM memory_item_subjects
@@ -2541,16 +2550,32 @@ function upgradeMemoryItemSubjectsV27(db) {
     const subjectIds = [
       ...new Set(subjectsForMemory.all(memory.id).map((subject) => subject.subject_id)),
     ];
-    insertCanonicalSlot.run(
-      memory.id,
-      canonicalTupleHash(["memory", memory.kind, canonicalizeText(memory.title), subjectIds])
-    );
+    const canonicalSlotKey = canonicalTupleHash([
+      "memory",
+      memory.kind,
+      canonicalizeText(memory.title),
+      subjectIds,
+    ]);
+    const existing = existingCanonicalSlot.get(memory.id);
+    if (existing) {
+      if (
+        existing.algorithm !== "canonical-v1" ||
+        existing.canonical_slot_key !== canonicalSlotKey
+      ) {
+        throw new Error(`memory item canonical slot mismatch for ${memory.id}`);
+      }
+      continue;
+    }
+    insertCanonicalSlot.run(memory.id, canonicalSlotKey);
   }
+}
+
+function installMemoryConflictIntegrityTriggers(db) {
   db.exec(`
-    DROP TRIGGER memory_supersessions_validate_slot;
-    DROP TRIGGER memory_conflict_members_validate_slot;
-    DROP TRIGGER memory_conflict_groups_validate_resolution;
-    DROP TRIGGER memory_items_v2_terminal_lifecycle;
+    DROP TRIGGER IF EXISTS memory_supersessions_validate_slot;
+    DROP TRIGGER IF EXISTS memory_conflict_members_validate_slot;
+    DROP TRIGGER IF EXISTS memory_conflict_groups_validate_resolution;
+    DROP TRIGGER IF EXISTS memory_items_v2_terminal_lifecycle;
 
     CREATE TRIGGER memory_supersessions_validate_slot
     BEFORE INSERT ON memory_supersessions
@@ -2564,8 +2589,15 @@ function upgradeMemoryItemSubjectsV27(db) {
         ON next_slot.memory_item_id = next.id
       WHERE previous.id = NEW.previous_id
         AND (
-          previous.canonical_slot_key = next.canonical_slot_key
-          OR previous_slot.canonical_slot_key = next_slot.canonical_slot_key
+          (
+            previous_slot.memory_item_id IS NOT NULL
+            AND next_slot.memory_item_id IS NOT NULL
+            AND previous_slot.canonical_slot_key = next_slot.canonical_slot_key
+          )
+          OR (
+            (previous_slot.memory_item_id IS NULL OR next_slot.memory_item_id IS NULL)
+            AND previous.canonical_slot_key = next.canonical_slot_key
+          )
         )
     )
     BEGIN
@@ -2578,19 +2610,36 @@ function upgradeMemoryItemSubjectsV27(db) {
       SELECT 1
       FROM memory_conflict_groups AS conflict
       JOIN memory_items_v2 AS item ON item.id = NEW.memory_item_id
-      LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
+      JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
       WHERE conflict.id = NEW.group_id
         AND conflict.state = 'open'
         AND (
-          conflict.slot_key = item.canonical_slot_key
-          OR conflict.slot_key = slot.canonical_slot_key
-          OR EXISTS (
-            SELECT 1
-            FROM memory_conflict_members AS semantic_member
-            JOIN memory_item_canonical_slots AS semantic_slot
-              ON semantic_slot.memory_item_id = semantic_member.memory_item_id
-            WHERE semantic_member.group_id = conflict.id
-              AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
+          (
+            NOT EXISTS (
+              SELECT 1 FROM memory_conflict_members AS first_member
+              WHERE first_member.group_id = conflict.id
+            )
+            AND (
+              conflict.slot_key = item.canonical_slot_key
+              OR conflict.slot_key = slot.canonical_slot_key
+            )
+          )
+          OR (
+            EXISTS (
+              SELECT 1 FROM memory_conflict_members AS existing_member
+              WHERE existing_member.group_id = conflict.id
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM memory_conflict_members AS existing_member
+              LEFT JOIN memory_item_canonical_slots AS existing_slot
+                ON existing_slot.memory_item_id = existing_member.memory_item_id
+              WHERE existing_member.group_id = conflict.id
+                AND (
+                  existing_slot.memory_item_id IS NULL
+                  OR existing_slot.canonical_slot_key <> slot.canonical_slot_key
+                )
+            )
           )
         )
     )
@@ -2602,22 +2651,21 @@ function upgradeMemoryItemSubjectsV27(db) {
     BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
     WHEN NEW.state = 'resolved' AND NOT EXISTS (
       SELECT 1
-      FROM memory_conflict_members AS member
-      JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
-      LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
-      WHERE member.group_id = NEW.id
-        AND member.memory_item_id = NEW.selected_member_id
-        AND (
-          NEW.slot_key = item.canonical_slot_key
-          OR NEW.slot_key = slot.canonical_slot_key
-          OR EXISTS (
-            SELECT 1
-            FROM memory_conflict_members AS semantic_member
-            JOIN memory_item_canonical_slots AS semantic_slot
-              ON semantic_slot.memory_item_id = semantic_member.memory_item_id
-            WHERE semantic_member.group_id = NEW.id
-              AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
-          )
+      FROM memory_conflict_members AS selected_member
+      JOIN memory_item_canonical_slots AS selected_slot
+        ON selected_slot.memory_item_id = selected_member.memory_item_id
+      WHERE selected_member.group_id = NEW.id
+        AND selected_member.memory_item_id = NEW.selected_member_id
+        AND NOT EXISTS (
+          SELECT 1
+          FROM memory_conflict_members AS member
+          LEFT JOIN memory_item_canonical_slots AS member_slot
+            ON member_slot.memory_item_id = member.memory_item_id
+          WHERE member.group_id = NEW.id
+            AND (
+              member_slot.memory_item_id IS NULL
+              OR member_slot.canonical_slot_key <> selected_slot.canonical_slot_key
+            )
         )
     )
     BEGIN
@@ -2637,25 +2685,35 @@ function upgradeMemoryItemSubjectsV27(db) {
         AND EXISTS (
           SELECT 1
           FROM memory_conflict_groups AS conflict
-           LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
-           WHERE (
-             conflict.slot_key = OLD.canonical_slot_key
-             OR conflict.slot_key = slot.canonical_slot_key
-             OR EXISTS (
-               SELECT 1
-               FROM memory_conflict_members AS semantic_member
-               JOIN memory_item_canonical_slots AS semantic_slot
-                 ON semantic_slot.memory_item_id = semantic_member.memory_item_id
-               WHERE semantic_member.group_id = conflict.id
-                 AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
-             )
-           )
-            AND conflict.state = 'resolved'
+          JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
+          WHERE conflict.state = 'resolved'
             AND conflict.selected_member_id = OLD.id
-            AND conflict.episode = (
-              SELECT MAX(latest.episode)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM memory_conflict_members AS group_member
+              LEFT JOIN memory_item_canonical_slots AS member_slot
+                ON member_slot.memory_item_id = group_member.memory_item_id
+              WHERE group_member.group_id = conflict.id
+                AND (
+                  member_slot.memory_item_id IS NULL
+                  OR member_slot.canonical_slot_key <> slot.canonical_slot_key
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
               FROM memory_conflict_groups AS latest
-              WHERE latest.slot_key = conflict.slot_key
+              WHERE latest.episode > conflict.episode
+                AND (
+                  latest.slot_key = slot.canonical_slot_key
+                  OR EXISTS (
+                    SELECT 1
+                    FROM memory_conflict_members AS latest_member
+                    JOIN memory_item_canonical_slots AS latest_slot
+                      ON latest_slot.memory_item_id = latest_member.memory_item_id
+                    WHERE latest_member.group_id = latest.id
+                      AND latest_slot.canonical_slot_key = slot.canonical_slot_key
+                  )
+                )
             )
         )
       )
@@ -2671,25 +2729,38 @@ function upgradeMemoryItemSubjectsV27(db) {
             ON supersession.previous_id = OLD.id
             AND supersession.next_id = conflict.selected_member_id
             AND supersession.reason = 'conflict_resolution'
-           LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
-           WHERE (
-             conflict.slot_key = OLD.canonical_slot_key
-             OR conflict.slot_key = slot.canonical_slot_key
-             OR EXISTS (
-               SELECT 1
-               FROM memory_conflict_members AS semantic_member
-               JOIN memory_item_canonical_slots AS semantic_slot
-                 ON semantic_slot.memory_item_id = semantic_member.memory_item_id
-               WHERE semantic_member.group_id = conflict.id
-                 AND semantic_slot.canonical_slot_key = slot.canonical_slot_key
-             )
-           )
-            AND conflict.state = 'resolved'
+          JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
+          JOIN memory_item_canonical_slots AS selected_slot
+            ON selected_slot.memory_item_id = conflict.selected_member_id
+          WHERE conflict.state = 'resolved'
             AND conflict.selected_member_id <> OLD.id
-            AND conflict.episode = (
-              SELECT MAX(latest.episode)
+            AND selected_slot.canonical_slot_key = slot.canonical_slot_key
+            AND NOT EXISTS (
+              SELECT 1
+              FROM memory_conflict_members AS group_member
+              LEFT JOIN memory_item_canonical_slots AS member_slot
+                ON member_slot.memory_item_id = group_member.memory_item_id
+              WHERE group_member.group_id = conflict.id
+                AND (
+                  member_slot.memory_item_id IS NULL
+                  OR member_slot.canonical_slot_key <> slot.canonical_slot_key
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1
               FROM memory_conflict_groups AS latest
-              WHERE latest.slot_key = conflict.slot_key
+              WHERE latest.episode > conflict.episode
+                AND (
+                  latest.slot_key = slot.canonical_slot_key
+                  OR EXISTS (
+                    SELECT 1
+                    FROM memory_conflict_members AS latest_member
+                    JOIN memory_item_canonical_slots AS latest_slot
+                      ON latest_slot.memory_item_id = latest_member.memory_item_id
+                    WHERE latest_member.group_id = latest.id
+                      AND latest_slot.canonical_slot_key = slot.canonical_slot_key
+                  )
+                )
             )
         )
       )
@@ -2698,6 +2769,32 @@ function upgradeMemoryItemSubjectsV27(db) {
       SELECT RAISE(ABORT, 'memory item lifecycle transition is invalid');
     END;
   `);
+}
+
+function upgradeMemoryConflictIntegrityV28(db, fromVersion) {
+  const requiredTables = new Map([
+    ["memory_items_v2", ["id", "kind", "title", "canonical_slot_key"]],
+    ["memory_item_subjects", ["memory_item_id", "subject_kind", "subject_id"]],
+    ["memory_item_canonical_slots", ["memory_item_id", "canonical_slot_key", "algorithm"]],
+    ["memory_conflict_groups", ["id", "slot_key", "episode", "state"]],
+    ["memory_conflict_members", ["group_id", "memory_item_id"]],
+    ["memory_supersessions", ["previous_id", "next_id", "reason"]],
+  ]);
+  if (!tableExists(db, "memory_items_v2") && fromVersion < 27) {
+    const hasPartialV27MemorySchema = [...requiredTables.keys()]
+      .slice(1)
+      .some((table) => tableExists(db, table));
+    if (!hasPartialV27MemorySchema) return;
+  }
+  for (const [table, requiredColumns] of requiredTables) {
+    if (!tableExists(db, table)) throw new Error(`v28 repair requires v27 table ${table}`);
+    const actualColumns = columns(db, table);
+    if (requiredColumns.some((column) => !actualColumns.has(column))) {
+      throw new Error(`v28 repair requires v27 columns on ${table}`);
+    }
+  }
+  backfillMemoryItemCanonicalSlots(db);
+  installMemoryConflictIntegrityTriggers(db);
 }
 
 const EVIDENCE_REFS_VALIDATE_LINEAGE_V27_TRIGGER = `
@@ -4679,6 +4776,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 27) {
         upgradeMemoryItemSubjectsV27(db);
         upgradeOccurrenceEvidenceLineageV27(db);
+      }
+      if (fromVersion < 28) {
+        upgradeMemoryConflictIntegrityV28(db, fromVersion);
       }
 
       const violations = db.pragma("foreign_key_check");
