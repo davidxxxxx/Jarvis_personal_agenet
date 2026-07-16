@@ -358,6 +358,82 @@ function dedupeCandidateItems(
   return { unique, ignored };
 }
 
+function convergeMemoryCandidates(items, segmentById) {
+  const ordinary = dedupeCandidateItems(
+    items.filter((item) => item.kind !== "event"),
+    "memory",
+    (memory) => memory.canonicalValueKey,
+    "evidenceSegmentIds"
+  );
+  const eventGroups = new Map();
+  for (const item of items.filter((candidate) => candidate.kind === "event")) {
+    const group = eventGroups.get(item.canonicalValueKey) ?? [];
+    group.push(item);
+    eventGroups.set(item.canonicalValueKey, group);
+  }
+
+  const uniqueEvents = [];
+  const ignoredEvents = [];
+  for (const group of eventGroups.values()) {
+    const intervals = group
+      .map((item) => {
+        const segments = item.evidenceSegmentIds.map((segmentId) => segmentById.get(segmentId));
+        return {
+          item,
+          startedAt: Math.min(...segments.map((segment) => segment.startedAt)),
+          endedAt: Math.max(...segments.map((segment) => segment.endedAt)),
+        };
+      })
+      .sort(
+        (left, right) =>
+          left.startedAt - right.startedAt ||
+          left.endedAt - right.endedAt ||
+          compareCanonicalItems(left.item, right.item)
+      );
+    const clusters = [];
+    for (const interval of intervals) {
+      const cluster = clusters.at(-1);
+      if (!cluster || interval.startedAt - cluster.endedAt > EVENT_DEDUPE_WINDOW_MS) {
+        clusters.push({
+          startedAt: interval.startedAt,
+          endedAt: interval.endedAt,
+          items: [interval.item],
+        });
+        continue;
+      }
+      cluster.endedAt = Math.max(cluster.endedAt, interval.endedAt);
+      cluster.items.push(interval.item);
+    }
+
+    for (const [eventClusterIndex, cluster] of clusters.entries()) {
+      const members = [...cluster.items].sort(compareCanonicalItems);
+      const selected = {
+        ...members[0],
+        evidenceSegmentIds: normalizeStringSet(
+          members.flatMap((item) => item.evidenceSegmentIds),
+          "memory.evidenceSegmentIds"
+        ),
+        eventClusterIndex,
+      };
+      uniqueEvents.push(selected);
+      if (members.length > 1) {
+        ignoredEvents.push({
+          entityKind: "memory",
+          canonicalKey: selected.planCanonicalKey,
+          semanticFingerprint: selected.semanticFingerprint,
+          reason: "candidate_internal_duplicate",
+          ignoredCount: members.length - 1,
+        });
+      }
+    }
+  }
+
+  return {
+    unique: [...ordinary.unique, ...uniqueEvents],
+    ignored: [...ordinary.ignored, ...ignoredEvents].sort(compareActions),
+  };
+}
+
 function validateCandidate(candidate) {
   const input = exactObject(
     candidate,
@@ -685,6 +761,8 @@ function validateExisting(existing) {
   }
 
   const todoIds = new Set();
+  const todoRowsById = new Map();
+  const todoRowsByBaseKey = new Map();
   const todoRevisionIds = new Set();
   const todoOccurrenceIds = new Set();
   for (const todo of snapshot.todos) {
@@ -770,6 +848,10 @@ function validateExisting(existing) {
         allowEmpty: true,
       });
     }
+    todoRowsById.set(row.id, row);
+    const baseRows = todoRowsByBaseKey.get(row.canonicalBaseKey) ?? [];
+    baseRows.push(row);
+    todoRowsByBaseKey.set(row.canonicalBaseKey, baseRows);
   }
 
   const suggestionIds = new Set();
@@ -841,6 +923,7 @@ function validateExisting(existing) {
   const recurrencePreviousIds = new Set();
   const recurrenceNextIds = new Set();
   const recurrenceSourceIds = new Set();
+  const recurrenceByPreviousId = new Map();
   for (const recurrence of snapshot.todoRecurrences) {
     const row = exactObject(
       recurrence,
@@ -860,10 +943,38 @@ function validateExisting(existing) {
     ) {
       validationFail("malformed_existing");
     }
+    if (
+      todoRowsById.get(row.previousTodoId).canonicalBaseKey !==
+      todoRowsById.get(row.nextTodoId).canonicalBaseKey
+    ) {
+      validationFail("malformed_existing");
+    }
     recurrenceIds.add(row.id);
     recurrencePreviousIds.add(row.previousTodoId);
     recurrenceNextIds.add(row.nextTodoId);
+    recurrenceByPreviousId.set(row.previousTodoId, row);
     if (row.sourceOccurrenceId !== null) recurrenceSourceIds.add(row.sourceOccurrenceId);
+  }
+  const visitState = new Map();
+  const visitTodo = (todoId) => {
+    if (visitState.get(todoId) === "visiting") validationFail("malformed_existing");
+    if (visitState.get(todoId) === "visited") return;
+    visitState.set(todoId, "visiting");
+    const nextTodoId = recurrenceByPreviousId.get(todoId)?.nextTodoId;
+    if (nextTodoId) visitTodo(nextTodoId);
+    visitState.set(todoId, "visited");
+  };
+  for (const todoId of todoIds) visitTodo(todoId);
+  for (const rows of todoRowsByBaseKey.values()) {
+    const activeRows = rows.filter((row) => row.status === "open");
+    const leafRows = rows.filter((row) => !recurrenceByPreviousId.has(row.id));
+    if (
+      activeRows.length > 1 ||
+      leafRows.length !== 1 ||
+      (activeRows.length === 1 && activeRows[0].id !== leafRows[0].id)
+    ) {
+      validationFail("malformed_existing");
+    }
   }
   return snapshot;
 }
@@ -929,202 +1040,171 @@ function validatePlannerInput(input) {
   return { value, candidate, evidenceContext, existing, replacements };
 }
 
-class MemoryMerger {
-  plan(input) {
-    const validated = validatePlannerInput(input);
-    input = validated.value;
-    const canonical = canonicalizeCandidate(input.candidate);
-    const { segmentById, bindingByLabel } = validated.evidenceContext;
-    const resolvedMemories = canonical.memories.map((memory) => {
-      const relatedSubjects = [];
-      const seenSubjects = new Set();
-      for (const segmentId of memory.evidenceSegmentIds) {
-        const speakerLabel = segmentById.get(segmentId)?.speakerLabel;
-        if (speakerLabel === null || speakerLabel === undefined) continue;
-        const binding = bindingByLabel.get(speakerLabel);
-        if (!binding) continue;
-        const subjectKey = `${binding.subjectKind}\0${binding.subjectId}`;
-        if (seenSubjects.has(subjectKey)) continue;
-        seenSubjects.add(subjectKey);
-        relatedSubjects.push({
-          subjectKind: binding.subjectKind,
-          subjectId: binding.subjectId,
-        });
-      }
-      relatedSubjects.sort(
-        (left, right) =>
-          compareCodePoints(left.subjectId, right.subjectId) ||
-          compareCodePoints(left.subjectKind, right.subjectKind)
-      );
-      const relatedSubjectIds = normalizeStringSet(
-        relatedSubjects.map((subject) => subject.subjectId),
-        "memory.relatedSubjectIds"
-      );
-      const canonicalTuple = ["memory", memory.kind, memory.normalizedTitle, relatedSubjectIds];
-      const planCanonicalKey = canonicalTupleHash(canonicalTuple);
-      const canonicalValueKey = canonicalTupleHash([
-        "memory_value",
-        planCanonicalKey,
-        memory.normalizedBody,
-      ]);
-      return {
-        ...memory,
-        relatedSubjects,
-        canonicalTuple,
-        planCanonicalKey,
-        canonicalValueKey,
-        semanticFingerprint: canonicalTupleHash([
-          "memory_candidate",
-          canonicalValueKey,
-          memory.confidence,
-          memory.evidenceSegmentIds,
-        ]),
-      };
-    });
-    const resolvedTopics = canonical.topics.map((topic) => ({
-      ...topic,
-      planCanonicalKey: topic.canonicalHash,
-      semanticFingerprint: canonicalTupleHash(["topic_candidate", ...topic.semanticTuple]),
-    }));
-    const resolvedTodos = canonical.todos.map((todo) => {
-      const binding = todo.ownerLabel === null ? null : bindingByLabel.get(todo.ownerLabel);
-      const canonicalTuple = ["todo", todo.normalizedTitle, binding?.subjectId ?? null];
-      const planCanonicalKey = canonicalTupleHash(canonicalTuple);
-      return {
-        ...todo,
-        ownerSubjectKind: binding?.subjectKind ?? null,
-        ownerSubjectId: binding?.subjectId ?? null,
-        canonicalTuple,
-        planCanonicalKey,
-        semanticFingerprint: canonicalTupleHash([
-          "todo_candidate",
-          canonicalTuple,
-          todo.normalizedDueText,
-          todo.evidenceSegmentIds,
-        ]),
-      };
-    });
-    const resolvedSuggestions = canonical.suggestions.map((suggestion) => ({
-      ...suggestion,
-      planCanonicalKey: suggestion.canonicalHash,
+function resolveCandidateContext(input, validated) {
+  const canonical = canonicalizeCandidate(input.candidate);
+  const { segmentById, bindingByLabel } = validated.evidenceContext;
+  const resolvedMemories = canonical.memories.map((memory) => {
+    const relatedSubjects = [];
+    const seenSubjects = new Set();
+    for (const segmentId of memory.evidenceSegmentIds) {
+      const speakerLabel = segmentById.get(segmentId)?.speakerLabel;
+      if (speakerLabel === null || speakerLabel === undefined) continue;
+      const binding = bindingByLabel.get(speakerLabel);
+      if (!binding) continue;
+      const subjectKey = `${binding.subjectKind}\0${binding.subjectId}`;
+      if (seenSubjects.has(subjectKey)) continue;
+      seenSubjects.add(subjectKey);
+      relatedSubjects.push({
+        subjectKind: binding.subjectKind,
+        subjectId: binding.subjectId,
+      });
+    }
+    relatedSubjects.sort(
+      (left, right) =>
+        compareCodePoints(left.subjectId, right.subjectId) ||
+        compareCodePoints(left.subjectKind, right.subjectKind)
+    );
+    const relatedSubjectIds = normalizeStringSet(
+      relatedSubjects.map((subject) => subject.subjectId),
+      "memory.relatedSubjectIds"
+    );
+    const canonicalTuple = ["memory", memory.kind, memory.normalizedTitle, relatedSubjectIds];
+    const planCanonicalKey = canonicalTupleHash(canonicalTuple);
+    const canonicalValueKey = canonicalTupleHash([
+      "memory_value",
+      planCanonicalKey,
+      memory.normalizedBody,
+    ]);
+    return {
+      ...memory,
+      relatedSubjects,
+      canonicalTuple,
+      planCanonicalKey,
+      canonicalValueKey,
       semanticFingerprint: canonicalTupleHash([
-        "suggestion_candidate",
-        ...suggestion.semanticTuple,
+        "memory_candidate",
+        canonicalValueKey,
+        memory.confidence,
+        memory.evidenceSegmentIds,
       ]),
-    }));
-    const memoryCandidates = dedupeCandidateItems(
-      resolvedMemories,
-      "memory",
-      (memory) => memory.canonicalValueKey,
-      "evidenceSegmentIds"
-    );
-    const topicCandidates = dedupeCandidateItems(
-      resolvedTopics,
-      "topic",
-      (topic) => topic.planCanonicalKey
-    );
-    const todoCandidates = dedupeCandidateItems(
-      resolvedTodos,
-      "todo",
-      (todo) => todo.planCanonicalKey
-    );
-    const suggestionCandidates = dedupeCandidateItems(
-      resolvedSuggestions,
-      "suggestion",
-      (suggestion) => suggestion.planCanonicalKey,
-      "basedOnEvidenceSegmentIds"
-    );
-    const memories = memoryCandidates.unique;
-    const topics = topicCandidates.unique;
-    const todos = todoCandidates.unique;
-    const suggestions = suggestionCandidates.unique;
-    const ignoredDuplicates = [
-      ...memoryCandidates.ignored,
-      ...topicCandidates.ignored,
-      ...todoCandidates.ignored,
-      ...suggestionCandidates.ignored,
-    ].sort(compareActions);
-    const topicsByKey = new Map(input.existing.topics.map((topic) => [topic.canonicalKey, topic]));
-    const memoriesByValueKey = new Map(
-      input.existing.memories.map((memory) => [memory.canonicalValueKey, memory])
-    );
-    const memoriesBySlotKey = new Map();
-    for (const memory of input.existing.memories) {
-      if (memory.lifecycle === "superseded") continue;
-      const slot = memoriesBySlotKey.get(memory.canonicalSlotKey) ?? [];
-      slot.push(memory);
-      memoriesBySlotKey.set(memory.canonicalSlotKey, slot);
-    }
-    const todosByBaseKey = new Map();
-    for (const todo of input.existing.todos) {
-      const instances = todosByBaseKey.get(todo.canonicalBaseKey) ?? [];
-      instances.push(todo);
-      todosByBaseKey.set(todo.canonicalBaseKey, instances);
-    }
-    const suggestionsByKey = new Map(
-      input.existing.suggestions.map((suggestion) => [suggestion.canonicalKey, suggestion])
-    );
-    const inserts = suggestions
-      .filter((suggestion) => !suggestionsByKey.has(suggestion.planCanonicalKey))
-      .map((suggestion) => ({
-        entityKind: "suggestion",
-        canonicalKey: suggestion.canonicalHash,
-        canonicalTuple: suggestion.canonicalTuple,
-        title: suggestion.title,
-        rationale: suggestion.rationale,
-        evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds,
-      }))
-      .concat(
-        topics
-          .filter((topic) => !topicsByKey.has(topic.canonicalHash))
-          .map((topic) => ({
-            entityKind: "topic",
-            canonicalKey: topic.canonicalHash,
-            canonicalTuple: topic.canonicalTuple,
-            name: topic.name,
-            summary: topic.summary,
-            normalizedSummary: topic.normalizedSummary,
-            evidenceSegmentIds: topic.evidenceSegmentIds,
-          }))
-      )
-      .concat(
-        memories
-          .filter((memory) => !memoriesByValueKey.has(memory.canonicalValueKey))
-          .map((memory) => ({
-            entityKind: "memory",
-            canonicalSlotKey: memory.planCanonicalKey,
-            canonicalValueKey: memory.canonicalValueKey,
-            canonicalTuple: memory.canonicalTuple,
-            kind: memory.kind,
-            title: memory.title,
-            body: memory.body,
-            normalizedBody: memory.normalizedBody,
-            confidence: memory.confidence,
-            relatedSubjects: memory.relatedSubjects,
-            evidenceSegmentIds: memory.evidenceSegmentIds,
-          })),
-        todos
-          .filter((todo) => !todosByBaseKey.has(todo.planCanonicalKey))
-          .map((todo) => ({
-            entityKind: "todo",
-            canonicalBaseKey: todo.planCanonicalKey,
-            canonicalTuple: todo.canonicalTuple,
-            title: todo.title,
-            ownerSubjectKind: todo.ownerSubjectKind,
-            ownerSubjectId: todo.ownerSubjectId,
-            dueText: todo.dueText,
-            evidenceSegmentIds: todo.evidenceSegmentIds,
-          }))
-      )
-      .sort(compareActions);
-    const revisions = [];
-    for (const topic of topics) {
-      const existingTopic = topicsByKey.get(topic.canonicalHash);
-      if (!existingTopic) continue;
-      const previous = [...existingTopic.revisions].sort(
-        (left, right) => right.revision - left.revision || compareCodePoints(right.id, left.id)
-      )[0];
-      if (canonicalizeText(previous.summary) === topic.normalizedSummary) continue;
+    };
+  });
+  const resolvedTopics = canonical.topics.map((topic) => ({
+    ...topic,
+    planCanonicalKey: topic.canonicalHash,
+    semanticFingerprint: canonicalTupleHash(["topic_candidate", ...topic.semanticTuple]),
+  }));
+  const resolvedTodos = canonical.todos.map((todo) => {
+    const binding = todo.ownerLabel === null ? null : bindingByLabel.get(todo.ownerLabel);
+    const canonicalTuple = ["todo", todo.normalizedTitle, binding?.subjectId ?? null];
+    const planCanonicalKey = canonicalTupleHash(canonicalTuple);
+    return {
+      ...todo,
+      ownerSubjectKind: binding?.subjectKind ?? null,
+      ownerSubjectId: binding?.subjectId ?? null,
+      canonicalTuple,
+      planCanonicalKey,
+      semanticFingerprint: canonicalTupleHash([
+        "todo_candidate",
+        canonicalTuple,
+        todo.normalizedDueText,
+        todo.evidenceSegmentIds,
+      ]),
+    };
+  });
+  const resolvedSuggestions = canonical.suggestions.map((suggestion) => ({
+    ...suggestion,
+    planCanonicalKey: suggestion.canonicalHash,
+    semanticFingerprint: canonicalTupleHash(["suggestion_candidate", ...suggestion.semanticTuple]),
+  }));
+  const memoryCandidates = convergeMemoryCandidates(resolvedMemories, segmentById);
+  const topicCandidates = dedupeCandidateItems(
+    resolvedTopics,
+    "topic",
+    (topic) => topic.planCanonicalKey
+  );
+  const todoCandidates = dedupeCandidateItems(
+    resolvedTodos,
+    "todo",
+    (todo) => todo.planCanonicalKey
+  );
+  const suggestionCandidates = dedupeCandidateItems(
+    resolvedSuggestions,
+    "suggestion",
+    (suggestion) => suggestion.planCanonicalKey,
+    "basedOnEvidenceSegmentIds"
+  );
+  const memories = memoryCandidates.unique;
+  const topics = topicCandidates.unique;
+  const todos = todoCandidates.unique;
+  const suggestions = suggestionCandidates.unique;
+  const ignoredDuplicates = [
+    ...memoryCandidates.ignored,
+    ...topicCandidates.ignored,
+    ...todoCandidates.ignored,
+    ...suggestionCandidates.ignored,
+  ].sort(compareActions);
+  const topicsByKey = new Map(input.existing.topics.map((topic) => [topic.canonicalKey, topic]));
+  const memoriesByValueKey = new Map(
+    input.existing.memories.map((memory) => [memory.canonicalValueKey, memory])
+  );
+  const memoriesBySlotKey = new Map();
+  for (const memory of input.existing.memories) {
+    if (memory.lifecycle === "superseded") continue;
+    const slot = memoriesBySlotKey.get(memory.canonicalSlotKey) ?? [];
+    slot.push(memory);
+    memoriesBySlotKey.set(memory.canonicalSlotKey, slot);
+  }
+  const todosByBaseKey = new Map();
+  for (const todo of input.existing.todos) {
+    const instances = todosByBaseKey.get(todo.canonicalBaseKey) ?? [];
+    instances.push(todo);
+    todosByBaseKey.set(todo.canonicalBaseKey, instances);
+  }
+  const suggestionsByKey = new Map(
+    input.existing.suggestions.map((suggestion) => [suggestion.canonicalKey, suggestion])
+  );
+  const todoRecurrencePreviousIds = new Set(
+    input.existing.todoRecurrences.map((recurrence) => recurrence.previousTodoId)
+  );
+  return {
+    segmentById,
+    memories,
+    topics,
+    todos,
+    suggestions,
+    ignoredDuplicates,
+    topicsByKey,
+    memoriesByValueKey,
+    memoriesBySlotKey,
+    todosByBaseKey,
+    suggestionsByKey,
+    todoRecurrencePreviousIds,
+  };
+}
+
+function planTopics({ input, topics, topicsByKey }) {
+  const inserts = topics
+    .filter((topic) => !topicsByKey.has(topic.canonicalHash))
+    .map((topic) => ({
+      entityKind: "topic",
+      canonicalKey: topic.canonicalHash,
+      canonicalTuple: topic.canonicalTuple,
+      name: topic.name,
+      summary: topic.summary,
+      normalizedSummary: topic.normalizedSummary,
+      evidenceSegmentIds: topic.evidenceSegmentIds,
+    }))
+    .sort(compareActions);
+  const revisions = [];
+  const occurrenceLinks = [];
+  for (const topic of topics) {
+    const existingTopic = topicsByKey.get(topic.canonicalHash);
+    if (!existingTopic) continue;
+    const previous = [...existingTopic.revisions].sort(
+      (left, right) => right.revision - left.revision || compareCodePoints(right.id, left.id)
+    )[0];
+    if (canonicalizeText(previous.summary) !== topic.normalizedSummary) {
       revisions.push({
         entityKind: "topic",
         topicId: existingTopic.id,
@@ -1135,423 +1215,577 @@ class MemoryMerger {
         normalizedSummary: topic.normalizedSummary,
         evidenceSegmentIds: topic.evidenceSegmentIds,
       });
+      continue;
     }
-    revisions.sort(compareActions);
-
-    const occurrenceLinks = [];
-    const conflictGroups = new Map();
-    const recordMemoryConflict = (
-      canonicalSlotKey,
-      existingMemoryIds,
-      candidateCanonicalValueKeys
-    ) => {
-      const group = conflictGroups.get(canonicalSlotKey) ?? {
-        existingMemoryIds: new Set(),
-        candidateCanonicalValueKeys: new Set(),
-      };
-      for (const memoryId of existingMemoryIds) group.existingMemoryIds.add(memoryId);
-      for (const valueKey of candidateCanonicalValueKeys) {
-        group.candidateCanonicalValueKeys.add(valueKey);
-      }
-      conflictGroups.set(canonicalSlotKey, group);
-    };
-    const candidateValuesBySlotKey = new Map();
-    for (const memory of memories) {
-      const valueKeys = candidateValuesBySlotKey.get(memory.planCanonicalKey) ?? new Set();
-      valueKeys.add(memory.canonicalValueKey);
-      candidateValuesBySlotKey.set(memory.planCanonicalKey, valueKeys);
-    }
-    for (const [canonicalSlotKey, candidateCanonicalValueKeys] of candidateValuesBySlotKey) {
-      if (
-        candidateCanonicalValueKeys.size > 1 &&
-        [...candidateCanonicalValueKeys].some((valueKey) => !memoriesByValueKey.has(valueKey))
-      ) {
-        recordMemoryConflict(canonicalSlotKey, [], candidateCanonicalValueKeys);
-      }
-    }
-    const supersessions = [];
-    const recurrences = [];
-    const normalizedReplacements = [...validated.replacements].sort(compareActions);
-    const usedReplacementKeys = new Set();
-    const evidenceBounds = (evidenceSegmentIds) => {
-      const segments = evidenceSegmentIds.map((segmentId) => segmentById.get(segmentId));
-      return {
-        startedAt: Math.min(...segments.map((segment) => segment.startedAt)),
-        endedAt: Math.max(...segments.map((segment) => segment.endedAt)),
-      };
-    };
-    const replacementForOccurrence = (memory, occurrence) =>
-      normalizedReplacements.find((replacement) => {
-        if (
-          replacement.replacesSegmentIds.length === 0 ||
-          replacement.replacesSegmentIds.includes(replacement.newSegmentId) ||
-          !memory.evidenceSegmentIds.includes(replacement.newSegmentId) ||
-          !occurrence.evidenceSegmentIds.every((segmentId) =>
-            replacement.replacesSegmentIds.includes(segmentId)
-          )
-        ) {
-          return false;
-        }
-        return [replacement.newSegmentId, ...replacement.replacesSegmentIds].every(
-          (segmentId) => segmentById.get(segmentId)?.sessionId === input.analysisInput.sessionId
-        );
+    const eligibleOccurrences = existingTopic.occurrences.filter(
+      (occurrence) => occurrence.revisionId === previous.id
+    );
+    const covered = eligibleOccurrences.find((occurrence) =>
+      topic.evidenceSegmentIds.every((segmentId) =>
+        occurrence.evidenceSegmentIds.includes(segmentId)
+      )
+    );
+    if (covered) continue;
+    const candidateEvidence = new Set(topic.evidenceSegmentIds);
+    const reusable = [...eligibleOccurrences]
+      .filter((occurrence) =>
+        occurrence.evidenceSegmentIds.some((segmentId) => candidateEvidence.has(segmentId))
+      )
+      .sort((left, right) => compareCodePoints(left.id, right.id))[0];
+    if (reusable) {
+      occurrenceLinks.push({
+        entityKind: "topic_occurrence",
+        topicId: existingTopic.id,
+        occurrenceId: reusable.id,
+        revisionId: previous.id,
+        mode: "link_evidence",
+        evidenceSegmentIds: topic.evidenceSegmentIds.filter(
+          (segmentId) => !reusable.evidenceSegmentIds.includes(segmentId)
+        ),
       });
+    } else {
+      occurrenceLinks.push({
+        entityKind: "topic",
+        topicId: existingTopic.id,
+        revisionId: previous.id,
+        mode: "create_occurrence",
+        evidenceSegmentIds: topic.evidenceSegmentIds,
+      });
+    }
+  }
 
-    for (const topic of topics) {
-      const existingTopic = topicsByKey.get(topic.canonicalHash);
-      if (!existingTopic) continue;
-      const previousRevision = [...existingTopic.revisions].sort(
-        (left, right) => right.revision - left.revision || compareCodePoints(right.id, left.id)
-      )[0];
-      if (canonicalizeText(previousRevision.summary) !== topic.normalizedSummary) continue;
-      const eligibleOccurrences = existingTopic.occurrences.filter(
-        (occurrence) => occurrence.revisionId === previousRevision.id
+  const existingMergePairs = new Set(
+    input.existing.topicMergeSuggestions
+      .filter((suggestion) => suggestion.algorithmVersion === TOPIC_SIMILARITY_ALGORITHM)
+      .map((suggestion) =>
+        [suggestion.leftTopicId, suggestion.rightTopicId].sort(compareCodePoints).join("\0")
+      )
+  );
+  const plannedPairKeys = new Set();
+  const mergeSuggestions = [];
+  const topicRefsByKey = new Map();
+  for (const existingTopic of input.existing.topics) {
+    if (existingTopic.lifecycle !== "active") continue;
+    topicRefsByKey.set(existingTopic.canonicalKey, {
+      canonicalKey: existingTopic.canonicalKey,
+      topicId: existingTopic.id,
+      name: existingTopic.name,
+      fromCandidate: false,
+    });
+  }
+  for (const topic of topics) {
+    const exactTopic = topicsByKey.get(topic.canonicalHash);
+    if (exactTopic) {
+      const existingRef = topicRefsByKey.get(topic.canonicalHash);
+      if (existingRef) existingRef.fromCandidate = true;
+      continue;
+    }
+    topicRefsByKey.set(topic.canonicalHash, {
+      canonicalKey: topic.canonicalHash,
+      name: topic.name,
+      fromCandidate: true,
+    });
+  }
+  const topicRefs = [...topicRefsByKey.values()].sort((left, right) =>
+    compareCodePoints(left.canonicalKey, right.canonicalKey)
+  );
+  for (let leftIndex = 0; leftIndex < topicRefs.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < topicRefs.length; rightIndex += 1) {
+      const left = topicRefs[leftIndex];
+      const right = topicRefs[rightIndex];
+      if (!left.fromCandidate && !right.fromCandidate) continue;
+      const score = diceBigramScore(left.name, right.name);
+      if (score < TOPIC_SIMILARITY_THRESHOLD) continue;
+      if (
+        left.topicId &&
+        right.topicId &&
+        existingMergePairs.has([left.topicId, right.topicId].sort(compareCodePoints).join("\0"))
+      ) {
+        continue;
+      }
+      const pairKey = canonicalTupleHash([
+        "topic_merge_pair",
+        left.canonicalKey,
+        right.canonicalKey,
+        TOPIC_SIMILARITY_ALGORITHM,
+      ]);
+      if (plannedPairKeys.has(pairKey)) continue;
+      plannedPairKeys.add(pairKey);
+      mergeSuggestions.push({
+        pairKey,
+        leftTopic: {
+          canonicalKey: left.canonicalKey,
+          ...(left.topicId ? { topicId: left.topicId } : {}),
+        },
+        rightTopic: {
+          canonicalKey: right.canonicalKey,
+          ...(right.topicId ? { topicId: right.topicId } : {}),
+        },
+        algorithmVersion: TOPIC_SIMILARITY_ALGORITHM,
+        score: roundSix(score),
+        state: "proposed",
+      });
+    }
+  }
+  revisions.sort(compareActions);
+  occurrenceLinks.sort(compareActions);
+  mergeSuggestions.sort(compareActions);
+  return { inserts, revisions, occurrenceLinks, mergeSuggestions };
+}
+
+function evidenceBoundsFor(evidenceSegmentIds, segmentById) {
+  const segments = evidenceSegmentIds.map((segmentId) => segmentById.get(segmentId));
+  return {
+    startedAt: Math.min(...segments.map((segment) => segment.startedAt)),
+    endedAt: Math.max(...segments.map((segment) => segment.endedAt)),
+  };
+}
+
+function planMemories({
+  input,
+  validated,
+  memories,
+  memoriesByValueKey,
+  memoriesBySlotKey,
+  segmentById,
+}) {
+  const inserts = memories
+    .filter(
+      (memory) =>
+        !memoriesByValueKey.has(memory.canonicalValueKey) &&
+        (memory.kind !== "event" || memory.eventClusterIndex === 0)
+    )
+    .map((memory) => ({
+      entityKind: "memory",
+      canonicalSlotKey: memory.planCanonicalKey,
+      canonicalValueKey: memory.canonicalValueKey,
+      canonicalTuple: memory.canonicalTuple,
+      kind: memory.kind,
+      title: memory.title,
+      body: memory.body,
+      normalizedBody: memory.normalizedBody,
+      confidence: memory.confidence,
+      relatedSubjects: memory.relatedSubjects,
+      evidenceSegmentIds: memory.evidenceSegmentIds,
+    }));
+  const occurrenceLinks = [];
+  const conflictGroups = new Map();
+  const recordMemoryConflict = (
+    canonicalSlotKey,
+    existingMemoryIds,
+    candidateCanonicalValueKeys
+  ) => {
+    const group = conflictGroups.get(canonicalSlotKey) ?? {
+      existingMemoryIds: new Set(),
+      candidateCanonicalValueKeys: new Set(),
+    };
+    for (const memoryId of existingMemoryIds) group.existingMemoryIds.add(memoryId);
+    for (const valueKey of candidateCanonicalValueKeys) {
+      group.candidateCanonicalValueKeys.add(valueKey);
+    }
+    conflictGroups.set(canonicalSlotKey, group);
+  };
+  const candidateValuesBySlotKey = new Map();
+  for (const memory of memories) {
+    const valueKeys = candidateValuesBySlotKey.get(memory.planCanonicalKey) ?? new Set();
+    valueKeys.add(memory.canonicalValueKey);
+    candidateValuesBySlotKey.set(memory.planCanonicalKey, valueKeys);
+  }
+  for (const [canonicalSlotKey, candidateCanonicalValueKeys] of candidateValuesBySlotKey) {
+    if (
+      candidateCanonicalValueKeys.size > 1 &&
+      [...candidateCanonicalValueKeys].some((valueKey) => !memoriesByValueKey.has(valueKey))
+    ) {
+      recordMemoryConflict(canonicalSlotKey, [], candidateCanonicalValueKeys);
+    }
+  }
+
+  const supersessions = [];
+  const normalizedReplacements = [...validated.replacements].sort(compareActions);
+  const usedReplacementKeys = new Set();
+  const replacementForOccurrence = (memory, occurrence) =>
+    normalizedReplacements.find((replacement) => {
+      if (
+        replacement.replacesSegmentIds.length === 0 ||
+        replacement.replacesSegmentIds.includes(replacement.newSegmentId) ||
+        !memory.evidenceSegmentIds.includes(replacement.newSegmentId) ||
+        !occurrence.evidenceSegmentIds.every((segmentId) =>
+          replacement.replacesSegmentIds.includes(segmentId)
+        )
+      ) {
+        return false;
+      }
+      return [replacement.newSegmentId, ...replacement.replacesSegmentIds].every(
+        (segmentId) => segmentById.get(segmentId)?.sessionId === input.analysisInput.sessionId
       );
-      const covered = eligibleOccurrences.find((occurrence) =>
-        topic.evidenceSegmentIds.every((segmentId) =>
+    });
+
+  for (const memory of memories) {
+    const exactMemory = memoriesByValueKey.get(memory.canonicalValueKey);
+    if (exactMemory) {
+      if (memory.kind === "event") {
+        const candidateBounds = evidenceBoundsFor(memory.evidenceSegmentIds, segmentById);
+        const reusableEvent = exactMemory.occurrences
+          .map((occurrence) => {
+            const gap = Math.max(
+              0,
+              candidateBounds.startedAt - occurrence.endedAt,
+              occurrence.startedAt - candidateBounds.endedAt
+            );
+            return { occurrence, gap };
+          })
+          .filter(({ gap }) => gap <= EVENT_DEDUPE_WINDOW_MS)
+          .sort(
+            (left, right) =>
+              left.gap - right.gap || compareCodePoints(left.occurrence.id, right.occurrence.id)
+          )[0]?.occurrence;
+        if (reusableEvent) {
+          const missingEvidence = memory.evidenceSegmentIds.filter(
+            (segmentId) => !reusableEvent.evidenceSegmentIds.includes(segmentId)
+          );
+          if (missingEvidence.length > 0) {
+            occurrenceLinks.push({
+              entityKind: "memory_occurrence",
+              memoryId: exactMemory.id,
+              occurrenceId: reusableEvent.id,
+              mode: "link_evidence",
+              evidenceSegmentIds: missingEvidence,
+            });
+          }
+          continue;
+        }
+      }
+      const candidateEvidence = new Set(memory.evidenceSegmentIds);
+      const covered = exactMemory.occurrences.find((occurrence) =>
+        memory.evidenceSegmentIds.every((segmentId) =>
           occurrence.evidenceSegmentIds.includes(segmentId)
         )
       );
       if (covered) continue;
-      const candidateEvidence = new Set(topic.evidenceSegmentIds);
-      const reusable = [...eligibleOccurrences]
-        .filter((occurrence) =>
+      const reusable = [...exactMemory.occurrences]
+        .sort((left, right) => compareCodePoints(left.id, right.id))
+        .find((occurrence) =>
           occurrence.evidenceSegmentIds.some((segmentId) => candidateEvidence.has(segmentId))
-        )
-        .sort((left, right) => compareCodePoints(left.id, right.id))[0];
+        );
       if (reusable) {
         occurrenceLinks.push({
-          entityKind: "topic_occurrence",
-          topicId: existingTopic.id,
+          entityKind: "memory_occurrence",
+          memoryId: exactMemory.id,
           occurrenceId: reusable.id,
-          revisionId: previousRevision.id,
           mode: "link_evidence",
-          evidenceSegmentIds: topic.evidenceSegmentIds.filter(
+          evidenceSegmentIds: memory.evidenceSegmentIds.filter(
             (segmentId) => !reusable.evidenceSegmentIds.includes(segmentId)
           ),
         });
       } else {
         occurrenceLinks.push({
-          entityKind: "topic",
-          topicId: existingTopic.id,
-          revisionId: previousRevision.id,
+          entityKind: "memory",
+          memoryId: exactMemory.id,
+          canonicalValueKey: memory.canonicalValueKey,
           mode: "create_occurrence",
-          evidenceSegmentIds: topic.evidenceSegmentIds,
+          ...evidenceBoundsFor(memory.evidenceSegmentIds, segmentById),
+          confidence: memory.confidence,
+          evidenceSegmentIds: memory.evidenceSegmentIds,
         });
       }
+      continue;
     }
 
-    for (const memory of memories) {
-      const exactMemory = memoriesByValueKey.get(memory.canonicalValueKey);
-      if (exactMemory) {
-        if (memory.kind === "event") {
-          const candidateBounds = evidenceBounds(memory.evidenceSegmentIds);
-          const reusableEvent = exactMemory.occurrences
-            .map((occurrence) => {
-              const gap = Math.max(
-                0,
-                candidateBounds.startedAt - occurrence.endedAt,
-                occurrence.startedAt - candidateBounds.endedAt
-              );
-              return { occurrence, gap };
-            })
-            .filter(({ gap }) => gap <= EVENT_DEDUPE_WINDOW_MS)
-            .sort(
-              (left, right) =>
-                left.gap - right.gap || compareCodePoints(left.occurrence.id, right.occurrence.id)
-            )[0]?.occurrence;
-          if (reusableEvent) {
-            const missingEvidence = memory.evidenceSegmentIds.filter(
-              (segmentId) => !reusableEvent.evidenceSegmentIds.includes(segmentId)
-            );
-            if (missingEvidence.length > 0) {
-              occurrenceLinks.push({
-                entityKind: "memory_occurrence",
-                memoryId: exactMemory.id,
-                occurrenceId: reusableEvent.id,
-                mode: "link_evidence",
-                evidenceSegmentIds: missingEvidence,
-              });
-            }
-            continue;
-          }
-        }
-        const candidateEvidence = new Set(memory.evidenceSegmentIds);
-        const covered = exactMemory.occurrences.find((occurrence) =>
-          memory.evidenceSegmentIds.every((segmentId) =>
-            occurrence.evidenceSegmentIds.includes(segmentId)
-          )
-        );
-        if (covered) continue;
-        const reusable = [...exactMemory.occurrences]
-          .sort((left, right) => compareCodePoints(left.id, right.id))
-          .find((occurrence) =>
-            occurrence.evidenceSegmentIds.some((segmentId) => candidateEvidence.has(segmentId))
-          );
-        if (reusable) {
-          occurrenceLinks.push({
-            entityKind: "memory_occurrence",
-            memoryId: exactMemory.id,
-            occurrenceId: reusable.id,
-            mode: "link_evidence",
-            evidenceSegmentIds: memory.evidenceSegmentIds.filter(
-              (segmentId) => !reusable.evidenceSegmentIds.includes(segmentId)
-            ),
-          });
-        } else {
-          occurrenceLinks.push({
-            entityKind: "memory",
-            memoryId: exactMemory.id,
-            canonicalValueKey: memory.canonicalValueKey,
-            mode: "create_occurrence",
-            ...evidenceBounds(memory.evidenceSegmentIds),
-            confidence: memory.confidence,
-            evidenceSegmentIds: memory.evidenceSegmentIds,
-          });
-        }
-        continue;
-      }
-
-      const priorValues = memoriesBySlotKey.get(memory.planCanonicalKey) ?? [];
-      if (priorValues.length === 0) continue;
-      const conflictingIds = [];
-      for (const prior of priorValues) {
-        let replacementAction = null;
-        for (const occurrence of [...prior.occurrences].sort((left, right) =>
-          compareCodePoints(left.id, right.id)
-        )) {
-          const replacement = replacementForOccurrence(memory, occurrence);
-          if (!replacement) continue;
-          replacementAction = {
-            priorMemoryId: prior.id,
-            priorOccurrenceId: occurrence.id,
-            nextMemoryCanonicalValueKey: memory.canonicalValueKey,
-            canonicalSlotKey: memory.planCanonicalKey,
-            reason: "transcript_replacement",
-            newSegmentId: replacement.newSegmentId,
-            replacesSegmentIds: replacement.replacesSegmentIds,
-          };
-          break;
-        }
-        if (replacementAction) supersessions.push(replacementAction);
-        if (replacementAction) {
-          const replacement = normalizedReplacements.find(
-            (item) =>
-              item.newSegmentId === replacementAction.newSegmentId &&
-              item.replacesSegmentIds.length === replacementAction.replacesSegmentIds.length &&
-              item.replacesSegmentIds.every(
-                (segmentId, index) => segmentId === replacementAction.replacesSegmentIds[index]
-              )
-          );
-          usedReplacementKeys.add(replacement.replacementKey);
-        } else conflictingIds.push(prior.id);
-      }
-      if (conflictingIds.length > 0) {
-        recordMemoryConflict(memory.planCanonicalKey, conflictingIds, [memory.canonicalValueKey]);
-      }
-    }
-
-    const conflicts = [...conflictGroups.entries()].map(([canonicalSlotKey, group]) => ({
-      canonicalSlotKey,
-      existingMemoryIds: [...group.existingMemoryIds].sort(compareCodePoints),
-      candidateCanonicalValueKeys: [...group.candidateCanonicalValueKeys].sort(compareCodePoints),
-      reason: "independent_changed_body",
-    }));
-
-    for (const todo of todos) {
-      const instances = todosByBaseKey.get(todo.planCanonicalKey) ?? [];
-      if (instances.length === 0) continue;
-      const active = [...instances]
-        .filter((instance) => instance.status === "open")
-        .sort((left, right) => compareCodePoints(left.id, right.id))[0];
-      const existingTodo =
-        active ?? [...instances].sort((left, right) => compareCodePoints(left.id, right.id))[0];
-      const previousRevision = [...existingTodo.revisions].sort(
-        (left, right) => right.revision - left.revision || compareCodePoints(right.id, left.id)
-      )[0];
-      const covered = existingTodo.occurrences.find((occurrence) =>
-        todo.evidenceSegmentIds.every((segmentId) =>
-          occurrence.evidenceSegmentIds.includes(segmentId)
-        )
-      );
-      if (covered) continue;
-      const bounds = evidenceBounds(todo.evidenceSegmentIds);
-
-      if (existingTodo.status === "open") {
-        const candidateEvidence = new Set(todo.evidenceSegmentIds);
-        const reusable = [...existingTodo.occurrences]
-          .sort((left, right) => compareCodePoints(left.id, right.id))
-          .find((occurrence) =>
-            occurrence.evidenceSegmentIds.some((segmentId) => candidateEvidence.has(segmentId))
-          );
-        if (reusable) {
-          occurrenceLinks.push({
-            entityKind: "todo_occurrence",
-            todoId: existingTodo.id,
-            occurrenceId: reusable.id,
-            mode: "link_evidence",
-            evidenceSegmentIds: todo.evidenceSegmentIds.filter(
-              (segmentId) => !reusable.evidenceSegmentIds.includes(segmentId)
-            ),
-          });
-        } else {
-          occurrenceLinks.push({
-            entityKind: "todo",
-            todoId: existingTodo.id,
-            revisionId: previousRevision.id,
-            mode: "create_occurrence",
-            ...bounds,
-            evidenceSegmentIds: todo.evidenceSegmentIds,
-          });
-        }
-        continue;
-      }
-
-      const isLater =
-        existingTodo.status === "completed" && bounds.startedAt > existingTodo.completedAt;
-      if (!isLater) {
-        occurrenceLinks.push({
-          entityKind: "todo",
-          todoId: existingTodo.id,
-          revisionId: previousRevision.id,
-          mode: "attach_history",
-          ...bounds,
-          evidenceSegmentIds: todo.evidenceSegmentIds,
-        });
-        continue;
-      }
-
-      const existingRecurrence = input.existing.todoRecurrences.find(
-        (recurrence) => recurrence.previousTodoId === existingTodo.id
-      );
-      if (existingRecurrence) continue;
-      recurrences.push({
-        previousTodoId: existingTodo.id,
-        nextTodoInstanceKey: canonicalTupleHash([
-          "todo_recurrence",
-          existingTodo.id,
-          todo.planCanonicalKey,
-          todo.evidenceSegmentIds,
-        ]),
-        canonicalBaseKey: todo.planCanonicalKey,
-        title: todo.title,
-        ownerSubjectKind: todo.ownerSubjectKind,
-        ownerSubjectId: todo.ownerSubjectId,
-        dueText: todo.dueText,
-        ...bounds,
-        evidenceSegmentIds: todo.evidenceSegmentIds,
-        reason: "later_evidence",
+    if (memory.kind === "event" && memory.eventClusterIndex > 0) {
+      occurrenceLinks.push({
+        entityKind: "memory",
+        canonicalValueKey: memory.canonicalValueKey,
+        mode: "create_occurrence",
+        ...evidenceBoundsFor(memory.evidenceSegmentIds, segmentById),
+        confidence: memory.confidence,
+        evidenceSegmentIds: memory.evidenceSegmentIds,
       });
+      continue;
     }
 
-    for (const suggestion of suggestions) {
-      const existingSuggestion = suggestionsByKey.get(suggestion.planCanonicalKey);
-      if (
-        !existingSuggestion ||
-        existingSuggestion.state !== "proposed" ||
-        suggestion.basedOnEvidenceSegmentIds.length === 0
-      ) {
-        continue;
-      }
-      const covered = existingSuggestion.occurrences.find((occurrence) =>
-        suggestion.basedOnEvidenceSegmentIds.every((segmentId) =>
-          occurrence.evidenceSegmentIds.includes(segmentId)
-        )
-      );
-      if (covered) continue;
-      const occurrence = [...existingSuggestion.occurrences].sort((left, right) =>
+    const priorValues = memoriesBySlotKey.get(memory.planCanonicalKey) ?? [];
+    if (priorValues.length === 0) continue;
+    const conflictingIds = [];
+    for (const prior of priorValues) {
+      let replacementAction = null;
+      for (const occurrence of [...prior.occurrences].sort((left, right) =>
         compareCodePoints(left.id, right.id)
-      )[0];
-      if (occurrence) {
+      )) {
+        const replacement = replacementForOccurrence(memory, occurrence);
+        if (!replacement) continue;
+        replacementAction = {
+          priorMemoryId: prior.id,
+          priorOccurrenceId: occurrence.id,
+          nextMemoryCanonicalValueKey: memory.canonicalValueKey,
+          canonicalSlotKey: memory.planCanonicalKey,
+          reason: "transcript_replacement",
+          newSegmentId: replacement.newSegmentId,
+          replacesSegmentIds: replacement.replacesSegmentIds,
+        };
+        break;
+      }
+      if (replacementAction) supersessions.push(replacementAction);
+      if (replacementAction) {
+        const replacement = normalizedReplacements.find(
+          (item) =>
+            item.newSegmentId === replacementAction.newSegmentId &&
+            item.replacesSegmentIds.length === replacementAction.replacesSegmentIds.length &&
+            item.replacesSegmentIds.every(
+              (segmentId, index) => segmentId === replacementAction.replacesSegmentIds[index]
+            )
+        );
+        usedReplacementKeys.add(replacement.replacementKey);
+      } else conflictingIds.push(prior.id);
+    }
+    if (conflictingIds.length > 0) {
+      recordMemoryConflict(memory.planCanonicalKey, conflictingIds, [memory.canonicalValueKey]);
+    }
+  }
+
+  const conflicts = [...conflictGroups.entries()].map(([canonicalSlotKey, group]) => ({
+    canonicalSlotKey,
+    existingMemoryIds: [...group.existingMemoryIds].sort(compareCodePoints),
+    candidateCanonicalValueKeys: [...group.candidateCanonicalValueKeys].sort(compareCodePoints),
+    reason: "independent_changed_body",
+  }));
+  if (
+    normalizedReplacements.some(
+      (replacement) => !usedReplacementKeys.has(replacement.replacementKey)
+    )
+  ) {
+    validationFail("untrusted_replacement");
+  }
+
+  occurrenceLinks.sort(compareActions);
+  conflicts.sort(compareActions);
+  supersessions.sort(compareActions);
+  return { inserts, occurrenceLinks, supersessions, conflicts };
+}
+
+function planTodos({ input, todos, todosByBaseKey, todoRecurrencePreviousIds, segmentById }) {
+  const inserts = todos
+    .filter((todo) => !todosByBaseKey.has(todo.planCanonicalKey))
+    .map((todo) => ({
+      entityKind: "todo",
+      canonicalBaseKey: todo.planCanonicalKey,
+      canonicalTuple: todo.canonicalTuple,
+      title: todo.title,
+      ownerSubjectKind: todo.ownerSubjectKind,
+      ownerSubjectId: todo.ownerSubjectId,
+      dueText: todo.dueText,
+      evidenceSegmentIds: todo.evidenceSegmentIds,
+    }));
+  const occurrenceLinks = [];
+  const recurrences = [];
+
+  for (const todo of todos) {
+    const instances = todosByBaseKey.get(todo.planCanonicalKey) ?? [];
+    if (instances.length === 0) continue;
+    const active = [...instances]
+      .filter((instance) => instance.status === "open")
+      .sort((left, right) => compareCodePoints(left.id, right.id))[0];
+    const terminalLeaf = [...instances]
+      .filter((instance) => !todoRecurrencePreviousIds.has(instance.id))
+      .sort((left, right) => compareCodePoints(left.id, right.id))[0];
+    const existingTodo =
+      active ??
+      terminalLeaf ??
+      [...instances].sort((left, right) => compareCodePoints(left.id, right.id))[0];
+    const previousRevision = [...existingTodo.revisions].sort(
+      (left, right) => right.revision - left.revision || compareCodePoints(right.id, left.id)
+    )[0];
+    const covered = existingTodo.occurrences.find((occurrence) =>
+      todo.evidenceSegmentIds.every((segmentId) =>
+        occurrence.evidenceSegmentIds.includes(segmentId)
+      )
+    );
+    if (covered) continue;
+    const bounds = evidenceBoundsFor(todo.evidenceSegmentIds, segmentById);
+
+    if (existingTodo.status === "open") {
+      const candidateEvidence = new Set(todo.evidenceSegmentIds);
+      const reusable = [...existingTodo.occurrences]
+        .sort((left, right) => compareCodePoints(left.id, right.id))
+        .find((occurrence) =>
+          occurrence.evidenceSegmentIds.some((segmentId) => candidateEvidence.has(segmentId))
+        );
+      if (reusable) {
         occurrenceLinks.push({
-          entityKind: "suggestion_occurrence",
-          suggestionId: existingSuggestion.id,
-          occurrenceId: occurrence.id,
+          entityKind: "todo_occurrence",
+          todoId: existingTodo.id,
+          occurrenceId: reusable.id,
           mode: "link_evidence",
-          evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds.filter(
-            (segmentId) => !occurrence.evidenceSegmentIds.includes(segmentId)
+          evidenceSegmentIds: todo.evidenceSegmentIds.filter(
+            (segmentId) => !reusable.evidenceSegmentIds.includes(segmentId)
           ),
         });
       } else {
         occurrenceLinks.push({
-          entityKind: "suggestion",
-          suggestionId: existingSuggestion.id,
+          entityKind: "todo",
+          todoId: existingTodo.id,
+          revisionId: previousRevision.id,
           mode: "create_occurrence",
-          evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds,
+          ...bounds,
+          evidenceSegmentIds: todo.evidenceSegmentIds,
         });
       }
+      continue;
     }
+
+    const isLater =
+      existingTodo.status === "completed" && bounds.startedAt > existingTodo.completedAt;
+    if (!isLater) {
+      occurrenceLinks.push({
+        entityKind: "todo",
+        todoId: existingTodo.id,
+        revisionId: previousRevision.id,
+        mode: "attach_history",
+        ...bounds,
+        evidenceSegmentIds: todo.evidenceSegmentIds,
+      });
+      continue;
+    }
+
+    const existingRecurrence = input.existing.todoRecurrences.find(
+      (recurrence) => recurrence.previousTodoId === existingTodo.id
+    );
+    if (existingRecurrence) continue;
+    recurrences.push({
+      previousTodoId: existingTodo.id,
+      nextTodoInstanceKey: canonicalTupleHash([
+        "todo_recurrence",
+        existingTodo.id,
+        todo.planCanonicalKey,
+        todo.evidenceSegmentIds,
+      ]),
+      canonicalBaseKey: todo.planCanonicalKey,
+      title: todo.title,
+      ownerSubjectKind: todo.ownerSubjectKind,
+      ownerSubjectId: todo.ownerSubjectId,
+      dueText: todo.dueText,
+      ...bounds,
+      evidenceSegmentIds: todo.evidenceSegmentIds,
+      reason: "later_evidence",
+    });
+  }
+
+  occurrenceLinks.sort(compareActions);
+  recurrences.sort(compareActions);
+  return { inserts, occurrenceLinks, recurrences };
+}
+
+function planSuggestions({ suggestions, suggestionsByKey }) {
+  const inserts = suggestions
+    .filter((suggestion) => !suggestionsByKey.has(suggestion.planCanonicalKey))
+    .map((suggestion) => ({
+      entityKind: "suggestion",
+      canonicalKey: suggestion.canonicalHash,
+      canonicalTuple: suggestion.canonicalTuple,
+      title: suggestion.title,
+      rationale: suggestion.rationale,
+      evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds,
+    }));
+  const occurrenceLinks = [];
+
+  for (const suggestion of suggestions) {
+    const existingSuggestion = suggestionsByKey.get(suggestion.planCanonicalKey);
+    if (
+      !existingSuggestion ||
+      existingSuggestion.state !== "proposed" ||
+      suggestion.basedOnEvidenceSegmentIds.length === 0
+    ) {
+      continue;
+    }
+    const covered = existingSuggestion.occurrences.find((occurrence) =>
+      suggestion.basedOnEvidenceSegmentIds.every((segmentId) =>
+        occurrence.evidenceSegmentIds.includes(segmentId)
+      )
+    );
+    if (covered) continue;
+    const occurrence = [...existingSuggestion.occurrences].sort((left, right) =>
+      compareCodePoints(left.id, right.id)
+    )[0];
+    if (occurrence) {
+      occurrenceLinks.push({
+        entityKind: "suggestion_occurrence",
+        suggestionId: existingSuggestion.id,
+        occurrenceId: occurrence.id,
+        mode: "link_evidence",
+        evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds.filter(
+          (segmentId) => !occurrence.evidenceSegmentIds.includes(segmentId)
+        ),
+      });
+    } else {
+      occurrenceLinks.push({
+        entityKind: "suggestion",
+        suggestionId: existingSuggestion.id,
+        mode: "create_occurrence",
+        evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds,
+      });
+    }
+  }
+
+  occurrenceLinks.sort(compareActions);
+  return { inserts, occurrenceLinks };
+}
+
+class MemoryMerger {
+  plan(input) {
+    const validated = validatePlannerInput(input);
+    input = validated.value;
+    const {
+      segmentById,
+      memories,
+      topics,
+      todos,
+      suggestions,
+      ignoredDuplicates,
+      topicsByKey,
+      memoriesByValueKey,
+      memoriesBySlotKey,
+      todosByBaseKey,
+      suggestionsByKey,
+      todoRecurrencePreviousIds,
+    } = resolveCandidateContext(input, validated);
+    const topicPlan = planTopics({ input, topics, topicsByKey });
+    const memoryPlan = planMemories({
+      input,
+      validated,
+      memories,
+      memoriesByValueKey,
+      memoriesBySlotKey,
+      segmentById,
+    });
+    const todoPlan = planTodos({
+      input,
+      todos,
+      todosByBaseKey,
+      todoRecurrencePreviousIds,
+      segmentById,
+    });
+    const suggestionPlan = planSuggestions({ suggestions, suggestionsByKey });
+    const inserts = suggestionPlan.inserts
+      .concat(topicPlan.inserts)
+      .concat(memoryPlan.inserts, todoPlan.inserts)
+      .sort(compareActions);
+    const revisions = topicPlan.revisions;
+
+    const occurrenceLinks = [
+      ...topicPlan.occurrenceLinks,
+      ...memoryPlan.occurrenceLinks,
+      ...todoPlan.occurrenceLinks,
+      ...suggestionPlan.occurrenceLinks,
+    ];
+    const supersessions = memoryPlan.supersessions;
+    const conflicts = memoryPlan.conflicts;
+    const recurrences = todoPlan.recurrences;
+
     occurrenceLinks.sort(compareActions);
     conflicts.sort(compareActions);
     supersessions.sort(compareActions);
     recurrences.sort(compareActions);
 
-    const existingMergePairs = new Set(
-      input.existing.topicMergeSuggestions
-        .filter((suggestion) => suggestion.algorithmVersion === TOPIC_SIMILARITY_ALGORITHM)
-        .map((suggestion) =>
-          [suggestion.leftTopicId, suggestion.rightTopicId].sort(compareCodePoints).join("\0")
-        )
-    );
-    const plannedPairKeys = new Set();
-    const mergeSuggestions = [];
-    for (const topic of topics) {
-      const exactTopic = topicsByKey.get(topic.canonicalHash);
-      const candidateRef = {
-        canonicalKey: topic.canonicalHash,
-        ...(exactTopic ? { topicId: exactTopic.id } : {}),
-      };
-      for (const existingTopic of input.existing.topics) {
-        if (
-          existingTopic.lifecycle !== "active" ||
-          existingTopic.canonicalKey === topic.canonicalHash
-        ) {
-          continue;
-        }
-        const score = diceBigramScore(topic.name, existingTopic.name);
-        if (score < TOPIC_SIMILARITY_THRESHOLD) continue;
-        const existingRef = {
-          canonicalKey: existingTopic.canonicalKey,
-          topicId: existingTopic.id,
-        };
-        const pair = [candidateRef, existingRef].sort((left, right) =>
-          compareCodePoints(left.canonicalKey, right.canonicalKey)
-        );
-        if (
-          pair[0].topicId &&
-          pair[1].topicId &&
-          existingMergePairs.has(
-            [pair[0].topicId, pair[1].topicId].sort(compareCodePoints).join("\0")
-          )
-        ) {
-          continue;
-        }
-        const pairKey = canonicalTupleHash([
-          "topic_merge_pair",
-          pair[0].canonicalKey,
-          pair[1].canonicalKey,
-          TOPIC_SIMILARITY_ALGORITHM,
-        ]);
-        if (plannedPairKeys.has(pairKey)) continue;
-        plannedPairKeys.add(pairKey);
-        mergeSuggestions.push({
-          pairKey,
-          leftTopic: pair[0],
-          rightTopic: pair[1],
-          algorithmVersion: TOPIC_SIMILARITY_ALGORITHM,
-          score: roundSix(score),
-          state: "proposed",
-        });
-      }
-    }
-    mergeSuggestions.sort(compareActions);
-    if (
-      normalizedReplacements.some(
-        (replacement) => !usedReplacementKeys.has(replacement.replacementKey)
-      )
-    ) {
-      validationFail("untrusted_replacement");
-    }
+    const mergeSuggestions = topicPlan.mergeSuggestions;
 
     return {
       inserts,

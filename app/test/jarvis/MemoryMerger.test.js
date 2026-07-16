@@ -1701,3 +1701,306 @@ test("candidate memory values in one slot remain distinct and plan one conflict"
   assert.deepEqual(alreadyApplied.occurrenceLinks, []);
   assert.deepEqual(alreadyApplied.conflicts, []);
 });
+
+test("candidate events cluster by the inclusive dedupe window before value convergence", () => {
+  const mergerModule = loadMemoryMerger();
+  const memories = [
+    {
+      kind: "event",
+      title: "Launch",
+      body: "API v2 launched.",
+      confidence: 0.9,
+      evidenceSegmentIds: ["event-a"],
+    },
+    {
+      kind: "event",
+      title: "Launch",
+      body: "API v2 launched.",
+      confidence: 0.9,
+      evidenceSegmentIds: ["event-b"],
+    },
+  ];
+  const evidence = {
+    segments: [
+      ...planFixture().evidence.segments,
+      {
+        id: "event-a",
+        sessionId: "session-1",
+        startedAt: 1_000,
+        endedAt: 2_000,
+        speakerLabel: null,
+      },
+      {
+        id: "event-b",
+        sessionId: "session-1",
+        startedAt: 2_000 + mergerModule.EVENT_DEDUPE_WINDOW_MS + 1,
+        endedAt: 2_100 + mergerModule.EVENT_DEDUPE_WINDOW_MS + 1,
+        speakerLabel: null,
+      },
+    ],
+    bindings: planFixture().evidence.bindings,
+  };
+  const base = planFixture({
+    candidate: plannerCandidate({ memories }),
+    evidence,
+  });
+  const reversed = planFixture({
+    candidate: plannerCandidate({ memories: [...memories].reverse() }),
+    evidence,
+  });
+
+  const merger = new mergerModule.MemoryMerger();
+  const expected = merger.plan(base);
+  const actual = merger.plan(reversed);
+  assert.deepEqual(actual, expected);
+  const memoryInserts = expected.inserts.filter((action) => action.entityKind === "memory");
+  assert.equal(memoryInserts.length, 1);
+  const futureOccurrences = expected.occurrenceLinks.filter(
+    (action) =>
+      action.entityKind === "memory" &&
+      action.canonicalValueKey === memoryInserts[0].canonicalValueKey &&
+      action.mode === "create_occurrence"
+  );
+  assert.deepEqual(
+    [
+      memoryInserts[0].evidenceSegmentIds,
+      ...futureOccurrences.map((action) => action.evidenceSegmentIds),
+    ],
+    [["event-a"], ["event-b"]]
+  );
+  assert.deepEqual(
+    futureOccurrences.map(({ startedAt, endedAt }) => ({ startedAt, endedAt })),
+    [
+      {
+        startedAt: 2_000 + mergerModule.EVENT_DEDUPE_WINDOW_MS + 1,
+        endedAt: 2_100 + mergerModule.EVENT_DEDUPE_WINDOW_MS + 1,
+      },
+    ]
+  );
+});
+
+test("new candidate topics plan an inclusive-threshold merge suggestion exactly once", () => {
+  const mergerModule = loadMemoryMerger();
+  const topics = [
+    { name: "abcdefghijklm", summary: "Left", evidenceSegmentIds: ["seg-1"] },
+    { name: "abcdefghijwxyz", summary: "Right", evidenceSegmentIds: ["seg-2"] },
+  ];
+  assert.equal(mergerModule.diceBigramSimilarity(topics[0].name, topics[1].name), 0.72);
+  const base = planFixture({ candidate: plannerCandidate({ topics }) });
+  const reversed = planFixture({
+    candidate: plannerCandidate({ topics: [...topics].reverse() }),
+  });
+
+  const merger = new mergerModule.MemoryMerger();
+  const expected = merger.plan(base);
+  const actual = merger.plan(reversed);
+  assert.deepEqual(actual, expected);
+  const topicInserts = expected.inserts.filter((action) => action.entityKind === "topic");
+  assert.equal(topicInserts.length, 2);
+  const topicRefs = topicInserts
+    .map((action) => ({ canonicalKey: action.canonicalKey }))
+    .sort((left, right) => (left.canonicalKey < right.canonicalKey ? -1 : 1));
+  assert.deepEqual(expected.mergeSuggestions, [
+    {
+      pairKey: mergerModule.canonicalTupleHash([
+        "topic_merge_pair",
+        topicRefs[0].canonicalKey,
+        topicRefs[1].canonicalKey,
+        mergerModule.TOPIC_SIMILARITY_ALGORITHM,
+      ]),
+      leftTopic: topicRefs[0],
+      rightTopic: topicRefs[1],
+      algorithmVersion: mergerModule.TOPIC_SIMILARITY_ALGORITHM,
+      score: 0.72,
+      state: "proposed",
+    },
+  ]);
+
+  const existingTopics = [...topicInserts]
+    .sort((left, right) => (left.canonicalKey < right.canonicalKey ? -1 : 1))
+    .map((action, index) => ({
+      id: `topic-${index === 0 ? "a" : "b"}`,
+      canonicalKey: action.canonicalKey,
+      name: action.name,
+      lifecycle: "active",
+      revisions: [
+        {
+          id: `topic-revision-${index}`,
+          revision: 1,
+          summary: action.summary,
+        },
+      ],
+      occurrences: [],
+    }));
+  const applied = merger.plan({
+    ...base,
+    existing: {
+      ...base.existing,
+      topics: existingTopics,
+      topicMergeSuggestions: [
+        {
+          id: "merge-existing",
+          leftTopicId: "topic-a",
+          rightTopicId: "topic-b",
+          algorithmVersion: mergerModule.TOPIC_SIMILARITY_ALGORITHM,
+          score: 0.72,
+          state: "proposed",
+        },
+      ],
+    },
+  });
+  assert.deepEqual(applied.mergeSuggestions, []);
+});
+
+test("todo recurrence planning advances from the unique terminal leaf", () => {
+  const mergerModule = loadMemoryMerger();
+  const canonicalBaseKey = mergerModule.canonicalTupleHash(["todo", "publish notes", "person-1"]);
+  const terminalTodo = (id, completedAt) => ({
+    id,
+    canonicalBaseKey,
+    title: "Publish notes",
+    ownerSubjectKind: "person",
+    ownerSubjectId: "person-1",
+    status: "completed",
+    completedAt,
+    revisions: [
+      {
+        id: `${id}-revision`,
+        revision: 1,
+        title: "Publish notes",
+        dueText: "Friday",
+      },
+    ],
+    occurrences: [],
+  });
+  const todoA = terminalTodo("todo-a", 10_000);
+  const todoB = terminalTodo("todo-b", 20_000);
+  const recurrence = {
+    id: "recurrence-a-b",
+    previousTodoId: "todo-a",
+    nextTodoId: "todo-b",
+    sourceOccurrenceId: null,
+  };
+  const evidence = {
+    segments: [
+      ...planFixture().evidence.segments,
+      {
+        id: "todo-after-b",
+        sessionId: "session-1",
+        startedAt: 20_001,
+        endedAt: 20_100,
+        speakerLabel: "P1",
+      },
+    ],
+    bindings: planFixture().evidence.bindings,
+  };
+  const base = planFixture({
+    candidate: plannerCandidate({
+      todos: [
+        {
+          title: "Publish notes",
+          ownerLabel: "P1",
+          dueText: "Friday",
+          evidenceSegmentIds: ["todo-after-b"],
+        },
+      ],
+    }),
+    evidence,
+    existing: {
+      ...planFixture().existing,
+      todos: [todoA, todoB],
+      todoRecurrences: [recurrence],
+    },
+  });
+  const reversed = structuredClone(base);
+  reversed.existing.todos.reverse();
+  reversed.existing.todoRecurrences.reverse();
+
+  const merger = new mergerModule.MemoryMerger();
+  const expected = merger.plan(base);
+  const actual = merger.plan(reversed);
+  assert.deepEqual(actual, expected);
+  assert.equal(expected.recurrences.length, 1);
+  assert.equal(expected.recurrences[0].previousTodoId, "todo-b");
+  assert.equal(expected.recurrences[0].reason, "later_evidence");
+  assert.deepEqual(expected.recurrences[0].evidenceSegmentIds, ["todo-after-b"]);
+});
+
+test("todo recurrence graphs fail closed unless each base has one valid leaf", async (t) => {
+  const mergerModule = loadMemoryMerger();
+  const todoRow = (id, title = "Graph todo", status = "completed") => ({
+    id,
+    canonicalBaseKey: mergerModule.canonicalTupleHash([
+      "todo",
+      mergerModule.canonicalizeText(title),
+      null,
+    ]),
+    title,
+    ownerSubjectKind: null,
+    ownerSubjectId: null,
+    status,
+    completedAt: status === "completed" ? 1_000 : null,
+    revisions: [
+      {
+        id: `${id}-revision`,
+        revision: 1,
+        title,
+        dueText: null,
+      },
+    ],
+    occurrences: [],
+  });
+  const edge = (id, previousTodoId, nextTodoId) => ({
+    id,
+    previousTodoId,
+    nextTodoId,
+    sourceOccurrenceId: null,
+  });
+  const assertGraphInvalid = (todos, todoRecurrences) => {
+    const input = planFixture({
+      existing: {
+        ...planFixture().existing,
+        todos,
+        todoRecurrences,
+      },
+    });
+    assertValidationIssue(mergerModule, input, "malformed_existing");
+  };
+
+  await t.test("rejects dangling edges", () => {
+    assertGraphInvalid([todoRow("todo-a")], [edge("edge-a-missing", "todo-a", "todo-missing")]);
+  });
+  await t.test("rejects cross-base edges", () => {
+    assertGraphInvalid(
+      [todoRow("todo-a", "Alpha"), todoRow("todo-b", "Beta")],
+      [edge("edge-a-b", "todo-a", "todo-b")]
+    );
+  });
+  await t.test("rejects cycles", () => {
+    assertGraphInvalid(
+      [todoRow("todo-a"), todoRow("todo-b")],
+      [edge("edge-a-b", "todo-a", "todo-b"), edge("edge-b-a", "todo-b", "todo-a")]
+    );
+  });
+  await t.test("rejects multiple outgoing edges", () => {
+    assertGraphInvalid(
+      [todoRow("todo-a"), todoRow("todo-b"), todoRow("todo-c")],
+      [edge("edge-a-b", "todo-a", "todo-b"), edge("edge-a-c", "todo-a", "todo-c")]
+    );
+  });
+  await t.test("rejects multiple incoming edges", () => {
+    assertGraphInvalid(
+      [todoRow("todo-a"), todoRow("todo-b"), todoRow("todo-c")],
+      [edge("edge-a-c", "todo-a", "todo-c"), edge("edge-b-c", "todo-b", "todo-c")]
+    );
+  });
+  await t.test("rejects ambiguous terminal leaves", () => {
+    assertGraphInvalid([todoRow("todo-a"), todoRow("todo-b")], []);
+  });
+  await t.test("rejects multiple active instances", () => {
+    assertGraphInvalid(
+      [todoRow("todo-a", "Graph todo", "open"), todoRow("todo-b", "Graph todo", "open")],
+      [edge("edge-a-b", "todo-a", "todo-b")]
+    );
+  });
+});

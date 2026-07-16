@@ -24,18 +24,18 @@ After the minimal memory occurrence ID tie-break, the then-current focused suite
 
 All behavioral RED runs below used `node --test --test-name-pattern=... test/jarvis/MemoryMerger.test.js`, except the takeover RED which used the complete focused command.
 
-| Behavior | Observed RED | Minimal GREEN | Green evidence |
-| --- | --- | --- | --- |
-| Reusable memory occurrence | Complete focused: 20 passed, 1 failed; selected occurrence changed between `occurrence-a` and `occurrence-b` after reversing snapshot order. | Sort reusable occurrences by ID before selecting a shared-evidence occurrence. | Complete focused 21/21. |
-| Reusable active-todo occurrence | Targeted 0/1; selected occurrence changed between `occurrence-a` and `occurrence-b`. | Sort todo occurrences by ID before selecting. | Targeted 1/1. |
-| Transcript supersession occurrence | Targeted 0/1; `priorOccurrenceId` changed between `occurrence-a` and `occurrence-b`. | Sort prior occurrences by ID before the existing authorization-and-break logic. | Targeted 1/1. |
-| Topic canonical identity collision | Targeted 0/1; two future topic inserts were returned for one canonical key (`2 !== 1`). A strengthened normalized-semantic/display tie then failed because retained `name`/`summary` changed with input order. | Group topics by planner canonical key and use a fixed display tuple as the final canonical sort tie-break. | Targeted 1/1 after each step. |
-| Todo canonical identity collision | Targeted 0/1; two future todo inserts were returned for one canonical base key (`2 !== 1`). A strengthened display tie then failed because retained `title`/`dueText` changed with input order. | Group todos by resolved planner canonical key and use a fixed display tuple tie-break. | Targeted 1/1 after each step. |
-| Memory-value and suggestion identity collision | Targeted 0/1; retained display wording changed with input order and duplicate unique identities produced extra inserts. | Group memories by canonical value key and suggestions by canonical key; use fixed display tuples. | Targeted 1/1. |
-| Duplicate evidence preservation | Strengthened targeted 0/1; memory insert contained only `seg-2`, not the required sorted union `seg-1`, `seg-2`. | Clone the selected item and union/sort/deduplicate memory and suggestion evidence within the identity group. | Targeted 1/1. |
-| Unified existing-vs-candidate conflict descriptor | Targeted 0/1; implementation returned singular `candidateCanonicalValueKey` instead of sorted `candidateCanonicalValueKeys`. | Accumulate conflicts by canonical slot into sets, then emit the unified sorted-array descriptor. | Combined conflict targeted run 2/2. |
-| Candidate-vs-candidate changed bodies | Targeted 0/1; both distinct values were inserted but `conflicts` was empty. | Accumulate all distinct candidate value keys for the slot while preserving both inserts. | Combined conflict targeted run 2/2. |
-| Applied candidate-candidate conflict no-op | Strengthened targeted 0/1; both inserts and links were no-ops but the planner repeated the conflict action. | Emit the candidate-candidate conflict only while at least one candidate value is absent from the existing snapshot. | Targeted 1/1. |
+| Behavior                                          | Observed RED                                                                                                                                                                                                   | Minimal GREEN                                                                                                       | Green evidence                      |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Reusable memory occurrence                        | Complete focused: 20 passed, 1 failed; selected occurrence changed between `occurrence-a` and `occurrence-b` after reversing snapshot order.                                                                   | Sort reusable occurrences by ID before selecting a shared-evidence occurrence.                                      | Complete focused 21/21.             |
+| Reusable active-todo occurrence                   | Targeted 0/1; selected occurrence changed between `occurrence-a` and `occurrence-b`.                                                                                                                           | Sort todo occurrences by ID before selecting.                                                                       | Targeted 1/1.                       |
+| Transcript supersession occurrence                | Targeted 0/1; `priorOccurrenceId` changed between `occurrence-a` and `occurrence-b`.                                                                                                                           | Sort prior occurrences by ID before the existing authorization-and-break logic.                                     | Targeted 1/1.                       |
+| Topic canonical identity collision                | Targeted 0/1; two future topic inserts were returned for one canonical key (`2 !== 1`). A strengthened normalized-semantic/display tie then failed because retained `name`/`summary` changed with input order. | Group topics by planner canonical key and use a fixed display tuple as the final canonical sort tie-break.          | Targeted 1/1 after each step.       |
+| Todo canonical identity collision                 | Targeted 0/1; two future todo inserts were returned for one canonical base key (`2 !== 1`). A strengthened display tie then failed because retained `title`/`dueText` changed with input order.                | Group todos by resolved planner canonical key and use a fixed display tuple tie-break.                              | Targeted 1/1 after each step.       |
+| Memory-value and suggestion identity collision    | Targeted 0/1; retained display wording changed with input order and duplicate unique identities produced extra inserts.                                                                                        | Group memories by canonical value key and suggestions by canonical key; use fixed display tuples.                   | Targeted 1/1.                       |
+| Duplicate evidence preservation                   | Strengthened targeted 0/1; memory insert contained only `seg-2`, not the required sorted union `seg-1`, `seg-2`.                                                                                               | Clone the selected item and union/sort/deduplicate memory and suggestion evidence within the identity group.        | Targeted 1/1.                       |
+| Unified existing-vs-candidate conflict descriptor | Targeted 0/1; implementation returned singular `candidateCanonicalValueKey` instead of sorted `candidateCanonicalValueKeys`.                                                                                   | Accumulate conflicts by canonical slot into sets, then emit the unified sorted-array descriptor.                    | Combined conflict targeted run 2/2. |
+| Candidate-vs-candidate changed bodies             | Targeted 0/1; both distinct values were inserted but `conflicts` was empty.                                                                                                                                    | Accumulate all distinct candidate value keys for the slot while preserving both inserts.                            | Combined conflict targeted run 2/2. |
+| Applied candidate-candidate conflict no-op        | Strengthened targeted 0/1; both inserts and links were no-ops but the planner repeated the conflict action.                                                                                                    | Emit the candidate-candidate conflict only while at least one candidate value is absent from the existing snapshot. | Targeted 1/1.                       |
 
 One initial topic-collision test run had a test-source Unicode transfer syntax error. It was corrected to explicit `\uFFxx` escapes and rerun to the behavioral `2 !== 1` RED above; the syntax-error run is not counted as TDD RED evidence.
 
@@ -95,3 +95,34 @@ Commands and fresh results:
 - Confirmed terminal todo monotonicity/recurrence boundaries and suggestion terminal-state behavior.
 - Confirmed fail-closed validation occurs before returning a plan and duplicate existing canonical map identities cannot select a row by input order.
 - Confirmed final file scope is limited to the two requested code/test files plus this report.
+
+## Follow-up review closure
+
+Independent review recorded C0/I3/M1 in `phase-4-task-4a-review.md`. The follow-up changed only the approved planner, focused test, and report files.
+
+### Follow-up RED/GREEN evidence
+
+| Review item                             | Observed RED                                                                                                                                             | Minimal GREEN                                                                                                                                                                                                                                |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I1 event candidate convergence          | Targeted 0/1: two same-value events separated beyond the inclusive 30-minute window incorrectly converged into one insert.                               | Cluster same-value event candidates by deterministic evidence intervals before value convergence; keep the first cluster as the insert and plan later clusters as occurrences. Targeted 1/1; full focused 28/28.                             |
+| I2 candidate-candidate topic similarity | Targeted 0/1: two new candidate topics with raw Dice score exactly `0.72` produced no merge suggestion.                                                  | Compare canonical unordered pairs across active existing and candidate topic references, include pairs with at least one candidate, apply the inclusive raw threshold, and suppress already-applied pairs. Targeted 1/1; full focused 29/29. |
+| I3 todo terminal leaf selection         | Targeted 0/1: later evidence for a completed A -> B chain planned no recurrence because A was selected by ID instead of B as the terminal leaf.          | Select the unique no-outgoing leaf when no open instance exists. Targeted 1/1.                                                                                                                                                               |
+| I3 todo graph validation                | Targeted parent plus seven subtests: 3 passed and 5 failed; cross-base edges, cycles, ambiguous leaves, and multiple active instances were not rejected. | Validate same-base edges, acyclicity, one incoming/outgoing edge maximum, exactly one leaf per base, at most one open instance, and require the open instance to be that leaf. Matrix 8/8; combined leaf/matrix 9/9; full focused 38/38.     |
+
+### M1 planner decomposition
+
+After the behavior fixes were green, `MemoryMerger.plan` was reduced to validation, candidate-context resolution, pure helper orchestration, deterministic array combination, and result construction. Planning is now separated into `planTopics`, `planMemories`, `planTodos`, and `planSuggestions`, with shared evidence-bound calculation isolated as a pure helper. The complete focused suite was run after each extraction step:
+
+- candidate-context extraction - 38/38
+- `planTopics` - 38/38
+- `planMemories` - 38/38
+- `planTodos` - 38/38
+- `planSuggestions` - 38/38
+
+### Follow-up final verification
+
+- `node --test test/jarvis/MemoryMerger.test.js` - PASS, 38/38.
+- `node --test test/jarvis/JarvisAnalysisSchema.test.js test/jarvis/MemoryRepository.test.js` - PASS, 58/58.
+- `node_modules/.bin/eslint.cmd src/jarvis/main/MemoryMerger.js test/jarvis/MemoryMerger.test.js` - PASS, exit 0; only the existing `MODULE_TYPELESS_PACKAGE_JSON` performance warning was printed.
+- `node_modules/.bin/prettier.cmd --check src/jarvis/main/MemoryMerger.js test/jarvis/MemoryMerger.test.js ../.superpowers/sdd/phase-4-task-4a-report.md` - PASS.
+- `git diff --check` and `git diff --cached --check` - PASS.
