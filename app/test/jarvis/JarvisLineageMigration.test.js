@@ -2516,7 +2516,11 @@ test("evidence references validate target input, manifest, capture lineage, boun
 
     const assertInvalidLineage = (overrides) =>
       assert.throws(() => insertEvidence(db, overrides), /evidence lineage is invalid/);
-    assertInvalidLineage({ id: "evidence-target-input", sourceAnalysisInputId: "input-other" });
+    assert.equal(
+      insertEvidence(db, { id: "evidence-target-input", sourceAnalysisInputId: "input-other" })
+        .changes,
+      1
+    );
     assertInvalidLineage({ id: "evidence-session", sessionId: "session-other" });
     assertInvalidLineage({
       id: "evidence-manifest",
@@ -2532,7 +2536,7 @@ test("evidence references validate target input, manifest, capture lineage, boun
     assertInvalidLineage({ id: "evidence-live-expired", state: "expired" });
     assertInvalidLineage({ id: "evidence-live-missing", state: "missing" });
 
-    assert.equal(insertEvidence(db).changes, 1);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 1);
     assert.throws(
       () => db.prepare("DELETE FROM audio_chunks WHERE id = 'chunk-1'").run(),
       /constraint|immutable/i
@@ -2542,7 +2546,8 @@ test("evidence references validate target input, manifest, capture lineage, boun
       1
     );
     assert.equal(
-      db.prepare("SELECT audio_state FROM evidence_refs WHERE id = 'evidence-1'").get().audio_state,
+      db.prepare("SELECT audio_state FROM evidence_refs WHERE id = 'evidence-target-input'").get()
+        .audio_state,
       "available"
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);

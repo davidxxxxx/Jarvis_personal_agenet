@@ -1,4 +1,6 @@
-const TARGET_VERSION = 26;
+const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
+
+const TARGET_VERSION = 27;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -2452,6 +2454,406 @@ const MEMORY_LINEAGE_SCHEMA = `
   END;
 `;
 
+const MEMORY_ITEM_SUBJECTS_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS memory_item_subjects (
+    memory_item_id TEXT NOT NULL REFERENCES memory_items_v2(id) ON DELETE CASCADE,
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('person','speaker_cluster')),
+    subject_id TEXT NOT NULL CHECK(typeof(subject_id)='text' AND length(subject_id)>0),
+    PRIMARY KEY(memory_item_id, subject_kind, subject_id)
+  );
+
+  CREATE TRIGGER IF NOT EXISTS memory_item_subjects_immutable_update
+  BEFORE UPDATE ON memory_item_subjects
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item subject is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS memory_item_subjects_immutable_delete
+  BEFORE DELETE ON memory_item_subjects
+  WHEN EXISTS (
+    SELECT 1 FROM memory_items_v2 WHERE id = OLD.memory_item_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item subject is immutable');
+  END;
+
+  CREATE TABLE IF NOT EXISTS memory_item_canonical_slots (
+    memory_item_id TEXT PRIMARY KEY REFERENCES memory_items_v2(id) ON DELETE CASCADE,
+    canonical_slot_key TEXT NOT NULL CHECK(
+      typeof(canonical_slot_key) = 'text' AND length(canonical_slot_key) = 64
+      AND canonical_slot_key NOT GLOB '*[^0-9a-f]*'
+    ),
+    algorithm TEXT NOT NULL CHECK(algorithm = 'canonical-v1')
+  );
+
+  CREATE TRIGGER IF NOT EXISTS memory_item_canonical_slots_immutable_update
+  BEFORE UPDATE ON memory_item_canonical_slots
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item canonical slot is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS memory_item_canonical_slots_immutable_delete
+  BEFORE DELETE ON memory_item_canonical_slots
+  WHEN EXISTS (
+    SELECT 1 FROM memory_items_v2 WHERE id = OLD.memory_item_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'memory item canonical slot is immutable');
+  END;
+`;
+
+function upgradeMemoryItemSubjectsV27(db) {
+  if (!tableExists(db, "memory_items_v2")) return;
+  db.exec(MEMORY_ITEM_SUBJECTS_SCHEMA);
+  db.exec(`
+    INSERT OR IGNORE INTO memory_item_subjects (
+      memory_item_id, subject_kind, subject_id
+    )
+    SELECT DISTINCT
+      occurrence.memory_value_id,
+      binding.subject_kind,
+      binding.subject_id
+    FROM evidence_refs AS evidence
+    JOIN memory_occurrences AS occurrence
+      ON evidence.entity_type = 'memory_occurrence'
+      AND occurrence.id = evidence.entity_id
+    JOIN analysis_input_segments AS manifest
+      ON manifest.analysis_input_id = evidence.source_analysis_input_id
+      AND manifest.segment_id = evidence.transcript_segment_id
+    JOIN analysis_input_speaker_bindings AS binding
+      ON binding.analysis_input_id = manifest.analysis_input_id
+      AND binding.label = manifest.speaker_binding_label
+    WHERE evidence.source_analysis_input_id IS NOT NULL
+    ORDER BY occurrence.memory_value_id, binding.subject_kind, binding.subject_id;
+  `);
+  const insertCanonicalSlot = db.prepare(
+    `INSERT OR IGNORE INTO memory_item_canonical_slots (
+       memory_item_id, canonical_slot_key, algorithm
+     ) VALUES (?, ?, 'canonical-v1')`
+  );
+  const subjectsForMemory = db.prepare(
+    `SELECT subject_id FROM memory_item_subjects
+     WHERE memory_item_id = ? ORDER BY subject_id, subject_kind`
+  );
+  for (const memory of db
+    .prepare("SELECT id, kind, title FROM memory_items_v2 ORDER BY id")
+    .all()) {
+    const subjectIds = [
+      ...new Set(subjectsForMemory.all(memory.id).map((subject) => subject.subject_id)),
+    ];
+    insertCanonicalSlot.run(
+      memory.id,
+      canonicalTupleHash(["memory", memory.kind, canonicalizeText(memory.title), subjectIds])
+    );
+  }
+  db.exec(`
+    DROP TRIGGER memory_supersessions_validate_slot;
+    DROP TRIGGER memory_conflict_members_validate_slot;
+    DROP TRIGGER memory_conflict_groups_validate_resolution;
+    DROP TRIGGER memory_items_v2_terminal_lifecycle;
+
+    CREATE TRIGGER memory_supersessions_validate_slot
+    BEFORE INSERT ON memory_supersessions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM memory_items_v2 AS previous
+      JOIN memory_items_v2 AS next ON next.id = NEW.next_id
+      LEFT JOIN memory_item_canonical_slots AS previous_slot
+        ON previous_slot.memory_item_id = previous.id
+      LEFT JOIN memory_item_canonical_slots AS next_slot
+        ON next_slot.memory_item_id = next.id
+      WHERE previous.id = NEW.previous_id
+        AND (
+          previous.canonical_slot_key = next.canonical_slot_key
+          OR previous_slot.canonical_slot_key = next_slot.canonical_slot_key
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'memory supersession slot mismatch');
+    END;
+
+    CREATE TRIGGER memory_conflict_members_validate_slot
+    BEFORE INSERT ON memory_conflict_members
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM memory_conflict_groups AS conflict
+      JOIN memory_items_v2 AS item ON item.id = NEW.memory_item_id
+      LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
+      WHERE conflict.id = NEW.group_id
+        AND conflict.state = 'open'
+        AND (
+          conflict.slot_key = item.canonical_slot_key
+          OR conflict.slot_key = slot.canonical_slot_key
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'memory conflict slot mismatch');
+    END;
+
+    CREATE TRIGGER memory_conflict_groups_validate_resolution
+    BEFORE UPDATE OF state, selected_member_id, resolved_at ON memory_conflict_groups
+    WHEN NEW.state = 'resolved' AND NOT EXISTS (
+      SELECT 1
+      FROM memory_conflict_members AS member
+      JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
+      LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = item.id
+      WHERE member.group_id = NEW.id
+        AND member.memory_item_id = NEW.selected_member_id
+        AND (
+          NEW.slot_key = item.canonical_slot_key
+          OR NEW.slot_key = slot.canonical_slot_key
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'memory conflict resolution is invalid');
+    END;
+
+    CREATE TRIGGER memory_items_v2_terminal_lifecycle
+    BEFORE UPDATE OF lifecycle ON memory_items_v2
+    WHEN NEW.lifecycle IS NOT OLD.lifecycle AND NOT (
+      (
+        OLD.lifecycle = 'active'
+        AND NEW.lifecycle IN ('conflict','superseded','dismissed')
+      )
+      OR (
+        OLD.lifecycle = 'conflict'
+        AND NEW.lifecycle = 'active'
+        AND EXISTS (
+          SELECT 1
+          FROM memory_conflict_groups AS conflict
+           LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
+           WHERE (
+             conflict.slot_key = OLD.canonical_slot_key
+             OR conflict.slot_key = slot.canonical_slot_key
+           )
+            AND conflict.state = 'resolved'
+            AND conflict.selected_member_id = OLD.id
+            AND conflict.episode = (
+              SELECT MAX(latest.episode)
+              FROM memory_conflict_groups AS latest
+              WHERE latest.slot_key = conflict.slot_key
+            )
+        )
+      )
+      OR (
+        OLD.lifecycle = 'conflict'
+        AND NEW.lifecycle = 'superseded'
+        AND EXISTS (
+          SELECT 1
+          FROM memory_conflict_groups AS conflict
+          JOIN memory_conflict_members AS member
+            ON member.group_id = conflict.id AND member.memory_item_id = OLD.id
+          JOIN memory_supersessions AS supersession
+            ON supersession.previous_id = OLD.id
+            AND supersession.next_id = conflict.selected_member_id
+            AND supersession.reason = 'conflict_resolution'
+           LEFT JOIN memory_item_canonical_slots AS slot ON slot.memory_item_id = OLD.id
+           WHERE (
+             conflict.slot_key = OLD.canonical_slot_key
+             OR conflict.slot_key = slot.canonical_slot_key
+           )
+            AND conflict.state = 'resolved'
+            AND conflict.selected_member_id <> OLD.id
+            AND conflict.episode = (
+              SELECT MAX(latest.episode)
+              FROM memory_conflict_groups AS latest
+              WHERE latest.slot_key = conflict.slot_key
+            )
+        )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'memory item lifecycle transition is invalid');
+    END;
+  `);
+}
+
+const EVIDENCE_REFS_VALIDATE_LINEAGE_V27_TRIGGER = `
+  CREATE TRIGGER evidence_refs_validate_lineage_insert
+  BEFORE INSERT ON evidence_refs
+  WHEN CASE NEW.entity_type
+    WHEN 'memory_occurrence' THEN EXISTS (
+      SELECT 1 FROM memory_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'topic_occurrence' THEN EXISTS (
+      SELECT 1 FROM topic_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'todo_occurrence' THEN EXISTS (
+      SELECT 1 FROM todo_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'suggestion_occurrence' THEN EXISTS (
+      SELECT 1 FROM suggestion_occurrences WHERE id = NEW.entity_id
+    )
+    WHEN 'session_summary_revision' THEN EXISTS (
+      SELECT 1 FROM session_summary_revisions WHERE id = NEW.entity_id
+    )
+    WHEN 'daily_digest' THEN EXISTS (
+      SELECT 1 FROM daily_digests WHERE id = NEW.entity_id
+    )
+    ELSE 0
+  END
+  AND NOT EXISTS (
+    SELECT 1
+    FROM transcript_segments AS segment
+    LEFT JOIN audio_chunks AS chunk ON chunk.id = NEW.audio_chunk_id
+    LEFT JOIN audio_tracks AS track ON track.id = NEW.track_id
+    WHERE segment.id = NEW.transcript_segment_id
+      AND segment.session_id = NEW.session_id
+      AND segment.result_kind = 'final'
+      AND segment.is_stable = 1
+      AND segment.superseded_by IS NULL
+      AND segment.duplicate_of IS NULL
+      AND NEW.started_at >= segment.started_at
+      AND NEW.ended_at <= segment.ended_at
+      AND instr(segment.text, NEW.quote_text) > 0
+      AND NEW.track_id IS segment.track_id
+      AND (NEW.track_id IS NULL OR track.session_id = NEW.session_id)
+      AND (
+        (
+          NEW.audio_state = 'missing'
+          AND NEW.audio_chunk_id IS NULL
+          AND segment.chunk_id IS NULL
+        )
+        OR (
+          NEW.audio_state IN ('available','expired')
+          AND chunk.id IS NOT NULL
+          AND segment.chunk_id = chunk.id
+          AND chunk.session_id = NEW.session_id
+          AND chunk.track_id IS NEW.track_id
+          AND NEW.started_at >= chunk.started_at
+          AND NEW.ended_at <= chunk.ended_at
+          AND (
+            (NEW.audio_state = 'available' AND chunk.deleted_at IS NULL)
+            OR (NEW.audio_state = 'expired' AND chunk.deleted_at IS NOT NULL)
+          )
+        )
+      )
+      AND (
+        (
+          NEW.source_analysis_input_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM analysis_inputs AS input
+            JOIN analysis_input_segments AS manifest
+              ON manifest.analysis_input_id = input.id
+            WHERE input.id = NEW.source_analysis_input_id
+              AND input.session_id = NEW.session_id
+              AND manifest.segment_id = NEW.transcript_segment_id
+              AND manifest.segment_version = segment.version
+              AND manifest.text_snapshot = segment.text
+              AND instr(manifest.text_snapshot, NEW.quote_text) > 0
+          )
+        )
+        OR NEW.source_analysis_input_id IS NULL
+      )
+      AND CASE NEW.entity_type
+        WHEN 'memory_occurrence' THEN EXISTS (
+          SELECT 1 FROM memory_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM analysis_inputs AS occurrence_input
+                  WHERE occurrence_input.id = analysis_input_id
+                    AND occurrence_input.session_id = NEW.session_id
+                )
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'topic_occurrence' THEN EXISTS (
+          SELECT 1 FROM topic_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM analysis_inputs AS occurrence_input
+                  WHERE occurrence_input.id = analysis_input_id
+                    AND occurrence_input.session_id = NEW.session_id
+                )
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'todo_occurrence' THEN EXISTS (
+          SELECT 1 FROM todo_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM analysis_inputs AS occurrence_input
+                  WHERE occurrence_input.id = analysis_input_id
+                    AND occurrence_input.session_id = NEW.session_id
+                )
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'suggestion_occurrence' THEN EXISTS (
+          SELECT 1 FROM suggestion_occurrences
+          WHERE id = NEW.entity_id
+            AND (
+              (
+                NEW.source_analysis_input_id IS NOT NULL
+                AND analysis_input_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM analysis_inputs AS occurrence_input
+                  WHERE occurrence_input.id = analysis_input_id
+                    AND occurrence_input.session_id = NEW.session_id
+                )
+                AND legacy_session_id IS NULL
+              )
+              OR (
+                NEW.source_analysis_input_id IS NULL
+                AND analysis_input_id IS NULL
+                AND legacy_session_id = NEW.session_id
+              )
+            )
+        )
+        WHEN 'session_summary_revision' THEN EXISTS (
+          SELECT 1 FROM session_summary_revisions
+          WHERE id = NEW.entity_id
+            AND session_id = NEW.session_id
+            AND source_analysis_input_id IS NEW.source_analysis_input_id
+        )
+        WHEN 'daily_digest' THEN EXISTS (
+          SELECT 1 FROM daily_digests WHERE id = NEW.entity_id
+        )
+        ELSE 0
+      END
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'evidence lineage is invalid');
+  END;
+`;
+
+function upgradeOccurrenceEvidenceLineageV27(db) {
+  if (!tableExists(db, "evidence_refs")) return;
+  db.exec("DROP TRIGGER IF EXISTS evidence_refs_validate_lineage_insert");
+  db.exec(EVIDENCE_REFS_VALIDATE_LINEAGE_V27_TRIGGER);
+}
+
 const EVIDENCE_EXPIRY_TRIGGER = `
   CREATE TRIGGER evidence_refs_expire_audio
   AFTER UPDATE OF deleted_at ON audio_chunks
@@ -4241,6 +4643,10 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       }
       if (fromVersion < 26) {
         upgradeAgentWorkloadV26(db);
+      }
+      if (fromVersion < 27) {
+        upgradeMemoryItemSubjectsV27(db);
+        upgradeOccurrenceEvidenceLineageV27(db);
       }
 
       const violations = db.pragma("foreign_key_check");

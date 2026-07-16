@@ -276,10 +276,10 @@ test("repository aggregates active work by runtime stage without double-counting
     insertChunk.run("c3", "c3.wav", 1_080_000, 1_200_000, 120_000, "hash-c3");
     const insertJob = repo.db.prepare(
       `INSERT INTO processing_jobs (
-        id, session_id, chunk_id, job_type, state, priority, input_hash,
+        id, session_id, chunk_id, job_type, state, priority, input_hash, lane,
         input_version, model_version, execution_device, blocked_reason, next_retry_at,
         created_at, completed_at
-      ) VALUES (@id, 's1', @chunkId, @jobType, @state, @priority, @hash,
+      ) VALUES (@id, 's1', @chunkId, @jobType, @state, @priority, @hash, @lane,
         1, '', @executionDevice, @blockedReason, @nextRetryAt, @createdAt, @completedAt)`
     );
     insertJob.run({
@@ -289,6 +289,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "pending",
       priority: 20,
       hash: "j1",
+      lane: "local",
       executionDevice: null,
       blockedReason: null,
       nextRetryAt: null,
@@ -302,6 +303,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "running",
       priority: 20,
       hash: "j2",
+      lane: "local",
       executionDevice: "cuda",
       blockedReason: null,
       nextRetryAt: null,
@@ -315,6 +317,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "retry",
       priority: 30,
       hash: "j3",
+      lane: "local",
       executionDevice: null,
       blockedReason: "resources_constrained",
       nextRetryAt: 90_000,
@@ -324,10 +327,11 @@ test("repository aggregates active work by runtime stage without double-counting
     insertJob.run({
       id: "j4",
       chunkId: null,
-      jobType: "analyze_session",
+      jobType: "generate_daily_digest",
       state: "blocked",
-      priority: 50,
+      priority: 80,
       hash: "j4",
+      lane: "cloud",
       executionDevice: null,
       blockedReason: null,
       nextRetryAt: null,
@@ -341,6 +345,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "completed",
       priority: 20,
       hash: "j5",
+      lane: "local",
       executionDevice: "cpu",
       blockedReason: null,
       nextRetryAt: null,
@@ -354,6 +359,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "retry",
       priority: 40,
       hash: "j7",
+      lane: "local",
       executionDevice: null,
       blockedReason: "cpu_load_high",
       nextRetryAt: 80_000,
@@ -367,6 +373,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "retry",
       priority: 40,
       hash: "j8",
+      lane: "local",
       executionDevice: null,
       blockedReason: "cpu_load_high",
       nextRetryAt: 70_000,
@@ -380,6 +387,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "blocked",
       priority: 45,
       hash: "j9",
+      lane: "local",
       executionDevice: null,
       blockedReason: "battery_saver",
       nextRetryAt: null,
@@ -410,7 +418,7 @@ test("repository aggregates active work by runtime stage without double-counting
       blocked: 2,
       total: 7,
       byStage: {
-        analysis: { pending: 0, running: 0, retry: 0, blocked: 1, total: 1 },
+        generate_daily_digest: { pending: 0, running: 0, retry: 0, blocked: 1, total: 1 },
         final_transcription: { pending: 1, running: 1, retry: 0, blocked: 0, total: 2 },
         speaker: { pending: 0, running: 0, retry: 3, blocked: 1, total: 4 },
       },
@@ -454,6 +462,7 @@ test("repository aggregates active work by runtime stage without double-counting
       state: "pending",
       priority: 20,
       hash: "j6",
+      lane: "local",
       executionDevice: null,
       blockedReason: null,
       nextRetryAt: null,

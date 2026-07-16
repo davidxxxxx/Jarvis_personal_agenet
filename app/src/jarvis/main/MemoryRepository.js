@@ -1,5 +1,12 @@
 const crypto = require("node:crypto");
 const { AnalysisSchemaError, validateCandidateAnalysis } = require("./JarvisAnalysisSchema");
+const {
+  MemoryMerger,
+  canonicalizeText,
+  canonicalTupleHash,
+  normalizeStringSet,
+  semanticCandidateHash,
+} = require("./MemoryMerger");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -173,7 +180,7 @@ function validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels })
 }
 
 class MemoryRepository {
-  constructor(db, { createId, now, validateRedactedCloudPayload } = {}) {
+  constructor(db, { createId, now, validateRedactedCloudPayload, memoryMerger } = {}) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
       throw new TypeError("database must be a live better-sqlite3 connection");
     }
@@ -183,10 +190,14 @@ class MemoryRepository {
     if (typeof validateRedactedCloudPayload !== "function") {
       throw new TypeError("validateRedactedCloudPayload must be a function");
     }
+    if (memoryMerger !== undefined && (!memoryMerger || typeof memoryMerger.plan !== "function")) {
+      throw new TypeError("memoryMerger must expose plan()");
+    }
     this.db = db;
     this.createId = createId;
     this.now = now;
     this.validateRedactedCloudPayload = validateRedactedCloudPayload;
+    this.memoryMerger = memoryMerger ?? new MemoryMerger();
   }
 
   _normalizeInputRequest(input) {
@@ -1064,11 +1075,36 @@ class MemoryRepository {
       if (!attempt || attempt.job_id !== jobId || attempt.state !== "reconciled") {
         throw codedError("MEMORY_CANDIDATE_BUDGET_UNRECONCILED");
       }
+      if (
+        Buffer.byteLength(candidateRow.candidate_json, "utf8") !== candidateRow.candidate_bytes ||
+        !safeHashEqual(sha256(candidateRow.candidate_json), candidateRow.candidate_hash)
+      ) {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      let candidate;
+      try {
+        candidate = JSON.parse(candidateRow.candidate_json);
+      } catch {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      if (candidate.schemaVersion !== candidateRow.response_schema_version) {
+        throw codedError("MEMORY_CANDIDATE_CORRUPT");
+      }
+      const inputRow = this.db
+        .prepare(
+          "SELECT session_id, input_hash, candidate_hash, applied_at FROM analysis_inputs WHERE id = ?"
+        )
+        .get(candidateRow.analysis_input_id);
       if (candidateRow.state === "applied") {
+        if (!inputRow?.candidate_hash || inputRow.applied_at === null) {
+          throw codedError("MEMORY_CANDIDATE_CORRUPT");
+        }
         return {
           status: "already_applied",
           analysisInputId: candidateRow.analysis_input_id,
           candidateHash: candidateRow.candidate_hash,
+          rawCandidateHash: candidateRow.candidate_hash,
+          semanticCandidateHash: inputRow.candidate_hash,
         };
       }
       if (candidateRow.state === "superseded") {
@@ -1078,9 +1114,6 @@ class MemoryRepository {
           candidateHash: candidateRow.candidate_hash,
         };
       }
-      const inputRow = this.db
-        .prepare("SELECT session_id, input_hash FROM analysis_inputs WHERE id = ?")
-        .get(candidateRow.analysis_input_id);
       const desiredHead = inputRow
         ? this.db
             .prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?")
@@ -1097,33 +1130,19 @@ class MemoryRepository {
         safeHashEqual(job.input_hash, inputRow.input_hash) &&
         safeHashEqual(job.desired_head_hash, candidateRow.desired_vector_hash);
       if (!isCurrent) {
-        this.db
+        const superseded = this.db
           .prepare(
             `UPDATE analysis_response_candidates
              SET state = 'superseded', disposition_at = ?
              WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
           )
           .run(at, candidateId);
+        if (superseded.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
         return {
           status: "superseded",
           analysisInputId: candidateRow.analysis_input_id,
           candidateHash: candidateRow.candidate_hash,
         };
-      }
-      if (
-        Buffer.byteLength(candidateRow.candidate_json, "utf8") !== candidateRow.candidate_bytes ||
-        !safeHashEqual(sha256(candidateRow.candidate_json), candidateRow.candidate_hash)
-      ) {
-        throw codedError("MEMORY_CANDIDATE_CORRUPT");
-      }
-      let candidate;
-      try {
-        candidate = JSON.parse(candidateRow.candidate_json);
-      } catch {
-        throw codedError("MEMORY_CANDIDATE_CORRUPT");
-      }
-      if (candidate.schemaVersion !== candidateRow.response_schema_version) {
-        throw codedError("MEMORY_CANDIDATE_CORRUPT");
       }
       const result = this.applyCandidateAnalysis({
         analysisInputId: candidateRow.analysis_input_id,
@@ -1131,13 +1150,14 @@ class MemoryRepository {
         candidate,
         claimedCandidateHash: candidateRow.candidate_hash,
       });
-      this.db
+      const applied = this.db
         .prepare(
           `UPDATE analysis_response_candidates
            SET state = 'applied', disposition_at = ?
            WHERE id = ? AND state = 'validated' AND disposition_at IS NULL`
         )
         .run(at, candidateId);
+      if (applied.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
       return result;
     });
     return transaction.immediate();
@@ -1191,6 +1211,265 @@ class MemoryRepository {
     };
   }
 
+  _plannerEvidenceSegmentIds(entityType, entityId) {
+    return normalizeStringSet(
+      this.db
+        .prepare(
+          `SELECT transcript_segment_id
+           FROM evidence_refs
+           WHERE entity_type = ? AND entity_id = ? AND transcript_segment_id IS NOT NULL
+           ORDER BY transcript_segment_id`
+        )
+        .all(entityType, entityId)
+        .map((row) => row.transcript_segment_id),
+      `${entityType}.evidenceSegmentIds`
+    );
+  }
+
+  _existingPlannerSnapshot() {
+    const memories = this.db
+      .prepare(
+        `SELECT id, kind, title, body, lifecycle
+         FROM memory_items_v2 ORDER BY id`
+      )
+      .all()
+      .map((row) => {
+        const relatedSubjects = this.db
+          .prepare(
+            `SELECT subject_kind, subject_id
+             FROM memory_item_subjects
+             WHERE memory_item_id = ?
+             ORDER BY subject_id, subject_kind`
+          )
+          .all(row.id)
+          .map((subject) => ({
+            subjectKind: subject.subject_kind,
+            subjectId: subject.subject_id,
+          }));
+        const relatedSubjectIds = normalizeStringSet(
+          relatedSubjects.map((subject) => subject.subjectId),
+          "existing.memory.relatedSubjectIds"
+        );
+        const canonicalSlotKey = canonicalTupleHash([
+          "memory",
+          row.kind,
+          canonicalizeText(row.title),
+          relatedSubjectIds,
+        ]);
+        return {
+          id: row.id,
+          kind: row.kind,
+          canonicalSlotKey,
+          canonicalValueKey: canonicalTupleHash([
+            "memory_value",
+            canonicalSlotKey,
+            canonicalizeText(row.body),
+          ]),
+          title: row.title,
+          body: row.body,
+          lifecycle: row.lifecycle,
+          relatedSubjects,
+          occurrences: this.db
+            .prepare(
+              `SELECT id, started_at, ended_at
+               FROM memory_occurrences
+               WHERE memory_value_id = ? ORDER BY id`
+            )
+            .all(row.id)
+            .map((occurrence) => ({
+              id: occurrence.id,
+              startedAt: occurrence.started_at,
+              endedAt: occurrence.ended_at,
+              evidenceSegmentIds: this._plannerEvidenceSegmentIds(
+                "memory_occurrence",
+                occurrence.id
+              ),
+            })),
+        };
+      });
+
+    const topics = this.db
+      .prepare("SELECT id, name, lifecycle FROM topics_v2 ORDER BY id")
+      .all()
+      .map((row) => ({
+        id: row.id,
+        canonicalKey: canonicalTupleHash(["topic", canonicalizeText(row.name)]),
+        name: row.name,
+        lifecycle: row.lifecycle,
+        revisions: this.db
+          .prepare(
+            `SELECT id, revision, summary
+             FROM topic_revisions WHERE topic_id = ? ORDER BY revision, id`
+          )
+          .all(row.id)
+          .map((revision) => ({
+            id: revision.id,
+            revision: revision.revision,
+            summary: revision.summary,
+          })),
+        occurrences: this.db
+          .prepare(
+            `SELECT id, topic_revision_id
+             FROM topic_occurrences WHERE topic_id = ? ORDER BY id`
+          )
+          .all(row.id)
+          .map((occurrence) => ({
+            id: occurrence.id,
+            revisionId: occurrence.topic_revision_id,
+            evidenceSegmentIds: this._plannerEvidenceSegmentIds("topic_occurrence", occurrence.id),
+          })),
+      }));
+
+    const topicMergeSuggestions = this.db
+      .prepare(
+        `SELECT id, left_topic_id, right_topic_id, algorithm_version, score, state
+         FROM topic_merge_suggestions ORDER BY id`
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        leftTopicId: row.left_topic_id,
+        rightTopicId: row.right_topic_id,
+        algorithmVersion: row.algorithm_version,
+        score: row.score,
+        state: row.state,
+      }));
+
+    const todos = this.db
+      .prepare(
+        `SELECT id, title, owner_subject_kind, owner_subject_id, status, completed_at
+         FROM todos_v2 ORDER BY id`
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        canonicalBaseKey: canonicalTupleHash([
+          "todo",
+          canonicalizeText(row.title),
+          row.owner_subject_id,
+        ]),
+        title: row.title,
+        ownerSubjectKind: row.owner_subject_kind,
+        ownerSubjectId: row.owner_subject_id,
+        status: row.status,
+        completedAt: row.status === "completed" ? row.completed_at : null,
+        revisions: this.db
+          .prepare(
+            `SELECT id, revision, title, due_text
+             FROM todo_revisions WHERE todo_instance_id = ? ORDER BY revision, id`
+          )
+          .all(row.id)
+          .map((revision) => ({
+            id: revision.id,
+            revision: revision.revision,
+            title: revision.title,
+            dueText: revision.due_text,
+          })),
+        occurrences: this.db
+          .prepare(
+            `SELECT id, todo_revision_id, started_at, ended_at
+             FROM todo_occurrences WHERE todo_instance_id = ? ORDER BY id`
+          )
+          .all(row.id)
+          .map((occurrence) => ({
+            id: occurrence.id,
+            revisionId: occurrence.todo_revision_id,
+            startedAt: occurrence.started_at,
+            endedAt: occurrence.ended_at,
+            evidenceSegmentIds: this._plannerEvidenceSegmentIds("todo_occurrence", occurrence.id),
+          })),
+      }));
+
+    const suggestions = this.db
+      .prepare("SELECT id, title, rationale, state FROM suggestions_v2 ORDER BY id")
+      .all()
+      .map((row) => ({
+        id: row.id,
+        canonicalKey: canonicalTupleHash([
+          "suggestion",
+          canonicalizeText(row.title),
+          canonicalizeText(row.rationale),
+        ]),
+        title: row.title,
+        rationale: row.rationale,
+        state: row.state,
+        occurrences: this.db
+          .prepare(
+            `SELECT id FROM suggestion_occurrences
+             WHERE suggestion_id = ? ORDER BY id`
+          )
+          .all(row.id)
+          .map((occurrence) => ({
+            id: occurrence.id,
+            evidenceSegmentIds: this._plannerEvidenceSegmentIds(
+              "suggestion_occurrence",
+              occurrence.id
+            ),
+          })),
+      }));
+
+    const memorySupersessions = this.db
+      .prepare(
+        `SELECT previous_id, next_id, reason
+         FROM memory_supersessions ORDER BY previous_id, next_id`
+      )
+      .all()
+      .map((row) => ({
+        id: canonicalTupleHash(["memory_supersession", row.previous_id, row.next_id, row.reason]),
+        priorMemoryId: row.previous_id,
+        nextMemoryId: row.next_id,
+        reason: row.reason,
+      }));
+
+    const todoRecurrences = this.db
+      .prepare(
+        `SELECT id, previous_todo_id, next_todo_id, source_occurrence_id
+         FROM todo_recurrences ORDER BY id`
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        previousTodoId: row.previous_todo_id,
+        nextTodoId: row.next_todo_id,
+        sourceOccurrenceId: row.source_occurrence_id,
+      }));
+
+    return {
+      memories,
+      topics,
+      topicMergeSuggestions,
+      todos,
+      suggestions,
+      memorySupersessions,
+      todoRecurrences,
+    };
+  }
+
+  _plannerSnapshot(inputRow, candidate, context) {
+    return {
+      analysisInput: { id: inputRow.id, sessionId: inputRow.session_id },
+      candidate,
+      evidence: {
+        segments: context.manifest.map((segment) => ({
+          id: segment.segment_id,
+          sessionId: segment.session_id,
+          startedAt: segment.started_at,
+          endedAt: segment.ended_at,
+          speakerLabel: segment.speaker_binding_label,
+        })),
+        bindings: context.bindings
+          .map((binding) => ({
+            label: binding.label,
+            subjectKind: binding.subject_kind,
+            subjectId: binding.subject_id,
+          }))
+          .sort((left, right) => left.label.localeCompare(right.label)),
+      },
+      existing: this._existingPlannerSnapshot(),
+      trustedTranscriptReplacements: [],
+    };
+  }
+
   applyCandidateAnalysis(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new TypeError("candidate application is required");
@@ -1198,23 +1477,30 @@ class MemoryRepository {
     const analysisInputId = assertId(input.analysisInputId, "analysisInputId");
     const inputHash = assertHash(input.inputHash, "inputHash");
     const candidate = input.candidate;
-    const candidateHash = sha256(canonicalJson(candidate));
+    const rawCandidateHash = sha256(canonicalJson(candidate));
     if (
       Object.prototype.hasOwnProperty.call(input, "claimedCandidateHash") &&
-      !safeHashEqual(candidateHash, input.claimedCandidateHash)
+      !safeHashEqual(rawCandidateHash, input.claimedCandidateHash)
     ) {
       throw codedError("MEMORY_CANDIDATE_HASH_MISMATCH");
     }
 
-    const transaction = this.db.transaction(() => {
+    const apply = () => {
       const inputRow = this.db
         .prepare("SELECT * FROM analysis_inputs WHERE id = ?")
         .get(analysisInputId);
       if (!inputRow) throw codedError("MEMORY_INPUT_NOT_FOUND");
       if (!safeHashEqual(inputHash, inputRow.input_hash)) throw codedError("MEMORY_INPUT_MISMATCH");
       if (inputRow.candidate_hash !== null) {
-        if (safeHashEqual(candidateHash, inputRow.candidate_hash)) {
-          return { status: "already_applied", analysisInputId, candidateHash };
+        const retrySemanticHash = semanticCandidateHash(candidate);
+        if (safeHashEqual(retrySemanticHash, inputRow.candidate_hash)) {
+          return {
+            status: "already_applied",
+            analysisInputId,
+            candidateHash: rawCandidateHash,
+            rawCandidateHash,
+            semanticCandidateHash: retrySemanticHash,
+          };
         }
         throw codedError("MEMORY_CANDIDATE_ALREADY_APPLIED");
       }
@@ -1224,6 +1510,9 @@ class MemoryRepository {
       const allowedSegmentIds = new Set(storedInput.payload.selectedSegmentIds);
       const allowedOwnerLabels = new Set(storedInput.payload.selectedOwnerLabels);
       validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels });
+      const plannerInput = this._plannerSnapshot(inputRow, candidate, context);
+      const plan = this.memoryMerger.plan(plannerInput);
+      const semanticHash = assertHash(plan.semanticCandidateHash, "semanticCandidateHash");
       const appliedAt = assertTimestamp(this.now(), "appliedAt");
 
       const evidenceStatement = this.db.prepare(
@@ -1233,9 +1522,15 @@ class MemoryRepository {
            quote_text, audio_state, created_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
+      const evidenceExists = this.db.prepare(
+        `SELECT 1 FROM evidence_refs
+         WHERE entity_type = ? AND entity_id = ? AND transcript_segment_id = ?`
+      );
       const insertEvidence = (entityType, entityId, evidenceSegmentIds) => {
         for (const segmentId of evidenceSegmentIds) {
           const segment = context.manifestById.get(segmentId);
+          if (!segment) throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          if (evidenceExists.get(entityType, entityId, segmentId)) continue;
           evidenceStatement.run(
             this._nextId("evidence"),
             entityType,
@@ -1265,56 +1560,122 @@ class MemoryRepository {
         };
       };
 
+      const cloudPayload = JSON.parse(inputRow.cloud_payload_json);
+      const completeness = cloudPayload.omittedRanges.length === 0 ? "final" : "incremental";
       const previousSummary = this.db
         .prepare(
-          `SELECT id, revision FROM session_summary_revisions
+          `SELECT id, revision, completeness, lifecycle, content_json
+           FROM session_summary_revisions
            WHERE session_id = ? ORDER BY revision DESC LIMIT 1`
         )
         .get(inputRow.session_id);
+      let reuseSummary = false;
       if (previousSummary) {
-        this.db
-          .prepare("UPDATE session_summary_revisions SET lifecycle = 'superseded' WHERE id = ?")
-          .run(previousSummary.id);
-      }
-      const summaryId = this._nextId("session_summary_revision");
-      const cloudPayload = JSON.parse(inputRow.cloud_payload_json);
-      this.db
-        .prepare(
-          `INSERT INTO session_summary_revisions (
-             id, session_id, revision, previous_revision_id, completeness, lifecycle,
-             content_json, source_analysis_input_id, provenance, created_at
-           ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 'evidence_linked', ?)`
-        )
-        .run(
-          summaryId,
-          inputRow.session_id,
-          (previousSummary?.revision ?? 0) + 1,
-          previousSummary?.id ?? null,
-          cloudPayload.omittedRanges.length === 0 ? "final" : "incremental",
-          JSON.stringify({
-            title: candidate.sessionSummary.title,
-            summary: candidate.sessionSummary.summary,
-          }),
-          analysisInputId,
-          appliedAt
+        let previousContent;
+        try {
+          previousContent = JSON.parse(previousSummary.content_json);
+        } catch {
+          throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+        }
+        if (
+          !hasExactKeys(previousContent, ["title", "summary"]) ||
+          typeof previousContent.title !== "string" ||
+          typeof previousContent.summary !== "string" ||
+          previousSummary.lifecycle !== "active"
+        ) {
+          throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+        }
+        const linkedEvidence = new Set(
+          this._plannerEvidenceSegmentIds("session_summary_revision", previousSummary.id)
         );
-      insertEvidence(
-        "session_summary_revision",
-        summaryId,
-        candidate.sessionSummary.evidenceSegmentIds
+        reuseSummary =
+          previousSummary.completeness === completeness &&
+          canonicalizeText(previousContent.title) ===
+            canonicalizeText(candidate.sessionSummary.title) &&
+          canonicalizeText(previousContent.summary) ===
+            canonicalizeText(candidate.sessionSummary.summary) &&
+          candidate.sessionSummary.evidenceSegmentIds.every((segmentId) =>
+            linkedEvidence.has(segmentId)
+          );
+      }
+      if (!reuseSummary) {
+        if (previousSummary) {
+          const superseded = this.db
+            .prepare(
+              `UPDATE session_summary_revisions
+               SET lifecycle = 'superseded' WHERE id = ? AND lifecycle = 'active'`
+            )
+            .run(previousSummary.id);
+          if (superseded.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
+        }
+        const summaryId = this._nextId("session_summary_revision");
+        this.db
+          .prepare(
+            `INSERT INTO session_summary_revisions (
+               id, session_id, revision, previous_revision_id, completeness, lifecycle,
+               content_json, source_analysis_input_id, provenance, created_at
+             ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 'evidence_linked', ?)`
+          )
+          .run(
+            summaryId,
+            inputRow.session_id,
+            (previousSummary?.revision ?? 0) + 1,
+            previousSummary?.id ?? null,
+            completeness,
+            JSON.stringify({
+              title: candidate.sessionSummary.title,
+              summary: candidate.sessionSummary.summary,
+            }),
+            analysisInputId,
+            appliedAt
+          );
+        insertEvidence(
+          "session_summary_revision",
+          summaryId,
+          candidate.sessionSummary.evidenceSegmentIds
+        );
+      }
+
+      const memoryIdsByCanonicalValueKey = new Map(
+        plannerInput.existing.memories.map((memory) => [memory.canonicalValueKey, memory.id])
+      );
+      const memoryCanonicalSlotById = new Map(
+        plannerInput.existing.memories.map((memory) => [memory.id, memory.canonicalSlotKey])
+      );
+      const topicIdsByCanonicalKey = new Map(
+        plannerInput.existing.topics.map((topic) => [topic.canonicalKey, topic.id])
+      );
+      const todoIdsByCanonicalBaseKey = new Map();
+      for (const todo of plannerInput.existing.todos) {
+        const ids = todoIdsByCanonicalBaseKey.get(todo.canonicalBaseKey) ?? [];
+        ids.push(todo.id);
+        todoIdsByCanonicalBaseKey.set(todo.canonicalBaseKey, ids);
+      }
+      const insertMemorySubject = this.db.prepare(
+        `INSERT INTO memory_item_subjects (
+           memory_item_id, subject_kind, subject_id
+         ) VALUES (?, ?, ?)`
+      );
+      const occurrenceEntityTypes = new Set([
+        "memory_occurrence",
+        "topic_occurrence",
+        "todo_occurrence",
+        "suggestion_occurrence",
+      ]);
+      const occurrenceCreationModes = new Set(["create_occurrence", "attach_history"]);
+      const addConflictMember = this.db.prepare(
+        `INSERT OR IGNORE INTO memory_conflict_members (
+           group_id, memory_item_id, created_at
+         ) VALUES (?, ?, ?)`
       );
 
-      for (const [index, memory] of candidate.memories.entries()) {
-        const slotKey = sha256(
-          canonicalJson({ kind: memory.kind, title: normalizedKey(memory.title) })
-        );
-        const valueKey = sha256(canonicalJson({ slotKey, body: normalizedKey(memory.body) }));
+      const applyMemoryInsert = (memory) => {
+        const slotKey = memory.canonicalSlotKey;
+        const valueKey = memory.canonicalValueKey;
         let memoryRow = this.db
           .prepare("SELECT id FROM memory_items_v2 WHERE canonical_value_key = ?")
           .get(valueKey);
-        let memoryCreated = false;
         if (!memoryRow) {
-          memoryCreated = true;
           memoryRow = { id: this._nextId("memory") };
           this.db
             .prepare(
@@ -1335,83 +1696,24 @@ class MemoryRepository {
               appliedAt,
               appliedAt
             );
-        }
-        if (memoryCreated) {
-          const openConflict = this.db
-            .prepare(
-              `SELECT id FROM memory_conflict_groups
-               WHERE slot_key = ? AND state = 'open'`
-            )
-            .get(slotKey);
-          if (openConflict) {
-            this.db
-              .prepare(
-                `INSERT OR IGNORE INTO memory_conflict_members (
-                   group_id, memory_item_id, created_at
-                 ) VALUES (?, ?, ?)`
-              )
-              .run(openConflict.id, memoryRow.id, appliedAt);
-            this.db
-              .prepare(
-                `UPDATE memory_items_v2
-                 SET lifecycle = 'conflict', updated_at = ?
-                 WHERE id = ? AND lifecycle = 'active'`
-              )
-              .run(appliedAt, memoryRow.id);
-          } else {
-            let previousValues = this.db
-              .prepare(
-                `SELECT id FROM memory_items_v2
-                 WHERE canonical_slot_key = ? AND id <> ? AND lifecycle = 'active'
-                 ORDER BY created_at, id`
-              )
-              .all(slotKey, memoryRow.id);
-            if (previousValues.length === 0) {
-              const selected = this.db
-                .prepare(
-                  `SELECT selected_member_id AS id
-                   FROM memory_conflict_groups
-                   WHERE slot_key = ? AND state = 'resolved'
-                   ORDER BY episode DESC LIMIT 1`
-                )
-                .get(slotKey);
-              previousValues = selected ? [selected] : [];
-            }
-            if (previousValues.length > 0) {
-              const episode = this.db
-                .prepare(
-                  `SELECT COALESCE(MAX(episode), 0) + 1 AS episode
-                     FROM memory_conflict_groups WHERE slot_key = ?`
-                )
-                .get(slotKey).episode;
-              const conflictGroupId = this._nextId("memory_conflict");
-              this.db
-                .prepare(
-                  `INSERT INTO memory_conflict_groups (
-                     id, slot_key, episode, state, selected_member_id, resolved_at,
-                     created_at, updated_at
-                   ) VALUES (?, ?, ?, 'open', NULL, NULL, ?, ?)`
-                )
-                .run(conflictGroupId, slotKey, episode, appliedAt, appliedAt);
-              const addMember = this.db.prepare(
-                `INSERT INTO memory_conflict_members (
-                   group_id, memory_item_id, created_at
-                 ) VALUES (?, ?, ?)`
-              );
-              for (const value of [...previousValues, memoryRow]) {
-                addMember.run(conflictGroupId, value.id, appliedAt);
-              }
-              this.db
-                .prepare(
-                  `UPDATE memory_items_v2
-                   SET lifecycle = 'conflict', updated_at = ?
-                   WHERE canonical_slot_key = ? AND lifecycle = 'active'`
-                )
-                .run(appliedAt, slotKey);
-            }
+          for (const subject of memory.relatedSubjects) {
+            insertMemorySubject.run(memoryRow.id, subject.subjectKind, subject.subjectId);
           }
+          this.db
+            .prepare(
+              `INSERT INTO memory_item_canonical_slots (
+                 memory_item_id, canonical_slot_key, algorithm
+               ) VALUES (?, ?, 'canonical-v1')`
+            )
+            .run(memoryRow.id, memory.canonicalSlotKey);
+          memoryIdsByCanonicalValueKey.set(memory.canonicalValueKey, memoryRow.id);
+          memoryCanonicalSlotById.set(memoryRow.id, memory.canonicalSlotKey);
         }
-        const fingerprint = sha256(canonicalJson(memory));
+        const fingerprint = canonicalTupleHash([
+          "memory_insert",
+          memory.canonicalValueKey,
+          memory.evidenceSegmentIds,
+        ]);
         const occurrenceId = this._nextId("memory_occurrence");
         const bounds = evidenceBounds(memory.evidenceSegmentIds);
         this.db
@@ -1425,7 +1727,7 @@ class MemoryRepository {
             occurrenceId,
             memoryRow.id,
             analysisInputId,
-            sha256(`${analysisInputId}\0memory\0${index}\0${fingerprint}`),
+            canonicalTupleHash(["memory_occurrence", analysisInputId, fingerprint]),
             fingerprint,
             bounds.startedAt,
             bounds.endedAt,
@@ -1433,10 +1735,10 @@ class MemoryRepository {
             appliedAt
           );
         insertEvidence("memory_occurrence", occurrenceId, memory.evidenceSegmentIds);
-      }
+      };
 
-      for (const [index, topic] of candidate.topics.entries()) {
-        const canonicalKey = sha256(normalizedKey(topic.name));
+      const applyTopicInsert = (topic) => {
+        const canonicalKey = topic.canonicalKey;
         let topicRow = this.db
           .prepare("SELECT id FROM topics_v2 WHERE canonical_key = ?")
           .get(canonicalKey);
@@ -1450,6 +1752,7 @@ class MemoryRepository {
                ) VALUES (?, ?, ?, 'canonical-v1', 'active', ?, 'evidence_linked', ?, ?)`
             )
             .run(topicRow.id, canonicalKey, topic.name, analysisInputId, appliedAt, appliedAt);
+          topicIdsByCanonicalKey.set(topic.canonicalKey, topicRow.id);
         }
         const previous = this.db
           .prepare(
@@ -1480,7 +1783,12 @@ class MemoryRepository {
               appliedAt
             );
         }
-        const fingerprint = sha256(canonicalJson(topic));
+        const fingerprint = canonicalTupleHash([
+          "topic_insert",
+          topic.canonicalKey,
+          topic.normalizedSummary,
+          topic.evidenceSegmentIds,
+        ]);
         const occurrenceId = this._nextId("topic_occurrence");
         this.db
           .prepare(
@@ -1494,23 +1802,26 @@ class MemoryRepository {
             topicRow.id,
             revision.id,
             analysisInputId,
-            sha256(`${analysisInputId}\0topic\0${index}\0${fingerprint}`),
+            canonicalTupleHash(["topic_occurrence", analysisInputId, fingerprint]),
             fingerprint,
             appliedAt
           );
         insertEvidence("topic_occurrence", occurrenceId, topic.evidenceSegmentIds);
-      }
+      };
 
-      for (const [index, todo] of candidate.todos.entries()) {
+      const applyTodoInsert = (todo) => {
         const binding =
-          todo.ownerLabel === null ? null : context.bindingByLabel.get(todo.ownerLabel);
-        const baseKey = sha256(
-          canonicalJson({
-            title: normalizedKey(todo.title),
-            ownerKind: binding?.subject_kind ?? null,
-            ownerId: binding?.subject_id ?? null,
-          })
-        );
+          todo.ownerSubjectId === null
+            ? null
+            : context.bindings.find(
+                (item) =>
+                  item.subject_kind === todo.ownerSubjectKind &&
+                  item.subject_id === todo.ownerSubjectId
+              );
+        if (todo.ownerSubjectId !== null && !binding) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const baseKey = todo.canonicalBaseKey;
         let todoRow = this.db
           .prepare(
             `SELECT * FROM todos_v2
@@ -1540,6 +1851,7 @@ class MemoryRepository {
               appliedAt,
               appliedAt
             );
+          todoIdsByCanonicalBaseKey.set(todo.canonicalBaseKey, [todoRow.id]);
           this.db
             .prepare(
               `INSERT INTO todo_state_transitions (
@@ -1576,7 +1888,12 @@ class MemoryRepository {
               appliedAt
             );
         }
-        const fingerprint = sha256(canonicalJson(todo));
+        const fingerprint = canonicalTupleHash([
+          "todo_insert",
+          todo.canonicalBaseKey,
+          todo.dueText,
+          todo.evidenceSegmentIds,
+        ]);
         const occurrenceId = this._nextId("todo_occurrence");
         const bounds = evidenceBounds(todo.evidenceSegmentIds);
         this.db
@@ -1591,22 +1908,17 @@ class MemoryRepository {
             todoRow.id,
             revision.id,
             analysisInputId,
-            sha256(`${analysisInputId}\0todo\0${index}\0${fingerprint}`),
+            canonicalTupleHash(["todo_occurrence", analysisInputId, fingerprint]),
             fingerprint,
             bounds.startedAt,
             bounds.endedAt,
             appliedAt
           );
         insertEvidence("todo_occurrence", occurrenceId, todo.evidenceSegmentIds);
-      }
+      };
 
-      for (const [index, suggestion] of candidate.suggestions.entries()) {
-        const canonicalKey = sha256(
-          canonicalJson({
-            title: normalizedKey(suggestion.title),
-            rationale: normalizedKey(suggestion.rationale),
-          })
-        );
+      const applySuggestionInsert = (suggestion) => {
+        const canonicalKey = suggestion.canonicalKey;
         let suggestionRow = this.db
           .prepare("SELECT id FROM suggestions_v2 WHERE canonical_key = ?")
           .get(canonicalKey);
@@ -1629,7 +1941,11 @@ class MemoryRepository {
               appliedAt
             );
         }
-        const fingerprint = sha256(canonicalJson(suggestion));
+        const fingerprint = canonicalTupleHash([
+          "suggestion_insert",
+          suggestion.canonicalKey,
+          suggestion.evidenceSegmentIds,
+        ]);
         const occurrenceId = this._nextId("suggestion_occurrence");
         this.db
           .prepare(
@@ -1642,11 +1958,517 @@ class MemoryRepository {
             occurrenceId,
             suggestionRow.id,
             analysisInputId,
-            sha256(`${analysisInputId}\0suggestion\0${index}\0${fingerprint}`),
+            canonicalTupleHash(["suggestion_occurrence", analysisInputId, fingerprint]),
             fingerprint,
             appliedAt
           );
-        insertEvidence("suggestion_occurrence", occurrenceId, suggestion.basedOnEvidenceSegmentIds);
+        insertEvidence("suggestion_occurrence", occurrenceId, suggestion.evidenceSegmentIds);
+      };
+
+      for (const action of plan.inserts) {
+        if (action.entityKind === "memory") applyMemoryInsert(action);
+        else if (action.entityKind === "topic") applyTopicInsert(action);
+        else if (action.entityKind === "todo") applyTodoInsert(action);
+        else if (action.entityKind === "suggestion") applySuggestionInsert(action);
+        else throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
+      }
+
+      const resolveMemoryId = ({ memoryId, canonicalValueKey }) => {
+        const byCanonical = canonicalValueKey
+          ? memoryIdsByCanonicalValueKey.get(canonicalValueKey)
+          : undefined;
+        if (memoryId && byCanonical && memoryId !== byCanonical) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const resolved = memoryId ?? byCanonical;
+        if (!resolved || !memoryCanonicalSlotById.has(resolved)) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        return resolved;
+      };
+      const requireEvidence = (action) => {
+        if (!Array.isArray(action.evidenceSegmentIds) || action.evidenceSegmentIds.length === 0) {
+          throw codedError("MEMORY_EVIDENCE_REQUIRED");
+        }
+      };
+      const assertActionBounds = (action) => {
+        const bounds = evidenceBounds(action.evidenceSegmentIds);
+        if (action.startedAt !== bounds.startedAt || action.endedAt !== bounds.endedAt) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+      };
+
+      for (const revision of plan.revisions) {
+        if (revision.entityKind !== "topic") throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
+        const topicId = topicIdsByCanonicalKey.get(revision.canonicalKey);
+        if (!topicId || topicId !== revision.topicId) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const previous = this.db
+          .prepare(
+            `SELECT id, revision FROM topic_revisions
+             WHERE topic_id = ? ORDER BY revision DESC, id DESC LIMIT 1`
+          )
+          .get(topicId);
+        if (
+          !previous ||
+          previous.id !== revision.previousRevisionId ||
+          previous.revision !== revision.previousRevision
+        ) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        requireEvidence(revision);
+        const revisionId = this._nextId("topic_revision");
+        this.db
+          .prepare(
+            `INSERT INTO topic_revisions (
+               id, topic_id, revision, previous_revision_id, summary,
+               source_analysis_input_id, provenance, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'evidence_linked', ?)`
+          )
+          .run(
+            revisionId,
+            topicId,
+            previous.revision + 1,
+            previous.id,
+            revision.summary,
+            analysisInputId,
+            appliedAt
+          );
+        const fingerprint = canonicalTupleHash([
+          "topic_revision",
+          revision.canonicalKey,
+          revision.normalizedSummary,
+          revision.evidenceSegmentIds,
+        ]);
+        const occurrenceId = this._nextId("topic_occurrence");
+        this.db
+          .prepare(
+            `INSERT INTO topic_occurrences (
+               id, topic_id, topic_revision_id, analysis_input_id, legacy_session_id,
+               occurrence_key, candidate_item_fingerprint, created_at
+             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`
+          )
+          .run(
+            occurrenceId,
+            topicId,
+            revisionId,
+            analysisInputId,
+            canonicalTupleHash(["topic_occurrence", analysisInputId, fingerprint]),
+            fingerprint,
+            appliedAt
+          );
+        insertEvidence("topic_occurrence", occurrenceId, revision.evidenceSegmentIds);
+      }
+
+      for (const action of plan.occurrenceLinks) {
+        const actionFingerprint = canonicalTupleHash(["occurrence_action", action]);
+        if (action.mode === "link_evidence") {
+          if (!occurrenceEntityTypes.has(action.entityKind)) {
+            throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
+          }
+          const occurrenceTable = {
+            memory_occurrence: "memory_occurrences",
+            topic_occurrence: "topic_occurrences",
+            todo_occurrence: "todo_occurrences",
+            suggestion_occurrence: "suggestion_occurrences",
+          }[action.entityKind];
+          const occurrence = this.db
+            .prepare(`SELECT * FROM ${occurrenceTable} WHERE id = ?`)
+            .get(action.occurrenceId);
+          if (!occurrence) throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          if (
+            (action.memoryId && occurrence.memory_value_id !== action.memoryId) ||
+            (action.topicId && occurrence.topic_id !== action.topicId) ||
+            (action.todoId && occurrence.todo_instance_id !== action.todoId) ||
+            (action.suggestionId && occurrence.suggestion_id !== action.suggestionId) ||
+            (action.revisionId && occurrence.topic_revision_id !== action.revisionId)
+          ) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          insertEvidence(action.entityKind, action.occurrenceId, action.evidenceSegmentIds);
+          continue;
+        }
+
+        if (!occurrenceCreationModes.has(action.mode)) {
+          throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
+        }
+        if (action.entityKind === "memory") {
+          requireEvidence(action);
+          assertActionBounds(action);
+          const memoryId = resolveMemoryId(action);
+          const occurrenceId = this._nextId("memory_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO memory_occurrences (
+                 id, memory_value_id, analysis_input_id, legacy_session_id, occurrence_key,
+                 candidate_item_fingerprint, started_at, ended_at, confidence, created_at
+               ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              occurrenceId,
+              memoryId,
+              analysisInputId,
+              canonicalTupleHash(["memory_occurrence", analysisInputId, actionFingerprint]),
+              actionFingerprint,
+              action.startedAt,
+              action.endedAt,
+              action.confidence,
+              appliedAt
+            );
+          insertEvidence("memory_occurrence", occurrenceId, action.evidenceSegmentIds);
+        } else if (action.entityKind === "topic") {
+          requireEvidence(action);
+          const topic = this.db
+            .prepare("SELECT id FROM topics_v2 WHERE id = ?")
+            .get(action.topicId);
+          const revision = this.db
+            .prepare("SELECT topic_id FROM topic_revisions WHERE id = ?")
+            .get(action.revisionId);
+          if (!topic || revision?.topic_id !== topic.id) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          const occurrenceId = this._nextId("topic_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO topic_occurrences (
+                 id, topic_id, topic_revision_id, analysis_input_id, legacy_session_id,
+                 occurrence_key, candidate_item_fingerprint, created_at
+               ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`
+            )
+            .run(
+              occurrenceId,
+              topic.id,
+              action.revisionId,
+              analysisInputId,
+              canonicalTupleHash(["topic_occurrence", analysisInputId, actionFingerprint]),
+              actionFingerprint,
+              appliedAt
+            );
+          insertEvidence("topic_occurrence", occurrenceId, action.evidenceSegmentIds);
+        } else if (action.entityKind === "todo") {
+          requireEvidence(action);
+          assertActionBounds(action);
+          const revision = this.db
+            .prepare("SELECT todo_instance_id FROM todo_revisions WHERE id = ?")
+            .get(action.revisionId);
+          if (revision?.todo_instance_id !== action.todoId) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          const occurrenceId = this._nextId("todo_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO todo_occurrences (
+                 id, todo_instance_id, todo_revision_id, analysis_input_id,
+                 legacy_session_id, occurrence_key, candidate_item_fingerprint,
+                 started_at, ended_at, created_at
+               ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
+            )
+            .run(
+              occurrenceId,
+              action.todoId,
+              action.revisionId,
+              analysisInputId,
+              canonicalTupleHash(["todo_occurrence", analysisInputId, actionFingerprint]),
+              actionFingerprint,
+              action.startedAt,
+              action.endedAt,
+              appliedAt
+            );
+          insertEvidence("todo_occurrence", occurrenceId, action.evidenceSegmentIds);
+        } else if (action.entityKind === "suggestion" && action.mode === "create_occurrence") {
+          const suggestion = this.db
+            .prepare("SELECT id, state FROM suggestions_v2 WHERE id = ?")
+            .get(action.suggestionId);
+          if (!suggestion || suggestion.state !== "proposed") {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          const occurrenceId = this._nextId("suggestion_occurrence");
+          this.db
+            .prepare(
+              `INSERT INTO suggestion_occurrences (
+                 id, suggestion_id, analysis_input_id, legacy_session_id,
+                 occurrence_key, candidate_item_fingerprint, created_at
+               ) VALUES (?, ?, ?, NULL, ?, ?, ?)`
+            )
+            .run(
+              occurrenceId,
+              suggestion.id,
+              analysisInputId,
+              canonicalTupleHash(["suggestion_occurrence", analysisInputId, actionFingerprint]),
+              actionFingerprint,
+              appliedAt
+            );
+          insertEvidence("suggestion_occurrence", occurrenceId, action.evidenceSegmentIds);
+        } else {
+          throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
+        }
+      }
+
+      for (const supersession of plan.supersessions) {
+        const nextMemoryId = resolveMemoryId({
+          canonicalValueKey: supersession.nextMemoryCanonicalValueKey,
+        });
+        if (
+          !memoryCanonicalSlotById.has(supersession.priorMemoryId) ||
+          memoryCanonicalSlotById.get(supersession.priorMemoryId) !==
+            supersession.canonicalSlotKey ||
+          memoryCanonicalSlotById.get(nextMemoryId) !== supersession.canonicalSlotKey ||
+          supersession.priorMemoryId === nextMemoryId
+        ) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        this.db
+          .prepare(
+            `INSERT INTO memory_supersessions (
+               previous_id, next_id, reason, analysis_input_id, created_at
+             ) VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(
+            supersession.priorMemoryId,
+            nextMemoryId,
+            supersession.reason,
+            analysisInputId,
+            appliedAt
+          );
+        const lifecycle = this.db
+          .prepare("SELECT lifecycle FROM memory_items_v2 WHERE id = ?")
+          .get(supersession.priorMemoryId)?.lifecycle;
+        if (lifecycle !== "active") throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        this.db
+          .prepare(
+            `UPDATE memory_items_v2
+             SET lifecycle = 'superseded', updated_at = ?
+             WHERE id = ? AND lifecycle = 'active'`
+          )
+          .run(appliedAt, supersession.priorMemoryId);
+      }
+
+      for (const conflict of plan.conflicts) {
+        const memberIds = new Set(conflict.existingMemoryIds);
+        for (const canonicalValueKey of conflict.candidateCanonicalValueKeys) {
+          const memoryId = memoryIdsByCanonicalValueKey.get(canonicalValueKey);
+          if (!memoryId) throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          memberIds.add(memoryId);
+        }
+        if (
+          memberIds.size < 2 ||
+          [...memberIds].some(
+            (memoryId) => memoryCanonicalSlotById.get(memoryId) !== conflict.canonicalSlotKey
+          )
+        ) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        let group = this.db
+          .prepare(
+            `SELECT id FROM memory_conflict_groups
+             WHERE slot_key = ? AND state = 'open'`
+          )
+          .get(conflict.canonicalSlotKey);
+        if (!group) {
+          const episode = this.db
+            .prepare(
+              `SELECT COALESCE(MAX(episode), 0) + 1 AS episode
+               FROM memory_conflict_groups WHERE slot_key = ?`
+            )
+            .get(conflict.canonicalSlotKey).episode;
+          group = { id: this._nextId("memory_conflict") };
+          this.db
+            .prepare(
+              `INSERT INTO memory_conflict_groups (
+                 id, slot_key, episode, state, selected_member_id, resolved_at,
+                 created_at, updated_at
+               ) VALUES (?, ?, ?, 'open', NULL, NULL, ?, ?)`
+            )
+            .run(group.id, conflict.canonicalSlotKey, episode, appliedAt, appliedAt);
+        }
+        for (const memoryId of [...memberIds].sort()) {
+          addConflictMember.run(group.id, memoryId, appliedAt);
+          const row = this.db
+            .prepare("SELECT lifecycle FROM memory_items_v2 WHERE id = ?")
+            .get(memoryId);
+          if (!row || !["active", "conflict"].includes(row.lifecycle)) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          if (row.lifecycle === "active") {
+            this.db
+              .prepare(
+                `UPDATE memory_items_v2
+                 SET lifecycle = 'conflict', updated_at = ? WHERE id = ? AND lifecycle = 'active'`
+              )
+              .run(appliedAt, memoryId);
+          }
+        }
+      }
+
+      for (const suggestion of plan.mergeSuggestions) {
+        const resolveTopicRef = (reference) => {
+          const topicId = topicIdsByCanonicalKey.get(reference.canonicalKey);
+          if (!topicId || (reference.topicId && reference.topicId !== topicId)) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          return topicId;
+        };
+        const resolvedIds = [
+          resolveTopicRef(suggestion.leftTopic),
+          resolveTopicRef(suggestion.rightTopic),
+        ].sort();
+        if (resolvedIds[0] === resolvedIds[1]) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const existing = this.db
+          .prepare(
+            `SELECT * FROM topic_merge_suggestions
+             WHERE pair_key = ? OR (
+               left_topic_id = ? AND right_topic_id = ? AND algorithm_version = ?
+             )`
+          )
+          .get(suggestion.pairKey, resolvedIds[0], resolvedIds[1], suggestion.algorithmVersion);
+        if (existing) {
+          if (
+            existing.pair_key !== suggestion.pairKey ||
+            existing.left_topic_id !== resolvedIds[0] ||
+            existing.right_topic_id !== resolvedIds[1] ||
+            existing.algorithm_version !== suggestion.algorithmVersion
+          ) {
+            throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+          }
+          continue;
+        }
+        this.db
+          .prepare(
+            `INSERT INTO topic_merge_suggestions (
+               id, left_topic_id, right_topic_id, pair_key, algorithm_version,
+               score, state, decided_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'proposed', NULL, ?, ?)`
+          )
+          .run(
+            this._nextId("topic_merge_suggestion"),
+            resolvedIds[0],
+            resolvedIds[1],
+            suggestion.pairKey,
+            suggestion.algorithmVersion,
+            suggestion.score,
+            appliedAt,
+            appliedAt
+          );
+      }
+
+      for (const recurrence of plan.recurrences) {
+        requireEvidence(recurrence);
+        assertActionBounds(recurrence);
+        const previous = this.db
+          .prepare(
+            `SELECT id, status, completed_at, title, owner_subject_id
+             FROM todos_v2 WHERE id = ?`
+          )
+          .get(recurrence.previousTodoId);
+        if (
+          !previous ||
+          previous.status !== "completed" ||
+          recurrence.startedAt <= previous.completed_at ||
+          this.db
+            .prepare("SELECT 1 FROM todo_recurrences WHERE previous_todo_id = ?")
+            .get(previous.id)
+        ) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const derivedBaseKey = canonicalTupleHash([
+          "todo",
+          canonicalizeText(previous.title),
+          previous.owner_subject_id,
+        ]);
+        if (derivedBaseKey !== recurrence.canonicalBaseKey) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const binding =
+          recurrence.ownerSubjectId === null
+            ? null
+            : context.bindings.find(
+                (item) =>
+                  item.subject_kind === recurrence.ownerSubjectKind &&
+                  item.subject_id === recurrence.ownerSubjectId
+              );
+        if (recurrence.ownerSubjectId !== null && !binding) {
+          throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
+        }
+        const nextTodoId = this._nextId("todo");
+        this.db
+          .prepare(
+            `INSERT INTO todos_v2 (
+               id, canonical_base_key, instance_key, title, owner_subject_kind,
+               owner_subject_id, owner_display_name_snapshot, status, recurrence_of_id,
+               source_analysis_input_id, provenance, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, 'evidence_linked', ?, ?)`
+          )
+          .run(
+            nextTodoId,
+            recurrence.canonicalBaseKey,
+            recurrence.nextTodoInstanceKey,
+            recurrence.title,
+            recurrence.ownerSubjectKind,
+            recurrence.ownerSubjectId,
+            binding?.subject_display_name_snapshot ?? null,
+            previous.id,
+            analysisInputId,
+            appliedAt,
+            appliedAt
+          );
+        this.db
+          .prepare(
+            `INSERT INTO todo_state_transitions (
+               id, todo_instance_id, from_status, to_status, reason,
+               source_analysis_input_id, actor, occurred_at
+             ) VALUES (?, ?, NULL, 'open', 'recurrence', ?, 'system', ?)`
+          )
+          .run(this._nextId("todo_transition"), nextTodoId, analysisInputId, appliedAt);
+        const revisionId = this._nextId("todo_revision");
+        this.db
+          .prepare(
+            `INSERT INTO todo_revisions (
+               id, todo_instance_id, revision, previous_revision_id, title, due_text,
+               source_analysis_input_id, provenance, created_at
+             ) VALUES (?, ?, 1, NULL, ?, ?, ?, 'evidence_linked', ?)`
+          )
+          .run(
+            revisionId,
+            nextTodoId,
+            recurrence.title,
+            recurrence.dueText,
+            analysisInputId,
+            appliedAt
+          );
+        const occurrenceId = this._nextId("todo_occurrence");
+        const fingerprint = canonicalTupleHash(["todo_recurrence", recurrence]);
+        this.db
+          .prepare(
+            `INSERT INTO todo_occurrences (
+               id, todo_instance_id, todo_revision_id, analysis_input_id, legacy_session_id,
+               occurrence_key, candidate_item_fingerprint, started_at, ended_at, created_at
+             ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            occurrenceId,
+            nextTodoId,
+            revisionId,
+            analysisInputId,
+            canonicalTupleHash(["todo_occurrence", analysisInputId, fingerprint]),
+            fingerprint,
+            recurrence.startedAt,
+            recurrence.endedAt,
+            appliedAt
+          );
+        insertEvidence("todo_occurrence", occurrenceId, recurrence.evidenceSegmentIds);
+        this.db
+          .prepare(
+            `INSERT INTO todo_recurrences (
+               id, previous_todo_id, next_todo_id, source_occurrence_id, created_at
+             ) VALUES (?, ?, ?, ?, ?)`
+          )
+          .run(this._nextId("todo_recurrence"), previous.id, nextTodoId, occurrenceId, appliedAt);
+        const todoIds = todoIdsByCanonicalBaseKey.get(recurrence.canonicalBaseKey) ?? [];
+        todoIds.push(nextTodoId);
+        todoIdsByCanonicalBaseKey.set(recurrence.canonicalBaseKey, todoIds);
       }
 
       const cas = this.db
@@ -1654,11 +2476,18 @@ class MemoryRepository {
           `UPDATE analysis_inputs SET candidate_hash = ?, applied_at = ?
            WHERE id = ? AND candidate_hash IS NULL AND applied_at IS NULL`
         )
-        .run(candidateHash, appliedAt, analysisInputId);
+        .run(semanticHash, appliedAt, analysisInputId);
       if (cas.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
-      return { status: "applied", analysisInputId, candidateHash };
-    });
-    return transaction.immediate();
+      return {
+        status: "applied",
+        analysisInputId,
+        candidateHash: rawCandidateHash,
+        rawCandidateHash,
+        semanticCandidateHash: semanticHash,
+      };
+    };
+    if (this.db.inTransaction) return apply();
+    return this.db.transaction(apply).immediate();
   }
 
   importLegacyAnalysis() {
@@ -2411,6 +3240,47 @@ class MemoryRepository {
       return { status: "completed", importedRowCount };
     });
     return transaction.immediate();
+  }
+
+  _transitionSuggestion(input, terminalState) {
+    if (!hasExactKeys(input, ["suggestionId", "at"])) {
+      throw new TypeError("suggestion transition must contain suggestionId and at");
+    }
+    const suggestionId = assertId(input.suggestionId, "suggestionId");
+    const at = assertTimestamp(input.at, "at");
+    const transaction = this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT state, decided_at FROM suggestions_v2 WHERE id = ?")
+        .get(suggestionId);
+      if (!row) throw codedError("MEMORY_SUGGESTION_NOT_FOUND");
+      if (row.state === terminalState) {
+        if (row.decided_at !== at) throw codedError("MEMORY_SUGGESTION_STALE_TRANSITION");
+        return {
+          status: `already_${terminalState}`,
+          suggestionId,
+          decidedAt: row.decided_at,
+        };
+      }
+      if (row.state !== "proposed") throw codedError("MEMORY_SUGGESTION_ALREADY_DECIDED");
+      const updated = this.db
+        .prepare(
+          `UPDATE suggestions_v2
+           SET state = ?, decided_at = ?, updated_at = MAX(updated_at, ?)
+           WHERE id = ? AND state = 'proposed' AND decided_at IS NULL`
+        )
+        .run(terminalState, at, at, suggestionId);
+      if (updated.changes !== 1) throw codedError("MEMORY_SUGGESTION_STALE_TRANSITION");
+      return { status: terminalState, suggestionId, decidedAt: at };
+    });
+    return transaction.immediate();
+  }
+
+  acceptSuggestion(input) {
+    return this._transitionSuggestion(input, "accepted");
+  }
+
+  dismissSuggestion(input) {
+    return this._transitionSuggestion(input, "dismissed");
   }
 
   resolveMemoryConflict(input) {

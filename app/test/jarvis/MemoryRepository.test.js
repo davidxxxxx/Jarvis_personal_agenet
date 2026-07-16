@@ -1,11 +1,19 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const Database = require("better-sqlite3");
 const test = require("node:test");
 
 const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
+const {
+  canonicalTupleHash,
+  canonicalizeText,
+  semanticCandidateHash,
+} = require("../../src/jarvis/main/MemoryMerger");
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -30,8 +38,8 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function createFixture() {
-  const db = new Database(":memory:");
+function createFixture(filename = ":memory:") {
+  const db = new Database(filename);
   db.pragma("foreign_keys = ON");
   applyJarvisMigrations(db);
   db.exec(`
@@ -393,8 +401,8 @@ function validCandidate(overrides = {}) {
   };
 }
 
-function createStoredInput(db, counters = { ids: 0, clocks: 0 }) {
-  const repository = createRepository(db, counters);
+function createStoredInput(db, counters = { ids: 0, clocks: 0 }, overrides = {}) {
+  const repository = createRepository(db, counters, overrides);
   const input = repository.createAnalysisInput(validCreateInput());
   return { repository, input, counters };
 }
@@ -406,6 +414,32 @@ function createAlternativeInput(repository, text) {
     })
   );
   return repository.createAnalysisInput(validCreateInput({ cloudPayloadJson }));
+}
+
+function createInputForSegments(repository, segmentIds, identity, sessionId = "session-1") {
+  const request = validInput({
+    sessionId,
+    transcriptRevision: sha256(`transcript:${identity}`),
+    segmentIds,
+  });
+  const prepared = repository.prepareAnalysisInput(request);
+  return repository.createAnalysisInput({
+    ...request,
+    prepareToken: prepared.prepareToken,
+    inputContractVersion: "jarvis-analysis-input-v2",
+    redactionVersion: "jarvis-redaction-v1",
+    cloudPayloadJson: JSON.stringify({
+      inputVersion: "jarvis-analysis-input-v2",
+      segments: prepared.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        startedAt: segment.startedAt,
+        endedAt: segment.endedAt,
+        speakerLabel: segment.speakerBindingLabel,
+        text: `redacted ${segment.segmentId}`,
+      })),
+      omittedRanges: [],
+    }),
+  });
 }
 
 function setDesiredHead(repository, input, overrides = {}) {
@@ -744,10 +778,310 @@ test("persists a validated candidate linked to job input head and reconciled bud
   }
 });
 
-test("candidate apply CAS supersedes a stale desired head without visible writes", () => {
+test("stored candidate exact retry avoids planner clock and ID work while returning both hashes", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  let plannerCalls = 0;
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const realMerger = new MemoryMerger();
+  try {
+    const { repository, input } = createStoredInput(db, counters, {
+      memoryMerger: {
+        plan(plannerInput) {
+          plannerCalls += 1;
+          return realMerger.plan(plannerInput);
+        },
+      },
+    });
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(db, job.id, "budget-request-exact-retry"),
+      candidate: validCandidate(),
+    });
+
+    const applied = repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+    const countsAfterApply = { ...counters };
+    assert.equal(plannerCalls, 1);
+    assert.deepEqual(
+      repository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: "cloud-worker",
+        at: 7_101,
+      }),
+      {
+        status: "already_applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash: persisted.candidateHash,
+        rawCandidateHash: persisted.candidateHash,
+        semanticCandidateHash: applied.semanticCandidateHash,
+      }
+    );
+    assert.equal(plannerCalls, 1);
+    assert.deepEqual(counters, countsAfterApply);
+  } finally {
+    db.close();
+  }
+});
+
+test("stored candidate disposition CAS failure rolls back the semantic hash and visible writes", () => {
   const db = createFixture();
   try {
     const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(db, job.id, "budget-request-cas-rollback"),
+      candidate: validCandidate(),
+    });
+    db.exec(`
+      CREATE TRIGGER inject_candidate_disposition_cas_miss
+      BEFORE UPDATE OF state ON analysis_response_candidates
+      WHEN OLD.id = '${persisted.candidateId}' AND NEW.state = 'applied'
+      BEGIN
+        SELECT RAISE(IGNORE);
+      END;
+    `);
+
+    assert.throws(
+      () =>
+        repository.applyStoredAnalysisCandidate({
+          candidateId: persisted.candidateId,
+          jobId: job.id,
+          owner: "cloud-worker",
+          at: 7_100,
+        }),
+      { code: "MEMORY_CAS_CONFLICT" }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT state, disposition_at FROM analysis_response_candidates WHERE id = ?")
+        .get(persisted.candidateId),
+      { state: "validated", disposition_at: null }
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId),
+      { candidate_hash: null, applied_at: null }
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("every injected planner action-class failure rolls back the whole stored-candidate transaction", () => {
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const invalidActions = {
+    inserts: { entityKind: "unknown" },
+    revisions: { entityKind: "unknown" },
+    occurrenceLinks: { mode: "unknown", entityKind: "unknown" },
+    supersessions: {
+      priorMemoryId: "missing-memory",
+      nextMemoryCanonicalValueKey: "f".repeat(64),
+      canonicalSlotKey: "e".repeat(64),
+      reason: "transcript_replacement",
+    },
+    conflicts: {
+      canonicalSlotKey: "e".repeat(64),
+      existingMemoryIds: [],
+      candidateCanonicalValueKeys: [],
+    },
+    mergeSuggestions: {
+      leftTopic: { canonicalKey: "e".repeat(64), topicId: null },
+      rightTopic: { canonicalKey: "f".repeat(64), topicId: null },
+    },
+    recurrences: {
+      previousTodoId: "missing-todo",
+      canonicalBaseKey: "e".repeat(64),
+      evidenceSegmentIds: ["segment-1"],
+    },
+  };
+
+  for (const [actionClass, invalidAction] of Object.entries(invalidActions)) {
+    const db = createFixture();
+    const realMerger = new MemoryMerger();
+    try {
+      const { repository, input } = createStoredInput(db, undefined, {
+        memoryMerger: {
+          plan(plannerInput) {
+            const plan = realMerger.plan(plannerInput);
+            return { ...plan, [actionClass]: [...plan[actionClass], invalidAction] };
+          },
+        },
+      });
+      const head = setDesiredHead(repository, input);
+      const { store, job } = createCloudJob(db, head);
+      store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+      const persisted = repository.persistValidatedAnalysisCandidate({
+        jobId: job.id,
+        analysisInputId: input.analysisInputId,
+        budgetAttemptId: reconcileBudgetAttempt(db, job.id, `budget-request-${actionClass}`),
+        candidate: validCandidate(),
+      });
+
+      assert.throws(
+        () =>
+          repository.applyStoredAnalysisCandidate({
+            candidateId: persisted.candidateId,
+            jobId: job.id,
+            owner: "cloud-worker",
+            at: 7_100,
+          }),
+        actionClass
+      );
+      assert.deepEqual(
+        db
+          .prepare("SELECT state, disposition_at FROM analysis_response_candidates WHERE id = ?")
+          .get(persisted.candidateId),
+        { state: "validated", disposition_at: null },
+        actionClass
+      );
+      assert.deepEqual(
+        db
+          .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+          .get(input.analysisInputId),
+        { candidate_hash: null, applied_at: null },
+        actionClass
+      );
+      assert.deepEqual(
+        db
+          .prepare(
+            `SELECT
+               (SELECT count(*) FROM memory_items_v2) AS memories,
+               (SELECT count(*) FROM topics_v2) AS topics,
+               (SELECT count(*) FROM todos_v2) AS todos,
+               (SELECT count(*) FROM suggestions_v2) AS suggestions,
+               (SELECT count(*) FROM session_summary_revisions) AS summaries,
+               (SELECT count(*) FROM evidence_refs) AS evidence`
+          )
+          .get(),
+        { memories: 0, topics: 0, todos: 0, suggestions: 0, summaries: 0, evidence: 0 },
+        actionClass
+      );
+    } finally {
+      db.close();
+    }
+  }
+});
+
+test("two SQLite connections serialize contending application of the same stored candidate", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-memory-race-"));
+  const filename = path.join(directory, "jarvis.sqlite");
+  const firstDb = createFixture(filename);
+  const secondDb = new Database(filename);
+  secondDb.pragma("foreign_keys = ON");
+  secondDb.pragma("busy_timeout = 1");
+  try {
+    const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+    const realMerger = new MemoryMerger();
+    let secondRepository;
+    let persisted;
+    let job;
+    let contentionError;
+    let visibleDuringContention;
+    const firstRepository = createRepository(firstDb, undefined, {
+      memoryMerger: {
+        plan(plannerInput) {
+          try {
+            secondRepository.applyStoredAnalysisCandidate({
+              candidateId: persisted.candidateId,
+              jobId: job.id,
+              owner: "cloud-worker",
+              at: 7_100,
+            });
+          } catch (error) {
+            contentionError = error;
+          }
+          visibleDuringContention = secondDb
+            .prepare(
+              `SELECT
+                 (SELECT count(*) FROM memory_items_v2) AS memories,
+                 (SELECT count(*) FROM evidence_refs) AS evidence`
+            )
+            .get();
+          return realMerger.plan(plannerInput);
+        },
+      },
+    });
+    const input = firstRepository.createAnalysisInput(validCreateInput());
+    const head = setDesiredHead(firstRepository, input);
+    const cloud = createCloudJob(firstDb, head);
+    job = cloud.job;
+    const { store } = cloud;
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    persisted = firstRepository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(firstDb, job.id, "budget-request-two-connections"),
+      candidate: validCandidate(),
+    });
+    let secondPlannerCalls = 0;
+    secondRepository = createRepository(secondDb, undefined, {
+      memoryMerger: {
+        plan() {
+          secondPlannerCalls += 1;
+          throw new Error("serialized retry invoked planner");
+        },
+      },
+    });
+
+    assert.equal(
+      firstRepository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: "cloud-worker",
+        at: 7_100,
+      }).status,
+      "applied"
+    );
+    assert.equal(contentionError?.code, "SQLITE_BUSY");
+    assert.deepEqual(visibleDuringContention, { memories: 0, evidence: 0 });
+    assert.equal(secondPlannerCalls, 0);
+    assert.equal(
+      secondRepository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: "cloud-worker",
+        at: 7_101,
+      }).status,
+      "already_applied"
+    );
+    assert.equal(secondPlannerCalls, 0);
+    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
+    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 4);
+  } finally {
+    secondDb.close();
+    firstDb.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("candidate apply CAS supersedes a stale desired head without visible writes", () => {
+  const db = createFixture();
+  let plannerCalls = 0;
+  try {
+    const { repository, input } = createStoredInput(db, undefined, {
+      memoryMerger: {
+        plan() {
+          plannerCalls += 1;
+          throw new Error("stale desired head invoked planner");
+        },
+      },
+    });
     const oldHead = setDesiredHead(repository, input);
     const { store, job } = createCloudJob(db, oldHead);
     store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
@@ -781,6 +1115,7 @@ test("candidate apply CAS supersedes a stale desired head without visible writes
       null
     );
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 0);
+    assert.equal(plannerCalls, 0);
     assert.equal(
       db
         .prepare("SELECT state FROM analysis_response_candidates WHERE id = ?")
@@ -794,8 +1129,16 @@ test("candidate apply CAS supersedes a stale desired head without visible writes
 
 test("candidate apply fails closed when the current desired vector hash is inconsistent", () => {
   const db = createFixture();
+  let plannerCalls = 0;
   try {
-    const { repository, input } = createStoredInput(db);
+    const { repository, input } = createStoredInput(db, undefined, {
+      memoryMerger: {
+        plan() {
+          plannerCalls += 1;
+          throw new Error("corrupt desired head invoked planner");
+        },
+      },
+    });
     const head = setDesiredHead(repository, input);
     const { store, job } = createCloudJob(db, head);
     store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
@@ -827,12 +1170,619 @@ test("candidate apply fails closed when the current desired vector hash is incon
       { code: "MEMORY_DESIRED_HEAD_CORRUPT" }
     );
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 0);
+    assert.equal(plannerCalls, 0);
     assert.equal(
       db
         .prepare("SELECT state FROM analysis_response_candidates WHERE id = ?")
         .get(persisted.candidateId).state,
       "validated"
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("candidate application plans from the exact private snapshot before clock or ID allocation", () => {
+  const db = createFixture();
+  try {
+    const counters = { ids: 0, clocks: 0 };
+    let snapshot;
+    let countersAtPlan;
+    const repository = createRepository(db, counters, {
+      memoryMerger: {
+        plan(input) {
+          snapshot = input;
+          countersAtPlan = { ...counters };
+          return {
+            inserts: [],
+            revisions: [],
+            occurrenceLinks: [],
+            supersessions: [],
+            conflicts: [],
+            mergeSuggestions: [],
+            recurrences: [],
+            ignoredDuplicates: [],
+            semanticCandidateHash: HASH_C,
+          };
+        },
+      },
+    });
+    const input = repository.createAnalysisInput(validCreateInput());
+    const baseline = { ...counters };
+    const candidate = validCandidate({ memories: [], topics: [], todos: [], suggestions: [] });
+    const rawCandidateHash = sha256(canonicalJson(candidate));
+
+    assert.deepEqual(
+      repository.applyCandidateAnalysis({
+        analysisInputId: input.analysisInputId,
+        inputHash: input.inputHash,
+        candidate,
+        claimedCandidateHash: rawCandidateHash,
+      }),
+      {
+        status: "applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash: rawCandidateHash,
+        rawCandidateHash,
+        semanticCandidateHash: HASH_C,
+      }
+    );
+    assert.deepEqual(countersAtPlan, baseline);
+    assert.deepEqual(snapshot, {
+      analysisInput: { id: input.analysisInputId, sessionId: "session-1" },
+      candidate,
+      evidence: {
+        segments: [
+          {
+            id: "segment-1",
+            sessionId: "session-1",
+            startedAt: 1000,
+            endedAt: 5000,
+            speakerLabel: "SELF",
+          },
+        ],
+        bindings: [
+          {
+            label: "SELF",
+            subjectKind: "person",
+            subjectId: "person-self",
+          },
+        ],
+      },
+      existing: {
+        memories: [],
+        topics: [],
+        topicMergeSuggestions: [],
+        todos: [],
+        suggestions: [],
+        memorySupersessions: [],
+        todoRecurrences: [],
+      },
+      trustedTranscriptReplacements: [],
+    });
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash, applied_at FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId),
+      { candidate_hash: HASH_C, applied_at: 6002 }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("planner insert actions persist canonical entities subjects and semantic reorder idempotency", () => {
+  const db = createFixture();
+  try {
+    const counters = { ids: 0, clocks: 0 };
+    const repository = createRepository(db, counters);
+    const input = repository.createAnalysisInput(validCreateInput());
+    const candidate = validCandidate({
+      memories: [
+        ...validCandidate().memories,
+        {
+          kind: "preference",
+          title: "Storage preference",
+          body: "Keep durable data local.",
+          confidence: 0.8,
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      topics: [
+        ...validCandidate().topics,
+        {
+          name: "Privacy",
+          summary: "Keep private data local",
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      todos: [
+        ...validCandidate().todos,
+        {
+          title: "Verify local storage",
+          ownerLabel: "SELF",
+          dueText: "Tomorrow",
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      suggestions: [
+        ...validCandidate().suggestions,
+        {
+          title: "Audit storage",
+          rationale: "Confirm all durable state remains local.",
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    });
+    const rawCandidateHash = sha256(canonicalJson(candidate));
+    const semanticHash = semanticCandidateHash(candidate);
+
+    assert.deepEqual(
+      repository.applyCandidateAnalysis({
+        analysisInputId: input.analysisInputId,
+        inputHash: input.inputHash,
+        candidate,
+        claimedCandidateHash: rawCandidateHash,
+      }),
+      {
+        status: "applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash: rawCandidateHash,
+        rawCandidateHash,
+        semanticCandidateHash: semanticHash,
+      }
+    );
+    const expectedDecisionSlot = canonicalTupleHash([
+      "memory",
+      "decision",
+      canonicalizeText("Deployment choice"),
+      ["person-self"],
+    ]);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, canonical_value_key
+           FROM memory_items_v2 WHERE title = 'Deployment choice'`
+        )
+        .get(),
+      {
+        canonical_slot_key: expectedDecisionSlot,
+        canonical_value_key: canonicalTupleHash([
+          "memory_value",
+          expectedDecisionSlot,
+          canonicalizeText("Use the local-first deployment."),
+        ]),
+      }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT canonical_slot_key, algorithm
+           FROM memory_item_canonical_slots
+           WHERE memory_item_id = (
+             SELECT id FROM memory_items_v2 WHERE title = 'Deployment choice'
+           )`
+        )
+        .get(),
+      { canonical_slot_key: expectedDecisionSlot, algorithm: "canonical-v1" }
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT memory_item_id, subject_kind, subject_id
+           FROM memory_item_subjects ORDER BY memory_item_id`
+        )
+        .all()
+        .map(({ subject_kind, subject_id }) => ({ subject_kind, subject_id })),
+      [
+        { subject_kind: "person", subject_id: "person-self" },
+        { subject_kind: "person", subject_id: "person-self" },
+      ]
+    );
+    assert.deepEqual(
+      db
+        .prepare("SELECT candidate_hash FROM analysis_inputs WHERE id = ?")
+        .get(input.analysisInputId),
+      { candidate_hash: semanticHash }
+    );
+
+    const afterFirst = { ...counters };
+    const countsAfterFirst = db
+      .prepare(
+        `SELECT
+           (SELECT count(*) FROM memory_items_v2) AS memories,
+           (SELECT count(*) FROM topics_v2) AS topics,
+           (SELECT count(*) FROM todos_v2) AS todos,
+           (SELECT count(*) FROM suggestions_v2) AS suggestions,
+           (SELECT count(*) FROM evidence_refs) AS evidence`
+      )
+      .get();
+    const reordered = {
+      ...candidate,
+      memories: [...candidate.memories].reverse(),
+      topics: [...candidate.topics].reverse(),
+      todos: [...candidate.todos].reverse(),
+      suggestions: [...candidate.suggestions].reverse(),
+    };
+    const reorderedRawHash = sha256(canonicalJson(reordered));
+    assert.notEqual(reorderedRawHash, rawCandidateHash);
+    assert.deepEqual(
+      repository.applyCandidateAnalysis({
+        analysisInputId: input.analysisInputId,
+        inputHash: input.inputHash,
+        candidate: reordered,
+        claimedCandidateHash: reorderedRawHash,
+      }),
+      {
+        status: "already_applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash: reorderedRawHash,
+        rawCandidateHash: reorderedRawHash,
+        semanticCandidateHash: semanticHash,
+      }
+    );
+    assert.deepEqual(counters, afterFirst);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM memory_items_v2) AS memories,
+             (SELECT count(*) FROM topics_v2) AS topics,
+             (SELECT count(*) FROM todos_v2) AS todos,
+             (SELECT count(*) FROM suggestions_v2) AS suggestions,
+             (SELECT count(*) FROM evidence_refs) AS evidence`
+        )
+        .get(),
+      countsAfterFirst
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("candidate-internal duplicates and candidate-candidate conflicts apply the exact converged plan", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const local = validCandidate().memories[0];
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        topics: [],
+        todos: [],
+        suggestions: [],
+        memories: [
+          local,
+          {
+            ...local,
+            title: "DEPLOYMENT   CHOICE",
+            body: "use the LOCAL-FIRST deployment.",
+          },
+          { ...local, body: "Use the cloud-first deployment." },
+        ],
+      }),
+    });
+
+    assert.deepEqual(
+      db.prepare("SELECT body, lifecycle FROM memory_items_v2 ORDER BY body").all(),
+      [
+        { body: "Use the cloud-first deployment.", lifecycle: "conflict" },
+        { body: "use the LOCAL-FIRST deployment.", lifecycle: "conflict" },
+      ]
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count, 2);
+    assert.deepEqual(db.prepare("SELECT state, episode FROM memory_conflict_groups").get(), {
+      state: "open",
+      episode: 1,
+    });
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM memory_conflict_members").get().count,
+      2
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("event overlap exact 30-minute gap and plus-one millisecond apply planner occurrence actions", () => {
+  const db = createFixture();
+  const windowMs = 30 * 60 * 1_000;
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES
+        ('chunk-event-base', 'session-1', 'event-base.wav', 1000, 2000, 1000, '${"1".repeat(64)}',
+         ${3000 + windowMs}, 'completed', 'track-1', 'mic', 10, 'committed'),
+        ('chunk-event-overlap', 'session-1', 'event-overlap.wav', 1500, 2500, 1000,
+         '${"2".repeat(64)}', ${3000 + windowMs}, 'completed', 'track-1', 'mic', 11, 'committed'),
+        ('chunk-event-exact', 'session-1', 'event-exact.wav', ${2000 + windowMs},
+         ${2100 + windowMs}, 100, '${"3".repeat(64)}', ${3000 + windowMs}, 'completed',
+         'track-1', 'mic', 12, 'committed'),
+        ('chunk-event-late', 'session-1', 'event-late.wav', ${2001 + windowMs},
+         ${2101 + windowMs}, 100, '${"4".repeat(64)}', ${3000 + windowMs}, 'completed',
+         'track-1', 'mic', 13, 'committed');
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES
+        ('event-base', 'session-1', 1000, 2000, 'person-self', 'SELF', 'event base', 0.9,
+         1, 'analyzed', 'track-1', 'chunk-event-base', 'mic', 'final', 1, 'whisper-event', 2000),
+        ('event-overlap', 'session-1', 1500, 2500, 'person-self', 'SELF', 'event overlap', 0.9,
+         1, 'analyzed', 'track-1', 'chunk-event-overlap', 'mic', 'final', 1, 'whisper-event', 2500),
+        ('event-exact', 'session-1', ${2000 + windowMs}, ${2100 + windowMs},
+         'person-self', 'SELF', 'event exact', 0.9, 1, 'analyzed', 'track-1',
+         'chunk-event-exact', 'mic', 'final', 1, 'whisper-event', ${2100 + windowMs}),
+        ('event-late', 'session-1', ${2001 + windowMs}, ${2101 + windowMs},
+         'person-self', 'SELF', 'event late', 0.9, 1, 'analyzed', 'track-1',
+         'chunk-event-late', 'mic', 'final', 1, 'whisper-event', ${2101 + windowMs});
+    `);
+    const repository = createRepository(db);
+    const sequence = [
+      ["event-base", 1],
+      ["event-overlap", 1],
+      ["event-exact", 1],
+      ["event-late", 2],
+    ];
+    const eventInputs = new Map();
+    for (const [segmentId, expectedOccurrences] of sequence) {
+      const input = createInputForSegments(repository, [segmentId], segmentId);
+      eventInputs.set(segmentId, input);
+      try {
+        repository.applyCandidateAnalysis({
+          analysisInputId: input.analysisInputId,
+          inputHash: input.inputHash,
+          candidate: validCandidate({
+            sessionSummary: {
+              title: "Launch",
+              summary: "API v2 launch evidence.",
+              evidenceSegmentIds: [segmentId],
+            },
+            memories: [
+              {
+                kind: "event",
+                title: "Launch",
+                body: "API v2 launched.",
+                confidence: 0.9,
+                evidenceSegmentIds: [segmentId],
+              },
+            ],
+            topics: [],
+            todos: [],
+            suggestions: [],
+          }),
+        });
+      } catch (error) {
+        error.message = `${segmentId}: ${error.message}`;
+        throw error;
+      }
+      assert.equal(
+        db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count,
+        expectedOccurrences,
+        segmentId
+      );
+    }
+
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
+    assert.deepEqual(
+      db.prepare("SELECT started_at, ended_at FROM memory_occurrences ORDER BY started_at").all(),
+      [
+        { started_at: 1000, ended_at: 2000 },
+        { started_at: 2001 + windowMs, ended_at: 2101 + windowMs },
+      ]
+    );
+    assert.equal(
+      db
+        .prepare(
+          "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'memory_occurrence'"
+        )
+        .get().count,
+      4
+    );
+
+    const firstOccurrenceId = db
+      .prepare("SELECT id FROM memory_occurrences ORDER BY started_at LIMIT 1")
+      .get().id;
+    const otherSessionInput = createInputForSegments(
+      repository,
+      ["segment-other"],
+      "cross-session",
+      "session-2"
+    );
+    const insertInvalidEvidence = db.prepare(
+      `INSERT INTO evidence_refs (
+         id, entity_type, entity_id, source_analysis_input_id, session_id,
+         transcript_segment_id, audio_chunk_id, track_id, started_at, ended_at,
+         quote_text, audio_state, created_at
+       ) VALUES (?, 'memory_occurrence', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', 9999)`
+    );
+    assert.throws(
+      () =>
+        insertInvalidEvidence.run(
+          "evidence-cross-session",
+          firstOccurrenceId,
+          otherSessionInput.analysisInputId,
+          "session-2",
+          "segment-other",
+          "chunk-2",
+          "track-2",
+          6000,
+          9000,
+          "other session"
+        ),
+      /evidence lineage is invalid/
+    );
+    assert.throws(
+      () =>
+        insertInvalidEvidence.run(
+          "evidence-manifest-mismatch",
+          firstOccurrenceId,
+          eventInputs.get("event-base").analysisInputId,
+          "session-1",
+          "event-late",
+          "chunk-event-late",
+          "track-1",
+          2001 + windowMs,
+          2101 + windowMs,
+          "event late"
+        ),
+      /evidence lineage is invalid/
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("future topic references create one deterministic proposed merge suggestion", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        memories: [],
+        todos: [],
+        suggestions: [],
+        topics: [
+          {
+            name: "Project Atlas",
+            summary: "Atlas planning",
+            evidenceSegmentIds: ["segment-1"],
+          },
+          {
+            name: "Project Atlas Plan",
+            summary: "Detailed Atlas planning",
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+
+    const topics = db.prepare("SELECT id, name FROM topics_v2 ORDER BY id").all();
+    assert.equal(topics.length, 2);
+    const merge = db.prepare("SELECT * FROM topic_merge_suggestions").get();
+    assert.ok(merge);
+    assert.equal(merge.left_topic_id < merge.right_topic_id, true);
+    assert.deepEqual(
+      [merge.left_topic_id, merge.right_topic_id].sort(),
+      topics.map((topic) => topic.id).sort()
+    );
+    assert.equal(merge.algorithm_version, "dice-bigram-v1");
+    assert.equal(merge.state, "proposed");
+    assert.equal(merge.decided_at, null);
+    assert.equal(merge.score, 0.827586);
+    assert.equal(
+      merge.pair_key,
+      canonicalTupleHash([
+        "topic_merge_pair",
+        ...[
+          canonicalTupleHash(["topic", canonicalizeText("Project Atlas")]),
+          canonicalTupleHash(["topic", canonicalizeText("Project Atlas Plan")]),
+        ].sort(),
+        "dice-bigram-v1",
+      ])
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("suggestion accept and dismiss are explicit terminal idempotent repository transitions", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({ memories: [], topics: [], todos: [] }),
+    });
+    const accepted = db.prepare("SELECT id FROM suggestions_v2").get();
+    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 }), {
+      status: "accepted",
+      suggestionId: accepted.id,
+      decidedAt: 7000,
+    });
+    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 }), {
+      status: "already_accepted",
+      suggestionId: accepted.id,
+      decidedAt: 7000,
+    });
+    assert.throws(() => repository.dismissSuggestion({ suggestionId: accepted.id, at: 7000 }), {
+      code: "MEMORY_SUGGESTION_ALREADY_DECIDED",
+    });
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+
+    const nextInput = createAlternativeInput(repository, "second suggestion input");
+    repository.applyCandidateAnalysis({
+      analysisInputId: nextInput.analysisInputId,
+      inputHash: nextInput.inputHash,
+      candidate: validCandidate({
+        memories: [],
+        topics: [],
+        todos: [],
+        suggestions: [
+          {
+            title: "Keep separate",
+            rationale: "This remains only a suggestion.",
+            basedOnEvidenceSegmentIds: [],
+          },
+        ],
+      }),
+    });
+    const dismissed = db.prepare("SELECT id FROM suggestions_v2 WHERE state = 'proposed'").get();
+    assert.deepEqual(repository.dismissSuggestion({ suggestionId: dismissed.id, at: 7100 }), {
+      status: "dismissed",
+      suggestionId: dismissed.id,
+      decidedAt: 7100,
+    });
+    assert.deepEqual(repository.dismissSuggestion({ suggestionId: dismissed.id, at: 7100 }), {
+      status: "already_dismissed",
+      suggestionId: dismissed.id,
+      decidedAt: 7100,
+    });
+    assert.throws(() => repository.acceptSuggestion({ suggestionId: dismissed.id, at: 7100 }), {
+      code: "MEMORY_SUGGESTION_ALREADY_DECIDED",
+    });
+    assert.throws(() => repository.acceptSuggestion({ suggestionId: "missing", at: 7200 }), {
+      code: "MEMORY_SUGGESTION_NOT_FOUND",
+    });
+    const terminalSuggestions = db
+      .prepare("SELECT id, state, decided_at, updated_at FROM suggestions_v2 ORDER BY id")
+      .all();
+    const terminalOccurrenceCount = db
+      .prepare("SELECT count(*) AS count FROM suggestion_occurrences")
+      .get().count;
+    const repeatedInput = createAlternativeInput(repository, "terminal suggestions repeated");
+    repository.applyCandidateAnalysis({
+      analysisInputId: repeatedInput.analysisInputId,
+      inputHash: repeatedInput.inputHash,
+      candidate: validCandidate({
+        memories: [],
+        topics: [],
+        todos: [],
+        suggestions: [
+          validCandidate().suggestions[0],
+          {
+            title: "Keep separate",
+            rationale: "This remains only a suggestion.",
+            basedOnEvidenceSegmentIds: [],
+          },
+        ],
+      }),
+    });
+    assert.deepEqual(
+      db.prepare("SELECT id, state, decided_at, updated_at FROM suggestions_v2 ORDER BY id").all(),
+      terminalSuggestions
+    );
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM suggestion_occurrences").get().count,
+      terminalOccurrenceCount
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
   } finally {
     db.close();
   }
@@ -1725,6 +2675,8 @@ test("applyCandidateAnalysis writes closed entities, occurrences, revisions, and
       status: "applied",
       analysisInputId: input.analysisInputId,
       candidateHash: sha256(canonicalJson(candidate)),
+      rawCandidateHash: sha256(canonicalJson(candidate)),
+      semanticCandidateHash: semanticCandidateHash(candidate),
     });
     assert.deepEqual(
       db
@@ -1911,7 +2863,13 @@ test("applyCandidateAnalysis verifies claimed candidate hash and is exactly idem
         inputHash: input.inputHash,
         candidate,
       }),
-      { status: "already_applied", analysisInputId: input.analysisInputId, candidateHash }
+      {
+        status: "already_applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash,
+        rawCandidateHash: candidateHash,
+        semanticCandidateHash: semanticCandidateHash(candidate),
+      }
     );
     assert.deepEqual(counters, countsAfterApply);
     assert.throws(
@@ -1923,6 +2881,61 @@ test("applyCandidateAnalysis verifies claimed candidate hash and is exactly idem
         }),
       { code: "MEMORY_CANDIDATE_ALREADY_APPLIED" }
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("reordered semantic retry is read-only and consumes no planner clock or ID work", () => {
+  const db = createFixture();
+  const counters = { ids: 0, clocks: 0 };
+  const MemoryMerger = require("../../src/jarvis/main/MemoryMerger").MemoryMerger;
+  const realMerger = new MemoryMerger();
+  let plannerCalls = 0;
+  try {
+    const { repository, input } = createStoredInput(db, counters, {
+      memoryMerger: {
+        plan(plannerInput) {
+          plannerCalls += 1;
+          return realMerger.plan(plannerInput);
+        },
+      },
+    });
+    const candidate = validCandidate({
+      suggestions: [
+        validCandidate().suggestions[0],
+        {
+          title: "Check the release notes",
+          rationale: "A second review catches omissions.",
+          basedOnEvidenceSegmentIds: [],
+        },
+      ],
+    });
+    const applied = repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate,
+    });
+    const countersAfterApply = { ...counters };
+    assert.equal(plannerCalls, 1);
+
+    const reordered = { ...candidate, suggestions: [...candidate.suggestions].reverse() };
+    assert.deepEqual(
+      repository.applyCandidateAnalysis({
+        analysisInputId: input.analysisInputId,
+        inputHash: input.inputHash,
+        candidate: reordered,
+      }),
+      {
+        status: "already_applied",
+        analysisInputId: input.analysisInputId,
+        candidateHash: sha256(canonicalJson(reordered)),
+        rawCandidateHash: sha256(canonicalJson(reordered)),
+        semanticCandidateHash: applied.semanticCandidateHash,
+      }
+    );
+    assert.equal(plannerCalls, 1);
+    assert.deepEqual(counters, countersAfterApply);
   } finally {
     db.close();
   }
@@ -1974,7 +2987,7 @@ test("applyCandidateAnalysis rolls back every derived row when the final CAS fai
   }
 });
 
-test("applyCandidateAnalysis appends topic, todo, and session-summary revisions without overwriting history", () => {
+test("applyCandidateAnalysis appends topic and summary revisions while reusing the planned todo revision", () => {
   const db = createFixture();
   try {
     const { repository, input } = createStoredInput(db);
@@ -2020,9 +3033,16 @@ test("applyCandidateAnalysis appends topic, todo, and session-summary revisions 
          FROM todo_revisions ORDER BY revision`
       )
       .all();
-    assert.equal(todoRevisions.length, 2);
-    assert.equal(todoRevisions[1].previous_revision_id, todoRevisions[0].id);
-    assert.equal(todoRevisions[1].due_text, "tomorrow");
+    assert.equal(todoRevisions.length, 1);
+    assert.equal(todoRevisions[0].previous_revision_id, null);
+    assert.equal(todoRevisions[0].due_text, null);
+    assert.deepEqual(
+      db
+        .prepare("SELECT todo_revision_id FROM todo_occurrences ORDER BY created_at, id")
+        .all()
+        .map((row) => row.todo_revision_id),
+      [todoRevisions[0].id]
+    );
 
     const summaries = db
       .prepare(
@@ -2042,6 +3062,55 @@ test("applyCandidateAnalysis appends topic, todo, and session-summary revisions 
       title: "Session title",
       summary: "A revised durable session summary.",
     });
+  } finally {
+    db.close();
+  }
+});
+
+test("normalized-identical session summary reuses active history when evidence is already linked", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const candidate = validCandidate({ memories: [], topics: [], todos: [], suggestions: [] });
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate,
+    });
+    const nextInput = createAlternativeInput(repository, "normalized summary retry");
+    repository.applyCandidateAnalysis({
+      analysisInputId: nextInput.analysisInputId,
+      inputHash: nextInput.inputHash,
+      candidate: {
+        ...candidate,
+        sessionSummary: {
+          title: "SESSION   TITLE",
+          summary: "a DURABLE session summary.",
+          evidenceSegmentIds: ["segment-1"],
+        },
+      },
+    });
+
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT revision, previous_revision_id, lifecycle, content_json
+           FROM session_summary_revisions`
+        )
+        .all(),
+      [
+        {
+          revision: 1,
+          previous_revision_id: null,
+          lifecycle: "active",
+          content_json: JSON.stringify({
+            title: "Session title",
+            summary: "A durable session summary.",
+          }),
+        },
+      ]
+    );
+    assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 1);
   } finally {
     db.close();
   }
@@ -2248,8 +3317,8 @@ test("later analysis cannot reopen a terminal todo and preserves append-only tra
       completed_at: 7000,
       dismissed_at: null,
     });
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todo_occurrences").get().count, 2);
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todo_revisions").get().count, 2);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todo_occurrences").get().count, 1);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todo_revisions").get().count, 1);
     assert.deepEqual(
       db
         .prepare(
@@ -2260,6 +3329,207 @@ test("later analysis cannot reopen a terminal todo and preserves append-only tra
       [
         { from_status: null, to_status: "open", reason: "analysis_created", actor: "system" },
         { from_status: "open", to_status: "completed", reason: "user_action", actor: "user" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("strictly later evidence applies a closed todo A to B to C recurrence chain", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const firstInput = repository.createAnalysisInput(validCreateInput());
+    repository.applyCandidateAnalysis({
+      analysisInputId: firstInput.analysisInputId,
+      inputHash: firstInput.inputHash,
+      candidate: validCandidate({
+        memories: [],
+        topics: [],
+        suggestions: [],
+        todos: [
+          {
+            title: "Prepare the release",
+            ownerLabel: null,
+            dueText: null,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+    const previous = db.prepare("SELECT id FROM todos_v2").get();
+    db.prepare(
+      `INSERT INTO todo_state_transitions (
+         id, todo_instance_id, from_status, to_status, reason,
+         source_analysis_input_id, actor, occurred_at
+       ) VALUES ('complete-before-later-evidence', ?, 'open', 'completed',
+                 'user_action', NULL, 'user', 4000)`
+    ).run(previous.id);
+
+    const request = validInput({
+      transcriptRevision: HASH_C,
+      segmentIds: ["segment-omitted"],
+    });
+    const prepared = repository.prepareAnalysisInput(request);
+    const nextInput = repository.createAnalysisInput({
+      ...request,
+      prepareToken: prepared.prepareToken,
+      inputContractVersion: "jarvis-analysis-input-v2",
+      redactionVersion: "jarvis-redaction-v1",
+      cloudPayloadJson: JSON.stringify({
+        inputVersion: "jarvis-analysis-input-v2",
+        segments: [
+          {
+            segmentId: "segment-omitted",
+            startedAt: 5000,
+            endedAt: 5500,
+            speakerLabel: "P1",
+            text: "later redacted evidence",
+          },
+        ],
+        omittedRanges: [],
+      }),
+    });
+    repository.applyCandidateAnalysis({
+      analysisInputId: nextInput.analysisInputId,
+      inputHash: nextInput.inputHash,
+      candidate: validCandidate({
+        sessionSummary: {
+          title: "Later session title",
+          summary: "A later durable session summary.",
+          evidenceSegmentIds: ["segment-omitted"],
+        },
+        memories: [],
+        topics: [],
+        suggestions: [],
+        todos: [
+          {
+            title: "Prepare the release",
+            ownerLabel: null,
+            dueText: "Next week",
+            evidenceSegmentIds: ["segment-omitted"],
+          },
+        ],
+      }),
+    });
+
+    const todos = db
+      .prepare(
+        `SELECT id, status, completed_at, recurrence_of_id
+         FROM todos_v2 ORDER BY created_at, id`
+      )
+      .all();
+    assert.deepEqual(
+      todos.map(({ status, completed_at, recurrence_of_id }) => ({
+        status,
+        completed_at,
+        recurrence_of_id,
+      })),
+      [
+        { status: "completed", completed_at: 4000, recurrence_of_id: null },
+        { status: "open", completed_at: null, recurrence_of_id: previous.id },
+      ]
+    );
+    const nextOccurrence = db
+      .prepare(
+        "SELECT id, todo_instance_id, started_at FROM todo_occurrences WHERE started_at = 5000"
+      )
+      .get();
+    const recurrence = db.prepare("SELECT * FROM todo_recurrences").get();
+    assert.match(recurrence.id, /^[A-Za-z0-9_-]+$/);
+    assert.equal(Number.isSafeInteger(recurrence.created_at), true);
+    assert.deepEqual(
+      {
+        previous_todo_id: recurrence.previous_todo_id,
+        next_todo_id: recurrence.next_todo_id,
+        source_occurrence_id: recurrence.source_occurrence_id,
+      },
+      {
+        previous_todo_id: previous.id,
+        next_todo_id: todos[1].id,
+        source_occurrence_id: nextOccurrence.id,
+      }
+    );
+    assert.equal(nextOccurrence.todo_instance_id, todos[1].id);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT from_status, to_status, reason, actor
+           FROM todo_state_transitions ORDER BY rowid`
+        )
+        .all(),
+      [
+        { from_status: null, to_status: "open", reason: "analysis_created", actor: "system" },
+        { from_status: "open", to_status: "completed", reason: "user_action", actor: "user" },
+        { from_status: null, to_status: "open", reason: "recurrence", actor: "system" },
+      ]
+    );
+
+    db.prepare(
+      `INSERT INTO todo_state_transitions (
+         id, todo_instance_id, from_status, to_status, reason,
+         source_analysis_input_id, actor, occurred_at
+       ) VALUES ('complete-second-recurrence', ?, 'open', 'completed',
+                 'user_action', NULL, 'user', 5600)`
+    ).run(todos[1].id);
+    const thirdInput = createInputForSegments(
+      repository,
+      ["segment-other"],
+      "third-recurrence",
+      "session-2"
+    );
+    repository.applyCandidateAnalysis({
+      analysisInputId: thirdInput.analysisInputId,
+      inputHash: thirdInput.inputHash,
+      candidate: validCandidate({
+        sessionSummary: {
+          title: "Third session title",
+          summary: "A third durable session summary.",
+          evidenceSegmentIds: ["segment-other"],
+        },
+        memories: [],
+        topics: [],
+        suggestions: [],
+        todos: [
+          {
+            title: "Prepare the release",
+            ownerLabel: null,
+            dueText: "Next month",
+            evidenceSegmentIds: ["segment-other"],
+          },
+        ],
+      }),
+    });
+
+    const chain = db
+      .prepare(
+        `SELECT id, status, completed_at, recurrence_of_id
+         FROM todos_v2 ORDER BY created_at, id`
+      )
+      .all();
+    assert.deepEqual(
+      chain.map(({ status, completed_at, recurrence_of_id }) => ({
+        status,
+        completed_at,
+        recurrence_of_id,
+      })),
+      [
+        { status: "completed", completed_at: 4000, recurrence_of_id: null },
+        { status: "completed", completed_at: 5600, recurrence_of_id: previous.id },
+        { status: "open", completed_at: null, recurrence_of_id: todos[1].id },
+      ]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT previous_todo_id, next_todo_id
+           FROM todo_recurrences ORDER BY created_at, id`
+        )
+        .all(),
+      [
+        { previous_todo_id: previous.id, next_todo_id: todos[1].id },
+        { previous_todo_id: todos[1].id, next_todo_id: chain[2].id },
       ]
     );
   } finally {
@@ -2518,7 +3788,7 @@ test("canonical keys use locale-independent Unicode lowercasing", () => {
       }),
     });
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
-    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count, 2);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM memory_occurrences").get().count, 1);
     assert.equal(db.prepare("SELECT count(*) AS count FROM memory_conflict_groups").get().count, 0);
   } finally {
     String.prototype.toLocaleLowerCase = original;
