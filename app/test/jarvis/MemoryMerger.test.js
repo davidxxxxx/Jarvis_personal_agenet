@@ -1554,6 +1554,129 @@ test("candidate todo identity collisions converge before planning unique inserts
   );
 });
 
+test("candidate topic identity convergence unions disjoint evidence and is applied-idempotent", () => {
+  const mergerModule = loadMemoryMerger();
+  const candidate = plannerCandidate({
+    topics: [
+      { name: "API", summary: "Ready", evidenceSegmentIds: ["seg-2"] },
+      {
+        name: "\uFF21\uFF30\uFF29",
+        summary: "READY",
+        evidenceSegmentIds: ["seg-1"],
+      },
+      { name: "api", summary: "ready", evidenceSegmentIds: ["seg-2"] },
+    ],
+  });
+  const base = planFixture({ candidate });
+  const merger = new mergerModule.MemoryMerger();
+
+  const planned = merger.plan(base);
+  const [insert] = planned.inserts.filter((action) => action.entityKind === "topic");
+  assert.deepEqual(insert.evidenceSegmentIds, ["seg-1", "seg-2"]);
+
+  const applied = merger.plan({
+    ...base,
+    existing: {
+      ...base.existing,
+      topics: [
+        {
+          id: "topic-api",
+          canonicalKey: insert.canonicalKey,
+          name: insert.name,
+          lifecycle: "active",
+          revisions: [
+            {
+              id: "topic-api-revision",
+              revision: 1,
+              summary: insert.summary,
+            },
+          ],
+          occurrences: [
+            {
+              id: "topic-api-occurrence",
+              revisionId: "topic-api-revision",
+              evidenceSegmentIds: insert.evidenceSegmentIds,
+            },
+          ],
+        },
+      ],
+    },
+  });
+  assert.deepEqual(applied.inserts, []);
+  assert.deepEqual(applied.revisions, []);
+  assert.deepEqual(applied.occurrenceLinks, []);
+});
+
+test("candidate todo identity convergence unions disjoint evidence and is applied-idempotent", () => {
+  const mergerModule = loadMemoryMerger();
+  const candidate = plannerCandidate({
+    todos: [
+      {
+        title: "Publish notes",
+        ownerLabel: "P1",
+        dueText: "Friday",
+        evidenceSegmentIds: ["seg-2"],
+      },
+      {
+        title: "PUBLISH NOTES",
+        ownerLabel: "P1",
+        dueText: "FRIDAY",
+        evidenceSegmentIds: ["seg-1"],
+      },
+      {
+        title: "publish notes",
+        ownerLabel: "P1",
+        dueText: "friday",
+        evidenceSegmentIds: ["seg-2"],
+      },
+    ],
+  });
+  const base = planFixture({ candidate });
+  const merger = new mergerModule.MemoryMerger();
+
+  const planned = merger.plan(base);
+  const [insert] = planned.inserts.filter((action) => action.entityKind === "todo");
+  assert.deepEqual(insert.evidenceSegmentIds, ["seg-1", "seg-2"]);
+
+  const applied = merger.plan({
+    ...base,
+    existing: {
+      ...base.existing,
+      todos: [
+        {
+          id: "todo-publish-notes",
+          canonicalBaseKey: insert.canonicalBaseKey,
+          title: insert.title,
+          ownerSubjectKind: insert.ownerSubjectKind,
+          ownerSubjectId: insert.ownerSubjectId,
+          status: "open",
+          completedAt: null,
+          revisions: [
+            {
+              id: "todo-publish-notes-revision",
+              revision: 1,
+              title: insert.title,
+              dueText: insert.dueText,
+            },
+          ],
+          occurrences: [
+            {
+              id: "todo-publish-notes-occurrence",
+              revisionId: "todo-publish-notes-revision",
+              startedAt: 1_000,
+              endedAt: 4_000,
+              evidenceSegmentIds: insert.evidenceSegmentIds,
+            },
+          ],
+        },
+      ],
+    },
+  });
+  assert.deepEqual(applied.inserts, []);
+  assert.deepEqual(applied.occurrenceLinks, []);
+  assert.deepEqual(applied.recurrences, []);
+});
+
 test("candidate memory-value and suggestion identities converge deterministically", () => {
   const mergerModule = loadMemoryMerger();
   const memories = [
@@ -2002,5 +2125,128 @@ test("todo recurrence graphs fail closed unless each base has one valid leaf", a
       [todoRow("todo-a", "Graph todo", "open"), todoRow("todo-b", "Graph todo", "open")],
       [edge("edge-a-b", "todo-a", "todo-b")]
     );
+  });
+});
+
+test("todo recurrence source lineage validates completed transitions", async (t) => {
+  const mergerModule = loadMemoryMerger();
+  const canonicalBaseKey = mergerModule.canonicalTupleHash(["todo", "lineage todo", null]);
+  const todoRow = ({ id, status, completedAt, occurrences = [] }) => ({
+    id,
+    canonicalBaseKey,
+    title: "Lineage todo",
+    ownerSubjectKind: null,
+    ownerSubjectId: null,
+    status,
+    completedAt,
+    revisions: [
+      {
+        id: `${id}-revision`,
+        revision: 1,
+        title: "Lineage todo",
+        dueText: null,
+      },
+    ],
+    occurrences: occurrences.map((occurrence) => ({
+      ...occurrence,
+      revisionId: `${id}-revision`,
+    })),
+  });
+  const lineageInput = ({
+    previousStatus = "completed",
+    previousCompletedAt = 1_000,
+    sourceOccurrenceId = "source-occurrence",
+    sourceOwner = "next",
+    sourceStartedAt = 1_001,
+  } = {}) => {
+    const sourceOccurrence = {
+      id: "source-occurrence",
+      startedAt: sourceStartedAt,
+      endedAt: 2_000,
+      evidenceSegmentIds: [],
+    };
+    const previousOccurrences = sourceOwner === "previous" ? [sourceOccurrence] : [];
+    const nextOccurrences = sourceOwner === "next" ? [sourceOccurrence] : [];
+    return planFixture({
+      existing: {
+        ...planFixture().existing,
+        todos: [
+          todoRow({
+            id: "todo-previous",
+            status: previousStatus,
+            completedAt: previousCompletedAt,
+            occurrences: previousOccurrences,
+          }),
+          todoRow({
+            id: "todo-next",
+            status: "completed",
+            completedAt: 5_000,
+            occurrences: nextOccurrences,
+          }),
+        ],
+        todoRecurrences: [
+          {
+            id: "recurrence-previous-next",
+            previousTodoId: "todo-previous",
+            nextTodoId: "todo-next",
+            sourceOccurrenceId,
+          },
+        ],
+      },
+    });
+  };
+  const assertLineageInvalid = (overrides) =>
+    assertValidationIssue(mergerModule, lineageInput(overrides), "malformed_existing");
+
+  await t.test(
+    "accepts a source occurrence owned by next and strictly later than completion",
+    () => {
+      assert.doesNotThrow(() => new mergerModule.MemoryMerger().plan(lineageInput()));
+    }
+  );
+  await t.test("accepts a null source retained after previous completion", () => {
+    assert.doesNotThrow(() =>
+      new mergerModule.MemoryMerger().plan(
+        lineageInput({ sourceOccurrenceId: null, sourceOwner: "missing" })
+      )
+    );
+  });
+  await t.test("rejects a dangling source occurrence", () => {
+    assertLineageInvalid({ sourceOwner: "missing" });
+  });
+  await t.test("rejects a source occurrence owned by the previous todo", () => {
+    assertLineageInvalid({ sourceOwner: "previous" });
+  });
+  await t.test("rejects a source occurrence equal to previous completion", () => {
+    assertLineageInvalid({ sourceStartedAt: 1_000 });
+  });
+  await t.test("rejects a source occurrence earlier than previous completion", () => {
+    assertLineageInvalid({ sourceStartedAt: 999 });
+  });
+  await t.test("rejects a malformed source occurrence start time", () => {
+    assertLineageInvalid({ sourceStartedAt: "1001" });
+  });
+  await t.test("rejects a dismissed previous todo even when source is null", () => {
+    assertLineageInvalid({
+      previousStatus: "dismissed",
+      previousCompletedAt: null,
+      sourceOccurrenceId: null,
+      sourceOwner: "missing",
+    });
+  });
+  await t.test("rejects an open previous todo even when source is null", () => {
+    assertLineageInvalid({
+      previousStatus: "open",
+      previousCompletedAt: null,
+      sourceOccurrenceId: null,
+      sourceOwner: "missing",
+    });
+  });
+  await t.test("rejects malformed previous completion time", () => {
+    assertLineageInvalid({
+      previousCompletedAt: "1000",
+      sourceOccurrenceId: null,
+      sourceOwner: "missing",
+    });
   });
 });

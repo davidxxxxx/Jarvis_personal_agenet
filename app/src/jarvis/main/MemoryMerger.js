@@ -764,7 +764,7 @@ function validateExisting(existing) {
   const todoRowsById = new Map();
   const todoRowsByBaseKey = new Map();
   const todoRevisionIds = new Set();
-  const todoOccurrenceIds = new Set();
+  const todoOccurrenceById = new Map();
   for (const todo of snapshot.todos) {
     const row = exactObject(
       todo,
@@ -836,10 +836,9 @@ function validateExisting(existing) {
         "malformed_existing"
       );
       requireId(item.id, "malformed_existing");
-      if (todoOccurrenceIds.has(item.id) || !revisionIds.has(item.revisionId)) {
+      if (todoOccurrenceById.has(item.id) || !revisionIds.has(item.revisionId)) {
         validationFail("malformed_existing");
       }
-      todoOccurrenceIds.add(item.id);
       requireInteger(item.startedAt, "malformed_existing");
       requireInteger(item.endedAt, "malformed_existing");
       if (item.endedAt < item.startedAt) validationFail("malformed_existing");
@@ -847,6 +846,7 @@ function validateExisting(existing) {
         issueCode: "malformed_existing",
         allowEmpty: true,
       });
+      todoOccurrenceById.set(item.id, { todoId: row.id, startedAt: item.startedAt });
     }
     todoRowsById.set(row.id, row);
     const baseRows = todoRowsByBaseKey.get(row.canonicalBaseKey) ?? [];
@@ -943,10 +943,19 @@ function validateExisting(existing) {
     ) {
       validationFail("malformed_existing");
     }
+    const previousTodo = todoRowsById.get(row.previousTodoId);
+    const sourceOccurrence =
+      row.sourceOccurrenceId === null ? null : todoOccurrenceById.get(row.sourceOccurrenceId);
     if (
-      todoRowsById.get(row.previousTodoId).canonicalBaseKey !==
-      todoRowsById.get(row.nextTodoId).canonicalBaseKey
+      previousTodo.status !== "completed" ||
+      (row.sourceOccurrenceId !== null &&
+        (!sourceOccurrence ||
+          sourceOccurrence.todoId !== row.nextTodoId ||
+          sourceOccurrence.startedAt <= previousTodo.completedAt))
     ) {
+      validationFail("malformed_existing");
+    }
+    if (previousTodo.canonicalBaseKey !== todoRowsById.get(row.nextTodoId).canonicalBaseKey) {
       validationFail("malformed_existing");
     }
     recurrenceIds.add(row.id);
@@ -1121,12 +1130,14 @@ function resolveCandidateContext(input, validated) {
   const topicCandidates = dedupeCandidateItems(
     resolvedTopics,
     "topic",
-    (topic) => topic.planCanonicalKey
+    (topic) => topic.planCanonicalKey,
+    "evidenceSegmentIds"
   );
   const todoCandidates = dedupeCandidateItems(
     resolvedTodos,
     "todo",
-    (todo) => todo.planCanonicalKey
+    (todo) => todo.planCanonicalKey,
+    "evidenceSegmentIds"
   );
   const suggestionCandidates = dedupeCandidateItems(
     resolvedSuggestions,
