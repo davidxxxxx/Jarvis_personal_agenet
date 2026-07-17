@@ -87,11 +87,11 @@ function createAnalysisManifest(core, desiredHead) {
 function digestInputIsFinalOnly(input) {
   return Boolean(
     input &&
-      input.contractVersion === "jarvis-daily-digest-input-v1" &&
-      new Set(["partial", "final"]).has(input.completeness) &&
-      input.inputWatermark?.schemaVersion === "jarvis-daily-digest-watermark-v1" &&
-      Array.isArray(input.inputWatermark.evidence) &&
-      input.inputWatermark.evidence.length > 0
+    input.contractVersion === "jarvis-daily-digest-input-v1" &&
+    new Set(["partial", "final"]).has(input.completeness) &&
+    input.inputWatermark?.schemaVersion === "jarvis-daily-digest-watermark-v1" &&
+    Array.isArray(input.inputWatermark.evidence) &&
+    input.inputWatermark.evidence.length > 0
   );
 }
 
@@ -237,7 +237,7 @@ function createProductionAgentCloudComposition({
     analysisScheduler,
     dailyDigestScheduler,
     cloudDispatcher,
-    budgetGuard,
+    analysisBudgetGuard: budgetGuard,
   });
 }
 

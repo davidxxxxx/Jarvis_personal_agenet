@@ -38,8 +38,11 @@ const CHANNELS = Object.freeze({
   analyzeSession: "jarvis:analysis:run",
   regenerateDailyDigest: "jarvis:analysis:daily-digest:regenerate",
   getAnalysisStatus: "jarvis:analysis:status",
+  getAnalysisBudget: "jarvis:analysis-budget:get",
+  setAnalysisBudget: "jarvis:analysis-budget:set",
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
+  clearMiniMaxKey: "jarvis:minimax:clear-key",
   startCapture: "jarvis:capture:start",
   setRetentionMode: "jarvis:capture:set-retention-mode",
   sourceInterrupted: "jarvis:capture:source-interrupted",
@@ -321,6 +324,147 @@ function normalizeEvidenceContextResponse(input) {
   };
 }
 
+function normalizeMiniMaxKeyInput(input) {
+  exactEnumerableObject(input, ["key"], "MiniMax key input");
+  if (typeof input.key !== "string") {
+    throw new TypeError("MiniMax key must be a string");
+  }
+  const key = input.key.trim();
+  if (!key || key.length > 512 || /[\u0000-\u001f\u007f]/u.test(key)) {
+    throw new TypeError("MiniMax key must be a bounded non-empty string");
+  }
+  return { key };
+}
+
+const PUBLIC_MINIMAX_MODELS = new Set(["MiniMax-M2.7"]);
+
+function normalizeMiniMaxConfig(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("MiniMax config response is invalid");
+  }
+  if (typeof input.keyConfigured !== "boolean" || !PUBLIC_MINIMAX_MODELS.has(input.model)) {
+    throw new TypeError("MiniMax config response is invalid");
+  }
+  return {
+    keyConfigured: input.keyConfigured,
+    model: input.model,
+  };
+}
+
+function normalizeAnalysisBudgetInput(input) {
+  exactEnumerableObject(input, ["monthlyLimitMicrousd", "timezone"], "analysis budget input");
+  if (
+    !Number.isSafeInteger(input.monthlyLimitMicrousd) ||
+    input.monthlyLimitMicrousd < 0 ||
+    input.monthlyLimitMicrousd > 10_000_000
+  ) {
+    throw new RangeError("monthlyLimitMicrousd must be between 0 and 10000000");
+  }
+  if (
+    typeof input.timezone !== "string" ||
+    !input.timezone ||
+    input.timezone !== input.timezone.trim() ||
+    input.timezone.length > 128 ||
+    /[\u0000-\u001f\u007f]/u.test(input.timezone)
+  ) {
+    throw new TypeError("timezone must be a bounded non-empty string");
+  }
+  return {
+    monthlyLimitMicrousd: input.monthlyLimitMicrousd,
+    timezone: input.timezone,
+  };
+}
+
+const ANALYSIS_BUDGET_BLOCKED_REASONS = new Set([
+  null,
+  "budget_exceeded",
+  "usage_unknown",
+  "over_limit",
+]);
+
+function normalizeAnalysisBudgetStatus(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("analysis budget response is invalid");
+  }
+  if (
+    typeof input.monthKey !== "string" ||
+    !/^\d{4}-(0[1-9]|1[0-2])$/u.test(input.monthKey) ||
+    typeof input.timezone !== "string" ||
+    !input.timezone ||
+    input.timezone.length > 128 ||
+    input.currency !== "USD" ||
+    !ANALYSIS_BUDGET_BLOCKED_REASONS.has(input.blockedReason)
+  ) {
+    throw new TypeError("analysis budget response is invalid");
+  }
+  for (const key of [
+    "monthlyLimitMicrousd",
+    "spentMicrousd",
+    "reservedMicrousd",
+    "remainingMicrousd",
+  ]) {
+    if (!Number.isSafeInteger(input[key]) || input[key] < 0) {
+      throw new TypeError("analysis budget response is invalid");
+    }
+  }
+  return {
+    monthKey: input.monthKey,
+    timezone: input.timezone,
+    currency: "USD",
+    monthlyLimitMicrousd: input.monthlyLimitMicrousd,
+    spentMicrousd: input.spentMicrousd,
+    reservedMicrousd: input.reservedMicrousd,
+    remainingMicrousd: input.remainingMicrousd,
+    blockedReason: input.blockedReason,
+  };
+}
+
+const ANALYSIS_STATUS_STATES = new Set([
+  "waiting",
+  "preparing",
+  "queued",
+  "analyzing",
+  "ready",
+  "quota_limited",
+  "retry_needed",
+  "blocked",
+]);
+const ANALYSIS_STATUS_ERROR_CODES = new Set([
+  null,
+  "analysis_runtime_not_ready",
+  "analysis_input_empty",
+  "analysis_input_invalid",
+  "analysis_input_state_invalid",
+  "analysis_desired_head_invalid",
+  "analysis_cloud_job_invalid",
+  "analysis_failed",
+  "offline",
+  "budget_exceeded",
+  "usage_unknown",
+  "over_limit",
+  "rate_limit",
+  "invalid_response",
+]);
+
+function normalizeAnalysisStatus(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("analysis status response is invalid");
+  }
+  if (
+    !ANALYSIS_STATUS_STATES.has(input.state) ||
+    !ANALYSIS_STATUS_ERROR_CODES.has(input.errorCode) ||
+    (input.updatedAt !== null && (!Number.isSafeInteger(input.updatedAt) || input.updatedAt < 0))
+  ) {
+    throw new TypeError("analysis status response is invalid");
+  }
+  return {
+    sessionId: assertId(input.sessionId, "sessionId"),
+    state: input.state,
+    errorCode: input.errorCode,
+    updatedAt: input.updatedAt,
+  };
+}
+
 const CAPTURE_FAILURE_CODES = new Set([
   "MIC_PERMISSION",
   "MIC_DISCONNECTED",
@@ -348,6 +492,11 @@ module.exports = {
   normalizeKnowledgeTodoCompletionInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
+  normalizeMiniMaxKeyInput,
+  normalizeMiniMaxConfig,
+  normalizeAnalysisBudgetInput,
+  normalizeAnalysisBudgetStatus,
+  normalizeAnalysisStatus,
   assertSessionStatus,
   assertCaptureFailureCode,
   assertCaptureMode,

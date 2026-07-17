@@ -524,7 +524,11 @@ test("ready notification failures are isolated so analysis and digest both get a
     },
     reconciler: { reconcileSession() {} },
     deduper: { dedupe() {} },
-    analysisScheduler: { analyzeSession: async () => { throw new Error("analysis down"); } },
+    analysisScheduler: {
+      analyzeSession: async () => {
+        throw new Error("analysis down");
+      },
+    },
     dailyDigestScheduler: {
       start() {},
       tick() {},
@@ -726,6 +730,10 @@ test("production cloud composition is built from the current repository epoch", 
     stop() {},
   };
   const calls = [];
+  const analysisBudgetGuard = {
+    getStatus() {},
+    setPolicy() {},
+  };
   const runtime = createJarvisProcessingRuntime({
     repository,
     service: configurableService({
@@ -744,6 +752,7 @@ test("production cloud composition is built from the current repository epoch", 
       assert.equal(input.previewScheduler, previewScheduler);
       calls.push("factory");
       return {
+        analysisBudgetGuard,
         analysisScheduler: { analyzeSession() {} },
         dailyDigestScheduler: {
           start: () => calls.push("digest_start"),
@@ -763,9 +772,46 @@ test("production cloud composition is built from the current repository epoch", 
   });
 
   assert.equal(runtime.analysisScheduler !== null, true);
+  assert.equal(runtime.analysisBudgetGuard, analysisBudgetGuard);
   await runtime.start();
   await runtime.stop();
   assert.deepEqual(calls, ["factory", "digest_start", "cloud_start", "digest_stop", "cloud_stop"]);
+});
+
+test("runtime rejects a cloud composition with an invalid analysis budget guard", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+
+  assert.throws(
+    () =>
+      createJarvisProcessingRuntime({
+        repository,
+        service: configurableService({
+          audioEvidenceReader: { withVerifiedWav: async () => null },
+          flacCompressionWorker: { run: async () => {} },
+          previewAudioRing: { withPreviewWav: async () => null },
+        }),
+        ipcHandlers: {
+          createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+        },
+        model: "base",
+        governor: {
+          sample: async () => ({ state: "available", restrictiveForMs: 0 }),
+          admit: () => ({ action: "run_cpu", reason: "resources_available" }),
+        },
+        previewScheduler: {
+          request() {},
+          tick: async () => 0,
+          status: () => ({ running: 0 }),
+          stop() {},
+        },
+        prepareTranscriptionJobs: () => 0,
+        cloudCompositionFactory: () => ({
+          analysisBudgetGuard: { getStatus() {} },
+        }),
+      }),
+    /analysisBudgetGuard must implement getStatus and setPolicy/u
+  );
 });
 
 test("production startup replaces an expired old-model lease before any transcription runs", async (t) => {

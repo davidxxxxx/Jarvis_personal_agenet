@@ -59,14 +59,15 @@ test("production composition owns one guarded dispatcher and performs zero start
       throw new Error("network must not run without a durable job");
     },
     governor: {
-      cloudPressure: () => Object.freeze({
-        state: "normal",
-        reason: null,
-        cpuLoadPct: 10,
-        memoryLoadPct: 20,
-        onAcPower: true,
-        batteryLevelPct: 100,
-      }),
+      cloudPressure: () =>
+        Object.freeze({
+          state: "normal",
+          reason: null,
+          cpuLoadPct: 10,
+          memoryLoadPct: 20,
+          onAcPower: true,
+          batteryLevelPct: 100,
+        }),
     },
     previewScheduler: { status: () => ({ running: 0 }) },
     timezoneProvider: () => "UTC",
@@ -78,6 +79,14 @@ test("production composition owns one guarded dispatcher and performs zero start
     "analyze_session",
     "generate_daily_digest",
   ]);
+  assert.equal(
+    composition.analysisBudgetGuard,
+    composition.cloudDispatcher.workers.analyze_session.budgetGuard
+  );
+  assert.equal(
+    composition.analysisBudgetGuard,
+    composition.cloudDispatcher.workers.generate_daily_digest.budgetGuard
+  );
   assert.equal(composition.analysisScheduler.cloudTransportEnabled, true);
   await composition.dailyDigestScheduler.start();
   await composition.cloudDispatcher.start();

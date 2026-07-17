@@ -60,7 +60,13 @@ Merge base: `b0d1b96ab35c1bb77f87008a923f9c5db27b0a17`
 - Task 5B2 digest service and crash recovery: complete (commit `c0e9fedd`; strict immutable-input binding, two-pass source freshness, exact admission/budget lifecycle, candidate-first zero-network recovery, paid/unknown crash-window convergence, and analysis/digest claim isolation; focused verifier 316/316 plus ESLint/diff checks)
 - Task 5C shared cloud/runtime/daily-digest integration: complete (shared priority-fenced cloud lane, IANA/DST-safe scheduler, per-repository production composition, missing-key zero-network behavior, date-only privacy-safe IPC; focused verifier 420/420; typecheck/ESLint/diff clean; independent review C0/I0)
 - Task 6: complete (durable knowledge/daily review UI, evidence navigation, bounded indexed public snapshots, safe session projections, and retry-safe user actions; main focused 150/150 plus migration 51/51 and renderer 293/293; independent review C0/I0)
-- Task 7/8 integration: pending
+- Task 7: complete (production analysis-budget runtime facade, awaited MiniMax key save/clear,
+  strict public IPC/preload projections, durable restart-safe analysis status, and independent
+  MiniMax budget/settings UI; full Jarvis regression green after final change; independent review
+  C0/I0/M0)
+- Task 8: in progress (release matrix and packaged Windows offline/restart smoke automation landed in
+  the working tree; real unsigned package build, ABI scan, unpacked launch, and matrix evidence update
+  pending)
 
 ## Review Notes
 

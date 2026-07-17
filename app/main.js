@@ -372,6 +372,7 @@ let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
 let openAiCorrectionService = null;
 let jarvisAnalysisScheduler = null;
+let jarvisAnalysisBudgetGuard = null;
 let jarvisDailyDigestScheduler = null;
 let jarvisAnalysisInputBuilder = null;
 let jarvisControlQueue = null;
@@ -707,12 +708,30 @@ async function initializeCoreManagers() {
       );
     },
     quiesce() {
-      return Promise.resolve(
-        jarvisProcessingLifecycle.runtime?.analysisScheduler?.quiesce?.()
-      );
+      return Promise.resolve(jarvisProcessingLifecycle.runtime?.analysisScheduler?.quiesce?.());
     },
     resume() {
       jarvisProcessingLifecycle.runtime?.analysisScheduler?.resume?.();
+    },
+  };
+  jarvisAnalysisBudgetGuard = {
+    getStatus(options) {
+      const guard = jarvisProcessingLifecycle.runtime?.analysisBudgetGuard;
+      if (!guard) {
+        const error = new Error("analysis budget runtime is unavailable");
+        error.code = "ANALYSIS_BUDGET_RUNTIME_UNAVAILABLE";
+        throw error;
+      }
+      return guard.getStatus(options);
+    },
+    setPolicy(input) {
+      const guard = jarvisProcessingLifecycle.runtime?.analysisBudgetGuard;
+      if (!guard) {
+        const error = new Error("analysis budget runtime is unavailable");
+        error.code = "ANALYSIS_BUDGET_RUNTIME_UNAVAILABLE";
+        throw error;
+      }
+      return guard.setPolicy(input);
     },
   };
   jarvisDailyDigestScheduler = {
@@ -808,6 +827,7 @@ async function initializeCoreManagers() {
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler: jarvisAnalysisScheduler,
+    analysisBudgetGuard: jarvisAnalysisBudgetGuard,
     dailyDigestScheduler: jarvisDailyDigestScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
     storageManager: jarvisStorageManager,

@@ -70,7 +70,7 @@ describe("JarvisShell", () => {
     expect(screen.getByText("实时对话")).toBeInTheDocument();
     expect(screen.getByText("正在监听")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /每日回顾/ })).toBeInTheDocument();
-    expect(screen.getByText(/MiniMax 分析/)).toBeInTheDocument();
+    expect(screen.getByText(/MiniMax 个人助手分析/)).toBeInTheDocument();
   });
 
   it("enables every memory navigation destination", () => {

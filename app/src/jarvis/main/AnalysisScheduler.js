@@ -116,9 +116,20 @@ class AnalysisScheduler {
 
   getStatus(sessionId) {
     const id = assertId(sessionId, "sessionId");
-    return (
-      this.status.get(id) ?? { sessionId: id, state: "waiting", errorCode: null, updatedAt: null }
-    );
+    const transient = this.status.get(id);
+    if (transient?.state === "preparing") return transient;
+    if (isCallable(this.memoryRepository, "getAnalysisWorkState")) {
+      return { sessionId: id, ...this.memoryRepository.getAnalysisWorkState(id) };
+    }
+    return {
+      sessionId: id,
+      state: "waiting",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: null,
+    };
   }
 
   analyzeSession(sessionId, kind = "incremental") {

@@ -25,6 +25,8 @@ import type {
   JarvisCloudBudgetInput,
   JarvisCloudBudgetStatus,
   JarvisAnalysisStatus,
+  JarvisAnalysisBudgetInput,
+  JarvisAnalysisBudgetStatus,
   JarvisMemoryItem,
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
@@ -639,6 +641,11 @@ declare global {
         getAnalysisStatus: (sessionId: string) => Promise<JarvisAnalysisStatus>;
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;
+        clearMiniMaxKey: () => Promise<JarvisMiniMaxConfig>;
+        getAnalysisBudget: () => Promise<JarvisAnalysisBudgetStatus>;
+        setAnalysisBudget: (
+          input: JarvisAnalysisBudgetInput
+        ) => Promise<JarvisAnalysisBudgetStatus>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
         setRetentionMode: (
           id: string,

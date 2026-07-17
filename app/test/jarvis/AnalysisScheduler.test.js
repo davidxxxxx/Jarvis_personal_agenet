@@ -269,3 +269,34 @@ test("quiesce rejects new enqueue work and resume restores enqueue-only scheduli
   scheduler.resume();
   assert.equal((await scheduler.analyzeSession("s1", "final")).state, "queued");
 });
+
+test("getStatus prefers durable state and uses memory only during synchronous preparation", () => {
+  const { scheduler } = harness();
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "retry_needed",
+    retryable: true,
+    errorCode: "offline",
+    nextRetryAt: 20,
+    attemptCount: 2,
+    updatedAt: null,
+  });
+
+  scheduler._setStatus("s1", "blocked", "stale_memory_status");
+  assert.deepEqual(scheduler.getStatus("s1"), {
+    sessionId: "s1",
+    state: "retry_needed",
+    retryable: true,
+    errorCode: "offline",
+    nextRetryAt: 20,
+    attemptCount: 2,
+    updatedAt: null,
+  });
+
+  scheduler._setStatus("s1", "preparing");
+  assert.deepEqual(scheduler.getStatus("s1"), {
+    sessionId: "s1",
+    state: "preparing",
+    errorCode: null,
+    updatedAt: 10,
+  });
+});

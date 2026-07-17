@@ -162,6 +162,7 @@ class JarvisProcessingRuntime {
     previewScheduler = null,
     cloudDispatcher = null,
     analysisScheduler = null,
+    analysisBudgetGuard = null,
     dailyDigestScheduler = null,
     speakerProcessingPolicy = null,
     prepareTranscriptionJobs = null,
@@ -225,6 +226,13 @@ class JarvisProcessingRuntime {
       throw new TypeError("analysisScheduler.analyzeSession must be a function");
     }
     if (
+      analysisBudgetGuard !== null &&
+      (typeof analysisBudgetGuard.getStatus !== "function" ||
+        typeof analysisBudgetGuard.setPolicy !== "function")
+    ) {
+      throw new TypeError("analysisBudgetGuard must implement getStatus and setPolicy");
+    }
+    if (
       dailyDigestScheduler !== null &&
       (typeof dailyDigestScheduler.start !== "function" ||
         typeof dailyDigestScheduler.tick !== "function" ||
@@ -264,6 +272,7 @@ class JarvisProcessingRuntime {
     this.previewScheduler = previewScheduler;
     this.cloudDispatcher = cloudDispatcher;
     this.analysisScheduler = analysisScheduler;
+    this.analysisBudgetGuard = analysisBudgetGuard;
     this.dailyDigestScheduler = dailyDigestScheduler;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
@@ -795,13 +804,14 @@ function createJarvisProcessingRuntime({
           stop: () => whisperManager.stopServer(),
         }
       : null);
-  const cloudComposition = cloudCompositionFactory?.({
-    repository,
-    governor: effectiveGovernor,
-    previewScheduler: effectivePreviewScheduler,
-    owner,
-    now,
-  }) ?? null;
+  const cloudComposition =
+    cloudCompositionFactory?.({
+      repository,
+      governor: effectiveGovernor,
+      previewScheduler: effectivePreviewScheduler,
+      owner,
+      now,
+    }) ?? null;
   const worker = new JarvisTranscriptionWorker({
     repository,
     audioEvidenceReader: service.audioEvidenceReader,

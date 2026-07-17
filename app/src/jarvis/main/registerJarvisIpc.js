@@ -12,6 +12,11 @@ const {
   normalizeKnowledgeTodoCompletionInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
+  normalizeMiniMaxKeyInput,
+  normalizeMiniMaxConfig,
+  normalizeAnalysisBudgetInput,
+  normalizeAnalysisBudgetStatus,
+  normalizeAnalysisStatus,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const {
@@ -411,6 +416,28 @@ function toPublicKnowledgeOverview(snapshot) {
   };
 }
 
+function publicBoundaryError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function safePublicCall(operation, normalize, code, message) {
+  try {
+    return normalize(operation());
+  } catch {
+    throw publicBoundaryError(code, message);
+  }
+}
+
+async function safePublicCallAsync(operation, normalize, code, message) {
+  try {
+    return normalize(await operation());
+  } catch {
+    throw publicBoundaryError(code, message);
+  }
+}
+
 function registerJarvisIpc({
   ipcMain,
   repository,
@@ -419,6 +446,7 @@ function registerJarvisIpc({
   voiceEnrollmentService,
   environmentManager,
   analysisScheduler,
+  analysisBudgetGuard = null,
   dailyDigestScheduler = null,
   audioEvidenceReader,
   storageManager,
@@ -465,6 +493,13 @@ function registerJarvisIpc({
       typeof dailyDigestScheduler.regenerate !== "function")
   ) {
     throw new TypeError("dailyDigestScheduler public methods are required");
+  }
+  if (
+    analysisBudgetGuard !== null &&
+    (typeof analysisBudgetGuard.getStatus !== "function" ||
+      typeof analysisBudgetGuard.setPolicy !== "function")
+  ) {
+    throw new TypeError("analysisBudgetGuard public methods are required");
   }
 
   const cloudBudgetStatus = () => ({
@@ -767,28 +802,97 @@ function registerJarvisIpc({
     });
   }
   if (analysisScheduler) {
-    ipcMain.handle(CHANNELS.analyzeSession, (_event, sessionId, kind) =>
-      analysisScheduler.analyzeSession(assertId(sessionId, "sessionId"), kind ?? "incremental")
-    );
-    ipcMain.handle(CHANNELS.getAnalysisStatus, (_event, sessionId) =>
-      analysisScheduler.getStatus(assertId(sessionId, "sessionId"))
-    );
+    ipcMain.handle(CHANNELS.analyzeSession, async (_event, ...args) => {
+      if (args.length < 1 || args.length > 2) {
+        throw new TypeError("analysis request requires sessionId and optional kind");
+      }
+      const sessionId = assertId(args[0], "sessionId");
+      const kind = args[1] ?? "incremental";
+      if (kind !== "incremental" && kind !== "final") {
+        throw new TypeError("invalid analysis kind");
+      }
+      return safePublicCallAsync(
+        () => analysisScheduler.analyzeSession(sessionId, kind),
+        normalizeAnalysisStatus,
+        "ANALYSIS_STATUS_UNAVAILABLE",
+        "Analysis status is unavailable"
+      );
+    });
+    ipcMain.handle(CHANNELS.getAnalysisStatus, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("analysis status requires sessionId");
+      const sessionId = assertId(args[0], "sessionId");
+      return safePublicCall(
+        () => analysisScheduler.getStatus(sessionId),
+        normalizeAnalysisStatus,
+        "ANALYSIS_STATUS_UNAVAILABLE",
+        "Analysis status is unavailable"
+      );
+    });
+  }
+  if (analysisBudgetGuard) {
+    ipcMain.handle(CHANNELS.getAnalysisBudget, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("analysis budget status takes no arguments");
+      return safePublicCall(
+        () => analysisBudgetGuard.getStatus({}),
+        normalizeAnalysisBudgetStatus,
+        "ANALYSIS_BUDGET_UNAVAILABLE",
+        "Analysis budget is unavailable"
+      );
+    });
+    ipcMain.handle(CHANNELS.setAnalysisBudget, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("analysis budget update requires one argument");
+      const input = normalizeAnalysisBudgetInput(args[0]);
+      return safePublicCall(
+        () => analysisBudgetGuard.setPolicy(input),
+        normalizeAnalysisBudgetStatus,
+        "ANALYSIS_BUDGET_UNAVAILABLE",
+        "Analysis budget is unavailable"
+      );
+    });
   }
   if (
     typeof environmentManager.getMiniMaxKey === "function" &&
-    typeof environmentManager.saveMiniMaxKey === "function"
+    typeof environmentManager.saveMiniMaxKey === "function" &&
+    typeof environmentManager.clearMiniMaxKey === "function"
   ) {
-    const miniMaxConfig = () => ({
-      keyConfigured: Boolean(environmentManager.getMiniMaxKey()),
-      model: process.env.MINIMAX_MODEL || "MiniMax-M2.7",
+    const miniMaxConfig = () =>
+      normalizeMiniMaxConfig({
+        keyConfigured: Boolean(environmentManager.getMiniMaxKey()),
+        model: "MiniMax-M2.7",
+      });
+    ipcMain.handle(CHANNELS.getMiniMaxConfig, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("MiniMax config takes no arguments");
+      return safePublicCall(
+        miniMaxConfig,
+        normalizeMiniMaxConfig,
+        "MINIMAX_SETTINGS_UNAVAILABLE",
+        "MiniMax settings are unavailable"
+      );
     });
-    ipcMain.handle(CHANNELS.getMiniMaxConfig, miniMaxConfig);
-    ipcMain.handle(CHANNELS.setMiniMaxKey, async (_event, key) => {
-      if (typeof key !== "string" || !key.trim() || key.length > 512) {
-        throw new TypeError("MiniMax key must be a non-empty string");
-      }
-      await environmentManager.saveMiniMaxKey(key.trim());
-      return miniMaxConfig();
+    ipcMain.handle(CHANNELS.setMiniMaxKey, async (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("MiniMax key update requires one argument");
+      const { key } = normalizeMiniMaxKeyInput(args[0]);
+      return safePublicCallAsync(
+        async () => {
+          await environmentManager.saveMiniMaxKey(key);
+          return miniMaxConfig();
+        },
+        normalizeMiniMaxConfig,
+        "MINIMAX_SETTINGS_UNAVAILABLE",
+        "MiniMax settings are unavailable"
+      );
+    });
+    ipcMain.handle(CHANNELS.clearMiniMaxKey, async (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("MiniMax key clear takes no arguments");
+      return safePublicCallAsync(
+        async () => {
+          await environmentManager.clearMiniMaxKey();
+          return miniMaxConfig();
+        },
+        normalizeMiniMaxConfig,
+        "MINIMAX_SETTINGS_UNAVAILABLE",
+        "MiniMax settings are unavailable"
+      );
     });
   }
   ipcMain.handle(CHANNELS.startCapture, (_event, input) =>

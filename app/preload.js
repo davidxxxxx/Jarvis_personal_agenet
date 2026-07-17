@@ -8,6 +8,11 @@ const {
   normalizeKnowledgeTodoCompletionInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
+  normalizeMiniMaxKeyInput,
+  normalizeMiniMaxConfig,
+  normalizeAnalysisBudgetInput,
+  normalizeAnalysisBudgetStatus,
+  normalizeAnalysisStatus,
 } = require("./src/jarvis/shared/contracts");
 
 const ENROLLMENT_WINDOW_COUNT = 3;
@@ -95,6 +100,55 @@ function invokeEvidenceContext(input) {
       error.code = "EVIDENCE_CONTEXT_UNAVAILABLE";
       throw error;
     });
+}
+
+function publicInvoke(channel, args, normalize, code, message) {
+  return ipcRenderer
+    .invoke(channel, ...args)
+    .then(normalize)
+    .catch(() => {
+      const error = new Error(message);
+      error.code = code;
+      throw error;
+    });
+}
+
+function invokeAnalysisStatus(channel, sessionId, kind) {
+  const id = assertJarvisId(sessionId, "sessionId");
+  const args = [id];
+  if (kind !== undefined) {
+    if (kind !== "incremental" && kind !== "final") {
+      throw new TypeError("invalid analysis kind");
+    }
+    args.push(kind);
+  }
+  return publicInvoke(
+    channel,
+    args,
+    normalizeAnalysisStatus,
+    "ANALYSIS_STATUS_UNAVAILABLE",
+    "Analysis status is unavailable"
+  );
+}
+
+function invokeMiniMaxSettings(channel, args) {
+  return publicInvoke(
+    channel,
+    args,
+    normalizeMiniMaxConfig,
+    "MINIMAX_SETTINGS_UNAVAILABLE",
+    "MiniMax settings are unavailable"
+  );
+}
+
+function invokeAnalysisBudget(channel, args) {
+  return publicInvoke(
+    channel,
+    args,
+    normalizeAnalysisBudgetStatus,
+    "ANALYSIS_BUDGET_UNAVAILABLE",
+    "Analysis budget is unavailable"
+  );
 }
 
 /**
@@ -202,15 +256,21 @@ contextBridge.exposeInMainWorld("electronAPI", {
         normalizeKnowledgeTodoCompletionInput({ todoId })
       ),
     getEvidenceContext: (input) => invokeEvidenceContext(input),
-    analyzeSession: (sessionId, kind) => ipcRenderer.invoke("jarvis:analysis:run", sessionId, kind),
+    analyzeSession: (sessionId, kind) =>
+      invokeAnalysisStatus("jarvis:analysis:run", sessionId, kind),
     regenerateDailyDigest: (localDate) =>
       ipcRenderer.invoke(
         "jarvis:analysis:daily-digest:regenerate",
         normalizeDailyDigestDateRequest({ localDate })
       ),
-    getAnalysisStatus: (sessionId) => ipcRenderer.invoke("jarvis:analysis:status", sessionId),
-    getMiniMaxConfig: () => ipcRenderer.invoke("jarvis:minimax:get-config"),
-    setMiniMaxKey: (key) => ipcRenderer.invoke("jarvis:minimax:set-key", key),
+    getAnalysisStatus: (sessionId) => invokeAnalysisStatus("jarvis:analysis:status", sessionId),
+    getMiniMaxConfig: () => invokeMiniMaxSettings("jarvis:minimax:get-config", []),
+    setMiniMaxKey: (key) =>
+      invokeMiniMaxSettings("jarvis:minimax:set-key", [normalizeMiniMaxKeyInput({ key })]),
+    clearMiniMaxKey: () => invokeMiniMaxSettings("jarvis:minimax:clear-key", []),
+    getAnalysisBudget: () => invokeAnalysisBudget("jarvis:analysis-budget:get", []),
+    setAnalysisBudget: (input) =>
+      invokeAnalysisBudget("jarvis:analysis-budget:set", [normalizeAnalysisBudgetInput(input)]),
     startCapture: (input) => ipcRenderer.invoke("jarvis:capture:start", input),
     setRetentionMode: (id, retentionMode, at) =>
       ipcRenderer.invoke("jarvis:capture:set-retention-mode", id, retentionMode, at),

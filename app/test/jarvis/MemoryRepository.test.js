@@ -7,6 +7,7 @@ const Database = require("better-sqlite3");
 const test = require("node:test");
 
 const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
+const AnalysisScheduler = require("../../src/jarvis/main/AnalysisScheduler");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const {
@@ -14,6 +15,7 @@ const {
   canonicalizeText,
   semanticCandidateHash,
 } = require("../../src/jarvis/main/MemoryMerger");
+const { normalizeAnalysisStatus } = require("../../src/jarvis/shared/contracts");
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -636,6 +638,17 @@ function createCloudJob(db, head, overrides = {}) {
   return { store, job };
 }
 
+function assertAnalysisWorkState(repository, expected) {
+  const actual = repository.getAnalysisWorkState("session-1");
+  assert.deepEqual(actual, expected);
+  assert.deepEqual(normalizeAnalysisStatus({ sessionId: "session-1", ...actual }), {
+    sessionId: "session-1",
+    state: expected.state,
+    errorCode: expected.errorCode,
+    updatedAt: expected.updatedAt,
+  });
+}
+
 function reconcileBudgetAttempt(
   db,
   jobId,
@@ -983,6 +996,191 @@ test("a changed desired vector can enqueue a replacement job for the same immuta
     );
   } finally {
     db.close();
+  }
+});
+
+test("analysis work state maps only the exact current desired-head job and requires applied output", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    assertAnalysisWorkState(repository, {
+      state: "waiting",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: null,
+    });
+
+    const head = setDesiredHead(repository, input);
+    assertAnalysisWorkState(repository, {
+      state: "retry_needed",
+      retryable: true,
+      errorCode: "analysis_runtime_not_ready",
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: head.updatedAt,
+    });
+
+    const { job } = createCloudJob(db, head);
+    assertAnalysisWorkState(repository, {
+      state: "queued",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: 7_000,
+    });
+
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'running', attempt_count = 1, lease_owner = 'worker',
+           lease_expires_at = 8000
+       WHERE id = ?`
+    ).run(job.id);
+    assertAnalysisWorkState(repository, {
+      state: "analyzing",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 1,
+      updatedAt: null,
+    });
+
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'retry', next_retry_at = 9000, lease_owner = NULL,
+           lease_expires_at = NULL, error_code = 'network'
+       WHERE id = ?`
+    ).run(job.id);
+    assertAnalysisWorkState(repository, {
+      state: "retry_needed",
+      retryable: true,
+      errorCode: "offline",
+      nextRetryAt: 9_000,
+      attemptCount: 1,
+      updatedAt: null,
+    });
+
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', next_retry_at = NULL, error_code = 'invalid_structure',
+           completed_at = 7100
+       WHERE id = ?`
+    ).run(job.id);
+    assertAnalysisWorkState(repository, {
+      state: "blocked",
+      retryable: false,
+      errorCode: "invalid_response",
+      nextRetryAt: null,
+      attemptCount: 1,
+      updatedAt: 7_100,
+    });
+
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'completed', error_code = NULL, completed_at = 7200
+       WHERE id = ?`
+    ).run(job.id);
+    assertAnalysisWorkState(repository, {
+      state: "blocked",
+      retryable: false,
+      errorCode: "analysis_failed",
+      nextRetryAt: null,
+      attemptCount: 1,
+      updatedAt: 7_200,
+    });
+
+    db.prepare(
+      `UPDATE analysis_inputs
+       SET candidate_hash = ?, applied_at = 7150
+       WHERE id = ?`
+    ).run(HASH_C, input.analysisInputId);
+    assertAnalysisWorkState(repository, {
+      state: "ready",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 1,
+      updatedAt: 7_200,
+    });
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis work state ignores old jobs after the desired head advances", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const oldHead = setDesiredHead(repository, input);
+    const { store, job: oldJob } = createCloudJob(db, oldHead);
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'superseded', error_code = 'ANALYSIS_SUPERSEDED', completed_at = 7100
+       WHERE id = ?`
+    ).run(oldJob.id);
+
+    const currentInput = createAlternativeInput(repository, "current redacted evidence");
+    const currentHead = setDesiredHead(repository, currentInput);
+    assertAnalysisWorkState(repository, {
+      state: "retry_needed",
+      retryable: true,
+      errorCode: "analysis_runtime_not_ready",
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: currentHead.updatedAt,
+    });
+
+    const currentJob = store.enqueueCloudJob({
+      sessionId: "session-1",
+      jobType: "analyze_session",
+      analysisInputId: currentHead.analysisInputId,
+      desiredHeadHash: currentHead.desiredVectorHash,
+      inputHash: currentHead.analysisInputHash,
+      inputVersion: 1,
+      modelVersion: currentHead.modelVersion,
+    });
+    assert.equal(currentJob.state, "pending");
+    assert.equal(repository.getAnalysisWorkState("session-1").state, "queued");
+  } finally {
+    db.close();
+  }
+});
+
+test("a reopened repository and new scheduler report durable analysis status", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-analysis-status-"));
+  const filename = path.join(directory, "jarvis.sqlite");
+  let db = createFixture(filename);
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    createCloudJob(db, head);
+    db.close();
+    db = null;
+
+    const reopenedDb = new Database(filename);
+    db = reopenedDb;
+    reopenedDb.pragma("foreign_keys = ON");
+    applyJarvisMigrations(reopenedDb);
+    const reopenedRepository = createRepository(reopenedDb);
+    const scheduler = new AnalysisScheduler({
+      repository: { getSessionDetail() {} },
+      memoryRepository: reopenedRepository,
+    });
+
+    assert.deepEqual(scheduler.getStatus("session-1"), {
+      sessionId: "session-1",
+      state: "queued",
+      retryable: false,
+      errorCode: null,
+      nextRetryAt: null,
+      attemptCount: 0,
+      updatedAt: 7_000,
+    });
+  } finally {
+    db?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 

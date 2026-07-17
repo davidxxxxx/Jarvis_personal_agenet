@@ -311,10 +311,26 @@ function createIpcHarness(overrides = {}) {
     getOpenAIKey: () => "sk-project-test",
     getMiniMaxKey: () => "sk-cp-test",
     saveMiniMaxKey: () => ({ success: true }),
+    clearMiniMaxKey: () => ({ success: true }),
   };
   const analysisScheduler = {
     analyzeSession: () => Promise.resolve({ state: "ready" }),
     getStatus: () => ({ state: "waiting" }),
+  };
+  const analysisBudgetGuard = {
+    getStatus: () => ({
+      monthKey: "2026-07",
+      timezone: "Asia/Shanghai",
+      currency: "USD",
+      monthlyLimitMicrousd: 5_000_000,
+      spentMicrousd: 0,
+      reservedMicrousd: 0,
+      remainingMicrousd: 5_000_000,
+      blockedReason: null,
+    }),
+    setPolicy(input) {
+      return { ...this.getStatus(), ...input };
+    },
   };
   registerJarvisIpc({
     ipcMain,
@@ -323,6 +339,7 @@ function createIpcHarness(overrides = {}) {
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler,
+    analysisBudgetGuard,
   });
   return {
     handlers,
@@ -331,6 +348,7 @@ function createIpcHarness(overrides = {}) {
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler,
+    analysisBudgetGuard,
   };
 }
 
@@ -874,6 +892,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "createSession",
       "failCapture",
       "finishCapture",
+      "getAnalysisBudget",
       "getAnalysisStatus",
       "getCloudBudget",
       "getDailyDigest",
@@ -911,6 +930,8 @@ test("contract exposes only the named Jarvis channels", () => {
       "rejectSpeaker",
       "undoSpeakerCorrection",
       "resumeCapture",
+      "clearMiniMaxKey",
+      "setAnalysisBudget",
       "setCloudBudget",
       "setMiniMaxKey",
       "setSessionStatus",
@@ -986,8 +1007,11 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.getTodayInsights,
       CHANNELS.analyzeSession,
       CHANNELS.getAnalysisStatus,
+      CHANNELS.getAnalysisBudget,
       CHANNELS.getMiniMaxConfig,
+      CHANNELS.clearMiniMaxKey,
       CHANNELS.setMiniMaxKey,
+      CHANNELS.setAnalysisBudget,
       CHANNELS.decideKnowledgeSuggestion,
       CHANNELS.resolveKnowledgeConflict,
     ].sort()
@@ -1273,13 +1297,158 @@ test("IPC registration requires every speaker correction service capability", ()
 });
 
 test("IPC exposes MiniMax configured state without returning the secret", async () => {
-  const { handlers } = createIpcHarness();
+  const calls = [];
+  const { handlers, environmentManager } = createIpcHarness();
+  environmentManager.saveMiniMaxKey = async (key) => {
+    calls.push(["save", key]);
+  };
+  environmentManager.clearMiniMaxKey = async () => {
+    calls.push(["clear"]);
+  };
   const config = await handlers.get(CHANNELS.getMiniMaxConfig)();
-  const expectedModel = process.env.MINIMAX_MODEL || "MiniMax-M2.7";
+  const expectedModel = "MiniMax-M2.7";
   assert.deepEqual(config, { keyConfigured: true, model: expectedModel });
   assert.doesNotMatch(JSON.stringify(config), /sk-cp/);
-  const saved = await handlers.get(CHANNELS.setMiniMaxKey)(null, "new-token-plan-key");
+  const saved = await handlers.get(CHANNELS.setMiniMaxKey)(null, { key: "new-token-plan-key" });
   assert.deepEqual(saved, { keyConfigured: true, model: expectedModel });
+  const cleared = await handlers.get(CHANNELS.clearMiniMaxKey)(null);
+  assert.deepEqual(cleared, { keyConfigured: true, model: expectedModel });
+  assert.deepEqual(calls, [["save", "new-token-plan-key"], ["clear"]]);
+  await assert.rejects(
+    handlers.get(CHANNELS.setMiniMaxKey)(null, {
+      key: "new-token-plan-key",
+      extra: "forbidden",
+    })
+  );
+});
+
+test("analysis IPC projects a strict safe status and masks scheduler failures", async () => {
+  const { handlers, analysisScheduler } = createIpcHarness();
+  analysisScheduler.analyzeSession = async (sessionId, kind) => ({
+    sessionId,
+    state: kind === "final" ? "queued" : "preparing",
+    errorCode: null,
+    updatedAt: 7_000,
+    jobId: "private-job",
+    desiredVectorHash: "private-hash",
+    reused: true,
+    rawError: "C:\\private\\provider.log",
+  });
+  analysisScheduler.getStatus = (sessionId) => ({
+    sessionId,
+    state: "retry_needed",
+    errorCode: "rate_limit",
+    updatedAt: 8_000,
+    jobId: "private-job",
+    rawError: "provider body",
+  });
+
+  assert.deepEqual(await handlers.get(CHANNELS.analyzeSession)(null, "session-1", "final"), {
+    sessionId: "session-1",
+    state: "queued",
+    errorCode: null,
+    updatedAt: 7_000,
+  });
+  assert.deepEqual(handlers.get(CHANNELS.getAnalysisStatus)(null, "session-1"), {
+    sessionId: "session-1",
+    state: "retry_needed",
+    errorCode: "rate_limit",
+    updatedAt: 8_000,
+  });
+
+  analysisScheduler.getStatus = () => {
+    throw new Error("C:\\private\\jarvis.db raw scheduler failure");
+  };
+  assert.throws(
+    () => handlers.get(CHANNELS.getAnalysisStatus)(null, "session-1"),
+    (error) => {
+      assert.equal(error.code, "ANALYSIS_STATUS_UNAVAILABLE");
+      assert.equal(error.message, "Analysis status is unavailable");
+      return true;
+    }
+  );
+});
+
+test("analysis budget IPC enforces exact policy input and returns a safe allowlist", async () => {
+  const calls = [];
+  const { handlers, analysisBudgetGuard } = createIpcHarness();
+  analysisBudgetGuard.getStatus = () => ({
+    monthKey: "2026-07",
+    timezone: "Asia/Shanghai",
+    currency: "USD",
+    monthlyLimitMicrousd: 5_000_000,
+    spentMicrousd: 1_000_000,
+    reservedMicrousd: 500_000,
+    remainingMicrousd: 3_500_000,
+    blockedReason: null,
+    requestId: "private-request",
+    rawError: "C:\\private\\ledger.db",
+  });
+  analysisBudgetGuard.setPolicy = (input) => {
+    calls.push(input);
+    return { ...analysisBudgetGuard.getStatus(), ...input };
+  };
+
+  assert.deepEqual(await handlers.get(CHANNELS.getAnalysisBudget)(null), {
+    monthKey: "2026-07",
+    timezone: "Asia/Shanghai",
+    currency: "USD",
+    monthlyLimitMicrousd: 5_000_000,
+    spentMicrousd: 1_000_000,
+    reservedMicrousd: 500_000,
+    remainingMicrousd: 3_500_000,
+    blockedReason: null,
+  });
+  const updated = await handlers.get(CHANNELS.setAnalysisBudget)(null, {
+    monthlyLimitMicrousd: 0,
+    timezone: "UTC",
+  });
+  assert.equal(updated.monthlyLimitMicrousd, 0);
+  assert.equal(updated.timezone, "UTC");
+  assert.deepEqual(calls, [{ monthlyLimitMicrousd: 0, timezone: "UTC" }]);
+  for (const invalid of [
+    { monthlyLimitMicrousd: -1, timezone: "UTC" },
+    { monthlyLimitMicrousd: 10_000_001, timezone: "UTC" },
+    { monthlyLimitMicrousd: 5_000_000, timezone: "UTC", extra: true },
+  ]) {
+    assert.throws(() => handlers.get(CHANNELS.setAnalysisBudget)(null, invalid));
+  }
+  assert.equal(calls.length, 1);
+});
+
+test("MiniMax and analysis budget IPC failures expose only fixed safe errors", async () => {
+  const { handlers, environmentManager, analysisBudgetGuard } = createIpcHarness();
+  environmentManager.saveMiniMaxKey = async () => {
+    throw new Error("C:\\private\\secure-store sk-cp-secret");
+  };
+  environmentManager.clearMiniMaxKey = async () => {
+    throw new Error("C:\\private\\secure-store sk-cp-secret");
+  };
+  analysisBudgetGuard.getStatus = () => {
+    throw new Error("C:\\private\\ledger.db SQL failed");
+  };
+
+  await assert.rejects(
+    handlers.get(CHANNELS.setMiniMaxKey)(null, { key: "sk-cp-secret" }),
+    (error) => {
+      assert.equal(error.code, "MINIMAX_SETTINGS_UNAVAILABLE");
+      assert.equal(error.message, "MiniMax settings are unavailable");
+      return true;
+    }
+  );
+  await assert.rejects(handlers.get(CHANNELS.clearMiniMaxKey)(null), (error) => {
+    assert.equal(error.code, "MINIMAX_SETTINGS_UNAVAILABLE");
+    assert.equal(error.message, "MiniMax settings are unavailable");
+    return true;
+  });
+  assert.throws(
+    () => handlers.get(CHANNELS.getAnalysisBudget)(null),
+    (error) => {
+      assert.equal(error.code, "ANALYSIS_BUDGET_UNAVAILABLE");
+      assert.equal(error.message, "Analysis budget is unavailable");
+      return true;
+    }
+  );
 });
 
 test("IPC returns metadata-only self voice enrollment status", async () => {

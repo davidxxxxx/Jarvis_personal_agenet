@@ -754,14 +754,55 @@ export interface JarvisKnowledgeTodoCompletionResult {
 
 export interface JarvisAnalysisStatus {
   sessionId: string;
-  state: "waiting" | "analyzing" | "ready" | "quota_limited" | "retry_needed" | "blocked";
-  errorCode: string | null;
+  state:
+    | "waiting"
+    | "preparing"
+    | "queued"
+    | "analyzing"
+    | "ready"
+    | "quota_limited"
+    | "retry_needed"
+    | "blocked";
+  errorCode:
+    | "analysis_runtime_not_ready"
+    | "analysis_input_empty"
+    | "analysis_input_invalid"
+    | "analysis_input_state_invalid"
+    | "analysis_desired_head_invalid"
+    | "analysis_cloud_job_invalid"
+    | "analysis_failed"
+    | "offline"
+    | "budget_exceeded"
+    | "usage_unknown"
+    | "over_limit"
+    | "rate_limit"
+    | "invalid_response"
+    | null;
   updatedAt: number | null;
 }
 
 export interface JarvisMiniMaxConfig {
   keyConfigured: boolean;
-  model: string;
+  model: "MiniMax-M2.7";
+}
+
+export type JarvisAnalysisBudgetBlockedReason =
+  "budget_exceeded" | "usage_unknown" | "over_limit" | null;
+
+export interface JarvisAnalysisBudgetStatus {
+  monthKey: string;
+  timezone: string;
+  currency: "USD";
+  monthlyLimitMicrousd: number;
+  spentMicrousd: number;
+  reservedMicrousd: number;
+  remainingMicrousd: number;
+  blockedReason: JarvisAnalysisBudgetBlockedReason;
+}
+
+export interface JarvisAnalysisBudgetInput {
+  monthlyLimitMicrousd: number;
+  timezone: string;
 }
 
 export interface JarvisVoiceEnrollmentSession {

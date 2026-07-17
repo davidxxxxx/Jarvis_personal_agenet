@@ -33,11 +33,49 @@ const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
 const PUBLIC_SNAPSHOT_LIST_LIMIT = 101;
 const PUBLIC_SNAPSHOT_HISTORY_LIMIT = 20;
 const PUBLIC_SNAPSHOT_EVIDENCE_LIMIT = 8;
+const PUBLIC_ANALYSIS_ERROR_CODES = new Set([
+  "analysis_runtime_not_ready",
+  "analysis_input_empty",
+  "analysis_input_invalid",
+  "analysis_input_state_invalid",
+  "analysis_desired_head_invalid",
+  "analysis_cloud_job_invalid",
+  "analysis_failed",
+  "offline",
+  "budget_exceeded",
+  "usage_unknown",
+  "over_limit",
+  "rate_limit",
+  "invalid_response",
+]);
+const OFFLINE_ANALYSIS_ERROR_CODES = new Set(["network", "service_unavailable", "timeout"]);
+const BUDGET_ANALYSIS_ERROR_CODES = new Set(["analysis_budget_denied", "budget_unavailable"]);
+const RUNTIME_ANALYSIS_ERROR_CODES = new Set([
+  "analysis_deferred_for_local_work",
+  "analysis_configuration_required",
+  "configuration",
+]);
+const INVALID_ANALYSIS_ERROR_CODES = new Set([
+  "invalid_json",
+  "invalid_structure",
+  "ANALYSIS_RESPONSE_INVALID",
+]);
 
 function codedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+function publicAnalysisErrorCode(errorCode, blockedReason, fallback = "analysis_failed") {
+  const raw = errorCode ?? blockedReason;
+  if (PUBLIC_ANALYSIS_ERROR_CODES.has(raw)) return raw;
+  if (OFFLINE_ANALYSIS_ERROR_CODES.has(raw)) return "offline";
+  if (BUDGET_ANALYSIS_ERROR_CODES.has(raw)) return "budget_exceeded";
+  if (raw === "analysis_usage_unknown") return "usage_unknown";
+  if (RUNTIME_ANALYSIS_ERROR_CODES.has(raw)) return "analysis_runtime_not_ready";
+  if (INVALID_ANALYSIS_ERROR_CODES.has(raw)) return "invalid_response";
+  return fallback;
 }
 
 function canonicalJson(value) {
@@ -1409,6 +1447,116 @@ class MemoryRepository {
         this.db.prepare("SELECT * FROM analysis_desired_heads WHERE session_id = ?").get(id)
       )
     );
+    return read.deferred();
+  }
+
+  getAnalysisWorkState(sessionId) {
+    const id = assertId(sessionId, "sessionId");
+    const read = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT head.updated_at AS head_updated_at, input.applied_at,
+                  job.state, job.error_code, job.blocked_reason, job.next_retry_at,
+                  job.attempt_count, job.created_at, job.completed_at
+           FROM analysis_desired_heads AS head
+           JOIN analysis_inputs AS input
+             ON input.id = head.analysis_input_id
+            AND input.session_id = head.session_id
+            AND input.input_hash = head.analysis_input_hash
+           LEFT JOIN processing_jobs AS job
+             ON job.session_id = head.session_id
+            AND job.job_type = 'analyze_session'
+            AND job.lane = 'cloud'
+            AND job.analysis_input_id = head.analysis_input_id
+            AND job.input_hash = head.analysis_input_hash
+            AND job.desired_head_hash = head.desired_vector_hash
+            AND job.model_version = json_extract(
+              head.desired_vector_json, '$.modelVersion'
+            )
+            AND job.input_version = 1
+            AND job.track_id IS NULL
+            AND job.chunk_id IS NULL
+            AND job.digest_input_id IS NULL
+           WHERE head.session_id = ?`
+        )
+        .get(id);
+      if (!row) {
+        return {
+          state: "waiting",
+          retryable: false,
+          errorCode: null,
+          nextRetryAt: null,
+          attemptCount: 0,
+          updatedAt: null,
+        };
+      }
+      if (row.state === null) {
+        return {
+          state: "retry_needed",
+          retryable: true,
+          errorCode: "analysis_runtime_not_ready",
+          nextRetryAt: null,
+          attemptCount: 0,
+          updatedAt: row.head_updated_at,
+        };
+      }
+
+      const attemptCount =
+        Number.isSafeInteger(row.attempt_count) && row.attempt_count >= 0 ? row.attempt_count : 0;
+      if (row.state === "pending") {
+        return {
+          state: "queued",
+          retryable: false,
+          errorCode: null,
+          nextRetryAt: null,
+          attemptCount,
+          updatedAt: Number.isSafeInteger(row.created_at) ? row.created_at : null,
+        };
+      }
+      if (row.state === "running") {
+        return {
+          state: "analyzing",
+          retryable: false,
+          errorCode: null,
+          nextRetryAt: null,
+          attemptCount,
+          updatedAt: null,
+        };
+      }
+      if (row.state === "retry") {
+        return {
+          state: "retry_needed",
+          retryable: true,
+          errorCode: publicAnalysisErrorCode(
+            row.error_code,
+            row.blocked_reason,
+            "analysis_runtime_not_ready"
+          ),
+          nextRetryAt: Number.isSafeInteger(row.next_retry_at) ? row.next_retry_at : null,
+          attemptCount,
+          updatedAt: null,
+        };
+      }
+      if (row.state === "completed") {
+        const ready = row.applied_at !== null;
+        return {
+          state: ready ? "ready" : "blocked",
+          retryable: false,
+          errorCode: ready ? null : "analysis_failed",
+          nextRetryAt: null,
+          attemptCount,
+          updatedAt: Number.isSafeInteger(row.completed_at) ? row.completed_at : null,
+        };
+      }
+      return {
+        state: "blocked",
+        retryable: false,
+        errorCode: publicAnalysisErrorCode(row.error_code, row.blocked_reason),
+        nextRetryAt: null,
+        attemptCount,
+        updatedAt: Number.isSafeInteger(row.completed_at) ? row.completed_at : null,
+      };
+    });
     return read.deferred();
   }
 
