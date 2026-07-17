@@ -5,20 +5,20 @@ const path = require("node:path");
 
 const appRoot = path.resolve(__dirname, "../..");
 
-test("production main keeps MiniMax analysis transport unreachable until guarded runtime lands", () => {
+test("production main builds guarded MiniMax workers for each repository runtime epoch", () => {
   const source = fs.readFileSync(path.join(appRoot, "main.js"), "utf8");
 
-  assert.doesNotMatch(source, /require\("\.\/src\/jarvis\/main\/MiniMaxAnalysisClient"\)/u);
-  assert.doesNotMatch(source, /new MiniMaxAnalysisClient\s*\(/u);
   assert.match(source, /const AnalysisInputBuilder = require\(/u);
+  assert.match(source, /createProductionAgentCloudComposition/u);
   assert.match(
     source,
     /new JarvisRepository\(configuredDb,\s*\{[\s\S]*?validateRedactedCloudPayload:[\s\S]*?verifyRedactedCloudPayload/u
   );
   assert.match(
     source,
-    /new AnalysisScheduler\(\{[\s\S]*?cloudTransportEnabled:\s*false[\s\S]*?\}\)/u
+    /cloudCompositionFactory:[\s\S]*?repository,[\s\S]*?getApiKey:\s*\(\)\s*=>\s*environmentManager\.getMiniMaxKey\(\)[\s\S]*?governor,[\s\S]*?previewScheduler/u
   );
+  assert.doesNotMatch(source, /cloudTransportEnabled:\s*false/u);
 });
 
 test("MiniMax key IPC waits for secure persistence before reporting configured state", () => {

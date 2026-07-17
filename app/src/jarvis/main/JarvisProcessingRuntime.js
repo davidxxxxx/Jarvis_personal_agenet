@@ -161,6 +161,8 @@ class JarvisProcessingRuntime {
     startupBarrier = null,
     previewScheduler = null,
     cloudDispatcher = null,
+    analysisScheduler = null,
+    dailyDigestScheduler = null,
     speakerProcessingPolicy = null,
     prepareTranscriptionJobs = null,
   } = {}) {
@@ -219,6 +221,20 @@ class JarvisProcessingRuntime {
     ) {
       throw new TypeError("cloudDispatcher must implement start, drainOnce, and stop");
     }
+    if (analysisScheduler !== null && typeof analysisScheduler.analyzeSession !== "function") {
+      throw new TypeError("analysisScheduler.analyzeSession must be a function");
+    }
+    if (
+      dailyDigestScheduler !== null &&
+      (typeof dailyDigestScheduler.start !== "function" ||
+        typeof dailyDigestScheduler.tick !== "function" ||
+        typeof dailyDigestScheduler.onSessionReady !== "function" ||
+        typeof dailyDigestScheduler.stop !== "function")
+    ) {
+      throw new TypeError(
+        "dailyDigestScheduler must implement start, tick, onSessionReady, and stop"
+      );
+    }
     if (
       speakerProcessingPolicy !== null &&
       (typeof speakerProcessingPolicy?.evaluate !== "function" ||
@@ -247,6 +263,8 @@ class JarvisProcessingRuntime {
     this.startupBarrier = startupBarrier;
     this.previewScheduler = previewScheduler;
     this.cloudDispatcher = cloudDispatcher;
+    this.analysisScheduler = analysisScheduler;
+    this.dailyDigestScheduler = dailyDigestScheduler;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
@@ -274,6 +292,8 @@ class JarvisProcessingRuntime {
       } catch (error) {
         this.log({ phase: "recovery", error });
       }
+      await Promise.resolve(this.dailyDigestScheduler?.start?.());
+      if (this.stopping) return 0;
       this._tickCloud({ startup: true });
       this.timer = this.setInterval(() => {
         void this.drainOnce().catch((error) => {
@@ -427,7 +447,19 @@ class JarvisProcessingRuntime {
         this.repository.enqueueSpeakerIdentityResolutionJob?.(session.id, {
           at: this.now(),
         });
-        this.repository.refreshSessionReadiness(session.id, this.now());
+        const readiness = this.repository.refreshSessionReadiness(session.id, this.now());
+        if (readiness?.processing_state === "ready") {
+          try {
+            await Promise.resolve(this.analysisScheduler?.analyzeSession?.(session.id, "final"));
+          } catch (error) {
+            this.log({ phase: "analysis_ready", sessionId: session.id, error });
+          }
+          try {
+            await Promise.resolve(this.dailyDigestScheduler?.onSessionReady?.(session.id));
+          } catch (error) {
+            this.log({ phase: "daily_digest_ready", sessionId: session.id, error });
+          }
+        }
       } catch (error) {
         this.log({ phase: "post_process", sessionId: session.id, error });
       } finally {
@@ -440,6 +472,11 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    try {
+      await Promise.resolve(this.dailyDigestScheduler?.tick?.());
+    } catch (error) {
+      this.log({ phase: "daily_digest_tick", error });
+    }
     this._tickCloud();
     if (this.prepareTranscriptionJobs) await this.prepareTranscriptionJobs();
     if (this.stopping || !this.running) return 0;
@@ -489,13 +526,22 @@ class JarvisProcessingRuntime {
     this.stopping = true;
     this.running = false;
     this.previewScheduler?.stop?.();
-    const cloudStop = Promise.resolve().then(() => this.cloudDispatcher?.stop?.());
     if (this.timer !== null) {
       this.clearInterval(this.timer);
       this.timer = null;
     }
     this.stopPromise = (async () => {
       let primaryError = null;
+      try {
+        await Promise.resolve(this.dailyDigestScheduler?.stop?.());
+      } catch (error) {
+        primaryError = error;
+      }
+      try {
+        await Promise.resolve(this.cloudDispatcher?.stop?.());
+      } catch (error) {
+        primaryError ??= error;
+      }
       try {
         await Promise.resolve(this.inFlight);
       } catch (error) {
@@ -507,7 +553,6 @@ class JarvisProcessingRuntime {
         primaryError ??= error;
       }
       try {
-        await cloudStop;
         await Promise.resolve(this.cloudInFlight);
       } catch (error) {
         primaryError ??= error;
@@ -549,6 +594,7 @@ function createJarvisProcessingRuntime({
   sessionDiarizationWorker = null,
   speakerIdentityResolutionWorker = null,
   speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
+  cloudCompositionFactory = null,
   ...runtimeOptions
 } = {}) {
   if (!repository?.captureEvidenceStore) {
@@ -571,6 +617,9 @@ function createJarvisProcessingRuntime({
     typeof speakerIdentityResolutionWorker?.run !== "function"
   ) {
     throw new TypeError("speakerIdentityResolutionWorker.run must be a function");
+  }
+  if (cloudCompositionFactory !== null && typeof cloudCompositionFactory !== "function") {
+    throw new TypeError("cloudCompositionFactory must be a function or null");
   }
   const configuredModel = model.trim();
   if (typeof service.configureTranscriptionModelVersion !== "function") {
@@ -746,6 +795,13 @@ function createJarvisProcessingRuntime({
           stop: () => whisperManager.stopServer(),
         }
       : null);
+  const cloudComposition = cloudCompositionFactory?.({
+    repository,
+    governor: effectiveGovernor,
+    previewScheduler: effectivePreviewScheduler,
+    owner,
+    now,
+  }) ?? null;
   const worker = new JarvisTranscriptionWorker({
     repository,
     audioEvidenceReader: service.audioEvidenceReader,
@@ -795,6 +851,7 @@ function createJarvisProcessingRuntime({
     speakerProcessingPolicy,
     prepareTranscriptionJobs: effectivePrepareTranscriptionJobs,
     ...runtimeOptions,
+    ...(cloudComposition ?? {}),
     startupBarrier,
   });
 }

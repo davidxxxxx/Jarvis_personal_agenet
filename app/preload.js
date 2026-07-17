@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 const {
   assertId: assertJarvisId,
   normalizeSpeakerConfirmationInput,
+  normalizeDailyDigestDateRequest,
 } = require("./src/jarvis/shared/contracts");
 
 const ENROLLMENT_WINDOW_COUNT = 3;
@@ -162,7 +163,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke("jarvis:memory:todo-status", todoId, status),
     listMemories: (limit) => ipcRenderer.invoke("jarvis:memory:list", limit),
     getTodayInsights: (sessionId) => ipcRenderer.invoke("jarvis:memory:today-insights", sessionId),
+    getDailyDigest: (localDate) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:daily-digest",
+        normalizeDailyDigestDateRequest({ localDate })
+      ),
     analyzeSession: (sessionId, kind) => ipcRenderer.invoke("jarvis:analysis:run", sessionId, kind),
+    regenerateDailyDigest: (localDate) =>
+      ipcRenderer.invoke(
+        "jarvis:analysis:daily-digest:regenerate",
+        normalizeDailyDigestDateRequest({ localDate })
+      ),
     getAnalysisStatus: (sessionId) => ipcRenderer.invoke("jarvis:analysis:status", sessionId),
     getMiniMaxConfig: () => ipcRenderer.invoke("jarvis:minimax:get-config"),
     setMiniMaxKey: (key) => ipcRenderer.invoke("jarvis:minimax:set-key", key),

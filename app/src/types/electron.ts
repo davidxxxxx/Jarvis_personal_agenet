@@ -37,6 +37,8 @@ import type {
   JarvisSessionTimeline,
   JarvisRuntimeStatus,
   JarvisTodayInsights,
+  JarvisDailyDigestReadResult,
+  JarvisDailyDigestStatus,
   JarvisTodo,
   JarvisTopic,
   JarvisTopicDetail,
@@ -611,10 +613,12 @@ declare global {
         setTodoStatus: (todoId: string, status: "open" | "completed") => Promise<JarvisTodo | null>;
         listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
         getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
+        getDailyDigest: (localDate: string) => Promise<JarvisDailyDigestReadResult>;
         analyzeSession: (
           sessionId: string,
           kind: "incremental" | "final"
         ) => Promise<JarvisAnalysisStatus>;
+        regenerateDailyDigest: (localDate: string) => Promise<JarvisDailyDigestStatus>;
         getAnalysisStatus: (sessionId: string) => Promise<JarvisAnalysisStatus>;
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;

@@ -578,6 +578,15 @@ class MiniMaxDailyDigestClient {
     }
   }
 
+  isConfigured() {
+    try {
+      const apiKey = this.getApiKey();
+      return typeof apiKey === "string" && Boolean(apiKey.trim()) && apiKey === apiKey.trim();
+    } catch {
+      return false;
+    }
+  }
+
   async generate(input) {
     const requestId = this.createRequestId();
     const startedAt = this.now();

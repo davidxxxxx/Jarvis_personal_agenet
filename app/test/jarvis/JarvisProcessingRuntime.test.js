@@ -468,6 +468,79 @@ test("start recovers expired leases immediately and owns an unref polling timer"
   assert.deepEqual(calls, ["recover:500", "timer:2500", "unref", "clear"]);
 });
 
+test("ready sessions enqueue final analysis before exact-session digest and cloud work", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => calls.push("recover"),
+      runOnce: async () => 0,
+    },
+    repository: {
+      listProcessingSessions: () => [{ id: "ready-session" }],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession: () => calls.push("reconcile") },
+    deduper: { dedupe: () => calls.push("dedupe") },
+    analysisScheduler: {
+      analyzeSession: (sessionId, kind) => calls.push(`analysis_ready:${sessionId}:${kind}`),
+    },
+    dailyDigestScheduler: {
+      start: () => calls.push("digest_start"),
+      tick: () => calls.push("digest_tick"),
+      onSessionReady: (sessionId) => calls.push(`digest_ready:${sessionId}`),
+      stop: () => calls.push("digest_stop"),
+    },
+    cloudDispatcher: {
+      start: () => calls.push("cloud_start"),
+      drainOnce: () => calls.push("cloud_tick"),
+      stop: () => calls.push("cloud_stop"),
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl: () => {},
+  });
+
+  await runtime.start();
+  await runtime.stop();
+  assert.equal(calls.indexOf("digest_start") < calls.indexOf("cloud_start"), true);
+  assert.equal(calls.includes("digest_tick"), true);
+  assert.equal(calls.indexOf("analysis_ready:ready-session:final") > calls.indexOf("dedupe"), true);
+  assert.equal(
+    calls.indexOf("analysis_ready:ready-session:final") <
+      calls.indexOf("digest_ready:ready-session"),
+    true
+  );
+  assert.equal(calls.indexOf("digest_stop") < calls.indexOf("cloud_stop"), true);
+});
+
+test("ready notification failures are isolated so analysis and digest both get a chance", async () => {
+  const phases = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [{ id: "s1" }],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: { analyzeSession: async () => { throw new Error("analysis down"); } },
+    dailyDigestScheduler: {
+      start() {},
+      tick() {},
+      onSessionReady: (sessionId) => phases.push(`digest:${sessionId}`),
+      stop() {},
+    },
+    log: ({ phase }) => phases.push(phase),
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  await runtime.start();
+  await runtime.stop();
+  assert.deepEqual(phases, ["analysis_ready", "digest:s1"]);
+});
+
 test("startup recovery errors are surfaced without disabling immediate drain or polling", async () => {
   const calls = [];
   const runtime = new JarvisProcessingRuntime({
@@ -636,6 +709,63 @@ test("production composition binds transcribe and compression handlers to curren
       deferrals: [],
     }
   );
+});
+
+test("production cloud composition is built from the current repository epoch", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const governor = {
+    sample: async () => ({ state: "available", restrictiveForMs: 0 }),
+    admit: () => ({ action: "run_cpu", reason: "resources_available" }),
+    cloudPressure: () => ({ state: "normal", reason: null }),
+  };
+  const previewScheduler = {
+    request() {},
+    tick: async () => 0,
+    status: () => ({ running: 0 }),
+    stop() {},
+  };
+  const calls = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: configurableService({
+      audioEvidenceReader: { withVerifiedWav: async () => null },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    }),
+    ipcHandlers: { createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }) },
+    model: "base",
+    governor,
+    previewScheduler,
+    prepareTranscriptionJobs: () => 0,
+    cloudCompositionFactory(input) {
+      assert.equal(input.repository, repository);
+      assert.equal(input.governor, governor);
+      assert.equal(input.previewScheduler, previewScheduler);
+      calls.push("factory");
+      return {
+        analysisScheduler: { analyzeSession() {} },
+        dailyDigestScheduler: {
+          start: () => calls.push("digest_start"),
+          tick() {},
+          onSessionReady() {},
+          stop: () => calls.push("digest_stop"),
+        },
+        cloudDispatcher: {
+          start: () => calls.push("cloud_start"),
+          drainOnce() {},
+          stop: () => calls.push("cloud_stop"),
+        },
+      };
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  assert.equal(runtime.analysisScheduler !== null, true);
+  await runtime.start();
+  await runtime.stop();
+  assert.deepEqual(calls, ["factory", "digest_start", "cloud_start", "digest_stop", "cloud_stop"]);
 });
 
 test("production startup replaces an expired old-model lease before any transcription runs", async (t) => {

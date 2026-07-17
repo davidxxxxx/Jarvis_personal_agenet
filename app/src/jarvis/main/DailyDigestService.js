@@ -50,6 +50,13 @@ const ATTEMPT_DISPOSITION = Object.freeze({
   released: Object.freeze(["released", "retry_with_new_attempt"]),
   usage_unknown: Object.freeze(["usage_unknown", "block_for_period"]),
 });
+const PUBLIC_ERROR_CODES = new Set([
+  "offline",
+  "budget_unavailable",
+  "usage_unknown",
+  "invalid_response",
+  "runtime_unavailable",
+]);
 
 function codedError(code) {
   const error = new Error(code);
@@ -135,6 +142,17 @@ function jsonObject(value, name) {
     throw new TypeError(`${name} must be a JSON object`);
   }
   return value;
+}
+
+function publicErrorCode(...values) {
+  const joined = values.filter((value) => typeof value === "string").join("_").toLowerCase();
+  if (/usage_unknown/u.test(joined)) return "usage_unknown";
+  if (/budget|quota/u.test(joined)) return "budget_unavailable";
+  if (/offline|network|connection/u.test(joined)) return "offline";
+  if (/invalid|schema|response/u.test(joined)) return "invalid_response";
+  if (/runtime|configuration/u.test(joined)) return "runtime_unavailable";
+  const exact = values.find((value) => PUBLIC_ERROR_CODES.has(value));
+  return exact ?? (joined ? "generation_failed" : null);
 }
 
 class DailyDigestService {
@@ -281,6 +299,48 @@ class DailyDigestService {
     return this.memoryRepository.getLatestDailyDigest({
       localDate,
       timezone: this._timezone(),
+    });
+  }
+
+  getPublicStatus(input) {
+    const localDate = this._localDateInput(input, "daily digest status input");
+    const timezone = this._timezone();
+    const digest = this.memoryRepository.getLatestDailyDigest({ localDate, timezone });
+    const work = this.memoryRepository.getLatestDailyDigestWorkState?.({ localDate, timezone }) ?? null;
+    if (!work) {
+      return Object.freeze({
+        state: digest ? "ready" : "not_generated",
+        retryable: false,
+        errorCode: null,
+        nextRetryAt: null,
+        attemptCount: 0,
+      });
+    }
+    const states = {
+      pending: "queued",
+      running: "running",
+      retry: "retry_needed",
+      completed: digest ? "ready" : "blocked",
+      blocked: "blocked",
+      failed: "blocked",
+      cancelled: "blocked",
+      superseded: digest ? "ready" : "blocked",
+      audio_expired_before_processing: "blocked",
+    };
+    const state = states[work.state] ?? "blocked";
+    return Object.freeze({
+      state,
+      retryable: new Set(["queued", "running", "retry_needed"]).has(state),
+      errorCode:
+        state === "blocked" ? publicErrorCode(work.errorCode, work.blockedReason) : null,
+      nextRetryAt:
+        state === "retry_needed" && Number.isSafeInteger(work.nextRetryAt)
+          ? work.nextRetryAt
+          : null,
+      attemptCount:
+        Number.isSafeInteger(work.attemptCount) && work.attemptCount >= 0
+          ? work.attemptCount
+          : 0,
     });
   }
 
@@ -811,6 +871,10 @@ class DailyDigestService {
     if (!initialDecision.eligible) {
       this._defer(job.id, "daily_digest_deferred_for_local_work");
       return { status: "deferred", reason: initialDecision.reason, jobId: job.id };
+    }
+    if (typeof this.client.isConfigured === "function" && !this.client.isConfigured()) {
+      this._defer(job.id, "daily_digest_configuration_required");
+      return { status: "deferred", reason: "configuration_required", jobId: job.id };
     }
 
     const requestId = text(this.createRequestId(), "requestId");

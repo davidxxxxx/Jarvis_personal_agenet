@@ -650,6 +650,14 @@ class CaptureEvidenceStore {
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at <= @at)
           AND priority < @priorityBefore
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active
+            WHERE active.lane = 'cloud'
+              AND active.state = 'running'
+              AND active.completed_at IS NULL
+              AND active.lease_expires_at > @at
+              AND active.id <> processing_jobs.id
+          )
           AND (
             (job_type = 'generate_daily_digest' AND digest_input_id IS NOT NULL)
             OR (analysis_input_id IS NOT NULL AND desired_head_hash IS NOT NULL)
@@ -666,6 +674,14 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
           AND priority < @priorityBefore
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active
+            WHERE active.lane = 'cloud'
+              AND active.state = 'running'
+              AND active.completed_at IS NULL
+              AND active.lease_expires_at > @at
+              AND active.id <> processing_jobs.id
+          )
           AND (
             (
               job_type = 'analyze_session'
@@ -709,10 +725,10 @@ class CaptureEvidenceStore {
           )
       `),
       listExpiredCloudCandidateLeases: db.prepare(`
-        SELECT job_id, candidate_id, candidate_state
+        SELECT job_id, job_type, candidate_id, candidate_state
         FROM (
-          SELECT job.id AS job_id, candidate.id AS candidate_id,
-                 candidate.state AS candidate_state, candidate.created_at
+          SELECT job.id AS job_id, job.job_type AS job_type, candidate.id AS candidate_id,
+                 candidate.state AS candidate_state, job.priority, candidate.created_at
           FROM processing_jobs AS job
           JOIN analysis_response_candidates AS candidate ON candidate.job_id = job.id
           JOIN analysis_budget_attempts AS attempt
@@ -733,8 +749,8 @@ class CaptureEvidenceStore {
             AND attempt.operation = 'session_analysis'
             AND attempt.state = 'reconciled'
           UNION ALL
-          SELECT job.id AS job_id, candidate.id AS candidate_id,
-                 candidate.state AS candidate_state, candidate.created_at
+          SELECT job.id AS job_id, job.job_type AS job_type, candidate.id AS candidate_id,
+                 candidate.state AS candidate_state, job.priority, candidate.created_at
           FROM processing_jobs AS job
           JOIN daily_digest_response_candidates AS candidate ON candidate.job_id = job.id
           JOIN daily_digest_inputs AS input ON input.id = candidate.digest_input_id
@@ -758,7 +774,7 @@ class CaptureEvidenceStore {
             AND attempt.operation = 'daily_digest'
             AND attempt.state = 'reconciled'
         )
-        ORDER BY created_at ASC, candidate_id ASC
+        ORDER BY priority ASC, created_at ASC, candidate_id ASC
         LIMIT @limit
       `),
       recoverExpiredCloudPrestartLease: db.prepare(`
@@ -772,6 +788,14 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
           AND priority < @priorityBefore
+          AND NOT EXISTS (
+            SELECT 1 FROM processing_jobs AS active
+            WHERE active.lane = 'cloud'
+              AND active.state = 'running'
+              AND active.completed_at IS NULL
+              AND active.lease_expires_at > @at
+              AND active.id <> processing_jobs.id
+          )
           AND (
             (
               job_type = 'analyze_session'
@@ -938,20 +962,26 @@ class CaptureEvidenceStore {
               )
             )
           )
-        ORDER BY job.created_at ASC, job.id ASC
+        ORDER BY job.priority ASC, job.created_at ASC, job.id ASC
         LIMIT @limit
       `),
       listAgentAdmissionBacklog: db.prepare(`
-        SELECT job_type, state, priority, next_retry_at
+        SELECT job_type, lane, state, priority, next_retry_at
         FROM processing_jobs
-        WHERE lane = 'local'
-          AND job_type IN (
-            'transcribe_chunk','preview_transcription','speaker',
-            'diarize_track','resolve_identities','compress_chunk'
+        WHERE (
+            (
+              lane = 'local'
+              AND job_type IN (
+                'transcribe_chunk','preview_transcription','speaker',
+                'diarize_track','resolve_identities','compress_chunk'
+              )
+            )
+            OR (lane = 'cloud' AND job_type = 'analyze_session')
           )
           AND state IN ('pending','running','retry','retention_urgent','storage_recovery_compress')
           AND completed_at IS NULL
           AND priority < @priorityBefore
+          AND (@excludeJobId IS NULL OR id <> @excludeJobId)
         ORDER BY priority ASC, created_at ASC, id ASC
       `),
       countCloudLaneInFlight: db.prepare(`
@@ -960,6 +990,7 @@ class CaptureEvidenceStore {
           AND job_type IN ('analyze_session','generate_daily_digest')
           AND state = 'running'
           AND completed_at IS NULL
+          AND (@excludeJobId IS NULL OR id <> @excludeJobId)
       `),
       recoverExpiredTranscriptionJobLeases: db.prepare(`
         UPDATE processing_jobs
@@ -1197,6 +1228,7 @@ class CaptureEvidenceStore {
           if (result.changes === 1) {
             recovered.push({
               jobId: candidate.job_id,
+              jobType: candidate.job_type,
               candidateId: candidate.candidate_id,
               candidateState: candidate.candidate_state,
               leaseOwner: owner,
@@ -2160,11 +2192,12 @@ class CaptureEvidenceStore {
     });
   }
 
-  listAgentAdmissionBacklog({ priorityBefore = 70 } = {}) {
+  listAgentAdmissionBacklog({ priorityBefore = 70, excludeJobId = null } = {}) {
     this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
-    return this.statements.listAgentAdmissionBacklog.all({ priorityBefore }).map((row) => ({
+    if (excludeJobId !== null) this._assertIdentifier(excludeJobId, "excludeJobId");
+    return this.statements.listAgentAdmissionBacklog.all({ priorityBefore, excludeJobId }).map((row) => ({
       jobType: row.job_type,
-      lane: "local",
+      lane: row.lane,
       state: ["retention_urgent", "storage_recovery_compress"].includes(row.state)
         ? "pending"
         : row.state,
@@ -2173,8 +2206,9 @@ class CaptureEvidenceStore {
     }));
   }
 
-  countCloudLaneInFlight() {
-    return this.statements.countCloudLaneInFlight.get().count;
+  countCloudLaneInFlight({ excludeJobId = null } = {}) {
+    if (excludeJobId !== null) this._assertIdentifier(excludeJobId, "excludeJobId");
+    return this.statements.countCloudLaneInFlight.get({ excludeJobId }).count;
   }
 
   recoverExpiredLeases(at) {

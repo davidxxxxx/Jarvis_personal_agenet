@@ -24,6 +24,7 @@ class AgentCloudDispatcher {
   constructor({
     store,
     worker,
+    workers,
     recoverIncompleteBudgetAttempts,
     owner,
     now = Date.now,
@@ -37,15 +38,41 @@ class AgentCloudDispatcher {
     ]) {
       requiredMethod(store, method, "store");
     }
-    for (const method of ["recoverCandidate", "execute"]) {
-      requiredMethod(worker, method, "worker");
+    let registry;
+    let priorityBefore;
+    if (workers === undefined) {
+      for (const method of ["recoverCandidate", "execute"]) {
+        requiredMethod(worker, method, "worker");
+      }
+      registry = Object.freeze({ analyze_session: worker });
+      priorityBefore = 71;
+    } else {
+      if (
+        !workers ||
+        typeof workers !== "object" ||
+        Array.isArray(workers) ||
+        Object.getPrototypeOf(workers) !== Object.prototype ||
+        Object.keys(workers).length !== 2 ||
+        !Object.prototype.hasOwnProperty.call(workers, "analyze_session") ||
+        !Object.prototype.hasOwnProperty.call(workers, "generate_daily_digest")
+      ) {
+        throw new TypeError("workers must contain exact analysis and daily digest workers");
+      }
+      for (const [jobType, registeredWorker] of Object.entries(workers)) {
+        for (const method of ["recoverCandidate", "execute"]) {
+          requiredMethod(registeredWorker, method, `workers.${jobType}`);
+        }
+      }
+      registry = Object.freeze({ ...workers });
+      priorityBefore = 81;
     }
     if (typeof recoverIncompleteBudgetAttempts !== "function") {
       throw new TypeError("recoverIncompleteBudgetAttempts must be a function");
     }
     if (typeof now !== "function") throw new TypeError("now must be a function");
     this.store = store;
-    this.worker = worker;
+    this.workers = registry;
+    this.priorityBefore = priorityBefore;
     this.recoverIncompleteBudgetAttempts = recoverIncompleteBudgetAttempts;
     this.owner = assertId(owner, "owner");
     this.now = now;
@@ -115,14 +142,20 @@ class AgentCloudDispatcher {
       at,
       leaseMs: this.leaseMs,
       limit: this.recoveryLimit,
-      priorityBefore: 71,
+      priorityBefore: this.priorityBefore,
     });
     if (!Array.isArray(recoveries)) {
       throw new TypeError("cloud candidate recovery must return an array");
     }
     let processed = 0;
     for (const recovery of recoveries) {
-      await this.worker.recoverCandidate(recovery);
+      const jobType = recovery?.jobType ??
+        (this.priorityBefore === 71 ? "analyze_session" : null);
+      const registeredWorker = this.workers[jobType];
+      if (!registeredWorker) {
+        throw new TypeError("cloud candidate recovery returned an unknown job type");
+      }
+      await registeredWorker.recoverCandidate(recovery);
       processed += 1;
     }
     if (this.stopping) return processed;
@@ -131,21 +164,18 @@ class AgentCloudDispatcher {
       at: this._now(),
       leaseMs: this.leaseMs,
       limit: 1,
-      priorityBefore: 71,
+      priorityBefore: this.priorityBefore,
     });
     if (!Array.isArray(prestart) || prestart.length > 1) {
       throw new TypeError("cloud pre-start recovery must return at most one job");
     }
     if (prestart.length === 1) {
       const job = prestart[0];
-      if (
-        job?.job_type !== "analyze_session" ||
-        job?.lane !== "cloud" ||
-        job?.state !== "running"
-      ) {
-        throw new TypeError("pre-start recovery returned a non-analysis cloud job");
+      const registeredWorker = this.workers[job?.job_type];
+      if (!registeredWorker || job?.lane !== "cloud" || job?.state !== "running") {
+        throw new TypeError("pre-start recovery returned an unknown cloud job");
       }
-      await this.worker.execute(job);
+      await registeredWorker.execute(job);
       return processed + 1;
     }
     const claimed = this.store.claimCloudJobs({
@@ -153,17 +183,18 @@ class AgentCloudDispatcher {
       at: this._now(),
       leaseMs: this.leaseMs,
       limit: 1,
-      priorityBefore: 71,
+      priorityBefore: this.priorityBefore,
     });
     if (!Array.isArray(claimed) || claimed.length > 1) {
       throw new TypeError("cloud claim must return at most one job");
     }
     if (claimed.length === 0) return processed;
     const job = claimed[0];
-    if (job?.job_type !== "analyze_session" || job?.lane !== "cloud") {
-      throw new TypeError("dispatcher claimed a non-analysis cloud job");
+    const registeredWorker = this.workers[job?.job_type];
+    if (!registeredWorker || job?.lane !== "cloud") {
+      throw new TypeError("dispatcher claimed an unknown cloud job");
     }
-    await this.worker.execute(job);
+    await registeredWorker.execute(job);
     return processed + 1;
   }
 

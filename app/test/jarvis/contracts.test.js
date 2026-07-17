@@ -515,6 +515,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "finishCapture",
       "getAnalysisStatus",
       "getCloudBudget",
+      "getDailyDigest",
       "getMiniMaxConfig",
       "getPersonDetail",
       "getRuntimeStatus",
@@ -539,6 +540,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "pauseCapture",
       "pickStorageDirectory",
       "renamePerson",
+      "regenerateDailyDigest",
       "confirmSpeaker",
       "listSessionSpeakerClusters",
       "listSpeakerCorrections",
@@ -622,6 +624,123 @@ test("IPC registers only request-response repository channels", () => {
   );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
+});
+
+test("daily digest IPC accepts only localDate and rebuilds a private-safe public view", async () => {
+  const handlers = new Map();
+  const calls = [];
+  const content = {
+    schemaVersion: "jarvis-daily-digest-v1",
+    sections: {
+      today: [{ text: "Did the work", evidenceSegmentIds: ["segment-1"], secret: "drop" }],
+      interactions: [],
+      topicsAndDecisions: [],
+      commitmentsAndTodos: [],
+      worthRemembering: [],
+      tomorrowSuggestions: [],
+    },
+    processing: {
+      completeness: "final",
+      missingStages: [],
+      transcriptCoverage: {
+        selectedSegmentCount: 1,
+        incompleteSegmentCount: 0,
+        sessionCount: 1,
+        startsAt: 1,
+        endsAt: 2,
+        privateHash: "drop",
+      },
+    },
+    providerResponse: "drop",
+  };
+  const dailyDigestScheduler = {
+    getLatest(input) {
+      calls.push(["get", input]);
+      return {
+        id: "private-digest-id",
+        timezone: "Asia/Shanghai",
+        lifecycle: "active",
+        sourceHash: "private-source-hash",
+        localDate: input.localDate,
+        revision: 2,
+        completeness: "final",
+        content,
+        evidence: [{
+          sessionId: "session-1",
+          segmentId: "segment-1",
+          startedAt: 1,
+          endedAt: 2,
+          quote: "Did the work",
+          audioState: "available",
+          path: "G:\\private.wav",
+        }],
+        createdAt: 3,
+        updatedAt: 4,
+      };
+    },
+    getPublicStatus(input) {
+      calls.push(["status", input]);
+      return {
+        state: "ready",
+        retryable: false,
+        errorCode: null,
+        nextRetryAt: null,
+        attemptCount: 1,
+        jobId: "private-job-id",
+      };
+    },
+    regenerate(input) {
+      calls.push(["regenerate", input]);
+    },
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    dailyDigestScheduler,
+  });
+
+  const result = await handlers.get(CHANNELS.getDailyDigest)(null, {
+    localDate: "2026-07-17",
+  });
+  assert.deepEqual(Object.keys(result), ["digest", "status"]);
+  assert.deepEqual(Object.keys(result.digest), [
+    "localDate", "revision", "completeness", "content", "evidence", "createdAt", "updatedAt",
+  ]);
+  const serialized = JSON.stringify(result);
+  for (const privateValue of [
+    "private-digest-id",
+    "private-source-hash",
+    "private-job-id",
+    "G:\\private.wav",
+    "providerResponse",
+    "privateHash",
+    "secret",
+  ]) {
+    assert.equal(serialized.includes(privateValue), false, privateValue);
+  }
+  assert.deepEqual(
+    await handlers.get(CHANNELS.regenerateDailyDigest)(null, { localDate: "2026-07-17" }),
+    result.status
+  );
+  assert.deepEqual(calls.map(([name]) => name), ["get", "status", "regenerate", "status"]);
+  await assert.rejects(
+    async () => handlers.get(CHANNELS.getDailyDigest)(null, {
+      localDate: "2026-07-17",
+      timezone: "UTC",
+    }),
+    /only localDate|invalid structure/i
+  );
+  await assert.rejects(
+    async () => handlers.get(CHANNELS.getDailyDigest)(null, { localDate: "2026-02-29" }),
+    /valid calendar date/i
+  );
+  await assert.rejects(
+    async () => handlers.get(CHANNELS.getDailyDigest)(null, { localDate: "2026-07-17" }, {}),
+    /one argument/i
+  );
 });
 
 test("speaker correction IPC validates renderer input and routes only to the correction service", () => {

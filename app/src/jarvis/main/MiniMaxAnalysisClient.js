@@ -284,6 +284,15 @@ class MiniMaxAnalysisClient {
     }
   }
 
+  isConfigured() {
+    try {
+      const apiKey = this.getApiKey();
+      return typeof apiKey === "string" && Boolean(apiKey.trim()) && apiKey === apiKey.trim();
+    } catch {
+      return false;
+    }
+  }
+
   async analyze(input) {
     const requestId = this.createRequestId();
     const startedAt = this.now();

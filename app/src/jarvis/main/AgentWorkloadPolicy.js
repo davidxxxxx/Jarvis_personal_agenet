@@ -14,6 +14,17 @@ const TOP_LEVEL_KEYS = new Set([
   "pressure",
   "cloudLaneInFlight",
 ]);
+const DIGEST_TOP_LEVEL_KEYS = new Set([
+  "snapshotVersion",
+  "kind",
+  "sourceCurrent",
+  "sourceFinalOnly",
+  "backlog",
+  "captureActive",
+  "previewActive",
+  "pressure",
+  "cloudLaneInFlight",
+]);
 const MANIFEST_KEYS = new Set([
   "manifestVersion",
   "sessionId",
@@ -247,6 +258,18 @@ function validatePressure(value) {
 
 function validateSnapshot(value) {
   const snapshot = plainObject(value, "admission snapshot");
+  if (snapshot.kind === "generate_daily_digest") {
+    exactKeys(snapshot, DIGEST_TOP_LEVEL_KEYS, "admission snapshot");
+    if (snapshot.snapshotVersion !== 1) throw new TypeError("snapshotVersion must be 1");
+    boolean(snapshot.sourceCurrent, "sourceCurrent");
+    boolean(snapshot.sourceFinalOnly, "sourceFinalOnly");
+    validateBacklog(snapshot.backlog);
+    boolean(snapshot.captureActive, "captureActive");
+    boolean(snapshot.previewActive, "previewActive");
+    validatePressure(snapshot.pressure);
+    nonNegativeInteger(snapshot.cloudLaneInFlight, "cloudLaneInFlight");
+    return snapshot;
+  }
   exactKeys(snapshot, TOP_LEVEL_KEYS, "admission snapshot");
   if (snapshot.snapshotVersion !== 1) throw new TypeError("snapshotVersion must be 1");
   if (snapshot.kind !== "analyze_session") {
@@ -323,8 +346,8 @@ function hasFinalOnlyInput(manifest) {
   );
 }
 
-function decision(eligible, reason) {
-  return Object.freeze({ eligible, reason, priority: AGENT_WORK_PRIORITY.analyze_session });
+function decision(kind, eligible, reason) {
+  return Object.freeze({ eligible, reason, priority: AGENT_WORK_PRIORITY[kind] });
 }
 
 class AgentWorkloadPolicy {
@@ -337,32 +360,42 @@ class AgentWorkloadPolicy {
       throw new TypeError("snapshot must be created by freezeAgentAdmissionSnapshot");
     }
     validateSnapshot(snapshot);
-    if (!desiredVectorMatches(snapshot.manifest, snapshot.desiredHead)) {
-      return decision(false, "current_input_superseded");
-    }
-    if (!hasFinalOnlyInput(snapshot.manifest)) {
-      return decision(false, "final_inputs_pending");
+    const kind = snapshot.kind;
+    if (kind === "analyze_session") {
+      if (!desiredVectorMatches(snapshot.manifest, snapshot.desiredHead)) {
+        return decision(kind, false, "current_input_superseded");
+      }
+      if (!hasFinalOnlyInput(snapshot.manifest)) {
+        return decision(kind, false, "final_inputs_pending");
+      }
+    } else {
+      if (!snapshot.sourceCurrent) {
+        return decision(kind, false, "current_input_superseded");
+      }
+      if (!snapshot.sourceFinalOnly) {
+        return decision(kind, false, "final_inputs_pending");
+      }
     }
     if (
       snapshot.backlog.some(
         (job) =>
-          job.lane === "local" &&
+          (kind === "generate_daily_digest" || job.lane === "local") &&
           ACTIONABLE_JOB_STATES.has(job.state) &&
-          job.priority < AGENT_WORK_PRIORITY.analyze_session
+          job.priority < AGENT_WORK_PRIORITY[kind]
       )
     ) {
-      return decision(false, "higher_priority_backlog");
+      return decision(kind, false, "higher_priority_backlog");
     }
     if (snapshot.captureActive || snapshot.previewActive) {
-      return decision(false, "preview_active");
+      return decision(kind, false, "preview_active");
     }
     if (snapshot.pressure.state !== "normal") {
-      return decision(false, "system_constrained");
+      return decision(kind, false, "system_constrained");
     }
     if (snapshot.cloudLaneInFlight > 0) {
-      return decision(false, "cloud_lane_busy");
+      return decision(kind, false, "cloud_lane_busy");
     }
-    return decision(true, null);
+    return decision(kind, true, null);
   }
 }
 

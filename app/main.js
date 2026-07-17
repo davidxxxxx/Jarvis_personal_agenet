@@ -319,7 +319,9 @@ const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
 const OpenAiCorrectionService = require("./src/jarvis/main/OpenAiCorrectionService");
 const AnalysisInputBuilder = require("./src/jarvis/main/AnalysisInputBuilder");
-const AnalysisScheduler = require("./src/jarvis/main/AnalysisScheduler");
+const {
+  createProductionAgentCloudComposition,
+} = require("./src/jarvis/main/AgentCloudComposition");
 const registerJarvisIpc = require("./src/jarvis/main/registerJarvisIpc");
 const SpeakerCorrectionService = require("./src/jarvis/main/SpeakerCorrectionService");
 const JarvisControlQueue = require("./src/jarvis/main/JarvisControlQueue");
@@ -370,6 +372,8 @@ let voiceEnrollmentService = null;
 let cloudBudgetGuard = null;
 let openAiCorrectionService = null;
 let jarvisAnalysisScheduler = null;
+let jarvisDailyDigestScheduler = null;
+let jarvisAnalysisInputBuilder = null;
 let jarvisControlQueue = null;
 let rendererShutdownHandshake = null;
 let jarvisPowerLifecycle = null;
@@ -383,6 +387,19 @@ function buildJarvisProcessingRuntime() {
     service: jarvisService,
     ipcHandlers,
     model,
+    cloudCompositionFactory: ({ repository, governor, previewScheduler, owner, now }) =>
+      createProductionAgentCloudComposition({
+        repository,
+        inputBuilder: jarvisAnalysisInputBuilder,
+        getApiKey: () => environmentManager.getMiniMaxKey(),
+        fetchImpl: (url, options) => net.fetch(url, options),
+        governor,
+        previewScheduler,
+        timezoneProvider: () => Intl.DateTimeFormat().resolvedOptions().timeZone,
+        owner,
+        now,
+        log: (entry) => debugLogger?.info("Jarvis agent cloud", entry, "jarvis"),
+      }),
     log: ({ phase, sessionId, error }) =>
       debugLogger?.warn(
         "Jarvis background processing failed",
@@ -526,9 +543,10 @@ async function initializeCoreManagers() {
       : (legacyConfiguredRecordings ?? legacyRecordings),
     recordingsRoot,
   });
-  const analysisInputBuilder = new AnalysisInputBuilder();
+  jarvisAnalysisInputBuilder = new AnalysisInputBuilder();
   jarvisRepository = new JarvisRepository(configuredDb, {
-    validateRedactedCloudPayload: (input) => analysisInputBuilder.verifyRedactedCloudPayload(input),
+    validateRedactedCloudPayload: (input) =>
+      jarvisAnalysisInputBuilder.verifyRedactedCloudPayload(input),
   });
   const speakerCorrectionService = new SpeakerCorrectionService({
     repository: jarvisRepository,
@@ -667,12 +685,65 @@ async function initializeCoreManagers() {
     voiceProfileStore,
   });
   environmentManager = new EnvironmentManager();
-  jarvisAnalysisScheduler = new AnalysisScheduler({
-    repository: jarvisRepository,
-    memoryRepository: jarvisRepository.memoryRepository,
-    inputBuilder: analysisInputBuilder,
-    cloudTransportEnabled: false,
-  });
+  jarvisAnalysisScheduler = {
+    analyzeSession(sessionId, kind) {
+      const scheduler = jarvisProcessingLifecycle.runtime?.analysisScheduler;
+      if (scheduler) return scheduler.analyzeSession(sessionId, kind);
+      return Promise.resolve({
+        sessionId,
+        state: "blocked",
+        errorCode: "analysis_runtime_not_ready",
+        updatedAt: Date.now(),
+      });
+    },
+    getStatus(sessionId) {
+      return (
+        jarvisProcessingLifecycle.runtime?.analysisScheduler?.getStatus?.(sessionId) ?? {
+          sessionId,
+          state: "waiting",
+          errorCode: null,
+          updatedAt: null,
+        }
+      );
+    },
+    quiesce() {
+      return Promise.resolve(
+        jarvisProcessingLifecycle.runtime?.analysisScheduler?.quiesce?.()
+      );
+    },
+    resume() {
+      jarvisProcessingLifecycle.runtime?.analysisScheduler?.resume?.();
+    },
+  };
+  jarvisDailyDigestScheduler = {
+    getLatest(input) {
+      const scheduler = jarvisProcessingLifecycle.runtime?.dailyDigestScheduler;
+      if (!scheduler) return null;
+      return scheduler.getLatest(input);
+    },
+    getPublicStatus(input) {
+      const scheduler = jarvisProcessingLifecycle.runtime?.dailyDigestScheduler;
+      if (!scheduler) {
+        return {
+          state: "blocked",
+          retryable: true,
+          errorCode: "runtime_unavailable",
+          nextRetryAt: null,
+          attemptCount: 0,
+        };
+      }
+      return scheduler.getPublicStatus(input);
+    },
+    regenerate(input) {
+      const scheduler = jarvisProcessingLifecycle.runtime?.dailyDigestScheduler;
+      if (!scheduler) {
+        const error = new Error("daily digest runtime is unavailable");
+        error.code = "DAILY_DIGEST_RUNTIME_UNAVAILABLE";
+        throw error;
+      }
+      return scheduler.regenerate(input);
+    },
+  };
   cloudBudgetGuard = new CloudBudgetGuard({
     repository: jarvisRepository,
     createId: () => `cloud_${require("node:crypto").randomUUID().replaceAll("-", "")}`,
@@ -737,6 +808,7 @@ async function initializeCoreManagers() {
     voiceEnrollmentService,
     environmentManager,
     analysisScheduler: jarvisAnalysisScheduler,
+    dailyDigestScheduler: jarvisDailyDigestScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
     storageManager: jarvisStorageManager,
     pickStorageDirectory: async () => {

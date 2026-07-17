@@ -503,6 +503,85 @@ export interface JarvisTodayInsights {
   memories: JarvisMemoryItem[];
 }
 
+export interface JarvisDailyDigestFactualItem {
+  text: string;
+  evidenceSegmentIds: string[];
+}
+
+export interface JarvisDailyDigestContent {
+  schemaVersion: "jarvis-daily-digest-v1";
+  sections: {
+    today: JarvisDailyDigestFactualItem[];
+    interactions: Array<JarvisDailyDigestFactualItem & { subjectRef: string }>;
+    topicsAndDecisions: JarvisDailyDigestFactualItem[];
+    commitmentsAndTodos: JarvisDailyDigestFactualItem[];
+    worthRemembering: JarvisDailyDigestFactualItem[];
+    tomorrowSuggestions: Array<{
+      text: string;
+      rationale: string;
+      evidenceSegmentIds: string[];
+      allowedActions: Array<"accept" | "dismiss" | "convert_to_todo">;
+    }>;
+  };
+  processing: {
+    completeness: "partial" | "final";
+    missingStages: string[];
+    transcriptCoverage: {
+      selectedSegmentCount: number;
+      incompleteSegmentCount: number;
+      sessionCount: number;
+      startsAt: number;
+      endsAt: number;
+    };
+  };
+}
+
+export interface JarvisDailyDigestEvidence {
+  sessionId: string;
+  segmentId: string;
+  startedAt: number;
+  endedAt: number;
+  quote: string;
+  audioState: "available" | "expired" | "missing";
+}
+
+export interface JarvisDailyDigest {
+  localDate: string;
+  revision: number;
+  completeness: "partial" | "final";
+  content: JarvisDailyDigestContent;
+  evidence: JarvisDailyDigestEvidence[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface JarvisDailyDigestStatus {
+  state:
+    | "not_generated"
+    | "empty"
+    | "queued"
+    | "running"
+    | "retry_needed"
+    | "ready"
+    | "blocked";
+  retryable: boolean;
+  errorCode:
+    | "offline"
+    | "budget_unavailable"
+    | "usage_unknown"
+    | "invalid_response"
+    | "runtime_unavailable"
+    | "generation_failed"
+    | null;
+  nextRetryAt: number | null;
+  attemptCount: number;
+}
+
+export interface JarvisDailyDigestReadResult {
+  digest: JarvisDailyDigest | null;
+  status: JarvisDailyDigestStatus;
+}
+
 export interface JarvisAnalysisStatus {
   sessionId: string;
   state: "waiting" | "analyzing" | "ready" | "quota_limited" | "retry_needed" | "blocked";

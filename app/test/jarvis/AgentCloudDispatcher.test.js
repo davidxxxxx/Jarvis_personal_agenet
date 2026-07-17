@@ -301,3 +301,99 @@ test("shutdown stops new claims and joins the active cloud request", async () =>
   await stopping;
   assert.equal(stopped, true);
 });
+
+test("shared dispatcher routes digest recovery and analysis execution through one lane", async () => {
+  const AgentCloudDispatcher = loadDispatcher();
+  const calls = [];
+  const dispatcher = new AgentCloudDispatcher({
+    store: {
+      recoverExpiredCloudCandidateLeases(input) {
+        calls.push(["recover_leases", input]);
+        return [{
+          jobId: "job-digest-1",
+          jobType: "generate_daily_digest",
+          candidateId: "candidate-digest-1",
+          candidateState: "validated",
+          leaseOwner: "shared-cloud-worker",
+          leaseExpiresAt: 1_100,
+        }];
+      },
+      recoverExpiredCloudPrestartLeases(input) {
+        calls.push(["recover_prestart", input]);
+        return [];
+      },
+      claimCloudJobs(input) {
+        calls.push(["claim", input]);
+        return [claimedJob()];
+      },
+    },
+    workers: {
+      analyze_session: {
+        recoverCandidate: () => assert.fail("analysis candidate recovery not expected"),
+        async execute(job) {
+          calls.push(["analysis_execute", job.id]);
+        },
+      },
+      generate_daily_digest: {
+        recoverCandidate(candidate) {
+          calls.push(["digest_recover", candidate.candidateId]);
+        },
+        execute: () => assert.fail("digest execution not expected"),
+      },
+    },
+    recoverIncompleteBudgetAttempts: () => ({ releasedCount: 0, usageUnknownCount: 0 }),
+    owner: "shared-cloud-worker",
+    now: () => 100,
+    leaseMs: 1_000,
+  });
+
+  assert.equal(await dispatcher.start(), 2);
+  assert.deepEqual(calls.map(([name]) => name), [
+    "recover_leases",
+    "digest_recover",
+    "recover_prestart",
+    "claim",
+    "analysis_execute",
+  ]);
+  for (const name of ["recover_leases", "recover_prestart", "claim"]) {
+    assert.equal(calls.find(([call]) => call === name)[1].priorityBefore, 81);
+  }
+});
+
+test("shared dispatcher routes a recovered digest job before any new claim", async () => {
+  const AgentCloudDispatcher = loadDispatcher();
+  const calls = [];
+  const dispatcher = new AgentCloudDispatcher({
+    store: {
+      recoverExpiredCloudCandidateLeases: () => [],
+      recoverExpiredCloudPrestartLeases() {
+        return [{
+          id: "job-digest-1",
+          job_type: "generate_daily_digest",
+          lane: "cloud",
+          state: "running",
+        }];
+      },
+      claimCloudJobs: () => assert.fail("new claim must wait"),
+    },
+    workers: {
+      analyze_session: {
+        recoverCandidate: () => assert.fail("analysis recovery not expected"),
+        execute: () => assert.fail("analysis execution not expected"),
+      },
+      generate_daily_digest: {
+        recoverCandidate: () => assert.fail("digest candidate recovery not expected"),
+        async execute(job) {
+          calls.push(job.id);
+        },
+      },
+    },
+    recoverIncompleteBudgetAttempts: () => ({ releasedCount: 0, usageUnknownCount: 0 }),
+    owner: "shared-cloud-worker",
+    now: () => 100,
+    leaseMs: 1_000,
+  });
+
+  assert.equal(await dispatcher.start(), 1);
+  assert.deepEqual(calls, ["job-digest-1"]);
+});

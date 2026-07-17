@@ -29,7 +29,9 @@ const CHANNELS = Object.freeze({
   setTodoStatus: "jarvis:memory:todo-status",
   listMemories: "jarvis:memory:list",
   getTodayInsights: "jarvis:memory:today-insights",
+  getDailyDigest: "jarvis:memory:daily-digest",
   analyzeSession: "jarvis:analysis:run",
+  regenerateDailyDigest: "jarvis:analysis:daily-digest:regenerate",
   getAnalysisStatus: "jarvis:analysis:status",
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
@@ -114,6 +116,32 @@ function assertSessionStatus(value) {
   return value;
 }
 
+function normalizeDailyDigestDateRequest(input) {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    Object.getPrototypeOf(input) !== Object.prototype ||
+    Object.keys(input).length !== 1 ||
+    !Object.prototype.hasOwnProperty.call(input, "localDate")
+  ) {
+    throw new TypeError("daily digest request must contain only localDate");
+  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(input.localDate);
+  if (!match) throw new TypeError("daily digest localDate must use YYYY-MM-DD");
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCFullYear(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  if (
+    date.getUTCFullYear() !== Number(match[1]) ||
+    date.getUTCMonth() !== Number(match[2]) - 1 ||
+    date.getUTCDate() !== Number(match[3])
+  ) {
+    throw new TypeError("daily digest localDate must be a valid calendar date");
+  }
+  return { localDate: input.localDate };
+}
+
 const CAPTURE_FAILURE_CODES = new Set([
   "MIC_PERMISSION",
   "MIC_DISCONNECTED",
@@ -135,6 +163,7 @@ module.exports = {
   SESSION_STATUSES,
   assertId,
   normalizeSpeakerConfirmationInput,
+  normalizeDailyDigestDateRequest,
   assertSessionStatus,
   assertCaptureFailureCode,
   assertCaptureMode,

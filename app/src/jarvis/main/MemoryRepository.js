@@ -1302,6 +1302,59 @@ class MemoryRepository {
     return read.deferred();
   }
 
+  getAnalysisAdmissionManifest(analysisInputId) {
+    const id = assertId(analysisInputId, "analysisInputId");
+    const read = this.db.transaction(() => {
+      const stored = this._loadStoredAnalysisInput(id);
+      if (!stored) return null;
+      const session = this.db
+        .prepare("SELECT id, status, processing_state FROM sessions WHERE id = ?")
+        .get(stored.row.session_id);
+      if (!session) throw codedError("MEMORY_INPUT_CORRUPT");
+      const bindings = new Map(
+        stored.prepared.speakerBindings.map((binding) => [binding.label, binding])
+      );
+      return {
+        manifestVersion: 1,
+        sessionId: session.id,
+        sessionState:
+          session.status === "completed"
+            ? "ended"
+            : session.status === "recovered"
+              ? "recovered_terminal"
+              : "active",
+        processingState: session.processing_state,
+        segments: stored.prepared.segments.map((segment) => {
+          const live = this.db
+            .prepare(
+              `SELECT result_kind, is_stable, superseded_by, duplicate_of
+               FROM transcript_segments WHERE id = ?`
+            )
+            .get(segment.segmentId);
+          if (!live) throw codedError("MEMORY_INPUT_CORRUPT");
+          const binding = bindings.get(segment.speakerBindingLabel);
+          return {
+            ordinal: segment.ordinal,
+            segmentId: segment.segmentId,
+            segmentVersion: segment.segmentVersion,
+            textHash: segment.textHash,
+            final: live.result_kind === "final",
+            stable: live.is_stable === 1,
+            current: live.superseded_by === null,
+            duplicate: live.duplicate_of !== null,
+            identityKind:
+              binding?.subjectKind === "person"
+                ? "durable_subject"
+                : binding
+                  ? "temporary_subject"
+                  : "unresolved",
+          };
+        }),
+      };
+    });
+    return read.deferred();
+  }
+
   _mapAnalysisDesiredHead(row) {
     if (!row) return null;
     let vector;
@@ -4832,6 +4885,37 @@ class MemoryRepository {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       evidence,
+    };
+  }
+
+  getLatestDailyDigestWorkState(input) {
+    assertExactPlainObject(
+      input,
+      ["localDate", "timezone"],
+      "latest daily digest work query"
+    );
+    const localDate = assertLocalDate(input.localDate);
+    const timezone = assertTimezone(input.timezone);
+    const row = this.db
+      .prepare(
+        `SELECT job.state, job.error_code, job.blocked_reason, job.next_retry_at,
+                job.attempt_count
+         FROM daily_digest_inputs AS digest_input
+         LEFT JOIN processing_jobs AS job
+           ON job.digest_input_id = digest_input.id
+          AND job.job_type = 'generate_daily_digest'
+         WHERE digest_input.local_date = ? AND digest_input.timezone = ?
+         ORDER BY digest_input.created_at DESC, digest_input.id DESC
+         LIMIT 1`
+      )
+      .get(localDate, timezone);
+    if (!row || row.state === null) return null;
+    return {
+      state: row.state,
+      errorCode: row.error_code,
+      blockedReason: row.blocked_reason,
+      nextRetryAt: row.next_retry_at,
+      attemptCount: row.attempt_count,
     };
   }
 

@@ -414,6 +414,10 @@ class JarvisAnalysisWorker {
         jobId: job.id,
       };
     }
+    if (typeof this.client.isConfigured === "function" && !this.client.isConfigured()) {
+      this._defer(job.id, "analysis_configuration_required");
+      return { status: "deferred", reason: "configuration_required", jobId: job.id };
+    }
 
     const requestId = assertId(this.createRequestId(), "requestId");
     const reservation = this.budgetGuard.reserveNextAttempt({

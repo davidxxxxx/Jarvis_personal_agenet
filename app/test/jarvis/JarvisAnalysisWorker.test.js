@@ -328,6 +328,7 @@ function executionHarness({
   applyResult = { status: "applied" },
   executionDeviceRecorded = true,
   executionDeviceError = null,
+  clientConfigured = true,
 } = {}) {
   const JarvisAnalysisWorker = loadWorker();
   const calls = [];
@@ -441,6 +442,7 @@ function executionHarness({
       return typeof value === "function" ? value() : value;
     },
     client: {
+      isConfigured: () => clientConfigured,
       async analyze(input) {
         calls.push(["request", input]);
         if (clientError) throw clientError;
@@ -490,6 +492,19 @@ test("executes the exact durable request ordering and applies through candidate 
     ]
   );
   assert.equal(calls.find(([name]) => name === "request")[1], cloudInput);
+});
+
+test("missing MiniMax configuration defers before reserving or starting budget", async () => {
+  const { worker, calls } = executionHarness({ clientConfigured: false });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "deferred",
+    reason: "configuration_required",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(calls.some(([name]) => name === "reserve"), false);
+  assert.equal(calls.some(([name]) => name === "mark_started"), false);
+  assert.equal(calls.some(([name]) => name === "request"), false);
 });
 
 test("analysis jobs require the fixed input contract version before durable reads", async () => {

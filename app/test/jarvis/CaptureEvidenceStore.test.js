@@ -301,6 +301,7 @@ function seedCloudDigestRecovery(
     persistCandidate = true,
     actualUsage = { inputTokens: 100, outputTokens: 100 },
     suffix = "recovery",
+    candidateCreatedAt = 150,
   } = {}
 ) {
   const input = seedDailyDigestInput(db, {
@@ -349,7 +350,7 @@ function seedCloudDigestRecovery(
     `INSERT INTO daily_digest_response_candidates (
        id, job_id, digest_input_id, budget_attempt_id, response_schema_version,
        candidate_json, candidate_bytes, candidate_hash, state, created_at, disposition_at
-     ) VALUES (?, ?, ?, ?, 'jarvis-daily-digest-v1', ?, ?, ?, ?, 150, ?)`
+      ) VALUES (?, ?, ?, ?, 'jarvis-daily-digest-v1', ?, ?, ?, ?, ?, ?)`
   ).run(
     candidateId,
     job.id,
@@ -359,6 +360,7 @@ function seedCloudDigestRecovery(
     Buffer.byteLength(candidateJson, "utf8"),
     "7".repeat(64),
     candidateState,
+    candidateCreatedAt,
     candidateState === "validated" ? null : 175
   );
   return { job, input, requestId, candidateId };
@@ -2813,6 +2815,40 @@ test("keeps local and cloud claims disjoint and accepts only fixed cloud job typ
   );
 });
 
+test("cloud claims never create two simultaneously live leases", (t) => {
+  const { db, store } = fixture(t);
+  const analysisJob = seedCloudAnalysisRecovery(db, store, {
+    attemptState: "none",
+    persistCandidate: false,
+  });
+  const digestInput = seedDailyDigestInput(db, { inputHash: "6".repeat(64) });
+  const digestJob = store.enqueueDailyDigestJob({
+    digestInputId: digestInput.inputId,
+    inputHash: digestInput.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+
+  assert.deepEqual(
+    store.claimCloudJobs({ owner: "second-worker", at: 150, leaseMs: 100, limit: 2 }),
+    []
+  );
+  assert.equal(
+    db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(analysisJob.id)
+      .lease_owner,
+    "dead-cloud-worker"
+  );
+  const claimed = store.claimCloudJobs({
+    owner: "second-worker",
+    at: 200,
+    leaseMs: 100,
+    limit: 2,
+  });
+  assert.equal(claimed.length, 1);
+  assert.equal(claimed[0].id, digestJob.id);
+  assert.equal(claimed[0].lease_owner, "second-worker");
+});
+
 test("generic lease recovery never mutates cloud work", (t) => {
   const { db, store } = fixture(t);
   seedProcessingJob(db, {
@@ -2866,6 +2902,7 @@ test("recovers only an expired cloud analysis lease backed by a reconciled candi
     [
       {
         jobId: job.id,
+        jobType: "analyze_session",
         candidateId: "analysis-candidate-recovery",
         candidateState: "validated",
         leaseOwner: "restart-cloud-worker",
@@ -2904,6 +2941,7 @@ test("bounded cloud candidate recovery discovers applied work without a network 
     [
       {
         jobId: job.id,
+        jobType: "analyze_session",
         candidateId: "analysis-candidate-recovery",
         candidateState: "applied",
         leaseOwner: "restart-cloud-worker",
@@ -2931,6 +2969,7 @@ test("restart recovery leases an exactly linked reconciled superseded candidate"
     [
       {
         jobId: job.id,
+        jobType: "analyze_session",
         candidateId: "analysis-candidate-recovery",
         candidateState: "superseded",
         leaseOwner: "restart-cloud-worker",
@@ -2956,6 +2995,7 @@ test("digest candidate recovery renews validated applied and superseded unfinish
       }),
       [{
         jobId: seeded.job.id,
+        jobType: "generate_daily_digest",
         candidateId: seeded.candidateId,
         candidateState,
         leaseOwner: "restart-digest-worker",
@@ -2964,6 +3004,29 @@ test("digest candidate recovery renews validated applied and superseded unfinish
       candidateState
     );
   }
+});
+
+test("shared cloud candidate recovery prefers analysis over an older digest", (t) => {
+  const { db, store } = fixture(t);
+  const analysisJob = seedCloudAnalysisRecovery(db, store);
+  db.prepare("UPDATE processing_jobs SET lease_expires_at = 99 WHERE id = ?").run(analysisJob.id);
+  seedCloudDigestRecovery(db, store, {
+    suffix: "older-priority",
+    candidateCreatedAt: 140,
+  });
+  db.prepare("UPDATE processing_jobs SET lease_expires_at = 200 WHERE id = ?").run(analysisJob.id);
+
+  const recovered = store.recoverExpiredCloudCandidateLeases({
+    owner: "shared-cloud-worker",
+    at: 200,
+    leaseMs: 300,
+    limit: 1,
+    priorityBefore: 81,
+  });
+
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].jobId, analysisJob.id);
+  assert.equal(recovered[0].jobType, "analyze_session");
 });
 
 test("analysis-only candidate recovery cannot renew a daily digest lease", (t) => {
@@ -2999,6 +3062,7 @@ test("analysis-only candidate recovery cannot renew a daily digest lease", (t) =
     [
       {
         jobId: seeded.job.id,
+        jobType: "generate_daily_digest",
         candidateId: seeded.candidateId,
         candidateState: "validated",
         leaseOwner: "shared-cloud-worker",
@@ -3297,6 +3361,36 @@ test("analysis-only recovery cannot claim a daily digest terminal-budget lease",
     })[0].id,
     seeded.job.id
   );
+});
+
+test("shared cloud prestart recovery prefers analysis over an older digest", (t) => {
+  const { db, store } = fixture(t);
+  const analysisJob = seedCloudAnalysisRecovery(db, store, {
+    attemptState: "none",
+    persistCandidate: false,
+  });
+  db.prepare("UPDATE processing_jobs SET lease_expires_at = 99 WHERE id = ?").run(analysisJob.id);
+  const digest = seedCloudDigestRecovery(db, store, {
+    attemptState: "none",
+    persistCandidate: false,
+    suffix: "older-prestart-priority",
+  });
+  db.prepare(
+    "UPDATE processing_jobs SET lease_expires_at = 200, created_at = 200 WHERE id = ?"
+  ).run(analysisJob.id);
+  db.prepare("UPDATE processing_jobs SET created_at = 100 WHERE id = ?").run(digest.job.id);
+
+  const recovered = store.recoverExpiredCloudPrestartLeases({
+    owner: "shared-cloud-worker",
+    at: 200,
+    leaseMs: 300,
+    limit: 1,
+    priorityBefore: 81,
+  });
+
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].id, analysisJob.id);
+  assert.equal(recovered[0].job_type, "analyze_session");
 });
 
 test("recovered paid digest crash windows converge without another network request", async (t) => {
@@ -3683,6 +3777,35 @@ test("agent admission backlog includes running and future-retry local work only"
      WHERE id = 'cloud-digest'`
   ).run();
   assert.equal(store.countCloudLaneInFlight(), 1);
+  assert.equal(store.countCloudLaneInFlight({ excludeJobId: "cloud-digest" }), 0);
+  assert.throws(
+    () => store.countCloudLaneInFlight({ excludeJobId: "../cloud-digest" }),
+    /identifier/i
+  );
+});
+
+test("digest admission sees actionable analysis while analysis excludes its own claim", (t) => {
+  const { db, store } = fixture(t);
+  const job = seedCloudAnalysisRecovery(db, store, {
+    attemptState: "none",
+    persistCandidate: false,
+  });
+
+  assert.deepEqual(store.listAgentAdmissionBacklog({ priorityBefore: 70 }), []);
+  assert.deepEqual(store.listAgentAdmissionBacklog({
+    priorityBefore: 80,
+    excludeJobId: "other-job",
+  }), [{
+    jobType: "analyze_session",
+    lane: "cloud",
+    state: "running",
+    priority: 70,
+    nextRetryAt: null,
+  }]);
+  assert.deepEqual(store.listAgentAdmissionBacklog({
+    priorityBefore: 80,
+    excludeJobId: job.id,
+  }), []);
 });
 
 test("atomically claims only durable jobs above the preview priority ceiling", (t) => {

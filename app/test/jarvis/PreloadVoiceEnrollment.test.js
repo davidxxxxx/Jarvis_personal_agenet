@@ -110,6 +110,21 @@ test("preload exposes narrow cloud budget controls", async () => {
   assert.deepEqual(invokes, [["jarvis:cloud-budget:get"], ["jarvis:cloud-budget:set", input]]);
 });
 
+test("preload exposes only scalar-date daily digest controls", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  assert.equal(await api.getDailyDigest("2026-07-17"), "invoked");
+  assert.equal(await api.regenerateDailyDigest("2026-07-17"), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:memory:daily-digest", { localDate: "2026-07-17" }],
+    ["jarvis:analysis:daily-digest:regenerate", { localDate: "2026-07-17" }],
+  ]);
+  assert.equal("getDailyDigestStatus" in api, false);
+  assert.throws(() => api.getDailyDigest({ localDate: "2026-07-17", timezone: "UTC" }));
+  assert.throws(() => api.regenerateDailyDigest("2026-02-29"), /valid calendar date/i);
+  assert.equal(invokes.length, 2);
+});
+
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
   const { api, sends, invokes, listeners } = loadPreloadApi();
   const shutdownRequests = [];

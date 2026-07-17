@@ -96,6 +96,21 @@ function evaluate(raw) {
   return new AgentWorkloadPolicy().evaluate(freezeAgentAdmissionSnapshot(raw));
 }
 
+function digestAdmissionSnapshot(overrides = {}) {
+  return {
+    snapshotVersion: 1,
+    kind: "generate_daily_digest",
+    sourceCurrent: true,
+    sourceFinalOnly: true,
+    backlog: [],
+    captureActive: false,
+    previewActive: false,
+    pressure: { state: "normal", reason: null },
+    cloudLaneInFlight: 0,
+    ...overrides,
+  };
+}
+
 test("exports the final agent priorities and an immutable dependency-free policy", () => {
   assert.deepEqual(AGENT_WORK_PRIORITY, {
     analyze_session: 70,
@@ -290,6 +305,34 @@ test("capture, preview, system pressure, and cloud-lane occupancy use stable rea
   const laneBusy = admissionSnapshot();
   laneBusy.cloudLaneInFlight = 1;
   assert.equal(evaluate(laneBusy).reason, "cloud_lane_busy");
+});
+
+test("daily digest uses priority 80, accepts partial coverage, and waits for analysis", () => {
+  assert.deepEqual(evaluate(digestAdmissionSnapshot()), {
+    eligible: true,
+    reason: null,
+    priority: 80,
+  });
+  assert.deepEqual(
+    evaluate(digestAdmissionSnapshot({ sourceCurrent: false })),
+    { eligible: false, reason: "current_input_superseded", priority: 80 }
+  );
+  assert.deepEqual(
+    evaluate(digestAdmissionSnapshot({ sourceFinalOnly: false })),
+    { eligible: false, reason: "final_inputs_pending", priority: 80 }
+  );
+  assert.deepEqual(
+    evaluate(digestAdmissionSnapshot({
+      backlog: [{
+        jobType: "analyze_session",
+        lane: "cloud",
+        state: "retry",
+        priority: 70,
+        nextRetryAt: 9_999,
+      }],
+    })),
+    { eligible: false, reason: "higher_priority_backlog", priority: 80 }
+  );
 });
 
 test("reason precedence is desired, finality, backlog, preview, pressure, then cloud lane", () => {

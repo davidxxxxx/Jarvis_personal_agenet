@@ -3156,6 +3156,42 @@ test("getAnalysisInputForCloud returns exact payload scope without local identit
   }
 });
 
+test("analysis admission manifest rechecks terminal final identity state", () => {
+  const db = createFixture();
+  try {
+    db.prepare(
+      "UPDATE sessions SET processing_state = 'ready' WHERE id = 'session-1'"
+    ).run();
+    const repository = createRepository(db);
+    const input = repository.createAnalysisInput(validCreateInput());
+
+    assert.deepEqual(repository.getAnalysisAdmissionManifest(input.analysisInputId), {
+      manifestVersion: 1,
+      sessionId: "session-1",
+      sessionState: "ended",
+      processingState: "ready",
+      segments: [{
+        ordinal: 0,
+        segmentId: "segment-1",
+        segmentVersion: 1,
+        textHash: sha256("durable evidence"),
+        final: true,
+        stable: true,
+        current: true,
+        duplicate: false,
+        identityKind: "durable_subject",
+      }],
+    });
+    db.prepare("UPDATE sessions SET processing_state = 'processing' WHERE id = 'session-1'").run();
+    assert.equal(
+      repository.getAnalysisAdmissionManifest(input.analysisInputId).processingState,
+      "processing"
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("createAnalysisInput rejects empty or duplicate ordered segment ids", () => {
   const db = createFixture();
   try {
@@ -5557,6 +5593,11 @@ test("a latest partial candidate cannot regress an active final digest", () => {
       candidateId: first.candidateId,
       leaseOwner: "digest-worker-final-partial",
     });
+    assert.equal(context.store.completeJob(context.job.id, {
+      owner: "digest-worker-final-partial",
+      at: 7_001,
+      executionDevice: "cloud",
+    }), true);
     assert.equal(context.input.completeness, "final");
     db.prepare(
       "UPDATE sessions SET processing_state = 'processing', ready_at = NULL WHERE id = ?"
@@ -5609,6 +5650,11 @@ test("a newer final daily input appends one evidence-backed revision", () => {
       candidateId: first.candidateId,
       leaseOwner: "digest-worker-next-final",
     });
+    assert.equal(context.store.completeJob(context.job.id, {
+      owner: "digest-worker-next-final",
+      at: 7_001,
+      executionDevice: "cloud",
+    }), true);
     const addedSegmentId = appendDailyDigestSegment(db, context, "next-final-added");
     const nextInput = context.repository.createDailyDigestInput({
       localDate: context.input.localDate,
