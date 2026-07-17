@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Clock3, Search } from "lucide-react";
 import type {
   JarvisRuntimeStatus,
@@ -9,6 +9,7 @@ import type {
 import { useJarvisStore } from "./jarvisStore";
 import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
 import DurableTranscript from "./DurableTranscript";
+import KnowledgeMemoryPanel from "./KnowledgeMemoryPanel";
 import ProcessingStatus from "./ProcessingStatus";
 
 function duration(session: JarvisSession): string {
@@ -26,8 +27,50 @@ function dateLabel(at: number): string {
   }).format(at);
 }
 
+function safeStringArray(value: string | null | undefined): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string").slice(0, 100)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+interface LegacySuggestion {
+  content: string;
+  reason: string;
+}
+
+function safeLegacySuggestions(value: string | null | undefined): LegacySuggestion[] {
+  try {
+    const parsed: unknown = JSON.parse(value || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (item): item is LegacySuggestion =>
+          item !== null &&
+          typeof item === "object" &&
+          "content" in item &&
+          typeof item.content === "string" &&
+          "reason" in item &&
+          typeof item.reason === "string"
+      )
+      .slice(0, 100);
+  } catch {
+    return [];
+  }
+}
+
 export default function MemoryView() {
   const storedSessions = useJarvisStore((state) => state.sessions);
+  const selectedSessionId = useJarvisStore((state) => state.selectedSessionId);
+  const evidenceNavigation = useJarvisStore((state) => state.evidenceNavigation);
+  const markEvidenceSessionOpened = useJarvisStore((state) => state.markEvidenceSessionOpened);
+  const failEvidenceSession = useJarvisStore((state) => state.failEvidenceSession);
+  const acknowledgeEvidencePlayback = useJarvisStore((state) => state.acknowledgeEvidencePlayback);
+  const clearEvidenceNavigation = useJarvisStore((state) => state.clearEvidenceNavigation);
   const [sessions, setSessions] = useState(storedSessions);
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<JarvisSessionDetail | null>(null);
@@ -139,31 +182,60 @@ export default function MemoryView() {
     }
   };
 
-  const open = async (sessionId: string) => {
-    const generation = ++detailRequestGeneration.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const runtimeRequest =
-        typeof window.electronAPI?.jarvis?.getRuntimeStatus === "function"
-          ? window.electronAPI.jarvis.getRuntimeStatus().catch(() => null)
-          : Promise.resolve(null);
-      const [nextDetail, nextTimeline, nextRuntimeStatus] = await Promise.all([
-        window.electronAPI.jarvis.getSessionDetail(sessionId),
-        window.electronAPI.jarvis.getSessionTimeline(sessionId),
-        runtimeRequest,
-      ]);
-      if (generation !== detailRequestGeneration.current) return;
-      setDetail(nextDetail);
-      setTimeline(nextTimeline);
-      setRuntimeStatus(nextRuntimeStatus);
-    } catch {
-      if (generation !== detailRequestGeneration.current) return;
-      setError("无法读取这次录音。");
-    } finally {
-      if (generation === detailRequestGeneration.current) setLoading(false);
+  const open = useCallback(
+    async (sessionId: string, evidenceRequestId?: number) => {
+      const generation = ++detailRequestGeneration.current;
+      setLoading(true);
+      setError(null);
+      try {
+        const runtimeRequest =
+          typeof window.electronAPI?.jarvis?.getRuntimeStatus === "function"
+            ? window.electronAPI.jarvis.getRuntimeStatus().catch(() => null)
+            : Promise.resolve(null);
+        const [nextDetail, nextTimeline, nextRuntimeStatus] = await Promise.all([
+          window.electronAPI.jarvis.getSessionDetail(sessionId),
+          window.electronAPI.jarvis.getSessionTimeline(sessionId),
+          runtimeRequest,
+        ]);
+        if (generation !== detailRequestGeneration.current) return;
+        setDetail(nextDetail);
+        setTimeline(nextTimeline);
+        setRuntimeStatus(nextRuntimeStatus);
+        if (evidenceRequestId !== undefined) markEvidenceSessionOpened(evidenceRequestId);
+      } catch {
+        if (generation !== detailRequestGeneration.current) return;
+        setError("无法读取这次录音。");
+        if (evidenceRequestId !== undefined) failEvidenceSession(evidenceRequestId);
+      } finally {
+        if (generation === detailRequestGeneration.current) setLoading(false);
+      }
+    },
+    [failEvidenceSession, markEvidenceSessionOpened]
+  );
+
+  useEffect(() => {
+    if (
+      evidenceNavigation.phase !== "opening_session" ||
+      selectedSessionId !== evidenceNavigation.context.sessionId
+    ) {
+      return;
     }
-  };
+    if (
+      detail?.session.id === evidenceNavigation.context.sessionId &&
+      timeline?.session_id === evidenceNavigation.context.sessionId
+    ) {
+      markEvidenceSessionOpened(evidenceNavigation.requestId);
+      return;
+    }
+    void open(evidenceNavigation.context.sessionId, evidenceNavigation.requestId);
+  }, [
+    detail?.session.id,
+    evidenceNavigation,
+    markEvidenceSessionOpened,
+    open,
+    selectedSessionId,
+    timeline?.session_id,
+  ]);
 
   const analyze = async () => {
     if (!detail) return;
@@ -177,29 +249,37 @@ export default function MemoryView() {
       ]);
       setDetail(nextDetail);
       setTimeline(nextTimeline);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "分析失败，请检查 MiniMax 设置。");
+    } catch {
+      setError("分析失败，请检查 MiniMax 设置后重试。");
     } finally {
       setLoading(false);
     }
   };
 
   if (detail) {
-    const decisions = detail.summary
-      ? (JSON.parse(detail.summary.decisions_json || "[]") as string[])
-      : [];
-    const suggestions = detail.summary
-      ? (JSON.parse(detail.summary.suggestions_json || "[]") as Array<{
-          content: string;
-          reason: string;
-        }>)
-      : [];
+    const decisions = safeStringArray(detail.summary?.decisions_json);
+    const suggestions = safeLegacySuggestions(detail.summary?.suggestions_json);
+    const evidenceContext =
+      "context" in evidenceNavigation && evidenceNavigation.context.sessionId === detail.session.id
+        ? evidenceNavigation.context
+        : null;
+    const focusRequestId = evidenceContext ? evidenceNavigation.requestId : null;
+    const seekRequest =
+      evidenceNavigation.phase === "seeking" && evidenceContext
+        ? {
+            requestId: evidenceNavigation.requestId,
+            trackId: evidenceContext.trackId,
+            sourceType: evidenceContext.sourceType,
+            startedAt: evidenceContext.startedAt,
+          }
+        : null;
     return (
       <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
         <button
           type="button"
           onClick={() => {
             detailRequestGeneration.current += 1;
+            clearEvidenceNavigation();
             setLoading(false);
             setDetail(null);
             setTimeline(null);
@@ -242,7 +322,21 @@ export default function MemoryView() {
         <DurableTranscript
           sessionId={detail.session.id}
           segments={timeline?.segments.length ? timeline.segments : detail.segments}
+          focusSegmentId={evidenceContext?.transcriptSegmentId}
+          focusRequestId={focusRequestId}
         />
+        {evidenceNavigation.phase === "transcript_only" && evidenceContext && (
+          <p role="status" className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
+            {evidenceNavigation.reason === "audio_expired"
+              ? "Audio was removed by the retention policy. "
+              : evidenceNavigation.reason === "audio_missing"
+                ? "Audio is unavailable. "
+                : "Audio became unavailable. "}
+            {evidenceContext.transcriptState === "available"
+              ? "Transcript evidence remains."
+              : "Transcript evidence is unavailable."}
+          </p>
+        )}
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
           <h2 className="font-semibold">完整总结</h2>
           <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
@@ -312,6 +406,8 @@ export default function MemoryView() {
               <ContinuousSessionPlayer
                 timeline={timeline}
                 readChunk={window.electronAPI.jarvis.readAudioChunk}
+                seekRequest={seekRequest}
+                onSeekResult={acknowledgeEvidencePlayback}
               />
             </div>
           ) : (
@@ -328,6 +424,9 @@ export default function MemoryView() {
       <p className="mt-1 text-sm text-muted-foreground">
         所有录音会话、转写、总结和长期记忆都在这里。
       </p>
+      <div className="mt-6">
+        <KnowledgeMemoryPanel />
+      </div>
       <form
         className="mt-5 flex max-w-2xl gap-2"
         onSubmit={(event) => {
@@ -366,7 +465,10 @@ export default function MemoryView() {
                   <button
                     key={session.id}
                     type="button"
-                    onClick={() => void open(session.id)}
+                    onClick={() => {
+                      clearEvidenceNavigation();
+                      void open(session.id);
+                    }}
                     className="flex w-full items-center justify-between rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
                   >
                     <div>

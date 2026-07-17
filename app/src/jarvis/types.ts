@@ -103,7 +103,7 @@ export interface JarvisSession {
   started_at: number;
   ended_at: number | null;
   status: JarvisSessionStatus;
-  mic_device_id: string | null;
+  mic_device_id?: string | null;
   language: string;
   created_at: number;
   capture_mode: JarvisCaptureMode;
@@ -120,6 +120,62 @@ export interface JarvisSessionQuery {
   to?: number;
   limit?: number;
 }
+
+export type JarvisEvidenceOwnerType =
+  | "memory_value"
+  | "topic_revision"
+  | "todo_instance"
+  | "session_summary_revision"
+  | "daily_digest_item"
+  | "suggestion"
+  | "speaker_cluster";
+
+export interface JarvisEvidenceHandle {
+  ownerType: JarvisEvidenceOwnerType;
+  ownerId: string;
+  evidenceId: string;
+}
+
+export interface JarvisEvidenceContext extends JarvisEvidenceHandle {
+  sessionId: string;
+  sessionStartedAt: number;
+  sessionEndedAt: number | null;
+  transcriptSegmentId: string | null;
+  transcriptState: "available" | "missing";
+  trackId: string | null;
+  sourceType: "mic" | "system" | null;
+  startedAt: number;
+  endedAt: number;
+  quoteText: string | null;
+  audioState: "available" | "expired" | "missing";
+}
+
+export type JarvisEvidenceNavigationState =
+  | { phase: "idle"; requestId: number }
+  | { phase: "resolving"; requestId: number; handle: JarvisEvidenceHandle }
+  | { phase: "opening_session"; requestId: number; context: JarvisEvidenceContext }
+  | { phase: "seeking"; requestId: number; context: JarvisEvidenceContext }
+  | {
+      phase: "transcript_only";
+      requestId: number;
+      context: JarvisEvidenceContext;
+      reason: "audio_expired" | "audio_missing" | "audio_became_unavailable";
+    }
+  | { phase: "playing"; requestId: number; context: JarvisEvidenceContext }
+  | {
+      phase: "failed";
+      requestId: number;
+      code: "evidence_not_found" | "session_unavailable" | "evidence_navigation_failed";
+    };
+
+export interface JarvisContinuousSeekRequest {
+  requestId: number;
+  trackId: string | null;
+  sourceType: "mic" | "system" | null;
+  startedAt: number;
+}
+
+export type JarvisContinuousSeekResult = "playing" | "audio_unavailable" | "seek_target_missing";
 
 export interface JarvisTranscriptSegmentInput {
   id: string;
@@ -267,23 +323,15 @@ export interface JarvisPersonIdentityDetail {
 export interface JarvisAudioChunk {
   id: string;
   session_id: string;
-  path: string;
   started_at: number;
   ended_at: number;
   duration_ms: number;
-  sha256: string;
-  expires_at: number;
-  transcription_status: string;
-  pcm_sha256?: string;
   track_id?: string | null;
   source_type?: "mic" | "system";
   sequence_number?: number;
   write_state?: string;
   deleted_at?: number | null;
   format?: "wav" | "flac";
-  file_sha256?: string | null;
-  sample_rate?: number;
-  channels?: number;
 }
 
 export interface JarvisAudioGap {
@@ -293,9 +341,6 @@ export interface JarvisAudioGap {
   ended_at: number | null;
   reason: string;
   recovery_attempts: number;
-  restored_device_id?: string | null;
-  restored_device_label?: string | null;
-  restored_strategy?: string | null;
   average_level?: number | null;
   peak_level?: number | null;
 }
@@ -304,9 +349,6 @@ export interface JarvisAudioTrack {
   id: string;
   session_id: string;
   source_type: "mic" | "system";
-  device_id: string | null;
-  device_label: string | null;
-  strategy: string | null;
   sample_rate: number;
   channels: number;
   started_at: number;
@@ -543,6 +585,7 @@ export interface JarvisDailyDigestEvidence {
   endedAt: number;
   quote: string;
   audioState: "available" | "expired" | "missing";
+  handle?: JarvisEvidenceHandle;
 }
 
 export interface JarvisDailyDigest {
@@ -556,14 +599,7 @@ export interface JarvisDailyDigest {
 }
 
 export interface JarvisDailyDigestStatus {
-  state:
-    | "not_generated"
-    | "empty"
-    | "queued"
-    | "running"
-    | "retry_needed"
-    | "ready"
-    | "blocked";
+  state: "not_generated" | "empty" | "queued" | "running" | "retry_needed" | "ready" | "blocked";
   retryable: boolean;
   errorCode:
     | "offline"
@@ -580,6 +616,140 @@ export interface JarvisDailyDigestStatus {
 export interface JarvisDailyDigestReadResult {
   digest: JarvisDailyDigest | null;
   status: JarvisDailyDigestStatus;
+}
+
+export interface JarvisKnowledgeEvidence {
+  sessionId: string;
+  segmentId: string;
+  startedAt: number;
+  endedAt: number;
+  quote: string;
+  audioState: "available" | "expired" | "missing";
+  handle?: JarvisEvidenceHandle;
+}
+
+export interface JarvisKnowledgeOverview {
+  memories: Array<{
+    id: string;
+    kind: string;
+    title: string;
+    body: string;
+    confidence: number;
+    lifecycle: string;
+    createdAt: number;
+    updatedAt: number;
+    occurrences: Array<{
+      id: string;
+      sessionId: string | null;
+      startedAt: number | null;
+      endedAt: number | null;
+      confidence: number;
+      createdAt: number;
+      evidence: JarvisKnowledgeEvidence[];
+    }>;
+  }>;
+  topics: Array<{
+    id: string;
+    name: string;
+    lifecycle: string;
+    createdAt: number;
+    updatedAt: number;
+    revisions: Array<{
+      id: string;
+      revision: number;
+      summary: string;
+      createdAt: number;
+    }>;
+    occurrences: Array<{
+      id: string;
+      sessionId: string | null;
+      revisionId: string;
+      createdAt: number;
+      evidence: JarvisKnowledgeEvidence[];
+    }>;
+  }>;
+  todos: Array<{
+    id: string;
+    title: string;
+    ownerLabel: string | null;
+    status: "open" | "completed" | "dismissed";
+    completedAt: number | null;
+    dismissedAt: number | null;
+    createdAt: number;
+    updatedAt: number;
+    revisions: Array<{
+      id: string;
+      revision: number;
+      title: string;
+      dueText: string | null;
+      createdAt: number;
+    }>;
+    occurrences: Array<{
+      id: string;
+      sessionId: string | null;
+      revisionId: string;
+      startedAt: number | null;
+      endedAt: number | null;
+      createdAt: number;
+      evidence: JarvisKnowledgeEvidence[];
+    }>;
+    transitions: Array<{
+      id: string;
+      fromStatus: string | null;
+      toStatus: "open" | "completed" | "dismissed";
+      occurredAt: number;
+    }>;
+  }>;
+  suggestions: Array<{
+    id: string;
+    title: string;
+    rationale: string;
+    state: "proposed" | "accepted" | "dismissed";
+    decidedAt: number | null;
+    createdAt: number;
+    updatedAt: number;
+    occurrences: Array<{
+      id: string;
+      sessionId: string | null;
+      createdAt: number;
+      evidence: JarvisKnowledgeEvidence[];
+    }>;
+  }>;
+  conflicts: Array<{
+    id: string;
+    episode: number;
+    state: "open" | "resolved";
+    selectedMemoryItemId: string | null;
+    resolvedAt: number | null;
+    createdAt: number;
+    updatedAt: number;
+    members: Array<{
+      memoryItemId: string;
+      title: string;
+      body: string;
+      lifecycle: string;
+      selected: boolean;
+    }>;
+  }>;
+  truncated: boolean;
+}
+
+export interface JarvisSuggestionDecisionResult {
+  status: "accepted" | "already_accepted" | "dismissed" | "already_dismissed";
+  suggestionId: string;
+  decidedAt: number;
+}
+
+export interface JarvisMemoryConflictResolutionResult {
+  status: "resolved" | "already_resolved";
+  conflictGroupId: string;
+  selectedMemoryItemId: string;
+}
+
+export interface JarvisKnowledgeTodoCompletionResult {
+  status: "completed" | "already_completed";
+  todoId: string;
+  completedAt: number;
 }
 
 export interface JarvisAnalysisStatus {

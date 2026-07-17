@@ -20,7 +20,7 @@ function chunk(
   id: string,
   source_type: "mic" | "system",
   started_at: number,
-  sequence_number: number,
+  sequence_number: number
 ) {
   return {
     id,
@@ -56,9 +56,6 @@ function timeline(overrides: Partial<JarvisSessionTimeline> = {}): JarvisSession
         id: "track-mic",
         session_id: "session-1",
         source_type: "mic",
-        device_id: "physical-mic",
-        device_label: "Physical microphone",
-        strategy: "web-audio",
         sample_rate: 24_000,
         channels: 1,
         started_at: 1_000,
@@ -79,9 +76,6 @@ function timeline(overrides: Partial<JarvisSessionTimeline> = {}): JarvisSession
         id: "track-system",
         session_id: "session-1",
         source_type: "system",
-        device_id: null,
-        device_label: null,
-        strategy: "wasapi-loopback",
         sample_rate: 24_000,
         channels: 1,
         started_at: 1_000,
@@ -148,6 +142,64 @@ beforeEach(() => {
 });
 
 describe("ContinuousSessionPlayer", () => {
+  it("honors a controlled evidence seek and continues through the remaining source lane", async () => {
+    const readChunk = vi.fn(async () => new Uint8Array([1]));
+    const onSeekResult = vi.fn();
+    const sourceTimeline = timeline({
+      chunks: [
+        chunk("mic-1", "mic", 1_000, 0),
+        chunk("system-1", "system", 1_500, 0),
+        chunk("system-2", "system", 2_500, 1),
+      ],
+    });
+
+    render(
+      <ContinuousSessionPlayer
+        timeline={sourceTimeline}
+        readChunk={readChunk}
+        seekRequest={{
+          requestId: 7,
+          trackId: "track-system",
+          sourceType: "system",
+          startedAt: 1_750,
+        }}
+        onSeekResult={onSeekResult}
+      />
+    );
+
+    await waitFor(() => expect(readChunk).toHaveBeenNthCalledWith(1, "system-1"));
+    await waitFor(() => expect(createdAudio).toHaveLength(1));
+    expect(createdAudio[0].currentTime).toBe(0.25);
+    expect(onSeekResult).toHaveBeenCalledWith(7, "playing");
+
+    createdAudio[0].onended?.();
+    await waitFor(() => expect(readChunk).toHaveBeenNthCalledWith(2, "system-2"));
+    expect(readChunk).not.toHaveBeenCalledWith("mic-1");
+  });
+
+  it("reports a retention race without skipping to later audio", async () => {
+    const readChunk = vi.fn(async () => null);
+    const onSeekResult = vi.fn();
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          chunks: [chunk("system-1", "system", 1_500, 0), chunk("system-2", "system", 2_500, 1)],
+        })}
+        readChunk={readChunk}
+        seekRequest={{
+          requestId: 8,
+          trackId: "track-system",
+          sourceType: "system",
+          startedAt: 1_750,
+        }}
+        onSeekResult={onSeekResult}
+      />
+    );
+
+    await waitFor(() => expect(onSeekResult).toHaveBeenCalledWith(8, "audio_unavailable"));
+    expect(readChunk).toHaveBeenCalledTimes(1);
+  });
+
   it("plays successive chronological chunks as one session", async () => {
     const readChunk = vi.fn(async () => new Uint8Array([1, 2, 3]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);

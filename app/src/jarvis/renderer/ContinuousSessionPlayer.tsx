@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { JarvisAudioChunk, JarvisSessionTimeline } from "../types";
+import type {
+  JarvisAudioChunk,
+  JarvisContinuousSeekRequest,
+  JarvisContinuousSeekResult,
+  JarvisSessionTimeline,
+} from "../types";
 
 type PlaybackMode = "mix" | "mic" | "system";
 
 interface ContinuousSessionPlayerProps {
   timeline: JarvisSessionTimeline;
   readChunk: (chunkId: string) => Promise<Uint8Array | null>;
+  seekRequest?: JarvisContinuousSeekRequest | null;
+  onSeekResult?: (requestId: number, result: JarvisContinuousSeekResult) => void;
 }
 
 function orderedChunks(chunks: JarvisAudioChunk[]): JarvisAudioChunk[] {
@@ -26,6 +33,8 @@ function laneLabel(source: "mic" | "system"): string {
 export default function ContinuousSessionPlayer({
   timeline,
   readChunk,
+  seekRequest = null,
+  onSeekResult,
 }: ContinuousSessionPlayerProps) {
   const [mode, setMode] = useState<PlaybackMode>("mix");
   const [playing, setPlaying] = useState(false);
@@ -33,6 +42,12 @@ export default function ContinuousSessionPlayer({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null);
   const generationRef = useRef(0);
+  const consumedSeekRequestRef = useRef<number | null>(null);
+  const onSeekResultRef = useRef(onSeekResult);
+
+  useEffect(() => {
+    onSeekResultRef.current = onSeekResult;
+  }, [onSeekResult]);
 
   const releaseAudio = useCallback(() => {
     audioRef.current?.pause();
@@ -63,9 +78,7 @@ export default function ContinuousSessionPlayer({
   const allPlayable = useMemo(() => orderedChunks(timeline.chunks), [timeline.chunks]);
   const queue = useMemo(
     () =>
-      mode === "mix"
-        ? allPlayable
-        : allPlayable.filter((chunk) => chunk.source_type === mode),
+      mode === "mix" ? allPlayable : allPlayable.filter((chunk) => chunk.source_type === mode),
     [allPlayable, mode]
   );
 
@@ -74,7 +87,8 @@ export default function ContinuousSessionPlayer({
       playbackQueue: JarvisAudioChunk[],
       initialIndex: number,
       initialSeekSeconds: number,
-      generation: number
+      generation: number,
+      controlledRequestId: number | null = null
     ) => {
       let skipped = 0;
       for (let index = initialIndex; index < playbackQueue.length; index += 1) {
@@ -88,6 +102,12 @@ export default function ContinuousSessionPlayer({
         }
         if (generation !== generationRef.current) return;
         if (!bytes) {
+          if (controlledRequestId !== null && index === initialIndex) {
+            setWarning("证据音频已不可用，已保留并定位转写内容。");
+            setPlaying(false);
+            onSeekResultRef.current?.(controlledRequestId, "audio_unavailable");
+            return;
+          }
           skipped += 1;
           setWarning(`已跳过 ${skipped} 段不可用音频。时间线中的缺口仍会保留。`);
           continue;
@@ -111,10 +131,20 @@ export default function ContinuousSessionPlayer({
         };
         try {
           await audio.play();
+          if (generation !== generationRef.current) return;
+          if (controlledRequestId !== null && index === initialIndex) {
+            onSeekResultRef.current?.(controlledRequestId, "playing");
+          }
           return;
         } catch {
           if (generation !== generationRef.current) return;
           releaseAudio();
+          if (controlledRequestId !== null && index === initialIndex) {
+            setWarning("证据音频已不可用，已保留并定位转写内容。");
+            setPlaying(false);
+            onSeekResultRef.current?.(controlledRequestId, "audio_unavailable");
+            return;
+          }
           skipped += 1;
           setWarning(`已跳过 ${skipped} 段不可用音频。时间线中的缺口仍会保留。`);
         }
@@ -148,6 +178,42 @@ export default function ContinuousSessionPlayer({
     start([chunk], 0, Math.max(0, startedAt - chunk.started_at) / 1_000);
   };
 
+  const startControlledSeek = useCallback(
+    (request: JarvisContinuousSeekRequest) => {
+      stop();
+      setWarning(null);
+      const lane = request.trackId
+        ? allPlayable.filter((chunk) => chunk.track_id === request.trackId)
+        : request.sourceType
+          ? allPlayable.filter((chunk) => chunk.source_type === request.sourceType)
+          : allPlayable;
+      const targetIndex = lane.findIndex(
+        (chunk) => chunk.started_at <= request.startedAt && request.startedAt < chunk.ended_at
+      );
+      if (targetIndex < 0) {
+        setWarning("无法定位证据对应的音频分片，已保留转写内容。");
+        onSeekResultRef.current?.(request.requestId, "seek_target_missing");
+        return;
+      }
+      const generation = ++generationRef.current;
+      setPlaying(true);
+      void playAt(
+        lane,
+        targetIndex,
+        Math.max(0, request.startedAt - lane[targetIndex].started_at) / 1_000,
+        generation,
+        request.requestId
+      );
+    },
+    [allPlayable, playAt, stop]
+  );
+
+  useEffect(() => {
+    if (!seekRequest || consumedSeekRequestRef.current === seekRequest.requestId) return;
+    consumedSeekRequestRef.current = seekRequest.requestId;
+    startControlledSeek(seekRequest);
+  }, [seekRequest, startControlledSeek]);
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -170,7 +236,11 @@ export default function ContinuousSessionPlayer({
           {playing ? "停止播放" : "连续播放"}
         </button>
       </div>
-      {warning && <p role="alert" className="text-sm text-amber-700">{warning}</p>}
+      {warning && (
+        <p role="alert" className="text-sm text-amber-700">
+          {warning}
+        </p>
+      )}
       <div className="grid gap-3 md:grid-cols-2">
         {timeline.tracks.map((track) => (
           <section
@@ -182,14 +252,17 @@ export default function ContinuousSessionPlayer({
             <p className="mt-1 text-xs text-muted-foreground">{track.state}</p>
             <div className="mt-2 space-y-1">
               {track.gaps.map((gap) => {
-                const missingSeconds = Math.max(0, (gap.ended_at ?? Date.now()) - gap.started_at) / 1_000;
+                const missingSeconds =
+                  Math.max(0, (gap.ended_at ?? Date.now()) - gap.started_at) / 1_000;
                 return (
                   <p key={gap.id} className="rounded bg-amber-50 px-2 py-1 text-xs text-amber-800">
                     缺失 {missingSeconds.toFixed(1)} 秒 · {gap.reason}
                   </p>
                 );
               })}
-              {track.gaps.length === 0 && <p className="text-xs text-muted-foreground">没有已记录缺口</p>}
+              {track.gaps.length === 0 && (
+                <p className="text-xs text-muted-foreground">没有已记录缺口</p>
+              )}
             </div>
           </section>
         ))}
@@ -206,7 +279,8 @@ export default function ContinuousSessionPlayer({
                 className="block w-full rounded-lg bg-muted/30 p-3 text-left"
               >
                 <span className="block text-xs font-medium text-primary">
-                  {segment.speaker_label} · {new Date(segment.started_at).toLocaleTimeString("zh-CN")}
+                  {segment.speaker_label} ·{" "}
+                  {new Date(segment.started_at).toLocaleTimeString("zh-CN")}
                 </span>
                 <span className="mt-1 block text-sm leading-6">{segment.text}</span>
               </button>

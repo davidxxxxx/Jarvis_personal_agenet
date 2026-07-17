@@ -77,6 +77,29 @@ function seedJob(db, overrides = {}) {
   });
 }
 
+function seedDailyDigestJob(db) {
+  const sourceHash = "c".repeat(64);
+  const payload = JSON.stringify({ schemaVersion: "jarvis-daily-digest-input-v1" });
+  db.prepare(
+    `INSERT INTO daily_digest_inputs (
+       id, local_date, timezone, source_hash, contract_version, completeness,
+       input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+     ) VALUES (
+       'digest-input', '2026-07-17', 'Asia/Shanghai', ?,
+       'jarvis-daily-digest-input-v1', 'final', '{}', ?, ?, 'model-v2', 100
+     )`
+  ).run(sourceHash, payload, Buffer.byteLength(payload));
+  db.prepare(
+    `INSERT INTO processing_jobs (
+       id, session_id, job_type, state, priority, input_hash, input_version,
+       model_version, attempt_count, lane, digest_input_id, created_at
+     ) VALUES (
+       'cloud-digest', NULL, 'generate_daily_digest', 'pending', 80, ?, 3,
+       'model-v2', 0, 'cloud', 'digest-input', 100
+     )`
+  ).run(sourceHash);
+}
+
 test("reclaims an expired job and completes it exactly once", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, {
@@ -350,13 +373,7 @@ test("permit draining preserves durable retry and resource deferral transitions"
 test("local runner leaves unknown and cloud work unclaimed instead of classifying maintenance", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, { jobType: "unknown_job" });
-  seedJob(db, {
-    id: "cloud-digest",
-    jobType: "generate_daily_digest",
-    priority: 80,
-    lane: "cloud",
-    inputHash: "cloud-digest",
-  });
+  seedDailyDigestJob(db);
 
   assert.throws(
     () => runner.register("unknown_job", async () => {}),

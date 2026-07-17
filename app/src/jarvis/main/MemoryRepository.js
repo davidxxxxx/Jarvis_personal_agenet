@@ -14,6 +14,10 @@ const {
   DAILY_DIGEST_SCHEMA_VERSION,
   validateCandidateDailyDigest,
 } = require("./DailyDigestSchema");
+const {
+  normalizeEvidenceContextRequest,
+  normalizeEvidenceContextResponse,
+} = require("../shared/contracts");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -26,6 +30,9 @@ const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
 const MAX_DAILY_DIGEST_CANDIDATE_BYTES = 512 * 1024;
 const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
 const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
+const PUBLIC_SNAPSHOT_LIST_LIMIT = 101;
+const PUBLIC_SNAPSHOT_HISTORY_LIMIT = 20;
+const PUBLIC_SNAPSHOT_EVIDENCE_LIMIT = 8;
 
 function codedError(code) {
   const error = new Error(code);
@@ -50,8 +57,7 @@ function sha256(value) {
 
 function compileDigestRedactor(redactionTerms) {
   const redactAnalysisText = compileRedactionTerms(redactionTerms);
-  return (value) =>
-    redactAnalysisText(String(value)).replace(/\[SECRET\]/gu, "[REDACTED_SECRET]");
+  return (value) => redactAnalysisText(String(value)).replace(/\[SECRET\]/gu, "[REDACTED_SECRET]");
 }
 
 function digestFreeTextIsRedacted(value, redact, textContext = false) {
@@ -785,9 +791,7 @@ class MemoryRepository {
       evidenceSegmentIds,
     }));
     const selectMemoryKind = (kind) =>
-      memoryItems
-        .filter((item) => item.kind === kind)
-        .map(({ kind: _kind, ...item }) => item);
+      memoryItems.filter((item) => item.kind === kind).map(({ kind: _kind, ...item }) => item);
     const decisions = selectMemoryKind("decision");
     const commitments = selectMemoryKind("commitment");
 
@@ -908,11 +912,7 @@ class MemoryRepository {
   }
 
   createDailyDigestInput(input) {
-    assertExactPlainObject(
-      input,
-      ["localDate", "timezone", "modelVersion"],
-      "daily digest input"
-    );
+    assertExactPlainObject(input, ["localDate", "timezone", "modelVersion"], "daily digest input");
     const { localDate, timezone, modelVersion } = input;
     const boundary = resolveLocalDate({ localDate, timezone });
     const safeModelVersion = assertText(modelVersion, "modelVersion", 128);
@@ -956,12 +956,13 @@ class MemoryRepository {
           };
           sessionsById.set(segment.session_id, session);
         }
-        const subjectRef = segment.is_self === 1
-          ? "SELF"
-          : pseudonymousRef(
-              "subject",
-              segment.person_id ?? `${segment.session_id}:${segment.speaker_label}`
-            );
+        const subjectRef =
+          segment.is_self === 1
+            ? "SELF"
+            : pseudonymousRef(
+                "subject",
+                segment.person_id ?? `${segment.session_id}:${segment.speaker_label}`
+              );
         const text = redact(segment.text);
         session.segments.push({
           segmentId: segment.id,
@@ -1030,11 +1031,7 @@ class MemoryRepository {
         endsAt: Math.max(...segments.map((segment) => segment.ended_at)),
       };
       const allowedSegmentIds = new Set(segments.map((segment) => segment.id));
-      const evidenceSections = this._dailyEvidenceSections(
-        boundary,
-        allowedSegmentIds,
-        redact
-      );
+      const evidenceSections = this._dailyEvidenceSections(boundary, allowedSegmentIds, redact);
       const sections = {
         sessions,
         peopleInteractions,
@@ -1716,8 +1713,8 @@ class MemoryRepository {
     }
     if (
       allowedSegmentIds.size === 0 ||
-      [...segmentSubjectById].some(([segmentId, subjectRef]) =>
-        !subjectEvidenceByRef.get(subjectRef)?.has(segmentId)
+      [...segmentSubjectById].some(
+        ([segmentId, subjectRef]) => !subjectEvidenceByRef.get(subjectRef)?.has(segmentId)
       )
     ) {
       throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
@@ -1834,11 +1831,7 @@ class MemoryRepository {
   }
 
   listRecoverableDailyDigestCandidates(input = { afterId: "", limit: 100 }) {
-    assertExactPlainObject(
-      input,
-      ["afterId", "limit"],
-      "recoverable daily digest candidate query"
-    );
+    assertExactPlainObject(input, ["afterId", "limit"], "recoverable daily digest candidate query");
     const { afterId, limit } = input;
     if (typeof afterId !== "string" || Array.from(afterId).length > 512) {
       throw new TypeError("afterId must be a bounded string");
@@ -1929,10 +1922,7 @@ class MemoryRepository {
     }
     if (
       row.candidate_state !== "validated" &&
-      !(
-        ["applied", "superseded"].includes(row.candidate_state) &&
-        row.job_completed_at === null
-      )
+      !(["applied", "superseded"].includes(row.candidate_state) && row.job_completed_at === null)
     ) {
       return null;
     }
@@ -2012,11 +2002,13 @@ class MemoryRepository {
     ) {
       throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED");
     }
-    const evidenceSegmentIds = [...new Set(
-      Object.values(candidate.sections).flatMap((items) =>
-        items.flatMap((item) => item.evidenceSegmentIds)
-      )
-    )].sort();
+    const evidenceSegmentIds = [
+      ...new Set(
+        Object.values(candidate.sections).flatMap((items) =>
+          items.flatMap((item) => item.evidenceSegmentIds)
+        )
+      ),
+    ].sort();
     return {
       candidateRow,
       storedInput,
@@ -2100,7 +2092,8 @@ class MemoryRepository {
     const leaseOwner = assertText(input.leaseOwner, "leaseOwner");
     const transaction = this.db.transaction(() => {
       const loaded = this._loadDailyDigestCandidateForApply(candidateId);
-      const { candidateRow, storedInput, candidate, candidateJson, job, evidenceSegmentIds } = loaded;
+      const { candidateRow, storedInput, candidate, candidateJson, job, evidenceSegmentIds } =
+        loaded;
       const appliedAt = assertTimestamp(this.now(), "appliedAt");
       if (
         job.state !== "running" ||
@@ -4510,7 +4503,6 @@ class MemoryRepository {
         .get(suggestionId);
       if (!row) throw codedError("MEMORY_SUGGESTION_NOT_FOUND");
       if (row.state === terminalState) {
-        if (row.decided_at !== at) throw codedError("MEMORY_SUGGESTION_STALE_TRANSITION");
         return {
           status: `already_${terminalState}`,
           suggestionId,
@@ -4537,6 +4529,34 @@ class MemoryRepository {
 
   dismissSuggestion(input) {
     return this._transitionSuggestion(input, "dismissed");
+  }
+
+  completeTodo(input) {
+    if (!hasExactKeys(input, ["todoId"])) {
+      throw new TypeError("todo completion must contain only todoId");
+    }
+    const todoId = assertId(input.todoId, "todoId");
+    const transaction = this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT status, completed_at FROM todos_v2 WHERE id = ?")
+        .get(todoId);
+      if (!row) throw codedError("MEMORY_TODO_NOT_FOUND");
+      if (row.status === "completed") {
+        return { status: "already_completed", todoId, completedAt: row.completed_at };
+      }
+      if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+      const completedAt = assertTimestamp(this.now(), "completedAt");
+      this.db
+        .prepare(
+          `INSERT INTO todo_state_transitions (
+             id, todo_instance_id, from_status, to_status, reason,
+             source_analysis_input_id, actor, occurred_at
+           ) VALUES (?, ?, 'open', 'completed', 'user_action', NULL, 'user', ?)`
+        )
+        .run(this._nextId("todo_transition"), todoId, completedAt);
+      return { status: "completed", todoId, completedAt };
+    });
+    return transaction.immediate();
   }
 
   resolveMemoryConflict(input) {
@@ -4709,115 +4729,116 @@ class MemoryRepository {
   }
 
   _saveDigestRevisionInTransaction(input, createdAt = null) {
-      const {
-        localDate,
-        timezone,
-        sourceHash,
-        completeness,
-        inputWatermarkJson,
-        contentJson,
-        evidenceRows,
-      } = input;
-      const existing = this.db
-        .prepare(
-          `SELECT id, revision, completeness, input_watermark_json, content_json
+    const {
+      localDate,
+      timezone,
+      sourceHash,
+      completeness,
+      inputWatermarkJson,
+      contentJson,
+      evidenceRows,
+    } = input;
+    const existing = this.db
+      .prepare(
+        `SELECT id, revision, completeness, input_watermark_json, content_json
            FROM daily_digests
            WHERE local_date = ? AND timezone = ? AND source_hash = ?`
-        )
-        .get(localDate, timezone, sourceHash);
-      if (existing) {
-        const existingEvidenceIds = this.db
-          .prepare(
-            `SELECT transcript_segment_id FROM evidence_refs
+      )
+      .get(localDate, timezone, sourceHash);
+    if (existing) {
+      const existingEvidenceIds = this.db
+        .prepare(
+          `SELECT transcript_segment_id FROM evidence_refs
              WHERE entity_type = 'daily_digest' AND entity_id = ?
              ORDER BY transcript_segment_id`
-          )
-          .all(existing.id)
-          .map((row) => row.transcript_segment_id);
-        if (
-          existing.completeness !== completeness ||
-          existing.input_watermark_json !== inputWatermarkJson ||
-          existing.content_json !== contentJson ||
-          canonicalJson(existingEvidenceIds) !== canonicalJson(evidenceRows.map((row) => row.id))
-        ) {
-          throw codedError("MEMORY_DIGEST_HASH_COLLISION");
-        }
-        return {
-          status: "existing",
-          digestId: existing.id,
-          revision: existing.revision,
-          sourceHash,
-        };
+        )
+        .all(existing.id)
+        .map((row) => row.transcript_segment_id);
+      if (
+        existing.completeness !== completeness ||
+        existing.input_watermark_json !== inputWatermarkJson ||
+        existing.content_json !== contentJson ||
+        canonicalJson(existingEvidenceIds) !== canonicalJson(evidenceRows.map((row) => row.id))
+      ) {
+        throw codedError("MEMORY_DIGEST_HASH_COLLISION");
       }
-      const previous = this.db
-        .prepare(
-          `SELECT id, revision, completeness
+      return {
+        status: "existing",
+        digestId: existing.id,
+        revision: existing.revision,
+        sourceHash,
+      };
+    }
+    const previous = this.db
+      .prepare(
+        `SELECT id, revision, completeness
            FROM daily_digests
            WHERE local_date = ? AND timezone = ?
            ORDER BY revision DESC LIMIT 1`
-        )
-        .get(localDate, timezone);
-      if (previous?.completeness === "final" && completeness === "partial") {
-        throw codedError("MEMORY_DIGEST_COMPLETENESS_REGRESSION");
-      }
-      const digestId = this._nextId("daily_digest");
-      const appliedAt = createdAt === null
+      )
+      .get(localDate, timezone);
+    if (previous?.completeness === "final" && completeness === "partial") {
+      throw codedError("MEMORY_DIGEST_COMPLETENESS_REGRESSION");
+    }
+    const digestId = this._nextId("daily_digest");
+    const appliedAt =
+      createdAt === null
         ? assertTimestamp(this.now(), "createdAt")
         : assertTimestamp(createdAt, "createdAt");
-      const revision = (previous?.revision ?? 0) + 1;
-      this.db
-        .prepare(
-          `INSERT INTO daily_digests (
+    const revision = (previous?.revision ?? 0) + 1;
+    this.db
+      .prepare(
+        `INSERT INTO daily_digests (
              id, local_date, timezone, revision, completeness, lifecycle,
              input_watermark_json, content_json, previous_revision_id,
              source_hash, created_at, updated_at
            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          digestId,
-          localDate,
-          timezone,
-          revision,
-          completeness,
-          inputWatermarkJson,
-          contentJson,
-          previous?.id ?? null,
-          sourceHash,
-          appliedAt,
-          appliedAt
-        );
-      const insertEvidence = this.db.prepare(
-        `INSERT INTO evidence_refs (
+      )
+      .run(
+        digestId,
+        localDate,
+        timezone,
+        revision,
+        completeness,
+        inputWatermarkJson,
+        contentJson,
+        previous?.id ?? null,
+        sourceHash,
+        appliedAt,
+        appliedAt
+      );
+    const insertEvidence = this.db.prepare(
+      `INSERT INTO evidence_refs (
            id, entity_type, entity_id, source_analysis_input_id, session_id,
            transcript_segment_id, audio_chunk_id, track_id, started_at, ended_at,
            quote_text, audio_state, created_at
          ) VALUES (?, 'daily_digest', ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const evidence of evidenceRows) {
+      insertEvidence.run(
+        this._nextId("evidence"),
+        digestId,
+        evidence.session_id,
+        evidence.id,
+        evidence.chunk_id,
+        evidence.track_id,
+        evidence.started_at,
+        evidence.ended_at,
+        evidence.text,
+        evidence.chunk_id === null
+          ? "missing"
+          : evidence.deleted_at === null
+            ? "available"
+            : "expired",
+        appliedAt
       );
-      for (const evidence of evidenceRows) {
-        insertEvidence.run(
-          this._nextId("evidence"),
-          digestId,
-          evidence.session_id,
-          evidence.id,
-          evidence.chunk_id,
-          evidence.track_id,
-          evidence.started_at,
-          evidence.ended_at,
-          evidence.text,
-          evidence.chunk_id === null
-            ? "missing"
-            : evidence.deleted_at === null
-              ? "available"
-              : "expired",
-          appliedAt
-        );
-      }
-      if (previous) {
-        this.db
-          .prepare("UPDATE daily_digests SET lifecycle = 'superseded', updated_at = ? WHERE id = ?")
-          .run(appliedAt, previous.id);
-      }
-      return { status: "created", digestId, revision, sourceHash };
+    }
+    if (previous) {
+      this.db
+        .prepare("UPDATE daily_digests SET lifecycle = 'superseded', updated_at = ? WHERE id = ?")
+        .run(appliedAt, previous.id);
+    }
+    return { status: "created", digestId, revision, sourceHash };
   }
 
   saveDigestRevision(input) {
@@ -4829,11 +4850,7 @@ class MemoryRepository {
   }
 
   getLatestDailyDigest(input) {
-    assertExactPlainObject(
-      input,
-      ["localDate", "timezone"],
-      "latest daily digest query"
-    );
+    assertExactPlainObject(input, ["localDate", "timezone"], "latest daily digest query");
     const localDate = assertLocalDate(input.localDate);
     const timezone = assertTimezone(input.timezone);
     const row = this.db
@@ -4843,6 +4860,7 @@ class MemoryRepository {
                 digest.created_at, digest.updated_at,
                 (
                   SELECT COALESCE(json_group_array(json_object(
+                    'evidenceId', ordered.id,
                     'sessionId', ordered.session_id,
                     'segmentId', ordered.transcript_segment_id,
                     'startedAt', ordered.started_at,
@@ -4851,7 +4869,7 @@ class MemoryRepository {
                     'audioState', ordered.audio_state
                   )), json('[]'))
                   FROM (
-                    SELECT session_id, transcript_segment_id, started_at, ended_at,
+                    SELECT id, session_id, transcript_segment_id, started_at, ended_at,
                            quote_text, audio_state
                     FROM evidence_refs
                     WHERE entity_type = 'daily_digest' AND entity_id = digest.id
@@ -4871,6 +4889,19 @@ class MemoryRepository {
       evidence = JSON.parse(row.evidence_json);
       assertJsonObject(content, "daily digest content");
       if (!Array.isArray(evidence)) throw new TypeError("daily digest evidence must be an array");
+      evidence = evidence.map((entry) => ({
+        sessionId: entry.sessionId,
+        segmentId: entry.segmentId,
+        startedAt: entry.startedAt,
+        endedAt: entry.endedAt,
+        quote: entry.quote,
+        audioState: entry.audioState,
+        handle: normalizeEvidenceContextRequest({
+          ownerType: "daily_digest_item",
+          ownerId: row.id,
+          evidenceId: entry.evidenceId,
+        }),
+      }));
     } catch {
       throw codedError("MEMORY_PUBLIC_READ_CORRUPT");
     }
@@ -4889,11 +4920,7 @@ class MemoryRepository {
   }
 
   getLatestDailyDigestWorkState(input) {
-    assertExactPlainObject(
-      input,
-      ["localDate", "timezone"],
-      "latest daily digest work query"
-    );
+    assertExactPlainObject(input, ["localDate", "timezone"], "latest daily digest work query");
     const localDate = assertLocalDate(input.localDate);
     const timezone = assertTimezone(input.timezone);
     const row = this.db
@@ -4919,32 +4946,130 @@ class MemoryRepository {
     };
   }
 
+  getEvidenceContext(input) {
+    const handle = normalizeEvidenceContextRequest(input);
+    const lineageColumns = `
+      SELECT ref.session_id, session.started_at AS session_started_at,
+             session.ended_at AS session_ended_at,
+             segment.id AS transcript_segment_id,
+             COALESCE(track.source_type, segment.source_type) AS source_type,
+             ref.track_id, ref.started_at, ref.ended_at,
+             CASE WHEN segment.id IS NULL THEN NULL ELSE ref.quote_text END AS quote_text,
+             CASE
+               WHEN ref.audio_chunk_id IS NULL OR chunk.id IS NULL THEN 'missing'
+               WHEN chunk.deleted_at IS NULL THEN 'available'
+               ELSE 'expired'
+             END AS current_audio_state
+      FROM evidence_refs AS ref`;
+    const lineageJoins = `
+      JOIN sessions AS session ON session.id = ref.session_id
+      LEFT JOIN transcript_segments AS segment ON segment.id = ref.transcript_segment_id
+      LEFT JOIN audio_chunks AS chunk ON chunk.id = ref.audio_chunk_id
+      LEFT JOIN audio_tracks AS track ON track.id = ref.track_id`;
+    const ownerQueries = {
+      memory_value: `${lineageColumns}
+        JOIN memory_occurrences AS owner
+          ON ref.entity_type = 'memory_occurrence' AND owner.id = ref.entity_id
+        ${lineageJoins}
+        WHERE ref.id = ? AND owner.memory_value_id = ?`,
+      topic_revision: `${lineageColumns}
+        JOIN topic_occurrences AS owner
+          ON ref.entity_type = 'topic_occurrence' AND owner.id = ref.entity_id
+        ${lineageJoins}
+        WHERE ref.id = ? AND owner.topic_revision_id = ?`,
+      todo_instance: `${lineageColumns}
+        JOIN todo_occurrences AS owner
+          ON ref.entity_type = 'todo_occurrence' AND owner.id = ref.entity_id
+        ${lineageJoins}
+        WHERE ref.id = ? AND owner.todo_instance_id = ?`,
+      session_summary_revision: `${lineageColumns}
+        ${lineageJoins}
+        WHERE ref.id = ? AND ref.entity_type = 'session_summary_revision'
+          AND ref.entity_id = ?`,
+      daily_digest_item: `${lineageColumns}
+        ${lineageJoins}
+        WHERE ref.id = ? AND ref.entity_type = 'daily_digest'
+          AND ref.entity_id = ?`,
+      suggestion: `${lineageColumns}
+        JOIN suggestion_occurrences AS owner
+          ON ref.entity_type = 'suggestion_occurrence' AND owner.id = ref.entity_id
+        ${lineageJoins}
+        WHERE ref.id = ? AND owner.suggestion_id = ?`,
+    };
+    let row;
+    if (handle.ownerType === "speaker_cluster") {
+      row = this.db
+        .prepare(
+          `SELECT segment.session_id, session.started_at AS session_started_at,
+                  session.ended_at AS session_ended_at,
+                  segment.id AS transcript_segment_id,
+                  COALESCE(track.source_type, segment.source_type) AS source_type,
+                  segment.track_id, segment.started_at, segment.ended_at,
+                  segment.text AS quote_text,
+                  CASE
+                    WHEN segment.chunk_id IS NULL OR chunk.id IS NULL THEN 'missing'
+                    WHEN chunk.deleted_at IS NULL THEN 'available'
+                    ELSE 'expired'
+                  END AS current_audio_state
+           FROM speaker_clusters AS cluster
+           JOIN speaker_cluster_segments AS link ON link.cluster_id = cluster.id
+           JOIN transcript_segments AS segment
+             ON segment.id = link.transcript_segment_id
+            AND segment.session_id = cluster.session_id
+            AND segment.track_id = cluster.track_id
+           JOIN sessions AS session ON session.id = segment.session_id
+           LEFT JOIN audio_chunks AS chunk ON chunk.id = segment.chunk_id
+           LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+           WHERE cluster.id = ? AND link.transcript_segment_id = ?`
+        )
+        .get(handle.ownerId, handle.evidenceId);
+    } else {
+      row = this.db.prepare(ownerQueries[handle.ownerType]).get(handle.evidenceId, handle.ownerId);
+    }
+    if (!row) return null;
+    const quoteText =
+      row.quote_text === null ? null : Array.from(row.quote_text).slice(0, 4_096).join("");
+    return normalizeEvidenceContextResponse({
+      ...handle,
+      sessionId: row.session_id,
+      sessionStartedAt: row.session_started_at,
+      sessionEndedAt: row.session_ended_at,
+      transcriptSegmentId: row.transcript_segment_id,
+      transcriptState: row.transcript_segment_id === null ? "missing" : "available",
+      trackId: row.track_id,
+      sourceType: row.source_type,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      quoteText,
+      audioState: row.current_audio_state,
+    });
+  }
+
   readPublicSnapshot() {
     const read = this.db.transaction(() => {
-      const parsePublicObject = (json) => {
-        try {
-          const value = JSON.parse(json);
-          assertJsonObject(value, "public content");
-          return value;
-        } catch {
-          throw codedError("MEMORY_PUBLIC_READ_CORRUPT");
-        }
-      };
       const evidenceStatement = this.db.prepare(
-        `SELECT session_id, transcript_segment_id, started_at, ended_at,
-                quote_text, audio_state
-         FROM evidence_refs
-         WHERE entity_type = ? AND entity_id = ?
-         ORDER BY started_at, ended_at, transcript_segment_id`
+        `SELECT * FROM (
+           SELECT id, session_id, transcript_segment_id, started_at, ended_at,
+                  quote_text, audio_state
+           FROM evidence_refs
+           WHERE entity_type = ? AND entity_id = ?
+           ORDER BY started_at DESC, ended_at DESC, transcript_segment_id DESC
+           LIMIT ?
+         ) ORDER BY started_at, ended_at, transcript_segment_id`
       );
-      const evidenceFor = (entityType, entityId) =>
-        evidenceStatement.all(entityType, entityId).map((row) => ({
+      const evidenceFor = (entityType, entityId, ownerType, ownerId) =>
+        evidenceStatement.all(entityType, entityId, PUBLIC_SNAPSHOT_EVIDENCE_LIMIT).map((row) => ({
           sessionId: row.session_id,
           segmentId: row.transcript_segment_id,
           startedAt: row.started_at,
           endedAt: row.ended_at,
           quote: row.quote_text,
           audioState: row.audio_state,
+          handle: normalizeEvidenceContextRequest({
+            ownerType,
+            ownerId,
+            evidenceId: row.id,
+          }),
         }));
 
       const memoryOccurrences = this.db.prepare(
@@ -4954,15 +5079,17 @@ class MemoryRepository {
          FROM memory_occurrences AS occurrence
          LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
          WHERE occurrence.memory_value_id = ?
-         ORDER BY occurrence.created_at, occurrence.id`
+         ORDER BY occurrence.created_at DESC, occurrence.id DESC
+         LIMIT ?`
       );
       const memories = this.db
         .prepare(
           `SELECT id, kind, title, body, confidence, lifecycle, provenance,
                   created_at, updated_at
-           FROM memory_items_v2 ORDER BY updated_at DESC, id`
+           FROM memory_items_v2 ORDER BY updated_at DESC, id
+           LIMIT ?`
         )
-        .all()
+        .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
         .map((row) => ({
           id: row.id,
           kind: row.kind,
@@ -4973,34 +5100,40 @@ class MemoryRepository {
           provenance: row.provenance,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
-          occurrences: memoryOccurrences.all(row.id).map((occurrence) => ({
-            id: occurrence.id,
-            sessionId: occurrence.session_id,
-            startedAt: occurrence.started_at,
-            endedAt: occurrence.ended_at,
-            confidence: occurrence.confidence,
-            createdAt: occurrence.created_at,
-            evidence: evidenceFor("memory_occurrence", occurrence.id),
-          })),
+          occurrences: memoryOccurrences
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((occurrence) => ({
+              id: occurrence.id,
+              sessionId: occurrence.session_id,
+              startedAt: occurrence.started_at,
+              endedAt: occurrence.ended_at,
+              confidence: occurrence.confidence,
+              createdAt: occurrence.created_at,
+              evidence: evidenceFor("memory_occurrence", occurrence.id, "memory_value", row.id),
+            })),
         }));
 
       const topicRevisions = this.db.prepare(
         `SELECT id, revision, summary, provenance, created_at
-         FROM topic_revisions WHERE topic_id = ? ORDER BY revision`
+         FROM topic_revisions WHERE topic_id = ? ORDER BY revision DESC
+         LIMIT ?`
       );
       const topicOccurrences = this.db.prepare(
         `SELECT occurrence.id, occurrence.topic_revision_id, occurrence.created_at,
                 COALESCE(occurrence.legacy_session_id, input.session_id) AS session_id
          FROM topic_occurrences AS occurrence
          LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
-         WHERE occurrence.topic_id = ? ORDER BY occurrence.created_at, occurrence.id`
+         WHERE occurrence.topic_id = ? ORDER BY occurrence.created_at DESC, occurrence.id DESC
+         LIMIT ?`
       );
       const topics = this.db
         .prepare(
           `SELECT id, name, lifecycle, provenance, created_at, updated_at
-           FROM topics_v2 ORDER BY updated_at DESC, id`
+           FROM topics_v2 ORDER BY updated_at DESC, id
+           LIMIT ?`
         )
-        .all()
+        .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
         .map((row) => ({
           id: row.id,
           name: row.name,
@@ -5008,25 +5141,37 @@ class MemoryRepository {
           provenance: row.provenance,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
-          revisions: topicRevisions.all(row.id).map((revision) => ({
-            id: revision.id,
-            revision: revision.revision,
-            summary: revision.summary,
-            provenance: revision.provenance,
-            createdAt: revision.created_at,
-          })),
-          occurrences: topicOccurrences.all(row.id).map((occurrence) => ({
-            id: occurrence.id,
-            sessionId: occurrence.session_id,
-            revisionId: occurrence.topic_revision_id,
-            createdAt: occurrence.created_at,
-            evidence: evidenceFor("topic_occurrence", occurrence.id),
-          })),
+          revisions: topicRevisions
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((revision) => ({
+              id: revision.id,
+              revision: revision.revision,
+              summary: revision.summary,
+              provenance: revision.provenance,
+              createdAt: revision.created_at,
+            })),
+          occurrences: topicOccurrences
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((occurrence) => ({
+              id: occurrence.id,
+              sessionId: occurrence.session_id,
+              revisionId: occurrence.topic_revision_id,
+              createdAt: occurrence.created_at,
+              evidence: evidenceFor(
+                "topic_occurrence",
+                occurrence.id,
+                "topic_revision",
+                occurrence.topic_revision_id
+              ),
+            })),
         }));
 
       const todoRevisions = this.db.prepare(
         `SELECT id, revision, title, due_text, provenance, created_at
-         FROM todo_revisions WHERE todo_instance_id = ? ORDER BY revision`
+         FROM todo_revisions WHERE todo_instance_id = ? ORDER BY revision DESC
+         LIMIT ?`
       );
       const todoOccurrences = this.db.prepare(
         `SELECT occurrence.id, occurrence.todo_revision_id, occurrence.started_at,
@@ -5035,21 +5180,24 @@ class MemoryRepository {
          FROM todo_occurrences AS occurrence
          LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
          WHERE occurrence.todo_instance_id = ?
-         ORDER BY occurrence.created_at, occurrence.id`
+         ORDER BY occurrence.created_at DESC, occurrence.id DESC
+         LIMIT ?`
       );
       const todoTransitions = this.db.prepare(
         `SELECT id, from_status, to_status, reason, actor, occurred_at
          FROM todo_state_transitions WHERE todo_instance_id = ?
-         ORDER BY occurred_at, id`
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT ?`
       );
       const todos = this.db
         .prepare(
           `SELECT todo.id, todo.title, todo.status, todo.completed_at, todo.dismissed_at,
                   todo.provenance, todo.created_at, todo.updated_at,
                   todo.owner_display_name_snapshot AS owner_label
-           FROM todos_v2 AS todo ORDER BY todo.updated_at DESC, todo.id`
+           FROM todos_v2 AS todo ORDER BY todo.updated_at DESC, todo.id
+           LIMIT ?`
         )
-        .all()
+        .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
         .map((row) => ({
           id: row.id,
           title: row.title,
@@ -5060,31 +5208,40 @@ class MemoryRepository {
           provenance: row.provenance,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
-          revisions: todoRevisions.all(row.id).map((revision) => ({
-            id: revision.id,
-            revision: revision.revision,
-            title: revision.title,
-            dueText: revision.due_text,
-            provenance: revision.provenance,
-            createdAt: revision.created_at,
-          })),
-          occurrences: todoOccurrences.all(row.id).map((occurrence) => ({
-            id: occurrence.id,
-            sessionId: occurrence.session_id,
-            revisionId: occurrence.todo_revision_id,
-            startedAt: occurrence.started_at,
-            endedAt: occurrence.ended_at,
-            createdAt: occurrence.created_at,
-            evidence: evidenceFor("todo_occurrence", occurrence.id),
-          })),
-          transitions: todoTransitions.all(row.id).map((transition) => ({
-            id: transition.id,
-            fromStatus: transition.from_status,
-            toStatus: transition.to_status,
-            reason: transition.reason,
-            actor: transition.actor,
-            occurredAt: transition.occurred_at,
-          })),
+          revisions: todoRevisions
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((revision) => ({
+              id: revision.id,
+              revision: revision.revision,
+              title: revision.title,
+              dueText: revision.due_text,
+              provenance: revision.provenance,
+              createdAt: revision.created_at,
+            })),
+          occurrences: todoOccurrences
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((occurrence) => ({
+              id: occurrence.id,
+              sessionId: occurrence.session_id,
+              revisionId: occurrence.todo_revision_id,
+              startedAt: occurrence.started_at,
+              endedAt: occurrence.ended_at,
+              createdAt: occurrence.created_at,
+              evidence: evidenceFor("todo_occurrence", occurrence.id, "todo_instance", row.id),
+            })),
+          transitions: todoTransitions
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((transition) => ({
+              id: transition.id,
+              fromStatus: transition.from_status,
+              toStatus: transition.to_status,
+              reason: transition.reason,
+              actor: transition.actor,
+              occurredAt: transition.occurred_at,
+            })),
         }));
 
       const suggestionOccurrences = this.db.prepare(
@@ -5093,14 +5250,16 @@ class MemoryRepository {
          FROM suggestion_occurrences AS occurrence
          LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
          WHERE occurrence.suggestion_id = ?
-         ORDER BY occurrence.created_at, occurrence.id`
+         ORDER BY occurrence.created_at DESC, occurrence.id DESC
+         LIMIT ?`
       );
       const suggestions = this.db
         .prepare(
           `SELECT id, title, rationale, state, provenance, decided_at, created_at, updated_at
-           FROM suggestions_v2 ORDER BY updated_at DESC, id`
+           FROM suggestions_v2 ORDER BY updated_at DESC, id
+           LIMIT ?`
         )
-        .all()
+        .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
         .map((row) => ({
           id: row.id,
           title: row.title,
@@ -5110,65 +5269,31 @@ class MemoryRepository {
           decidedAt: row.decided_at,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
-          occurrences: suggestionOccurrences.all(row.id).map((occurrence) => ({
-            id: occurrence.id,
-            sessionId: occurrence.session_id,
-            createdAt: occurrence.created_at,
-            evidence: evidenceFor("suggestion_occurrence", occurrence.id),
-          })),
-        }));
-
-      const sessionSummaries = this.db
-        .prepare(
-          `SELECT id, session_id, revision, completeness, lifecycle, content_json,
-                  provenance, created_at
-           FROM session_summary_revisions ORDER BY created_at DESC, id`
-        )
-        .all()
-        .map((row) => ({
-          id: row.id,
-          sessionId: row.session_id,
-          revision: row.revision,
-          completeness: row.completeness,
-          lifecycle: row.lifecycle,
-          content: parsePublicObject(row.content_json),
-          provenance: row.provenance,
-          createdAt: row.created_at,
-          evidence: evidenceFor("session_summary_revision", row.id),
-        }));
-
-      const dailyDigests = this.db
-        .prepare(
-          `SELECT id, local_date, timezone, revision, completeness, lifecycle,
-                  content_json, created_at, updated_at
-           FROM daily_digests ORDER BY local_date DESC, timezone, revision DESC`
-        )
-        .all()
-        .map((row) => ({
-          id: row.id,
-          localDate: row.local_date,
-          timezone: row.timezone,
-          revision: row.revision,
-          completeness: row.completeness,
-          lifecycle: row.lifecycle,
-          content: parsePublicObject(row.content_json),
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-          evidence: evidenceFor("daily_digest", row.id),
+          occurrences: suggestionOccurrences
+            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+            .reverse()
+            .map((occurrence) => ({
+              id: occurrence.id,
+              sessionId: occurrence.session_id,
+              createdAt: occurrence.created_at,
+              evidence: evidenceFor("suggestion_occurrence", occurrence.id, "suggestion", row.id),
+            })),
         }));
 
       const conflictMembers = this.db.prepare(
         `SELECT item.id, item.title, item.body, item.lifecycle
          FROM memory_conflict_members AS member
          JOIN memory_items_v2 AS item ON item.id = member.memory_item_id
-         WHERE member.group_id = ? ORDER BY item.created_at, item.id`
+         WHERE member.group_id = ? ORDER BY item.created_at, item.id
+         LIMIT ?`
       );
       const memoryConflicts = this.db
         .prepare(
           `SELECT id, episode, state, selected_member_id, resolved_at, created_at, updated_at
-           FROM memory_conflict_groups ORDER BY created_at DESC, id`
+           FROM memory_conflict_groups ORDER BY created_at DESC, id
+           LIMIT ?`
         )
-        .all()
+        .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
         .map((row) => ({
           id: row.id,
           episode: row.episode,
@@ -5177,7 +5302,7 @@ class MemoryRepository {
           resolvedAt: row.resolved_at,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
-          members: conflictMembers.all(row.id).map((member) => ({
+          members: conflictMembers.all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT).map((member) => ({
             memoryItemId: member.id,
             title: member.title,
             body: member.body,
@@ -5191,8 +5316,6 @@ class MemoryRepository {
         topics,
         todos,
         suggestions,
-        sessionSummaries,
-        dailyDigests,
         memoryConflicts,
       };
     });

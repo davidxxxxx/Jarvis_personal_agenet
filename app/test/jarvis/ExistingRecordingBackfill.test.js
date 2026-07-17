@@ -160,7 +160,7 @@ function assertTerminalAndTruthful(repository) {
         chunk_id: "blocked-chunk",
         format: "flac",
         transcription_status: "pending",
-        job_type: "test_unsupported_transcription",
+        job_type: "speaker",
         job_state: "blocked",
         error_code: "HANDLER_MISSING",
         processing_state: "processing",
@@ -258,7 +258,7 @@ test("a copied legacy database reaches terminal truthful transcription states id
     .prepare(
       `
       UPDATE processing_jobs
-      SET job_type = 'test_unsupported_transcription'
+      SET job_type = 'speaker'
       WHERE chunk_id = 'blocked-chunk'
     `
     )

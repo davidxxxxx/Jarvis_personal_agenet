@@ -138,6 +138,67 @@ describe("PeopleView durable identity detail", () => {
     expect(document.body.textContent).not.toMatch(/embedding|\.wav|[A-Z]:\\/i);
   });
 
+  it("summarizes only durably attributed person sources and keeps suggestions separate", async () => {
+    const attributed = detail(source);
+    attributed.sessions = [
+      {
+        id: "session-1",
+        started_at: Date.UTC(2026, 6, 11, 1, 0),
+        ended_at: Date.UTC(2026, 6, 11, 1, 30),
+        status: "completed",
+        mic_device_id: null,
+        language: "zh",
+        created_at: Date.UTC(2026, 6, 11, 1, 0),
+        capture_mode: "mic",
+      },
+    ];
+    attributed.memories = [
+      {
+        id: "memory-person-1",
+        type: "fact",
+        content: "Budget stays local.",
+        person_id: source.id,
+        topic_id: null,
+        confidence: 0.9,
+        last_seen_at: Date.UTC(2026, 6, 11, 1, 10),
+        occurrence_count: 2,
+        needs_confirmation: 0,
+      },
+    ];
+    attributed.identity.appearances.push({
+      clusterId: "cluster-suggested",
+      sessionId: "session-suggested",
+      localLabel: "speaker_2",
+      linkState: "suggested",
+      score: 0.72,
+      margin: 0.04,
+      updatedAt: 7,
+    });
+    const getKnowledgeOverview = vi.fn(async () => ({
+      memories: [
+        {
+          id: "unattributed",
+          title: "Must not be joined by renderer",
+          body: "Unrelated knowledge quote",
+        },
+      ],
+    }));
+    window.electronAPI.jarvis.getPersonDetail = vi.fn(async () => attributed);
+    window.electronAPI.jarvis.getKnowledgeOverview = getKnowledgeOverview as never;
+
+    render(<PeopleView />);
+    fireEvent.click(await screen.findByRole("button", { name: /Source Person/ }));
+
+    expect(await screen.findByRole("heading", { name: /Persistent source summary/ })).toBeVisible();
+    expect(screen.getByText(/1 confirmed speaker source/)).toBeVisible();
+    expect(screen.getByText(/1 suggested match \(not confirmed\)/)).toBeVisible();
+    expect(screen.getByText(/1 saved memory/)).toBeVisible();
+    expect(screen.getByText("Budget stays local.")).toBeVisible();
+    expect(screen.getByText(/2 supporting occurrences/)).toBeVisible();
+    expect(screen.queryByText("Unrelated knowledge quote")).not.toBeInTheDocument();
+    expect(getKnowledgeOverview).not.toHaveBeenCalled();
+  });
+
   it("cancels without IPC and confirms an explicitly irreversible merge once", async () => {
     const cachedCluster = {
       id: "cluster-cached",

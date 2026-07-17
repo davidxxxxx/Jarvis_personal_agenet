@@ -31,6 +31,20 @@ function registerJarvisIpc(options) {
 
 function createRepository(overrides = {}) {
   return {
+    memoryRepository: {
+      readPublicSnapshot: () => ({
+        memories: [],
+        topics: [],
+        todos: [],
+        suggestions: [],
+        memoryConflicts: [],
+      }),
+      acceptSuggestion: () => ({ status: "accepted" }),
+      dismissSuggestion: () => ({ status: "dismissed" }),
+      resolveMemoryConflict: () => ({ status: "resolved" }),
+      completeTodo: () => ({ status: "completed" }),
+      getEvidenceContext: () => null,
+    },
     createSession: () => "created",
     setSessionStatus: () => "status-set",
     getSession: () => "session",
@@ -67,6 +81,196 @@ function createRepository(overrides = {}) {
     ...overrides,
   };
 }
+
+test("v2 knowledge IPC projects bounded safe fields and keeps action ownership in main", async () => {
+  const calls = [];
+  const handlers = new Map();
+  const repository = createRepository({
+    memoryRepository: {
+      readPublicSnapshot: () => ({
+        memories: [
+          {
+            id: "memory_1",
+            kind: "decision",
+            title: "Choose local storage",
+            body: "Keep private data local.",
+            confidence: 0.9,
+            lifecycle: "active",
+            provenance: "private-provenance",
+            createdAt: 1,
+            updatedAt: 2,
+            occurrences: [
+              {
+                id: "occurrence_1",
+                sessionId: "session_1",
+                startedAt: 10,
+                endedAt: 20,
+                confidence: 0.9,
+                createdAt: 21,
+                inputHash: "private-hash",
+                evidence: [
+                  {
+                    sessionId: "session_1",
+                    segmentId: "segment_1",
+                    startedAt: 10,
+                    endedAt: 20,
+                    quote: "Keep private data local.",
+                    audioState: "available",
+                    handle: {
+                      ownerType: "memory_value",
+                      ownerId: "memory_1",
+                      evidenceId: "evidence_1",
+                    },
+                    path: "C:\\private.wav",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+        topics: [],
+        todos: [],
+        suggestions: [],
+        memoryConflicts: [],
+        dailyDigests: [{ sourceHash: "private-source" }],
+        sessionSummaries: [{ content: { prompt: "private-prompt" } }],
+      }),
+      acceptSuggestion: (input) => (calls.push(["accept", input]), { status: "accepted" }),
+      dismissSuggestion: (input) => (calls.push(["dismiss", input]), { status: "dismissed" }),
+      resolveMemoryConflict: (input) => (calls.push(["resolve", input]), { status: "resolved" }),
+      completeTodo: (input) => (calls.push(["complete", input]), { status: "completed" }),
+      getEvidenceContext: () => null,
+    },
+  });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository,
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    now: () => 7_000,
+  });
+
+  const overview = await handlers.get(CHANNELS.getKnowledgeOverview)(null);
+  assert.deepEqual(Object.keys(overview).sort(), [
+    "conflicts",
+    "memories",
+    "suggestions",
+    "todos",
+    "topics",
+    "truncated",
+  ]);
+  assert.equal(overview.memories[0].occurrences[0].evidence[0].quote, "Keep private data local.");
+  assert.deepEqual(overview.memories[0].occurrences[0].evidence[0].handle, {
+    ownerType: "memory_value",
+    ownerId: "memory_1",
+    evidenceId: "evidence_1",
+  });
+  const serialized = JSON.stringify(overview);
+  for (const secret of [
+    "private-provenance",
+    "private-hash",
+    "C:\\private.wav",
+    "private-source",
+    "private-prompt",
+  ]) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+
+  await handlers.get(CHANNELS.decideKnowledgeSuggestion)(null, {
+    suggestionId: "suggestion_1",
+    action: "accept",
+  });
+  await handlers.get(CHANNELS.resolveKnowledgeConflict)(null, {
+    conflictGroupId: "conflict_1",
+    selectedMemoryItemId: "memory_1",
+  });
+  await handlers.get(CHANNELS.completeKnowledgeTodo)(null, { todoId: "todo_1" });
+  assert.deepEqual(calls, [
+    ["accept", { suggestionId: "suggestion_1", at: 7_000 }],
+    ["resolve", { conflictGroupId: "conflict_1", selectedMemoryItemId: "memory_1" }],
+    ["complete", { todoId: "todo_1" }],
+  ]);
+  assert.throws(() =>
+    handlers.get(CHANNELS.completeKnowledgeTodo)(null, { todoId: "todo_1", status: "open" })
+  );
+});
+
+test("evidence context IPC validates ownership and returns only the safe context allowlist", async () => {
+  const calls = [];
+  const repository = createRepository();
+  repository.memoryRepository.getEvidenceContext = (input) => {
+    calls.push(input);
+    return {
+      ...input,
+      sessionId: "session_1",
+      sessionStartedAt: 1_000,
+      sessionEndedAt: 5_000,
+      transcriptSegmentId: "segment_1",
+      transcriptState: "available",
+      trackId: "track_1",
+      sourceType: "mic",
+      startedAt: 1_500,
+      endedAt: 2_500,
+      quoteText: "Stored quote",
+      audioState: "available",
+      path: "C:\\private\\capture.flac",
+      sha256: "a".repeat(64),
+      device_id: "private-device",
+      rawError: "private stack",
+    };
+  };
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository,
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+  const request = {
+    ownerType: "memory_value",
+    ownerId: "memory_1",
+    evidenceId: "evidence_1",
+  };
+
+  const result = await handlers.get(CHANNELS.getEvidenceContext)(null, request);
+  assert.deepEqual(calls, [request]);
+  assert.deepEqual(Object.keys(result), [
+    "ownerType",
+    "ownerId",
+    "evidenceId",
+    "sessionId",
+    "sessionStartedAt",
+    "sessionEndedAt",
+    "transcriptSegmentId",
+    "transcriptState",
+    "trackId",
+    "sourceType",
+    "startedAt",
+    "endedAt",
+    "quoteText",
+    "audioState",
+  ]);
+  assert.equal(JSON.stringify(result).includes("private"), false);
+  assert.throws(() =>
+    handlers.get(CHANNELS.getEvidenceContext)(null, { ...request, sessionId: "forged" })
+  );
+  assert.throws(() => handlers.get(CHANNELS.getEvidenceContext)(null, request, request));
+  assert.equal(calls.length, 1);
+
+  repository.memoryRepository.getEvidenceContext = () => {
+    throw new Error("C:\\private\\jarvis.db SQL failed");
+  };
+  await assert.rejects(
+    Promise.resolve().then(() => handlers.get(CHANNELS.getEvidenceContext)(null, request)),
+    (error) => {
+      assert.equal(error.code, "EVIDENCE_CONTEXT_UNAVAILABLE");
+      assert.equal(error.message, "Evidence context is unavailable");
+      return true;
+    }
+  );
+});
 
 function createService(overrides = {}) {
   return {
@@ -337,6 +541,9 @@ test("retired provenance is private at audio IPC boundaries", () => {
     id: "c1",
     session_id: "s1",
     path: "speech.wav",
+    sha256: "a".repeat(64),
+    pcm_sha256: "b".repeat(64),
+    file_sha256: "c".repeat(64),
     format: "wav",
     retired_path: "private.flac",
     retired_format: "flac",
@@ -346,7 +553,14 @@ test("retired provenance is private at audio IPC boundaries", () => {
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     repository: createRepository({
       listAudioChunks: () => [privateChunk],
-      getSessionDetail: () => ({ session: { id: "s1" }, audioChunks: [privateChunk] }),
+      getSessionDetail: () => ({
+        session: {
+          id: "s1",
+          mic_device_id: "private-device-id",
+          capture_policy_json: '{"strategy":"private"}',
+        },
+        audioChunks: [privateChunk],
+      }),
     }),
     service: createService(),
     voiceEnrollmentService: createVoiceEnrollmentService(),
@@ -355,10 +569,156 @@ test("retired provenance is private at audio IPC boundaries", () => {
 
   const list = handlers.get(CHANNELS.listAudioChunks)(null, "s1");
   const detail = handlers.get(CHANNELS.getSessionDetail)(null, "s1");
+  assert.equal(Object.hasOwn(detail.session, "mic_device_id"), false);
+  assert.equal(Object.hasOwn(detail.session, "capture_policy_json"), false);
   for (const chunk of [list[0], detail.audioChunks[0]]) {
+    assert.deepEqual(
+      Object.keys(chunk),
+      [
+        "id",
+        "session_id",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "track_id",
+        "source_type",
+        "sequence_number",
+        "write_state",
+        "deleted_at",
+        "format",
+      ].filter((key) => Object.hasOwn(privateChunk, key))
+    );
+    assert.equal(Object.hasOwn(chunk, "path"), false);
+    assert.equal(Object.hasOwn(chunk, "sha256"), false);
+    assert.equal(Object.hasOwn(chunk, "pcm_sha256"), false);
+    assert.equal(Object.hasOwn(chunk, "file_sha256"), false);
     assert.equal(Object.hasOwn(chunk, "retired_path"), false);
     assert.equal(Object.hasOwn(chunk, "retired_format"), false);
     assert.equal(Object.hasOwn(chunk, "retired_file_sha256"), false);
+  }
+});
+
+test("audio timeline IPC projects strict chunk track and gap allowlists", () => {
+  const handlers = new Map();
+  const privateGap = {
+    id: "gap_1",
+    track_id: "track_1",
+    started_at: 1_500,
+    ended_at: 1_700,
+    reason: "device_lost",
+    recovery_attempts: 2,
+    average_level: 0.2,
+    peak_level: 0.8,
+    restored_device_id: "private-restored-id",
+    restored_device_label: "Private restored microphone",
+    restored_strategy: "private-strategy",
+  };
+  const privateTrack = {
+    id: "track_1",
+    session_id: "s1",
+    source_type: "mic",
+    device_id: "private-device-id",
+    device_label: "Private microphone",
+    strategy: "private-capture-strategy",
+    sample_rate: 24_000,
+    channels: 1,
+    started_at: 1_000,
+    ended_at: 5_000,
+    state: "ended",
+    gaps: [privateGap],
+  };
+  const privateChunk = {
+    id: "chunk_1",
+    session_id: "s1",
+    track_id: "track_1",
+    source_type: "mic",
+    started_at: 1_000,
+    ended_at: 5_000,
+    duration_ms: 4_000,
+    sequence_number: 0,
+    write_state: "committed",
+    deleted_at: null,
+    format: "flac",
+    path: "C:\\private\\capture.flac",
+    sha256: "a".repeat(64),
+    pcm_sha256: "b".repeat(64),
+    file_sha256: "c".repeat(64),
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      getSessionTimeline: () => ({
+        session_id: "s1",
+        started_at: 1_000,
+        ended_at: 5_000,
+        status: "completed",
+        processing_state: "ready",
+        timeline_version: 1,
+        finalized_at: 5_100,
+        ready_at: 5_200,
+        tracks: [privateTrack],
+        gaps: [privateGap],
+        chunks: [privateChunk],
+        segments: [],
+        processing_counts: { pending: 0, leased: 0, retry: 0, blocked: 0, completed: 1, total: 1 },
+        rawError: "private timeline stack",
+      }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const result = handlers.get(CHANNELS.getSessionTimeline)(null, "s1");
+  assert.deepEqual(Object.keys(result.tracks[0]), [
+    "id",
+    "session_id",
+    "source_type",
+    "sample_rate",
+    "channels",
+    "started_at",
+    "ended_at",
+    "state",
+    "gaps",
+  ]);
+  assert.deepEqual(Object.keys(result.gaps[0]), [
+    "id",
+    "track_id",
+    "started_at",
+    "ended_at",
+    "reason",
+    "recovery_attempts",
+    "average_level",
+    "peak_level",
+  ]);
+  assert.deepEqual(Object.keys(result.chunks[0]), [
+    "id",
+    "session_id",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "track_id",
+    "source_type",
+    "sequence_number",
+    "write_state",
+    "deleted_at",
+    "format",
+  ]);
+  const serialized = JSON.stringify(result);
+  for (const secret of [
+    "private-device-id",
+    "Private microphone",
+    "private-capture-strategy",
+    "private-restored-id",
+    "Private restored microphone",
+    "private-strategy",
+    "C:\\private\\capture.flac",
+    "private timeline stack",
+    "a".repeat(64),
+    "b".repeat(64),
+    "c".repeat(64),
+  ]) {
+    assert.equal(serialized.includes(secret), false, secret);
   }
 });
 
@@ -509,6 +869,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "beginVoiceEnrollment",
       "cancelVoiceEnrollment",
       "completeVoiceEnrollment",
+      "completeKnowledgeTodo",
       "control",
       "createSession",
       "failCapture",
@@ -516,6 +877,8 @@ test("contract exposes only the named Jarvis channels", () => {
       "getAnalysisStatus",
       "getCloudBudget",
       "getDailyDigest",
+      "getEvidenceContext",
+      "getKnowledgeOverview",
       "getMiniMaxConfig",
       "getPersonDetail",
       "getRuntimeStatus",
@@ -560,6 +923,8 @@ test("contract exposes only the named Jarvis channels", () => {
       "syncSegments",
       "searchMemory",
       "renameTopic",
+      "decideKnowledgeSuggestion",
+      "resolveKnowledgeConflict",
       "upsertSegments",
     ].sort()
   );
@@ -600,11 +965,14 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.beginVoiceEnrollment,
       CHANNELS.getVoiceEnrollmentStatus,
       CHANNELS.completeVoiceEnrollment,
+      CHANNELS.completeKnowledgeTodo,
       CHANNELS.cancelVoiceEnrollment,
       CHANNELS.getCloudBudget,
       CHANNELS.setCloudBudget,
       CHANNELS.getSessionDetail,
       CHANNELS.getSessionTimeline,
+      CHANNELS.getEvidenceContext,
+      CHANNELS.getKnowledgeOverview,
       CHANNELS.getRuntimeStatus,
       CHANNELS.searchMemory,
       CHANNELS.listPeopleOverview,
@@ -620,6 +988,8 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.getAnalysisStatus,
       CHANNELS.getMiniMaxConfig,
       CHANNELS.setMiniMaxKey,
+      CHANNELS.decideKnowledgeSuggestion,
+      CHANNELS.resolveKnowledgeConflict,
     ].sort()
   );
   assert.equal(handlers.has(CHANNELS.control), false);
@@ -657,7 +1027,7 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
     getLatest(input) {
       calls.push(["get", input]);
       return {
-        id: "private-digest-id",
+        id: "digest-1",
         timezone: "Asia/Shanghai",
         lifecycle: "active",
         sourceHash: "private-source-hash",
@@ -665,15 +1035,22 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
         revision: 2,
         completeness: "final",
         content,
-        evidence: [{
-          sessionId: "session-1",
-          segmentId: "segment-1",
-          startedAt: 1,
-          endedAt: 2,
-          quote: "Did the work",
-          audioState: "available",
-          path: "G:\\private.wav",
-        }],
+        evidence: [
+          {
+            sessionId: "session-1",
+            segmentId: "segment-1",
+            startedAt: 1,
+            endedAt: 2,
+            quote: "Did the work",
+            audioState: "available",
+            handle: {
+              ownerType: "daily_digest_item",
+              ownerId: "digest-1",
+              evidenceId: "evidence-1",
+            },
+            path: "G:\\private.wav",
+          },
+        ],
         createdAt: 3,
         updatedAt: 4,
       };
@@ -707,11 +1084,21 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
   });
   assert.deepEqual(Object.keys(result), ["digest", "status"]);
   assert.deepEqual(Object.keys(result.digest), [
-    "localDate", "revision", "completeness", "content", "evidence", "createdAt", "updatedAt",
+    "localDate",
+    "revision",
+    "completeness",
+    "content",
+    "evidence",
+    "createdAt",
+    "updatedAt",
   ]);
+  assert.deepEqual(result.digest.evidence[0].handle, {
+    ownerType: "daily_digest_item",
+    ownerId: "digest-1",
+    evidenceId: "evidence-1",
+  });
   const serialized = JSON.stringify(result);
   for (const privateValue of [
-    "private-digest-id",
     "private-source-hash",
     "private-job-id",
     "G:\\private.wav",
@@ -725,12 +1112,16 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
     await handlers.get(CHANNELS.regenerateDailyDigest)(null, { localDate: "2026-07-17" }),
     result.status
   );
-  assert.deepEqual(calls.map(([name]) => name), ["get", "status", "regenerate", "status"]);
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ["get", "status", "regenerate", "status"]
+  );
   await assert.rejects(
-    async () => handlers.get(CHANNELS.getDailyDigest)(null, {
-      localDate: "2026-07-17",
-      timezone: "UTC",
-    }),
+    async () =>
+      handlers.get(CHANNELS.getDailyDigest)(null, {
+        localDate: "2026-07-17",
+        timezone: "UTC",
+      }),
     /only localDate|invalid structure/i
   );
   await assert.rejects(
@@ -967,6 +1358,43 @@ test("IPC preserves repository errors for Electron invoke rejection", () => {
   });
 
   assert.throws(() => handlers.get(CHANNELS.getSession)(null, "s1"), expected);
+});
+
+test("session list and search IPC remove device and storage-private fields", async () => {
+  const privateSession = {
+    id: "s1",
+    started_at: 1,
+    ended_at: null,
+    status: "recording",
+    mic_device_id: "private-device-id",
+    language: "zh",
+    created_at: 1,
+    capture_mode: "mic",
+    capture_policy_json: '{"private":true}',
+    storage_root: "C:\\private\\recordings",
+  };
+  const { handlers } = createIpcHarness({
+    getSession: () => privateSession,
+    listSessions: () => [privateSession],
+    searchMemory: () => [privateSession],
+  });
+
+  for (const result of [
+    await handlers.get(CHANNELS.getSession)(null, "s1"),
+    (await handlers.get(CHANNELS.listSessions)(null, {}))[0],
+    (await handlers.get(CHANNELS.searchMemory)(null, "session", 10))[0],
+  ]) {
+    assert.deepEqual(Object.keys(result).sort(), [
+      "capture_mode",
+      "created_at",
+      "ended_at",
+      "id",
+      "language",
+      "started_at",
+      "status",
+    ]);
+    assert.equal(JSON.stringify(result).includes("private"), false);
+  }
 });
 
 test("IPC binds narrow voice enrollment sessions to the requesting renderer", async () => {

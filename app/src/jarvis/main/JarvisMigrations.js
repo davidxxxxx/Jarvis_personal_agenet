@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 29;
+const TARGET_VERSION = 30;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -4900,10 +4900,12 @@ function assertExactV29TableColumns(db, table, expected) {
 }
 
 function normalizeProcessingJobsTableSql(sql) {
-  return normalizeSchemaSql(sql).replace(
-    /^CREATE TABLE (?:processing_jobs_v29|"processing_jobs"|processing_jobs)/u,
-    "CREATE TABLE processing_jobs"
-  ).replace(/\s+([,)])/gu, "$1");
+  return normalizeSchemaSql(sql)
+    .replace(
+      /^CREATE TABLE (?:processing_jobs_v29|"processing_jobs"|processing_jobs)/u,
+      "CREATE TABLE processing_jobs"
+    )
+    .replace(/\s+([,)])/gu, "$1");
 }
 
 function reviewedProcessingJobsTableSql(db) {
@@ -4936,7 +4938,9 @@ function reviewedProcessingJobsTableSql(db) {
     reference.exec("DROP TABLE processing_jobs");
     reference.exec(PROCESSING_JOBS_V29_SCHEMA);
     const v29 = reference
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'"
+      )
       .get().sql;
     reference.exec(`
       ALTER TABLE processing_jobs_v29 DROP COLUMN blocked_reason;
@@ -4949,7 +4953,9 @@ function reviewedProcessingJobsTableSql(db) {
       "execution_device TEXT CHECK(execution_device IS NULL OR execution_device IN ('cuda','cpu','cloud'))"
     );
     const repairedLegacyV29 = reference
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'processing_jobs_v29'"
+      )
       .get().sql;
     return new Set([v28, v29, repairedLegacyV29].map(normalizeProcessingJobsTableSql));
   } finally {
@@ -5022,7 +5028,10 @@ function reviewedV29DailySchema(db) {
          FROM sqlite_master
          WHERE sql IS NOT NULL
            AND name IN (${[...V29_OWNED_OBJECT_TARGETS.keys()]
-             .filter((name) => !name.startsWith("processing_jobs_") && !name.startsWith("idx_processing_jobs_"))
+             .filter(
+               (name) =>
+                 !name.startsWith("processing_jobs_") && !name.startsWith("idx_processing_jobs_")
+             )
              .map(() => "?")
              .join(",")}, 'daily_digest_inputs', 'daily_digest_response_candidates')
          ORDER BY type, name`
@@ -5041,7 +5050,9 @@ function validateAndRepairV29DailySchema(db) {
   const reviewed = reviewedV29DailySchema(db);
   for (const canonical of reviewed.filter((object) => object.type === "table")) {
     const actual = db
-      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type = 'table' AND name = ?"
+      )
       .get(canonical.name);
     if (!actual || normalizeSchemaSql(actual.sql) !== normalizeSchemaSql(canonical.sql)) {
       throw new Error(`v29 schema collision for ${canonical.name}`);
@@ -5211,6 +5222,59 @@ function upgradeDailyDigestV29(db) {
   for (const object of customObjects) db.exec(object.sql);
   if (!hasCandidates) db.exec(DAILY_DIGEST_RESPONSE_CANDIDATE_SCHEMA);
   validateAndRepairV29DailySchema(db);
+}
+
+const PUBLIC_KNOWLEDGE_QUERY_INDEXES_V30 = `
+  CREATE INDEX IF NOT EXISTS idx_memory_items_public_updated
+  ON memory_items_v2(updated_at DESC, id);
+  CREATE INDEX IF NOT EXISTS idx_topics_public_updated
+  ON topics_v2(updated_at DESC, id);
+  CREATE INDEX IF NOT EXISTS idx_todos_public_updated
+  ON todos_v2(updated_at DESC, id);
+  CREATE INDEX IF NOT EXISTS idx_suggestions_public_updated
+  ON suggestions_v2(updated_at DESC, id);
+  CREATE INDEX IF NOT EXISTS idx_memory_conflicts_public_created
+  ON memory_conflict_groups(created_at DESC, id);
+
+  CREATE INDEX IF NOT EXISTS idx_memory_occurrences_public_history
+  ON memory_occurrences(memory_value_id, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_topic_revisions_public_history
+  ON topic_revisions(topic_id, revision DESC);
+  CREATE INDEX IF NOT EXISTS idx_topic_occurrences_public_history
+  ON topic_occurrences(topic_id, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_todo_revisions_public_history
+  ON todo_revisions(todo_instance_id, revision DESC);
+  CREATE INDEX IF NOT EXISTS idx_todo_occurrences_public_history
+  ON todo_occurrences(todo_instance_id, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_todo_transitions_public_history
+  ON todo_state_transitions(todo_instance_id, occurred_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_suggestion_occurrences_public_history
+  ON suggestion_occurrences(suggestion_id, created_at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_evidence_refs_public_history
+  ON evidence_refs(
+    entity_type, entity_id, started_at DESC, ended_at DESC, transcript_segment_id DESC
+  );
+`;
+
+function upgradePublicKnowledgeIndexesV30(db) {
+  for (const table of [
+    "memory_items_v2",
+    "memory_occurrences",
+    "topics_v2",
+    "topic_revisions",
+    "topic_occurrences",
+    "todos_v2",
+    "todo_revisions",
+    "todo_occurrences",
+    "todo_state_transitions",
+    "suggestions_v2",
+    "suggestion_occurrences",
+    "memory_conflict_groups",
+    "evidence_refs",
+  ]) {
+    if (!tableExists(db, table)) throw new Error(`v30 public knowledge indexes require ${table}`);
+  }
+  db.exec(PUBLIC_KNOWLEDGE_QUERY_INDEXES_V30);
 }
 
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
@@ -5486,6 +5550,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 29) {
         upgradeDailyDigestV29(db);
       }
+      if (fromVersion < 30) {
+        upgradePublicKnowledgeIndexesV30(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -5513,4 +5580,5 @@ module.exports = {
   AGENT_WORKLOAD_SCHEMA,
   upgradeAgentWorkloadV26,
   upgradeDailyDigestV29,
+  upgradePublicKnowledgeIndexesV30,
 };

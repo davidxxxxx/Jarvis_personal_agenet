@@ -82,6 +82,15 @@ export default function PeopleView() {
   const source = detail?.person ?? null;
   const target = people.find((person) => person.id === mergeTargetId) ?? null;
   const selfLabel = t("jarvis.speakerSelf");
+  const confirmedSourceCount =
+    detail?.identity.appearances.filter((appearance) => appearance.linkState === "confirmed")
+      .length ?? 0;
+  const suggestedSourceCount =
+    detail?.identity.appearances.filter((appearance) => appearance.linkState === "suggested")
+      .length ?? 0;
+  const attributedMemories = detail
+    ? detail.memories.filter((memory) => memory.person_id === detail.person.id)
+    : [];
 
   const commitMerge = async () => {
     if (!source || !target || source.is_self || mergeBusy) return;
@@ -159,13 +168,85 @@ export default function PeopleView() {
               </p>
             </div>
           </div>
-          <div className="mt-5 space-y-2">
-            {detail.memories.map((memory) => (
-              <p key={memory.id} className="rounded-lg bg-muted/30 p-3 text-sm">
-                {memory.content}
-              </p>
-            ))}
-          </div>
+          <section className="mt-5 rounded-lg border border-border/50 bg-muted/20 p-4">
+            <h3 className="text-sm font-semibold">
+              {t("jarvis.peoplePersistentSourceSummary", {
+                defaultValue: "Persistent source summary / 持久来源摘要",
+              })}
+            </h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("jarvis.peoplePersistentSourceSummaryDescription", {
+                defaultValue:
+                  "Only durably attributed sources are counted / 只统计已持久归属给此人物的会话、说话人关联和记忆。",
+              })}
+            </p>
+            <dl className="mt-3 grid gap-3 sm:grid-cols-3">
+              <div>
+                <dt className="sr-only">
+                  {t("jarvis.peopleConfirmedSources", {
+                    defaultValue: "Confirmed speaker sources",
+                  })}
+                </dt>
+                <dd className="text-sm font-medium">
+                  {t("jarvis.peopleConfirmedSourceCount", {
+                    count: confirmedSourceCount,
+                    defaultValue:
+                      confirmedSourceCount === 1
+                        ? "{{count}} confirmed speaker source / 条已确认说话来源"
+                        : "{{count}} confirmed speaker sources / 条已确认说话来源",
+                  })}
+                </dd>
+              </div>
+              <div>
+                <dt className="sr-only">
+                  {t("jarvis.peopleSuggestedSources", {
+                    defaultValue: "Suggested speaker matches",
+                  })}
+                </dt>
+                <dd className="text-sm font-medium">
+                  {t("jarvis.peopleSuggestedSourceCount", {
+                    count: suggestedSourceCount,
+                    defaultValue:
+                      suggestedSourceCount === 1
+                        ? "{{count}} suggested match (not confirmed) / 条建议匹配（尚未确认）"
+                        : "{{count}} suggested matches (not confirmed) / 条建议匹配（尚未确认）",
+                  })}
+                </dd>
+              </div>
+              <div>
+                <dt className="sr-only">
+                  {t("jarvis.peopleSavedMemories", { defaultValue: "Saved memories" })}
+                </dt>
+                <dd className="text-sm font-medium">
+                  {t("jarvis.peopleSavedMemoryCount", {
+                    count: attributedMemories.length,
+                    defaultValue:
+                      attributedMemories.length === 1
+                        ? "{{count}} saved memory / 条已保存记忆"
+                        : "{{count}} saved memories / 条已保存记忆",
+                  })}
+                </dd>
+              </div>
+            </dl>
+            {attributedMemories.length > 0 && (
+              <ul className="mt-4 space-y-2">
+                {attributedMemories.map((memory) => (
+                  <li key={memory.id} className="rounded-lg bg-background/70 p-3 text-sm">
+                    <p>{memory.content}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {t("jarvis.peopleSupportingOccurrenceCount", {
+                        count: memory.occurrence_count,
+                        defaultValue:
+                          memory.occurrence_count === 1
+                            ? "{{count}} supporting occurrence / 条支持记录"
+                            : "{{count}} supporting occurrences / 条支持记录",
+                      })}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
           <div className="mt-6 grid gap-4 lg:grid-cols-3">
             <section>
               <h3 className="text-sm font-semibold">{t("jarvis.peopleSamples")}</h3>

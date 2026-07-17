@@ -4,6 +4,10 @@ const { execFile } = require("node:child_process");
 
 const FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
 const IO_REPARSE_TAG_MOUNT_POINT = "0xa0000003";
+// PowerShell startup plus Win32_Volume CIM enumeration can exceed ten seconds while the
+// all-day regression suite is saturating the machine. Storage migration is not a hot path;
+// prefer a bounded, truthful result over a load-dependent false failure.
+const WINDOWS_METADATA_TIMEOUT_MS = 30_000;
 
 const WINDOWS_METADATA_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -48,7 +52,7 @@ function defaultMetadataProvider(candidate) {
     execFile(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", `& {${WINDOWS_METADATA_SCRIPT}}`, candidate],
-      { windowsHide: true, timeout: 10_000, maxBuffer: 256 * 1024 },
+      { windowsHide: true, timeout: WINDOWS_METADATA_TIMEOUT_MS, maxBuffer: 256 * 1024 },
       (error, stdout) => {
         if (error) {
           reject(error);

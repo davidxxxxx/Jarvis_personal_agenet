@@ -2164,7 +2164,7 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       suggestionId: accepted.id,
       decidedAt: 7000,
     });
-    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 }), {
+    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7001 }), {
       status: "already_accepted",
       suggestionId: accepted.id,
       decidedAt: 7000,
@@ -2197,7 +2197,7 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       suggestionId: dismissed.id,
       decidedAt: 7100,
     });
-    assert.deepEqual(repository.dismissSuggestion({ suggestionId: dismissed.id, at: 7100 }), {
+    assert.deepEqual(repository.dismissSuggestion({ suggestionId: dismissed.id, at: 7101 }), {
       status: "already_dismissed",
       suggestionId: dismissed.id,
       decidedAt: 7100,
@@ -2241,6 +2241,60 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       terminalOccurrenceCount
     );
     assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("completeTodo records one forward-only user transition and is idempotent", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({ suggestions: [] }),
+    });
+    const todo = db.prepare("SELECT id FROM todos_v2").get();
+    const before = db
+      .prepare("SELECT count(*) AS count FROM todo_state_transitions WHERE todo_instance_id = ?")
+      .get(todo.id).count;
+
+    const first = repository.completeTodo({ todoId: todo.id });
+    assert.equal(first.status, "completed");
+    assert.equal(first.todoId, todo.id);
+    assert.equal(Number.isSafeInteger(first.completedAt), true);
+    assert.deepEqual(repository.completeTodo({ todoId: todo.id }), {
+      status: "already_completed",
+      todoId: todo.id,
+      completedAt: first.completedAt,
+    });
+    assert.equal(
+      db
+        .prepare("SELECT count(*) AS count FROM todo_state_transitions WHERE todo_instance_id = ?")
+        .get(todo.id).count,
+      before + 1
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT from_status, to_status, reason, actor, occurred_at
+           FROM todo_state_transitions WHERE todo_instance_id = ?
+           ORDER BY occurred_at DESC, id DESC LIMIT 1`
+        )
+        .get(todo.id),
+      {
+        from_status: "open",
+        to_status: "completed",
+        reason: "user_action",
+        actor: "user",
+        occurred_at: first.completedAt,
+      }
+    );
+    assert.throws(() => repository.completeTodo({ todoId: "missing" }), {
+      code: "MEMORY_TODO_NOT_FOUND",
+    });
+    assert.throws(() => repository.completeTodo({ todoId: todo.id, at: 1 }));
   } finally {
     db.close();
   }
@@ -3159,9 +3213,7 @@ test("getAnalysisInputForCloud returns exact payload scope without local identit
 test("analysis admission manifest rechecks terminal final identity state", () => {
   const db = createFixture();
   try {
-    db.prepare(
-      "UPDATE sessions SET processing_state = 'ready' WHERE id = 'session-1'"
-    ).run();
+    db.prepare("UPDATE sessions SET processing_state = 'ready' WHERE id = 'session-1'").run();
     const repository = createRepository(db);
     const input = repository.createAnalysisInput(validCreateInput());
 
@@ -3170,17 +3222,19 @@ test("analysis admission manifest rechecks terminal final identity state", () =>
       sessionId: "session-1",
       sessionState: "ended",
       processingState: "ready",
-      segments: [{
-        ordinal: 0,
-        segmentId: "segment-1",
-        segmentVersion: 1,
-        textHash: sha256("durable evidence"),
-        final: true,
-        stable: true,
-        current: true,
-        duplicate: false,
-        identityKind: "durable_subject",
-      }],
+      segments: [
+        {
+          ordinal: 0,
+          segmentId: "segment-1",
+          segmentVersion: 1,
+          textHash: sha256("durable evidence"),
+          final: true,
+          stable: true,
+          current: true,
+          duplicate: false,
+          identityKind: "durable_subject",
+        },
+      ],
     });
     db.prepare("UPDATE sessions SET processing_state = 'processing' WHERE id = 'session-1'").run();
     assert.equal(
@@ -4998,8 +5052,10 @@ test("canonical keys use locale-independent Unicode lowercasing", () => {
 test("persists a canonical validated daily digest candidate against immutable input identity", () => {
   const db = createFixture();
   try {
-    const { repository, input, job, budgetAttemptId, candidate } =
-      createStoredDailyDigestContext(db, "persist");
+    const { repository, input, job, budgetAttemptId, candidate } = createStoredDailyDigestContext(
+      db,
+      "persist"
+    );
     const candidateJson = canonicalJson(candidate);
     const persisted = repository.persistValidatedDailyDigestCandidate({
       jobId: job.id,
@@ -5012,11 +5068,13 @@ test("persists a canonical validated daily digest candidate against immutable in
     assert.equal(persisted.state, "validated");
     assert.equal(persisted.candidateHash, sha256(candidateJson));
     assert.deepEqual(
-      db.prepare(
-        `SELECT job_id, digest_input_id, budget_attempt_id, response_schema_version,
+      db
+        .prepare(
+          `SELECT job_id, digest_input_id, budget_attempt_id, response_schema_version,
                 candidate_json, candidate_bytes, candidate_hash, state, disposition_at
          FROM daily_digest_response_candidates WHERE id = ?`
-      ).get(persisted.candidateId),
+        )
+        .get(persisted.candidateId),
       {
         job_id: job.id,
         digest_input_id: input.digestInputId,
@@ -5045,10 +5103,10 @@ test("daily digest candidate persistence is exact-idempotent and fails closed on
       candidate: context.candidate,
     };
     const created = context.repository.persistValidatedDailyDigestCandidate(request);
-    assert.deepEqual(
-      context.repository.persistValidatedDailyDigestCandidate(request),
-      { ...created, status: "existing" }
-    );
+    assert.deepEqual(context.repository.persistValidatedDailyDigestCandidate(request), {
+      ...created,
+      status: "existing",
+    });
 
     const secondBudgetAttemptId = reconcileBudgetAttempt(
       db,
@@ -5058,36 +5116,40 @@ test("daily digest candidate persistence is exact-idempotent and fails closed on
       2
     );
     assert.throws(
-      () => context.repository.persistValidatedDailyDigestCandidate({
-        ...request,
-        budgetAttemptId: secondBudgetAttemptId,
-      }),
+      () =>
+        context.repository.persistValidatedDailyDigestCandidate({
+          ...request,
+          budgetAttemptId: secondBudgetAttemptId,
+        }),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_ALREADY_PERSISTED" }
     );
     assert.throws(
-      () => context.repository.persistValidatedDailyDigestCandidate({
-        ...request,
-        candidate: {
-          ...context.candidate,
-          sections: {
-            ...context.candidate.sections,
-            today: [{
-              text: "Different canonical bytes.",
-              evidenceSegmentIds: [
-                context.input.cloudPayload.sections.sessions[0].segments[0].segmentId,
+      () =>
+        context.repository.persistValidatedDailyDigestCandidate({
+          ...request,
+          candidate: {
+            ...context.candidate,
+            sections: {
+              ...context.candidate.sections,
+              today: [
+                {
+                  text: "Different canonical bytes.",
+                  evidenceSegmentIds: [
+                    context.input.cloudPayload.sections.sessions[0].segments[0].segmentId,
+                  ],
+                },
               ],
-            }],
+            },
           },
-        },
-      }),
+        }),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_ALREADY_PERSISTED" }
     );
     assert.throws(
       () => context.repository.persistValidatedDailyDigestCandidate({ ...request, unknown: true }),
       /exact|keys|candidate/i
     );
-    assert.throws(
-      () => context.repository.persistValidatedDailyDigestCandidate({
+    assert.throws(() =>
+      context.repository.persistValidatedDailyDigestCandidate({
         ...request,
         digestInputId: "daily-digest-input-cross",
       })
@@ -5104,8 +5166,10 @@ test("daily digest candidate persistence is exact-idempotent and fails closed on
 test("lists recoverable daily digest candidates with safe status-only pagination", () => {
   const db = createFixture();
   try {
-    const { repository, input, job, budgetAttemptId, candidate } =
-      createStoredDailyDigestContext(db, "list");
+    const { repository, input, job, budgetAttemptId, candidate } = createStoredDailyDigestContext(
+      db,
+      "list"
+    );
     const persisted = repository.persistValidatedDailyDigestCandidate({
       jobId: job.id,
       digestInputId: input.digestInputId,
@@ -5160,19 +5224,16 @@ test("gets one recoverable daily digest candidate by exact job identity", () => 
       budgetAttemptId: context.budgetAttemptId,
       candidate: context.candidate,
     });
-    assert.deepEqual(
-      context.repository.getRecoverableDailyDigestCandidateByJob(context.job.id),
-      {
-        candidateId: persisted.candidateId,
-        jobId: context.job.id,
-        digestInputId: context.input.digestInputId,
-        candidateState: "validated",
-        jobState: "running",
-        leaseOwner: "digest-worker-job-query",
-        leaseExpiresAt: 17_000,
-        budgetState: "reconciled",
-      }
-    );
+    assert.deepEqual(context.repository.getRecoverableDailyDigestCandidateByJob(context.job.id), {
+      candidateId: persisted.candidateId,
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      candidateState: "validated",
+      jobState: "running",
+      leaseOwner: "digest-worker-job-query",
+      leaseExpiresAt: 17_000,
+      budgetState: "reconciled",
+    });
     assert.equal(
       context.repository.getRecoverableDailyDigestCandidateByJob("missing-digest-job"),
       null
@@ -5182,8 +5243,10 @@ test("gets one recoverable daily digest candidate by exact job identity", () => 
       /jobId|empty/i
     );
     db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
-    db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
-      .run(HASH_C, context.job.id);
+    db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?").run(
+      HASH_C,
+      context.job.id
+    );
     assert.throws(
       () => context.repository.getRecoverableDailyDigestCandidateByJob(context.job.id),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH" }
@@ -5212,11 +5275,13 @@ test("atomically applies a validated daily digest candidate and replays read-onl
     assert.equal(applied.revision, 1);
     assert.equal(applied.sourceHash, context.input.sourceHash);
     assert.deepEqual(
-      db.prepare(
-        `SELECT local_date, timezone, revision, completeness, lifecycle,
+      db
+        .prepare(
+          `SELECT local_date, timezone, revision, completeness, lifecycle,
                 input_watermark_json, content_json, source_hash
          FROM daily_digests WHERE id = ?`
-      ).get(applied.digestId),
+        )
+        .get(applied.digestId),
       {
         local_date: context.input.localDate,
         timezone: context.input.timezone,
@@ -5229,26 +5294,29 @@ test("atomically applies a validated daily digest candidate and replays read-onl
       }
     );
     assert.deepEqual(
-      db.prepare(
-        `SELECT transcript_segment_id FROM evidence_refs
+      db
+        .prepare(
+          `SELECT transcript_segment_id FROM evidence_refs
          WHERE entity_type = 'daily_digest' AND entity_id = ?
          ORDER BY transcript_segment_id`
-      ).all(applied.digestId),
+        )
+        .all(applied.digestId),
       [{ transcript_segment_id: `digest-segment-apply` }],
       "duplicate evidence references across digest sections must collapse deterministically"
     );
     assert.deepEqual(
-      db.prepare(
-        "SELECT state, disposition_at FROM daily_digest_response_candidates WHERE id = ?"
-      ).get(persisted.candidateId),
+      db
+        .prepare("SELECT state, disposition_at FROM daily_digest_response_candidates WHERE id = ?")
+        .get(persisted.candidateId),
       { state: "applied", disposition_at: 6003 }
     );
 
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "wrong-replay-worker",
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "wrong-replay-worker",
+        }),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
     );
     assert.deepEqual(
@@ -5289,32 +5357,37 @@ test("daily digest apply rejects wrong or expired leases with zero visible write
       candidate: context.candidate,
     });
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "wrong-worker",
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "wrong-worker",
+        }),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
     );
-    db.prepare("UPDATE processing_jobs SET lease_expires_at = 6004 WHERE id = ?")
-      .run(context.job.id);
+    db.prepare("UPDATE processing_jobs SET lease_expires_at = 6004 WHERE id = ?").run(
+      context.job.id
+    );
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "digest-worker-lease",
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "digest-worker-lease",
+        }),
       { code: "MEMORY_DAILY_DIGEST_CANDIDATE_LEASE_LOST" }
     );
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "digest-worker-lease",
-        extra: true,
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "digest-worker-lease",
+          extra: true,
+        }),
       /exact|keys|application/i
     );
     assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
     assert.equal(
-      db.prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
+      db
+        .prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
         .get().count,
       0
     );
@@ -5355,10 +5428,11 @@ test("daily digest candidate CAS failure rolls back revision evidence and prior 
       END;
     `);
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "digest-worker-cas",
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "digest-worker-cas",
+        }),
       /injected daily digest candidate CAS failure/
     );
     assert.deepEqual(
@@ -5370,7 +5444,8 @@ test("daily digest candidate CAS failure rolls back revision evidence and prior 
       { state: "validated", disposition_at: null }
     );
     assert.equal(
-      db.prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
+      db
+        .prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
         .get().count,
       1
     );
@@ -5485,10 +5560,11 @@ test("daily digest apply revalidates tampered evidence against the exact immutab
     );
 
     assert.throws(
-      () => context.repository.applyValidatedDailyDigestCandidate({
-        candidateId: persisted.candidateId,
-        leaseOwner: "digest-worker-tamper",
-      }),
+      () =>
+        context.repository.applyValidatedDailyDigestCandidate({
+          candidateId: persisted.candidateId,
+          leaseOwner: "digest-worker-tamper",
+        }),
       { code: "invalid_structure" }
     );
     assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
@@ -5520,16 +5596,19 @@ test("daily digest apply rejects terminal jobs and tampered job budget or input 
       name: "job input hash",
       mutate(db, context) {
         db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
-        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
-          .run(HASH_C, context.job.id);
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?").run(
+          HASH_C,
+          context.job.id
+        );
       },
       code: "MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH",
     },
     {
       name: "job budget model mismatch",
       mutate(db, context) {
-        db.prepare("UPDATE processing_jobs SET model_version = 'tampered-model' WHERE id = ?")
-          .run(context.job.id);
+        db.prepare("UPDATE processing_jobs SET model_version = 'tampered-model' WHERE id = ?").run(
+          context.job.id
+        );
       },
       code: "MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED",
     },
@@ -5539,8 +5618,7 @@ test("daily digest apply rejects terminal jobs and tampered job budget or input 
         db.exec("DROP TRIGGER daily_digest_inputs_immutable_update");
         db.prepare(
           "UPDATE daily_digest_inputs SET cloud_payload_json = '{}', input_bytes = 2 WHERE id = ?"
-        )
-          .run(context.input.digestInputId);
+        ).run(context.input.digestInputId);
       },
       code: "DAILY_DIGEST_INPUT_CORRUPT",
     },
@@ -5559,17 +5637,20 @@ test("daily digest apply rejects terminal jobs and tampered job budget or input 
         });
         item.mutate(db, context, index);
         assert.throws(
-          () => context.repository.applyValidatedDailyDigestCandidate({
-            candidateId: persisted.candidateId,
-            leaseOwner: `digest-worker-${item.name.replaceAll(" ", "-")}`,
-          }),
+          () =>
+            context.repository.applyValidatedDailyDigestCandidate({
+              candidateId: persisted.candidateId,
+              leaseOwner: `digest-worker-${item.name.replaceAll(" ", "-")}`,
+            }),
           { code: item.code }
         );
         assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
         assert.equal(
-          db.prepare(
-            "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'"
-          ).get().count,
+          db
+            .prepare(
+              "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'"
+            )
+            .get().count,
           0
         );
       } finally {
@@ -5593,11 +5674,14 @@ test("a latest partial candidate cannot regress an active final digest", () => {
       candidateId: first.candidateId,
       leaseOwner: "digest-worker-final-partial",
     });
-    assert.equal(context.store.completeJob(context.job.id, {
-      owner: "digest-worker-final-partial",
-      at: 7_001,
-      executionDevice: "cloud",
-    }), true);
+    assert.equal(
+      context.store.completeJob(context.job.id, {
+        owner: "digest-worker-final-partial",
+        at: 7_001,
+        executionDevice: "cloud",
+      }),
+      true
+    );
     assert.equal(context.input.completeness, "final");
     db.prepare(
       "UPDATE sessions SET processing_state = 'processing', ready_at = NULL WHERE id = ?"
@@ -5624,12 +5708,14 @@ test("a latest partial candidate cannot regress an active final digest", () => {
     );
     assert.deepEqual(
       db.prepare("SELECT id, revision, completeness, lifecycle FROM daily_digests").all(),
-      [{
-        id: firstApplied.digestId,
-        revision: 1,
-        completeness: "final",
-        lifecycle: "active",
-      }]
+      [
+        {
+          id: firstApplied.digestId,
+          revision: 1,
+          completeness: "final",
+          lifecycle: "active",
+        },
+      ]
     );
   } finally {
     db.close();
@@ -5650,11 +5736,14 @@ test("a newer final daily input appends one evidence-backed revision", () => {
       candidateId: first.candidateId,
       leaseOwner: "digest-worker-next-final",
     });
-    assert.equal(context.store.completeJob(context.job.id, {
-      owner: "digest-worker-next-final",
-      at: 7_001,
-      executionDevice: "cloud",
-    }), true);
+    assert.equal(
+      context.store.completeJob(context.job.id, {
+        owner: "digest-worker-next-final",
+        at: 7_001,
+        executionDevice: "cloud",
+      }),
+      true
+    );
     const addedSegmentId = appendDailyDigestSegment(db, context, "next-final-added");
     const nextInput = context.repository.createDailyDigestInput({
       localDate: context.input.localDate,
@@ -5689,10 +5778,12 @@ test("a newer final daily input appends one evidence-backed revision", () => {
       ]
     );
     assert.deepEqual(
-      db.prepare(
-        `SELECT transcript_segment_id FROM evidence_refs
+      db
+        .prepare(
+          `SELECT transcript_segment_id FROM evidence_refs
          WHERE entity_type = 'daily_digest' AND entity_id = ? ORDER BY transcript_segment_id`
-      ).all(applied.digestId),
+        )
+        .all(applied.digestId),
       [
         { transcript_segment_id: "digest-segment-next-final" },
         { transcript_segment_id: addedSegmentId },
@@ -5732,9 +5823,9 @@ test("two repositories applying one durable candidate converge on one revision",
     assert.equal(second.status, "already_applied");
     assert.equal(firstDb.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 1);
     assert.equal(
-      firstDb.prepare(
-        "SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'"
-      ).get().count,
+      firstDb
+        .prepare("SELECT count(*) AS count FROM evidence_refs WHERE entity_type = 'daily_digest'")
+        .get().count,
       1
     );
   } finally {
@@ -5813,20 +5904,25 @@ test("saveDigestRevision treats the complete evidence set as replay identity", (
 
     const created = repository.saveDigestRevision(digest);
     const countersAfterCreate = { ...counters };
-    assert.deepEqual(repository.saveDigestRevision({
-      ...digest,
-      evidenceSegmentIds: ["segment-1", "segment-other"],
-    }), {
-      ...created,
-      status: "existing",
-    });
+    assert.deepEqual(
+      repository.saveDigestRevision({
+        ...digest,
+        evidenceSegmentIds: ["segment-1", "segment-other"],
+      }),
+      {
+        ...created,
+        status: "existing",
+      }
+    );
     assert.deepEqual(counters, countersAfterCreate);
     assert.deepEqual(
-      db.prepare(
-        `SELECT transcript_segment_id FROM evidence_refs
+      db
+        .prepare(
+          `SELECT transcript_segment_id FROM evidence_refs
          WHERE entity_type = 'daily_digest' AND entity_id = ?
          ORDER BY transcript_segment_id`
-      ).all(created.digestId),
+        )
+        .all(created.digestId),
       [{ transcript_segment_id: "segment-1" }, { transcript_segment_id: "segment-other" }]
     );
 
@@ -5861,10 +5957,9 @@ test("saveDigestRevision rejects duplicate or out-of-scope evidence before durab
     ]) {
       assert.throws(() => repository.saveDigestRevision({ ...digest, evidenceSegmentIds }));
     }
-    assert.throws(
-      () => repository.saveDigestRevision({ ...digest, localDate: "1970-01-02" }),
-      { code: "MEMORY_DIGEST_EVIDENCE_OUT_OF_SCOPE" }
-    );
+    assert.throws(() => repository.saveDigestRevision({ ...digest, localDate: "1970-01-02" }), {
+      code: "MEMORY_DIGEST_EVIDENCE_OUT_OF_SCOPE",
+    });
     assert.deepEqual(counters, { ids: 0, clocks: 0 });
     assert.equal(db.prepare("SELECT count(*) AS count FROM daily_digests").get().count, 0);
     assert.equal(db.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 0);
@@ -5897,22 +5992,25 @@ test("saveDigestRevision rolls back the new revision and supersession when evide
     `);
 
     assert.throws(
-      () => repository.saveDigestRevision({
-        ...base,
-        sourceHash: HASH_B,
-        content: { summary: "Second" },
-        evidenceSegmentIds: ["segment-other"],
-      }),
+      () =>
+        repository.saveDigestRevision({
+          ...base,
+          sourceHash: HASH_B,
+          content: { summary: "Second" },
+          evidenceSegmentIds: ["segment-other"],
+        }),
       /injected digest evidence failure/
     );
     assert.deepEqual(db.prepare("SELECT revision, lifecycle FROM daily_digests").all(), [
       { revision: 1, lifecycle: "active" },
     ]);
     assert.deepEqual(
-      db.prepare(
-        `SELECT transcript_segment_id FROM evidence_refs
+      db
+        .prepare(
+          `SELECT transcript_segment_id FROM evidence_refs
          WHERE entity_type = 'daily_digest' ORDER BY transcript_segment_id`
-      ).all(),
+        )
+        .all(),
       [{ transcript_segment_id: "segment-1" }]
     );
   } finally {
@@ -6108,6 +6206,9 @@ test("getLatestDailyDigest returns only the active public revision with fresh ev
     assert.equal(latest.id, second.digestId);
     assert.equal(latest.lifecycle, "active");
     assert.deepEqual(latest.content, { summary: "Latest public" });
+    const latestEvidenceId = db
+      .prepare("SELECT id FROM evidence_refs WHERE entity_type = 'daily_digest' AND entity_id = ?")
+      .get(second.digestId).id;
     assert.deepEqual(latest.evidence, [
       {
         sessionId: "session-2",
@@ -6116,6 +6217,11 @@ test("getLatestDailyDigest returns only the active public revision with fresh ev
         endedAt: 9000,
         quote: "other session",
         audioState: "available",
+        handle: {
+          ownerType: "daily_digest_item",
+          ownerId: second.digestId,
+          evidenceId: latestEvidenceId,
+        },
       },
     ]);
     const serialized = JSON.stringify(latest);
@@ -6123,11 +6229,12 @@ test("getLatestDailyDigest returns only the active public revision with fresh ev
       assert.equal(serialized.includes(privateValue), false, privateValue);
     }
     assert.throws(
-      () => repository.getLatestDailyDigest({
-        localDate: "1970-01-01",
-        timezone: "Asia/Shanghai",
-        extra: true,
-      }),
+      () =>
+        repository.getLatestDailyDigest({
+          localDate: "1970-01-01",
+          timezone: "Asia/Shanghai",
+          extra: true,
+        }),
       /exact|keys|digest/i
     );
   } finally {
@@ -6142,7 +6249,14 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     repository.applyCandidateAnalysis({
       analysisInputId: input.analysisInputId,
       inputHash: input.inputHash,
-      candidate: validCandidate(),
+      candidate: validCandidate({
+        suggestions: [
+          {
+            ...validCandidate().suggestions[0],
+            basedOnEvidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
     });
     repository.saveDigestRevision({
       localDate: "1970-01-01",
@@ -6159,10 +6273,8 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     });
     const snapshot = repository.readPublicSnapshot();
     assert.deepEqual(Object.keys(snapshot).sort(), [
-      "dailyDigests",
       "memories",
       "memoryConflicts",
-      "sessionSummaries",
       "suggestions",
       "todos",
       "topics",
@@ -6171,8 +6283,14 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     assert.equal(snapshot.topics.length, 1);
     assert.equal(snapshot.todos.length, 1);
     assert.equal(snapshot.suggestions.length, 1);
-    assert.equal(snapshot.sessionSummaries.length, 1);
-    assert.equal(snapshot.dailyDigests.length, 1);
+    const memoryEvidenceId = db
+      .prepare(
+        `SELECT ref.id FROM evidence_refs AS ref
+         JOIN memory_occurrences AS occurrence ON occurrence.id = ref.entity_id
+         WHERE ref.entity_type = 'memory_occurrence'
+           AND occurrence.memory_value_id = ?`
+      )
+      .get(snapshot.memories[0].id).id;
     assert.deepEqual(snapshot.memories[0].occurrences[0].evidence, [
       {
         sessionId: "session-1",
@@ -6181,21 +6299,31 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
         endedAt: 5000,
         quote: "durable evidence",
         audioState: "available",
+        handle: {
+          ownerType: "memory_value",
+          ownerId: snapshot.memories[0].id,
+          evidenceId: memoryEvidenceId,
+        },
       },
     ]);
     assert.equal(snapshot.todos[0].ownerLabel, "Local Self");
-    assert.deepEqual(snapshot.dailyDigests[0].content, { summary: "Public digest" });
-    assert.deepEqual(snapshot.dailyDigests[0].evidence, [
-      {
-        sessionId: "session-1",
-        segmentId: "segment-1",
-        startedAt: 1000,
-        endedAt: 5000,
-        quote: "durable evidence",
-        audioState: "available",
-      },
-    ]);
-    assert.equal("inputWatermark" in snapshot.dailyDigests[0], false);
+    const semanticHandles = [
+      snapshot.topics[0].occurrences[0].evidence[0].handle,
+      snapshot.todos[0].occurrences[0].evidence[0].handle,
+      snapshot.suggestions[0].occurrences[0].evidence[0].handle,
+    ];
+    assert.deepEqual(
+      semanticHandles.map((handle) => [handle.ownerType, handle.ownerId]),
+      [
+        ["topic_revision", snapshot.topics[0].occurrences[0].revisionId],
+        ["todo_instance", snapshot.todos[0].id],
+        ["suggestion", snapshot.suggestions[0].id],
+      ]
+    );
+    assert.equal(
+      semanticHandles.every((handle) => /^evidence-[0-9]+$/u.test(handle.evidenceId)),
+      true
+    );
 
     const forbiddenKeys = new Set([
       "analysisInputId",
@@ -6243,7 +6371,289 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
   }
 });
 
-test("readPublicSnapshot fails closed when durable JSON content is structurally corrupt", () => {
+test("readPublicSnapshot bounds durable rows and keeps the newest history in display order", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate(),
+    });
+
+    for (let index = 0; index < 105; index += 1) {
+      db.prepare(
+        `INSERT INTO memory_items_v2 (
+           id, kind, canonical_slot_key, canonical_value_key, title, body, confidence,
+           lifecycle, source_analysis_input_id, provenance, created_at, updated_at
+         ) VALUES (?, 'fact', ?, ?, ?, ?, 1, 'active', ?, 'evidence_linked', ?, ?)`
+      ).run(
+        `bounded-memory-${index}`,
+        sha256(`bounded-slot-${index}`),
+        sha256(`bounded-value-${index}`),
+        `Bounded memory ${index}`,
+        `Bounded body ${index}`,
+        input.analysisInputId,
+        20_000 + index,
+        20_000 + index
+      );
+    }
+
+    const topic = db.prepare("SELECT id FROM topics_v2 LIMIT 1").get();
+    let previousTopicRevisionId = db
+      .prepare("SELECT id FROM topic_revisions WHERE topic_id = ? AND revision = 1")
+      .get(topic.id).id;
+    for (let revision = 2; revision <= 25; revision += 1) {
+      const revisionId = `bounded-topic-revision-${revision}`;
+      db.prepare(
+        `INSERT INTO topic_revisions (
+           id, topic_id, revision, previous_revision_id, summary,
+           source_analysis_input_id, provenance, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 'evidence_linked', ?)`
+      ).run(
+        revisionId,
+        topic.id,
+        revision,
+        previousTopicRevisionId,
+        `Topic revision ${revision}`,
+        input.analysisInputId,
+        30_000 + revision
+      );
+      db.prepare(
+        `INSERT INTO topic_occurrences (
+           id, topic_id, topic_revision_id, analysis_input_id, legacy_session_id,
+           occurrence_key, candidate_item_fingerprint, created_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`
+      ).run(
+        `bounded-topic-occurrence-${revision}`,
+        topic.id,
+        revisionId,
+        input.analysisInputId,
+        sha256(`bounded-topic-occurrence-key-${revision}`),
+        sha256(`bounded-topic-fingerprint-${revision}`),
+        30_000 + revision
+      );
+      previousTopicRevisionId = revisionId;
+    }
+
+    const todo = db.prepare("SELECT id FROM todos_v2 LIMIT 1").get();
+    let previousTodoRevisionId = db
+      .prepare("SELECT id FROM todo_revisions WHERE todo_instance_id = ? AND revision = 1")
+      .get(todo.id).id;
+    for (let revision = 2; revision <= 25; revision += 1) {
+      const revisionId = `bounded-todo-revision-${revision}`;
+      db.prepare(
+        `INSERT INTO todo_revisions (
+           id, todo_instance_id, revision, previous_revision_id, title, due_text,
+           source_analysis_input_id, provenance, created_at
+         ) VALUES (?, ?, ?, ?, ?, NULL, ?, 'evidence_linked', ?)`
+      ).run(
+        revisionId,
+        todo.id,
+        revision,
+        previousTodoRevisionId,
+        `Todo revision ${revision}`,
+        input.analysisInputId,
+        40_000 + revision
+      );
+      previousTodoRevisionId = revisionId;
+    }
+
+    const snapshot = repository.readPublicSnapshot();
+    assert.equal(snapshot.memories.length, 101);
+    const publicTopic = snapshot.topics.find((item) => item.id === topic.id);
+    assert.deepEqual(
+      publicTopic.revisions.map((revision) => revision.revision),
+      Array.from({ length: 20 }, (_value, index) => index + 6)
+    );
+    assert.deepEqual(
+      publicTopic.occurrences.map((occurrence) => occurrence.revisionId),
+      Array.from({ length: 20 }, (_value, index) => `bounded-topic-revision-${index + 6}`)
+    );
+    const publicTodo = snapshot.todos.find((item) => item.id === todo.id);
+    assert.deepEqual(
+      publicTodo.revisions.map((revision) => revision.revision),
+      Array.from({ length: 20 }, (_value, index) => index + 6)
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("getEvidenceContext validates semantic owner membership before returning safe lineage", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const base = validCandidate();
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        memories: [
+          ...base.memories,
+          {
+            kind: "preference",
+            title: "Storage preference",
+            body: "Keep recordings local.",
+            confidence: 0.8,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+        suggestions: [
+          {
+            ...base.suggestions[0],
+            basedOnEvidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+    const digest = repository.saveDigestRevision({
+      localDate: "1970-01-01",
+      timezone: "Asia/Shanghai",
+      sourceHash: HASH_C,
+      inputWatermark: { latestAppliedAt: 6000 },
+      content: { summary: "Public digest" },
+      completeness: "partial",
+      evidenceSegmentIds: ["segment-1"],
+    });
+
+    const handles = [
+      {
+        ownerType: "memory_value",
+        ...db
+          .prepare(
+            `SELECT item.id AS ownerId, ref.id AS evidenceId
+             FROM memory_items_v2 AS item
+             JOIN memory_occurrences AS occurrence ON occurrence.memory_value_id = item.id
+             JOIN evidence_refs AS ref
+               ON ref.entity_type = 'memory_occurrence' AND ref.entity_id = occurrence.id
+             WHERE item.title = 'Deployment choice'`
+          )
+          .get(),
+      },
+      {
+        ownerType: "topic_revision",
+        ...db
+          .prepare(
+            `SELECT revision.id AS ownerId, ref.id AS evidenceId
+             FROM topic_revisions AS revision
+             JOIN topic_occurrences AS occurrence
+               ON occurrence.topic_revision_id = revision.id
+             JOIN evidence_refs AS ref
+               ON ref.entity_type = 'topic_occurrence' AND ref.entity_id = occurrence.id`
+          )
+          .get(),
+      },
+      {
+        ownerType: "todo_instance",
+        ...db
+          .prepare(
+            `SELECT todo.id AS ownerId, ref.id AS evidenceId
+             FROM todos_v2 AS todo
+             JOIN todo_occurrences AS occurrence ON occurrence.todo_instance_id = todo.id
+             JOIN evidence_refs AS ref
+               ON ref.entity_type = 'todo_occurrence' AND ref.entity_id = occurrence.id`
+          )
+          .get(),
+      },
+      {
+        ownerType: "session_summary_revision",
+        ...db
+          .prepare(
+            `SELECT summary.id AS ownerId, ref.id AS evidenceId
+             FROM session_summary_revisions AS summary
+             JOIN evidence_refs AS ref
+               ON ref.entity_type = 'session_summary_revision' AND ref.entity_id = summary.id`
+          )
+          .get(),
+      },
+      {
+        ownerType: "daily_digest_item",
+        ownerId: digest.digestId,
+        evidenceId: db
+          .prepare(
+            `SELECT id FROM evidence_refs
+             WHERE entity_type = 'daily_digest' AND entity_id = ?`
+          )
+          .get(digest.digestId).id,
+      },
+      {
+        ownerType: "suggestion",
+        ...db
+          .prepare(
+            `SELECT suggestion.id AS ownerId, ref.id AS evidenceId
+             FROM suggestions_v2 AS suggestion
+             JOIN suggestion_occurrences AS occurrence
+               ON occurrence.suggestion_id = suggestion.id
+             JOIN evidence_refs AS ref
+               ON ref.entity_type = 'suggestion_occurrence' AND ref.entity_id = occurrence.id`
+          )
+          .get(),
+      },
+      {
+        ownerType: "speaker_cluster",
+        ownerId: "cluster-other",
+        evidenceId: "segment-omitted",
+      },
+    ];
+
+    const allowedKeys = [
+      "ownerType",
+      "ownerId",
+      "evidenceId",
+      "sessionId",
+      "sessionStartedAt",
+      "sessionEndedAt",
+      "transcriptSegmentId",
+      "transcriptState",
+      "trackId",
+      "sourceType",
+      "startedAt",
+      "endedAt",
+      "quoteText",
+      "audioState",
+    ].sort();
+    for (const handle of handles) {
+      const context = repository.getEvidenceContext(handle);
+      assert.deepEqual(Object.keys(context).sort(), allowedKeys, handle.ownerType);
+      assert.equal(context.ownerType, handle.ownerType);
+      assert.equal(context.ownerId, handle.ownerId);
+      assert.equal(context.evidenceId, handle.evidenceId);
+      assert.equal(context.sessionStartedAt <= context.startedAt, true);
+      assert.equal(context.startedAt < context.endedAt, true);
+      assert.equal(context.endedAt <= context.sessionEndedAt, true);
+      assert.equal(JSON.stringify(context).includes("capture-"), false);
+      assert.equal(JSON.stringify(context).includes(HASH_A), false);
+    }
+
+    const otherMemory = db
+      .prepare("SELECT id FROM memory_items_v2 WHERE title = 'Storage preference'")
+      .get().id;
+    assert.equal(
+      repository.getEvidenceContext({
+        ownerType: "memory_value",
+        ownerId: otherMemory,
+        evidenceId: handles[0].evidenceId,
+      }),
+      null
+    );
+    assert.equal(
+      repository.getEvidenceContext({
+        ownerType: "speaker_cluster",
+        ownerId: "cluster-other",
+        evidenceId: "segment-1",
+      }),
+      null
+    );
+    assert.throws(() =>
+      repository.getEvidenceContext({ ...handles[0], sessionId: "forged-session" })
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("knowledge snapshot ignores unrelated corrupt digest JSON while digest reads fail closed", () => {
   const db = createFixture();
   try {
     const repository = createRepository(db);
@@ -6258,9 +6668,17 @@ test("readPublicSnapshot fails closed when durable JSON content is structurally 
     });
     db.exec("DROP TRIGGER daily_digests_immutable_content");
     db.prepare("UPDATE daily_digests SET content_json = '[]'").run();
-    assert.throws(() => repository.readPublicSnapshot(), {
-      code: "MEMORY_PUBLIC_READ_CORRUPT",
-    });
+    assert.doesNotThrow(() => repository.readPublicSnapshot());
+    assert.throws(
+      () =>
+        repository.getLatestDailyDigest({
+          localDate: "1970-01-01",
+          timezone: "Asia/Shanghai",
+        }),
+      {
+        code: "MEMORY_PUBLIC_READ_CORRUPT",
+      }
+    );
   } finally {
     db.close();
   }
@@ -6345,7 +6763,6 @@ test("session deletion removes source occurrences but preserves durable public h
     assert.equal(snapshot.todos[0].ownerLabel, "P1");
     assert.equal(snapshot.suggestions[0].provenance, "source_deleted");
     assert.deepEqual(snapshot.memories[0].occurrences, []);
-    assert.deepEqual(snapshot.sessionSummaries, []);
   } finally {
     db.close();
   }

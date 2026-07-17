@@ -13,6 +13,10 @@ import type {
   JarvisSpeakerClusterView,
   JarvisSpeakerConfirmationResult,
   JarvisSpeakerPersonSummary,
+  JarvisContinuousSeekResult,
+  JarvisEvidenceContext,
+  JarvisEvidenceHandle,
+  JarvisEvidenceNavigationState,
 } from "../types";
 import { initialSessionState, type SessionState } from "./sessionMachine";
 
@@ -71,6 +75,8 @@ interface JarvisRendererState {
   speakerCorrectionCandidates: JarvisSpeakerPersonSummary[];
   speakerCorrectionCandidateClusterId: string | null;
   selectedView: JarvisView;
+  selectedSessionId: string | null;
+  evidenceNavigation: JarvisEvidenceNavigationState;
   operation: JarvisControlAction | null;
   error: string | null;
   captureMode: JarvisCaptureMode;
@@ -82,6 +88,11 @@ interface JarvisRendererState {
   setSessions: (sessions: JarvisSession[]) => void;
   setPeople: (people: JarvisPerson[]) => void;
   setSelectedView: (view: JarvisView) => void;
+  openEvidence: (handle: JarvisEvidenceHandle) => Promise<void>;
+  markEvidenceSessionOpened: (requestId: number) => void;
+  failEvidenceSession: (requestId: number) => void;
+  acknowledgeEvidencePlayback: (requestId: number, result: JarvisContinuousSeekResult) => void;
+  clearEvidenceNavigation: () => void;
   setOperation: (operation: JarvisControlAction | null) => void;
   setError: (error: string | null) => void;
   setCaptureMode: (captureMode: JarvisCaptureMode) => void;
@@ -112,6 +123,8 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
   speakerCorrectionCandidates: [],
   speakerCorrectionCandidateClusterId: null,
   selectedView: "today",
+  selectedSessionId: null,
+  evidenceNavigation: { phase: "idle", requestId: 0 },
   operation: null,
   error: null,
   captureMode: "mic",
@@ -122,7 +135,117 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
   setSession: (session) => set({ session }),
   setSessions: (sessions) => set({ sessions }),
   setPeople: (people) => set({ people }),
-  setSelectedView: (selectedView) => set({ selectedView }),
+  setSelectedView: (selectedView) =>
+    set((current) =>
+      selectedView !== "memory" && current.evidenceNavigation.phase !== "idle"
+        ? {
+            selectedView,
+            selectedSessionId: null,
+            evidenceNavigation: {
+              phase: "idle" as const,
+              requestId: current.evidenceNavigation.requestId + 1,
+            },
+          }
+        : { selectedView }
+    ),
+  openEvidence: async (handle) => {
+    const requestId = get().evidenceNavigation.requestId + 1;
+    set({ evidenceNavigation: { phase: "resolving", requestId, handle } });
+    try {
+      const api = window.electronAPI?.jarvis as unknown as {
+        getEvidenceContext?: (value: JarvisEvidenceHandle) => Promise<JarvisEvidenceContext | null>;
+      };
+      if (typeof api.getEvidenceContext !== "function") throw new Error("unavailable");
+      const context = await api.getEvidenceContext(handle);
+      if (get().evidenceNavigation.requestId !== requestId) return;
+      if (!context) {
+        set({
+          evidenceNavigation: { phase: "failed", requestId, code: "evidence_not_found" },
+        });
+        return;
+      }
+      set({
+        selectedView: "memory",
+        selectedSessionId: context.sessionId,
+        evidenceNavigation: { phase: "opening_session", requestId, context },
+      });
+    } catch {
+      if (get().evidenceNavigation.requestId !== requestId) return;
+      set({
+        evidenceNavigation: { phase: "failed", requestId, code: "evidence_navigation_failed" },
+      });
+    }
+  },
+  markEvidenceSessionOpened: (requestId) =>
+    set((current) => {
+      const navigation = current.evidenceNavigation;
+      if (navigation.requestId !== requestId || navigation.phase !== "opening_session") return {};
+      if (navigation.context.audioState === "expired") {
+        return {
+          evidenceNavigation: {
+            phase: "transcript_only" as const,
+            requestId,
+            context: navigation.context,
+            reason: "audio_expired" as const,
+          },
+        };
+      }
+      if (navigation.context.audioState === "missing") {
+        return {
+          evidenceNavigation: {
+            phase: "transcript_only" as const,
+            requestId,
+            context: navigation.context,
+            reason: "audio_missing" as const,
+          },
+        };
+      }
+      return {
+        evidenceNavigation: {
+          phase: "seeking" as const,
+          requestId,
+          context: navigation.context,
+        },
+      };
+    }),
+  failEvidenceSession: (requestId) =>
+    set((current) =>
+      current.evidenceNavigation.requestId === requestId
+        ? {
+            evidenceNavigation: {
+              phase: "failed" as const,
+              requestId,
+              code: "session_unavailable" as const,
+            },
+          }
+        : {}
+    ),
+  acknowledgeEvidencePlayback: (requestId, result) =>
+    set((current) => {
+      const navigation = current.evidenceNavigation;
+      if (navigation.requestId !== requestId || navigation.phase !== "seeking") return {};
+      return result === "playing"
+        ? {
+            evidenceNavigation: {
+              phase: "playing" as const,
+              requestId,
+              context: navigation.context,
+            },
+          }
+        : {
+            evidenceNavigation: {
+              phase: "transcript_only" as const,
+              requestId,
+              context: navigation.context,
+              reason: "audio_became_unavailable" as const,
+            },
+          };
+    }),
+  clearEvidenceNavigation: () =>
+    set((current) => ({
+      selectedSessionId: null,
+      evidenceNavigation: { phase: "idle", requestId: current.evidenceNavigation.requestId + 1 },
+    })),
   setOperation: (operation) => set({ operation }),
   setError: (error) => set({ error }),
   setCaptureMode: (captureMode) => set({ captureMode }),

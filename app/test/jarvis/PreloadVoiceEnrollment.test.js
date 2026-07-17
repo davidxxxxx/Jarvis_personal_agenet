@@ -125,6 +125,28 @@ test("preload exposes only scalar-date daily digest controls", async () => {
   assert.equal(invokes.length, 2);
 });
 
+test("preload exposes narrow v2 knowledge reads and actions", async () => {
+  const { api, invokes } = loadPreloadApi();
+
+  await api.getKnowledgeOverview();
+  await api.decideKnowledgeSuggestion("suggestion_1", "accept");
+  await api.resolveKnowledgeConflict("conflict_1", "memory_1");
+  await api.completeKnowledgeTodo("todo_1");
+
+  assert.deepEqual(invokes, [
+    ["jarvis:memory:v2-overview"],
+    ["jarvis:memory:v2-suggestion-decision", { suggestionId: "suggestion_1", action: "accept" }],
+    [
+      "jarvis:memory:v2-conflict-resolve",
+      { conflictGroupId: "conflict_1", selectedMemoryItemId: "memory_1" },
+    ],
+    ["jarvis:memory:v2-todo-complete", { todoId: "todo_1" }],
+  ]);
+  assert.throws(() => api.decideKnowledgeSuggestion("suggestion_1", "convert"));
+  assert.throws(() => api.completeKnowledgeTodo("../todo"));
+  assert.equal(invokes.length, 4);
+});
+
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
   const { api, sends, invokes, listeners } = loadPreloadApi();
   const shutdownRequests = [];

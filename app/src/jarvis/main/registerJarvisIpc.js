@@ -7,9 +7,19 @@ const {
   assertRetentionMode,
   normalizeSpeakerConfirmationInput,
   normalizeDailyDigestDateRequest,
+  normalizeSuggestionDecisionInput,
+  normalizeMemoryConflictResolutionInput,
+  normalizeKnowledgeTodoCompletionInput,
+  normalizeEvidenceContextRequest,
+  normalizeEvidenceContextResponse,
 } = require("../shared/contracts");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
-const { toPublicAudioChunk, toPublicSessionDetail } = require("./AudioChunkPublicView");
+const {
+  toRendererAudioChunk,
+  toRendererSession,
+  toPublicSessionDetail,
+  toRendererSessionTimeline,
+} = require("./AudioChunkPublicView");
 const path = require("node:path");
 
 const REQUIRED_REPOSITORY_METHODS = [
@@ -212,6 +222,7 @@ function toPublicDailyDigest(digest) {
       endedAt: entry.endedAt,
       quote: entry.quote,
       audioState: entry.audioState,
+      handle: normalizeEvidenceContextRequest(entry.handle),
     })),
     createdAt: digest.createdAt,
     updatedAt: digest.updatedAt,
@@ -254,6 +265,149 @@ function toPublicDailyDigestStatus(status) {
       Number.isSafeInteger(status.attemptCount) && status.attemptCount >= 0
         ? status.attemptCount
         : 0,
+  };
+}
+
+const KNOWLEDGE_LIST_LIMIT = 100;
+const KNOWLEDGE_HISTORY_LIMIT = 20;
+const KNOWLEDGE_EVIDENCE_LIMIT = 8;
+
+function limited(items, limit) {
+  return (Array.isArray(items) ? items : []).slice(0, limit);
+}
+
+function toPublicKnowledgeEvidence(entry) {
+  return {
+    sessionId: entry.sessionId,
+    segmentId: entry.segmentId,
+    startedAt: entry.startedAt,
+    endedAt: entry.endedAt,
+    quote: entry.quote,
+    audioState: entry.audioState,
+    handle: normalizeEvidenceContextRequest(entry.handle),
+  };
+}
+
+function publicEvidence(items) {
+  return limited(items, KNOWLEDGE_EVIDENCE_LIMIT).map(toPublicKnowledgeEvidence);
+}
+
+function toPublicKnowledgeOverview(snapshot) {
+  const memories = limited(snapshot?.memories, KNOWLEDGE_LIST_LIMIT).map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    title: item.title,
+    body: item.body,
+    confidence: item.confidence,
+    lifecycle: item.lifecycle,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
+      id: occurrence.id,
+      sessionId: occurrence.sessionId,
+      startedAt: occurrence.startedAt,
+      endedAt: occurrence.endedAt,
+      confidence: occurrence.confidence,
+      createdAt: occurrence.createdAt,
+      evidence: publicEvidence(occurrence.evidence),
+    })),
+  }));
+  const topics = limited(snapshot?.topics, KNOWLEDGE_LIST_LIMIT).map((item) => ({
+    id: item.id,
+    name: item.name,
+    lifecycle: item.lifecycle,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({
+      id: revision.id,
+      revision: revision.revision,
+      summary: revision.summary,
+      createdAt: revision.createdAt,
+    })),
+    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
+      id: occurrence.id,
+      sessionId: occurrence.sessionId,
+      revisionId: occurrence.revisionId,
+      createdAt: occurrence.createdAt,
+      evidence: publicEvidence(occurrence.evidence),
+    })),
+  }));
+  const todos = limited(snapshot?.todos, KNOWLEDGE_LIST_LIMIT).map((item) => ({
+    id: item.id,
+    title: item.title,
+    ownerLabel: item.ownerLabel,
+    status: item.status,
+    completedAt: item.completedAt,
+    dismissedAt: item.dismissedAt,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({
+      id: revision.id,
+      revision: revision.revision,
+      title: revision.title,
+      dueText: revision.dueText,
+      createdAt: revision.createdAt,
+    })),
+    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
+      id: occurrence.id,
+      sessionId: occurrence.sessionId,
+      revisionId: occurrence.revisionId,
+      startedAt: occurrence.startedAt,
+      endedAt: occurrence.endedAt,
+      createdAt: occurrence.createdAt,
+      evidence: publicEvidence(occurrence.evidence),
+    })),
+    transitions: limited(item.transitions, KNOWLEDGE_HISTORY_LIMIT).map((transition) => ({
+      id: transition.id,
+      fromStatus: transition.fromStatus,
+      toStatus: transition.toStatus,
+      occurredAt: transition.occurredAt,
+    })),
+  }));
+  const suggestions = limited(snapshot?.suggestions, KNOWLEDGE_LIST_LIMIT).map((item) => ({
+    id: item.id,
+    title: item.title,
+    rationale: item.rationale,
+    state: item.state,
+    decidedAt: item.decidedAt,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
+      id: occurrence.id,
+      sessionId: occurrence.sessionId,
+      createdAt: occurrence.createdAt,
+      evidence: publicEvidence(occurrence.evidence),
+    })),
+  }));
+  const conflicts = limited(snapshot?.memoryConflicts, KNOWLEDGE_LIST_LIMIT).map((item) => ({
+    id: item.id,
+    episode: item.episode,
+    state: item.state,
+    selectedMemoryItemId: item.selectedMemoryItemId,
+    resolvedAt: item.resolvedAt,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    members: limited(item.members, KNOWLEDGE_HISTORY_LIMIT).map((member) => ({
+      memoryItemId: member.memoryItemId,
+      title: member.title,
+      body: member.body,
+      lifecycle: member.lifecycle,
+      selected: member.selected === true,
+    })),
+  }));
+  return {
+    memories,
+    topics,
+    todos,
+    suggestions,
+    conflicts,
+    truncated: [
+      snapshot?.memories,
+      snapshot?.topics,
+      snapshot?.todos,
+      snapshot?.suggestions,
+      snapshot?.memoryConflicts,
+    ].some((items) => Array.isArray(items) && items.length > KNOWLEDGE_LIST_LIMIT),
   };
 }
 
@@ -334,14 +488,18 @@ function registerJarvisIpc({
     });
   };
 
-  ipcMain.handle(CHANNELS.createSession, (_event, input) => repository.createSession(input));
+  ipcMain.handle(CHANNELS.createSession, (_event, input) =>
+    toRendererSession(repository.createSession(input))
+  );
   ipcMain.handle(CHANNELS.setSessionStatus, (_event, id, status, at) =>
     repository.setSessionStatus(assertId(id, "sessionId"), assertSessionStatus(status), at)
   );
   ipcMain.handle(CHANNELS.getSession, (_event, id) =>
-    repository.getSession(assertId(id, "sessionId"))
+    toRendererSession(repository.getSession(assertId(id, "sessionId")))
   );
-  ipcMain.handle(CHANNELS.listSessions, (_event, query) => repository.listSessions(query));
+  ipcMain.handle(CHANNELS.listSessions, (_event, query) =>
+    repository.listSessions(query).map(toRendererSession)
+  );
   ipcMain.handle(CHANNELS.upsertSegments, (_event, sessionId, segments) =>
     repository.upsertTranscriptSegments(assertId(sessionId, "sessionId"), segments)
   );
@@ -385,7 +543,7 @@ function registerJarvisIpc({
     return speakerCorrectionService.mergePeople(sourceId, targetId);
   });
   ipcMain.handle(CHANNELS.listAudioChunks, (_event, sessionId) =>
-    repository.listAudioChunks(assertId(sessionId, "sessionId")).map(toPublicAudioChunk)
+    repository.listAudioChunks(assertId(sessionId, "sessionId")).map(toRendererAudioChunk)
   );
   ipcMain.handle(CHANNELS.readAudioChunk, async (_event, audioChunkId) => {
     const chunk = repository.getAudioChunk(assertId(audioChunkId, "audioChunkId"));
@@ -416,11 +574,7 @@ function registerJarvisIpc({
       activeCapture.sessionId === timeline.session_id
         ? (processingLifecycle?.runtime?.previewStatus?.() ?? null)
         : null;
-    return {
-      ...timeline,
-      chunks: timeline.chunks.map(toPublicAudioChunk),
-      preview_status: previewStatus,
-    };
+    return toRendererSessionTimeline(timeline, previewStatus);
   });
   ipcMain.handle(CHANNELS.getRuntimeStatus, async () => {
     const observedAt = now();
@@ -503,9 +657,10 @@ function registerJarvisIpc({
   });
   ipcMain.handle(CHANNELS.searchMemory, (_event, query, limit) => {
     if (typeof query !== "string") throw new TypeError("query must be a string");
-    return query.trim()
+    const sessions = query.trim()
       ? repository.searchMemory(query, limit)
       : repository.listSessions({ limit: limit ?? 100 });
+    return sessions.map(toRendererSession);
   });
   ipcMain.handle(CHANNELS.listPeopleOverview, () => repository.listPeopleOverview());
   ipcMain.handle(CHANNELS.getPersonDetail, (_event, personId) =>
@@ -527,6 +682,73 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.getTodayInsights, (_event, sessionId) =>
     repository.getTodayInsights(assertId(sessionId, "sessionId"))
   );
+  if (repository.memoryRepository) {
+    const currentKnowledgeRepository = () => {
+      const memoryRepository = repository.memoryRepository;
+      for (const method of [
+        "readPublicSnapshot",
+        "acceptSuggestion",
+        "dismissSuggestion",
+        "resolveMemoryConflict",
+        "completeTodo",
+        "getEvidenceContext",
+      ]) {
+        if (!memoryRepository || typeof memoryRepository[method] !== "function") {
+          throw new Error("Knowledge repository is unavailable");
+        }
+      }
+      return memoryRepository;
+    };
+    ipcMain.handle(CHANNELS.getKnowledgeOverview, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("knowledge overview takes no arguments");
+      return toPublicKnowledgeOverview(currentKnowledgeRepository().readPublicSnapshot());
+    });
+    ipcMain.handle(CHANNELS.decideKnowledgeSuggestion, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("suggestion decision requires one argument");
+      const input = normalizeSuggestionDecisionInput(args[0]);
+      const result = currentKnowledgeRepository()[
+        input.action === "accept" ? "acceptSuggestion" : "dismissSuggestion"
+      ]({ suggestionId: input.suggestionId, at: now() });
+      return {
+        status: result.status,
+        suggestionId: result.suggestionId,
+        decidedAt: result.decidedAt,
+      };
+    });
+    ipcMain.handle(CHANNELS.resolveKnowledgeConflict, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("conflict resolution requires one argument");
+      const input = normalizeMemoryConflictResolutionInput(args[0]);
+      const result = currentKnowledgeRepository().resolveMemoryConflict(input);
+      return {
+        status: result.status,
+        conflictGroupId: result.conflictGroupId,
+        selectedMemoryItemId: result.selectedMemoryItemId,
+      };
+    });
+    ipcMain.handle(CHANNELS.completeKnowledgeTodo, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("todo completion requires one argument");
+      const input = normalizeKnowledgeTodoCompletionInput(args[0]);
+      const result = currentKnowledgeRepository().completeTodo(input);
+      return {
+        status: result.status,
+        todoId: result.todoId,
+        completedAt: result.completedAt,
+      };
+    });
+    ipcMain.handle(CHANNELS.getEvidenceContext, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("evidence context requires one argument");
+      const input = normalizeEvidenceContextRequest(args[0]);
+      try {
+        return normalizeEvidenceContextResponse(
+          currentKnowledgeRepository().getEvidenceContext(input)
+        );
+      } catch {
+        const error = new Error("Evidence context is unavailable");
+        error.code = "EVIDENCE_CONTEXT_UNAVAILABLE";
+        throw error;
+      }
+    });
+  }
   if (dailyDigestScheduler) {
     ipcMain.handle(CHANNELS.getDailyDigest, async (_event, ...args) => {
       if (args.length !== 1) throw new TypeError("daily digest request requires one argument");

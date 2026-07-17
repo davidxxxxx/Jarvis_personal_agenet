@@ -1428,7 +1428,7 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
     db.pragma("foreign_keys = ON");
     applyJarvisMigrations(db, { now: () => 1_000 });
 
-    assert.equal(TARGET_VERSION, 29);
+    assert.ok(TARGET_VERSION >= 29);
     assert.deepEqual(columnNames(db, "daily_digest_inputs"), [
       "id",
       "local_date",
@@ -1457,8 +1457,9 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
     ]);
     assert.ok(columnNames(db, "processing_jobs").includes("digest_input_id"));
     assert.equal(
-      db.pragma("foreign_key_list(daily_digest_response_candidates)").find((fk) => fk.from === "job_id")
-        .on_delete,
+      db
+        .pragma("foreign_key_list(daily_digest_response_candidates)")
+        .find((fk) => fk.from === "job_id").on_delete,
       "RESTRICT"
     );
     assert.equal(
@@ -1467,11 +1468,13 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
       "RESTRICT"
     );
     assert.match(
-      db.prepare(
-        `SELECT sql FROM sqlite_master
+      db
+        .prepare(
+          `SELECT sql FROM sqlite_master
          WHERE type = 'trigger'
            AND name = 'daily_digest_response_candidates_validate_insert'`
-      ).get().sql,
+        )
+        .get().sql,
       /attempt\.state = 'reconciled'/
     );
 
@@ -1505,10 +1508,12 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
        )`
     ).run("a".repeat(64));
     assert.deepEqual(
-      db.prepare(
-        `SELECT session_id, lane, priority, digest_input_id, analysis_input_id, desired_head_hash
+      db
+        .prepare(
+          `SELECT session_id, lane, priority, digest_input_id, analysis_input_id, desired_head_hash
          FROM processing_jobs WHERE id = 'digest-job-1'`
-      ).get(),
+        )
+        .get(),
       {
         session_id: null,
         lane: "cloud",
@@ -1519,7 +1524,10 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
       }
     );
     assert.throws(
-      () => db.prepare("UPDATE daily_digest_inputs SET completeness = 'partial' WHERE id = ?").run("digest-input-1"),
+      () =>
+        db
+          .prepare("UPDATE daily_digest_inputs SET completeness = 'partial' WHERE id = ?")
+          .run("digest-input-1"),
       /immutable/i
     );
     assert.throws(
@@ -1528,24 +1536,28 @@ test("v29 creates immutable digest inputs candidates and sessionless digest job 
     );
     assert.throws(
       () =>
-        db.prepare(
-          `INSERT INTO processing_jobs (
+        db
+          .prepare(
+            `INSERT INTO processing_jobs (
              id, session_id, job_type, state, priority, input_hash, input_version,
              model_version, lane, digest_input_id, created_at
            ) VALUES ('bad-digest-session', 'missing', 'generate_daily_digest', 'pending', 80,
              ?, 1, 'MiniMax-M2.7', 'cloud', 'digest-input-1', 1000)`
-        ).run("a".repeat(64)),
+          )
+          .run("a".repeat(64)),
       /invalid|foreign key|check constraint/i
     );
     assert.throws(
       () =>
-        db.prepare(
-          `INSERT INTO processing_jobs (
+        db
+          .prepare(
+            `INSERT INTO processing_jobs (
              id, session_id, job_type, state, priority, input_hash, input_version,
              model_version, lane, created_at
            ) VALUES ('bad-local-session', NULL, 'transcribe_chunk', 'pending', 30,
              'local-input', 1, 'model', 'local', 1000)`
-        ).run(),
+          )
+          .run(),
       /invalid|not null|constraint/i
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
@@ -1568,8 +1580,20 @@ test("v29 preserves custom processing objects and rolls back hostile owned-name 
       PRAGMA user_version = 28;
     `);
     applyJarvisMigrations(db, { now: () => 2_000 });
-    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='custom_processing_state'").get());
-    assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='custom_processing_guard'").get());
+    assert.ok(
+      db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='index' AND name='custom_processing_state'"
+        )
+        .get()
+    );
+    assert.ok(
+      db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='custom_processing_guard'"
+        )
+        .get()
+    );
 
     db.exec(`
       CREATE TABLE hostile_trigger_owner (id INTEGER PRIMARY KEY);
@@ -1619,21 +1643,33 @@ test("v29 repairs missing or modified same-target owned objects before accepting
     applyJarvisMigrations(db, { now: () => 2_000 });
 
     const immutable = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_inputs_immutable_update'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_inputs_immutable_update'"
+      )
       .get()?.sql;
     const candidateGuard = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_response_candidates_validate_insert'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='daily_digest_response_candidates_validate_insert'"
+      )
       .get()?.sql;
     assert.match(immutable ?? "", /RAISE\(ABORT, 'daily digest input is immutable'\)/);
     assert.match(candidateGuard ?? "", /daily digest candidate identity mismatch/);
     assert.ok(
-      db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_daily_digest_candidates_recovery'").get()
+      db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_daily_digest_candidates_recovery'"
+        )
+        .get()
     );
     const activeDayIndex = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_transcript_segments_digest_active_day'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_transcript_segments_digest_active_day'"
+      )
       .get()?.sql;
     const pendingSessionIndex = db
-      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_digest_pending_session'")
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_digest_pending_session'"
+      )
       .get()?.sql;
     assert.match(activeDayIndex ?? "", /started_at, ended_at, id/);
     assert.match(activeDayIndex ?? "", /superseded_by IS NULL/);
@@ -1657,10 +1693,7 @@ test("v29 rejects exact-column daily tables whose normalized SQL weakens checks 
       `UPDATE sqlite_master
        SET sql = replace(sql, ?, ?)
        WHERE type = 'table' AND name = 'daily_digest_inputs'`
-    ).run(
-      "completeness IN ('partial','final')",
-      "completeness IN ('partial','final','hostile')"
-    );
+    ).run("completeness IN ('partial','final')", "completeness IN ('partial','final','hostile')");
     db.pragma("user_version = 28");
     db.pragma("writable_schema = OFF");
     db.close();
@@ -1739,6 +1772,60 @@ test("v29 installs digest day-range indexes that the planner uses", () => {
     assert.match(incompletePlan, /idx_transcript_segments_digest_active_day/);
     assert.match(evidencePlan, /idx_evidence_refs_digest_day/);
     assert.match(pendingPlan, /idx_processing_jobs_digest_pending_session/);
+  } finally {
+    db.close();
+  }
+});
+
+test("v30 indexes bounded public knowledge reads without full scans or top-level temp sorts", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    assert.equal(TARGET_VERSION, 30);
+
+    const explain = (sql, ...params) =>
+      db
+        .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .all(...params)
+        .map((row) => row.detail)
+        .join(" ");
+    const plans = {
+      memories: explain("SELECT id FROM memory_items_v2 ORDER BY updated_at DESC, id LIMIT ?", 101),
+      topics: explain("SELECT id FROM topics_v2 ORDER BY updated_at DESC, id LIMIT ?", 101),
+      todos: explain("SELECT id FROM todos_v2 ORDER BY updated_at DESC, id LIMIT ?", 101),
+      suggestions: explain(
+        "SELECT id FROM suggestions_v2 ORDER BY updated_at DESC, id LIMIT ?",
+        101
+      ),
+      conflicts: explain(
+        "SELECT id FROM memory_conflict_groups ORDER BY created_at DESC, id LIMIT ?",
+        101
+      ),
+      suggestionHistory: explain(
+        `SELECT id FROM suggestion_occurrences
+         WHERE suggestion_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
+        "suggestion-1",
+        20
+      ),
+      todoTransitions: explain(
+        `SELECT id FROM todo_state_transitions
+         WHERE todo_instance_id = ? ORDER BY occurred_at DESC, id DESC LIMIT ?`,
+        "todo-1",
+        20
+      ),
+    };
+
+    assert.match(plans.memories, /idx_memory_items_public_updated/);
+    assert.match(plans.topics, /idx_topics_public_updated/);
+    assert.match(plans.todos, /idx_todos_public_updated/);
+    assert.match(plans.suggestions, /idx_suggestions_public_updated/);
+    assert.match(plans.conflicts, /idx_memory_conflicts_public_created/);
+    assert.match(plans.suggestionHistory, /idx_suggestion_occurrences_public_history/);
+    assert.match(plans.todoTransitions, /idx_todo_transitions_public_history/);
+    for (const plan of Object.values(plans)) {
+      assert.doesNotMatch(plan, /SCAN (suggestion_occurrences|todo_state_transitions)/);
+      assert.doesNotMatch(plan, /USE TEMP B-TREE FOR ORDER BY/);
+    }
   } finally {
     db.close();
   }
@@ -1986,14 +2073,16 @@ test("v29 preserves legacy session-anchored digest jobs as inert terminal histor
 
     assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
       fromVersion: 28,
-      toVersion: 29,
+      toVersion: TARGET_VERSION,
     });
     assert.deepEqual(
-      db.prepare(
-        `SELECT id, session_id, track_id, chunk_id, job_type, state, priority, input_hash, model_version,
+      db
+        .prepare(
+          `SELECT id, session_id, track_id, chunk_id, job_type, state, priority, input_hash, model_version,
                 lane, digest_input_id, error_code, completed_at
          FROM processing_jobs WHERE id = 'legacy-digest-job'`
-      ).get(),
+        )
+        .get(),
       {
         id: "legacy-digest-job",
         session_id: "legacy-digest-session",

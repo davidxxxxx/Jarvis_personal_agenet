@@ -39,6 +39,12 @@ import type {
   JarvisTodayInsights,
   JarvisDailyDigestReadResult,
   JarvisDailyDigestStatus,
+  JarvisKnowledgeOverview,
+  JarvisSuggestionDecisionResult,
+  JarvisMemoryConflictResolutionResult,
+  JarvisKnowledgeTodoCompletionResult,
+  JarvisEvidenceHandle,
+  JarvisEvidenceContext,
   JarvisTodo,
   JarvisTopic,
   JarvisTopicDetail,
@@ -614,6 +620,17 @@ declare global {
         listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
         getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
         getDailyDigest: (localDate: string) => Promise<JarvisDailyDigestReadResult>;
+        getKnowledgeOverview: () => Promise<JarvisKnowledgeOverview>;
+        decideKnowledgeSuggestion: (
+          suggestionId: string,
+          action: "accept" | "dismiss"
+        ) => Promise<JarvisSuggestionDecisionResult>;
+        resolveKnowledgeConflict: (
+          conflictGroupId: string,
+          selectedMemoryItemId: string
+        ) => Promise<JarvisMemoryConflictResolutionResult>;
+        completeKnowledgeTodo: (todoId: string) => Promise<JarvisKnowledgeTodoCompletionResult>;
+        getEvidenceContext: (handle: JarvisEvidenceHandle) => Promise<JarvisEvidenceContext | null>;
         analyzeSession: (
           sessionId: string,
           kind: "incremental" | "final"

@@ -3,6 +3,11 @@ const {
   assertId: assertJarvisId,
   normalizeSpeakerConfirmationInput,
   normalizeDailyDigestDateRequest,
+  normalizeSuggestionDecisionInput,
+  normalizeMemoryConflictResolutionInput,
+  normalizeKnowledgeTodoCompletionInput,
+  normalizeEvidenceContextRequest,
+  normalizeEvidenceContextResponse,
 } = require("./src/jarvis/shared/contracts");
 
 const ENROLLMENT_WINDOW_COUNT = 3;
@@ -78,6 +83,18 @@ async function invokeSpeakerConfirmation(normalizedInput) {
   error.code = "ambiguous_duplicate_name";
   error.candidates = candidates;
   throw error;
+}
+
+function invokeEvidenceContext(input) {
+  const normalized = normalizeEvidenceContextRequest(input);
+  return ipcRenderer
+    .invoke("jarvis:evidence:get-context", normalized)
+    .then(normalizeEvidenceContextResponse)
+    .catch(() => {
+      const error = new Error("Evidence context is unavailable");
+      error.code = "EVIDENCE_CONTEXT_UNAVAILABLE";
+      throw error;
+    });
 }
 
 /**
@@ -168,6 +185,23 @@ contextBridge.exposeInMainWorld("electronAPI", {
         "jarvis:memory:daily-digest",
         normalizeDailyDigestDateRequest({ localDate })
       ),
+    getKnowledgeOverview: () => ipcRenderer.invoke("jarvis:memory:v2-overview"),
+    decideKnowledgeSuggestion: (suggestionId, action) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-suggestion-decision",
+        normalizeSuggestionDecisionInput({ suggestionId, action })
+      ),
+    resolveKnowledgeConflict: (conflictGroupId, selectedMemoryItemId) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-conflict-resolve",
+        normalizeMemoryConflictResolutionInput({ conflictGroupId, selectedMemoryItemId })
+      ),
+    completeKnowledgeTodo: (todoId) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-todo-complete",
+        normalizeKnowledgeTodoCompletionInput({ todoId })
+      ),
+    getEvidenceContext: (input) => invokeEvidenceContext(input),
     analyzeSession: (sessionId, kind) => ipcRenderer.invoke("jarvis:analysis:run", sessionId, kind),
     regenerateDailyDigest: (localDate) =>
       ipcRenderer.invoke(

@@ -21,7 +21,7 @@ test("v26 creates durable desired-head, candidate, and explicit processing-lane 
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.equal(TARGET_VERSION, 29);
+    assert.equal(TARGET_VERSION, 30);
     assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: TARGET_VERSION });
 
     const tables = schemaNames(db, "table");

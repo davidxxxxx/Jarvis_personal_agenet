@@ -500,7 +500,10 @@ test("package safety rejects malformed missing ONNX unpacked aliases", async () 
   const target = path.join(source, relativePath);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, "safe");
-  await asar.createPackageWithOptions(source, packagePath, { unpack: "**/*.txt" });
+  // @electron/asar's unpack glob is matched against basenames on Windows; a
+  // slash-qualified glob silently produces an ordinary packed entry there.
+  await asar.createPackageWithOptions(source, packagePath, { unpack: "malformed.txt" });
+  assert.equal(asar.statFile(packagePath, relativePath, false).unpacked, true);
   fs.rmSync(source, { recursive: true, force: true });
   fs.rmSync(`${packagePath}.unpacked`, { recursive: true, force: true });
   try {
