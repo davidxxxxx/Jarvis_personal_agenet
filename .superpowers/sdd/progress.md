@@ -1,6 +1,6 @@
 # Jarvis SDD Progress
 
-Branch: `codex/jarvis-all-day-runtime`
+Branch: `master` (fast-forwarded from `codex/jarvis-all-day-runtime`)
 Merge base: `b0d1b96ab35c1bb77f87008a923f9c5db27b0a17`
 
 ## Phase 1 - Evidence and Dual-Track Capture
@@ -49,8 +49,8 @@ Merge base: `b0d1b96ab35c1bb77f87008a923f9c5db27b0a17`
 
 - Task 1: complete (commits `2a5591e1`..`217074cf`; durable v2 lineage, history semantics, redacted payload storage, conflict lifecycle, legacy import, and v25 budget schema/core; independent reviews clean after cross-session importer fixes; final C0/I0/M0)
 - Task 2: complete (commit `4b95be0c`; v2 closed schema, deterministic redacted input builder, single-request official-endpoint MiniMax client, v2 scheduler chain, and production fail-closed wiring; independent review clean after two privacy/idempotence fix rounds; final C0/I0/M0)
-- Task 7A budget foundation: in progress (commits `3378281f`, `1b72387d`; durable v25 ledger, service lifecycle, and awaited encrypted MiniMax secret persistence complete; worker/IPC/GUI integration pending)
-- Task 8A final-only foundation: in progress (commit `2c871300`; branded immutable admission snapshot, priority 70/80 contract, and independent cloud pressure projection complete; durable desired-head/cloud lane/runtime integration pending)
+- Task 7A budget foundation: complete (commits `3378281f`, `1b72387d`; foundation integrated by Task 7 into the production worker, IPC, preload, and settings UI)
+- Task 8A final-only foundation: complete (commit `2c871300`; foundation integrated by Tasks 3, 5C, and 8 into the durable desired-head, shared cloud lane, runtime, and release gates)
 - Task 8B durable cloud-lane foundation: complete (commit `8639b41e`; v26 desired-head CAS, immutable response candidates, startup zero-network recovery, and disjoint local/cloud processing lanes; independent review clean after one fix round; final C0/I0/M0)
 - Task 3: complete (commits `c3237627`, `07a6d25f`, `572675d2`; durable one-request analysis worker, restart-safe cloud dispatcher, authoritative budget recovery, enqueue-only scheduler, and zero-network candidate recovery; independent review clean after two fix rounds; final C0/I0/M0)
 - Task 4A pure planner: complete (commits `e2796836`, `244eb60e`, `b7f336d3`; canonical-v1 semantic planner, event clustering, topic similarity, conflict and recurrence lineage, deterministic convergence; independent review clean after two fix rounds; final C0/I0/M0)
@@ -64,9 +64,14 @@ Merge base: `b0d1b96ab35c1bb77f87008a923f9c5db27b0a17`
   strict public IPC/preload projections, durable restart-safe analysis status, and independent
   MiniMax budget/settings UI; full Jarvis regression green after final change; independent review
   C0/I0/M0)
-- Task 8: in progress (release matrix and packaged Windows offline/restart smoke automation landed in
-  the working tree; real unsigned package build, ABI scan, unpacked launch, and matrix evidence update
-  pending)
+- Task 8: complete (commits `b0f2670a`, `9a68ea8b`, `9bfe707e`, `151a2bd6`; release matrix,
+  packaged Windows offline/restart smoke automation, deterministic Jarvis-renderer selection, stable
+  shutdown cleanup, real unsigned package build, source Node ABI 137 restore, packaged Electron ABI
+  145 verification, two-launch offline persistence smoke, full regression, static gates, and both
+  three-hour virtual endurance gates passed; candidate evidence is under
+  `G:\Jarvis\.release-evidence\phase-4\20260717-154928-9bfe707e`; real microphone, live CUDA,
+  consented CAM++ fixtures, legacy fixture migration, and live MiniMax billing UAT remain explicitly
+  blocked on their external prerequisites)
 
 ## Review Notes
 
