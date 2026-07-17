@@ -1,6 +1,55 @@
+const {
+  DEFAULT_DAILY_DIGEST_REQUEST_BYTES,
+  MAX_DAILY_DIGEST_RESPONSE_BYTES,
+} = require("./DailyDigestContractLimits");
+
 const CANDIDATE_STATES = new Set(["validated", "applied", "superseded"]);
 const APPLY_STATES = new Set(["applied", "already_applied", "superseded"]);
 const REGENERATE_WAKE_STATES = new Set(["pending", "retry"]);
+const HASH_PATTERN = /^[0-9a-f]{64}$/u;
+const MAX_TOKEN_COUNT = 1_000_000_000;
+const INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
+const INPUT_KEYS = [
+  "status",
+  "digestInputId",
+  "localDate",
+  "timezone",
+  "sourceHash",
+  "contractVersion",
+  "completeness",
+  "inputWatermark",
+  "inputWatermarkJson",
+  "cloudPayload",
+  "cloudPayloadJson",
+  "inputBytes",
+  "modelVersion",
+  "createdAt",
+];
+const ATTEMPT_KEYS = [
+  "requestId",
+  "jobId",
+  "attemptNumber",
+  "provider",
+  "model",
+  "operation",
+  "state",
+  "disposition",
+  "startupAction",
+  "reasonCode",
+  "actualInputTokens",
+  "actualOutputTokens",
+  "actualMicrousd",
+  "createdAt",
+  "startedAt",
+  "finalizedAt",
+];
+const ATTEMPT_DISPOSITION = Object.freeze({
+  reserved: Object.freeze(["reserved_not_started", "release_and_retry"]),
+  started: Object.freeze(["started_unreconciled", "mark_usage_unknown"]),
+  reconciled: Object.freeze(["reconciled", "none"]),
+  released: Object.freeze(["released", "retry_with_new_attempt"]),
+  usage_unknown: Object.freeze(["usage_unknown", "block_for_period"]),
+});
 
 function codedError(code) {
   const error = new Error(code);
@@ -40,26 +89,123 @@ function timestamp(value, name) {
   return value;
 }
 
+function safeIntegerOrNull(value, name) {
+  if (value === null) return null;
+  return timestamp(value, name);
+}
+
+function usage(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    !Object.prototype.hasOwnProperty.call(value, "inputTokens") ||
+    !Object.prototype.hasOwnProperty.call(value, "outputTokens") ||
+    !Number.isSafeInteger(value.inputTokens) ||
+    value.inputTokens < 0 ||
+    value.inputTokens > MAX_TOKEN_COUNT ||
+    !Number.isSafeInteger(value.outputTokens) ||
+    value.outputTokens < 0 ||
+    value.outputTokens > MAX_TOKEN_COUNT
+  ) {
+    return null;
+  }
+  return { inputTokens: value.inputTokens, outputTokens: value.outputTokens };
+}
+
+function authoritativeErrorUsage(error) {
+  const safeUsage = usage(error?.usage);
+  if (
+    !safeUsage ||
+    !Number.isSafeInteger(error?.requestBytes) ||
+    error.requestBytes < 1 ||
+    error.requestBytes > DEFAULT_DAILY_DIGEST_REQUEST_BYTES ||
+    !Number.isSafeInteger(error?.responseBytes) ||
+    error.responseBytes < 1 ||
+    error.responseBytes > MAX_DAILY_DIGEST_RESPONSE_BYTES
+  ) {
+    return null;
+  }
+  return safeUsage;
+}
+
+function jsonObject(value, name) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${name} must be a JSON object`);
+  }
+  return value;
+}
+
 class DailyDigestService {
   constructor(input) {
     exactPlainObject(
       input,
-      ["memoryRepository", "store", "modelVersion", "timezoneProvider", "now", "owner"],
+      [
+        "memoryRepository",
+        "store",
+        "budgetGuard",
+        "client",
+        "admit",
+        "estimatedUsage",
+        "createRequestId",
+        "modelVersion",
+        "timezoneProvider",
+        "now",
+        "owner",
+      ],
       "daily digest service dependencies"
     );
     for (const method of [
       "createDailyDigestInput",
       "getLatestDailyDigest",
       "applyValidatedDailyDigestCandidate",
+      "getDailyDigestInput",
+      "getRecoverableDailyDigestCandidateByJob",
+      "persistValidatedDailyDigestCandidate",
     ]) {
       if (typeof input.memoryRepository?.[method] !== "function") {
         throw new TypeError(`memoryRepository.${method} must be a function`);
       }
     }
-    for (const method of ["enqueueDailyDigestJob", "wakeDailyDigestJob", "completeJob"]) {
+    for (const method of [
+      "enqueueDailyDigestJob",
+      "wakeDailyDigestJob",
+      "completeJob",
+      "deferJob",
+      "blockJob",
+      "recordJobExecutionDevice",
+      "supersedeDailyDigestJob",
+    ]) {
       if (typeof input.store?.[method] !== "function") {
         throw new TypeError(`store.${method} must be a function`);
       }
+    }
+    for (const method of [
+      "listAttemptDispositionsByJob",
+      "reserveNextAttempt",
+      "markStarted",
+      "reconcile",
+      "release",
+      "markUsageUnknown",
+    ]) {
+      if (typeof input.budgetGuard?.[method] !== "function") {
+        throw new TypeError(`budgetGuard.${method} must be a function`);
+      }
+    }
+    if (typeof input.client?.generate !== "function") {
+      throw new TypeError("client.generate must be a function");
+    }
+    if (typeof input.admit !== "function") throw new TypeError("admit must be a function");
+    exactPlainObject(
+      input.estimatedUsage,
+      ["inputTokens", "outputTokens"],
+      "estimatedUsage"
+    );
+    const estimatedUsage = usage(input.estimatedUsage);
+    if (!estimatedUsage) throw new TypeError("estimatedUsage is invalid");
+    if (typeof input.createRequestId !== "function") {
+      throw new TypeError("createRequestId must be a function");
     }
     if (typeof input.timezoneProvider !== "function") {
       throw new TypeError("timezoneProvider must be a function");
@@ -67,7 +213,15 @@ class DailyDigestService {
     if (typeof input.now !== "function") throw new TypeError("now must be a function");
     this.memoryRepository = input.memoryRepository;
     this.store = input.store;
+    this.budgetGuard = input.budgetGuard;
+    this.client = input.client;
+    this.admit = input.admit;
+    this.estimatedUsage = Object.freeze(estimatedUsage);
+    this.createRequestId = input.createRequestId;
     this.modelVersion = text(input.modelVersion, "modelVersion", 128);
+    if (input.client.model !== this.modelVersion) {
+      throw new TypeError("client.model must equal modelVersion");
+    }
     this.timezoneProvider = input.timezoneProvider;
     this.now = input.now;
     this.owner = text(input.owner, "owner");
@@ -154,6 +308,702 @@ class DailyDigestService {
     };
   }
 
+  _at() {
+    return timestamp(this.now(), "at");
+  }
+
+  _validateClaimedJob(job) {
+    try {
+      if (!job || typeof job !== "object" || Array.isArray(job)) {
+        throw new TypeError("claimed daily digest job is required");
+      }
+      text(job.id, "jobId");
+      text(job.digest_input_id, "digestInputId");
+      text(job.lease_owner, "leaseOwner");
+      if (
+        job.job_type !== "generate_daily_digest" ||
+        job.lane !== "cloud" ||
+        job.state !== "running" ||
+        !HASH_PATTERN.test(job.input_hash) ||
+        job.input_version !== 1 ||
+        job.model_version !== this.modelVersion ||
+        job.lease_owner !== this.owner ||
+        !Number.isSafeInteger(job.lease_expires_at) ||
+        job.lease_expires_at <= this._at() ||
+        job.session_id !== null ||
+        job.track_id !== null ||
+        job.chunk_id !== null ||
+        job.analysis_input_id !== null ||
+        job.desired_head_hash !== null
+      ) {
+        throw new TypeError("claimed daily digest job contract is invalid");
+      }
+      return job;
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_JOB_CONTRACT_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+  }
+
+  _validateInputShape(input, allowedStatuses = ["existing"]) {
+    try {
+      exactPlainObject(input, INPUT_KEYS, "daily digest immutable input");
+      if (!allowedStatuses.includes(input.status)) throw new TypeError("input status is invalid");
+      text(input.digestInputId, "digestInputId");
+      if (!/^\d{4}-\d{2}-\d{2}$/u.test(input.localDate)) {
+        throw new TypeError("localDate is invalid");
+      }
+      text(input.timezone, "timezone", 64);
+      if (!HASH_PATTERN.test(input.sourceHash)) throw new TypeError("sourceHash is invalid");
+      if (input.contractVersion !== INPUT_CONTRACT_VERSION) {
+        throw new TypeError("input contract is invalid");
+      }
+      if (!new Set(["partial", "final"]).has(input.completeness)) {
+        throw new TypeError("completeness is invalid");
+      }
+      jsonObject(input.inputWatermark, "inputWatermark");
+      jsonObject(input.cloudPayload, "cloudPayload");
+      if (
+        typeof input.inputWatermarkJson !== "string" ||
+        JSON.stringify(input.inputWatermark) !== input.inputWatermarkJson ||
+        typeof input.cloudPayloadJson !== "string" ||
+        JSON.stringify(input.cloudPayload) !== input.cloudPayloadJson ||
+        !Number.isSafeInteger(input.inputBytes) ||
+        input.inputBytes !== Buffer.byteLength(input.cloudPayloadJson, "utf8") ||
+        typeof input.modelVersion !== "string" ||
+        !input.modelVersion.trim() ||
+        input.modelVersion !== input.modelVersion.trim() ||
+        Array.from(input.modelVersion).length > 128
+      ) {
+        throw new TypeError("immutable input fields are invalid");
+      }
+      timestamp(input.createdAt, "createdAt");
+      return input;
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_INPUT_CONTRACT_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+  }
+
+  _validateBoundInput(job, input) {
+    const stored = this._validateInputShape(input);
+    if (
+      stored.digestInputId !== job.digest_input_id ||
+      stored.sourceHash !== job.input_hash
+    ) {
+      throw codedError("DAILY_DIGEST_INPUT_CONTRACT_INVALID");
+    }
+    return stored;
+  }
+
+  _validateCandidates(value) {
+    if (!Array.isArray(value)) throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    try {
+      return value.map((candidate) => {
+        exactPlainObject(
+          candidate,
+          [
+            "candidateId",
+            "jobId",
+            "digestInputId",
+            "candidateState",
+            "jobState",
+            "leaseOwner",
+            "leaseExpiresAt",
+            "budgetState",
+          ],
+          "recoverable daily digest candidate"
+        );
+        text(candidate.candidateId, "candidateId");
+        text(candidate.jobId, "jobId");
+        text(candidate.digestInputId, "digestInputId");
+        if (!CANDIDATE_STATES.has(candidate.candidateState)) {
+          throw new TypeError("candidateState is invalid");
+        }
+        text(candidate.jobState, "jobState", 64);
+        if (candidate.leaseOwner !== null) text(candidate.leaseOwner, "leaseOwner");
+        safeIntegerOrNull(candidate.leaseExpiresAt, "leaseExpiresAt");
+        text(candidate.budgetState, "budgetState", 64);
+        return candidate;
+      });
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+  }
+
+  _validateAttempts(job, value) {
+    if (!Array.isArray(value)) throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    try {
+      return value.map((attempt, index) => {
+        exactPlainObject(attempt, ATTEMPT_KEYS, "daily digest budget attempt disposition");
+        text(attempt.requestId, "requestId");
+        if (
+          attempt.jobId !== job.id ||
+          attempt.attemptNumber !== index + 1 ||
+          attempt.provider !== "minimax" ||
+          attempt.model !== this.modelVersion ||
+          attempt.operation !== "daily_digest" ||
+          !Object.prototype.hasOwnProperty.call(ATTEMPT_DISPOSITION, attempt.state)
+        ) {
+          throw new TypeError("attempt identity is invalid");
+        }
+        const [disposition, startupAction] = ATTEMPT_DISPOSITION[attempt.state];
+        if (attempt.disposition !== disposition || attempt.startupAction !== startupAction) {
+          throw new TypeError("attempt disposition is invalid");
+        }
+        timestamp(attempt.createdAt, "attempt createdAt");
+        const expectsStarted = ["started", "reconciled", "usage_unknown"].includes(attempt.state);
+        const expectsFinal = ["reconciled", "released", "usage_unknown"].includes(attempt.state);
+        if (expectsStarted) timestamp(attempt.startedAt, "attempt startedAt");
+        else if (attempt.startedAt !== null) throw new TypeError("attempt startedAt is invalid");
+        if (expectsFinal) timestamp(attempt.finalizedAt, "attempt finalizedAt");
+        else if (attempt.finalizedAt !== null) throw new TypeError("attempt finalizedAt is invalid");
+        if (expectsStarted && attempt.startedAt < attempt.createdAt) {
+          throw new TypeError("attempt chronology is invalid");
+        }
+        if (expectsFinal && attempt.finalizedAt < (attempt.startedAt ?? attempt.createdAt)) {
+          throw new TypeError("attempt chronology is invalid");
+        }
+        if (attempt.state === "reconciled") {
+          timestamp(attempt.actualInputTokens, "actualInputTokens");
+          timestamp(attempt.actualOutputTokens, "actualOutputTokens");
+          timestamp(attempt.actualMicrousd, "actualMicrousd");
+          if (attempt.reasonCode !== null) throw new TypeError("reasonCode is invalid");
+        } else {
+          if (
+            attempt.actualInputTokens !== null ||
+            attempt.actualOutputTokens !== null ||
+            attempt.actualMicrousd !== null
+          ) {
+            throw new TypeError("actual usage is invalid");
+          }
+          if (["released", "usage_unknown"].includes(attempt.state)) {
+            text(attempt.reasonCode, "reasonCode", 128);
+          } else if (attempt.reasonCode !== null) {
+            throw new TypeError("reasonCode is invalid");
+          }
+        }
+        return attempt;
+      });
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+  }
+
+  _loadDurableState(job) {
+    const input = this._validateBoundInput(
+      job,
+      this.memoryRepository.getDailyDigestInput(job.digest_input_id)
+    );
+    const recoverable = this.memoryRepository.getRecoverableDailyDigestCandidateByJob(job.id);
+    const candidates = recoverable === null ? [] : this._validateCandidates([recoverable]);
+    const attempts = this._validateAttempts(
+      job,
+      this.budgetGuard.listAttemptDispositionsByJob({
+        jobId: job.id,
+        provider: "minimax",
+        operation: "daily_digest",
+      })
+    );
+    return { input, candidates, attempts };
+  }
+
+  _matchingCandidate(job, input, candidates) {
+    const matching = candidates.filter((candidate) => candidate.jobId === job.id);
+    if (matching.length > 1) throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    const candidate = matching[0];
+    if (!candidate) return null;
+    if (
+      candidate.digestInputId !== input.digestInputId ||
+      candidate.jobState !== "running" ||
+      candidate.leaseOwner !== job.lease_owner ||
+      candidate.leaseExpiresAt !== job.lease_expires_at ||
+      candidate.budgetState !== "reconciled"
+    ) {
+      throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    }
+    return candidate;
+  }
+
+  _requireBudgetTransition(result, { requestId, state, replayed }) {
+    if (
+      !result ||
+      typeof result !== "object" ||
+      Array.isArray(result) ||
+      result.ok !== true ||
+      result.requestId !== requestId ||
+      result.state !== state ||
+      (replayed !== undefined && result.replayed !== replayed)
+    ) {
+      throw codedError("DAILY_DIGEST_BUDGET_TRANSITION_INVALID");
+    }
+    return result;
+  }
+
+  _complete(jobId) {
+    if (
+      this.store.completeJob(jobId, {
+        owner: this.owner,
+        at: this._at(),
+        executionDevice: "cloud",
+      }) !== true
+    ) {
+      throw codedError("JOB_LEASE_LOST");
+    }
+  }
+
+  _defer(jobId, reason) {
+    const at = this._at();
+    if (
+      this.store.deferJob(jobId, {
+        owner: this.owner,
+        at,
+        nextRetryAt: at + 15_000,
+        reason,
+      }) !== true
+    ) {
+      throw codedError("JOB_LEASE_LOST");
+    }
+  }
+
+  _block(jobId, errorCode) {
+    if (
+      this.store.blockJob(jobId, {
+        owner: this.owner,
+        at: this._at(),
+        errorCode,
+      }) !== true
+    ) {
+      throw codedError("JOB_LEASE_LOST");
+    }
+  }
+
+  _supersede(jobId) {
+    if (
+      this.store.supersedeDailyDigestJob(jobId, {
+        owner: this.owner,
+        at: this._at(),
+      }) !== true
+    ) {
+      throw codedError("JOB_LEASE_LOST");
+    }
+  }
+
+  _decision(job, input) {
+    let decision;
+    try {
+      decision = this.admit(job, input);
+      exactPlainObject(decision, ["eligible", "reason"], "daily digest admission");
+      if (
+        !Object.isFrozen(decision) ||
+        typeof decision.eligible !== "boolean" ||
+        (decision.reason !== null &&
+          (typeof decision.reason !== "string" ||
+            !decision.reason.trim() ||
+            decision.reason !== decision.reason.trim())) ||
+        (decision.eligible && decision.reason !== null) ||
+        (!decision.eligible && decision.reason === null)
+      ) {
+        throw new TypeError("daily digest admission is invalid");
+      }
+      return decision;
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_ADMISSION_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+  }
+
+  _preparePriorAttempt(job, attempts) {
+    const latest = attempts.at(-1);
+    if (!latest) return { attemptNumber: 1 };
+    const attemptNumber = latest.attemptNumber + 1;
+    if (!Number.isSafeInteger(attemptNumber)) {
+      throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    }
+    if (latest.state === "reserved") {
+      this._requireBudgetTransition(
+        this.budgetGuard.release({
+          requestId: latest.requestId,
+          reasonCode: "shutdown_before_transport",
+        }),
+        { requestId: latest.requestId, state: "released" }
+      );
+      return { attemptNumber };
+    }
+    if (latest.state === "started") {
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId: latest.requestId,
+          reasonCode: "process_recovery",
+        }),
+        { requestId: latest.requestId, state: "usage_unknown" }
+      );
+      this._block(job.id, "daily_digest_usage_unknown");
+      return { status: "blocked", reason: "usage_unknown", jobId: job.id };
+    }
+    if (latest.state === "usage_unknown") {
+      this._block(job.id, "daily_digest_usage_unknown");
+      return { status: "blocked", reason: "usage_unknown", jobId: job.id };
+    }
+    if (latest.state === "reconciled") {
+      if (
+        latest.actualInputTokens === 0 &&
+        latest.actualOutputTokens === 0 &&
+        latest.actualMicrousd === 0
+      ) {
+        return { attemptNumber };
+      }
+      this._block(job.id, "daily_digest_reconciled_without_candidate");
+      return { status: "blocked", reason: "reconciled_without_candidate", jobId: job.id };
+    }
+    if (latest.state === "released") return { attemptNumber };
+    throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+  }
+
+  _enqueueCurrentInput(current) {
+    if (current.status === "empty") return;
+    this.store.enqueueDailyDigestJob({
+      digestInputId: current.digestInputId,
+      inputHash: current.sourceHash,
+      inputVersion: 1,
+      modelVersion: this.modelVersion,
+    });
+  }
+
+  _rebuildCurrentInput(storedInput) {
+    const rebuilt = this.memoryRepository.createDailyDigestInput({
+      localDate: storedInput.localDate,
+      timezone: storedInput.timezone,
+      modelVersion: this.modelVersion,
+    });
+    if (
+      rebuilt &&
+      typeof rebuilt === "object" &&
+      !Array.isArray(rebuilt) &&
+      rebuilt.status === "empty"
+    ) {
+      try {
+        exactPlainObject(rebuilt, ["status", "localDate", "timezone"], "empty daily digest input");
+        if (
+          rebuilt.localDate !== storedInput.localDate ||
+          rebuilt.timezone !== storedInput.timezone
+        ) {
+          throw new TypeError("empty daily digest source is mismatched");
+        }
+      } catch (cause) {
+        const error = codedError("DAILY_DIGEST_INPUT_CONTRACT_INVALID");
+        error.cause = cause;
+        throw error;
+      }
+      return { current: rebuilt, matches: false };
+    }
+    const current = this._validateInputShape(rebuilt, ["created", "existing"]);
+    if (
+      current.localDate !== storedInput.localDate ||
+      current.timezone !== storedInput.timezone
+    ) {
+      throw codedError("DAILY_DIGEST_INPUT_CONTRACT_INVALID");
+    }
+    const matches =
+      current.digestInputId === storedInput.digestInputId &&
+      current.sourceHash === storedInput.sourceHash &&
+      current.completeness === storedInput.completeness;
+    return { current, matches };
+  }
+
+  _ensureCurrent(job, storedInput, requestId = null) {
+    let rebuilt;
+    try {
+      rebuilt = this._rebuildCurrentInput(storedInput);
+    } catch (error) {
+      if (requestId !== null) {
+        this._requireBudgetTransition(
+          this.budgetGuard.release({
+            requestId,
+            reasonCode: "superseded_before_transport",
+          }),
+          { requestId, state: "released" }
+        );
+      }
+      throw error;
+    }
+    if (rebuilt.matches) return true;
+    if (requestId !== null) {
+      this._requireBudgetTransition(
+        this.budgetGuard.release({
+          requestId,
+          reasonCode: "superseded_before_transport",
+        }),
+        { requestId, state: "released" }
+      );
+    }
+    this._enqueueCurrentInput(rebuilt.current);
+    this._supersede(job.id);
+    return false;
+  }
+
+  _validateResponse(response) {
+    const exceedsByteLimit =
+      (Number.isSafeInteger(response?.requestBytes) &&
+        response.requestBytes > DEFAULT_DAILY_DIGEST_REQUEST_BYTES) ||
+      (Number.isSafeInteger(response?.responseBytes) &&
+        response.responseBytes > MAX_DAILY_DIGEST_RESPONSE_BYTES);
+    const authoritativeUsage = exceedsByteLimit ? null : usage(response?.usage);
+    try {
+      exactPlainObject(
+        response,
+        ["result", "usage", "requestBytes", "responseBytes"],
+        "daily digest client response"
+      );
+      if (
+        !authoritativeUsage ||
+        !Number.isSafeInteger(response.requestBytes) ||
+        response.requestBytes < 1 ||
+        response.requestBytes > DEFAULT_DAILY_DIGEST_REQUEST_BYTES ||
+        !Number.isSafeInteger(response.responseBytes) ||
+        response.responseBytes < 1 ||
+        response.responseBytes > MAX_DAILY_DIGEST_RESPONSE_BYTES
+      ) {
+        throw new TypeError("daily digest response metadata is invalid");
+      }
+      jsonObject(response.result, "daily digest result");
+      return { result: response.result, usage: authoritativeUsage };
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_RESPONSE_INVALID");
+      error.cause = cause;
+      error.authoritativeUsage = authoritativeUsage;
+      throw error;
+    }
+  }
+
+  _reconcile(requestId, authoritativeUsage) {
+    return this._requireBudgetTransition(
+      this.budgetGuard.reconcile({ requestId, usage: authoritativeUsage }),
+      { requestId, state: "reconciled" }
+    );
+  }
+
+  async execute(claimedJob) {
+    const job = this._validateClaimedJob(claimedJob);
+    const initial = this._loadDurableState(job);
+    const recoverable = this._matchingCandidate(job, initial.input, initial.candidates);
+    if (recoverable) {
+      return this.recoverCandidate({
+        candidateId: recoverable.candidateId,
+        jobId: job.id,
+        candidateState: recoverable.candidateState,
+        leaseOwner: job.lease_owner,
+      });
+    }
+    const prior = this._preparePriorAttempt(job, initial.attempts);
+    if (prior.status) return prior;
+    if (!this._ensureCurrent(job, initial.input)) {
+      return { status: "superseded", jobId: job.id };
+    }
+    const initialDecision = this._decision(job, initial.input);
+    if (!initialDecision.eligible) {
+      this._defer(job.id, "daily_digest_deferred_for_local_work");
+      return { status: "deferred", reason: initialDecision.reason, jobId: job.id };
+    }
+
+    const requestId = text(this.createRequestId(), "requestId");
+    const reservation = this.budgetGuard.reserveNextAttempt({
+      requestId,
+      jobId: job.id,
+      provider: "minimax",
+      model: this.modelVersion,
+      operation: "daily_digest",
+      estimatedUsage: this.estimatedUsage,
+    });
+    if (reservation?.ok !== true) {
+      try {
+        exactPlainObject(reservation, ["ok", "reason"], "budget reservation denial");
+        if (reservation.ok !== false) throw new TypeError("reservation denial is invalid");
+        text(reservation.reason, "reservation reason", 128);
+      } catch (cause) {
+        const error = codedError("DAILY_DIGEST_BUDGET_TRANSITION_INVALID");
+        error.cause = cause;
+        throw error;
+      }
+      this._defer(job.id, "daily_digest_budget_denied");
+      return { status: "deferred", reason: reservation.reason, jobId: job.id };
+    }
+    try {
+      exactPlainObject(
+        reservation,
+        ["ok", "requestId", "attemptNumber", "state", "reservedMicrousd", "replayed"],
+        "budget reservation"
+      );
+      if (
+        reservation.requestId !== requestId ||
+        reservation.attemptNumber !== prior.attemptNumber ||
+        reservation.state !== "reserved" ||
+        reservation.replayed !== false ||
+        !Number.isSafeInteger(reservation.reservedMicrousd) ||
+        reservation.reservedMicrousd < 0
+      ) {
+        throw new TypeError("budget reservation is invalid");
+      }
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_BUDGET_TRANSITION_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+
+    let reloadedInput;
+    try {
+      reloadedInput = this._validateBoundInput(
+        job,
+        this.memoryRepository.getDailyDigestInput(job.digest_input_id)
+      );
+    } catch (error) {
+      this._requireBudgetTransition(
+        this.budgetGuard.release({ requestId, reasonCode: "superseded_before_transport" }),
+        { requestId, state: "released" }
+      );
+      throw error;
+    }
+    if (!this._ensureCurrent(job, reloadedInput, requestId)) {
+      return { status: "superseded", jobId: job.id };
+    }
+    const finalDecision = this._decision(job, reloadedInput);
+    if (!finalDecision.eligible) {
+      this._requireBudgetTransition(
+        this.budgetGuard.release({ requestId, reasonCode: "admission_revoked" }),
+        { requestId, state: "released" }
+      );
+      this._defer(job.id, "daily_digest_deferred_for_local_work");
+      return { status: "deferred", reason: finalDecision.reason, jobId: job.id };
+    }
+
+    this._requireBudgetTransition(this.budgetGuard.markStarted(requestId), {
+      requestId,
+      state: "started",
+      replayed: false,
+    });
+    try {
+      if (
+        this.store.recordJobExecutionDevice(job.id, {
+          owner: this.owner,
+          at: this._at(),
+          executionDevice: "cloud",
+        }) !== true
+      ) {
+        throw codedError("JOB_LEASE_LOST");
+      }
+    } catch (error) {
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId,
+          reasonCode: "process_recovery",
+        }),
+        { requestId, state: "usage_unknown" }
+      );
+      throw error;
+    }
+
+    let response;
+    try {
+      response = await this.client.generate({
+        cloudPayloadJson: reloadedInput.cloudPayloadJson,
+        inputHash: reloadedInput.sourceHash,
+      });
+    } catch (error) {
+      const authoritativeUsage = authoritativeErrorUsage(error);
+      if (authoritativeUsage) {
+        this._reconcile(requestId, authoritativeUsage);
+        if (authoritativeUsage.inputTokens === 0 && authoritativeUsage.outputTokens === 0) {
+          this._defer(job.id, "daily_digest_authoritative_zero_usage");
+          return { status: "deferred", reason: "authoritative_zero_usage", jobId: job.id };
+        }
+        this._block(job.id, "daily_digest_invalid_response");
+        return { status: "blocked", reason: "invalid_response", jobId: job.id };
+      }
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({
+          requestId,
+          reasonCode: "transport_ambiguous",
+        }),
+        { requestId, state: "usage_unknown" }
+      );
+      this._block(job.id, "daily_digest_usage_unknown");
+      return { status: "blocked", reason: "usage_unknown", jobId: job.id };
+    }
+
+    let validated;
+    try {
+      validated = this._validateResponse(response);
+    } catch (error) {
+      if (error.authoritativeUsage) {
+        this._reconcile(requestId, error.authoritativeUsage);
+        this._block(job.id, "daily_digest_invalid_response");
+        return { status: "blocked", reason: "invalid_response", jobId: job.id };
+      }
+      this._requireBudgetTransition(
+        this.budgetGuard.markUsageUnknown({ requestId, reasonCode: "usage_invalid" }),
+        { requestId, state: "usage_unknown" }
+      );
+      this._block(job.id, "daily_digest_usage_unknown");
+      return { status: "blocked", reason: "usage_unknown", jobId: job.id };
+    }
+
+    this._reconcile(requestId, validated.usage);
+    const persisted = this.memoryRepository.persistValidatedDailyDigestCandidate({
+      jobId: job.id,
+      digestInputId: job.digest_input_id,
+      budgetAttemptId: requestId,
+      candidate: validated.result,
+    });
+    try {
+      exactPlainObject(
+        persisted,
+        ["status", "candidateId", "candidateHash", "state"],
+        "persisted daily digest candidate"
+      );
+      if (
+        !new Set(["created", "existing"]).has(persisted.status) ||
+        !CANDIDATE_STATES.has(persisted.state) ||
+        !HASH_PATTERN.test(persisted.candidateHash)
+      ) {
+        throw new TypeError("persisted candidate status is invalid");
+      }
+      text(persisted.candidateId, "candidateId");
+    } catch (cause) {
+      const error = codedError("DAILY_DIGEST_CANDIDATE_PERSIST_INVALID");
+      error.cause = cause;
+      throw error;
+    }
+    const applied = this.memoryRepository.applyValidatedDailyDigestCandidate({
+      candidateId: persisted.candidateId,
+      leaseOwner: this.owner,
+    });
+    if (
+      !applied ||
+      typeof applied !== "object" ||
+      Array.isArray(applied) ||
+      !APPLY_STATES.has(applied.status) ||
+      typeof applied.candidateId !== "string"
+    ) {
+      throw codedError("DAILY_DIGEST_CANDIDATE_APPLY_INVALID");
+    }
+    if (applied.candidateId !== persisted.candidateId) {
+      throw codedError("DAILY_DIGEST_CANDIDATE_ID_MISMATCH");
+    }
+    if (applied.jobId !== job.id) {
+      throw codedError("DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
+    }
+    if (applied.status === "superseded") this._supersede(job.id);
+    else this._complete(job.id);
+    return { status: applied.status, jobId: job.id };
+  }
+
   recoverCandidate(input) {
     exactPlainObject(
       input,
@@ -167,25 +1017,44 @@ class DailyDigestService {
     }
     const leaseOwner = text(input.leaseOwner, "leaseOwner");
     if (leaseOwner !== this.owner) throw codedError("JOB_LEASE_LOST");
+    const durable = this.memoryRepository.getRecoverableDailyDigestCandidateByJob(jobId);
+    if (durable === null) throw codedError("DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
+    const [recovery] = this._validateCandidates([durable]);
+    if (recovery.candidateId !== candidateId) {
+      throw codedError("DAILY_DIGEST_CANDIDATE_ID_MISMATCH");
+    }
+    if (
+      recovery.jobId !== jobId ||
+      recovery.candidateState !== input.candidateState ||
+      recovery.jobState !== "running" ||
+      recovery.leaseOwner !== leaseOwner ||
+      recovery.leaseExpiresAt === null ||
+      recovery.leaseExpiresAt <= this._at() ||
+      recovery.budgetState !== "reconciled"
+    ) {
+      throw codedError("DAILY_DIGEST_DURABLE_STATE_INVALID");
+    }
     const applied = this.memoryRepository.applyValidatedDailyDigestCandidate({
       candidateId,
       leaseOwner,
     });
-    if (!applied || !APPLY_STATES.has(applied.status)) {
+    if (
+      !applied ||
+      typeof applied !== "object" ||
+      Array.isArray(applied) ||
+      !APPLY_STATES.has(applied.status) ||
+      typeof applied.candidateId !== "string"
+    ) {
       throw codedError("DAILY_DIGEST_CANDIDATE_RECOVERY_INVALID");
+    }
+    if (applied.candidateId !== candidateId) {
+      throw codedError("DAILY_DIGEST_CANDIDATE_ID_MISMATCH");
     }
     if (applied.jobId !== jobId) {
       throw codedError("DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
     }
-    if (
-      this.store.completeJob(jobId, {
-        owner: leaseOwner,
-        at: timestamp(this.now(), "at"),
-        executionDevice: "cloud",
-      }) !== true
-    ) {
-      throw codedError("JOB_LEASE_LOST");
-    }
+    if (applied.status === "superseded") this._supersede(jobId);
+    else this._complete(jobId);
     return { status: applied.status, jobId, candidateId };
   }
 }

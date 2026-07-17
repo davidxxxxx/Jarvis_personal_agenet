@@ -1822,6 +1822,79 @@ class MemoryRepository {
       }));
   }
 
+  getRecoverableDailyDigestCandidateByJob(jobId) {
+    const id = assertId(jobId, "jobId");
+    const row = this.db
+      .prepare(
+        `SELECT candidate.id AS candidate_id, candidate.job_id,
+                candidate.digest_input_id, candidate.state AS candidate_state,
+                candidate.budget_attempt_id,
+                job.state AS job_state, job.completed_at AS job_completed_at,
+                job.lease_owner, job.lease_expires_at, job.job_type, job.lane,
+                job.session_id, job.analysis_input_id, job.desired_head_hash,
+                job.digest_input_id AS job_digest_input_id, job.input_hash,
+                job.input_version, job.model_version,
+                digest_input.id AS stored_digest_input_id,
+                digest_input.source_hash AS stored_source_hash,
+                attempt.request_id AS attempt_request_id,
+                attempt.job_id AS attempt_job_id, attempt.provider AS attempt_provider,
+                attempt.model AS attempt_model, attempt.operation AS attempt_operation,
+                attempt.state AS budget_state
+         FROM daily_digest_response_candidates AS candidate
+         LEFT JOIN processing_jobs AS job ON job.id = candidate.job_id
+         LEFT JOIN daily_digest_inputs AS digest_input
+           ON digest_input.id = candidate.digest_input_id
+         LEFT JOIN analysis_budget_attempts AS attempt
+           ON attempt.request_id = candidate.budget_attempt_id
+         WHERE candidate.job_id = ?`
+      )
+      .get(id);
+    if (!row) return null;
+    if (
+      row.job_id !== id ||
+      row.job_type !== "generate_daily_digest" ||
+      row.lane !== "cloud" ||
+      row.session_id !== null ||
+      row.analysis_input_id !== null ||
+      row.desired_head_hash !== null ||
+      row.job_digest_input_id !== row.digest_input_id ||
+      row.stored_digest_input_id !== row.digest_input_id ||
+      !safeHashEqual(row.input_hash, row.stored_source_hash) ||
+      row.input_version !== 1
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH");
+    }
+    if (
+      row.attempt_request_id !== row.budget_attempt_id ||
+      row.attempt_job_id !== id ||
+      row.attempt_provider !== "minimax" ||
+      row.attempt_model !== row.model_version ||
+      row.attempt_operation !== "daily_digest" ||
+      row.budget_state !== "reconciled"
+    ) {
+      throw codedError("MEMORY_DAILY_DIGEST_CANDIDATE_BUDGET_UNRECONCILED");
+    }
+    if (
+      row.candidate_state !== "validated" &&
+      !(
+        ["applied", "superseded"].includes(row.candidate_state) &&
+        row.job_completed_at === null
+      )
+    ) {
+      return null;
+    }
+    return {
+      candidateId: row.candidate_id,
+      jobId: row.job_id,
+      digestInputId: row.digest_input_id,
+      candidateState: row.candidate_state,
+      jobState: row.job_state,
+      leaseOwner: row.lease_owner,
+      leaseExpiresAt: row.lease_expires_at,
+      budgetState: row.budget_state,
+    };
+  }
+
   _loadDailyDigestCandidateForApply(candidateId) {
     const candidateRow = this.db
       .prepare("SELECT * FROM daily_digest_response_candidates WHERE id = ?")

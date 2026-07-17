@@ -665,6 +665,7 @@ class CaptureEvidenceStore {
           AND completed_at IS NULL
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
+          AND priority < @priorityBefore
           AND (
             (
               job_type = 'analyze_session'
@@ -722,6 +723,7 @@ class CaptureEvidenceStore {
             AND job.completed_at IS NULL
             AND job.lease_expires_at IS NOT NULL
             AND job.lease_expires_at <= @at
+            AND job.priority < @priorityBefore
             AND candidate.analysis_input_id = job.analysis_input_id
             AND candidate.desired_vector_hash = job.desired_head_hash
             AND candidate.state IN ('validated','applied','superseded')
@@ -744,6 +746,7 @@ class CaptureEvidenceStore {
             AND job.completed_at IS NULL
             AND job.lease_expires_at IS NOT NULL
             AND job.lease_expires_at <= @at
+            AND job.priority < @priorityBefore
             AND job.digest_input_id IS NOT NULL
             AND candidate.digest_input_id = job.digest_input_id
             AND input.id = job.digest_input_id
@@ -768,6 +771,7 @@ class CaptureEvidenceStore {
           AND completed_at IS NULL
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
+          AND priority < @priorityBefore
           AND (
             (
               job_type = 'analyze_session'
@@ -794,12 +798,12 @@ class CaptureEvidenceStore {
                     AND latest.model = processing_jobs.model_version
                     AND latest.operation = 'session_analysis'
                     AND (
-                      latest.state = 'released'
+                      latest.state IN ('started','usage_unknown','released')
                       OR (
                         latest.state = 'reconciled'
-                        AND latest.actual_input_tokens = 0
-                        AND latest.actual_output_tokens = 0
-                        AND latest.actual_microusd = 0
+                        AND latest.actual_input_tokens IS NOT NULL
+                        AND latest.actual_output_tokens IS NOT NULL
+                        AND latest.actual_microusd IS NOT NULL
                       )
                     )
                 )
@@ -834,12 +838,12 @@ class CaptureEvidenceStore {
                     AND latest.model = processing_jobs.model_version
                     AND latest.operation = 'daily_digest'
                     AND (
-                      latest.state = 'released'
+                      latest.state IN ('started','usage_unknown','released')
                       OR (
                         latest.state = 'reconciled'
-                        AND latest.actual_input_tokens = 0
-                        AND latest.actual_output_tokens = 0
-                        AND latest.actual_microusd = 0
+                        AND latest.actual_input_tokens IS NOT NULL
+                        AND latest.actual_output_tokens IS NOT NULL
+                        AND latest.actual_microusd IS NOT NULL
                       )
                     )
                 )
@@ -855,6 +859,7 @@ class CaptureEvidenceStore {
           AND job.completed_at IS NULL
           AND job.lease_expires_at IS NOT NULL
           AND job.lease_expires_at <= @at
+          AND job.priority < @priorityBefore
           AND (
             (
               job.job_type = 'analyze_session'
@@ -881,12 +886,12 @@ class CaptureEvidenceStore {
                     AND latest.model = job.model_version
                     AND latest.operation = 'session_analysis'
                     AND (
-                      latest.state = 'released'
+                      latest.state IN ('started','usage_unknown','released')
                       OR (
                         latest.state = 'reconciled'
-                        AND latest.actual_input_tokens = 0
-                        AND latest.actual_output_tokens = 0
-                        AND latest.actual_microusd = 0
+                        AND latest.actual_input_tokens IS NOT NULL
+                        AND latest.actual_output_tokens IS NOT NULL
+                        AND latest.actual_microusd IS NOT NULL
                       )
                     )
                 )
@@ -921,12 +926,12 @@ class CaptureEvidenceStore {
                     AND latest.model = job.model_version
                     AND latest.operation = 'daily_digest'
                     AND (
-                      latest.state = 'released'
+                      latest.state IN ('started','usage_unknown','released')
                       OR (
                         latest.state = 'reconciled'
-                        AND latest.actual_input_tokens = 0
-                        AND latest.actual_output_tokens = 0
-                        AND latest.actual_microusd = 0
+                        AND latest.actual_input_tokens IS NOT NULL
+                        AND latest.actual_output_tokens IS NOT NULL
+                        AND latest.actual_microusd IS NOT NULL
                       )
                     )
                 )
@@ -1020,6 +1025,23 @@ class CaptureEvidenceStore {
         WHERE id = @id
           AND lane = 'cloud'
           AND job_type = 'analyze_session'
+          AND state = 'running'
+          AND completed_at IS NULL
+          AND lease_owner = @owner
+          AND lease_expires_at > @at
+      `),
+      supersedeLeasedDailyDigestJob: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            completed_at = @at,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'DAILY_DIGEST_SUPERSEDED',
+            blocked_reason = NULL
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'generate_daily_digest'
           AND state = 'running'
           AND completed_at IS NULL
           AND lease_owner = @owner
@@ -1157,8 +1179,12 @@ class CaptureEvidenceStore {
       }
     );
     this.recoverExpiredCloudCandidateLeasesTransaction = db.transaction(
-      ({ owner, at, leaseExpiresAt, limit }) => {
-        const candidates = this.statements.listExpiredCloudCandidateLeases.all({ at, limit });
+      ({ owner, at, leaseExpiresAt, limit, priorityBefore }) => {
+        const candidates = this.statements.listExpiredCloudCandidateLeases.all({
+          at,
+          limit,
+          priorityBefore,
+        });
         const recovered = [];
         for (const candidate of candidates) {
           const result = this.statements.recoverExpiredCloudCandidateLease.run({
@@ -1166,6 +1192,7 @@ class CaptureEvidenceStore {
             owner,
             at,
             leaseExpiresAt,
+            priorityBefore,
           });
           if (result.changes === 1) {
             recovered.push({
@@ -1181,8 +1208,12 @@ class CaptureEvidenceStore {
       }
     );
     this.recoverExpiredCloudPrestartLeasesTransaction = db.transaction(
-      ({ owner, at, leaseExpiresAt, limit }) => {
-        const candidates = this.statements.listExpiredCloudPrestartLeases.all({ at, limit });
+      ({ owner, at, leaseExpiresAt, limit, priorityBefore }) => {
+        const candidates = this.statements.listExpiredCloudPrestartLeases.all({
+          at,
+          limit,
+          priorityBefore,
+        });
         const recovered = [];
         for (const candidate of candidates) {
           const result = this.statements.recoverExpiredCloudPrestartLease.run({
@@ -1190,6 +1221,7 @@ class CaptureEvidenceStore {
             owner,
             at,
             leaseExpiresAt,
+            priorityBefore,
           });
           if (result.changes === 1) {
             recovered.push(this.statements.getProcessingJob.get(candidate.id));
@@ -2080,11 +2112,18 @@ class CaptureEvidenceStore {
     });
   }
 
-  recoverExpiredCloudCandidateLeases({ owner, at, leaseMs, limit = 100 } = {}) {
+  recoverExpiredCloudCandidateLeases({
+    owner,
+    at,
+    leaseMs,
+    limit = 100,
+    priorityBefore = Number.MAX_SAFE_INTEGER,
+  } = {}) {
     this._assertIdentifier(owner, "owner");
     this._assertNonNegativeSafeInteger(at, "at");
     this._assertPositiveSafeInteger(leaseMs, "leaseMs");
     this._assertPositiveSafeInteger(limit, "limit");
+    this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
     if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
     const leaseExpiresAt = at + leaseMs;
     if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
@@ -2093,14 +2132,22 @@ class CaptureEvidenceStore {
       at,
       leaseExpiresAt,
       limit,
+      priorityBefore,
     });
   }
 
-  recoverExpiredCloudPrestartLeases({ owner, at, leaseMs, limit = 1 } = {}) {
+  recoverExpiredCloudPrestartLeases({
+    owner,
+    at,
+    leaseMs,
+    limit = 1,
+    priorityBefore = Number.MAX_SAFE_INTEGER,
+  } = {}) {
     this._assertIdentifier(owner, "owner");
     this._assertNonNegativeSafeInteger(at, "at");
     this._assertPositiveSafeInteger(leaseMs, "leaseMs");
     this._assertPositiveSafeInteger(limit, "limit");
+    this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
     if (limit > 1_000) throw new RangeError("limit must not exceed 1000");
     const leaseExpiresAt = at + leaseMs;
     if (!Number.isSafeInteger(leaseExpiresAt)) throw new RangeError("lease expiry overflow");
@@ -2109,6 +2156,7 @@ class CaptureEvidenceStore {
       at,
       leaseExpiresAt,
       limit,
+      priorityBefore,
     });
   }
 
@@ -2166,6 +2214,11 @@ class CaptureEvidenceStore {
   supersedeAnalysisJob(id, { owner, at }) {
     const input = this._assertJobLeaseTransition(id, { owner, at });
     return this.statements.supersedeLeasedAnalysisJob.run(input).changes === 1;
+  }
+
+  supersedeDailyDigestJob(id, { owner, at }) {
+    const input = this._assertJobLeaseTransition(id, { owner, at });
+    return this.statements.supersedeLeasedDailyDigestJob.run(input).changes === 1;
   }
 
   retryJob(id, { owner, at, nextRetryAt = at, errorCode }) {

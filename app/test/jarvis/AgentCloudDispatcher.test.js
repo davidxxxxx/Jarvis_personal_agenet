@@ -204,6 +204,14 @@ test("startup recovers applied and validated candidates before claiming new requ
       "execute",
     ]
   );
+  assert.equal(
+    calls.find(([name]) => name === "recover_leases")[1].priorityBefore,
+    71
+  );
+  assert.equal(
+    calls.find(([name]) => name === "recover_prestart")[1].priorityBefore,
+    71
+  );
   assert.equal(calls.find(([name]) => name === "claim")[1].priorityBefore, 71);
 });
 

@@ -1,8 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const AnalysisBudgetGuard = require("../../src/jarvis/main/AnalysisBudgetGuard");
 const AnalysisBudgetRepository = require("../../src/jarvis/main/AnalysisBudgetRepository");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
+const DailyDigestService = require("../../src/jarvis/main/DailyDigestService");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 
@@ -2644,6 +2646,71 @@ test("daily digest job APIs enforce exact objects and keep model metadata out of
   }
 });
 
+test("supersedeDailyDigestJob is lease fenced and terminal only for daily digest work", (t) => {
+  const { db, store } = fixture(t);
+  const input = seedDailyDigestInput(db, { inputHash: "8".repeat(64) });
+  const job = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  const [claimed] = store.claimCloudJobs({
+    owner: "digest-worker",
+    at: 500,
+    leaseMs: 100,
+    limit: 1,
+  });
+  assert.equal(claimed.id, job.id);
+  assert.equal(
+    store.supersedeDailyDigestJob(job.id, { owner: "wrong-worker", at: 510 }),
+    false
+  );
+  assert.equal(
+    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 600 }),
+    false
+  );
+  assert.equal(
+    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 510 }),
+    true
+  );
+  assert.deepEqual(
+    db.prepare(
+      `SELECT state, completed_at, next_retry_at, lease_owner, lease_expires_at,
+              error_code, blocked_reason, execution_device
+       FROM processing_jobs WHERE id = ?`
+    ).get(job.id),
+    {
+      state: "superseded",
+      completed_at: 510,
+      next_retry_at: null,
+      lease_owner: null,
+      lease_expires_at: null,
+      error_code: "DAILY_DIGEST_SUPERSEDED",
+      blocked_reason: null,
+      execution_device: null,
+    }
+  );
+  assert.equal(
+    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 511 }),
+    false
+  );
+  const analysisJob = setPrestartRecoveryState(db, store, "none");
+  db.prepare(
+    `UPDATE processing_jobs
+     SET lease_owner = 'digest-worker', lease_expires_at = 900
+     WHERE id = ?`
+  ).run(analysisJob.id);
+  assert.equal(
+    store.supersedeDailyDigestJob(analysisJob.id, { owner: "digest-worker", at: 700 }),
+    false
+  );
+  assert.deepEqual(
+    db.prepare("SELECT job_type, state FROM processing_jobs WHERE id = ?").get(analysisJob.id),
+    { job_type: "analyze_session", state: "running" }
+  );
+});
+
 test("daily digest candidates require a reconciled daily-digest budget attempt", (t) => {
   const { db, store } = fixture(t);
   const input = seedDailyDigestInput(db, { inputHash: "1".repeat(64) });
@@ -2899,6 +2966,48 @@ test("digest candidate recovery renews validated applied and superseded unfinish
   }
 });
 
+test("analysis-only candidate recovery cannot renew a daily digest lease", (t) => {
+  const { db, store } = fixture(t);
+  const seeded = seedCloudDigestRecovery(db, store, {
+    candidateState: "validated",
+    suffix: "candidate-priority-fence",
+  });
+
+  assert.deepEqual(
+    store.recoverExpiredCloudCandidateLeases({
+      owner: "analysis-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+      priorityBefore: 71,
+    }),
+    []
+  );
+  assert.equal(
+    db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(seeded.job.id)
+      .lease_owner,
+    "dead-cloud-worker"
+  );
+  assert.deepEqual(
+    store.recoverExpiredCloudCandidateLeases({
+      owner: "shared-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+      priorityBefore: 81,
+    }),
+    [
+      {
+        jobId: seeded.job.id,
+        candidateId: seeded.candidateId,
+        candidateState: "validated",
+        leaseOwner: "shared-cloud-worker",
+        leaseExpiresAt: 500,
+      },
+    ]
+  );
+});
+
 test("digest candidate recovery rejects every mismatched input job budget and state link", async (t) => {
   const scenarios = [
     {
@@ -3098,8 +3207,15 @@ test("cloud candidate lease recovery refuses live, ambiguous, and non-analysis w
   }
 });
 
-test("expired cloud pre-start recovery reassigns only absent released or zero-cost attempts", (t) => {
-  for (const state of ["none", "released", "reconciled_zero"]) {
+test("expired cloud pre-start recovery reassigns safe and terminal-budget attempts", (t) => {
+  for (const state of [
+    "none",
+    "released",
+    "started",
+    "usage_unknown",
+    "reconciled_zero",
+    "reconciled_nonzero",
+  ]) {
     const child = fixture(t);
     const job = setPrestartRecoveryState(child.db, child.store, state);
     const recovered = child.store.recoverExpiredCloudPrestartLeases({
@@ -3118,11 +3234,14 @@ test("expired cloud pre-start recovery reassigns only absent released or zero-co
   }
 });
 
-test("expired digest pre-start recovery renews absent released and reconciled-zero attempts", (t) => {
+test("expired digest pre-start recovery renews safe and terminal-budget attempts", (t) => {
   const scenarios = [
     { state: "none", actualUsage: undefined },
     { state: "released", actualUsage: undefined },
+    { state: "started", actualUsage: undefined },
+    { state: "usage_unknown", actualUsage: undefined },
     { state: "reconciled", actualUsage: { inputTokens: 0, outputTokens: 0 } },
+    { state: "reconciled", actualUsage: { inputTokens: 100, outputTokens: 100 } },
   ];
   for (const [index, scenario] of scenarios.entries()) {
     const child = fixture(t);
@@ -3145,38 +3264,173 @@ test("expired digest pre-start recovery renews absent released and reconciled-ze
   }
 });
 
-test("expired digest pre-start recovery refuses ambiguous or inexact work", async (t) => {
+test("analysis-only recovery cannot claim a daily digest terminal-budget lease", (t) => {
+  const { db, store } = fixture(t);
+  const seeded = seedCloudDigestRecovery(db, store, {
+    attemptState: "usage_unknown",
+    persistCandidate: false,
+    suffix: "priority-fence",
+  });
+
+  assert.deepEqual(
+    store.recoverExpiredCloudPrestartLeases({
+      owner: "analysis-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+      priorityBefore: 71,
+    }),
+    []
+  );
+  assert.equal(
+    db.prepare("SELECT lease_owner FROM processing_jobs WHERE id = ?").get(seeded.job.id)
+      .lease_owner,
+    "dead-cloud-worker"
+  );
+  assert.equal(
+    store.recoverExpiredCloudPrestartLeases({
+      owner: "shared-cloud-worker",
+      at: 200,
+      leaseMs: 300,
+      limit: 1,
+      priorityBefore: 81,
+    })[0].id,
+    seeded.job.id
+  );
+});
+
+test("recovered paid digest crash windows converge without another network request", async (t) => {
+  const budgetAt = Date.UTC(2026, 6, 16, 4);
   const scenarios = [
     {
-      name: "started",
-      seed(db, store) {
-        return seedCloudDigestRecovery(db, store, {
-          attemptState: "started",
-          persistCandidate: false,
-          suffix: "prestart-started",
-        });
-      },
+      state: "started",
+      reason: "usage_unknown",
+      errorCode: "daily_digest_usage_unknown",
     },
     {
-      name: "usage unknown",
-      seed(db, store) {
-        return seedCloudDigestRecovery(db, store, {
-          attemptState: "usage_unknown",
-          persistCandidate: false,
-          suffix: "prestart-unknown",
-        });
-      },
+      state: "usage_unknown",
+      reason: "usage_unknown",
+      errorCode: "daily_digest_usage_unknown",
     },
     {
-      name: "reconciled nonzero",
-      seed(db, store) {
-        return seedCloudDigestRecovery(db, store, {
-          attemptState: "reconciled",
-          persistCandidate: false,
-          suffix: "prestart-nonzero",
-        });
-      },
+      state: "reconciled",
+      reason: "reconciled_without_candidate",
+      errorCode: "daily_digest_reconciled_without_candidate",
     },
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    await t.test(scenario.state, async (childTest) => {
+      const { db, store } = fixture(childTest);
+      const seeded = seedCloudDigestRecovery(db, store, {
+        attemptState: scenario.state,
+        persistCandidate: false,
+        suffix: `durable-convergence-${index}`,
+      });
+      const [job] = store.recoverExpiredCloudPrestartLeases({
+        owner: "digest-recovery-worker",
+        at: budgetAt + 10,
+        leaseMs: 300,
+        limit: 1,
+        priorityBefore: 81,
+      });
+      assert.equal(job.id, seeded.job.id);
+
+      const budgetGuard = new AnalysisBudgetGuard({
+        repository: new AnalysisBudgetRepository(db),
+        now: () => budgetAt + 20,
+        defaultTimezone: "Asia/Shanghai",
+      });
+      const inputRow = db.prepare("SELECT * FROM daily_digest_inputs WHERE id = ?").get(
+        seeded.input.inputId
+      );
+      const memoryRepository = {
+        createDailyDigestInput() {
+          throw new Error("source rebuild must remain unreachable");
+        },
+        getLatestDailyDigest() {
+          throw new Error("latest digest lookup must remain unreachable");
+        },
+        applyValidatedDailyDigestCandidate() {
+          throw new Error("candidate apply must remain unreachable");
+        },
+        getDailyDigestInput(inputId) {
+          assert.equal(inputId, seeded.input.inputId);
+          return {
+            status: "existing",
+            digestInputId: inputRow.id,
+            localDate: inputRow.local_date,
+            timezone: inputRow.timezone,
+            sourceHash: inputRow.source_hash,
+            contractVersion: inputRow.contract_version,
+            completeness: inputRow.completeness,
+            inputWatermark: JSON.parse(inputRow.input_watermark_json),
+            inputWatermarkJson: inputRow.input_watermark_json,
+            cloudPayload: JSON.parse(inputRow.cloud_payload_json),
+            cloudPayloadJson: inputRow.cloud_payload_json,
+            inputBytes: inputRow.input_bytes,
+            modelVersion: inputRow.model_version,
+            createdAt: inputRow.created_at,
+          };
+        },
+        getRecoverableDailyDigestCandidateByJob(jobId) {
+          assert.equal(jobId, seeded.job.id);
+          return null;
+        },
+        persistValidatedDailyDigestCandidate() {
+          throw new Error("candidate persistence must remain unreachable");
+        },
+      };
+      let networkRequests = 0;
+      const service = new DailyDigestService({
+        memoryRepository,
+        store,
+        budgetGuard,
+        client: {
+          model: "MiniMax-M2.7",
+          async generate() {
+            networkRequests += 1;
+            throw new Error("network must remain unreachable");
+          },
+        },
+        admit: () => {
+          throw new Error("admission must remain unreachable");
+        },
+        estimatedUsage: { inputTokens: 100, outputTokens: 100 },
+        createRequestId: () => {
+          throw new Error("request creation must remain unreachable");
+        },
+        modelVersion: "MiniMax-M2.7",
+        timezoneProvider: () => "Asia/Shanghai",
+        now: () => budgetAt + 20,
+        owner: "digest-recovery-worker",
+      });
+
+      assert.deepEqual(await service.execute(job), {
+        status: "blocked",
+        reason: scenario.reason,
+        jobId: seeded.job.id,
+      });
+      assert.equal(networkRequests, 0);
+      assert.deepEqual(
+        db.prepare(
+          `SELECT state, error_code, lease_owner, lease_expires_at, completed_at
+           FROM processing_jobs WHERE id = ?`
+        ).get(seeded.job.id),
+        {
+          state: "blocked",
+          error_code: scenario.errorCode,
+          lease_owner: null,
+          lease_expires_at: null,
+          completed_at: budgetAt + 20,
+        }
+      );
+    });
+  }
+});
+
+test("expired digest pre-start recovery refuses ambiguous or inexact work", async (t) => {
+  const scenarios = [
     {
       name: "candidate present",
       seed(db, store) {
@@ -3273,20 +3527,8 @@ test("expired digest pre-start recovery refuses ambiguous or inexact work", asyn
   }
 });
 
-test("expired cloud pre-start recovery refuses ambiguous paid candidate and non-analysis work", async (t) => {
+test("expired cloud pre-start recovery refuses incomplete paid candidate and non-analysis work", async (t) => {
   const scenarios = [
-    {
-      name: "started",
-      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "started"),
-    },
-    {
-      name: "usage unknown",
-      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "usage_unknown"),
-    },
-    {
-      name: "reconciled nonzero",
-      seed: ({ db, store }) => setPrestartRecoveryState(db, store, "reconciled_nonzero"),
-    },
     {
       name: "reconciled unknown",
       seed: ({ db, store }) => setPrestartRecoveryState(db, store, "reconciled_unknown"),

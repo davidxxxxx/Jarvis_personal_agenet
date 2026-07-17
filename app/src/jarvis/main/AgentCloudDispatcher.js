@@ -115,6 +115,7 @@ class AgentCloudDispatcher {
       at,
       leaseMs: this.leaseMs,
       limit: this.recoveryLimit,
+      priorityBefore: 71,
     });
     if (!Array.isArray(recoveries)) {
       throw new TypeError("cloud candidate recovery must return an array");
@@ -130,6 +131,7 @@ class AgentCloudDispatcher {
       at: this._now(),
       leaseMs: this.leaseMs,
       limit: 1,
+      priorityBefore: 71,
     });
     if (!Array.isArray(prestart) || prestart.length > 1) {
       throw new TypeError("cloud pre-start recovery must return at most one job");

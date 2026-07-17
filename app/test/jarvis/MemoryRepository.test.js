@@ -5114,6 +5114,49 @@ test("lists recoverable daily digest candidates with safe status-only pagination
   }
 });
 
+test("gets one recoverable daily digest candidate by exact job identity", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "job-query");
+    const persisted = context.repository.persistValidatedDailyDigestCandidate({
+      jobId: context.job.id,
+      digestInputId: context.input.digestInputId,
+      budgetAttemptId: context.budgetAttemptId,
+      candidate: context.candidate,
+    });
+    assert.deepEqual(
+      context.repository.getRecoverableDailyDigestCandidateByJob(context.job.id),
+      {
+        candidateId: persisted.candidateId,
+        jobId: context.job.id,
+        digestInputId: context.input.digestInputId,
+        candidateState: "validated",
+        jobState: "running",
+        leaseOwner: "digest-worker-job-query",
+        leaseExpiresAt: 17_000,
+        budgetState: "reconciled",
+      }
+    );
+    assert.equal(
+      context.repository.getRecoverableDailyDigestCandidateByJob("missing-digest-job"),
+      null
+    );
+    assert.throws(
+      () => context.repository.getRecoverableDailyDigestCandidateByJob(""),
+      /jobId|empty/i
+    );
+    db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
+    db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
+      .run(HASH_C, context.job.id);
+    assert.throws(
+      () => context.repository.getRecoverableDailyDigestCandidateByJob(context.job.id),
+      { code: "MEMORY_DAILY_DIGEST_CANDIDATE_JOB_MISMATCH" }
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("atomically applies a validated daily digest candidate and replays read-only", () => {
   const db = createFixture();
   try {
