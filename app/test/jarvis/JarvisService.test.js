@@ -1848,7 +1848,7 @@ test("a restoration retry succeeds after its committed response broadcast fails"
   }
 });
 
-test("a stale restoration retry cannot close a newer interruption gap", () => {
+test("a stale restoration retry cannot close a newer interruption gap", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-stale-restore-retry-"));
   const repository = createRepository();
   const service = new JarvisService({
@@ -1890,7 +1890,7 @@ test("a stale restoration retry cannot close a newer interruption gap", () => {
     assert.equal(restored.sources.mic.state, "active");
     assert.equal(repository.gaps[1].endedAt, 50);
   } finally {
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });
