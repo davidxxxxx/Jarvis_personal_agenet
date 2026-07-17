@@ -261,11 +261,18 @@ async function probeElectron({ port, httpJsonImpl = httpJson }) {
     httpJsonImpl(port, "/json/list"),
   ]);
   const pages = Array.isArray(targets) ? targets.filter((target) => target?.type === "page") : [];
-  const rendererPage = pages.find(
+  const debuggablePages = pages.filter(
     (target) =>
       typeof target.webSocketDebuggerUrl === "string" &&
       target.webSocketDebuggerUrl.startsWith("ws://127.0.0.1:")
   );
+  const rendererPage =
+    debuggablePages.find(
+      (target) => typeof target.url === "string" && /[?&]panel=true(?:&|$)/u.test(target.url)
+    ) ??
+    debuggablePages.find(
+      (target) => typeof target.url === "string" && /[?&]agent=true(?:&|$)/u.test(target.url)
+    );
   return {
     browserWebSocketUrl: version?.webSocketDebuggerUrl,
     pageWebSocketUrl: rendererPage?.webSocketDebuggerUrl,

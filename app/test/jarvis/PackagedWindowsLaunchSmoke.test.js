@@ -192,7 +192,7 @@ test("Electron probe returns the renderer page WebSocket URL", async () => {
       [
         {
           type: "page",
-          url: "file:///safe/index.html",
+          url: "file:///safe/index.html?panel=true",
           webSocketDebuggerUrl: "ws://127.0.0.1:48101/devtools/page/page-id",
         },
         {
@@ -212,6 +212,70 @@ test("Electron probe returns the renderer page WebSocket URL", async () => {
     browserWebSocketUrl: "ws://127.0.0.1:48101/devtools/browser/browser-id",
     pageWebSocketUrl: "ws://127.0.0.1:48101/devtools/page/page-id",
     pageCount: 1,
+  });
+});
+
+test("Electron probe does not report ready while only the legacy renderer is open", async () => {
+  const responses = new Map([
+    ["/json/version", { webSocketDebuggerUrl: "ws://127.0.0.1:48107/devtools/browser/browser-id" }],
+    [
+      "/json/list",
+      [
+        {
+          type: "page",
+          url: "file:///safe/index.html",
+          webSocketDebuggerUrl: "ws://127.0.0.1:48107/devtools/page/legacy",
+        },
+      ],
+    ],
+  ]);
+
+  const result = await probeElectron({
+    port: 48_107,
+    httpJsonImpl: async (_port, requestPath) => responses.get(requestPath),
+  });
+
+  assert.deepEqual(result, {
+    browserWebSocketUrl: "ws://127.0.0.1:48107/devtools/browser/browser-id",
+    pageWebSocketUrl: undefined,
+    pageCount: 1,
+  });
+});
+
+test("Electron probe prefers the Jarvis panel when legacy renderer pages are also open", async () => {
+  const responses = new Map([
+    ["/json/version", { webSocketDebuggerUrl: "ws://127.0.0.1:48106/devtools/browser/browser-id" }],
+    [
+      "/json/list",
+      [
+        {
+          type: "page",
+          url: "file:///safe/index.html",
+          webSocketDebuggerUrl: "ws://127.0.0.1:48106/devtools/page/legacy",
+        },
+        {
+          type: "page",
+          url: "file:///safe/index.html?agent=true",
+          webSocketDebuggerUrl: "ws://127.0.0.1:48106/devtools/page/agent",
+        },
+        {
+          type: "page",
+          url: "file:///safe/index.html?panel=true",
+          webSocketDebuggerUrl: "ws://127.0.0.1:48106/devtools/page/panel",
+        },
+      ],
+    ],
+  ]);
+
+  const result = await probeElectron({
+    port: 48_106,
+    httpJsonImpl: async (_port, requestPath) => responses.get(requestPath),
+  });
+
+  assert.deepEqual(result, {
+    browserWebSocketUrl: "ws://127.0.0.1:48106/devtools/browser/browser-id",
+    pageWebSocketUrl: "ws://127.0.0.1:48106/devtools/page/panel",
+    pageCount: 3,
   });
 });
 
