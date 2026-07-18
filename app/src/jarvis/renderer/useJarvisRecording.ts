@@ -101,10 +101,7 @@ export interface RecordingMeetingSnapshot {
 }
 
 export type JarvisPreparationStage =
-  | "checking_model"
-  | "downloading_model"
-  | "checking_microphone"
-  | "starting_audio";
+  "checking_model" | "downloading_model" | "checking_microphone" | "starting_audio";
 
 export interface LatestRefresh<T> {
   run: (load: () => Promise<T>) => Promise<void>;
@@ -216,11 +213,14 @@ function withPreparationTimeout<T>(
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      reject(new RecordingOperationError(code, "audio capture did not start in time"));
-    }, Math.max(1, timeoutMs));
+    const timer = setTimeout(
+      () => {
+        if (settled) return;
+        settled = true;
+        reject(new RecordingOperationError(code, "audio capture did not start in time"));
+      },
+      Math.max(1, timeoutMs)
+    );
     operation.then(
       (value) => {
         if (settled) return;

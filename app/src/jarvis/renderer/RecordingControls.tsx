@@ -151,7 +151,7 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
         ? t("jarvis.paused")
         : session.status === "starting" && recording.preparationStage
           ? t(`jarvis.preparation.${recording.preparationStage}`)
-        : t(`jarvis.status.${session.status}`);
+          : t(`jarvis.status.${session.status}`);
   const computerAudioLabel = t("jarvis.capture.sources.system");
   const recordingErrorKey =
     recording.error === "capture_source_unavailable"

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../../../i18n";
 import JarvisShell from "../JarvisShell";
@@ -70,6 +70,9 @@ describe("JarvisShell", () => {
     expect(screen.getByText("实时对话")).toBeInTheDocument();
     expect(screen.getByText("正在监听")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: /每日回顾/ })).toBeInTheDocument();
+    expect(screen.queryByText(/MiniMax 个人助手分析/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "打开助手设置" }));
     expect(screen.getByText(/MiniMax 个人助手分析/)).toBeInTheDocument();
   });
 

@@ -573,11 +573,7 @@ describe("Jarvis recording controller", () => {
 
     await rejection;
     expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: false });
-    expect(harness.jarvis.failCapture).toHaveBeenCalledWith(
-      "s1",
-      "capture_start_timeout",
-      1_000
-    );
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith("s1", "capture_start_timeout", 1_000);
     expect(harness.getSession()).toMatchObject({
       id: "s1",
       status: "failed",

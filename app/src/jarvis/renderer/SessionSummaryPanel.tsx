@@ -2,11 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CheckCircle2, LoaderCircle, RotateCcw } from "lucide-react";
 import { Button } from "../../components/ui/button";
-import type {
-  JarvisAnalysisStatus,
-  JarvisSessionDetail,
-  JarvisSessionSummary,
-} from "../types";
+import type { JarvisAnalysisStatus, JarvisSessionDetail, JarvisSessionSummary } from "../types";
 import type { SessionStatus } from "./sessionMachine";
 
 interface SessionSummaryPanelProps {

@@ -109,9 +109,7 @@ describe("SessionSummaryPanel", () => {
     getSessionDetail.mockResolvedValue(detailWithSummary());
     fireEvent.click(retry);
 
-    await waitFor(() =>
-      expect(analyzeSession).toHaveBeenCalledWith("session-1", "final")
-    );
+    await waitFor(() => expect(analyzeSession).toHaveBeenCalledWith("session-1", "final"));
     expect(
       await screen.findByText("Discussed the launch plan and agreed on Friday.")
     ).toBeInTheDocument();
