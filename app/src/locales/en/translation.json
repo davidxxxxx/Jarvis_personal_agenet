@@ -275,6 +275,15 @@
       "open": "Open assistant settings",
       "close": "Close assistant settings",
       "dismiss": "Dismiss assistant settings"
+    },
+    "currentSummary": {
+      "title": "This recording's summary",
+      "loading": "Generating the final summary…",
+      "unavailable": "The summary is not available yet. Your recording and transcript are saved.",
+      "retry": "Retry summary",
+      "decisions": "Key decisions",
+      "todos": "To-dos",
+      "suggestions": "Suggestions"
     }
   },
   "settings": {

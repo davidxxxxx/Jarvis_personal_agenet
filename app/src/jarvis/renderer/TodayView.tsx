@@ -7,6 +7,7 @@ import DailyReviewView from "./DailyReviewView";
 import LiveTranscript from "./LiveTranscript";
 import MiniMaxAgentSettingsCard from "./MiniMaxAgentSettingsCard";
 import RecordingControls from "./RecordingControls";
+import SessionSummaryPanel from "./SessionSummaryPanel";
 import TranscriptionQualityCard from "./TranscriptionQualityCard";
 import VoiceEnrollment from "./VoiceEnrollment";
 
@@ -48,6 +49,10 @@ export default function TodayView({ recording }: TodayViewProps) {
         aria-label={t("jarvis.insights")}
       >
         <div className="space-y-3">
+          <SessionSummaryPanel
+            sessionId={recording.session.id}
+            sessionStatus={recording.session.status}
+          />
           <DailyReviewView />
           <div className="rounded-xl border border-border/50 bg-card/70 p-4 shadow-sm">
             <div className="flex items-start gap-3">

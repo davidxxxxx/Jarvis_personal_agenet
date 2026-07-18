@@ -275,6 +275,15 @@
       "open": "打开助手设置",
       "close": "关闭助手设置",
       "dismiss": "收起助手设置"
+    },
+    "currentSummary": {
+      "title": "本次录音总结",
+      "loading": "正在生成完整总结…",
+      "unavailable": "总结暂时不可用，录音和完整转写已安全保存。",
+      "retry": "重试总结",
+      "decisions": "关键决定",
+      "todos": "待办",
+      "suggestions": "建议"
     }
   },
   "settings": {
