@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { BrainCircuit, KeyRound, WalletCards } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "../../components/ui/button";
-import type { JarvisAnalysisBudgetStatus, JarvisMiniMaxConfig } from "../types";
+import type {
+  JarvisAnalysisBudgetMode,
+  JarvisAnalysisBudgetStatus,
+  JarvisMiniMaxConfig,
+} from "../types";
 
 function dollars(microusd: number): string {
   return `$${(microusd / 1_000_000).toFixed(2)}`;
@@ -15,6 +19,7 @@ export default function MiniMaxAgentSettingsCard() {
   const [config, setConfig] = useState<JarvisMiniMaxConfig | null>(null);
   const [budget, setBudget] = useState<JarvisAnalysisBudgetStatus | null>(null);
   const [key, setKey] = useState("");
+  const [budgetMode, setBudgetMode] = useState<JarvisAnalysisBudgetMode>("capped");
   const [limitDollars, setLimitDollars] = useState("5");
   const [busy, setBusy] = useState<BusyAction>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -50,6 +55,7 @@ export default function MiniMaxAgentSettingsCard() {
       .then((nextBudget) => {
         if (!active) return;
         setBudget(nextBudget);
+        setBudgetMode(nextBudget.mode);
         setLimitDollars(String(nextBudget.monthlyLimitMicrousd / 1_000_000));
       })
       .catch(() => {
@@ -61,14 +67,19 @@ export default function MiniMaxAgentSettingsCard() {
   }, [reloadVersion]);
 
   const usageSummary = budget
-    ? t("jarvis.miniMaxAgent.usageSummary", {
+    ? budget.mode === "unlimited"
+      ? t("jarvis.miniMaxAgent.usageUnlimitedSummary", {
+          spent: dollars(budget.spentMicrousd),
+          reserved: dollars(budget.reservedMicrousd),
+        })
+      : t("jarvis.miniMaxAgent.usageSummary", {
         spent: dollars(budget.spentMicrousd),
         reserved: dollars(budget.reservedMicrousd),
-        remaining: dollars(budget.remainingMicrousd),
+          remaining: dollars(budget.remainingMicrousd ?? 0),
       })
     : "";
   const usedPercent = useMemo(() => {
-    if (!budget || budget.monthlyLimitMicrousd === 0) return 0;
+    if (!budget || budget.mode !== "capped" || budget.monthlyLimitMicrousd === 0) return 0;
     return Math.min(
       100,
       Math.round(
@@ -78,8 +89,10 @@ export default function MiniMaxAgentSettingsCard() {
   }, [budget]);
 
   const blockedCopy = budget
-    ? budget.monthlyLimitMicrousd === 0
+    ? budget.mode === "off"
       ? t("jarvis.miniMaxAgent.disabled")
+      : budget.mode === "unlimited"
+        ? t("jarvis.miniMaxAgent.unlimitedWarning")
       : budget.blockedReason === "usage_unknown"
         ? t("jarvis.miniMaxAgent.usageUnknown")
         : budget.blockedReason === "over_limit"
@@ -130,27 +143,38 @@ export default function MiniMaxAgentSettingsCard() {
   const applyBudget = async () => {
     if (busy || !budget) return;
     const parsed = Number(limitDollars);
-    const monthlyLimitMicrousd = Math.round(parsed * 1_000_000);
-    if (
+    const parsedLimitMicrousd = Math.round(parsed * 1_000_000);
+    if (budgetMode === "capped" &&
+      (
       !Number.isFinite(parsed) ||
       parsed < 0 ||
-      parsed > 10 ||
-      !Number.isSafeInteger(monthlyLimitMicrousd)
-    ) {
+        parsed > 1_000_000 ||
+        !Number.isSafeInteger(parsedLimitMicrousd)
+      )) {
       setMessage(null);
       setInvalidBudget(true);
       return;
     }
+    const monthlyLimitMicrousd =
+      budgetMode === "off"
+        ? 0
+        : budgetMode === "capped"
+          ? parsedLimitMicrousd
+          : Number.isSafeInteger(parsedLimitMicrousd) && parsedLimitMicrousd > 0
+            ? parsedLimitMicrousd
+            : Math.max(5_000_000, budget.monthlyLimitMicrousd);
     setBusy("budget");
     setMessage(null);
     setFailed(false);
     setInvalidBudget(false);
     try {
       const next = await window.electronAPI.jarvis.setAnalysisBudget({
+        mode: budgetMode,
         monthlyLimitMicrousd,
         timezone: budget.timezone,
       });
       setBudget(next);
+      setBudgetMode(next.mode);
       setLimitDollars(String(next.monthlyLimitMicrousd / 1_000_000));
       setMessage(t("jarvis.miniMaxAgent.budgetSaved"));
     } catch {
@@ -265,22 +289,40 @@ export default function MiniMaxAgentSettingsCard() {
         <label className="block text-xs text-muted-foreground" htmlFor="jarvis-minimax-budget">
           {t("jarvis.miniMaxAgent.budgetLabel")}
         </label>
+        <select
+          id="jarvis-minimax-budget-mode"
+          aria-label={t("jarvis.miniMaxAgent.budgetModeLabel")}
+          className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+          value={budgetMode}
+          disabled={busy !== null || budget === null}
+          onChange={(event) => {
+            setBudgetMode(event.target.value as JarvisAnalysisBudgetMode);
+            setFailed(false);
+            setInvalidBudget(false);
+          }}
+        >
+          <option value="off">{t("jarvis.miniMaxAgent.modeOff")}</option>
+          <option value="capped">{t("jarvis.miniMaxAgent.modeCapped")}</option>
+          <option value="unlimited">{t("jarvis.miniMaxAgent.modeUnlimited")}</option>
+        </select>
         <div className="flex gap-2">
-          <input
-            id="jarvis-minimax-budget"
-            className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
-            type="number"
-            min={0}
-            max={10}
-            step={1}
-            value={limitDollars}
-            disabled={busy !== null || budget === null}
-            onChange={(event) => {
-              setLimitDollars(event.target.value);
-              setFailed(false);
-              setInvalidBudget(false);
-            }}
-          />
+          {budgetMode === "capped" && (
+            <input
+              id="jarvis-minimax-budget"
+              className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-sm text-foreground"
+              type="number"
+              min={0}
+              max={1_000_000}
+              step={1}
+              value={limitDollars}
+              disabled={busy !== null || budget === null}
+              onChange={(event) => {
+                setLimitDollars(event.target.value);
+                setFailed(false);
+                setInvalidBudget(false);
+              }}
+            />
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -298,19 +340,21 @@ export default function MiniMaxAgentSettingsCard() {
                 timezone: budget.timezone,
               })}
             </p>
-            <div
-              className="h-1.5 overflow-hidden rounded-full bg-muted"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={usedPercent}
-              aria-valuetext={usageSummary}
-            >
+            {budget.mode === "capped" && (
               <div
-                className="h-full rounded-full bg-primary transition-[width]"
-                style={{ width: `${usedPercent}%` }}
-              />
-            </div>
+                className="h-1.5 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={usedPercent}
+                aria-valuetext={usageSummary}
+              >
+                <div
+                  className="h-full rounded-full bg-primary transition-[width]"
+                  style={{ width: `${usedPercent}%` }}
+                />
+              </div>
+            )}
             <p className="text-xs leading-5 text-muted-foreground">{usageSummary}</p>
           </div>
         )}

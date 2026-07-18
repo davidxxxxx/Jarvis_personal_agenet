@@ -51,6 +51,7 @@ test("repository factory initializes the default five-dollar local-month policy"
           at,
         }),
         {
+          mode: "capped",
           monthKey: "2026-07",
           timezone: "Asia/Shanghai",
           currency: "USD",
@@ -62,6 +63,7 @@ test("repository factory initializes the default five-dollar local-month policy"
         }
       );
       assert.deepEqual(repository.initialize({ timezone: "UTC", at: at + 1 }), {
+        mode: "capped",
         monthKey: "2026-07",
         timezone: "Asia/Shanghai",
         currency: "USD",
@@ -71,6 +73,67 @@ test("repository factory initializes the default five-dollar local-month policy"
         remainingMicrousd: 5_000_000,
         blockedReason: null,
       });
+    } finally {
+      repository.close();
+    }
+  });
+});
+
+test("capped two-hundred-dollar and unlimited policies persist without disabling usage accounting", () => {
+  withDatabase((databasePath) => {
+    const at = Date.UTC(2026, 6, 15, 4);
+    const repository = openAnalysisBudgetRepository(databasePath);
+    try {
+      repository.initialize({
+        mode: "capped",
+        monthlyLimitMicrousd: 5_000_000,
+        timezone: "Asia/Shanghai",
+        at,
+      });
+      assert.deepEqual(
+        repository.setPolicy({
+          mode: "capped",
+          monthlyLimitMicrousd: 200_000_000,
+          timezone: "Asia/Shanghai",
+          at: at + 1,
+        }),
+        {
+          mode: "capped",
+          monthKey: "2026-07",
+          timezone: "Asia/Shanghai",
+          currency: "USD",
+          monthlyLimitMicrousd: 200_000_000,
+          spentMicrousd: 0,
+          reservedMicrousd: 0,
+          remainingMicrousd: 200_000_000,
+          blockedReason: null,
+        }
+      );
+      assert.equal(repository.reserve(reservation(at + 2)).ok, true);
+      repository.markStarted({ requestId: "request-1", at: at + 3 });
+      repository.markUsageUnknown({
+        requestId: "request-1",
+        reasonCode: "usage_missing",
+        at: at + 4,
+      });
+      const unlimited = repository.setPolicy({
+        mode: "unlimited",
+        monthlyLimitMicrousd: 200_000_000,
+        timezone: "Asia/Shanghai",
+        at: at + 5,
+      });
+      assert.equal(unlimited.mode, "unlimited");
+      assert.equal(unlimited.remainingMicrousd, null);
+      assert.equal(unlimited.blockedReason, null);
+      assert.equal(
+        repository.reserve(
+          reservation(at + 6, {
+            requestId: "request-2",
+            jobId: "job-2",
+          })
+        ).ok,
+        true
+      );
     } finally {
       repository.close();
     }
@@ -99,7 +162,7 @@ test("same-zone limit changes use the active policy while period audit snapshots
           .monthlyLimitMicrousd,
         0
       );
-      assert.equal(repository.getStatus({ at }).blockedReason, "budget_exceeded");
+      assert.equal(repository.getStatus({ at }).blockedReason, "disabled");
       assert.equal(
         repository.setPolicy({
           monthlyLimitMicrousd: 10_000_000,
@@ -144,6 +207,7 @@ test("timezone changes remain pending until the old half-open period ends", () =
       );
       assert.equal(repository.getStatus({ at: oldPeriodEnd - 1 }).timezone, "America/Los_Angeles");
       assert.deepEqual(repository.getStatus({ at: oldPeriodEnd }), {
+        mode: "capped",
         monthKey: "2026-04",
         timezone: "Asia/Shanghai",
         currency: "USD",
@@ -618,6 +682,7 @@ test("started attempts reconcile actual usage exactly even when it exceeds the r
         hasCode("BUDGET_RECONCILIATION_COLLISION")
       );
       assert.deepEqual(repository.getStatus({ at: at + 5 }), {
+        mode: "capped",
         monthKey: "2026-07",
         timezone: "Asia/Shanghai",
         currency: "USD",

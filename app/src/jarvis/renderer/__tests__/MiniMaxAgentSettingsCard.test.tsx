@@ -5,6 +5,7 @@ import MiniMaxAgentSettingsCard from "../MiniMaxAgentSettingsCard";
 
 const DEFAULT_CONFIG = { keyConfigured: false, model: "MiniMax-M2.7" };
 const DEFAULT_BUDGET = {
+  mode: "capped" as const,
   monthKey: "2026-07",
   timezone: "Asia/Shanghai",
   currency: "USD" as const,
@@ -24,10 +25,15 @@ function installElectronApi(overrides = {}) {
     setAnalysisBudget: vi.fn().mockImplementation(async (input) => ({
       ...DEFAULT_BUDGET,
       ...input,
-      remainingMicrousd: Math.max(
-        0,
-        input.monthlyLimitMicrousd - DEFAULT_BUDGET.spentMicrousd - DEFAULT_BUDGET.reservedMicrousd
-      ),
+      remainingMicrousd:
+        input.mode === "unlimited"
+          ? null
+          : Math.max(
+              0,
+              input.monthlyLimitMicrousd -
+                DEFAULT_BUDGET.spentMicrousd -
+                DEFAULT_BUDGET.reservedMicrousd
+            ),
     })),
     ...overrides,
   };
@@ -53,6 +59,7 @@ describe("MiniMaxAgentSettingsCard", () => {
     expect(await screen.findByText("MiniMax key not configured")).toBeVisible();
     expect(screen.getByText("Model: MiniMax-M2.7")).toBeVisible();
     expect(screen.getByLabelText("MiniMax monthly hard limit (USD)")).toHaveValue(5);
+    expect(screen.getByLabelText("MiniMax budget mode")).toHaveValue("capped");
     expect(screen.getByText("2026-07 · Asia/Shanghai")).toBeVisible();
     expect(screen.getByText("Spent $1.00 · Reserved $0.50 · Remaining $3.50")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "30");
@@ -76,44 +83,34 @@ describe("MiniMaxAgentSettingsCard", () => {
     expect(await screen.findByText("MiniMax key not configured")).toBeVisible();
   });
 
-  it("applies zero and ten dollar hard limits but rejects out-of-range input", async () => {
+  it("applies a two-hundred-dollar cap and an explicit no-limit mode", async () => {
     const jarvis = installElectronApi();
     render(<MiniMaxAgentSettingsCard />);
     const input = await screen.findByLabelText("MiniMax monthly hard limit (USD)");
 
-    fireEvent.change(input, { target: { value: "0" } });
+    fireEvent.change(input, { target: { value: "200" } });
     fireEvent.click(screen.getByRole("button", { name: "Apply MiniMax budget" }));
     await waitFor(() =>
       expect(jarvis.setAnalysisBudget).toHaveBeenLastCalledWith({
-        monthlyLimitMicrousd: 0,
+        mode: "capped",
+        monthlyLimitMicrousd: 200_000_000,
+        timezone: "Asia/Shanghai",
+      })
+    );
+    fireEvent.change(screen.getByLabelText("MiniMax budget mode"), {
+      target: { value: "unlimited" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply MiniMax budget" }));
+    await waitFor(() =>
+      expect(jarvis.setAnalysisBudget).toHaveBeenLastCalledWith({
+        mode: "unlimited",
+        monthlyLimitMicrousd: 200_000_000,
         timezone: "Asia/Shanghai",
       })
     );
     expect(
-      await screen.findByText("MiniMax cloud analysis is disabled by the $0 limit.")
+      await screen.findByText(/No limit may create ongoing charges/)
     ).toBeVisible();
-
-    fireEvent.change(input, { target: { value: "10" } });
-    fireEvent.click(screen.getByRole("button", { name: "Apply MiniMax budget" }));
-    await waitFor(() =>
-      expect(jarvis.setAnalysisBudget).toHaveBeenLastCalledWith({
-        monthlyLimitMicrousd: 10_000_000,
-        timezone: "Asia/Shanghai",
-      })
-    );
-
-    fireEvent.change(input, { target: { value: "11" } });
-    fireEvent.click(screen.getByRole("button", { name: "Apply MiniMax budget" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Enter a monthly limit from $0 to $10."
-    );
-    expect(jarvis.setAnalysisBudget).toHaveBeenCalledTimes(2);
-
-    fireEvent.change(input, { target: { value: "-1" } });
-    fireEvent.click(screen.getByRole("button", { name: "Apply MiniMax budget" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Enter a monthly limit from $0 to $10."
-    );
     expect(jarvis.setAnalysisBudget).toHaveBeenCalledTimes(2);
   });
 

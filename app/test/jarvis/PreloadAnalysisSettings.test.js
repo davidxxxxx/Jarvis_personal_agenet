@@ -48,6 +48,7 @@ const config = {
 };
 
 const budget = {
+  mode: "capped",
   monthKey: "2026-07",
   timezone: "Asia/Shanghai",
   currency: "USD",
@@ -75,7 +76,14 @@ test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe r
     keyConfigured: true,
     model: "MiniMax-M2.7",
   });
-  assert.deepEqual(await api.setAnalysisBudget({ monthlyLimitMicrousd: 0, timezone: "UTC" }), {
+  assert.deepEqual(
+    await api.setAnalysisBudget({
+      mode: "unlimited",
+      monthlyLimitMicrousd: 200_000_000,
+      timezone: "UTC",
+    }),
+    {
+    mode: "capped",
     monthKey: "2026-07",
     timezone: "Asia/Shanghai",
     currency: "USD",
@@ -84,11 +92,15 @@ test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe r
     reservedMicrousd: 500_000,
     remainingMicrousd: 3_500_000,
     blockedReason: null,
-  });
+    }
+  );
   assert.deepEqual(invokes, [
     ["jarvis:minimax:set-key", { key: "sk-cp-user-key" }],
     ["jarvis:minimax:clear-key"],
-    ["jarvis:analysis-budget:set", { monthlyLimitMicrousd: 0, timezone: "UTC" }],
+    [
+      "jarvis:analysis-budget:set",
+      { mode: "unlimited", monthlyLimitMicrousd: 200_000_000, timezone: "UTC" },
+    ],
   ]);
 });
 
@@ -99,9 +111,10 @@ test("preload rejects malformed MiniMax and analysis-budget inputs before IPC", 
     assert.throws(() => api.setMiniMaxKey(key));
   }
   for (const input of [
-    { monthlyLimitMicrousd: -1, timezone: "UTC" },
-    { monthlyLimitMicrousd: 10_000_001, timezone: "UTC" },
-    { monthlyLimitMicrousd: 5_000_000, timezone: "UTC", extra: true },
+    { mode: "capped", monthlyLimitMicrousd: -1, timezone: "UTC" },
+    { mode: "capped", monthlyLimitMicrousd: 1_000_000_000_001, timezone: "UTC" },
+    { mode: "forever", monthlyLimitMicrousd: 5_000_000, timezone: "UTC" },
+    { mode: "capped", monthlyLimitMicrousd: 5_000_000, timezone: "UTC", extra: true },
   ]) {
     assert.throws(() => api.setAnalysisBudget(input));
   }

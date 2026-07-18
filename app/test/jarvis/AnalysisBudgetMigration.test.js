@@ -21,11 +21,51 @@ const LEGACY_V24_ATTEMPT_PERIOD_TRIGGER = `
 
 const TABLES = [
   "analysis_budget_policy_revisions",
+  "analysis_budget_policy_modes",
   "analysis_budget_settings",
   "analysis_budget_periods",
+  "analysis_budget_period_modes",
   "analysis_budget_price_versions",
   "analysis_budget_attempts",
 ];
+
+test("latest migration adds explicit immutable policy and period budget modes", () => {
+  const db = new Database(":memory:");
+  try {
+    migrate(db);
+    const repository = new AnalysisBudgetRepository(db);
+    repository.initialize({
+      mode: "capped",
+      monthlyLimitMicrousd: 5_000_000,
+      timezone: "Asia/Shanghai",
+      at: 1_720_992_000_000,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT mode, monthly_limit_microusd
+           FROM analysis_budget_policy_modes ORDER BY policy_revision`
+        )
+        .all(),
+      [{ mode: "capped", monthly_limit_microusd: 5_000_000 }]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT mode, monthly_limit_microusd
+           FROM analysis_budget_period_modes ORDER BY period_id`
+        )
+        .all(),
+      [{ mode: "capped", monthly_limit_microusd: 5_000_000 }]
+    );
+    assert.throws(
+      () => db.prepare("UPDATE analysis_budget_policy_modes SET mode = 'unlimited'").run(),
+      /immutable/
+    );
+  } finally {
+    db.close();
+  }
+});
 
 function tableNames(db) {
   return db
@@ -176,6 +216,8 @@ function createRepresentativeV23Database() {
       ('todo-unowned', '${"6".repeat(64)}', '${"6".repeat(64)}', 'Unowned',
        NULL, NULL, 'open', 'input-v23', 'evidence_linked', 20, 20);
     DROP TABLE analysis_budget_attempts;
+    DROP TABLE analysis_budget_period_modes;
+    DROP TABLE analysis_budget_policy_modes;
     DROP TABLE analysis_budget_periods;
     DROP TABLE analysis_budget_settings;
     DROP TABLE analysis_budget_price_versions;
@@ -188,7 +230,7 @@ function createRepresentativeV23Database() {
 test("latest migration retains the durable v25 budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 30);
+    assert.equal(TARGET_VERSION, 31);
     assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 

@@ -787,20 +787,24 @@ export interface JarvisMiniMaxConfig {
 }
 
 export type JarvisAnalysisBudgetBlockedReason =
-  "budget_exceeded" | "usage_unknown" | "over_limit" | null;
+  "disabled" | "budget_exceeded" | "usage_unknown" | "over_limit" | null;
+
+export type JarvisAnalysisBudgetMode = "off" | "capped" | "unlimited";
 
 export interface JarvisAnalysisBudgetStatus {
+  mode: JarvisAnalysisBudgetMode;
   monthKey: string;
   timezone: string;
   currency: "USD";
   monthlyLimitMicrousd: number;
   spentMicrousd: number;
   reservedMicrousd: number;
-  remainingMicrousd: number;
+  remainingMicrousd: number | null;
   blockedReason: JarvisAnalysisBudgetBlockedReason;
 }
 
 export interface JarvisAnalysisBudgetInput {
+  mode: JarvisAnalysisBudgetMode;
   monthlyLimitMicrousd: number;
   timezone: string;
 }

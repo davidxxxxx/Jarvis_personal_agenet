@@ -174,6 +174,7 @@ test("guard owns timestamps and delegates the complete lifecycle without exposin
     [
       "initialize",
       {
+        mode: "capped",
         monthlyLimitMicrousd: 5_000_000,
         timezone: "Asia/Shanghai",
         at: Date.UTC(2026, 6, 15, 4),
@@ -184,6 +185,7 @@ test("guard owns timestamps and delegates the complete lifecycle without exposin
     [
       "setPolicy",
       {
+        mode: "capped",
         monthlyLimitMicrousd: 10_000_000,
         timezone: "UTC",
         at: Date.UTC(2026, 6, 15, 4) + 3,
@@ -249,10 +251,22 @@ test("guard rejects malformed, extra, and unsafe public inputs before repository
   const invalidCalls = [
     () => guard.getStatus({ at: 1, extra: true }),
     () => guard.setPolicy({ monthlyLimitMicrousd: -1, timezone: "UTC" }),
-    () => guard.setPolicy({ monthlyLimitMicrousd: 10_000_001, timezone: "UTC" }),
+    () => guard.setPolicy({ monthlyLimitMicrousd: 1_000_000_000_001, timezone: "UTC" }),
     () => guard.setPolicy({ monthlyLimitMicrousd: 1.5, timezone: "UTC" }),
     () => guard.setPolicy({ monthlyLimitMicrousd: 1, timezone: "Asia/Calcutta" }),
     () => guard.setPolicy({ monthlyLimitMicrousd: 1, timezone: "UTC", extra: true }),
+    () =>
+      guard.setPolicy({
+        mode: "forever",
+        monthlyLimitMicrousd: 1,
+        timezone: "UTC",
+      }),
+    () =>
+      guard.setPolicy({
+        mode: "capped",
+        monthlyLimitMicrousd: 1_000_000_000_001,
+        timezone: "UTC",
+      }),
     () => guard.reserve({ ...reservation(), requestId: "" }),
     () => guard.reserve({ ...reservation(), jobId: "contains spaces" }),
     () => guard.reserve({ ...reservation(), attemptNumber: 0 }),
@@ -296,6 +310,45 @@ test("guard rejects malformed, extra, and unsafe public inputs before repository
   assert.equal(calls, 0);
 });
 
+test("guard forwards explicit capped and unlimited policy modes", () => {
+  const calls = [];
+  const guard = new AnalysisBudgetGuard({
+    repository: fakeRepository({
+      setPolicy(input) {
+        calls.push(input);
+        return input;
+      },
+    }),
+    now: () => 100,
+    defaultTimezone: "Asia/Shanghai",
+  });
+
+  guard.setPolicy({
+    mode: "capped",
+    monthlyLimitMicrousd: 200_000_000,
+    timezone: "UTC",
+  });
+  guard.setPolicy({
+    mode: "unlimited",
+    monthlyLimitMicrousd: 200_000_000,
+    timezone: "UTC",
+  });
+  assert.deepEqual(calls, [
+    {
+      mode: "capped",
+      monthlyLimitMicrousd: 200_000_000,
+      timezone: "UTC",
+      at: 100,
+    },
+    {
+      mode: "unlimited",
+      monthlyLimitMicrousd: 200_000_000,
+      timezone: "UTC",
+      at: 100,
+    },
+  ]);
+});
+
 test("guard integrates default, zero, and ten-dollar policies with durable transitions", () => {
   withRepository((repository) => {
     let now = Date.UTC(2026, 6, 15, 4);
@@ -307,11 +360,11 @@ test("guard integrates default, zero, and ten-dollar policies with durable trans
     assert.equal(guard.initialize().monthlyLimitMicrousd, 5_000_000);
     assert.equal(
       guard.setPolicy({ monthlyLimitMicrousd: 0, timezone: "Asia/Shanghai" }).blockedReason,
-      "budget_exceeded"
+      "disabled"
     );
     assert.deepEqual(guard.reserve(reservation()), {
       ok: false,
-      reason: "budget_exceeded",
+      reason: "disabled",
     });
     now += 1;
     guard.setPolicy({ monthlyLimitMicrousd: 10_000_000, timezone: "Asia/Shanghai" });

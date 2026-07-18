@@ -1373,6 +1373,7 @@ test("analysis budget IPC enforces exact policy input and returns a safe allowli
   const calls = [];
   const { handlers, analysisBudgetGuard } = createIpcHarness();
   analysisBudgetGuard.getStatus = () => ({
+    mode: "capped",
     monthKey: "2026-07",
     timezone: "Asia/Shanghai",
     currency: "USD",
@@ -1386,10 +1387,15 @@ test("analysis budget IPC enforces exact policy input and returns a safe allowli
   });
   analysisBudgetGuard.setPolicy = (input) => {
     calls.push(input);
-    return { ...analysisBudgetGuard.getStatus(), ...input };
+    return {
+      ...analysisBudgetGuard.getStatus(),
+      ...input,
+      remainingMicrousd: input.mode === "unlimited" ? null : 3_500_000,
+    };
   };
 
   assert.deepEqual(await handlers.get(CHANNELS.getAnalysisBudget)(null), {
+    mode: "capped",
     monthKey: "2026-07",
     timezone: "Asia/Shanghai",
     currency: "USD",
@@ -1400,16 +1406,21 @@ test("analysis budget IPC enforces exact policy input and returns a safe allowli
     blockedReason: null,
   });
   const updated = await handlers.get(CHANNELS.setAnalysisBudget)(null, {
-    monthlyLimitMicrousd: 0,
+    mode: "unlimited",
+    monthlyLimitMicrousd: 200_000_000,
     timezone: "UTC",
   });
-  assert.equal(updated.monthlyLimitMicrousd, 0);
+  assert.equal(updated.mode, "unlimited");
+  assert.equal(updated.monthlyLimitMicrousd, 200_000_000);
   assert.equal(updated.timezone, "UTC");
-  assert.deepEqual(calls, [{ monthlyLimitMicrousd: 0, timezone: "UTC" }]);
+  assert.deepEqual(calls, [
+    { mode: "unlimited", monthlyLimitMicrousd: 200_000_000, timezone: "UTC" },
+  ]);
   for (const invalid of [
-    { monthlyLimitMicrousd: -1, timezone: "UTC" },
-    { monthlyLimitMicrousd: 10_000_001, timezone: "UTC" },
-    { monthlyLimitMicrousd: 5_000_000, timezone: "UTC", extra: true },
+    { mode: "capped", monthlyLimitMicrousd: -1, timezone: "UTC" },
+    { mode: "capped", monthlyLimitMicrousd: 1_000_000_000_001, timezone: "UTC" },
+    { mode: "forever", monthlyLimitMicrousd: 5_000_000, timezone: "UTC" },
+    { mode: "capped", monthlyLimitMicrousd: 5_000_000, timezone: "UTC", extra: true },
   ]) {
     assert.throws(() => handlers.get(CHANNELS.setAnalysisBudget)(null, invalid));
   }

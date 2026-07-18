@@ -3,6 +3,7 @@ const { assertCanonicalIanaTimezone } = require("./ZonedCalendar");
 const {
   DEFAULT_MONTHLY_LIMIT_MICROUSD,
   MAX_MONTHLY_LIMIT_MICROUSD,
+  BUDGET_MODES,
 } = require("./AnalysisBudgetRepository");
 
 const OPERATIONS = new Set(["session_analysis", "daily_digest"]);
@@ -58,6 +59,15 @@ function assertMonthlyLimit(value) {
     );
   }
   return value;
+}
+
+function normalizeMode(value, monthlyLimitMicrousd) {
+  const mode = value ?? (monthlyLimitMicrousd === 0 ? "off" : "capped");
+  if (!BUDGET_MODES.has(mode)) throw new TypeError("mode must be off, capped, or unlimited");
+  if (mode === "off" && monthlyLimitMicrousd !== 0) {
+    throw new TypeError("off mode requires a zero monthly limit");
+  }
+  return mode;
 }
 
 function assertBoundedText(value, name) {
@@ -127,6 +137,7 @@ class AnalysisBudgetGuard {
 
   initialize() {
     return this.repository.initialize({
+      mode: "capped",
       monthlyLimitMicrousd: DEFAULT_MONTHLY_LIMIT_MICROUSD,
       timezone: this.defaultTimezone,
       at: this._now(),
@@ -145,11 +156,14 @@ class AnalysisBudgetGuard {
 
   setPolicy(input) {
     assertPlainObject(input, "policy input");
-    const keys = new Set(["monthlyLimitMicrousd", "timezone"]);
-    assertExactKeys(input, keys, "policy input");
-    assertRequiredKeys(input, keys, "policy input");
+    const allowed = new Set(["mode", "monthlyLimitMicrousd", "timezone"]);
+    const required = new Set(["monthlyLimitMicrousd", "timezone"]);
+    assertExactKeys(input, allowed, "policy input");
+    assertRequiredKeys(input, required, "policy input");
+    const monthlyLimitMicrousd = assertMonthlyLimit(input.monthlyLimitMicrousd);
     return this.repository.setPolicy({
-      monthlyLimitMicrousd: assertMonthlyLimit(input.monthlyLimitMicrousd),
+      mode: normalizeMode(input.mode, monthlyLimitMicrousd),
+      monthlyLimitMicrousd,
       timezone: assertCanonicalIanaTimezone(input.timezone),
       at: this._now(),
     });

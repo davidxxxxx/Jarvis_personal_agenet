@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 30;
+const TARGET_VERSION = 31;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
@@ -4074,6 +4074,10 @@ function analysisBudgetSchemaSignature(db) {
        ORDER BY type, name`
     )
     .all()
+    .filter(
+      (row) =>
+        !["analysis_budget_policy_modes", "analysis_budget_period_modes"].includes(row.tbl_name)
+    )
     .map((row) => ({
       type: row.type,
       name: row.name,
@@ -5277,6 +5281,117 @@ function upgradePublicKnowledgeIndexesV30(db) {
   db.exec(PUBLIC_KNOWLEDGE_QUERY_INDEXES_V30);
 }
 
+const ANALYSIS_BUDGET_MODES_V31_SCHEMA = `
+  CREATE TABLE analysis_budget_policy_modes (
+    policy_revision INTEGER PRIMARY KEY
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    mode TEXT NOT NULL CHECK(mode IN ('off','capped','unlimited')),
+    monthly_limit_microusd INTEGER NOT NULL CHECK(
+      typeof(monthly_limit_microusd) = 'integer'
+      AND monthly_limit_microusd BETWEEN 0 AND 1000000000000
+    ),
+    CHECK(mode <> 'off' OR monthly_limit_microusd = 0),
+    UNIQUE(policy_revision, mode, monthly_limit_microusd)
+  );
+
+  CREATE TABLE analysis_budget_period_modes (
+    period_id INTEGER PRIMARY KEY
+      REFERENCES analysis_budget_periods(id) ON DELETE RESTRICT,
+    policy_revision INTEGER NOT NULL
+      REFERENCES analysis_budget_policy_revisions(revision) ON DELETE RESTRICT,
+    mode TEXT NOT NULL CHECK(mode IN ('off','capped','unlimited')),
+    monthly_limit_microusd INTEGER NOT NULL CHECK(
+      typeof(monthly_limit_microusd) = 'integer'
+      AND monthly_limit_microusd BETWEEN 0 AND 1000000000000
+    ),
+    CHECK(mode <> 'off' OR monthly_limit_microusd = 0),
+    FOREIGN KEY(policy_revision, mode, monthly_limit_microusd)
+      REFERENCES analysis_budget_policy_modes(
+        policy_revision, mode, monthly_limit_microusd
+      ) ON DELETE RESTRICT
+  );
+
+  CREATE TRIGGER analysis_budget_policy_modes_no_update
+  BEFORE UPDATE ON analysis_budget_policy_modes
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy mode history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_policy_modes_no_replacement
+  BEFORE INSERT ON analysis_budget_policy_modes
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_policy_modes
+    WHERE policy_revision = NEW.policy_revision
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy mode replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_policy_modes_no_delete
+  BEFORE DELETE ON analysis_budget_policy_modes
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget policy mode history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_period_modes_no_update
+  BEFORE UPDATE ON analysis_budget_period_modes
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period mode history is immutable');
+  END;
+
+  CREATE TRIGGER analysis_budget_period_modes_no_replacement
+  BEFORE INSERT ON analysis_budget_period_modes
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_budget_period_modes
+    WHERE period_id = NEW.period_id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period mode replacement is forbidden');
+  END;
+
+  CREATE TRIGGER analysis_budget_period_modes_no_delete
+  BEFORE DELETE ON analysis_budget_period_modes
+  BEGIN
+    SELECT RAISE(ABORT, 'analysis budget period mode history is immutable');
+  END;
+`;
+
+function upgradeAnalysisBudgetModesV31(db) {
+  for (const table of [
+    "analysis_budget_policy_revisions",
+    "analysis_budget_periods",
+  ]) {
+    if (!tableExists(db, table)) throw new Error(`v31 analysis budget modes require ${table}`);
+  }
+  const hasPolicyModes = tableExists(db, "analysis_budget_policy_modes");
+  const hasPeriodModes = tableExists(db, "analysis_budget_period_modes");
+  if (hasPolicyModes || hasPeriodModes) {
+    if (!hasPolicyModes || !hasPeriodModes) {
+      throw new Error("analysis budget mode schema collision");
+    }
+    return;
+  }
+  db.exec(ANALYSIS_BUDGET_MODES_V31_SCHEMA);
+  db.exec(`
+    INSERT INTO analysis_budget_policy_modes (
+      policy_revision, mode, monthly_limit_microusd
+    )
+    SELECT revision,
+      CASE WHEN monthly_limit_microusd = 0 THEN 'off' ELSE 'capped' END,
+      monthly_limit_microusd
+    FROM analysis_budget_policy_revisions;
+
+    INSERT INTO analysis_budget_period_modes (
+      period_id, policy_revision, mode, monthly_limit_microusd
+    )
+    SELECT period.id, period.policy_revision, policy_mode.mode,
+      policy_mode.monthly_limit_microusd
+    FROM analysis_budget_periods AS period
+    JOIN analysis_budget_policy_modes AS policy_mode
+      ON policy_mode.policy_revision = period.policy_revision;
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -5553,6 +5668,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 30) {
         upgradePublicKnowledgeIndexesV30(db);
       }
+      if (fromVersion < 31) {
+        upgradeAnalysisBudgetModesV31(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -5581,4 +5699,5 @@ module.exports = {
   upgradeAgentWorkloadV26,
   upgradeDailyDigestV29,
   upgradePublicKnowledgeIndexesV30,
+  upgradeAnalysisBudgetModesV31,
 };

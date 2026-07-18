@@ -5,7 +5,9 @@ const { assertCanonicalIanaTimezone, monthKeyAt, resolveLocalMonth } = require("
 const { calculateUsageCostMicrousd } = require("./AnalysisBudgetPricing");
 
 const DEFAULT_MONTHLY_LIMIT_MICROUSD = 5_000_000;
-const MAX_MONTHLY_LIMIT_MICROUSD = 10_000_000;
+const MAX_MONTHLY_LIMIT_MICROUSD = 1_000_000_000_000;
+const LEGACY_MAX_MONTHLY_LIMIT_MICROUSD = 10_000_000;
+const BUDGET_MODES = new Set(["off", "capped", "unlimited"]);
 
 function assertTimestamp(value, name = "at") {
   if (!Number.isSafeInteger(value) || value < 0) {
@@ -21,6 +23,22 @@ function assertMonthlyLimit(value) {
     );
   }
   return value;
+}
+
+function normalizeMode(mode, monthlyLimitMicrousd) {
+  const normalized = mode ?? (monthlyLimitMicrousd === 0 ? "off" : "capped");
+  if (!BUDGET_MODES.has(normalized)) {
+    throw new TypeError("mode must be off, capped, or unlimited");
+  }
+  if (normalized === "off" && monthlyLimitMicrousd !== 0) {
+    throw new TypeError("off mode requires a zero monthly limit");
+  }
+  return normalized;
+}
+
+function legacyMonthlyLimit(mode, monthlyLimitMicrousd) {
+  if (mode === "off") return 0;
+  return Math.min(monthlyLimitMicrousd, LEGACY_MAX_MONTHLY_LIMIT_MICROUSD);
 }
 
 function codedError(code, cause) {
@@ -111,8 +129,13 @@ class AnalysisBudgetRepository {
   _policy(revision) {
     return this.db
       .prepare(
-        `SELECT revision, monthly_limit_microusd, timezone, currency, created_at, effective_at
-         FROM analysis_budget_policy_revisions WHERE revision = ?`
+        `SELECT policy.revision, policy.monthly_limit_microusd AS legacy_monthly_limit_microusd,
+                policy.timezone, policy.currency, policy.created_at, policy.effective_at,
+                policy_mode.mode, policy_mode.monthly_limit_microusd
+         FROM analysis_budget_policy_revisions AS policy
+         JOIN analysis_budget_policy_modes AS policy_mode
+           ON policy_mode.policy_revision = policy.revision
+         WHERE policy.revision = ?`
       )
       .get(revision);
   }
@@ -120,34 +143,55 @@ class AnalysisBudgetRepository {
   _latestPolicy(at) {
     return this.db
       .prepare(
-        `SELECT revision, monthly_limit_microusd, timezone, currency, created_at, effective_at
-         FROM analysis_budget_policy_revisions
-         WHERE effective_at <= ?
-         ORDER BY effective_at DESC, revision DESC LIMIT 1`
+        `SELECT policy.revision, policy.monthly_limit_microusd AS legacy_monthly_limit_microusd,
+                policy.timezone, policy.currency, policy.created_at, policy.effective_at,
+                policy_mode.mode, policy_mode.monthly_limit_microusd
+         FROM analysis_budget_policy_revisions AS policy
+         JOIN analysis_budget_policy_modes AS policy_mode
+           ON policy_mode.policy_revision = policy.revision
+         WHERE policy.effective_at <= ?
+         ORDER BY policy.effective_at DESC, policy.revision DESC LIMIT 1`
       )
       .get(at);
   }
 
-  _insertPolicy({ monthlyLimitMicrousd, timezone, createdAt, effectiveAt }) {
-    return Number(
+  _insertPolicy({ mode, monthlyLimitMicrousd, timezone, createdAt, effectiveAt }) {
+    const revision = Number(
       this.db
         .prepare(
           `INSERT INTO analysis_budget_policy_revisions (
              monthly_limit_microusd, timezone, currency, created_at, effective_at
            ) VALUES (?, ?, 'USD', ?, ?)`
         )
-        .run(monthlyLimitMicrousd, timezone, createdAt, effectiveAt).lastInsertRowid
+        .run(
+          legacyMonthlyLimit(mode, monthlyLimitMicrousd),
+          timezone,
+          createdAt,
+          effectiveAt
+        ).lastInsertRowid
     );
+    this.db
+      .prepare(
+        `INSERT INTO analysis_budget_policy_modes (
+           policy_revision, mode, monthly_limit_microusd
+         ) VALUES (?, ?, ?)`
+      )
+      .run(revision, mode, monthlyLimitMicrousd);
+    return revision;
   }
 
   _findPeriod(at) {
     return this.db
       .prepare(
-        `SELECT id, month_key, timezone, starts_at, ends_at, currency,
-                monthly_limit_microusd, policy_revision, created_at
-         FROM analysis_budget_periods
-         WHERE starts_at <= ? AND ends_at > ?
-         ORDER BY starts_at DESC LIMIT 1`
+        `SELECT period.id, period.month_key, period.timezone, period.starts_at, period.ends_at,
+                period.currency, period.monthly_limit_microusd AS legacy_monthly_limit_microusd,
+                period.policy_revision, period.created_at, period_mode.mode,
+                period_mode.monthly_limit_microusd
+         FROM analysis_budget_periods AS period
+         JOIN analysis_budget_period_modes AS period_mode
+           ON period_mode.period_id = period.id
+         WHERE period.starts_at <= ? AND period.ends_at > ?
+         ORDER BY period.starts_at DESC LIMIT 1`
       )
       .get(at, at);
   }
@@ -174,19 +218,28 @@ class AnalysisBudgetRepository {
         policy.timezone,
         startsAt,
         natural.endsAt,
-        policy.monthly_limit_microusd,
+        policy.legacy_monthly_limit_microusd,
         policy.revision,
         at
       );
+    const periodId = Number(result.lastInsertRowid);
+    this.db
+      .prepare(
+        `INSERT INTO analysis_budget_period_modes (
+           period_id, policy_revision, mode, monthly_limit_microusd
+         ) VALUES (?, ?, ?, ?)`
+      )
+      .run(periodId, policy.revision, policy.mode, policy.monthly_limit_microusd);
     return (
       this._findPeriod(at) ?? {
-        id: Number(result.lastInsertRowid),
+        id: periodId,
         month_key: monthKey,
         timezone: policy.timezone,
         starts_at: startsAt,
         ends_at: natural.endsAt,
         currency: "USD",
         monthly_limit_microusd: policy.monthly_limit_microusd,
+        mode: policy.mode,
         policy_revision: policy.revision,
         created_at: at,
       }
@@ -239,6 +292,7 @@ class AnalysisBudgetRepository {
 
   _status(at) {
     const { effectivePolicy, period } = this._ensureContext(at);
+    const mode = effectivePolicy.mode;
     const monthlyLimitMicrousd = effectivePolicy.monthly_limit_microusd;
     const totals = this.db
       .prepare(
@@ -253,12 +307,15 @@ class AnalysisBudgetRepository {
       )
       .get(period.id);
     const committed = totals.spent_microusd + totals.reserved_microusd;
-    const remainingMicrousd = Math.max(0, monthlyLimitMicrousd - committed);
+    const remainingMicrousd =
+      mode === "unlimited" ? null : Math.max(0, monthlyLimitMicrousd - committed);
     let blockedReason = null;
-    if (totals.unknown_count > 0) blockedReason = "usage_unknown";
-    else if (committed > monthlyLimitMicrousd) blockedReason = "over_limit";
-    else if (remainingMicrousd === 0) blockedReason = "budget_exceeded";
+    if (mode === "off") blockedReason = "disabled";
+    else if (mode === "capped" && totals.unknown_count > 0) blockedReason = "usage_unknown";
+    else if (mode === "capped" && committed > monthlyLimitMicrousd) blockedReason = "over_limit";
+    else if (mode === "capped" && remainingMicrousd === 0) blockedReason = "budget_exceeded";
     return {
+      mode,
       monthKey: period.month_key,
       timezone: period.timezone,
       currency: "USD",
@@ -367,10 +424,13 @@ class AnalysisBudgetRepository {
     const totals = this._periodTotals(context.period.id);
     const committed = totals.spent_microusd + totals.held_microusd;
     const limit = policy.monthly_limit_microusd;
-    if (totals.unknown_count > 0) return { ok: false, reason: "usage_unknown" };
-    if (committed > limit) return { ok: false, reason: "over_limit" };
-    if (committed >= limit || committed + reservedMicrousd > limit) {
-      return { ok: false, reason: "budget_exceeded" };
+    if (policy.mode === "off") return { ok: false, reason: "disabled" };
+    if (policy.mode === "capped") {
+      if (totals.unknown_count > 0) return { ok: false, reason: "usage_unknown" };
+      if (committed > limit) return { ok: false, reason: "over_limit" };
+      if (committed >= limit || committed + reservedMicrousd > limit) {
+        return { ok: false, reason: "budget_exceeded" };
+      }
     }
 
     this.db
@@ -406,14 +466,21 @@ class AnalysisBudgetRepository {
     });
   }
 
-  initialize({ monthlyLimitMicrousd = DEFAULT_MONTHLY_LIMIT_MICROUSD, timezone, at }) {
+  initialize({
+    mode,
+    monthlyLimitMicrousd = DEFAULT_MONTHLY_LIMIT_MICROUSD,
+    timezone,
+    at,
+  }) {
     const safeLimit = assertMonthlyLimit(monthlyLimitMicrousd);
+    const safeMode = normalizeMode(mode, safeLimit);
     const safeTimezone = assertCanonicalIanaTimezone(timezone);
     const safeAt = assertTimestamp(at);
     return this._immediate(() => {
       const settings = this._settings();
       if (settings.active_policy_revision === null) {
         const revision = this._insertPolicy({
+          mode: safeMode,
           monthlyLimitMicrousd: safeLimit,
           timezone: safeTimezone,
           createdAt: safeAt,
@@ -435,8 +502,9 @@ class AnalysisBudgetRepository {
     return this._immediate(() => this._status(safeAt));
   }
 
-  setPolicy({ monthlyLimitMicrousd, timezone, at }) {
+  setPolicy({ mode, monthlyLimitMicrousd, timezone, at }) {
     const safeLimit = assertMonthlyLimit(monthlyLimitMicrousd);
+    const safeMode = normalizeMode(mode, safeLimit);
     const safeTimezone = assertCanonicalIanaTimezone(timezone);
     const safeAt = assertTimestamp(at);
     return this._immediate(() => {
@@ -447,8 +515,9 @@ class AnalysisBudgetRepository {
       let pendingEffectiveAt = context.settings.pending_effective_at;
       const pendingPolicy = pendingRevision === null ? null : this._policy(pendingRevision);
 
-      if (safeLimit !== activePolicy.monthly_limit_microusd) {
+      if (safeLimit !== activePolicy.monthly_limit_microusd || safeMode !== activePolicy.mode) {
         activeRevision = this._insertPolicy({
+          mode: safeMode,
           monthlyLimitMicrousd: safeLimit,
           timezone: activePolicy.timezone,
           createdAt: safeAt,
@@ -460,6 +529,7 @@ class AnalysisBudgetRepository {
       if (safeTimezone === activePolicy.timezone) {
         if (pendingPolicy && pendingEffectiveAt > safeAt) {
           this._insertPolicy({
+            mode: safeMode,
             monthlyLimitMicrousd: safeLimit,
             timezone: activePolicy.timezone,
             createdAt: safeAt,
@@ -471,11 +541,13 @@ class AnalysisBudgetRepository {
       } else if (
         !pendingPolicy ||
         pendingPolicy.timezone !== safeTimezone ||
+        pendingPolicy.mode !== safeMode ||
         pendingPolicy.monthly_limit_microusd !== safeLimit ||
         pendingEffectiveAt !== context.period.ends_at
       ) {
         pendingEffectiveAt = context.period.ends_at;
         pendingRevision = this._insertPolicy({
+          mode: safeMode,
           monthlyLimitMicrousd: safeLimit,
           timezone: safeTimezone,
           createdAt: safeAt,
@@ -722,4 +794,5 @@ function openAnalysisBudgetRepository(databasePath, { busyTimeoutMs = 250 } = {}
 module.exports = AnalysisBudgetRepository;
 module.exports.DEFAULT_MONTHLY_LIMIT_MICROUSD = DEFAULT_MONTHLY_LIMIT_MICROUSD;
 module.exports.MAX_MONTHLY_LIMIT_MICROUSD = MAX_MONTHLY_LIMIT_MICROUSD;
+module.exports.BUDGET_MODES = BUDGET_MODES;
 module.exports.openAnalysisBudgetRepository = openAnalysisBudgetRepository;

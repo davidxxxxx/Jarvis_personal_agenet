@@ -47,6 +47,7 @@ test("service opens a migrated database with the five-dollar local-month default
     service.open(path.join(directory, "jarvis.sqlite"));
 
     assert.deepEqual(service.getStatus(), {
+      mode: "capped",
       monthKey: "2026-07",
       timezone: "Asia/Shanghai",
       currency: "USD",

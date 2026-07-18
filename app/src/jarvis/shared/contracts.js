@@ -352,13 +352,30 @@ function normalizeMiniMaxConfig(input) {
 }
 
 function normalizeAnalysisBudgetInput(input) {
-  exactEnumerableObject(input, ["monthlyLimitMicrousd", "timezone"], "analysis budget input");
+  const hasMode =
+    input && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "mode");
+  exactEnumerableObject(
+    input,
+    hasMode ? ["mode", "monthlyLimitMicrousd", "timezone"] : ["monthlyLimitMicrousd", "timezone"],
+    "analysis budget input"
+  );
   if (
     !Number.isSafeInteger(input.monthlyLimitMicrousd) ||
     input.monthlyLimitMicrousd < 0 ||
-    input.monthlyLimitMicrousd > 10_000_000
+    input.monthlyLimitMicrousd > 1_000_000_000_000
   ) {
-    throw new RangeError("monthlyLimitMicrousd must be between 0 and 10000000");
+    throw new RangeError("monthlyLimitMicrousd must be between 0 and 1000000000000");
+  }
+  const mode = hasMode
+    ? input.mode
+    : input.monthlyLimitMicrousd === 0
+      ? "off"
+      : "capped";
+  if (!new Set(["off", "capped", "unlimited"]).has(mode)) {
+    throw new TypeError("analysis budget mode is invalid");
+  }
+  if (mode === "off" && input.monthlyLimitMicrousd !== 0) {
+    throw new TypeError("off mode requires a zero monthly limit");
   }
   if (
     typeof input.timezone !== "string" ||
@@ -370,6 +387,7 @@ function normalizeAnalysisBudgetInput(input) {
     throw new TypeError("timezone must be a bounded non-empty string");
   }
   return {
+    mode,
     monthlyLimitMicrousd: input.monthlyLimitMicrousd,
     timezone: input.timezone,
   };
@@ -377,6 +395,7 @@ function normalizeAnalysisBudgetInput(input) {
 
 const ANALYSIS_BUDGET_BLOCKED_REASONS = new Set([
   null,
+  "disabled",
   "budget_exceeded",
   "usage_unknown",
   "over_limit",
@@ -392,22 +411,26 @@ function normalizeAnalysisBudgetStatus(input) {
     typeof input.timezone !== "string" ||
     !input.timezone ||
     input.timezone.length > 128 ||
+    !new Set(["off", "capped", "unlimited"]).has(input.mode) ||
     input.currency !== "USD" ||
     !ANALYSIS_BUDGET_BLOCKED_REASONS.has(input.blockedReason)
   ) {
     throw new TypeError("analysis budget response is invalid");
   }
-  for (const key of [
-    "monthlyLimitMicrousd",
-    "spentMicrousd",
-    "reservedMicrousd",
-    "remainingMicrousd",
-  ]) {
+  for (const key of ["monthlyLimitMicrousd", "spentMicrousd", "reservedMicrousd"]) {
     if (!Number.isSafeInteger(input[key]) || input[key] < 0) {
       throw new TypeError("analysis budget response is invalid");
     }
   }
+  if (
+    (input.mode === "unlimited" && input.remainingMicrousd !== null) ||
+    (input.mode !== "unlimited" &&
+      (!Number.isSafeInteger(input.remainingMicrousd) || input.remainingMicrousd < 0))
+  ) {
+    throw new TypeError("analysis budget response is invalid");
+  }
   return {
+    mode: input.mode,
     monthKey: input.monthKey,
     timezone: input.timezone,
     currency: "USD",
