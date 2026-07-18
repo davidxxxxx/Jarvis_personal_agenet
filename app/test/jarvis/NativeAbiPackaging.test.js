@@ -61,16 +61,22 @@ test("Node native restore uses trusted Node and npm CLI paths without a shell", 
 test("unsigned artifact verification retries a transient Windows signature result", () => {
   let attempts = 0;
   const waits = [];
+  const verificationEnvironments = [];
 
   assertUnsignedWindowsArtifacts({
     appRoot,
     platform: "win32",
     systemRoot: String.raw`C:\Windows`,
+    env: {
+      PATH: "trusted-path",
+      PSModulePath: String.raw`C:\Program Files\PowerShell\Modules;C:\Windows\Modules`,
+    },
     signatureScanAttempts: 2,
     signatureScanRetryDelayMs: 25,
     waitImpl: (delayMs) => waits.push(delayMs),
-    spawnSyncImpl: () => {
+    spawnSyncImpl: (_command, _args, options) => {
       attempts += 1;
+      verificationEnvironments.push(options.env);
       if (attempts === 1) {
         return {
           status: 0,
@@ -86,6 +92,14 @@ test("unsigned artifact verification retries a transient Windows signature resul
 
   assert.equal(attempts, 2);
   assert.deepEqual(waits, [25]);
+  for (const environment of verificationEnvironments) {
+    assert.equal(environment.PATH, "trusted-path");
+    assert.equal(
+      environment.PSModulePath,
+      String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\Modules`
+    );
+    assert.doesNotMatch(environment.PSModulePath, /PowerShell\\Modules/i);
+  }
 });
 
 test("native verifier invokes an absolute runtime without shell interpolation and requires ABI 145", () => {

@@ -147,6 +147,7 @@ function assertUnsignedWindowsArtifacts({
   artifactRoot = path.join(appRoot, "dist"),
   platform = process.platform,
   systemRoot = process.env.SystemRoot,
+  env = process.env,
   spawnSyncImpl = spawnSync,
   signatureScanAttempts = 10,
   signatureScanRetryDelayMs = 500,
@@ -173,6 +174,20 @@ function assertUnsignedWindowsArtifacts({
     "v1.0",
     "powershell.exe"
   );
+  const verificationEnvironment = { ...env };
+  for (const name of Object.keys(verificationEnvironment)) {
+    if (/^psmodulepath$/i.test(name)) delete verificationEnvironment[name];
+  }
+  // Windows PowerShell 5.1 cannot import PowerShell 7's security module.
+  // Pin its built-in module root so a parent PowerShell 7 process cannot
+  // leak an incompatible WindowsApps module path into Authenticode checks.
+  verificationEnvironment.PSModulePath = path.win32.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "Modules"
+  );
   let lastError;
   for (let attempt = 1; attempt <= signatureScanAttempts; attempt += 1) {
     const result = spawnSyncImpl(
@@ -186,7 +201,13 @@ function assertUnsignedWindowsArtifacts({
         path.join(appRoot, "scripts", "verify-unsigned-artifacts.ps1"),
         ...artifactPaths,
       ],
-      { cwd: appRoot, encoding: "utf8", shell: false, windowsHide: true }
+      {
+        cwd: appRoot,
+        encoding: "utf8",
+        shell: false,
+        windowsHide: true,
+        env: verificationEnvironment,
+      }
     );
     try {
       if (result.error || result.status !== 0) {
