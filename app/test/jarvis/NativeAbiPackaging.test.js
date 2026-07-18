@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  assertUnsignedWindowsArtifacts,
   buildUnsignedWindows,
   createElectronNativeRebuildInvocation,
   createNodeNativeRestoreInvocation,
@@ -55,6 +56,36 @@ test("Node native restore uses trusted Node and npm CLI paths without a shell", 
   assert.equal(path.isAbsolute(invocation.args[0]), true);
   assert.deepEqual(invocation.args.slice(1), ["rebuild", "better-sqlite3"]);
   assert.equal(invocation.options.shell, false);
+});
+
+test("unsigned artifact verification retries a transient Windows signature result", () => {
+  let attempts = 0;
+  const waits = [];
+
+  assertUnsignedWindowsArtifacts({
+    appRoot,
+    platform: "win32",
+    systemRoot: String.raw`C:\Windows`,
+    signatureScanAttempts: 2,
+    signatureScanRetryDelayMs: 25,
+    waitImpl: (delayMs) => waits.push(delayMs),
+    spawnSyncImpl: () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { name: "Jarvis Memory Setup 0.1.0.exe", status: "UnknownError" },
+            { name: "Jarvis Memory 0.1.0.exe", status: "NotSigned" },
+          ]),
+        };
+      }
+      return successfulAuthenticodeResult();
+    },
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(waits, [25]);
 });
 
 test("native verifier invokes an absolute runtime without shell interpolation and requires ABI 145", () => {

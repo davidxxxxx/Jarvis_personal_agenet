@@ -148,6 +148,9 @@ function assertUnsignedWindowsArtifacts({
   platform = process.platform,
   systemRoot = process.env.SystemRoot,
   spawnSyncImpl = spawnSync,
+  signatureScanAttempts = 10,
+  signatureScanRetryDelayMs = 500,
+  waitImpl = (delayMs) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs),
 } = {}) {
   if (platform !== "win32") {
     throw new Error("Authenticode verification requires Windows");
@@ -170,35 +173,45 @@ function assertUnsignedWindowsArtifacts({
     "v1.0",
     "powershell.exe"
   );
-  const result = spawnSyncImpl(
-    powershellPath,
-    [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      path.join(appRoot, "scripts", "verify-unsigned-artifacts.ps1"),
-      ...artifactPaths,
-    ],
-    { cwd: appRoot, encoding: "utf8", shell: false, windowsHide: true }
-  );
-  if (result.error || result.status !== 0) {
-    throw new Error("Authenticode verification failed");
-  }
-  let rows;
-  try {
-    const parsed = JSON.parse(String(result.stdout).trim());
-    rows = Array.isArray(parsed) ? parsed : [parsed];
-  } catch {
-    throw new Error("Authenticode verification returned invalid output");
-  }
-  for (const expectedName of expectedNames) {
-    const row = rows.find((entry) => entry?.name === expectedName);
-    if (!row || row.status !== "NotSigned") {
-      throw new Error(`artifact must be Authenticode NotSigned: ${expectedName}`);
+  let lastError;
+  for (let attempt = 1; attempt <= signatureScanAttempts; attempt += 1) {
+    const result = spawnSyncImpl(
+      powershellPath,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        path.join(appRoot, "scripts", "verify-unsigned-artifacts.ps1"),
+        ...artifactPaths,
+      ],
+      { cwd: appRoot, encoding: "utf8", shell: false, windowsHide: true }
+    );
+    try {
+      if (result.error || result.status !== 0) {
+        throw new Error("Authenticode verification failed");
+      }
+      const parsed = JSON.parse(String(result.stdout).trim());
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      for (const expectedName of expectedNames) {
+        const row = rows.find((entry) => entry?.name === expectedName);
+        if (!row || row.status !== "NotSigned") {
+          throw new Error(`artifact must be Authenticode NotSigned: ${expectedName}`);
+        }
+      }
+      return;
+    } catch (error) {
+      lastError =
+        error instanceof SyntaxError
+          ? new Error("Authenticode verification returned invalid output")
+          : error;
+      if (attempt < signatureScanAttempts) {
+        waitImpl(signatureScanRetryDelayMs);
+      }
     }
   }
+  throw lastError;
 }
 
 function buildUnsignedWindows(options = {}) {

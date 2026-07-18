@@ -7,11 +7,16 @@ const path = require("node:path");
 const test = require("node:test");
 const { PassThrough } = require("node:stream");
 
-const { DirectoryLeaseProvider } = require("../../src/jarvis/main/DirectoryLease");
+const {
+  DirectoryLeaseProvider,
+  resolveWindowsHelperPath,
+} = require("../../src/jarvis/main/DirectoryLease");
 const {
   acquireDataRootRuntimeLease,
   DATA_ROOT_IN_USE_CODE,
 } = require("../../src/jarvis/main/DataRootRuntimeLease");
+
+const appRoot = path.resolve(__dirname, "../..");
 
 function windowsHelperCount(parentProcessId = null) {
   if (process.platform !== "win32") return 0;
@@ -34,6 +39,31 @@ function windowsHelperCount(parentProcessId = null) {
   );
   return Number(String(raw).trim());
 }
+
+test("packaged Windows lease helper resolves to the real asar-unpacked file", () => {
+  const resourcesPath = path.resolve("G:\\packaged-jarvis\\resources");
+  const moduleDir = path.join(resourcesPath, "app.asar", "src", "jarvis", "main");
+
+  assert.equal(
+    resolveWindowsHelperPath({ moduleDir, resourcesPath }),
+    path.join(
+      resourcesPath,
+      "app.asar.unpacked",
+      "src",
+      "jarvis",
+      "main",
+      "directory-lease-helper.ps1"
+    )
+  );
+});
+
+test("Windows packaging unpacks the lease helper used by the resolved path", () => {
+  const builderConfig = JSON.parse(
+    require("node:fs").readFileSync(path.join(appRoot, "electron-builder.json"), "utf8")
+  );
+
+  assert.ok(builderConfig.asarUnpack.includes("src/jarvis/main/directory-lease-helper.ps1"));
+});
 
 async function waitForHelperCount(expected, parentProcessId = null) {
   const deadline = Date.now() + 5_000;

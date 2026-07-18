@@ -2,7 +2,30 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 
-const WINDOWS_HELPER_PATH = path.join(__dirname, "directory-lease-helper.ps1");
+const WINDOWS_HELPER_RELATIVE_PATH = path.join(
+  "src",
+  "jarvis",
+  "main",
+  "directory-lease-helper.ps1"
+);
+
+function resolveWindowsHelperPath({
+  moduleDir = __dirname,
+  resourcesPath = process.resourcesPath,
+} = {}) {
+  const asarMarker = `${path.sep}app.asar${path.sep}`;
+  const resolvedModuleDir = path.resolve(moduleDir);
+  if (
+    resolvedModuleDir.includes(asarMarker) &&
+    typeof resourcesPath === "string" &&
+    path.isAbsolute(resourcesPath)
+  ) {
+    return path.join(resourcesPath, "app.asar.unpacked", WINDOWS_HELPER_RELATIVE_PATH);
+  }
+  return path.join(resolvedModuleDir, "directory-lease-helper.ps1");
+}
+
+const WINDOWS_HELPER_PATH = resolveWindowsHelperPath();
 const DATA_ROOT_IN_USE_CODE = "JARVIS_DATA_ROOT_IN_USE";
 
 function dataRootInUseError() {
@@ -314,4 +337,9 @@ class DirectoryLeaseProvider {
   }
 }
 
-module.exports = { DATA_ROOT_IN_USE_CODE, DirectoryLeaseProvider, WINDOWS_HELPER_PATH };
+module.exports = {
+  DATA_ROOT_IN_USE_CODE,
+  DirectoryLeaseProvider,
+  WINDOWS_HELPER_PATH,
+  resolveWindowsHelperPath,
+};
