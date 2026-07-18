@@ -5,6 +5,7 @@ import { Button } from "../../components/ui/button";
 import { getSettings } from "../../stores/settingsStore";
 import type { UseJarvisRecordingResult } from "./useJarvisRecording";
 import FirstUseConsentDialog from "./FirstUseConsentDialog";
+import InputLevelWave from "./InputLevelWave";
 import JarvisMicrophoneSelector from "./JarvisMicrophoneSelector";
 import JarvisCaptureModeSelector from "./JarvisCaptureModeSelector";
 import { useJarvisStore } from "./jarvisStore";
@@ -134,7 +135,6 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
   }, [isRecording]);
 
   const elapsed = useMemo(() => formatDuration(activeElapsedMs(recording, now)), [now, recording]);
-  const micPercent = Math.round(Math.max(0, Math.min(1, recording.micLevel)) * 100);
   const statusLabel = isRecordingWithoutActiveSource
     ? t(
         hasRecoveringCaptureSource
@@ -244,23 +244,11 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
 
           <div className="flex items-center gap-3">
             {!isSystemOnly && (
-              <div
-                role="meter"
-                aria-label={t("jarvis.micLevel")}
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={micPercent}
-                className="w-24"
-              >
-                <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div
-                    className={`h-full rounded-full transition-[width] duration-100 ${
-                      isActivelyListening ? "bg-red-500" : "bg-primary"
-                    }`}
-                    style={{ width: `${micPercent}%` }}
-                  />
-                </div>
-              </div>
+              <InputLevelWave
+                level={recording.micLevel}
+                label={t("jarvis.micLevel")}
+                active={isActivelyListening}
+              />
             )}
             <time className="w-14 text-right font-mono text-sm tabular-nums text-foreground">
               {elapsed}

@@ -268,6 +268,13 @@
       "downloading_model": "正在下载语音模型…",
       "checking_microphone": "正在检查麦克风…",
       "starting_audio": "正在启动音频采集…"
+    },
+    "settingsDrawer": {
+      "title": "助手设置",
+      "description": "集中管理云端预算、转写质量和声纹档案。",
+      "open": "打开助手设置",
+      "close": "关闭助手设置",
+      "dismiss": "收起助手设置"
     }
   },
   "settings": {

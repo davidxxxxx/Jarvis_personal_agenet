@@ -268,6 +268,13 @@
       "downloading_model": "Downloading speech model…",
       "checking_microphone": "Checking microphone…",
       "starting_audio": "Starting audio capture…"
+    },
+    "settingsDrawer": {
+      "title": "Assistant settings",
+      "description": "Cloud budget, transcription quality, and voice profile.",
+      "open": "Open assistant settings",
+      "close": "Close assistant settings",
+      "dismiss": "Dismiss assistant settings"
     }
   },
   "settings": {
