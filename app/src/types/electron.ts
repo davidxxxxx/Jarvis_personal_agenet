@@ -1937,6 +1937,9 @@ declare global {
           inputGeneration: string;
         }) => void
       ) => () => void;
+      onMeetingTranscriptionAudioLevel?: (
+        callback: (payload: { source: "system"; level: number; inputGeneration: string }) => void
+      ) => () => void;
 
       // Speaker diarization
       downloadDiarizationModels?: () => Promise<{ success: boolean; error?: string }>;

@@ -987,6 +987,28 @@ test("IPCHandlers persists each exact source buffer once before AEC consumers", 
   assert.notEqual(calls[3][2], mic);
 });
 
+test("IPCHandlers publishes the level of persisted computer audio to its renderer owner", async (t) => {
+  const fixture = createFixture();
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const system = createPcm16(2_400, () => 16_384);
+
+  const result = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-system-level" }
+  );
+  send({ sender: fixture.sender }, system, "system", result.inputGeneration);
+
+  const levelEvents = fixture.sent.filter(
+    ([channel]) => channel === "meeting-transcription-audio-level"
+  );
+  assert.equal(levelEvents.length, 1);
+  assert.equal(levelEvents[0][1].source, "system");
+  assert.equal(levelEvents[0][1].inputGeneration, result.inputGeneration);
+  assert.ok(Math.abs(levelEvents[0][1].level - 0.5) < 0.001);
+});
+
 test("renderer ingress ignores foreign, missing, and stale generations without rejection", async (t) => {
   let appendCalls = 0;
   const foreignSent = [];

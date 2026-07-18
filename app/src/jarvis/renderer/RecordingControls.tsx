@@ -153,6 +153,21 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           ? t(`jarvis.preparation.${recording.preparationStage}`)
           : t(`jarvis.status.${session.status}`);
   const computerAudioLabel = t("jarvis.capture.sources.system");
+  const microphoneLabel = t("jarvis.capture.sources.mic");
+  const monitoredLevel =
+    captureMode === "mic"
+      ? recording.micLevel
+      : captureMode === "system"
+        ? recording.systemLevel
+        : Math.max(recording.micLevel, recording.systemLevel);
+  const monitoredSourceLabel =
+    captureMode === "mic"
+      ? microphoneLabel
+      : captureMode === "system"
+        ? computerAudioLabel
+        : recording.systemLevel > recording.micLevel
+          ? computerAudioLabel
+          : microphoneLabel;
   const recordingErrorKey =
     recording.error === "capture_source_unavailable"
       ? `jarvis.capture.unavailable.${captureMode}`
@@ -295,18 +310,17 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             </Button>
           )}
         </div>
-        {!isSystemOnly && (
-          <div className="mt-4">
-            <InputLevelWave
-              level={recording.micLevel}
-              label={t("jarvis.micLevel")}
-              active={isActivelyListening}
-              idleLabel={t("jarvis.micLevelState.idle")}
-              quietLabel={t("jarvis.micLevelState.quiet")}
-              audibleLabel={t("jarvis.micLevelState.audible")}
-            />
-          </div>
-        )}
+        <div className="mt-4">
+          <InputLevelWave
+            level={monitoredLevel}
+            label={t("jarvis.audioLevel")}
+            active={isActivelyListening}
+            idleLabel={t("jarvis.micLevelState.idle")}
+            quietLabel={t("jarvis.micLevelState.quiet")}
+            audibleLabel={t("jarvis.micLevelState.audible")}
+            sourceLabel={monitoredSourceLabel}
+          />
+        </div>
         {(recording.error || actionError) && (
           <p role="alert" className="mt-3 text-xs text-destructive">
             {t(actionError ? "jarvis.operationError" : recordingErrorKey)}

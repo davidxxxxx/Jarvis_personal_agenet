@@ -18,6 +18,7 @@ const idleRecording = {
   segments: [],
   partialText: "",
   micLevel: 0,
+  systemLevel: 0,
   error: null,
   operation: null,
   start,
@@ -126,7 +127,7 @@ describe("first-use recording consent", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("操作失败，请重试");
   });
 
-  it("reports microphone level semantics and refreshes its label on device change", async () => {
+  it("reports audio level semantics and refreshes its microphone label on device change", async () => {
     const mediaDevices = new EventTarget() as EventTarget & {
       enumerateDevices: ReturnType<typeof vi.fn>;
     };
@@ -137,10 +138,10 @@ describe("first-use recording consent", () => {
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: mediaDevices });
     render(<RecordingControls recording={{ ...idleRecording, operation: null, micLevel: 0.42 }} />);
 
-    const meter = screen.getByRole("meter", { name: "麦克风电平" });
+    const meter = screen.getByRole("meter", { name: "音频电平" });
     expect(meter).toHaveAttribute("aria-valuemin", "0");
     expect(meter).toHaveAttribute("aria-valuemax", "100");
-    expect(meter).toHaveAttribute("aria-valuenow", "42");
+    expect(meter).toHaveAttribute("aria-valuenow", "0");
 
     mediaDevices.dispatchEvent(new Event("devicechange"));
     expect(await screen.findByText("会议麦克风")).toBeInTheDocument();

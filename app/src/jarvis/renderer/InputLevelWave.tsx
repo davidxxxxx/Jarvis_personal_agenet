@@ -5,9 +5,11 @@ interface InputLevelWaveProps {
   idleLabel: string;
   quietLabel: string;
   audibleLabel: string;
+  sourceLabel?: string;
 }
 
-const AUDIBLE_THRESHOLD = 0.015;
+const AUDIBLE_FLOOR_DB = -62;
+const VISUAL_CEILING_DB = -12;
 const BAR_COUNT = 40;
 const WAVE_SHAPE = Array.from({ length: BAR_COUNT }, (_, index) => {
   const variation = Math.abs(Math.sin(index * 0.73) * Math.cos(index * 0.21));
@@ -21,15 +23,23 @@ export default function InputLevelWave({
   idleLabel,
   quietLabel,
   audibleLabel,
+  sourceLabel,
 }: InputLevelWaveProps) {
   const normalized = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
-  const percent = Math.round(normalized * 100);
-  const isAudible = active && normalized >= AUDIBLE_THRESHOLD;
+  const decibels = normalized > 0 ? 20 * Math.log10(normalized) : Number.NEGATIVE_INFINITY;
+  const isAudible = active && decibels >= AUDIBLE_FLOOR_DB;
   const state = !active ? "idle" : isAudible ? "audible" : "quiet";
   const stateLabel = state === "idle" ? idleLabel : isAudible ? audibleLabel : quietLabel;
-  // Speech RMS is commonly around 0.05–0.1. A square-root curve makes that
-  // range visually useful without changing or reprocessing the audio itself.
-  const visualLevel = isAudible ? Math.min(1, Math.sqrt(normalized) * 2.2) : 0;
+  // Map the useful speech/noise range to the whole player meter. This changes
+  // only the display: the captured PCM remains untouched.
+  const visualLevel = isAudible
+    ? Math.max(
+        0,
+        Math.min(1, (decibels - AUDIBLE_FLOOR_DB) / (VISUAL_CEILING_DB - AUDIBLE_FLOOR_DB))
+      )
+    : 0;
+  const percent = isAudible ? Math.max(1, Math.round(visualLevel * 100)) : 0;
+  const ariaValueText = [stateLabel, sourceLabel, `${percent}%`].filter(Boolean).join(", ");
 
   return (
     <div
@@ -38,7 +48,7 @@ export default function InputLevelWave({
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={percent}
-      aria-valuetext={`${stateLabel}, ${percent}%`}
+      aria-valuetext={ariaValueText}
       data-audio-state={state}
       className={`w-full rounded-xl border px-4 py-3 transition-[border-color,background-color,box-shadow] duration-150 ${
         isAudible
@@ -58,7 +68,10 @@ export default function InputLevelWave({
                   : "bg-muted-foreground/25"
             }`}
           />
-          {stateLabel}
+          <span>{stateLabel}</span>
+          {sourceLabel && (
+            <span className="font-normal text-muted-foreground">· {sourceLabel}</span>
+          )}
         </span>
         <span className="font-mono tabular-nums text-muted-foreground">{percent}%</span>
       </div>

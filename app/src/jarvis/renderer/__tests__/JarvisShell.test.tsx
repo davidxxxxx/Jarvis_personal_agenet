@@ -31,6 +31,7 @@ vi.mock("../useJarvisRecording", () => ({
     ],
     partialText: "",
     micLevel: 0.4,
+    systemLevel: 0,
     error: null,
     operation: null,
     start: vi.fn(),

@@ -1383,6 +1383,7 @@ export interface UseJarvisRecordingResult {
   segments: TranscriptSegment[];
   partialText: string;
   micLevel: number;
+  systemLevel: number;
   activeMicLabel?: string | null;
   micFallbackActive?: boolean;
   micRecoveryStatus?: "idle" | "reconnecting" | "restored";
@@ -1406,6 +1407,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micPartial = useMeetingRecordingStore((state) => state.micPartial);
   const systemPartial = useMeetingRecordingStore((state) => state.systemPartial);
   const micLevel = useMeetingRecordingStore((state) => state.currentMicLevel);
+  const systemLevel = useMeetingRecordingStore((state) => state.currentSystemLevel);
   const activeMicLabel = useMeetingRecordingStore((state) => state.activeMicLabel);
   const micFallbackActive = useMeetingRecordingStore((state) => state.micFallbackActive);
   const micRecoveryStatus = useMeetingRecordingStore((state) => state.micRecoveryStatus);
@@ -1675,6 +1677,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     segments,
     partialText: [micPartial, systemPartial].filter(Boolean).join(" "),
     micLevel,
+    systemLevel,
     activeMicLabel,
     micFallbackActive,
     micRecoveryStatus,

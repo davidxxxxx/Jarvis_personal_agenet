@@ -264,3 +264,28 @@ test("preload exposes generation-bound meeting source state events", () => {
   unsubscribe();
   assert.equal(listeners.has("meeting-transcription-source-state"), false);
 });
+
+test("preload exposes generation-bound computer-audio level metadata", () => {
+  const { rootApi, listeners } = loadPreloadApi();
+  const levels = [];
+
+  const unsubscribe = rootApi.onMeetingTranscriptionAudioLevel((payload) => levels.push(payload));
+  listeners.get("meeting-transcription-audio-level")(
+    {},
+    {
+      source: "system",
+      level: 0.125,
+      inputGeneration: "input-generation-3",
+    }
+  );
+
+  assert.deepEqual(levels, [
+    {
+      source: "system",
+      level: 0.125,
+      inputGeneration: "input-generation-3",
+    },
+  ]);
+  unsubscribe();
+  assert.equal(listeners.has("meeting-transcription-audio-level"), false);
+});

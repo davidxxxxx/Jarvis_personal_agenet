@@ -88,6 +88,21 @@ const MEETING_STREAM_SAMPLE_RATE = 24000;
 const MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES = 512 * 1024;
 const JARVIS_MIDNIGHT_REBIND_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT = 1_024;
+const MEETING_AUDIO_LEVEL_PUBLISH_INTERVAL_MS = 80;
+
+function calculatePcm16Rms(pcmBuffer) {
+  if (!Buffer.isBuffer(pcmBuffer) || pcmBuffer.byteLength < 2) return 0;
+  const sampleCount = Math.floor(pcmBuffer.byteLength / 2);
+  const sampleStride = Math.max(1, Math.floor(sampleCount / 1_024));
+  let sumSquares = 0;
+  let sampled = 0;
+  for (let sample = 0; sample < sampleCount; sample += sampleStride) {
+    const normalized = pcmBuffer.readInt16LE(sample * 2) / 32_768;
+    sumSquares += normalized * normalized;
+    sampled += 1;
+  }
+  return sampled > 0 ? Math.min(1, Math.sqrt(sumSquares / sampled)) : 0;
+}
 
 function createJarvisTranscribeWavAdapter({
   whisperManager,
@@ -6163,6 +6178,7 @@ class IPCHandlers {
         currentManagedSystemProducer: null,
         ownerDestroyedListener: null,
         teardownPromise: null,
+        lastSystemAudioLevelPublishedAt: 0,
         startSettledPromise: new Promise((resolve) => {
           resolveStartSettled = resolve;
         }),
@@ -6381,6 +6397,30 @@ class IPCHandlers {
       meetingDiarizationStream.write(buffer);
     };
 
+    const publishMeetingSystemAudioLevel = (inputBinding, buffer) => {
+      if (
+        !inputBinding ||
+        inputBinding !== activeMeetingInputBinding ||
+        inputBinding.active !== true ||
+        inputBinding.owner?.isDestroyed?.()
+      ) {
+        return;
+      }
+      const now = Date.now();
+      if (
+        now - inputBinding.lastSystemAudioLevelPublishedAt <
+        MEETING_AUDIO_LEVEL_PUBLISH_INTERVAL_MS
+      ) {
+        return;
+      }
+      inputBinding.lastSystemAudioLevelPublishedAt = now;
+      inputBinding.owner.send("meeting-transcription-audio-level", {
+        source: "system",
+        level: calculatePcm16Rms(buffer),
+        inputGeneration: inputBinding.inputGeneration,
+      });
+    };
+
     const sendMeetingAudio = (audioBuffer, source) => {
       const outboundBuffer = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
 
@@ -6428,6 +6468,7 @@ class IPCHandlers {
 
           if (persistedSource === "system") {
             const receivedAt = Date.now();
+            publishMeetingSystemAudioLevel(inputBinding, derivedBuffer);
             meetingEchoLeakDetector.recordSystemChunk(derivedBuffer, receivedAt);
             if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(derivedBuffer)) {
               meetingAecEnabled = false;

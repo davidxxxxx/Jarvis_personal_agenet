@@ -159,6 +159,9 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       }) => void)
     | null;
   let sourceStateListeners: Array<NonNullable<typeof sourceStateListener>>;
+  let audioLevelListener:
+    ((payload: { source: "system"; level: number; inputGeneration: string }) => void) | null;
+  let audioLevelListeners: Array<NonNullable<typeof audioLevelListener>>;
 
   beforeEach(() => {
     audioContexts.length = 0;
@@ -172,6 +175,8 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     inputRejectedListeners = [];
     sourceStateListener = null;
     sourceStateListeners = [];
+    audioLevelListener = null;
+    audioLevelListeners = [];
     vi.stubGlobal("AudioContext", FakeAudioContext);
     vi.stubGlobal("AudioWorkletNode", FakeAudioWorkletNode);
     Object.defineProperty(URL, "createObjectURL", {
@@ -234,6 +239,13 @@ describe("Jarvis shutdown final meeting segment integration", () => {
         sourceStateListeners.push(callback);
         return () => {
           sourceStateListener = null;
+        };
+      }),
+      onMeetingTranscriptionAudioLevel: vi.fn((callback) => {
+        audioLevelListener = callback;
+        audioLevelListeners.push(callback);
+        return () => {
+          audioLevelListener = null;
         };
       }),
       meetingTranscriptionStop: vi.fn(async () => ({ success: true })),
@@ -589,6 +601,45 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       error: "System audio capture stopped.",
       captureSourceStates: { mic: "recording", system: "unavailable" },
     });
+  });
+
+  it("tracks only the current recording generation's computer-audio level", async () => {
+    window.electronAPI.checkSystemAudioAccess = vi.fn(async () => ({
+      granted: true,
+      status: "granted" as const,
+      mode: "native" as const,
+      strategy: "wasapi-loopback" as const,
+    }));
+    vi.mocked(window.electronAPI.meetingTranscriptionStart!).mockResolvedValueOnce({
+      success: true,
+      systemAudioMode: "native",
+      systemAudioStrategy: "wasapi-loopback",
+      inputGeneration: "input-generation-system-level",
+    });
+
+    await startRecording({
+      noteId: null,
+      noteTitle: "Native system level",
+      folderId: null,
+      captureSystemAudio: true,
+      captureMicrophone: false,
+      requireAllSources: false,
+      jarvisSessionId: "s-native-system-level",
+    });
+
+    audioLevelListener?.({
+      source: "system",
+      level: 0.25,
+      inputGeneration: "stale-input-generation",
+    });
+    expect(useMeetingRecordingStore.getState().currentSystemLevel).toBe(0);
+
+    audioLevelListener?.({
+      source: "system",
+      level: 0.25,
+      inputGeneration: "input-generation-system-level",
+    });
+    expect(useMeetingRecordingStore.getState().currentSystemLevel).toBe(0.25);
   });
 
   it("retains a current native system failure emitted before start IPC settles", async () => {

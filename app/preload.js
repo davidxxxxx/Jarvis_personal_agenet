@@ -918,6 +918,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     "meeting-transcription-source-state",
     (callback) => (_event, data) => callback(data)
   ),
+  onMeetingTranscriptionAudioLevel: registerListener(
+    "meeting-transcription-audio-level",
+    (callback) => (_event, data) => callback(data)
+  ),
 
   // Dictation realtime streaming
   dictationRealtimeWarmup: (options) => ipcRenderer.invoke("dictation-realtime-warmup", options),

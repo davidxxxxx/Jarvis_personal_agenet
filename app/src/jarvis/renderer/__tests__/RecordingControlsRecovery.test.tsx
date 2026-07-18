@@ -20,6 +20,7 @@ function fakeRecording(
     segments: [],
     partialText: "",
     micLevel: 0,
+    systemLevel: 0,
     activeMicLabel: "Microphone (5- Shure MV7)",
     micFallbackActive: false,
     preparationStage: null,
@@ -287,7 +288,7 @@ describe("RecordingControls microphone recovery", () => {
     expect(screen.getByRole("radio", { name: "麦克风和电脑声音" })).toBeDisabled();
   });
 
-  it("uses computer-audio visuals without a microphone identity or meter in system-only mode", () => {
+  it("uses computer-audio visuals and its recorded level in system-only mode", () => {
     useJarvisStore.setState({
       captureMode: "system",
       sourceStates: { mic: "idle", system: "recording" },
@@ -298,6 +299,7 @@ describe("RecordingControls microphone recovery", () => {
         recording={fakeRecording({
           activeMicLabel: "Private microphone name",
           micLevel: 0.75,
+          systemLevel: 0.08,
         })}
       />
     );
@@ -305,7 +307,29 @@ describe("RecordingControls microphone recovery", () => {
     expect(screen.getByRole("img", { name: "电脑声音" })).toBeInTheDocument();
     expect(screen.getByText("电脑声音", { selector: "p" })).toBeInTheDocument();
     expect(screen.queryByText("Private microphone name")).not.toBeInTheDocument();
-    expect(screen.queryByRole("meter")).not.toBeInTheDocument();
+    const meter = screen.getByRole("meter", { name: "音频电平" });
+    expect(meter).toHaveAttribute("data-audio-state", "audible");
+    expect(screen.getByText("· 电脑声音")).toBeInTheDocument();
+  });
+
+  it("shows computer audio when it is the active signal in dual-source mode", () => {
+    useJarvisStore.setState({
+      captureMode: "dual",
+      sourceStates: { mic: "recording", system: "recording" },
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          micLevel: 0,
+          systemLevel: 0.05,
+        })}
+      />
+    );
+
+    const meter = screen.getByRole("meter", { name: "音频电平" });
+    expect(meter).toHaveAttribute("data-audio-state", "audible");
+    expect(screen.getByText("· 电脑声音")).toBeInTheDocument();
   });
 
   it("does not let runtime source loss change an active session capture mode", () => {

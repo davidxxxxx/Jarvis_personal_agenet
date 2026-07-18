@@ -106,6 +106,7 @@ interface MeetingRecordingState {
   userTouchedStepper: boolean;
   error: string | null;
   currentMicLevel: number;
+  currentSystemLevel: number;
   activeMicLabel: string | null;
   micFallbackActive: boolean;
   micRecoveryStatus: "idle" | "reconnecting" | "restored";
@@ -516,6 +517,7 @@ let preparePromise: Promise<void> | null = null;
 let prepareMicOnly: boolean | null = null;
 let prepareGeneration = 0;
 let ipcCleanups: Array<() => void> = [];
+let systemAudioLevelDecayTimer: ReturnType<typeof setTimeout> | null = null;
 let speakerIdentifications: SpeakerIdentification[] = [];
 let nextPlaceholderSpeakerIndex = 0;
 let systemPartialSpeakerIdValue: string | null = null;
@@ -548,6 +550,7 @@ export const useMeetingRecordingStore = create<MeetingRecordingState>()(() => ({
   userTouchedStepper: false,
   error: null,
   currentMicLevel: 0,
+  currentSystemLevel: 0,
   activeMicLabel: null,
   micFallbackActive: false,
   micRecoveryStatus: "idle",
@@ -801,6 +804,11 @@ async function cleanupCaptureSources(options: CaptureCleanupOptions = {}): Promi
   captureAttemptGeneration += 1;
   activeMeetingInputGeneration = null;
   activeJarvisSessionBinding = null;
+  if (systemAudioLevelDecayTimer) {
+    clearTimeout(systemAudioLevelDecayTimer);
+    systemAudioLevelDecayTimer = null;
+  }
+  useMeetingRecordingStore.setState({ currentSystemLevel: 0 });
   if (preparePromise) {
     prepareGeneration += 1;
     preparePromise = null;
@@ -1158,6 +1166,8 @@ export async function startRecording(
     systemPartialSpeakerName: null,
     diarizationSessionId: null,
     error: null,
+    currentMicLevel: 0,
+    currentSystemLevel: 0,
     activeMicLabel: null,
     micFallbackActive: false,
     micRecoveryStatus: "idle",
@@ -1236,6 +1246,7 @@ export async function startRecording(
     mainManagedSystemUnavailable = true;
     useMeetingRecordingStore.setState({
       error: "System audio capture stopped.",
+      currentSystemLevel: 0,
       captureSourceStates: {
         ...currentState.captureSourceStates,
         system: "unavailable",
@@ -1520,6 +1531,11 @@ export async function startRecording(
     activeMeetingInputGeneration = inputGeneration;
     activeJarvisSessionBinding = jarvisSessionBinding;
     acceptedSourceStateGeneration = inputGeneration;
+    const isCurrentInput = () =>
+      isCurrentCaptureAttempt() &&
+      isRecordingFlag &&
+      !meetingInputRejected &&
+      activeMeetingInputGeneration === inputGeneration;
 
     const systemAudioMode = startResult.systemAudioMode || initialSystemAudioAccess.mode;
     const systemAudioStrategy = startResult.systemAudioStrategy || initialSystemAudioStrategy;
@@ -1780,6 +1796,33 @@ export async function startRecording(
     );
     if (inputRejectedCleanup) ipcCleanups.push(inputRejectedCleanup);
 
+    const audioLevelCleanup = window.electronAPI?.onMeetingTranscriptionAudioLevel?.(
+      ({ source, level, inputGeneration: levelGeneration }) => {
+        if (
+          source !== "system" ||
+          levelGeneration !== inputGeneration ||
+          activeMeetingInputGeneration !== inputGeneration ||
+          !isCurrentInput()
+        ) {
+          return;
+        }
+        const normalizedLevel = Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 0;
+        useMeetingRecordingStore.setState({ currentSystemLevel: normalizedLevel });
+        if (systemAudioLevelDecayTimer) clearTimeout(systemAudioLevelDecayTimer);
+        systemAudioLevelDecayTimer = setTimeout(() => {
+          systemAudioLevelDecayTimer = null;
+          if (
+            activeMeetingInputGeneration === inputGeneration &&
+            isCurrentInput() &&
+            useMeetingRecordingStore.getState().currentSystemLevel !== 0
+          ) {
+            useMeetingRecordingStore.setState({ currentSystemLevel: 0 });
+          }
+        }, 600);
+      }
+    );
+    if (audioLevelCleanup) ipcCleanups.push(audioLevelCleanup);
+
     if (startResult.oneOnOneAttendee) {
       const synthetic: SpeakerIdentification = {
         speakerId: "speaker_0",
@@ -1863,11 +1906,6 @@ export async function startRecording(
     let resolveRendererSystemPersistenceDelay: (() => void) | null = null;
     let rendererSystemPersistencePromise: Promise<boolean> | null = null;
     let beginRendererSystemRecovery: () => void = () => {};
-    const isCurrentInput = () =>
-      isCurrentCaptureAttempt() &&
-      isRecordingFlag &&
-      !meetingInputRejected &&
-      activeMeetingInputGeneration === inputGeneration;
     const notifySourceInterrupted = async (
       sourceType: "mic" | "system",
       reason: string,
@@ -3017,6 +3055,7 @@ function resetStoppedMeetingState(): void {
     systemPartialSpeakerId: null,
     systemPartialSpeakerName: null,
     currentMicLevel: 0,
+    currentSystemLevel: 0,
     activeMicLabel: null,
     micFallbackActive: false,
     micRecoveryStatus: "idle",
