@@ -109,6 +109,11 @@
     "localOnly": "仅本地处理",
     "defaultMicrophone": "系统默认麦克风",
     "micLevel": "麦克风电平",
+    "micLevelState": {
+      "idle": "等待开始录音",
+      "quiet": "当前没有声音",
+      "audible": "检测到声音"
+    },
     "micReconnecting": "麦克风已断开，正在重连（第 {{count}} 次）…",
     "micRestored": "麦克风已恢复：{{device}}",
     "micFallback": "首选麦克风已断开，正在使用 {{device}} 继续录音。",

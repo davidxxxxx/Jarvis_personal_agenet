@@ -109,6 +109,11 @@
     "localOnly": "Local only",
     "defaultMicrophone": "System default microphone",
     "micLevel": "Microphone level",
+    "micLevelState": {
+      "idle": "Waiting to record",
+      "quiet": "No sound detected",
+      "audible": "Sound detected"
+    },
     "micReconnecting": "Microphone disconnected. Reconnecting (attempt {{count}})…",
     "micRestored": "Microphone restored: {{device}}",
     "micFallback": "Preferred microphone disconnected. Continuing with {{device}}.",

@@ -243,13 +243,6 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           </div>
 
           <div className="flex items-center gap-3">
-            {!isSystemOnly && (
-              <InputLevelWave
-                level={recording.micLevel}
-                label={t("jarvis.micLevel")}
-                active={isActivelyListening}
-              />
-            )}
             <time className="w-14 text-right font-mono text-sm tabular-nums text-foreground">
               {elapsed}
             </time>
@@ -302,6 +295,18 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             </Button>
           )}
         </div>
+        {!isSystemOnly && (
+          <div className="mt-4">
+            <InputLevelWave
+              level={recording.micLevel}
+              label={t("jarvis.micLevel")}
+              active={isActivelyListening}
+              idleLabel={t("jarvis.micLevelState.idle")}
+              quietLabel={t("jarvis.micLevelState.quiet")}
+              audibleLabel={t("jarvis.micLevelState.audible")}
+            />
+          </div>
+        )}
         {(recording.error || actionError) && (
           <p role="alert" className="mt-3 text-xs text-destructive">
             {t(actionError ? "jarvis.operationError" : recordingErrorKey)}
