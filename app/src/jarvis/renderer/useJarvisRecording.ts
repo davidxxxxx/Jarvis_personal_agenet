@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CaptureSourcesUnavailableError,
   lockSpeaker,
@@ -100,6 +100,12 @@ export interface RecordingMeetingSnapshot {
   error: string | null;
 }
 
+export type JarvisPreparationStage =
+  | "checking_model"
+  | "downloading_model"
+  | "checking_microphone"
+  | "starting_audio";
+
 export interface LatestRefresh<T> {
   run: (load: () => Promise<T>) => Promise<void>;
   invalidate: () => void;
@@ -128,7 +134,9 @@ export function createLatestRefresh<T>(
 
 export interface RecordingDependencies {
   jarvis: RecordingJarvisApi;
-  ensureTranscriptionReady: () => Promise<void>;
+  ensureTranscriptionReady: (
+    reportStage?: (stage: JarvisPreparationStage) => void
+  ) => Promise<void>;
   startRecording: (args: StartRecordingArgs) => Promise<JarvisPowerResumeRestorations | void>;
   stopRecording: (options?: StopRecordingOptions) => Promise<StopRecordingResult>;
   rebindUpstreamSession: (previousSessionId: string, nextSessionId: string) => void;
@@ -147,6 +155,8 @@ export interface RecordingDependencies {
   hasRecordingConsent: () => boolean;
   onOperationChange: (operation: JarvisControlAction | null) => void;
   onError: (code: string | null) => void;
+  onPreparationStage?: (stage: JarvisPreparationStage | null) => void;
+  preparationTimeoutMs?: number;
 }
 
 export interface RecordingController {
@@ -197,6 +207,35 @@ class RecordingActivationCancelledError extends Error {
     super("capture activation was cancelled");
     this.name = "RecordingActivationCancelledError";
   }
+}
+
+function withPreparationTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  code = "capture_start_timeout"
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new RecordingOperationError(code, "audio capture did not start in time"));
+    }, Math.max(1, timeoutMs));
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 function safeTimestamp(value: number | undefined, fallback: number): number {
@@ -256,6 +295,7 @@ function captureFailureCode(code: string): JarvisCaptureFailureCode {
     case "MIC_DISCONNECTED":
     case "capture_source_unavailable":
     case "capture_start_failed":
+    case "capture_start_timeout":
     case "upstream_start_failed":
     case "capture_activation_cancelled":
       return code;
@@ -615,8 +655,10 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     sessionCaptureMode = captureMode;
 
     try {
-      await deps.ensureTranscriptionReady();
+      deps.onPreparationStage?.("checking_model");
+      await deps.ensureTranscriptionReady((stage) => deps.onPreparationStage?.(stage));
       activation.assertCurrent();
+      deps.onPreparationStage?.("checking_microphone");
       const micDeviceId = captureMode === "system" ? null : deps.getMicDeviceId();
       await deps.jarvis.createSession({
         id,
@@ -638,7 +680,11 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       });
       captureStarted = true;
       activation.assertCurrent();
-      await deps.startRecording(recordingArgs(id, captureMode));
+      deps.onPreparationStage?.("starting_audio");
+      await withPreparationTimeout(
+        deps.startRecording(recordingArgs(id, captureMode)),
+        deps.preparationTimeoutMs ?? 20_000
+      );
       activation.assertCurrent();
       const meetingSnapshot = deps.getMeetingSnapshot();
       if (!meetingSnapshot.isRecording) {
@@ -703,6 +749,7 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
       failCurrentSession(code);
       throw error;
     } finally {
+      deps.onPreparationStage?.(null);
       end();
       activation.settle();
     }
@@ -1340,6 +1387,7 @@ export interface UseJarvisRecordingResult {
   micFallbackActive?: boolean;
   micRecoveryStatus?: "idle" | "reconnecting" | "restored";
   micRecoveryAttempt?: number;
+  preparationStage?: JarvisPreparationStage | null;
   operation: JarvisControlAction | null;
   error: string | null;
   start: () => Promise<void>;
@@ -1362,6 +1410,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micFallbackActive = useMeetingRecordingStore((state) => state.micFallbackActive);
   const micRecoveryStatus = useMeetingRecordingStore((state) => state.micRecoveryStatus);
   const micRecoveryAttempt = useMeetingRecordingStore((state) => state.micRecoveryAttempt);
+  const [preparationStage, setPreparationStage] = useState<JarvisPreparationStage | null>(null);
   const captureSourceStates = useMeetingRecordingStore((state) => state.captureSourceStates);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
@@ -1393,7 +1442,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   if (controllerRef.current === null) {
     controllerRef.current = createRecordingController({
       jarvis: rendererJarvisApi,
-      ensureTranscriptionReady: async () => {
+      ensureTranscriptionReady: async (reportStage) => {
         const settings = getSettings();
         const model = resolveJarvisWhisperModel(settings);
         const status = await window.electronAPI.checkModelStatus(model);
@@ -1405,6 +1454,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
         }
         if (status.downloaded) return;
 
+        reportStage?.("downloading_model");
         const downloaded = await window.electronAPI.downloadWhisperModel(model);
         if (!downloaded.success || !downloaded.downloaded) {
           throw new RecordingOperationError(
@@ -1434,6 +1484,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       hasRecordingConsent,
       onOperationChange: (operation) => useJarvisStore.getState().setOperation(operation),
       onError: (code) => useJarvisStore.getState().setError(code),
+      onPreparationStage: setPreparationStage,
     });
   }
 
@@ -1628,6 +1679,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     micFallbackActive,
     micRecoveryStatus,
     micRecoveryAttempt,
+    preparationStage,
     operation,
     error: upstreamError ?? controllerError,
     start,

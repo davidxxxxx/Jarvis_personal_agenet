@@ -262,6 +262,12 @@
       "finalizing": "正在结束…",
       "completed": "已结束",
       "failed": "录音已停止"
+    },
+    "preparation": {
+      "checking_model": "正在检查语音模型…",
+      "downloading_model": "正在下载语音模型…",
+      "checking_microphone": "正在检查麦克风…",
+      "starting_audio": "正在启动音频采集…"
     }
   },
   "settings": {

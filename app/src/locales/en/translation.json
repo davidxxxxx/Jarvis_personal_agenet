@@ -262,6 +262,12 @@
       "finalizing": "Finishing…",
       "completed": "Finished",
       "failed": "Recording stopped"
+    },
+    "preparation": {
+      "checking_model": "Checking speech model…",
+      "downloading_model": "Downloading speech model…",
+      "checking_microphone": "Checking microphone…",
+      "starting_audio": "Starting audio capture…"
     }
   },
   "settings": {

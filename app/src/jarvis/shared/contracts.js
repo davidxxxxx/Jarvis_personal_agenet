@@ -493,6 +493,7 @@ const CAPTURE_FAILURE_CODES = new Set([
   "MIC_DISCONNECTED",
   "capture_source_unavailable",
   "capture_start_failed",
+  "capture_start_timeout",
   "capture_pause_failed",
   "capture_finish_failed",
   "upstream_start_failed",

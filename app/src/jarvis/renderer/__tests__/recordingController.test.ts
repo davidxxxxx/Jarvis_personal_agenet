@@ -478,9 +478,15 @@ function createHarness({
     setPeople(await jarvis.listPeople());
   });
   const onOperationChange = vi.fn();
-  const ensureTranscriptionReady = vi.fn(async () => {
-    calls.push("transcription:ready");
+  const preparationStages: Array<string | null> = [];
+  const onPreparationStage = vi.fn((stage: string | null) => {
+    preparationStages.push(stage);
   });
+  const ensureTranscriptionReady = vi.fn<RecordingDependencies["ensureTranscriptionReady"]>(
+    async () => {
+      calls.push("transcription:ready");
+    }
+  );
 
   const deps: RecordingDependencies = {
     jarvis,
@@ -505,6 +511,7 @@ function createHarness({
     hasRecordingConsent: () => hasConsent,
     onError: vi.fn(),
     onOperationChange,
+    onPreparationStage,
   };
 
   return {
@@ -517,6 +524,8 @@ function createHarness({
     setSessions,
     createId,
     onOperationChange,
+    onPreparationStage,
+    preparationStages,
     ensureTranscriptionReady,
     getSession: () => session,
     setMeeting: (next: Partial<typeof meeting>) => {
@@ -530,6 +539,53 @@ afterEach(() => {
 });
 
 describe("Jarvis recording controller", () => {
+  it("reports concrete preparation stages and clears them after startup", async () => {
+    const harness = createHarness();
+    harness.ensureTranscriptionReady.mockImplementationOnce(async (reportStage) => {
+      reportStage?.("downloading_model");
+    });
+    const controller = createRecordingController(harness.deps);
+
+    await controller.start();
+
+    expect(harness.preparationStages).toEqual([
+      "checking_model",
+      "downloading_model",
+      "checking_microphone",
+      "starting_audio",
+      null,
+    ]);
+  });
+
+  it("bounds microphone activation and cleans up a late recorder start", async () => {
+    vi.useFakeTimers();
+    const harness = createHarness();
+    harness.deps.preparationTimeoutMs = 1_000;
+    harness.startRecording.mockImplementationOnce(() => {
+      harness.setMeeting({ isRecording: true });
+      return new Promise<void>(() => undefined);
+    });
+    const controller = createRecordingController(harness.deps);
+
+    const starting = controller.start();
+    const rejection = expect(starting).rejects.toMatchObject({ code: "capture_start_timeout" });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await rejection;
+    expect(harness.stopRecording).toHaveBeenCalledWith({ throwOnError: false });
+    expect(harness.jarvis.failCapture).toHaveBeenCalledWith(
+      "s1",
+      "capture_start_timeout",
+      1_000
+    );
+    expect(harness.getSession()).toMatchObject({
+      id: "s1",
+      status: "failed",
+      errorCode: "capture_start_timeout",
+    });
+    expect(harness.preparationStages.at(-1)).toBeNull();
+  });
+
   it("resumes with the enumerated microphone override and returns the actual recorder binding", async () => {
     const harness = createHarness({ status: "paused", captureMode: "mic" });
     const actual = {

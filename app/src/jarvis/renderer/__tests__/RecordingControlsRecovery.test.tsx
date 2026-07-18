@@ -22,6 +22,7 @@ function fakeRecording(
     micLevel: 0,
     activeMicLabel: "Microphone (5- Shure MV7)",
     micFallbackActive: false,
+    preparationStage: null,
     operation: null,
     error: null,
     start: vi.fn().mockResolvedValue(undefined),
@@ -63,6 +64,29 @@ describe("RecordingControls microphone recovery", () => {
       configurable: true,
       value: mediaDevices,
     });
+  });
+
+  it("shows the concrete startup stage instead of an indefinite generic status", async () => {
+    await i18n.changeLanguage("en");
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: "session-1",
+            status: "starting",
+            startedAt: 1_000,
+            activeSince: null,
+            accumulatedMs: 0,
+            errorCode: null,
+          },
+          operation: "start",
+          preparationStage: "checking_microphone",
+        })}
+      />
+    );
+
+    expect(screen.getByText("Checking microphone…")).toBeInTheDocument();
+    expect(screen.queryByText("Starting…")).not.toBeInTheDocument();
   });
 
   it("localizes system-only source status and unavailable recovery actions in English", async () => {
