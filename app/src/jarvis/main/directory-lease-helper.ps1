@@ -154,6 +154,19 @@ if ($mode -eq '--create') {
   if ($handle -eq [IntPtr]::new(-1)) {
     throw "CreateFileW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
   }
+} elseif ($mode -eq '--exclusive-file') {
+  $handle = [JarvisDirectoryLeaseNative]::CreateFileW(
+    $candidate,
+    [uint32]0x40000000,
+    [uint32]0,
+    [IntPtr]::Zero,
+    [uint32]4,
+    [uint32]0x00000080,
+    [IntPtr]::Zero
+  )
+  if ($handle -eq [IntPtr]::new(-1)) {
+    throw "CreateFileW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }
 } else {
   throw 'directory lease helper mode is invalid'
 }

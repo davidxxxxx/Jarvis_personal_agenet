@@ -314,6 +314,9 @@ const {
   adoptLegacyStorage,
   createProductionStorageComposition,
 } = require("./src/jarvis/main/JarvisStorageBootstrap");
+const {
+  acquireDataRootRuntimeLease,
+} = require("./src/jarvis/main/DataRootRuntimeLease");
 const StorageGovernor = require("./src/jarvis/main/StorageGovernor");
 const JarvisStorageManager = require("./src/jarvis/main/JarvisStorageManager");
 const CloudBudgetGuard = require("./src/jarvis/main/CloudBudgetGuard");
@@ -431,6 +434,7 @@ async function stopJarvisProcessingRuntime() {
 let gracefulShutdownCoordinator = null;
 let jarvisStorageManager = null;
 let jarvisDataRootConfig = null;
+let jarvisDataRootLease = null;
 let globeKeyAlertShown = false;
 let authBridgeServer = null;
 const WHISPER_WAKE_REWARM_DELAY_MS = 3000;
@@ -524,8 +528,9 @@ async function initializeCoreManagers() {
       : jarvisDataRootConfig.load();
   process.env.JARVIS_DATA_ROOT = configuredDataRoot;
   const recordingsRoot = path.join(configuredDataRoot, "recordings");
+  require("node:fs").mkdirSync(configuredDataRoot, { recursive: true });
+  jarvisDataRootLease = await acquireDataRootRuntimeLease({ dataRoot: configuredDataRoot });
   for (const directory of [
-    configuredDataRoot,
     recordingsRoot,
     path.join(configuredDataRoot, "components", "cuda"),
     path.join(configuredDataRoot, "models", "whisper-models"),
@@ -632,20 +637,35 @@ async function initializeCoreManagers() {
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
   const reconfigureStorageHolders = async (root) => {
+    const currentLeaseRoot = jarvisDataRootLease
+      ? path.dirname(jarvisDataRootLease.path)
+      : null;
+    const nextLease =
+      currentLeaseRoot === path.resolve(root)
+        ? jarvisDataRootLease
+        : await acquireDataRootRuntimeLease({ dataRoot: root });
+    const previousLease = jarvisDataRootLease;
     process.env.JARVIS_DATA_ROOT = root;
     const nextRecordingsRoot = path.join(root, "recordings");
-    require("node:fs").mkdirSync(nextRecordingsRoot, { recursive: true });
-    jarvisRepository.reopen(path.join(root, "jarvis.db"));
-    jarvisService.reconfigureStorage({ recordingsDir: nextRecordingsRoot });
-    retentionCleaner.reconfigureStorage({
-      recordingsRoot: nextRecordingsRoot,
-      artifactCleaner: jarvisService.flacCompressionWorker,
-      temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
-    });
-    storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
-    storageGovernor.ensureReserve();
-    whisperCudaManager?.resetDataRoot?.();
-    require("./src/helpers/safeTempDir").resetSafeTempDir();
+    try {
+      require("node:fs").mkdirSync(nextRecordingsRoot, { recursive: true });
+      jarvisRepository.reopen(path.join(root, "jarvis.db"));
+      jarvisService.reconfigureStorage({ recordingsDir: nextRecordingsRoot });
+      retentionCleaner.reconfigureStorage({
+        recordingsRoot: nextRecordingsRoot,
+        artifactCleaner: jarvisService.flacCompressionWorker,
+        temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
+      });
+      storageGovernor.reserve.setFilePath(path.join(root, ".emergency-reserve"));
+      storageGovernor.ensureReserve();
+      whisperCudaManager?.resetDataRoot?.();
+      require("./src/helpers/safeTempDir").resetSafeTempDir();
+      jarvisDataRootLease = nextLease;
+      if (previousLease && previousLease !== nextLease) await previousLease.release();
+    } catch (error) {
+      if (nextLease && nextLease !== previousLease) await nextLease.release().catch(() => {});
+      throw error;
+    }
   };
   migrationCoordinator.register(
     createJarvisRuntimeMigrationParticipant({
@@ -2098,8 +2118,11 @@ if (gotSingleInstanceLock) {
         });
       }
 
-      startApp().catch((error) => {
+      startApp().catch(async (error) => {
         console.error("Failed to start app:", error);
+        const lease = jarvisDataRootLease;
+        jarvisDataRootLease = null;
+        await lease?.release().catch(() => {});
         dialog.showErrorBox(
           i18nMain.t("startup.error.title"),
           i18nMain.t("startup.error.message", { error: error.message })
@@ -2242,10 +2265,13 @@ function performGracefulTeardown() {
       jarvisService = null;
       return service?.shutdown();
     },
-    closeRepository: () => {
+    closeRepository: async () => {
       const repository = jarvisRepository;
       jarvisRepository = null;
-      return repository?.close();
+      repository?.close();
+      const lease = jarvisDataRootLease;
+      jarvisDataRootLease = null;
+      await lease?.release();
     },
   });
   return gracefulShutdownCoordinator.shutdown();

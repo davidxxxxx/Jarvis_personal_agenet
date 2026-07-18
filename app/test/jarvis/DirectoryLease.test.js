@@ -8,6 +8,10 @@ const test = require("node:test");
 const { PassThrough } = require("node:stream");
 
 const { DirectoryLeaseProvider } = require("../../src/jarvis/main/DirectoryLease");
+const {
+  acquireDataRootRuntimeLease,
+  DATA_ROOT_IN_USE_CODE,
+} = require("../../src/jarvis/main/DataRootRuntimeLease");
 
 function windowsHelperCount(parentProcessId = null) {
   if (process.platform !== "win32") return 0;
@@ -89,6 +93,50 @@ test("creates and leases a Windows directory in one atomic operation", async (t)
   lease = null;
   await fsp.rename(created, moved);
   await waitForHelperCount(baseline, process.pid);
+});
+
+test("an exclusive runtime lease blocks a second Jarvis data-root owner until release", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows runtime lease test");
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-runtime-root-lease-"));
+  const leasePath = path.join(base, ".jarvis-runtime.lock");
+  const firstProvider = new DirectoryLeaseProvider();
+  const secondProvider = new DirectoryLeaseProvider();
+  let first = null;
+  let second = null;
+  t.after(async () => {
+    await second?.release().catch(() => {});
+    await first?.release().catch(() => {});
+    await fsp.rm(base, { recursive: true, force: true });
+  });
+
+  first = await firstProvider.acquireExclusiveFile(leasePath);
+  await assert.rejects(
+    secondProvider.acquireExclusiveFile(leasePath),
+    (error) => error?.code === DATA_ROOT_IN_USE_CODE
+  );
+  await first.release();
+  first = null;
+  second = await secondProvider.acquireExclusiveFile(leasePath);
+  second.assertActive();
+});
+
+test("data-root runtime lease exposes a stable safe conflict without the private path", async () => {
+  const privateRoot = path.resolve(os.tmpdir(), "private-jarvis-root");
+  const leaseProvider = {
+    async acquireExclusiveFile() {
+      const error = new Error(`cannot open ${privateRoot}`);
+      error.code = DATA_ROOT_IN_USE_CODE;
+      throw error;
+    },
+  };
+
+  await assert.rejects(
+    acquireDataRootRuntimeLease({ dataRoot: privateRoot, leaseProvider }),
+    (error) =>
+      error?.code === DATA_ROOT_IN_USE_CODE &&
+      /already using this data directory/i.test(error.message) &&
+      !error.message.includes(privateRoot)
+  );
 });
 
 test("platform-injected POSIX lease serializes real dev and ino identity", async (t) => {

@@ -537,6 +537,44 @@ test("adopts default userData recordings through the production coordinator", as
   migrated.close();
 });
 
+test("repeated legacy adoption is a database no-op once every locator already targets the new root", async (t) => {
+  const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-adoption-noop-"));
+  t.after(() => fsp.rm(base, { recursive: true, force: true }));
+  const legacyRecordings = path.join(base, "legacy-recordings");
+  const targetRecordings = path.join(base, "data", "recordings");
+  const databasePath = path.join(base, "data", "jarvis.db");
+  await fsp.mkdir(legacyRecordings, { recursive: true });
+  await fsp.mkdir(targetRecordings, { recursive: true });
+  const repository = new JarvisRepository(databasePath);
+  repository.checkpointForMigration();
+  repository.close();
+  const before = await fsp.readFile(databasePath);
+  const renames = [];
+  const fsImpl = {
+    ...fsp,
+    async rename(from, to) {
+      renames.push([from, to]);
+      return fsp.rename(from, to);
+    },
+  };
+
+  const result = await new DataRootRelocator({ fsImpl }).relocateRecordings({
+    databasePath,
+    oldRecordingsRoot: legacyRecordings,
+    newRecordingsRoot: targetRecordings,
+  });
+
+  assert.deepEqual(result, { databaseLocators: 0, recoverySidecars: 0 });
+  assert.deepEqual(await fsp.readFile(databasePath), before);
+  assert.deepEqual(renames, []);
+  assert.deepEqual(
+    (await fsp.readdir(path.dirname(databasePath))).filter((name) =>
+      name.startsWith(".jarvis-relocate-")
+    ),
+    []
+  );
+});
+
 for (const crashPoint of ["sidecar-temp-fsynced", "sqlite-relocation-wal-open"]) {
   test(`resumes in a new process after forced termination at ${crashPoint}`, async (t) => {
     const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-relocation-process-crash-"));

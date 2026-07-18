@@ -117,11 +117,26 @@ class DataRootRelocator {
     } finally {
       repository.close();
     }
+    if (databaseLocators === 0) {
+      await this._removeWorkDatabase(workDatabasePath);
+      return { databaseLocators, recoverySidecars };
+    }
     await this._verifySqliteDatabase(workDatabasePath);
     await this._fsyncFile(workDatabasePath);
     await this.fs.rename(workDatabasePath, formalDatabasePath);
     await this._fsyncDirectory(path.dirname(formalDatabasePath));
     return { databaseLocators, recoverySidecars };
+  }
+
+  async _removeWorkDatabase(workDatabasePath) {
+    for (const candidate of [
+      `${workDatabasePath}-shm`,
+      `${workDatabasePath}-wal`,
+      workDatabasePath,
+    ]) {
+      await this.fs.rm(candidate, { force: true });
+    }
+    await this._fsyncDirectory(path.dirname(workDatabasePath));
   }
 
   async _prepareWorkDatabase(formalDatabasePath, workDatabasePath) {
@@ -206,12 +221,14 @@ class DataRootRelocator {
         if (!wavStat.isFile() || wavStat.isSymbolicLink()) {
           throw new Error("migrated recovery WAV is unsafe");
         }
-        await this._writeVerifiedJson(
-          absolute,
-          { ...metadata, path: mappedPath },
-          { migrationId, token }
-        );
-        rewritten += 1;
+        if (path.resolve(metadata.path) !== path.resolve(mappedPath)) {
+          await this._writeVerifiedJson(
+            absolute,
+            { ...metadata, path: mappedPath },
+            { migrationId, token }
+          );
+          rewritten += 1;
+        }
       }
     };
     await walk(targetRecordings);

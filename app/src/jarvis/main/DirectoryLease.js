@@ -3,6 +3,13 @@ const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 
 const WINDOWS_HELPER_PATH = path.join(__dirname, "directory-lease-helper.ps1");
+const DATA_ROOT_IN_USE_CODE = "JARVIS_DATA_ROOT_IN_USE";
+
+function dataRootInUseError() {
+  const error = new Error("data-root runtime lease acquisition failed");
+  error.code = DATA_ROOT_IN_USE_CODE;
+  return error;
+}
 
 function timeoutAfter(milliseconds, message) {
   let timer;
@@ -85,6 +92,20 @@ class DirectoryLeaseProvider {
     }
   }
 
+  async acquireExclusiveFile(candidate) {
+    if (typeof candidate !== "string" || !path.isAbsolute(candidate)) {
+      throw new TypeError("exclusive lease path must be absolute");
+    }
+    const resolved = path.resolve(candidate);
+    try {
+      return this.platform === "win32"
+        ? await this._acquireWindows(resolved, "--exclusive-file", "file")
+        : await this._acquireExclusivePosixFile(resolved);
+    } catch {
+      throw dataRootInUseError();
+    }
+  }
+
   async _acquirePosix(candidate) {
     const leaseFs = this.fs;
     const handle = await this.fs.open(candidate, "r");
@@ -124,7 +145,32 @@ class DirectoryLeaseProvider {
     }
   }
 
-  async _acquireWindows(candidate, mode) {
+  async _acquireExclusivePosixFile(candidate) {
+    const handle = await this.fs.open(candidate, "wx", 0o600);
+    let active = true;
+    return {
+      path: candidate,
+      identity: `posix-file:${candidate}`,
+      assertActive() {
+        if (!active) throw new Error("directory lease is not active");
+      },
+      async assertCurrent() {
+        if (!active) throw new Error("directory lease is not active");
+        const stat = await handle.stat();
+        if (!stat.isFile()) throw new Error("exclusive lease path changed");
+      },
+      async release() {
+        if (!active) return;
+        active = false;
+        await handle.close();
+        await fsp.unlink(candidate).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+      },
+    };
+  }
+
+  async _acquireWindows(candidate, mode, expectedKind = "directory") {
     const timeoutMs = this.timeoutMs;
     let child;
     try {
@@ -218,12 +264,14 @@ class DirectoryLeaseProvider {
     try {
       metadata = await Promise.race([ready, acquisitionTimeout.promise]);
       acquisitionTimeout.clear();
+      const attributes = Number(metadata?.attributes);
+      const isDirectory = (attributes & 0x10) !== 0;
       if (
         !/^[0-9a-f]{8}$/i.test(metadata?.volumeSerial) ||
         !/^[0-9a-f]{16}$/i.test(metadata?.fileId) ||
-        !Number.isSafeInteger(Number(metadata?.attributes)) ||
-        (Number(metadata.attributes) & 0x10) === 0 ||
-        (Number(metadata.attributes) & 0x400) !== 0
+        !Number.isSafeInteger(attributes) ||
+        (attributes & 0x400) !== 0 ||
+        (expectedKind === "directory" ? !isDirectory : isDirectory)
       ) {
         throw new Error("directory lease metadata is invalid");
       }
@@ -266,4 +314,4 @@ class DirectoryLeaseProvider {
   }
 }
 
-module.exports = { DirectoryLeaseProvider, WINDOWS_HELPER_PATH };
+module.exports = { DATA_ROOT_IN_USE_CODE, DirectoryLeaseProvider, WINDOWS_HELPER_PATH };
