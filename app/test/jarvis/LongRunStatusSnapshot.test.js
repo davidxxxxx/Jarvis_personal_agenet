@@ -441,6 +441,19 @@ test("repository aggregates active work by runtime stage without double-counting
       completedAt: null,
     });
     repo.db
+      .prepare(
+        `INSERT INTO processing_jobs (
+           id, session_id, chunk_id, job_type, state, priority, input_hash, lane,
+           input_version, model_version, execution_device, blocked_reason, next_retry_at,
+           error_code, created_at, completed_at
+         ) VALUES (
+           'j-expired', 's1', NULL, 'speaker', 'audio_expired_before_processing', 30,
+           'j-expired', 'local', 1, '', NULL, NULL, NULL,
+           'audio_expired_before_processing', 1000, 2000
+         )`
+      )
+      .run();
+    repo.db
       .prepare("UPDATE audio_chunks SET transcription_status = 'no_speech' WHERE id = 'c3'")
       .run();
     repo.upsertTranscriptSegments("s1", [

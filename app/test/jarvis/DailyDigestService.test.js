@@ -85,6 +85,10 @@ function fixture(overrides = {}) {
       calls.push(["wakeDailyDigestJob", input]);
       return { ...state.job, state: "pending" };
     },
+    authorizeManualDailyDigestRetry(id, options) {
+      calls.push(["authorizeManualDailyDigestRetry", id, options]);
+      return overrides.manualRetryResult ?? null;
+    },
     completeJob(jobId, input) {
       calls.push(["completeJob", jobId, input]);
       return state.completeResult;
@@ -287,6 +291,61 @@ test("regenerate does not revive running blocked or terminal jobs", () => {
   }
 });
 
+test("regenerate authorizes a blocked digest only through the manual retry gate", () => {
+  const { service, calls } = fixture({
+    state: { job: { id: "job-blocked", state: "blocked" } },
+    manualRetryResult: { id: "job-blocked", state: "retry" },
+  });
+
+  const result = service.regenerate({ localDate: "2026-07-17" });
+
+  assert.equal(result.status, "woken");
+  assert.equal(result.jobId, "job-blocked");
+  assert.equal(result.jobState, "retry");
+  assert.deepEqual(
+    calls.filter(([name]) => name === "authorizeManualDailyDigestRetry"),
+    [
+      [
+        "authorizeManualDailyDigestRetry",
+        "job-blocked",
+        { allowUsageUnknown: false, at: 8_000 },
+      ],
+    ]
+  );
+});
+
+test("usage-unknown digest retry requires an explicit paid-retry acknowledgement", () => {
+  const { service, calls } = fixture({
+    state: { job: { id: "job-usage-unknown", state: "blocked" } },
+    manualRetryResult: { id: "job-usage-unknown", state: "retry" },
+  });
+
+  const result = service.regenerate({
+    localDate: "2026-07-17",
+    allowUsageUnknown: true,
+  });
+
+  assert.equal(result.status, "woken");
+  assert.deepEqual(
+    calls.filter(([name]) => name === "authorizeManualDailyDigestRetry"),
+    [
+      [
+        "authorizeManualDailyDigestRetry",
+        "job-usage-unknown",
+        { allowUsageUnknown: true, at: 8_000 },
+      ],
+    ]
+  );
+  assert.throws(
+    () =>
+      service.regenerate({
+        localDate: "2026-07-17",
+        allowUsageUnknown: "yes",
+      }),
+    /allowUsageUnknown.*boolean/i
+  );
+});
+
 test("recoverCandidate applies every durable state without network and lease-fences its terminal transition", () => {
   for (const candidateState of ["validated", "applied", "superseded"]) {
     const appliedStatus = candidateState === "validated" ? "applied" :
@@ -386,6 +445,7 @@ test("recoverCandidate never completes a caller-supplied job that differs from c
     store: {
       enqueueDailyDigestJob: () => null,
       wakeDailyDigestJob: () => null,
+      authorizeManualDailyDigestRetry: () => null,
       completeJob(jobId) {
         completed.push(jobId);
         jobs.get(jobId).state = "completed";
@@ -657,6 +717,7 @@ function executionFixture(options = {}) {
       return { id: "digest-job-current", state: "pending" };
     },
     wakeDailyDigestJob: () => null,
+    authorizeManualDailyDigestRetry: () => null,
     completeJob(jobId, input) {
       calls.push(["complete", jobId, input]);
       return state.completeResult;
@@ -680,6 +741,9 @@ function executionFixture(options = {}) {
     },
   };
   const budgetGuard = {
+    getStatus() {
+      return { mode: options.budgetMode ?? "capped" };
+    },
     listAttemptDispositionsByJob(input) {
       calls.push(["load_attempts", input]);
       return state.attempts;
@@ -1042,6 +1106,61 @@ test("execute applies every exact prior-attempt disposition without accidental r
     code: "DAILY_DIGEST_DURABLE_STATE_INVALID",
   });
   assert.equal(malformed.calls.some(([name]) => name === "request"), false);
+});
+
+test("manual usage-unknown retry sends one new request only in unlimited mode", async () => {
+  const previousAttempt = budgetAttempt("usage_unknown");
+  const authorizedJob = claimedDigestJob({
+    error_code: "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED",
+  });
+  const unlimited = executionFixture({
+    attempts: [previousAttempt],
+    budgetMode: "unlimited",
+  });
+
+  assert.deepEqual(await unlimited.service.execute(authorizedJob), {
+    status: "applied",
+    jobId: "digest-job-1",
+  });
+  assert.equal(unlimited.calls.filter(([name]) => name === "request").length, 1);
+  assert.equal(unlimited.state.reservation.attemptNumber, 2);
+
+  const capped = executionFixture({
+    attempts: [previousAttempt],
+    budgetMode: "capped",
+  });
+  assert.deepEqual(await capped.service.execute(authorizedJob), {
+    status: "blocked",
+    reason: "usage_unknown",
+    jobId: "digest-job-1",
+  });
+  assert.equal(capped.calls.some(([name]) => name === "request"), false);
+});
+
+test("manual retry authorization survives resource deferral before transport", async () => {
+  const deferred = executionFixture({
+    attempts: [budgetAttempt("usage_unknown")],
+    budgetMode: "unlimited",
+    admission: [Object.freeze({ eligible: false, reason: "external_gpu_busy" })],
+  });
+
+  assert.deepEqual(
+    await deferred.service.execute(
+      claimedDigestJob({
+        error_code: "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED",
+      })
+    ),
+    {
+      status: "deferred",
+      reason: "external_gpu_busy",
+      jobId: "digest-job-1",
+    }
+  );
+  assert.equal(deferred.calls.some(([name]) => name === "request"), false);
+  assert.equal(
+    deferred.calls.find(([name]) => name === "defer")[2].preserveManualRetry,
+    true
+  );
 });
 
 test("execute performs two exact frozen admission checks and keeps pre-start denial free", async () => {

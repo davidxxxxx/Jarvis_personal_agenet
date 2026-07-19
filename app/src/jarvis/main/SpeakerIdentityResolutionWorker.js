@@ -43,6 +43,8 @@ class SpeakerIdentityResolutionWorker {
   constructor({
     repository,
     resolver = new SpeakerIdentityResolver(),
+    dualEvidenceProvider = null,
+    dualResolver = null,
     policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
     clock = Date.now,
     yieldToEventLoop = defaultYieldToEventLoop,
@@ -58,6 +60,18 @@ class SpeakerIdentityResolutionWorker {
     if (!resolver || typeof resolver.resolveCluster !== "function") {
       throw new TypeError("resolver.resolveCluster is required");
     }
+    if ((dualEvidenceProvider === null) !== (dualResolver === null)) {
+      throw new TypeError("dualEvidenceProvider and dualResolver must be configured together");
+    }
+    if (
+      dualEvidenceProvider !== null &&
+      typeof dualEvidenceProvider.buildClusterEvidence !== "function"
+    ) {
+      throw new TypeError("dualEvidenceProvider.buildClusterEvidence is required");
+    }
+    if (dualResolver !== null && typeof dualResolver.resolveCluster !== "function") {
+      throw new TypeError("dualResolver.resolveCluster is required");
+    }
     assertExactIdentityResolutionPolicy(policy);
     assertExactIdentityResolutionPolicy(resolver.policy);
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
@@ -66,6 +80,8 @@ class SpeakerIdentityResolutionWorker {
     }
     this.repository = repository;
     this.resolver = resolver;
+    this.dualEvidenceProvider = dualEvidenceProvider;
+    this.dualResolver = dualResolver;
     this.policy = policy;
     this.clock = clock;
     this.yieldToEventLoop = yieldToEventLoop;
@@ -129,11 +145,51 @@ class SpeakerIdentityResolutionWorker {
         revision
       );
       rejectedByCluster.set(cluster.clusterId, rejectedPersonIds);
-      const result = this.resolver.resolveCluster({
-        cluster,
-        samples: snapshot.samples,
-        rejectedPersonIds,
-      });
+      let result;
+      if (this.dualEvidenceProvider === null) {
+        result = this.resolver.resolveCluster({
+          cluster,
+          samples: snapshot.samples,
+          rejectedPersonIds,
+        });
+      } else {
+        const evidence = await this.dualEvidenceProvider.buildClusterEvidence({
+          sessionId: identity.sessionId,
+          evidenceRunId: cluster.evidenceRunId,
+          clusterId: cluster.clusterId,
+          createdAt: this.clock(),
+        });
+        if (!evidence.eligible) {
+          result = {
+            candidatePersonId: null,
+            state: "unknown",
+            score: null,
+            margin: null,
+            reason: evidence.reason,
+          };
+        } else {
+          try {
+            result = this.dualResolver.resolveCluster({
+              cluster: {
+                ...cluster,
+                attributionState: evidence.attributionState,
+                overlapDetected: evidence.overlapDetected,
+                echoDetected: evidence.echoDetected,
+                speechMs: evidence.speechMs,
+                windowCount: evidence.windowCount,
+                qualityScore: evidence.qualityScore,
+                models: evidence.models,
+              },
+              samples: snapshot.samples,
+              rejectedPersonIds,
+            });
+          } finally {
+            for (const model of Object.values(evidence.models ?? {})) {
+              model?.embedding?.fill?.(0);
+            }
+          }
+        }
+      }
       results.push({
         evidenceRunId: cluster.evidenceRunId,
         clusterId: cluster.clusterId,
@@ -142,6 +198,7 @@ class SpeakerIdentityResolutionWorker {
         score: result.score,
         margin: result.margin,
         reason: result.reason,
+        ...(result.models ? { models: result.models } : {}),
       });
       await renewLease();
       if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {

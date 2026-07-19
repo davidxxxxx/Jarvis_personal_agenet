@@ -104,6 +104,128 @@ describe("DailyReviewView", () => {
     expect(screen.getByText("Completed project plan")).toBeVisible();
   });
 
+  it("requires an inline billing acknowledgement before retrying usage-unknown work", async () => {
+    vi.mocked(window.electronAPI.jarvis.getDailyDigest).mockResolvedValue({
+      digest: null,
+      status: {
+        state: "blocked",
+        retryable: false,
+        errorCode: "usage_unknown",
+        nextRetryAt: null,
+        attemptCount: 1,
+      },
+    });
+    render(<DailyReviewView localDate="2026-07-17" />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /retry anyway|仍然重试/i,
+      })
+    );
+    expect(
+      screen.getByText(/previous request may already have been charged|上一次请求可能已经计费/i)
+    ).toBeVisible();
+    expect(window.electronAPI.jarvis.regenerateDailyDigest).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /confirm paid retry|确认再次付费重试/i,
+      })
+    );
+    await waitFor(() =>
+      expect(window.electronAPI.jarvis.regenerateDailyDigest).toHaveBeenCalledWith(
+        "2026-07-17",
+        true
+      )
+    );
+  });
+
+  it("reads back authoritative state when a paid retry is accepted before IPC rejects", async () => {
+    vi.mocked(window.electronAPI.jarvis.getDailyDigest)
+      .mockReset()
+      .mockResolvedValueOnce({
+        digest: null,
+        status: {
+          state: "blocked",
+          retryable: false,
+          errorCode: "usage_unknown",
+          nextRetryAt: null,
+          attemptCount: 1,
+        },
+      })
+      .mockResolvedValue({
+        ...savedResult,
+        status: {
+          ...savedResult.status,
+          state: "ready",
+          retryable: false,
+          errorCode: null,
+        },
+      });
+    vi.mocked(window.electronAPI.jarvis.regenerateDailyDigest).mockRejectedValue(
+      new Error("status read failed after durable wake")
+    );
+    render(<DailyReviewView localDate="2026-07-17" />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /retry anyway|仍然重试/i,
+      })
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /confirm paid retry|确认再次付费重试/i,
+      })
+    );
+
+    expect(await screen.findByText("Completed project plan")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(window.electronAPI.jarvis.regenerateDailyDigest).toHaveBeenCalledTimes(1);
+  });
+
+  it("never offers another paid click while post-submit status remains unknown", async () => {
+    vi.mocked(window.electronAPI.jarvis.getDailyDigest)
+      .mockReset()
+      .mockResolvedValueOnce({
+        digest: null,
+        status: {
+          state: "blocked",
+          retryable: false,
+          errorCode: "usage_unknown",
+          nextRetryAt: null,
+          attemptCount: 1,
+        },
+      })
+      .mockRejectedValue(new Error("database temporarily busy"));
+    vi.mocked(window.electronAPI.jarvis.regenerateDailyDigest).mockRejectedValue(
+      new Error("status read failed after durable wake")
+    );
+    render(<DailyReviewView localDate="2026-07-17" />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /retry anyway|仍然重试/i,
+      })
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /confirm paid retry|确认再次付费重试/i,
+      })
+    );
+
+    expect(
+      await screen.findByRole("button", {
+        name: /check status|查询状态/i,
+      })
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: /confirm paid retry|确认再次付费重试/i,
+      })
+    ).not.toBeInTheDocument();
+    expect(window.electronAPI.jarvis.regenerateDailyDigest).toHaveBeenCalledTimes(1);
+  });
+
   it("uses a truthful empty state and never prints raw failures", async () => {
     vi.mocked(window.electronAPI.jarvis.getDailyDigest).mockRejectedValue(
       new Error("C:\\secret\\jarvis.db MiniMax payload")

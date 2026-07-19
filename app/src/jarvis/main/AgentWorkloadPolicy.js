@@ -341,7 +341,7 @@ function hasFinalOnlyInput(manifest) {
         segment.stable &&
         segment.current &&
         !segment.duplicate &&
-        segment.identityKind === "durable_subject"
+        segment.identityKind !== "unresolved"
     )
   );
 }

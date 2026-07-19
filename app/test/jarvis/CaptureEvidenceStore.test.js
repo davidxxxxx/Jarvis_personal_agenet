@@ -384,6 +384,11 @@ test("stores track state and gap lifecycle evidence", (t) => {
     id: "t1",
     session_id: "s1",
     source_type: "system",
+    application_key: null,
+    application_display_name: null,
+    capture_generation: 0,
+    track_kind: "system_mix",
+    attribution_state: "mixed_unknown",
     device_id: "device-1",
     device_label: "PC audio",
     strategy: "wasapi-loopback",
@@ -424,6 +429,95 @@ test("creates requested tracks atomically", (t) => {
     /audio_tracks\.id/i
   );
   assert.equal(db.prepare("SELECT count(*) count FROM audio_tracks").get().count, 0);
+});
+
+test("stores canonical application tracks and exact/fallback attribution intervals", (t) => {
+  const { store } = fixture(t);
+  createTrack(store);
+  createTrack(store, {
+    id: "chrome-track",
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    captureGeneration: 2,
+    strategy: "include-process-tree",
+  });
+
+  const exact = store.createApplicationAudioInterval({
+    id: "interval-exact",
+    sessionId: "s1",
+    trackId: "chrome-track",
+    intervalKind: "application_active",
+    applicationKey: "chrome",
+    attributionState: "exact",
+    captureGeneration: 2,
+    startedAt: 20,
+  });
+  const fallback = store.createApplicationAudioInterval({
+    id: "interval-fallback",
+    sessionId: "s1",
+    trackId: "t1",
+    intervalKind: "mixed_fallback",
+    attributionState: "mixed_unknown",
+    captureGeneration: 3,
+    startedAt: 30,
+    reason: "application_capture_failed",
+  });
+
+  assert.equal(exact.application_key, "chrome");
+  assert.equal(fallback.application_key, null);
+  assert.equal(store.closeApplicationAudioInterval("interval-exact", 29).changes, 1);
+  assert.deepEqual(
+    store.listApplicationAudioIntervals("s1").map((interval) => ({
+      id: interval.id,
+      kind: interval.interval_kind,
+      applicationKey: interval.application_key,
+      endedAt: interval.ended_at,
+    })),
+    [
+      {
+        id: "interval-exact",
+        kind: "application_active",
+        applicationKey: "chrome",
+        endedAt: 29,
+      },
+      {
+        id: "interval-fallback",
+        kind: "mixed_fallback",
+        applicationKey: null,
+        endedAt: null,
+      },
+    ]
+  );
+});
+
+test("rejects raw paths and partial application attribution before persistence", (t) => {
+  const { store } = fixture(t);
+  assert.throws(
+    () =>
+      createTrack(store, {
+        id: "raw-path",
+        applicationKey: "c:\\games\\dota2.exe",
+        applicationDisplayName: "DOTA 2",
+      }),
+    /canonical lowercase identifier/
+  );
+  assert.throws(
+    () =>
+      createTrack(store, {
+        id: "missing-name",
+        applicationKey: "chrome",
+      }),
+    /provided together/
+  );
+  assert.throws(
+    () =>
+      createTrack(store, {
+        id: "window-title",
+        applicationKey: "chrome",
+        applicationDisplayName: "C:\\private\\meeting.txt",
+      }),
+    /path data/
+  );
 });
 
 test("rolls back interruption when its gap cannot be persisted", (t) => {
@@ -892,6 +986,42 @@ test("pause requires exact ownership coverage chronology and current states", (t
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
 });
 
+test("pause and resume ignore application tracks that already ended", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, {
+    id: "app-t1",
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    captureGeneration: 1,
+    deviceId: null,
+    deviceLabel: null,
+    strategy: "wasapi-application-loopback",
+  });
+  store.setTrackState("app-t1", "ended", 18);
+
+  store.pauseCapture({
+    sessionId: "s1",
+    sources: [{ trackId: "t1", expectedState: "active" }],
+    at: 20,
+  });
+  store.resumeCapture({
+    sessionId: "s1",
+    sources: [{ trackId: "t1", expectedState: "paused" }],
+    at: 30,
+  });
+
+  assert.deepEqual(
+    db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(),
+    { state: "ended", ended_at: 18 }
+  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
+    state: "active",
+    ended_at: null,
+  });
+  assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
 test("resume rolls back all track activations when session persistence fails", (t) => {
   const { db, store } = fixture(t);
   createTrack(store);
@@ -1149,6 +1279,41 @@ test("finalization rejects timestamps before a prior track end", (t) => {
     ended_at: 30,
   });
   assert.equal(db.prepare("SELECT status FROM sessions WHERE id='s1'").get().status, "recording");
+});
+
+test("finalization preserves an application track's earlier terminal boundary", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store);
+  createTrack(store, {
+    id: "app-t1",
+    applicationKey: "kook",
+    applicationDisplayName: "KOOK",
+    captureGeneration: 1,
+    deviceId: null,
+    deviceLabel: null,
+    strategy: "wasapi-application-loopback",
+  });
+  store.setTrackState("app-t1", "ended", 18);
+
+  store.finalizeCapture({
+    sessionId: "s1",
+    sources: [
+      { trackId: "t1", gapId: null },
+      { trackId: "app-t1", gapId: null },
+    ],
+    trackState: "ended",
+    sessionStatus: "completed",
+    at: 40,
+  });
+
+  assert.deepEqual(
+    db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(),
+    { state: "ended", ended_at: 18 }
+  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
+    state: "ended",
+    ended_at: 40,
+  });
 });
 
 test("finalization rejects stale repeated terminal transitions", (t) => {
@@ -2648,6 +2813,86 @@ test("daily digest job APIs enforce exact objects and keep model metadata out of
   }
 });
 
+test("manual daily digest retry reopens only approved blocked failures", (t) => {
+  for (const errorCode of [
+    "daily_digest_invalid_response",
+    "daily_digest_reconciled_without_candidate",
+  ]) {
+    const { db, store } = fixture(t);
+    const input = seedDailyDigestInput(db, { inputHash: "6".repeat(64) });
+    const job = store.enqueueDailyDigestJob({
+      digestInputId: input.inputId,
+      inputHash: input.inputHash,
+      inputVersion: 1,
+      modelVersion: "MiniMax-M2.7",
+    });
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked',
+           completed_at = 400,
+           error_code = ?,
+           blocked_reason = 'provider_failure',
+           execution_device = 'cloud'
+       WHERE id = ?`
+    ).run(errorCode, job.id);
+
+    const retried = store.authorizeManualDailyDigestRetry(job.id, {
+      allowUsageUnknown: false,
+      at: 500,
+    });
+
+    assert.equal(retried?.state, "retry", errorCode);
+    assert.equal(retried?.next_retry_at, 500, errorCode);
+    assert.equal(retried?.error_code, "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED", errorCode);
+    assert.equal(retried?.completed_at, null, errorCode);
+    assert.equal(retried?.blocked_reason, null, errorCode);
+    assert.equal(retried?.execution_device, null, errorCode);
+  }
+});
+
+test("usage-unknown daily digest retry requires explicit authorization", (t) => {
+  const { db, store } = fixture(t);
+  const input = seedDailyDigestInput(db, { inputHash: "7".repeat(64) });
+  const job = store.enqueueDailyDigestJob({
+    digestInputId: input.inputId,
+    inputHash: input.inputHash,
+    inputVersion: 1,
+    modelVersion: "MiniMax-M2.7",
+  });
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'blocked',
+         completed_at = 400,
+         error_code = 'daily_digest_usage_unknown',
+         blocked_reason = 'transport_ambiguous'
+     WHERE id = ?`
+  ).run(job.id);
+
+  assert.equal(
+    store.authorizeManualDailyDigestRetry(job.id, {
+      allowUsageUnknown: false,
+      at: 500,
+    }),
+    null
+  );
+  assert.equal(store.getDailyDigestJobByInput(input.inputId).state, "blocked");
+
+  const retried = store.authorizeManualDailyDigestRetry(job.id, {
+    allowUsageUnknown: true,
+    at: 501,
+  });
+  assert.equal(retried?.state, "retry");
+  assert.equal(retried?.error_code, "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED");
+  assert.throws(
+    () =>
+      store.authorizeManualDailyDigestRetry(job.id, {
+        allowUsageUnknown: "yes",
+        at: 501,
+      }),
+    /allowUsageUnknown.*boolean/i
+  );
+});
+
 test("supersedeDailyDigestJob is lease fenced and terminal only for daily digest work", (t) => {
   const { db, store } = fixture(t);
   const input = seedDailyDigestInput(db, { inputHash: "8".repeat(64) });
@@ -4065,6 +4310,46 @@ test("resource deferral releases the lease without consuming an attempt or retai
       reason: "external_gpu_busy",
     }),
     false
+  );
+});
+
+test("resource deferral can preserve an explicit analysis manual-retry authorization", (t) => {
+  const { db, store } = fixture(t);
+  seedProcessingJob(db, {
+    state: "retry",
+    attemptCount: 2,
+    nextRetryAt: 400,
+    errorCode: "ANALYSIS_MANUAL_RETRY_AUTHORIZED",
+  });
+  const [claimed] = store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 1 });
+  assert.equal(claimed.id, "lease-job");
+
+  assert.equal(
+    store.deferJob("lease-job", {
+      owner: "worker-a",
+      at: 510,
+      reason: "external_gpu_busy",
+      preserveManualRetry: true,
+    }),
+    true
+  );
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, blocked_reason, error_code,
+                lease_owner, lease_expires_at, completed_at
+         FROM processing_jobs WHERE id = 'lease-job'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 2,
+      blocked_reason: "external_gpu_busy",
+      error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED",
+      lease_owner: null,
+      lease_expires_at: null,
+      completed_at: null,
+    }
   );
 });
 

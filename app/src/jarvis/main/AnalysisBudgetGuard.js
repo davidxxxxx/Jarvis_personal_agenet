@@ -6,7 +6,11 @@ const {
   BUDGET_MODES,
 } = require("./AnalysisBudgetRepository");
 
-const OPERATIONS = new Set(["session_analysis", "daily_digest"]);
+const OPERATIONS = new Set([
+  "session_analysis",
+  "daily_digest",
+  "activity_classification",
+]);
 const RELEASE_REASON_CODES = new Set([
   "local_preflight_failed",
   "admission_revoked",
@@ -203,7 +207,9 @@ class AnalysisBudgetGuard {
       throw new TypeError("attemptNumber must be a positive safe integer");
     }
     if (!OPERATIONS.has(input.operation)) {
-      throw new TypeError("operation must be session_analysis or daily_digest");
+      throw new TypeError(
+        "operation must be session_analysis, daily_digest, or activity_classification"
+      );
     }
     return {
       requestId: assertId(input.requestId, "requestId"),
@@ -229,7 +235,9 @@ class AnalysisBudgetGuard {
     assertExactKeys(input, keys, "job attempt query");
     assertRequiredKeys(input, keys, "job attempt query");
     if (!OPERATIONS.has(input.operation)) {
-      throw new TypeError("operation must be session_analysis or daily_digest");
+      throw new TypeError(
+        "operation must be session_analysis, daily_digest, or activity_classification"
+      );
     }
     return this._invokeOptionalRepositoryMethod("listAttemptDispositionsByJob", {
       jobId: assertId(input.jobId, "jobId"),

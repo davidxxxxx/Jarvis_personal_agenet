@@ -3,6 +3,7 @@ const {
   assertId: assertJarvisId,
   normalizeSpeakerConfirmationInput,
   normalizeDailyDigestDateRequest,
+  normalizeDailyDigestRegenerateRequest,
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
@@ -10,6 +11,8 @@ const {
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
   normalizeMiniMaxConfig,
+  normalizeResourceGovernanceSettings,
+  normalizeApplicationAudioSettings,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,
@@ -37,6 +40,18 @@ function assertVoiceEnrollmentPreflight(sessionId, payload) {
   }
   if (!Array.isArray(payload.windows) || payload.windows.length !== ENROLLMENT_WINDOW_COUNT) {
     throw new TypeError("voice enrollment preflight requires exactly three windows");
+  }
+  if (
+    !payload.source ||
+    payload.source.kind !== "microphone" ||
+    typeof payload.source.deviceId !== "string" ||
+    payload.source.deviceId.length < 1 ||
+    payload.source.deviceId.length > 512 ||
+    typeof payload.source.label !== "string" ||
+    payload.source.label.trim().length < 1 ||
+    payload.source.label.length > 512
+  ) {
+    throw new TypeError("voice enrollment preflight requires microphone identity");
   }
   let totalSamples = 0;
   let totalBytes = 0;
@@ -151,6 +166,68 @@ function invokeAnalysisBudget(channel, args) {
   );
 }
 
+function invokeResourceGovernance(channel, args) {
+  return publicInvoke(
+    channel,
+    args,
+    (input) =>
+      normalizeResourceGovernanceSettings({
+        profile: input?.profile,
+        externalGpuThresholdPct: input?.externalGpuThresholdPct,
+        recoveryWaitMs: input?.recoveryWaitMs,
+      }),
+    "RESOURCE_GOVERNANCE_UNAVAILABLE",
+    "Resource governance settings are unavailable"
+  );
+}
+
+function normalizeApplicationAudioStatus(input) {
+  const settings = normalizeApplicationAudioSettings({
+    enabled: input?.enabled,
+    trackLimit: input?.trackLimit,
+  });
+  const runtime = input?.runtime;
+  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
+    throw new TypeError("application audio runtime status is invalid");
+  }
+  return {
+    ...settings,
+    runtime: {
+      running: runtime.running === true,
+      configuredLimit: runtime.configuredLimit,
+      effectiveLimit: runtime.effectiveLimit,
+      fullscreen: runtime.fullscreen === true,
+      activeTracks: Array.isArray(runtime.activeTracks)
+        ? runtime.activeTracks.map((track) => ({
+            applicationKey: track?.applicationKey,
+            applicationDisplayName: track?.applicationDisplayName,
+            captureGeneration: track?.captureGeneration,
+            state: "recording",
+          }))
+        : [],
+      fallbacks: Array.isArray(runtime.fallbacks)
+        ? runtime.fallbacks.map((fallback) => ({
+            applicationKey: fallback?.applicationKey,
+            applicationDisplayName: fallback?.applicationDisplayName,
+            reason: fallback?.reason,
+            retryAt: fallback?.retryAt ?? null,
+            state: "mixed_unknown",
+          }))
+        : [],
+    },
+  };
+}
+
+function invokeApplicationAudioSettings(channel, args) {
+  return publicInvoke(
+    channel,
+    args,
+    normalizeApplicationAudioStatus,
+    "APPLICATION_AUDIO_SETTINGS_UNAVAILABLE",
+    "Application audio settings are unavailable"
+  );
+}
+
 /**
  * Helper to register an IPC listener and return a cleanup function.
  * Ensures renderer code can easily remove listeners to avoid leaks.
@@ -193,6 +270,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     syncSegments: (sessionId, segments) =>
       ipcRenderer.invoke("jarvis:segments:sync", sessionId, segments),
     listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
+    listActivityClassifications: (sessionId) =>
+      ipcRenderer.invoke("jarvis:activity:list-session", assertJarvisId(sessionId, "sessionId")),
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
     listSessionSpeakerClusters: (sessionId) =>
@@ -258,10 +337,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getEvidenceContext: (input) => invokeEvidenceContext(input),
     analyzeSession: (sessionId, kind) =>
       invokeAnalysisStatus("jarvis:analysis:run", sessionId, kind),
-    regenerateDailyDigest: (localDate) =>
+    regenerateDailyDigest: (localDate, allowUsageUnknown = false) =>
       ipcRenderer.invoke(
         "jarvis:analysis:daily-digest:regenerate",
-        normalizeDailyDigestDateRequest({ localDate })
+        normalizeDailyDigestRegenerateRequest({ localDate, allowUsageUnknown })
       ),
     getAnalysisStatus: (sessionId) => invokeAnalysisStatus("jarvis:analysis:status", sessionId),
     getMiniMaxConfig: () => invokeMiniMaxSettings("jarvis:minimax:get-config", []),
@@ -271,6 +350,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getAnalysisBudget: () => invokeAnalysisBudget("jarvis:analysis-budget:get", []),
     setAnalysisBudget: (input) =>
       invokeAnalysisBudget("jarvis:analysis-budget:set", [normalizeAnalysisBudgetInput(input)]),
+    getResourceGovernance: () => invokeResourceGovernance("jarvis:resource-governance:get", []),
+    setResourceGovernance: (input) =>
+      invokeResourceGovernance("jarvis:resource-governance:set", [
+        normalizeResourceGovernanceSettings(input),
+      ]),
+    getApplicationAudioSettings: () =>
+      invokeApplicationAudioSettings("jarvis:application-audio:get", []),
+    setApplicationAudioSettings: (input) =>
+      invokeApplicationAudioSettings("jarvis:application-audio:set", [
+        normalizeApplicationAudioSettings(input),
+      ]),
     startCapture: (input) => ipcRenderer.invoke("jarvis:capture:start", input),
     setRetentionMode: (id, retentionMode, at) =>
       ipcRenderer.invoke("jarvis:capture:set-retention-mode", id, retentionMode, at),

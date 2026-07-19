@@ -1,6 +1,7 @@
 const { SPEAKER_EMBEDDING_MODEL_ID } = require("../../helpers/speakerEmbeddings");
 const {
   EXPECTED_EMBEDDING_DIMENSION,
+  DUAL_SELF_PROFILE_POLICY,
   SELF_PROFILE_POLICY,
   SELF_VOICE_PROFILE_ID,
 } = require("./VoiceEnrollmentService");
@@ -33,9 +34,9 @@ function decodeLegacyEmbedding(value) {
   return embedding;
 }
 
-function embeddingNorm(value, label) {
-  if (!(value instanceof Float32Array) || value.length !== EXPECTED_EMBEDDING_DIMENSION) {
-    throw new TypeError(`${label} embedding must contain 512 Float32 values`);
+function embeddingNorm(value, label, dimension = EXPECTED_EMBEDDING_DIMENSION) {
+  if (!(value instanceof Float32Array) || value.length !== dimension) {
+    throw new TypeError(`${label} embedding must contain ${dimension} Float32 values`);
   }
   let squared = 0;
   for (const item of value) {
@@ -86,12 +87,49 @@ function validateEnrollmentEvidence(input) {
   }
 }
 
+function validateDualModelEvidence(model, policy, input) {
+  if (
+    !model ||
+    model.role !== input.role ||
+    model.modelId !== policy.modelId ||
+    model.embeddingSpace !== policy.embeddingSpace
+  ) {
+    throw new TypeError(`voice enrollment ${input.role} model does not match the policy`);
+  }
+  if (
+    !Array.isArray(model.samples) ||
+    model.samples.length !== DUAL_SELF_PROFILE_POLICY.minimumWindows
+  ) {
+    throw new TypeError("dual voice enrollment requires three embeddings per model");
+  }
+  for (const sample of model.samples) {
+    embeddingNorm(sample, `${input.role} sample`, policy.embeddingDimension);
+  }
+  const centroidNorm = embeddingNorm(
+    model.centroid,
+    `${input.role} centroid`,
+    policy.embeddingDimension
+  );
+  if (Math.abs(centroidNorm - 1) > 1e-4) {
+    throw new TypeError("dual voice enrollment centroid must be normalized");
+  }
+  if (
+    typeof model.selfConsistency !== "number" ||
+    !Number.isFinite(model.selfConsistency) ||
+    model.selfConsistency < DUAL_SELF_PROFILE_POLICY.minimumSelfConsistency ||
+    model.selfConsistency > 1
+  ) {
+    throw new TypeError("dual voice enrollment self-consistency is below policy");
+  }
+}
+
 class VoiceProfileStore {
   constructor({ repository, legacyProfileReader = null, now = Date.now }) {
     if (
       !repository ||
       typeof repository.getVoiceProfileAggregate !== "function" ||
       typeof repository.replaceVoiceEnrollmentSamples !== "function" ||
+      typeof repository.replaceVoiceEnrollmentSampleSets !== "function" ||
       typeof repository.importLegacyVoiceProfile !== "function" ||
       typeof repository.hasVoiceProfileImportMarker !== "function"
     ) {
@@ -150,6 +188,96 @@ class VoiceProfileStore {
       selfConsistency: input.selfConsistency,
       updatedAt: this.now(),
     });
+  }
+
+  getDualStatus() {
+    const entries = [
+      ["primary", DUAL_SELF_PROFILE_POLICY.primary],
+      ["review", DUAL_SELF_PROFILE_POLICY.review],
+    ].map(([role, policy]) => {
+      const aggregate = this.repository.getVoiceProfileAggregate(SELF_PERSON_ID, policy.modelId);
+      return {
+        role,
+        modelId: policy.modelId,
+        embeddingSpace: policy.embeddingSpace,
+        enrolled: Boolean(aggregate),
+        acceptedSpeechMs: aggregate?.acceptedSpeechMs ?? 0,
+        windowCount: aggregate?.windowCount ?? 0,
+        selfConsistency: aggregate?.selfConsistency ?? null,
+        updatedAt: aggregate?.updatedAt ?? null,
+      };
+    });
+    const enrolled = entries.every((entry) => entry.enrolled);
+    return {
+      enrolled,
+      modelId: DUAL_SELF_PROFILE_POLICY.policyId,
+      acceptedSpeechMs: enrolled
+        ? Math.min(...entries.map((entry) => entry.acceptedSpeechMs))
+        : 0,
+      windowCount: enrolled ? Math.min(...entries.map((entry) => entry.windowCount)) : 0,
+      selfConsistency: enrolled
+        ? Math.min(...entries.map((entry) => entry.selfConsistency))
+        : null,
+      updatedAt: enrolled ? Math.max(...entries.map((entry) => entry.updatedAt)) : null,
+      models: entries,
+    };
+  }
+
+  saveDualEnrollment(input) {
+    if (!input || input.policyId !== DUAL_SELF_PROFILE_POLICY.policyId) {
+      throw new TypeError("dual voice enrollment policy does not match");
+    }
+    if (!Array.isArray(input.models) || input.models.length !== 2) {
+      throw new TypeError("dual voice enrollment requires primary and review evidence");
+    }
+    if (
+      !Array.isArray(input.sampleSpeechMs) ||
+      input.sampleSpeechMs.length !== DUAL_SELF_PROFILE_POLICY.minimumWindows ||
+      input.sampleSpeechMs.some(
+        (speechMs) => !Number.isSafeInteger(speechMs) || speechMs <= 0
+      )
+    ) {
+      throw new TypeError("dual voice enrollment requires speech duration for each sample");
+    }
+    const acceptedSpeechMs = input.sampleSpeechMs.reduce((sum, value) => sum + value, 0);
+    if (
+      acceptedSpeechMs !== input.acceptedSpeechMs ||
+      acceptedSpeechMs < DUAL_SELF_PROFILE_POLICY.minimumSpeechMs ||
+      input.windowCount !== DUAL_SELF_PROFILE_POLICY.minimumWindows
+    ) {
+      throw new TypeError("dual voice enrollment does not satisfy the evidence policy");
+    }
+    const byRole = new Map(input.models.map((entry) => [entry?.role, entry]));
+    if (byRole.size !== 2) {
+      throw new TypeError("dual voice enrollment model roles must be unique");
+    }
+    validateDualModelEvidence(
+      byRole.get("primary"),
+      DUAL_SELF_PROFILE_POLICY.primary,
+      { role: "primary" }
+    );
+    validateDualModelEvidence(
+      byRole.get("review"),
+      DUAL_SELF_PROFILE_POLICY.review,
+      { role: "review" }
+    );
+    const updatedAt = this.now();
+    return this.repository.replaceVoiceEnrollmentSampleSets(
+      ["primary", "review"].map((role) => {
+        const model = byRole.get(role);
+        return {
+          personId: SELF_PERSON_ID,
+          modelId: model.modelId,
+          samples: model.samples,
+          centroid: model.centroid,
+          sampleSpeechMs: input.sampleSpeechMs,
+          acceptedSpeechMs,
+          windowCount: input.windowCount,
+          selfConsistency: model.selfConsistency,
+          updatedAt,
+        };
+      })
+    );
   }
 
   importLegacySelfProfile() {

@@ -1,0 +1,95 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "../../../i18n";
+import ResourceGovernanceSettingsCard from "../ResourceGovernanceSettingsCard";
+
+const BALANCED = {
+  profile: "balanced" as const,
+  externalGpuThresholdPct: 45,
+  recoveryWaitMs: 60_000,
+};
+
+function installElectronApi(overrides = {}) {
+  const jarvis = {
+    getResourceGovernance: vi.fn().mockResolvedValue(BALANCED),
+    setResourceGovernance: vi.fn().mockImplementation(async (input) => input),
+    ...overrides,
+  };
+  Object.defineProperty(window, "electronAPI", {
+    configurable: true,
+    value: { jarvis },
+  });
+  return jarvis;
+}
+
+beforeAll(async () => {
+  await i18n.changeLanguage("en");
+});
+
+beforeEach(() => {
+  installElectronApi();
+});
+
+describe("ResourceGovernanceSettingsCard", () => {
+  it("loads balanced defaults and switches to the game-priority preset", async () => {
+    const jarvis = installElectronApi();
+    render(<ResourceGovernanceSettingsCard />);
+
+    expect(await screen.findByRole("button", { name: /Balanced/ })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Game priority/ }));
+
+    await waitFor(() =>
+      expect(jarvis.setResourceGovernance).toHaveBeenCalledWith({
+        profile: "game_priority",
+        externalGpuThresholdPct: 20,
+        recoveryWaitMs: 120_000,
+      })
+    );
+    expect(screen.getByRole("button", { name: /Game priority/ })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    expect(screen.getByText("Resource priority updated.")).toBeVisible();
+  });
+
+  it("persists bounded advanced threshold and recovery overrides", async () => {
+    const jarvis = installElectronApi();
+    render(<ResourceGovernanceSettingsCard />);
+
+    await screen.findByRole("button", { name: /Balanced/ });
+    fireEvent.click(screen.getByText("Advanced settings"));
+    fireEvent.change(screen.getByLabelText("External GPU busy threshold (%)"), {
+      target: { value: "55" },
+    });
+    fireEvent.change(screen.getByLabelText("Recovery wait (seconds)"), {
+      target: { value: "90" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Apply advanced settings" }));
+
+    await waitFor(() =>
+      expect(jarvis.setResourceGovernance).toHaveBeenCalledWith({
+        profile: "balanced",
+        externalGpuThresholdPct: 55,
+        recoveryWaitMs: 90_000,
+      })
+    );
+    expect(screen.getByText(/Customized/)).toBeVisible();
+  });
+
+  it("masks raw desktop errors", async () => {
+    installElectronApi({
+      getResourceGovernance: vi
+        .fn()
+        .mockRejectedValue(new Error("C:\\private\\resource.json raw failure")),
+    });
+    render(<ResourceGovernanceSettingsCard />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Resource settings are temporarily unavailable."
+    );
+    expect(document.body.textContent).not.toContain("resource.json");
+  });
+});

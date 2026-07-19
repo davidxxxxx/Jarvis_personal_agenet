@@ -65,3 +65,30 @@ test("does not prompt without an installed local model", async () => {
   assert.equal(result.reason, "model_missing");
   assert.deepEqual(calls, []);
 });
+
+test("uses an installed model when the configured default model is unavailable", async () => {
+  const { calls, input } = dependencies({
+    modelName: "base",
+    whisperManager: {
+      getModelPath: (modelName) => `${modelName}.bin`,
+      listWhisperModels: async () => ({
+        success: true,
+        models: [
+          { model: "base", downloaded: false },
+          { model: "large-v3-turbo", downloaded: true },
+        ],
+      }),
+    },
+    fileExists: (filePath) => filePath === "large-v3-turbo.bin",
+    showPrompt: async () => ({ response: 0 }),
+  });
+
+  const result = await maybeOfferCudaWhisper(input);
+
+  assert.equal(result.enabled, true);
+  assert.deepEqual(calls, [
+    ["install", true],
+    ["activate", "large-v3-turbo"],
+    ["enabled", true],
+  ]);
+});

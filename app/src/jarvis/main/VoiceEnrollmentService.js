@@ -1,5 +1,8 @@
 const { randomUUID } = require("node:crypto");
 const { SPEAKER_EMBEDDING_MODEL_ID } = require("../../helpers/speakerEmbeddings");
+const {
+  SPEAKER_IDENTITY_MODEL_POLICY,
+} = require("./SessionDiarizationPolicy");
 
 const CAPTURE_SAMPLE_RATE = 24_000;
 const EMBEDDING_SAMPLE_RATE = 16_000;
@@ -24,6 +27,18 @@ const SELF_PROFILE_POLICY = Object.freeze({
   minimumSelfConsistency: 0.78,
 });
 
+const DUAL_SELF_PROFILE_POLICY = Object.freeze({
+  policyId: `${SPEAKER_IDENTITY_MODEL_POLICY.policyId}-self-enrollment-v1`,
+  minimumSpeechMs: 30_000,
+  minimumWindows: 3,
+  minimumSelfConsistency: 0.78,
+  primary: SPEAKER_IDENTITY_MODEL_POLICY.primary,
+  review: SPEAKER_IDENTITY_MODEL_POLICY.review,
+});
+
+const VIRTUAL_MICROPHONE_PATTERN =
+  /\b(sonar|virtual|voicemeeter|stereo mix|loopback|vb-audio|cable|obs)\b/i;
+
 function result(status, acceptedSpeechMs = 0, windowCount = 0, selfConsistency = null) {
   return {
     status,
@@ -31,6 +46,23 @@ function result(status, acceptedSpeechMs = 0, windowCount = 0, selfConsistency =
     acceptedSpeechMs,
     windowCount,
     selfConsistency,
+  };
+}
+
+function dualResult(
+  status,
+  acceptedSpeechMs = 0,
+  windowCount = 0,
+  selfConsistency = null,
+  models = null
+) {
+  return {
+    status,
+    modelId: DUAL_SELF_PROFILE_POLICY.policyId,
+    acceptedSpeechMs,
+    windowCount,
+    selfConsistency,
+    models,
   };
 }
 
@@ -55,7 +87,24 @@ function downsampleForEmbedding(samples) {
   return output;
 }
 
-function validatePayload(payload) {
+function validateEnrollmentSource(source) {
+  if (!source || typeof source !== "object" || source.kind !== "microphone") {
+    throw new TypeError("voice enrollment requires a microphone source");
+  }
+  if (
+    typeof source.deviceId !== "string" ||
+    source.deviceId.length < 1 ||
+    source.deviceId.length > 512 ||
+    typeof source.label !== "string" ||
+    source.label.trim().length < 1 ||
+    source.label.length > 512
+  ) {
+    throw new TypeError("voice enrollment microphone identity is invalid");
+  }
+  return !VIRTUAL_MICROPHONE_PATTERN.test(source.label);
+}
+
+function validatePayload(payload, { requirePhysicalMicrophone = false } = {}) {
   if (!payload || typeof payload !== "object") {
     throw new TypeError("voice enrollment payload is required");
   }
@@ -76,6 +125,8 @@ function validatePayload(payload) {
   if (!Array.isArray(payload.windows) || payload.windows.length !== REQUIRED_WINDOWS) {
     throw new TypeError("voice enrollment requires exactly three sample windows");
   }
+  const physicalMicrophone =
+    !requirePhysicalMicrophone || validateEnrollmentSource(payload.source);
   const requiredWindowSamples = CAPTURE_SAMPLE_RATE * WINDOW_SECONDS;
   const windows = payload.windows
     .map((window, index) => {
@@ -110,11 +161,11 @@ function validatePayload(payload) {
       throw new TypeError("voice enrollment sample windows must not overlap");
     }
   }
-  return windows;
+  return { windows, physicalMicrophone };
 }
 
-function normalizeEmbedding(value) {
-  if (!(value instanceof Float32Array) || value.length !== EXPECTED_EMBEDDING_DIMENSION) {
+function normalizeEmbedding(value, dimension = EXPECTED_EMBEDDING_DIMENSION) {
+  if (!(value instanceof Float32Array) || value.length !== dimension) {
     return null;
   }
   let normSquared = 0;
@@ -129,12 +180,14 @@ function normalizeEmbedding(value) {
   return normalized;
 }
 
-function normalizedCentroid(embeddings) {
-  const centroid = new Float32Array(EXPECTED_EMBEDDING_DIMENSION);
+function normalizedCentroid(embeddings, dimension = EXPECTED_EMBEDDING_DIMENSION) {
+  const centroid = new Float32Array(dimension);
   for (const embedding of embeddings) {
     for (let index = 0; index < centroid.length; index += 1) centroid[index] += embedding[index];
   }
-  return normalizeEmbedding(centroid);
+  const normalized = normalizeEmbedding(centroid, dimension);
+  centroid.fill(0);
+  return normalized;
 }
 
 function cosineSimilarity(left, right) {
@@ -153,6 +206,8 @@ function zeroPayloadSamples(payload) {
 class VoiceEnrollmentService {
   constructor({
     speakerEmbeddings,
+    primarySpeakerEmbeddings = null,
+    reviewSpeakerEmbeddings = null,
     speechDurationMeasurer,
     voiceProfileStore,
     createId = randomUUID,
@@ -160,16 +215,26 @@ class VoiceEnrollmentService {
     sessionTtlMs = DEFAULT_SESSION_TTL_MS,
     maxActiveSessions = DEFAULT_MAX_ACTIVE_SESSIONS,
   }) {
-    if (!speakerEmbeddings || typeof speakerEmbeddings.extractEmbeddingFromSamples !== "function") {
-      throw new TypeError("speakerEmbeddings is required");
+    const hasLegacy =
+      speakerEmbeddings && typeof speakerEmbeddings.extractEmbeddingFromSamples === "function";
+    const hasDual =
+      primarySpeakerEmbeddings &&
+      typeof primarySpeakerEmbeddings.extractEmbeddingFromSamples === "function" &&
+      reviewSpeakerEmbeddings &&
+      typeof reviewSpeakerEmbeddings.extractEmbeddingFromSamples === "function";
+    if (!hasLegacy && !hasDual) {
+      throw new TypeError("speaker embedding runtimes are required");
     }
     if (!speechDurationMeasurer || typeof speechDurationMeasurer.measureSpeechMs !== "function") {
       throw new TypeError("speechDurationMeasurer is required");
     }
     if (
       !voiceProfileStore ||
-      typeof voiceProfileStore.getStatus !== "function" ||
-      typeof voiceProfileStore.saveEnrollment !== "function"
+      (hasDual
+        ? typeof voiceProfileStore.getDualStatus !== "function" ||
+          typeof voiceProfileStore.saveDualEnrollment !== "function"
+        : typeof voiceProfileStore.getStatus !== "function" ||
+          typeof voiceProfileStore.saveEnrollment !== "function")
     ) {
       throw new TypeError("voiceProfileStore is required");
     }
@@ -187,6 +252,9 @@ class VoiceEnrollmentService {
       throw new TypeError("maxActiveSessions must be a safe integer between 1 and 32");
     }
     this.speakerEmbeddings = speakerEmbeddings;
+    this.primarySpeakerEmbeddings = primarySpeakerEmbeddings;
+    this.reviewSpeakerEmbeddings = reviewSpeakerEmbeddings;
+    this.dualMode = Boolean(hasDual);
     this.speechDurationMeasurer = speechDurationMeasurer;
     this.voiceProfileStore = voiceProfileStore;
     this.createId = createId;
@@ -198,7 +266,9 @@ class VoiceEnrollmentService {
   }
 
   getStatus() {
-    return this.voiceProfileStore.getStatus();
+    return this.dualMode
+      ? this.voiceProfileStore.getDualStatus()
+      : this.voiceProfileStore.getStatus();
   }
 
   begin({ ownerId }) {
@@ -251,7 +321,13 @@ class VoiceEnrollmentService {
         throw new Error("voice enrollment has not reached the minimum real capture duration");
       }
       this._deleteSession(sessionId, session);
-      const windows = validatePayload(payload);
+      const { windows, physicalMicrophone } = validatePayload(payload, {
+        requirePhysicalMicrophone: this.dualMode,
+      });
+      if (!physicalMicrophone) return dualResult("unsupported_microphone");
+      if (this.dualMode) {
+        return await this._completeDual({ sessionId, windows });
+      }
       const embeddings = [];
       const sampleSpeechMs = [];
       try {
@@ -316,6 +392,146 @@ class VoiceEnrollmentService {
     }
   }
 
+  async _completeDual({ sessionId, windows }) {
+    const modelEntries = [
+      {
+        role: "primary",
+        policy: DUAL_SELF_PROFILE_POLICY.primary,
+        runtime: this.primarySpeakerEmbeddings,
+        embeddings: [],
+      },
+      {
+        role: "review",
+        policy: DUAL_SELF_PROFILE_POLICY.review,
+        runtime: this.reviewSpeakerEmbeddings,
+        embeddings: [],
+      },
+    ];
+    const sampleSpeechMs = [];
+    const centroids = [];
+    try {
+      for (const [windowIndex, window] of windows.entries()) {
+        const speechMs = await this.speechDurationMeasurer.measureSpeechMs({
+          sessionId,
+          windowIndex,
+          sampleRate: CAPTURE_SAMPLE_RATE,
+          samples: window.samples,
+        });
+        if (!Number.isSafeInteger(speechMs) || speechMs < 0 || speechMs > WINDOW_SECONDS * 1_000) {
+          return dualResult("model_error");
+        }
+        const downsampled = downsampleForEmbedding(window.samples);
+        const normalizedWindow = [];
+        try {
+          for (const entry of modelEntries) {
+            const raw = await entry.runtime.extractEmbeddingFromSamples(downsampled);
+            if (raw === null || raw === undefined) {
+              normalizedWindow.push(null);
+              continue;
+            }
+            try {
+              normalizedWindow.push(
+                normalizeEmbedding(raw, entry.policy.embeddingDimension)
+              );
+            } finally {
+              raw.fill(0);
+            }
+          }
+        } catch {
+          for (const embedding of normalizedWindow) embedding?.fill(0);
+          return dualResult("model_error");
+        } finally {
+          downsampled.fill(0);
+        }
+        if (normalizedWindow.some((embedding) => embedding === null)) {
+          for (const embedding of normalizedWindow) embedding?.fill(0);
+          continue;
+        }
+        for (let index = 0; index < modelEntries.length; index += 1) {
+          modelEntries[index].embeddings.push(normalizedWindow[index]);
+        }
+        sampleSpeechMs.push(speechMs);
+      }
+
+      const acceptedSpeechMs = sampleSpeechMs.reduce((sum, value) => sum + value, 0);
+      if (
+        modelEntries.some(
+          (entry) => entry.embeddings.length < DUAL_SELF_PROFILE_POLICY.minimumWindows
+        ) ||
+        acceptedSpeechMs < DUAL_SELF_PROFILE_POLICY.minimumSpeechMs
+      ) {
+        return dualResult(
+          "insufficient_speech",
+          acceptedSpeechMs,
+          Math.min(...modelEntries.map((entry) => entry.embeddings.length))
+        );
+      }
+
+      const modelResults = [];
+      for (const entry of modelEntries) {
+        const centroid = normalizedCentroid(
+          entry.embeddings,
+          entry.policy.embeddingDimension
+        );
+        if (!centroid) return dualResult("model_error");
+        centroids.push(centroid);
+        const selfConsistency = Math.min(
+          ...entry.embeddings.map((embedding) => cosineSimilarity(embedding, centroid))
+        );
+        if (!Number.isFinite(selfConsistency)) return dualResult("model_error");
+        modelResults.push({
+          role: entry.role,
+          modelId: entry.policy.modelId,
+          embeddingSpace: entry.policy.embeddingSpace,
+          samples: entry.embeddings,
+          centroid,
+          selfConsistency,
+        });
+      }
+      const selfConsistency = Math.min(...modelResults.map((entry) => entry.selfConsistency));
+      if (selfConsistency < DUAL_SELF_PROFILE_POLICY.minimumSelfConsistency) {
+        return dualResult(
+          "inconsistent_samples",
+          acceptedSpeechMs,
+          REQUIRED_WINDOWS,
+          selfConsistency,
+          modelResults.map(({ role, modelId, embeddingSpace, selfConsistency: score }) => ({
+            role,
+            modelId,
+            embeddingSpace,
+            selfConsistency: score,
+          }))
+        );
+      }
+      this.voiceProfileStore.saveDualEnrollment({
+        policyId: DUAL_SELF_PROFILE_POLICY.policyId,
+        models: modelResults,
+        sampleSpeechMs,
+        acceptedSpeechMs,
+        windowCount: REQUIRED_WINDOWS,
+      });
+      return dualResult(
+        "accepted",
+        acceptedSpeechMs,
+        REQUIRED_WINDOWS,
+        selfConsistency,
+        modelResults.map(({ role, modelId, embeddingSpace, selfConsistency: score }) => ({
+          role,
+          modelId,
+          embeddingSpace,
+          selfConsistency: score,
+        }))
+      );
+    } catch {
+      return dualResult("model_error");
+    } finally {
+      for (const entry of modelEntries) {
+        for (const embedding of entry.embeddings) embedding.fill(0);
+      }
+      for (const centroid of centroids) centroid.fill(0);
+    }
+  }
+
   _resolveSession(ownerId, sessionId) {
     const safeOwnerId = requireOwnerId(ownerId);
     if (typeof sessionId !== "string" || !sessionId)
@@ -352,4 +568,6 @@ module.exports = VoiceEnrollmentService;
 module.exports.CAPTURE_SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
 module.exports.EXPECTED_EMBEDDING_DIMENSION = EXPECTED_EMBEDDING_DIMENSION;
 module.exports.SELF_PROFILE_POLICY = SELF_PROFILE_POLICY;
+module.exports.DUAL_SELF_PROFILE_POLICY = DUAL_SELF_PROFILE_POLICY;
 module.exports.SELF_VOICE_PROFILE_ID = SELF_VOICE_PROFILE_ID;
+module.exports.VIRTUAL_MICROPHONE_PATTERN = VIRTUAL_MICROPHONE_PATTERN;

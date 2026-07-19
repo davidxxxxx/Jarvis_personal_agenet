@@ -99,6 +99,7 @@
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "声纹样本不足，请清晰读完三段十秒语音后重试。",
       "inconsistent_samples": "三段声音不一致，请独自在更安静的环境中重试。",
+      "unsupported_microphone": "请选择实体麦克风。Sonar 等虚拟或回环设备不能用于绑定本人声纹。",
       "model_error": "声纹模型暂时不可用，请等待模型就绪后重试。"
     },
     "audioLevel": "音频电平",
@@ -118,6 +119,7 @@
     "micRestored": "麦克风已恢复：{{device}}",
     "micFallback": "首选麦克风已断开，正在使用 {{device}} 继续录音。",
     "recordingError": "录音无法继续，请检查麦克风后重试。",
+    "transcriptionPaused": "实时转写已暂停，音频仍在安全保存，稍后会自动补齐。",
     "operationError": "操作失败，请重试",
     "capture": {
       "groupLabel": "采集声音",
@@ -280,6 +282,44 @@
       "open": "打开助手设置",
       "close": "关闭助手设置",
       "dismiss": "收起助手设置"
+    },
+    "resourceGovernance": {
+      "title": "全天运行资源优先级",
+      "description": "控制 Jarvis 何时主动让出 GPU，以及何时恢复后台补齐。",
+      "loading": "正在加载资源设置…",
+      "profiles": {
+        "game_priority": {
+          "title": "游戏优先",
+          "description": "更早让路，稳定后较慢恢复。"
+        },
+        "balanced": {
+          "title": "平衡",
+          "description": "忽略轻量 GPU 占用，安全共享资源。"
+        },
+        "processing_priority": {
+          "title": "处理优先",
+          "description": "更多利用空闲 GPU 能力。"
+        }
+      },
+      "applicationAudio": {
+        "title": "按应用分离电脑声音",
+        "description": "只跟踪正在发声的应用；失败时退回系统混音，保证不漏音且不猜来源。",
+        "trackLimit": "最多同时保留的独立应用音轨",
+        "runtime": "正在记录 {{active}} 个应用音轨（上限 {{limit}}）· {{fallback}} 个来源已降级",
+        "idle": "将在下次录音时启动；全屏游戏期间最多保留两个应用音轨。"
+      },
+      "fullscreenGuarantee": "全屏游戏始终绝对优先。安全录音继续，实时转写、声纹、压缩、总结和 GPU 推理暂停。",
+      "advanced": "高级设置",
+      "customized": "已自定义",
+      "gpuThreshold": "外部 GPU 忙碌阈值（%）",
+      "gpuThresholdHelp": "只有其他进程正在使用选定 GPU，且总利用率达到此值时，Jarvis 才主动让路。",
+      "recoveryWait": "恢复等待时间（秒）",
+      "recoveryWaitHelp": "资源持续健康达到此时间后，暂停的后台任务才恢复。",
+      "applyAdvanced": "应用高级设置",
+      "saving": "正在保存…",
+      "saved": "资源优先级已更新。",
+      "error": "资源设置暂时不可用。",
+      "retry": "重试资源设置"
     },
     "currentSummary": {
       "title": "本次录音总结",

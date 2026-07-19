@@ -6,7 +6,6 @@ const { verifyNativeAbi } = require("./verify-native-abi");
 const ELECTRON_VERSION = "41.10.0";
 const ELECTRON_ABI = "145";
 const TARGET_ARCH = "x64";
-const TARGET_PLATFORM = "win32";
 
 const SIGNING_ENVIRONMENT = [
   /^(?:WIN(?:DOWS)?_)?CSC_/i,
@@ -30,11 +29,14 @@ function sanitizeUnsignedEnvironment(environment) {
 function createUnsignedBuilderInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
+  dirOnly = false,
 } = {}) {
   const configPath = path.join(appRoot, "electron-builder.unsigned-win.json");
+  const args = [require.resolve("electron-builder/cli.js"), "--win", "--config", configPath];
+  if (dirOnly) args.push("--dir");
   return {
     command: process.execPath,
-    args: [require.resolve("electron-builder/cli.js"), "--win", "--config", configPath],
+    args,
     env: sanitizeUnsignedEnvironment(env),
     options: {
       cwd: appRoot,
@@ -49,27 +51,22 @@ function createElectronNativeRebuildInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
 } = {}) {
-  const rebuildMainPath = require.resolve("@electron/rebuild");
-  const rebuildCliPath = path.join(path.dirname(rebuildMainPath), "cli.js");
+  const prebuildCliPath = require.resolve("prebuild-install/bin.js");
+  const modulePath = path.join(appRoot, "node_modules", "better-sqlite3");
   return {
     command: process.execPath,
     args: [
-      rebuildCliPath,
-      "--version",
+      prebuildCliPath,
+      "--runtime",
+      "electron",
+      "--target",
       ELECTRON_VERSION,
       "--arch",
       TARGET_ARCH,
-      "--platform",
-      TARGET_PLATFORM,
-      "--force",
-      "--only",
-      "better-sqlite3",
-      "--module-dir",
-      appRoot,
     ],
     env: sanitizeUnsignedEnvironment(env),
     options: {
-      cwd: appRoot,
+      cwd: modulePath,
       shell: false,
       stdio: "inherit",
       windowsHide: true,
@@ -81,13 +78,8 @@ function createNodeNativeRestoreInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
 } = {}) {
-  const npmCliPath = path.join(
-    path.dirname(process.execPath),
-    "node_modules",
-    "npm",
-    "bin",
-    "npm-cli.js"
-  );
+  const prebuildCliPath = require.resolve("prebuild-install/bin.js");
+  const modulePath = path.join(appRoot, "node_modules", "better-sqlite3");
   const restoreEnvironment = { ...env };
   for (const name of Object.keys(restoreEnvironment)) {
     if (/^(?:npm_config_)?(?:runtime|target|disturl|target_arch)$/i.test(name)) {
@@ -97,10 +89,18 @@ function createNodeNativeRestoreInvocation({
   delete restoreEnvironment.ELECTRON_RUN_AS_NODE;
   return {
     command: process.execPath,
-    args: [npmCliPath, "rebuild", "better-sqlite3"],
+    args: [
+      prebuildCliPath,
+      "--runtime",
+      "node",
+      "--target",
+      process.versions.node,
+      "--arch",
+      process.arch,
+    ],
     env: restoreEnvironment,
     options: {
-      cwd: appRoot,
+      cwd: modulePath,
       shell: false,
       stdio: "inherit",
       windowsHide: true,
@@ -258,7 +258,7 @@ function buildUnsignedWindows(options = {}) {
     assertSafeBuilderConfigImpl(configPath);
     runRequiredInvocation(
       electronRebuildInvocation,
-      "Electron native dependency rebuild",
+      "Electron native dependency prebuild install",
       spawnSyncImpl
     );
     verifyNativeAbiImpl({
@@ -280,13 +280,15 @@ function buildUnsignedWindows(options = {}) {
     });
     const artifactRoot = path.join(appRoot, "dist");
     assertSafeArtifactTreeImpl(artifactRoot);
-    assertUnsignedWindowsArtifactsImpl({
-      appRoot,
-      artifactRoot,
-      platform: options.platform,
-      systemRoot: options.systemRoot,
-      spawnSyncImpl,
-    });
+    if (!options.dirOnly) {
+      assertUnsignedWindowsArtifactsImpl({
+        appRoot,
+        artifactRoot,
+        platform: options.platform,
+        systemRoot: options.systemRoot,
+        spawnSyncImpl,
+      });
+    }
   } catch (error) {
     primaryError = error;
   } finally {
@@ -314,7 +316,9 @@ function buildUnsignedWindows(options = {}) {
   return result;
 }
 
-if (require.main === module) buildUnsignedWindows();
+if (require.main === module) {
+  buildUnsignedWindows({ dirOnly: process.argv.includes("--dir") });
+}
 
 module.exports = {
   assertUnsignedWindowsArtifacts,

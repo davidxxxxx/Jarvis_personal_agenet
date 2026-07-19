@@ -6,7 +6,14 @@ const os = require("node:os");
 const path = require("node:path");
 const { EventEmitter } = require("node:events");
 
-const { SpeakerEmbeddings } = require("../../src/helpers/speakerEmbeddings");
+const {
+  SpeakerEmbeddings,
+  decodeEmbeddingBuffer,
+} = require("../../src/helpers/speakerEmbeddings");
+const {
+  SPEAKER_MODEL_KEYS,
+  getSpeakerModelManifest,
+} = require("../../src/jarvis/main/SpeakerModelManifest");
 const DiarizationManager = require("../../src/helpers/diarization");
 
 function writeMonoPcm16Wav(filePath, sampleRate, samples) {
@@ -61,6 +68,124 @@ test("speaker extraction clears its private PCM clone after success and failure"
       assert.equal(source[0], 0.25);
     });
   }
+});
+
+test("speaker extraction decodes cloned binary views as float bytes", () => {
+  const expected = new Float32Array(512);
+  for (let index = 0; index < expected.length; index += 1) expected[index] = index / 17 - 3;
+  const bytes = Buffer.from(expected.buffer.slice(0));
+  const sliced = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  assert.deepEqual(decodeEmbeddingBuffer(bytes), expected);
+  assert.deepEqual(decodeEmbeddingBuffer(sliced), expected);
+  assert.deepEqual(decodeEmbeddingBuffer(expected.buffer.slice(0)), expected);
+  assert.equal(decodeEmbeddingBuffer(Buffer.alloc(3)), null);
+});
+
+test("speaker extraction prefers a structured 512-value response and rejects unknown payloads", async () => {
+  const expected = new Float32Array(512).fill(0.25);
+  const helper = new SpeakerEmbeddings({
+    workerClient: {
+      async request() {
+        return { embedding: Array.from(expected) };
+      },
+    },
+  });
+  helper._ensureLoaded = async () => {};
+
+  assert.deepEqual(await helper.extractEmbeddingFromSamples(new Float32Array(24_000)), expected);
+
+  helper.workerClient = { request: async () => ({ embedding: { invalid: true } }) };
+  await assert.rejects(
+    helper.extractEmbeddingFromSamples(new Float32Array(24_000)),
+    { code: "SPEAKER_EMBEDDING_PAYLOAD_INVALID" }
+  );
+});
+
+test("speaker extraction keeps Chinese CAM++ and ERes2NetV2 worker sessions isolated", async () => {
+  const calls = [];
+  const primaryModel = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.PRIMARY);
+  const reviewModel = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.REVIEW);
+  const workerClient = {
+    async request(method, payload) {
+      calls.push({ method, payload: { ...payload, samplesBuffer: undefined } });
+      if (method === "speaker.load") return { ok: true };
+      const dimension =
+        payload.modelKey === SPEAKER_MODEL_KEYS.PRIMARY
+          ? primaryModel.embeddingDimension
+          : reviewModel.embeddingDimension;
+      return { embedding: new Array(dimension).fill(0.25) };
+    },
+  };
+  const primary = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
+    workerClient,
+  });
+  const review = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.REVIEW,
+    workerClient,
+  });
+  primary.isAvailable = () => true;
+  review.isAvailable = () => true;
+  primary.getModelPath = () => String.raw`G:\JarvisData\models\speaker-models\campplus.onnx`;
+  review.getModelPath = () => String.raw`G:\JarvisData\models\speaker-models\eres2netv2.onnx`;
+
+  const primaryEmbedding = await primary.extractEmbeddingFromSamples(new Float32Array(24_000));
+  const reviewEmbedding = await review.extractEmbeddingFromSamples(new Float32Array(24_000));
+
+  assert.equal(primaryEmbedding.length, 192);
+  assert.equal(reviewEmbedding.length, 192);
+  assert.deepEqual(
+    calls.map(({ method, payload }) => [method, payload.modelKey]),
+    [
+      ["speaker.load", SPEAKER_MODEL_KEYS.PRIMARY],
+      ["speaker.extract", SPEAKER_MODEL_KEYS.PRIMARY],
+      ["speaker.load", SPEAKER_MODEL_KEYS.REVIEW],
+      ["speaker.extract", SPEAKER_MODEL_KEYS.REVIEW],
+    ]
+  );
+});
+
+test("speaker extraction rejects a worker vector from the wrong model dimension", async () => {
+  const helper = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
+    workerClient: {
+      async request(method) {
+        if (method === "speaker.load") return { ok: true };
+        return { embedding: new Array(512).fill(0.25) };
+      },
+    },
+  });
+  helper.isAvailable = () => true;
+  helper.getModelPath = () => String.raw`G:\JarvisData\models\speaker-models\campplus.onnx`;
+
+  await assert.rejects(
+    helper.extractEmbeddingFromSamples(new Float32Array(24_000)),
+    (error) => error.code === "SPEAKER_EMBEDDING_DIMENSION_MISMATCH"
+  );
+});
+
+test("speaker extraction admits an exact 1500 ms window despite floating-point subtraction", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-speaker-ms-boundary-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const wavPath = path.join(directory, "source.wav");
+  writeMonoPcm16Wav(wavPath, 16_000, Array.from({ length: 48_000 }, () => 1_000));
+  let extracted = false;
+  const helper = new SpeakerEmbeddings({
+    workerClient: {
+      async request() {
+        extracted = true;
+        return { embedding: new Array(512).fill(0.25) };
+      },
+    },
+  });
+  helper._ensureLoaded = async () => {};
+
+  assert.ok(2.002 - 0.502 < 1.5);
+  const embedding = await helper.extractEmbedding(wavPath, 0.502, 2.002);
+
+  assert.equal(extracted, true);
+  assert.equal(embedding.length, 512);
 });
 
 test("speaker model artifact hash is the SHA-256 of the local model file and is cached", async (t) => {
@@ -211,6 +336,158 @@ function fakeSidecar({ stdout = "", stderr = "", code = 0, error = null } = {}) 
   });
   return child;
 }
+
+test("diarization normalizes non-16 kHz WAV input and removes the private conversion", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-normalize-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const wavPath = path.join(directory, "private-source-24k.wav");
+  writeMonoPcm16Wav(wavPath, 24_000, [1, 2, 3, 4]);
+
+  for (const [name, sidecarCode] of [
+    ["success", 0],
+    ["sidecar failure", 7],
+  ]) {
+    await t.test(name, async () => {
+      const convertedPath = path.join(directory, `private-converted-${sidecarCode}.wav`);
+      const conversionCalls = [];
+      const spawnCalls = [];
+      const removed = [];
+      const manager = new DiarizationManager({
+        convertToWavImpl: async (inputPath, outputPath, options) => {
+          conversionCalls.push({ inputPath, outputPath, options });
+          writeMonoPcm16Wav(outputPath, 16_000, [1, 2, 3]);
+        },
+        createTempWavPathImpl: () => convertedPath,
+        unlinkImpl: async (filePath) => {
+          removed.push(filePath);
+          await fs.promises.unlink(filePath);
+        },
+        spawnImpl: (binaryPath, args) => {
+          spawnCalls.push({ binaryPath, args });
+          return fakeSidecar({ code: sidecarCode });
+        },
+      });
+      manager.getBinaryPath = () => "diarizer";
+      manager.isModelDownloaded = () => true;
+
+      if (sidecarCode === 0) {
+        assert.deepEqual(await manager.diarizeStrict(wavPath), []);
+      } else {
+        await assert.rejects(manager.diarizeStrict(wavPath), {
+          code: "DIARIZATION_SIDECAR_EXIT_NONZERO",
+        });
+      }
+
+      assert.deepEqual(conversionCalls, [
+        {
+          inputPath: wavPath,
+          outputPath: convertedPath,
+          options: { sampleRate: 16_000, channels: 1, redactPaths: true },
+        },
+      ]);
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].args.at(-1), convertedPath);
+      assert.deepEqual(removed, [convertedPath]);
+      assert.equal(fs.existsSync(convertedPath), false);
+      assert.equal(fs.existsSync(wavPath), true);
+    });
+  }
+
+  await t.test("conversion failure removes partial output before spawn", async () => {
+    const convertedPath = path.join(directory, "private-partial.wav");
+    const removed = [];
+    let spawnCount = 0;
+    const manager = new DiarizationManager({
+      convertToWavImpl: async (_inputPath, outputPath) => {
+        fs.writeFileSync(outputPath, Buffer.from("partial private audio"));
+        throw new Error("conversion failed");
+      },
+      createTempWavPathImpl: () => convertedPath,
+      unlinkImpl: async (filePath) => {
+        removed.push(filePath);
+        await fs.promises.unlink(filePath);
+      },
+      spawnImpl: () => {
+        spawnCount += 1;
+        return fakeSidecar();
+      },
+    });
+    manager.getBinaryPath = () => "diarizer";
+    manager.isModelDownloaded = () => true;
+
+    await assert.rejects(manager.diarizeStrict(wavPath), /conversion failed/);
+    assert.equal(spawnCount, 0);
+    assert.deepEqual(removed, [convertedPath]);
+    assert.equal(fs.existsSync(convertedPath), false);
+  });
+});
+
+test("strict diarization accepts only the packaged helper's known banner lines", () => {
+  const manager = new DiarizationManager();
+  const output = [
+    "OfflineSpeakerDiarizationConfig(segmentation=OfflineSpeakerSegmentationConfig(), embedding=OfflineSpeakerEmbeddingConfig())",
+    "Started",
+    "1.972 -- 3.203 speaker_01",
+  ].join("\n");
+
+  assert.deepEqual(manager._parseStrictOutput(output), [
+    { start: 1.972, end: 3.203, speaker: "speaker_01" },
+  ]);
+  assert.throws(
+    () => manager._parseStrictOutput(`${output}\nFinished`),
+    (error) => error.code === "DIARIZATION_SIDECAR_INVALID_OUTPUT"
+  );
+});
+
+test("diarization adapter logs exclude full audio, model, and binary paths", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-log-paths-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const wavPath = path.join(directory, "private-audio-24k.wav");
+  const convertedPath = path.join(directory, "private-converted-16k.wav");
+  const binaryPath = path.join(directory, "private-bin", "sherpa-onnx-diarize.exe");
+  const segmentationPath = path.join(directory, "private-models", "segmentation.onnx");
+  const embeddingPath = path.join(directory, "private-models", "embedding.onnx");
+  writeMonoPcm16Wav(wavPath, 24_000, [1, 2, 3, 4]);
+  const logCalls = [];
+  const loggerImpl = {
+    debug: (...args) => logCalls.push(args),
+    info: (...args) => logCalls.push(args),
+    warn: (...args) => logCalls.push(args),
+  };
+  const manager = new DiarizationManager({
+    loggerImpl,
+    convertToWavImpl: async (_inputPath, outputPath) => {
+      writeMonoPcm16Wav(outputPath, 16_000, [1, 2, 3]);
+    },
+    createTempWavPathImpl: () => convertedPath,
+    unlinkImpl: (filePath) => fs.promises.unlink(filePath),
+    spawnImpl: () =>
+      fakeSidecar({
+        code: 7,
+        stderr: `failed ${wavPath} ${convertedPath} ${segmentationPath} ${embeddingPath}`,
+      }),
+  });
+  manager.getBinaryPath = () => binaryPath;
+  manager.isModelDownloaded = () => true;
+  manager._resolveModelPath = (relativePath) =>
+    relativePath.includes("pyannote") ? segmentationPath : embeddingPath;
+
+  await assert.rejects(manager.diarizeStrict(wavPath), {
+    code: "DIARIZATION_SIDECAR_EXIT_NONZERO",
+  });
+
+  assert.ok(logCalls.length >= 2);
+  const serializedLogs = JSON.stringify(logCalls);
+  for (const privatePath of [
+    wavPath,
+    convertedPath,
+    binaryPath,
+    segmentationPath,
+    embeddingPath,
+  ]) {
+    assert.equal(serializedLogs.includes(privatePath), false);
+  }
+});
 
 test("strict diarization distinguishes dependency and sidecar failures while legacy stays tolerant", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-diarization-strict-"));

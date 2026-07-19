@@ -14,6 +14,7 @@ import type {
   JarvisSessionInput,
   JarvisSessionQuery,
   JarvisSessionStatus,
+  JarvisActivityClassification,
   JarvisSourceInterruptionInput,
   JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
@@ -27,6 +28,9 @@ import type {
   JarvisAnalysisStatus,
   JarvisAnalysisBudgetInput,
   JarvisAnalysisBudgetStatus,
+  JarvisResourceGovernanceSettings,
+  JarvisApplicationAudioSettings,
+  JarvisApplicationAudioStatus,
   JarvisMemoryItem,
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
@@ -593,6 +597,7 @@ declare global {
           segments: JarvisTranscriptSegmentInput[]
         ) => Promise<JarvisTranscriptSegment[]>;
         listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
+        listActivityClassifications: (sessionId: string) => Promise<JarvisActivityClassification[]>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listSessionSpeakerClusters: (sessionId: string) => Promise<JarvisSpeakerClusterView[]>;
@@ -637,7 +642,10 @@ declare global {
           sessionId: string,
           kind: "incremental" | "final"
         ) => Promise<JarvisAnalysisStatus>;
-        regenerateDailyDigest: (localDate: string) => Promise<JarvisDailyDigestStatus>;
+        regenerateDailyDigest: (
+          localDate: string,
+          allowUsageUnknown?: boolean
+        ) => Promise<JarvisDailyDigestStatus>;
         getAnalysisStatus: (sessionId: string) => Promise<JarvisAnalysisStatus>;
         getMiniMaxConfig: () => Promise<JarvisMiniMaxConfig>;
         setMiniMaxKey: (key: string) => Promise<JarvisMiniMaxConfig>;
@@ -646,6 +654,14 @@ declare global {
         setAnalysisBudget: (
           input: JarvisAnalysisBudgetInput
         ) => Promise<JarvisAnalysisBudgetStatus>;
+        getResourceGovernance: () => Promise<JarvisResourceGovernanceSettings>;
+        setResourceGovernance: (
+          input: JarvisResourceGovernanceSettings
+        ) => Promise<JarvisResourceGovernanceSettings>;
+        getApplicationAudioSettings: () => Promise<JarvisApplicationAudioStatus>;
+        setApplicationAudioSettings: (
+          input: JarvisApplicationAudioSettings
+        ) => Promise<JarvisApplicationAudioStatus>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
         setRetentionMode: (
           id: string,

@@ -49,6 +49,16 @@ class DeterministicVad {
   }
 }
 
+class FalseNegativeVad {
+  isReady() {
+    return true;
+  }
+
+  async classify() {
+    return 0.01;
+  }
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -285,6 +295,24 @@ test("initial silence keeps the writer closed and first retained chunk starts at
       .prepare("SELECT started_at, ended_at, reason FROM audio_gaps ORDER BY started_at")
       .all(),
     [{ started_at: 0, ended_at: 3_000, reason: "silence_suppressed" }]
+  );
+});
+
+test("audible PCM is durably retained even when VAD reports a false negative", async (t) => {
+  const { repository, service } = runtime(t, {
+    vadClassifier: new FalseNegativeVad(),
+  });
+
+  await appendAndDrain(service, "mic", pcm(1_000, 2_048));
+  service.finishCapture("s1", 1_000);
+
+  assert.deepEqual(
+    repository.listAudioChunks("s1").map((chunk) => ({
+      startedAt: chunk.started_at,
+      endedAt: chunk.ended_at,
+      durationMs: chunk.duration_ms,
+    })),
+    [{ startedAt: 0, endedAt: 1_000, durationMs: 1_000 }]
   );
 });
 

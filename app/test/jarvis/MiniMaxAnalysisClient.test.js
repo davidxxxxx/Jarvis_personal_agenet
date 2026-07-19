@@ -4,6 +4,10 @@ const assert = require("node:assert/strict");
 const MiniMaxAnalysisClient = require("../../src/jarvis/main/MiniMaxAnalysisClient");
 const { AnalysisClientError } = MiniMaxAnalysisClient;
 
+test("allows long MiniMax reasoning responses while keeping a finite timeout", () => {
+  assert.equal(MiniMaxAnalysisClient.DEFAULT_TIMEOUT_MS, 240_000);
+});
+
 function candidate(overrides = {}) {
   return {
     schemaVersion: "jarvis-analysis-v2",
@@ -77,9 +81,36 @@ function expectClientError(code, retryable, issueCode = undefined) {
   };
 }
 
-test("accepts exactly one tool call direct object or single JSON fence", async () => {
+test("accepts documented MiniMax reasoning content beside a valid tool call", async () => {
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () =>
+      response(
+        envelope(
+          toolMessage(candidate(), {
+            content: "<think>private reasoning stays out of the result</think>",
+          })
+        )
+      ),
+    getApiKey: () => "unit-test-key",
+  });
+
+  assert.deepEqual((await client.analyze(analysisInput())).result, candidate());
+});
+
+test("accepts MiniMax tool-call compatibility fields, direct object, or JSON fence", async () => {
   const messages = [
-    toolMessage(),
+    toolMessage(candidate(), {
+      content: [{ type: "text", text: "separated reasoning metadata" }],
+      function_call: null,
+    }),
+    {
+      content: null,
+      tool_calls: [],
+      function_call: {
+        name: "submit_jarvis_analysis",
+        arguments: JSON.stringify(candidate()),
+      },
+    },
     { content: JSON.stringify(candidate()) },
     { content: `\n\`\`\`JSON\n${JSON.stringify(candidate())}\n\`\`\`\n` },
   ];
@@ -96,41 +127,55 @@ test("accepts exactly one tool call direct object or single JSON fence", async (
     assert.deepEqual(result.usage, { inputTokens: 10, outputTokens: 20 });
     assert.equal(result.model, "MiniMax-M2.7");
   }
-  assert.equal(index, 3);
+  assert.equal(index, messages.length);
 });
 
-test("rejects ambiguous envelopes arrays primitives prose and mixed tool content", async () => {
+test("rejects ambiguous envelopes arrays primitives prose and malformed tool content", async () => {
   const invalidBodies = [
-    JSON.stringify({ choices: [] }),
-    JSON.stringify({ choices: [{ message: {} }, { message: {} }] }),
-    envelope({ ...toolMessage(), content: JSON.stringify(candidate()) }),
-    envelope({
-      ...toolMessage(),
-      tool_calls: [...toolMessage().tool_calls, ...toolMessage().tool_calls],
-    }),
-    envelope({ content: `${JSON.stringify(candidate())}\ntrailing prose` }),
-    envelope({ content: `${JSON.stringify(candidate())}${JSON.stringify(candidate())}` }),
-    envelope({ content: "```json\n{}\n```\n```json\n{}\n```" }),
-    envelope({ content: "[]" }),
-    envelope({ content: "1" }),
-    envelope({
-      content: JSON.stringify(candidate()),
-      function_call: { name: "submit_jarvis_analysis", arguments: JSON.stringify(candidate()) },
-    }),
-    envelope({
-      content: null,
-      function_call: { name: "submit_jarvis_analysis", arguments: JSON.stringify(candidate()) },
-    }),
+    [JSON.stringify({ choices: [] }), "envelope.choices_count"],
+    [
+      JSON.stringify({ choices: [{ message: {} }, { message: {} }] }),
+      "envelope.choices_count",
+    ],
+    [
+      envelope({
+        ...toolMessage(),
+        tool_calls: [...toolMessage().tool_calls, ...toolMessage().tool_calls],
+      }),
+      "envelope.tool_calls_count",
+    ],
+    [
+      envelope({
+        ...toolMessage(),
+        function_call: {
+          name: "submit_jarvis_analysis",
+          arguments: JSON.stringify(candidate()),
+        },
+      }),
+      "envelope.conflicting_function_call",
+    ],
+    [
+      envelope({ content: `${JSON.stringify(candidate())}\ntrailing prose` }),
+      "envelope.content.shape",
+    ],
+    [
+      envelope({ content: `${JSON.stringify(candidate())}${JSON.stringify(candidate())}` }),
+      "envelope.content.ambiguous",
+    ],
+    [envelope({ content: "```json\n{}\n```\n```json\n{}\n```" }), "envelope.content_fence"],
+    [envelope({ content: "[]" }), "envelope.content.shape"],
+    [envelope({ content: "1" }), "envelope.content.shape"],
+    [envelope({ content: null, function_call: { name: "other", arguments: "{}" } }), "envelope.legacy_function_call_shape"],
   ];
   let calls = 0;
   const client = new MiniMaxAnalysisClient({
-    fetchImpl: async () => response(invalidBodies[calls++]),
+    fetchImpl: async () => response(invalidBodies[calls++][0]),
     getApiKey: () => "unit-test-key",
   });
-  for (const _body of invalidBodies) {
+  for (const [, issueCode] of invalidBodies) {
     await assert.rejects(
       client.analyze(analysisInput()),
-      expectClientError("invalid_structure", false)
+      expectClientError("invalid_structure", false, issueCode)
     );
   }
   assert.equal(calls, invalidBodies.length);
@@ -154,6 +199,34 @@ test("strict schema failures make one request and never upload a repair", async 
   assert.doesNotMatch(JSON.stringify(requests), /repair|invalidAnalysis/i);
 });
 
+test("preserves authoritative usage when MiniMax returns an invalid candidate", async () => {
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () =>
+      response(envelope(toolMessage(candidate({ todos: { items: [] } })))),
+    getApiKey: () => "unit-test-key",
+  });
+
+  await assert.rejects(client.analyze(analysisInput()), (error) => {
+    assert.ok(expectClientError("invalid_structure", false, "schema.collection_type.todos")(error));
+    assert.deepEqual(error.authoritativeUsage, { inputTokens: 10, outputTokens: 20 });
+    return true;
+  });
+});
+
+test("rejects missing usage instead of treating it as authoritative zero", async () => {
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () =>
+      response(
+        JSON.stringify({
+          choices: [{ message: toolMessage() }],
+        })
+      ),
+    getApiKey: () => "unit-test-key",
+  });
+
+  await assert.rejects(client.analyze(analysisInput()), expectClientError("usage_unknown", false));
+});
+
 test("uses only the official HTTPS endpoint and privacy-preserving fetch options", async () => {
   let captured;
   const client = new MiniMaxAnalysisClient({
@@ -172,6 +245,10 @@ test("uses only the official HTTPS endpoint and privacy-preserving fetch options
   assert.equal(captured.options.useSessionCookies, false);
   assert.equal(captured.body.stream, false);
   assert.equal(captured.body.tools[0].function.name, "submit_jarvis_analysis");
+  assert.equal(captured.body.tool_choice, "auto");
+  assert.equal(captured.body.reasoning_split, true);
+  assert.equal(captured.body.temperature, 1);
+  assert.equal(captured.body.max_completion_tokens, 8192);
   assert.equal(captured.body.messages[1].content, analysisInput().cloudPayloadJson);
   assert.equal("allowedSegmentIds" in captured.body, false);
 

@@ -1,13 +1,300 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 31;
+const TARGET_VERSION = 34;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
+
+const PHASE2_INTELLIGENCE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS speaker_cluster_model_embeddings (
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL CHECK(
+      typeof(model_id) = 'text' AND length(trim(model_id)) BETWEEN 1 AND 200
+    ),
+    artifact_version TEXT NOT NULL CHECK(
+      typeof(artifact_version) = 'text' AND length(trim(artifact_version)) BETWEEN 1 AND 200
+    ),
+    embedding_space TEXT NOT NULL CHECK(
+      typeof(embedding_space) = 'text' AND length(trim(embedding_space)) BETWEEN 1 AND 128
+    ),
+    embedding BLOB NOT NULL CHECK(typeof(embedding) = 'blob' AND length(embedding) > 0),
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('mic','application','system_mix')),
+    attribution_state TEXT NOT NULL CHECK(attribution_state IN ('exact','mixed_unknown')),
+    speech_ms INTEGER NOT NULL CHECK(typeof(speech_ms) = 'integer' AND speech_ms >= 0),
+    window_count INTEGER NOT NULL CHECK(typeof(window_count) = 'integer' AND window_count >= 0),
+    quality_score REAL NOT NULL CHECK(
+      typeof(quality_score) IN ('real','integer') AND quality_score BETWEEN 0 AND 1
+    ),
+    overlap_detected INTEGER NOT NULL CHECK(overlap_detected IN (0,1)),
+    echo_detected INTEGER NOT NULL CHECK(echo_detected IN (0,1)),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    PRIMARY KEY(cluster_id, model_id),
+    UNIQUE(cluster_id, embedding_space),
+    CHECK(
+      (attribution_state = 'exact' AND source_kind IN ('mic','application'))
+      OR (attribution_state = 'mixed_unknown' AND source_kind = 'system_mix')
+    ),
+    CHECK(
+      attribution_state = 'mixed_unknown'
+      OR (overlap_detected = 0 AND echo_detected = 0)
+    )
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_speaker_cluster_models_model
+  ON speaker_cluster_model_embeddings(model_id, cluster_id);
+
+  CREATE TABLE IF NOT EXISTS speaker_identity_resolution_model_evidence (
+    resolution_id TEXT NOT NULL
+      REFERENCES speaker_identity_resolutions(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL CHECK(
+      typeof(model_id) = 'text' AND length(trim(model_id)) BETWEEN 1 AND 200
+    ),
+    artifact_version TEXT NOT NULL CHECK(
+      typeof(artifact_version) = 'text' AND length(trim(artifact_version)) BETWEEN 1 AND 200
+    ),
+    embedding_space TEXT NOT NULL CHECK(
+      typeof(embedding_space) = 'text' AND length(trim(embedding_space)) BETWEEN 1 AND 128
+    ),
+    similarity REAL NOT NULL CHECK(
+      typeof(similarity) IN ('real','integer') AND similarity BETWEEN -1 AND 1
+    ),
+    margin REAL NOT NULL CHECK(
+      typeof(margin) IN ('real','integer') AND margin BETWEEN 0 AND 2
+    ),
+    passed INTEGER NOT NULL CHECK(passed IN (0,1)),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    PRIMARY KEY(resolution_id, model_id),
+    UNIQUE(resolution_id, embedding_space)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_speaker_resolution_models_model
+  ON speaker_identity_resolution_model_evidence(model_id, resolution_id);
+
+  CREATE TABLE IF NOT EXISTS activity_classifications (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL CHECK(typeof(started_at) = 'integer' AND started_at >= 0),
+    ended_at INTEGER NOT NULL CHECK(
+      typeof(ended_at) = 'integer' AND ended_at > started_at
+    ),
+    category TEXT NOT NULL CHECK(category IN (
+      'work_meeting','learning','social_call','in_person_conversation',
+      'entertainment','gaming','other','unknown'
+    )),
+    confidence REAL NOT NULL CHECK(
+      typeof(confidence) IN ('real','integer') AND confidence BETWEEN 0 AND 1
+    ),
+    decision TEXT NOT NULL CHECK(decision IN ('adopted','tentative','unknown')),
+    source TEXT NOT NULL CHECK(source IN ('local','minimax','user')),
+    reason TEXT NOT NULL CHECK(
+      typeof(reason) = 'text' AND length(trim(reason)) BETWEEN 1 AND 1000
+    ),
+    source_attribution TEXT NOT NULL CHECK(source_attribution IN (
+      'application','microphone','application_and_microphone','mixed_unknown'
+    )),
+    evidence_json TEXT NOT NULL CHECK(
+      typeof(evidence_json) = 'text'
+      AND json_valid(evidence_json)
+      AND json_type(evidence_json) = 'object'
+    ),
+    supersedes_id TEXT REFERENCES activity_classifications(id) ON DELETE RESTRICT,
+    user_corrected_at INTEGER CHECK(
+      user_corrected_at IS NULL OR (
+        typeof(user_corrected_at) = 'integer' AND user_corrected_at >= 0
+      )
+    ),
+    created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(
+      typeof(updated_at) = 'integer' AND updated_at >= created_at
+    ),
+    CHECK(
+      (decision = 'adopted' AND confidence >= 0.8)
+      OR (decision = 'tentative' AND confidence >= 0.55 AND confidence < 0.8)
+      OR (decision = 'unknown' AND confidence < 0.55)
+    ),
+    CHECK(source_attribution <> 'mixed_unknown' OR confidence < 0.8),
+    CHECK(
+      (source = 'user' AND user_corrected_at IS NOT NULL)
+      OR (source <> 'user' AND user_corrected_at IS NULL)
+    ),
+    CHECK(supersedes_id IS NULL OR supersedes_id <> id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_activity_classifications_session_time
+  ON activity_classifications(session_id, started_at, ended_at, id);
+
+  CREATE INDEX IF NOT EXISTS idx_activity_classifications_category_time
+  ON activity_classifications(category, started_at, id);
+`;
+
+function audioTracksV32Schema(tableName, { ifNotExists = false } = {}) {
+  if (tableName !== "audio_tracks" && tableName !== "audio_tracks_v32") {
+    throw new TypeError("unsupported audio tracks table name");
+  }
+  return `
+    CREATE TABLE ${ifNotExists ? "IF NOT EXISTS " : ""}${tableName} (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL CHECK(source_type IN ('mic','system')),
+      application_key TEXT,
+      application_display_name TEXT,
+      capture_generation INTEGER NOT NULL DEFAULT 0 CHECK(
+        typeof(capture_generation) = 'integer' AND capture_generation >= 0
+      ),
+      track_kind TEXT GENERATED ALWAYS AS (
+        CASE
+          WHEN source_type = 'mic' THEN 'mic'
+          WHEN application_key IS NULL THEN 'system_mix'
+          ELSE 'application'
+        END
+      ) STORED,
+      attribution_state TEXT GENERATED ALWAYS AS (
+        CASE
+          WHEN source_type = 'system' AND application_key IS NULL THEN 'mixed_unknown'
+          ELSE 'exact'
+        END
+      ) STORED,
+      device_id TEXT,
+      device_label TEXT,
+      strategy TEXT,
+      sample_rate INTEGER NOT NULL,
+      channels INTEGER NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      state TEXT NOT NULL,
+      CHECK(
+        (application_key IS NULL AND application_display_name IS NULL)
+        OR (
+          source_type = 'system'
+          AND typeof(application_key) = 'text'
+          AND length(application_key) BETWEEN 1 AND 64
+          AND application_key = lower(application_key)
+          AND application_key NOT GLOB '*[^a-z0-9._-]*'
+          AND typeof(application_display_name) = 'text'
+          AND length(trim(application_display_name)) BETWEEN 1 AND 80
+          AND instr(application_display_name, char(92)) = 0
+          AND instr(application_display_name, '/') = 0
+          AND instr(application_display_name, ':') = 0
+        )
+      )
+    );
+  `;
+}
+
+const APPLICATION_AUDIO_TRACK_INDEXES = `
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_tracks_session_mic
+    ON audio_tracks(session_id)
+    WHERE track_kind = 'mic';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_tracks_session_system_mix
+    ON audio_tracks(session_id)
+    WHERE track_kind = 'system_mix';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_tracks_session_application
+    ON audio_tracks(session_id, application_key)
+    WHERE track_kind = 'application';
+  CREATE INDEX IF NOT EXISTS idx_audio_tracks_session_kind_started
+    ON audio_tracks(session_id, track_kind, started_at, id);
+  CREATE INDEX IF NOT EXISTS idx_audio_tracks_application_started
+    ON audio_tracks(application_key, started_at, id)
+    WHERE track_kind = 'application';
+`;
+
+const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS application_audio_intervals (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    interval_kind TEXT NOT NULL CHECK(
+      interval_kind IN ('application_active','mixed_fallback')
+    ),
+    application_key TEXT,
+    attribution_state TEXT NOT NULL CHECK(
+      attribution_state IN ('exact','mixed_unknown')
+    ),
+    capture_generation INTEGER NOT NULL DEFAULT 0 CHECK(
+      typeof(capture_generation) = 'integer' AND capture_generation >= 0
+    ),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    CHECK(ended_at IS NULL OR ended_at > started_at),
+    CHECK(reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 128)
+  );
+  CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_session_time
+    ON application_audio_intervals(session_id, started_at, id);
+  CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_track_time
+    ON application_audio_intervals(track_id, started_at, id);
+  CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_application_time
+    ON application_audio_intervals(application_key, started_at, id)
+    WHERE application_key IS NOT NULL;
+
+  CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_insert
+  BEFORE INSERT ON application_audio_intervals
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid application audio interval')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM audio_tracks AS track
+      WHERE track.id = NEW.track_id
+        AND track.session_id = NEW.session_id
+        AND (
+          (
+            NEW.interval_kind = 'application_active'
+            AND NEW.attribution_state = 'exact'
+            AND NEW.application_key IS NOT NULL
+            AND track.track_kind = 'application'
+            AND track.application_key = NEW.application_key
+            AND NEW.reason IS NULL
+          )
+          OR (
+            NEW.interval_kind = 'mixed_fallback'
+            AND NEW.attribution_state = 'mixed_unknown'
+            AND NEW.application_key IS NULL
+            AND track.track_kind = 'system_mix'
+            AND NEW.reason IS NOT NULL
+          )
+        )
+    );
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_update
+  BEFORE UPDATE OF session_id, track_id, interval_kind, application_key,
+                   attribution_state, capture_generation, started_at, ended_at, reason
+  ON application_audio_intervals
+  BEGIN
+    SELECT RAISE(ABORT, 'invalid application audio interval')
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM audio_tracks AS track
+      WHERE track.id = NEW.track_id
+        AND track.session_id = NEW.session_id
+        AND (
+          (
+            NEW.interval_kind = 'application_active'
+            AND NEW.attribution_state = 'exact'
+            AND NEW.application_key IS NOT NULL
+            AND track.track_kind = 'application'
+            AND track.application_key = NEW.application_key
+            AND NEW.reason IS NULL
+          )
+          OR (
+            NEW.interval_kind = 'mixed_fallback'
+            AND NEW.attribution_state = 'mixed_unknown'
+            AND NEW.application_key IS NULL
+            AND track.track_kind = 'system_mix'
+            AND NEW.reason IS NOT NULL
+          )
+        )
+    );
+  END;
+`;
 
 function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
   if (
-    !new Set(["transcript_segments", "transcript_segments_v13", "transcript_segments_v14"]).has(
-      tableName
-    )
+    !new Set([
+      "transcript_segments",
+      "transcript_segments_v13",
+      "transcript_segments_v14",
+      "transcript_segments_v33",
+    ]).has(tableName)
   ) {
     throw new TypeError("unsupported transcript segment table name");
   }
@@ -49,7 +336,9 @@ function transcriptSegmentsSchema(tableName, { ifNotExists = false } = {}) {
       CHECK(superseded_by IS NULL OR result_kind = 'provisional'),
       CHECK(
         duplicate_of IS NULL OR (
-          source_type = 'mic' AND echo_score >= 0.8 AND duplicate_of <> id
+          source_type IN ('mic','system')
+          AND (source_type = 'system' OR echo_score >= 0.8)
+          AND duplicate_of <> id
         )
       ),
       CHECK(
@@ -78,6 +367,10 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_chunk_model_final
     ON transcript_segments(chunk_id, model_version)
     WHERE chunk_id IS NOT NULL AND result_kind = 'final';
+  DROP TRIGGER IF EXISTS validate_transcript_duplicate_insert;
+  DROP TRIGGER IF EXISTS validate_transcript_duplicate_update;
+  DROP TRIGGER IF EXISTS invalidate_transcript_duplicates_on_target_text_update;
+  DROP TRIGGER IF EXISTS validate_transcript_duplicate_target_update;
   CREATE TRIGGER IF NOT EXISTS validate_final_transcript_lineage_insert
   BEFORE INSERT ON transcript_segments
   WHEN NEW.result_kind = 'final'
@@ -181,38 +474,66 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
   WHEN NEW.duplicate_of IS NOT NULL
   BEGIN
     SELECT RAISE(ABORT, 'invalid transcript duplicate')
-    WHERE NEW.source_type <> 'mic'
-      OR NEW.echo_score IS NULL
-      OR NEW.echo_score < 0.8
-      OR NEW.id = NEW.duplicate_of
+    WHERE NEW.id = NEW.duplicate_of
       OR NOT EXISTS (
         SELECT 1
         FROM transcript_segments AS target
+        JOIN audio_tracks AS source_track ON source_track.id = NEW.track_id
+        JOIN audio_tracks AS target_track ON target_track.id = target.track_id
         WHERE target.id = NEW.duplicate_of
           AND target.session_id = NEW.session_id
           AND target.source_type = 'system'
+          AND source_track.session_id = NEW.session_id
+          AND target_track.session_id = NEW.session_id
           AND NEW.started_at < target.ended_at
           AND target.started_at < NEW.ended_at
+          AND (
+            (
+              NEW.source_type = 'mic'
+              AND NEW.echo_score >= 0.8
+              AND source_track.track_kind = 'mic'
+              AND target_track.track_kind IN ('system_mix','application')
+            )
+            OR (
+              NEW.source_type = 'system'
+              AND source_track.track_kind = 'system_mix'
+              AND target_track.track_kind = 'application'
+            )
+          )
       );
   END;
   CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_update
-  BEFORE UPDATE OF duplicate_of, session_id, source_type, started_at, ended_at, echo_score
+  BEFORE UPDATE OF duplicate_of, session_id, track_id, source_type, started_at, ended_at, echo_score
   ON transcript_segments
   WHEN NEW.duplicate_of IS NOT NULL
   BEGIN
     SELECT RAISE(ABORT, 'invalid transcript duplicate')
-    WHERE NEW.source_type <> 'mic'
-      OR NEW.echo_score IS NULL
-      OR NEW.echo_score < 0.8
-      OR NEW.id = NEW.duplicate_of
+    WHERE NEW.id = NEW.duplicate_of
       OR NOT EXISTS (
         SELECT 1
         FROM transcript_segments AS target
+        JOIN audio_tracks AS source_track ON source_track.id = NEW.track_id
+        JOIN audio_tracks AS target_track ON target_track.id = target.track_id
         WHERE target.id = NEW.duplicate_of
           AND target.session_id = NEW.session_id
           AND target.source_type = 'system'
+          AND source_track.session_id = NEW.session_id
+          AND target_track.session_id = NEW.session_id
           AND NEW.started_at < target.ended_at
           AND target.started_at < NEW.ended_at
+          AND (
+            (
+              NEW.source_type = 'mic'
+              AND NEW.echo_score >= 0.8
+              AND source_track.track_kind = 'mic'
+              AND target_track.track_kind IN ('system_mix','application')
+            )
+            OR (
+              NEW.source_type = 'system'
+              AND source_track.track_kind = 'system_mix'
+              AND target_track.track_kind = 'application'
+            )
+          )
       );
   END;
   CREATE TRIGGER IF NOT EXISTS invalidate_transcript_duplicates_on_target_text_update
@@ -224,7 +545,7 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
     WHERE duplicate_of = OLD.id;
   END;
   CREATE TRIGGER IF NOT EXISTS validate_transcript_duplicate_target_update
-  BEFORE UPDATE OF id, session_id, source_type, started_at, ended_at
+  BEFORE UPDATE OF id, session_id, track_id, source_type, started_at, ended_at
   ON transcript_segments
   WHEN EXISTS (
     SELECT 1 FROM transcript_segments AS source
@@ -241,6 +562,27 @@ const TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS = `
             source.session_id <> NEW.session_id
             OR source.started_at >= NEW.ended_at
             OR NEW.started_at >= source.ended_at
+            OR NOT EXISTS (
+              SELECT 1
+              FROM audio_tracks AS source_track
+              JOIN audio_tracks AS target_track ON target_track.id = NEW.track_id
+              WHERE source_track.id = source.track_id
+                AND source_track.session_id = source.session_id
+                AND target_track.session_id = NEW.session_id
+                AND (
+                  (
+                    source.source_type = 'mic'
+                    AND source.echo_score >= 0.8
+                    AND source_track.track_kind = 'mic'
+                    AND target_track.track_kind IN ('system_mix','application')
+                  )
+                  OR (
+                    source.source_type = 'system'
+                    AND source_track.track_kind = 'system_mix'
+                    AND target_track.track_kind = 'application'
+                  )
+                )
+            )
           )
       );
   END;
@@ -433,7 +775,8 @@ const DAILY_DIGEST_QUERY_INDEXES = `
   CREATE INDEX idx_transcript_segments_digest_active_day
   ON transcript_segments(started_at, ended_at, id)
   WHERE superseded_by IS NULL
-    AND duplicate_of IS NULL;
+    AND duplicate_of IS NULL
+    AND (result_kind <> 'final' OR is_stable <> 1);
 
   CREATE INDEX idx_evidence_refs_digest_day
   ON evidence_refs(entity_type, started_at, ended_at, transcript_segment_id, entity_id);
@@ -870,6 +1213,31 @@ const TODO_OWNER_SNAPSHOT_TRIGGERS = `
   )
   BEGIN
     SELECT RAISE(ABORT, 'todo owner binding is invalid');
+  END;
+`;
+
+const ANALYSIS_INPUT_SEGMENT_SOURCE_PROTECTION_TRIGGERS = `
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_update
+  BEFORE UPDATE OF session_id, started_at, ended_at, speaker_label, text, is_stable,
+    track_id, chunk_id, result_kind, version, superseded_by, duplicate_of
+  ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1 FROM analysis_input_segments WHERE segment_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_delete
+  BEFORE DELETE ON transcript_segments
+  WHEN EXISTS (
+    SELECT 1
+    FROM analysis_input_segments AS manifest
+    JOIN analysis_inputs AS input ON input.id = manifest.analysis_input_id
+    JOIN sessions AS session ON session.id = input.session_id
+    WHERE manifest.segment_id = OLD.id
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
   END;
 `;
 
@@ -1601,28 +1969,7 @@ const MEMORY_LINEAGE_SCHEMA = `
   BEGIN
     SELECT RAISE(ABORT, 'analysis input segment ordinal is invalid');
   END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_update
-  BEFORE UPDATE OF session_id, started_at, ended_at, speaker_label, text, is_stable,
-    track_id, chunk_id, result_kind, version, superseded_by, duplicate_of
-  ON transcript_segments
-  WHEN EXISTS (
-    SELECT 1 FROM analysis_input_segments WHERE segment_id = OLD.id
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
-  END;
-  CREATE TRIGGER IF NOT EXISTS analysis_input_segments_protect_source_delete
-  BEFORE DELETE ON transcript_segments
-  WHEN EXISTS (
-    SELECT 1
-    FROM analysis_input_segments AS manifest
-    JOIN analysis_inputs AS input ON input.id = manifest.analysis_input_id
-    JOIN sessions AS session ON session.id = input.session_id
-    WHERE manifest.segment_id = OLD.id
-  )
-  BEGIN
-    SELECT RAISE(ABORT, 'manifested transcript segment is immutable');
-  END;
+  ${ANALYSIS_INPUT_SEGMENT_SOURCE_PROTECTION_TRIGGERS}
   CREATE TRIGGER IF NOT EXISTS memory_items_v2_source_deleted
   AFTER UPDATE OF source_analysis_input_id ON memory_items_v2
   WHEN OLD.source_analysis_input_id IS NOT NULL AND NEW.source_analysis_input_id IS NULL
@@ -3308,7 +3655,9 @@ const ANALYSIS_BUDGET_SCHEMA = `
   CREATE TABLE analysis_budget_price_versions (
     provider TEXT NOT NULL CHECK(typeof(provider) = 'text' AND length(provider) BETWEEN 1 AND 64),
     model TEXT NOT NULL CHECK(typeof(model) = 'text' AND length(model) BETWEEN 1 AND 128),
-    operation TEXT NOT NULL CHECK(operation IN ('session_analysis','daily_digest')),
+    operation TEXT NOT NULL CHECK(
+      operation IN ('session_analysis','daily_digest','activity_classification')
+    ),
     price_version TEXT NOT NULL
       CHECK(typeof(price_version) = 'text' AND length(price_version) BETWEEN 1 AND 128),
     currency TEXT NOT NULL CHECK(currency = 'USD'),
@@ -3716,6 +4065,9 @@ const ANALYSIS_BUDGET_SCHEMA = `
       'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
       'paygo_list_price_equivalent', 1784160000000),
     ('minimax', 'MiniMax-M2.7', 'daily_digest',
+      'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
+      'paygo_list_price_equivalent', 1784160000000),
+    ('minimax', 'MiniMax-M2.7', 'activity_classification',
       'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
       'paygo_list_price_equivalent', 1784160000000);
 `;
@@ -4167,10 +4519,12 @@ function retainValidAnalysisBudgetSchema(db, { allowAttemptPeriodTriggerUpgrade 
     )
     .all();
   if (
-    reviewedPrices.length !== 2 ||
+    reviewedPrices.length !== 3 ||
     reviewedPrices.some(
       (price) =>
-        !new Set(["session_analysis", "daily_digest"]).has(price.operation) ||
+        !new Set(["session_analysis", "daily_digest", "activity_classification"]).has(
+          price.operation
+        ) ||
         price.input_per_million_microusd !== 300_000 ||
         price.output_per_million_microusd !== 1_200_000 ||
         price.currency !== "USD" ||
@@ -4592,6 +4946,63 @@ function rebuildTranscriptSegmentsV14(db) {
     db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
   }
   db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
+}
+
+function upgradeTranscriptDuplicateLineageV33(db) {
+  if (!tableExists(db, "transcript_segments")) return;
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.exec(transcriptSegmentsSchema("transcript_segments_v33"));
+  db.exec(`
+    INSERT INTO transcript_segments_v33 (
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at, superseded_by,
+      echo_score, duplicate_of
+    )
+    SELECT
+      id, session_id, started_at, ended_at, person_id, speaker_label,
+      text, confidence, is_stable, analysis_state, track_id, chunk_id,
+      source_type, result_kind, version, model_version, completed_at, superseded_by,
+      echo_score, duplicate_of
+    FROM transcript_segments;
+    DROP INDEX IF EXISTS idx_segments_session_time;
+    DROP INDEX IF EXISTS idx_segments_superseded_by;
+    DROP INDEX IF EXISTS idx_segments_duplicate_of;
+    DROP INDEX IF EXISTS idx_transcript_chunk_model_final;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_insert;
+    DROP TRIGGER IF EXISTS validate_final_transcript_lineage_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_insert;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_update;
+    DROP TRIGGER IF EXISTS validate_transcript_supersession_target_update;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_insert;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_update;
+    DROP TRIGGER IF EXISTS invalidate_transcript_duplicates_on_target_text_update;
+    DROP TRIGGER IF EXISTS validate_transcript_duplicate_target_update;
+  `);
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP TABLE transcript_segments;
+      ALTER TABLE transcript_segments_v33 RENAME TO transcript_segments;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS);
+  db.exec(ANALYSIS_INPUT_SEGMENT_SOURCE_PROTECTION_TRIGGERS);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_transcript_segments_digest_day
+    ON transcript_segments(started_at, ended_at, id)
+    WHERE result_kind = 'final'
+      AND is_stable = 1
+      AND superseded_by IS NULL
+      AND duplicate_of IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_transcript_segments_digest_active_day
+    ON transcript_segments(started_at, ended_at, id)
+    WHERE superseded_by IS NULL
+      AND duplicate_of IS NULL
+      AND (result_kind <> 'final' OR is_stable <> 1);
+  `);
 }
 
 function rebuildLegacyProcessingJobs(db) {
@@ -5392,6 +5803,235 @@ function upgradeAnalysisBudgetModesV31(db) {
   `);
 }
 
+function upgradeApplicationAudioTracksV32(db) {
+  if (!tableExists(db, "audio_tracks")) {
+    throw new Error("v32 application audio tracks require audio_tracks");
+  }
+
+  const trackColumns = new Set(
+    db
+      .prepare("PRAGMA table_xinfo(audio_tracks)")
+      .all()
+      .map((row) => row.name)
+  );
+  const v32Columns = [
+    "application_key",
+    "application_display_name",
+    "capture_generation",
+    "track_kind",
+    "attribution_state",
+  ];
+  const presentV32Columns = v32Columns.filter((name) => trackColumns.has(name));
+  if (presentV32Columns.length === v32Columns.length) {
+    db.exec(APPLICATION_AUDIO_TRACK_INDEXES);
+    db.exec(APPLICATION_AUDIO_INTERVALS_SCHEMA);
+    return;
+  }
+  if (presentV32Columns.length > 0 || tableExists(db, "audio_tracks_v32")) {
+    throw new Error("application audio track schema collision");
+  }
+
+  for (const required of [
+    "id",
+    "session_id",
+    "source_type",
+    "device_id",
+    "device_label",
+    "strategy",
+    "sample_rate",
+    "channels",
+    "started_at",
+    "ended_at",
+    "state",
+  ]) {
+    if (!trackColumns.has(required)) {
+      throw new Error(`v32 application audio tracks require audio_tracks.${required}`);
+    }
+  }
+
+  const dependentSchemaObjects = db
+    .prepare(
+      `SELECT type, name, sql
+       FROM sqlite_master
+       WHERE sql IS NOT NULL
+         AND (
+           (type IN ('trigger','view') AND lower(sql) LIKE '%audio_tracks%')
+           OR (type = 'index' AND tbl_name = 'audio_tracks')
+         )
+       ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 ELSE 2 END, name`
+    )
+    .all();
+  const quoteIdentifier = (value) => `"${String(value).replaceAll('"', '""')}"`;
+
+  try {
+    for (const object of dependentSchemaObjects) {
+      if (object.type === "trigger") {
+        db.exec(`DROP TRIGGER ${quoteIdentifier(object.name)}`);
+      } else if (object.type === "view") {
+        db.exec(`DROP VIEW ${quoteIdentifier(object.name)}`);
+      }
+    }
+    db.exec(audioTracksV32Schema("audio_tracks_v32"));
+    db.exec(`
+      INSERT INTO audio_tracks_v32 (
+        id, session_id, source_type, application_key, application_display_name,
+        capture_generation, device_id, device_label, strategy,
+        sample_rate, channels, started_at, ended_at, state
+      )
+      SELECT
+        id, session_id, source_type, NULL, NULL,
+        0, device_id, device_label, strategy,
+        sample_rate, channels, started_at, ended_at, state
+      FROM audio_tracks;
+
+      DROP TABLE audio_tracks;
+      ALTER TABLE audio_tracks_v32 RENAME TO audio_tracks;
+    `);
+    for (const object of dependentSchemaObjects
+      .filter((candidate) => candidate.type !== "index")
+      .sort((left, right) => {
+        const order = { view: 0, trigger: 1 };
+        return order[left.type] - order[right.type] || left.name.localeCompare(right.name);
+      })) {
+      db.exec(object.sql);
+    }
+    for (const object of dependentSchemaObjects.filter(
+      (candidate) => candidate.type === "index"
+    )) {
+      db.exec(object.sql);
+    }
+  } catch (error) {
+    throw new Error(`v32 application audio track rebuild failed: ${error.message}`, {
+      cause: error,
+    });
+  }
+  db.exec(APPLICATION_AUDIO_TRACK_INDEXES);
+  db.exec(APPLICATION_AUDIO_INTERVALS_SCHEMA);
+}
+
+function upgradePhase2IntelligenceV34(db) {
+  const priceTable = db
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'analysis_budget_price_versions'`
+    )
+    .get();
+  if (priceTable && !priceTable.sql.includes("activity_classification")) {
+    for (const trigger of [
+      "analysis_budget_price_versions_no_update",
+      "analysis_budget_price_versions_no_replacement",
+      "analysis_budget_price_versions_no_delete",
+      "analysis_budget_attempts_validate_snapshot",
+    ]) {
+      db.exec(`DROP TRIGGER IF EXISTS ${trigger}`);
+    }
+    db.exec(`
+      CREATE TABLE analysis_budget_price_versions_v34 (
+        provider TEXT NOT NULL CHECK(
+          typeof(provider) = 'text' AND length(provider) BETWEEN 1 AND 64
+        ),
+        model TEXT NOT NULL CHECK(
+          typeof(model) = 'text' AND length(model) BETWEEN 1 AND 128
+        ),
+        operation TEXT NOT NULL CHECK(
+          operation IN ('session_analysis','daily_digest','activity_classification')
+        ),
+        price_version TEXT NOT NULL CHECK(
+          typeof(price_version) = 'text' AND length(price_version) BETWEEN 1 AND 128
+        ),
+        currency TEXT NOT NULL CHECK(currency = 'USD'),
+        input_per_million_microusd INTEGER NOT NULL CHECK(
+          typeof(input_per_million_microusd) = 'integer'
+          AND input_per_million_microusd BETWEEN 0 AND 1000000000
+        ),
+        output_per_million_microusd INTEGER NOT NULL CHECK(
+          typeof(output_per_million_microusd) = 'integer'
+          AND output_per_million_microusd BETWEEN 0 AND 1000000000
+        ),
+        billing_basis TEXT NOT NULL CHECK(billing_basis = 'paygo_list_price_equivalent'),
+        created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+        PRIMARY KEY(provider, model, operation, price_version)
+      );
+      INSERT INTO analysis_budget_price_versions_v34
+      SELECT * FROM analysis_budget_price_versions;
+      INSERT INTO analysis_budget_price_versions_v34 (
+        provider, model, operation, price_version, currency,
+        input_per_million_microusd, output_per_million_microusd,
+        billing_basis, created_at
+      ) VALUES (
+        'minimax', 'MiniMax-M2.7', 'activity_classification',
+        'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
+        'paygo_list_price_equivalent', 1784160000000
+      );
+      DROP TABLE analysis_budget_price_versions;
+      ALTER TABLE analysis_budget_price_versions_v34
+        RENAME TO analysis_budget_price_versions;
+
+      CREATE TRIGGER analysis_budget_price_versions_no_update
+      BEFORE UPDATE ON analysis_budget_price_versions
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis budget price history is immutable');
+      END;
+      CREATE TRIGGER analysis_budget_price_versions_no_replacement
+      BEFORE INSERT ON analysis_budget_price_versions
+      WHEN EXISTS (
+        SELECT 1 FROM analysis_budget_price_versions
+        WHERE provider = NEW.provider
+          AND model = NEW.model
+          AND operation = NEW.operation
+          AND price_version = NEW.price_version
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis budget price replacement is forbidden');
+      END;
+      CREATE TRIGGER analysis_budget_price_versions_no_delete
+      BEFORE DELETE ON analysis_budget_price_versions
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis budget price history is immutable');
+      END;
+      CREATE TRIGGER analysis_budget_attempts_validate_snapshot
+      BEFORE INSERT ON analysis_budget_attempts
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM analysis_budget_price_versions AS price
+        WHERE price.provider = NEW.provider
+          AND price.model = NEW.model
+          AND price.operation = NEW.operation
+          AND price.price_version = NEW.price_version
+          AND price.currency = NEW.currency
+          AND price.input_per_million_microusd = NEW.input_per_million_microusd
+          AND price.output_per_million_microusd = NEW.output_per_million_microusd
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis budget price snapshot mismatch');
+      END;
+    `);
+  } else if (priceTable) {
+    const activityPrice = db
+      .prepare(
+        `SELECT 1 FROM analysis_budget_price_versions
+         WHERE provider = 'minimax' AND model = 'MiniMax-M2.7'
+           AND operation = 'activity_classification'
+           AND price_version = 'minimax-m2.7-standard-2026-07-16'`
+      )
+      .get();
+    if (!activityPrice) {
+      db.prepare(
+        `INSERT INTO analysis_budget_price_versions (
+          provider, model, operation, price_version, currency,
+          input_per_million_microusd, output_per_million_microusd,
+          billing_basis, created_at
+        ) VALUES (
+          'minimax', 'MiniMax-M2.7', 'activity_classification',
+          'minimax-m2.7-standard-2026-07-16', 'USD', 300000, 1200000,
+          'paygo_list_price_equivalent', 1784160000000
+        )`
+      ).run();
+    }
+  }
+  db.exec(PHASE2_INTELLIGENCE_SCHEMA);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -5403,11 +6043,29 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
   }
 
   const rebuildsTranscriptSegments = tableExists(db, "transcript_segments");
+  const rebuildsApplicationAudioTracks =
+    tableExists(db, "audio_tracks") && !columns(db, "audio_tracks").has("application_key");
+  const budgetPriceSql = tableExists(db, "analysis_budget_price_versions")
+    ? db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+           WHERE type = 'table' AND name = 'analysis_budget_price_versions'`
+        )
+        .get()?.sql
+    : null;
+  const rebuildsAnalysisBudgetPrices =
+    fromVersion < 34 &&
+    typeof budgetPriceSql === "string" &&
+    !budgetPriceSql.includes("activity_classification");
+  const rebuildsReferencedSchema =
+    rebuildsTranscriptSegments ||
+    rebuildsApplicationAudioTracks ||
+    rebuildsAnalysisBudgetPrices;
   const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
-  if (rebuildsTranscriptSegments && db.inTransaction) {
-    throw new Error("transcript schema migration must own the outer transaction");
+  if (rebuildsReferencedSchema && db.inTransaction) {
+    throw new Error("referenced schema migration must own the outer transaction");
   }
-  if (rebuildsTranscriptSegments && foreignKeysWereEnabled) {
+  if (rebuildsReferencedSchema && foreignKeysWereEnabled) {
     db.pragma("foreign_keys = OFF");
   }
 
@@ -5443,21 +6101,11 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       addColumn(db, "audio_chunks", "retired_path TEXT");
       addColumn(db, "audio_chunks", "retired_format TEXT");
       addColumn(db, "audio_chunks", "retired_file_sha256 TEXT");
+      db.exec(audioTracksV32Schema("audio_tracks", { ifNotExists: true }));
+      if (fromVersion < 32) {
+        upgradeApplicationAudioTracksV32(db);
+      }
       db.exec(`
-      CREATE TABLE IF NOT EXISTS audio_tracks (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-        source_type TEXT NOT NULL CHECK(source_type IN ('mic','system')),
-        device_id TEXT,
-        device_label TEXT,
-        strategy TEXT,
-        sample_rate INTEGER NOT NULL,
-        channels INTEGER NOT NULL,
-        started_at INTEGER NOT NULL,
-        ended_at INTEGER,
-        state TEXT NOT NULL,
-        UNIQUE(session_id, source_type)
-      );
       CREATE TABLE IF NOT EXISTS audio_gaps (
         id TEXT PRIMARY KEY,
         track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
@@ -5671,6 +6319,12 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 31) {
         upgradeAnalysisBudgetModesV31(db);
       }
+      if (fromVersion < 33) {
+        upgradeTranscriptDuplicateLineageV33(db);
+      }
+      if (fromVersion < 34) {
+        upgradePhase2IntelligenceV34(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -5679,7 +6333,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       db.pragma(`user_version = ${TARGET_VERSION}`);
     })();
   } finally {
-    if (rebuildsTranscriptSegments && foreignKeysWereEnabled) {
+    if (rebuildsReferencedSchema && foreignKeysWereEnabled) {
       db.pragma("foreign_keys = ON");
     }
   }
@@ -5698,6 +6352,10 @@ module.exports = {
   AGENT_WORKLOAD_SCHEMA,
   upgradeAgentWorkloadV26,
   upgradeDailyDigestV29,
+  upgradeTranscriptDuplicateLineageV33,
   upgradePublicKnowledgeIndexesV30,
   upgradeAnalysisBudgetModesV31,
+  upgradeApplicationAudioTracksV32,
+  PHASE2_INTELLIGENCE_SCHEMA,
+  upgradePhase2IntelligenceV34,
 };

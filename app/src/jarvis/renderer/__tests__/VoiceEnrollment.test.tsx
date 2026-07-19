@@ -33,8 +33,15 @@ function createAudioHarness({
   nodeError,
   contextError,
 }: AudioHarnessOptions = {}) {
-  const track = { stop: vi.fn() };
-  const stream = { getTracks: () => [track] } as unknown as MediaStream;
+  const track = {
+    stop: vi.fn(),
+    label: "Physical microphone",
+    getSettings: vi.fn(() => ({ deviceId: "physical-mic-1" })),
+  };
+  const stream = {
+    getTracks: () => [track],
+    getAudioTracks: () => [track],
+  } as unknown as MediaStream;
   const source = { connect: vi.fn(), disconnect: vi.fn() };
   const gain = { connect: vi.fn(), disconnect: vi.fn(), gain: { value: 1 } };
   const port = {

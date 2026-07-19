@@ -7,7 +7,7 @@ function loadWorker() {
   return require("../../src/jarvis/main/JarvisAnalysisWorker");
 }
 
-function workerHarness({ applyResult = { status: "applied" } } = {}) {
+function workerHarness({ applyResult = { status: "applied" }, applyError = null } = {}) {
   const calls = [];
   const store = {
     completeJob(jobId, input) {
@@ -21,7 +21,8 @@ function workerHarness({ applyResult = { status: "applied" } } = {}) {
     deferJob() {
       return true;
     },
-    blockJob() {
+    blockJob(jobId, input) {
+      calls.push(["block", jobId, input]);
       return true;
     },
     recordJobExecutionDevice() {
@@ -31,6 +32,7 @@ function workerHarness({ applyResult = { status: "applied" } } = {}) {
   const memoryRepository = {
     applyStoredAnalysisCandidate(input) {
       calls.push(["apply", input]);
+      if (applyError) throw applyError;
       return applyResult;
     },
     getAnalysisInputForCloud() {
@@ -132,6 +134,25 @@ test("startup applies a validated candidate and completes it with zero client ca
     ],
     ["complete", "job-analysis-1", { owner: "cloud-worker", at: 200, executionDevice: "cloud" }],
   ]);
+});
+
+test("startup blocks a validated candidate whose local application fails", () => {
+  const { worker, calls } = workerHarness({
+    applyError: Object.assign(new Error("local merge failed"), { code: "MEMORY_MERGER_INVALID_INPUT" }),
+  });
+
+  assert.deepEqual(
+    worker.recoverCandidate({
+      jobId: "job-analysis-1",
+      candidateId: "candidate-1",
+      candidateState: "validated",
+      leaseOwner: "cloud-worker",
+      leaseExpiresAt: 500,
+    }),
+    { status: "blocked", reason: "candidate_apply_failed", jobId: "job-analysis-1" }
+  );
+  assert.equal(calls.some(([name]) => name === "complete"), false);
+  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_candidate_apply_failed");
 });
 
 test("startup supersedes a reconciled superseded candidate with zero network or apply calls", () => {
@@ -326,9 +347,11 @@ function executionHarness({
   clientError = null,
   attempts = [],
   applyResult = { status: "applied" },
+  applyError = null,
   executionDeviceRecorded = true,
   executionDeviceError = null,
   clientConfigured = true,
+  budgetMode = "capped",
 } = {}) {
   const JarvisAnalysisWorker = loadWorker();
   const calls = [];
@@ -399,10 +422,15 @@ function executionHarness({
     },
     applyStoredAnalysisCandidate(input) {
       calls.push(["apply", input]);
+      if (applyError) throw applyError;
       return applyResult;
     },
   };
   const budgetGuard = {
+    getStatus() {
+      calls.push(["budget_status"]);
+      return { mode: budgetMode };
+    },
     listAttemptDispositionsByJob(input) {
       calls.push(["load_attempts", input]);
       return attempts;
@@ -631,6 +659,49 @@ test("budget denial defers without deleting pending analysis work", async () => 
   );
 });
 
+test("manual retry authorization survives resource deferral before transport", async () => {
+  const head = desiredHead();
+  const reconciled = {
+    requestId: "prior-paid-request",
+    jobId: "job-analysis-1",
+    attemptNumber: 1,
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    operation: "session_analysis",
+    state: "reconciled",
+    actualInputTokens: 100,
+    actualOutputTokens: 50,
+    actualMicrousd: 10,
+  };
+  const harness = executionHarness({
+    initialHead: head,
+    attempts: [reconciled],
+    admissionStates: [
+      admissionState(head, {
+        pressure: {
+          state: "busy",
+          reason: "external_gpu_busy",
+          cpuLoadPct: 20,
+          memoryLoadPct: 30,
+          onAcPower: true,
+          batteryLevelPct: 100,
+        },
+      }),
+    ],
+  });
+
+  const result = await harness.worker.execute(
+    claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })
+  );
+
+  assert.equal(result.status, "deferred");
+  assert.equal(harness.calls.some(([name]) => name === "request"), false);
+  assert.equal(
+    harness.calls.find(([name]) => name === "defer")[2].preserveManualRetry,
+    true
+  );
+});
+
 test("prior started and usage-unknown attempts always block before reservation", async () => {
   for (const state of ["started", "usage_unknown"]) {
     const { worker, calls } = executionHarness({
@@ -663,6 +734,50 @@ test("prior started and usage-unknown attempts always block before reservation",
       });
     }
   }
+});
+
+test("an explicit manual retry may replace usage-unknown work only in no-limit mode", async () => {
+  const attempt = {
+    requestId: "budget-request-old",
+    jobId: "job-analysis-1",
+    attemptNumber: 1,
+    provider: "minimax",
+    model: "MiniMax-M2.7",
+    operation: "session_analysis",
+    state: "usage_unknown",
+  };
+  const capped = executionHarness({ attempts: [attempt], budgetMode: "capped" });
+  assert.equal(
+    (
+      await capped.worker.execute(
+        claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })
+      )
+    ).status,
+    "blocked"
+  );
+  assert.equal(capped.calls.some(([name]) => name === "request"), false);
+
+  const unlimited = executionHarness({
+    attempts: [attempt],
+    budgetMode: "unlimited",
+    reserveResult: {
+      ok: true,
+      requestId: "budget-request-1",
+      attemptNumber: 2,
+      state: "reserved",
+      reservedMicrousd: 100,
+      replayed: false,
+    },
+  });
+  assert.equal(
+    (
+      await unlimited.worker.execute(
+        claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })
+      )
+    ).status,
+    "applied"
+  );
+  assert.equal(unlimited.calls.filter(([name]) => name === "request").length, 1);
 });
 
 test("a prior reserved attempt is durably released before the next attempt", async () => {
@@ -852,6 +967,23 @@ test("invalid response structure with authoritative usage reconciles then blocks
     false
   );
   assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_invalid_response");
+});
+
+test("a paid validated response blocks durably when local candidate application fails", async () => {
+  const { worker, calls } = executionHarness({
+    applyError: Object.assign(new Error("local merge failed"), { code: "MEMORY_MERGER_INVALID_INPUT" }),
+  });
+
+  assert.deepEqual(await worker.execute(claimedJob()), {
+    status: "blocked",
+    reason: "candidate_apply_failed",
+    jobId: "job-analysis-1",
+  });
+  assert.equal(calls.filter(([name]) => name === "request").length, 1);
+  assert.equal(calls.filter(([name]) => name === "reconcile").length, 1);
+  assert.equal(calls.filter(([name]) => name === "persist").length, 1);
+  assert.equal(calls.some(([name]) => name === "complete"), false);
+  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_candidate_apply_failed");
 });
 
 test("a head change after paid response reconciles cost but CAS causes no visible write", async () => {

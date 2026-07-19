@@ -16,6 +16,7 @@ const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
 const DEFAULT_MAX_REQUEST_BYTES = DEFAULT_DAILY_DIGEST_REQUEST_BYTES;
 const DEFAULT_MAX_RESPONSE_BYTES = MAX_DAILY_DIGEST_RESPONSE_BYTES;
+const DEFAULT_TIMEOUT_MS = 240_000;
 const OFFICIAL_HOSTS = new Set(["api.minimaxi.com", "api.minimax.io"]);
 const LOG_KEYS = new Set([
   "requestId",
@@ -426,9 +427,6 @@ function extractCandidate(body) {
     if (!Array.isArray(toolCalls) || toolCalls.length !== 1) {
       throw clientError("invalid_structure");
     }
-    if (message.content !== undefined && message.content !== null && message.content !== "") {
-      throw clientError("invalid_structure");
-    }
     const call = toolCalls[0];
     if (
       call?.function?.name !== "submit_jarvis_daily_digest" ||
@@ -436,6 +434,8 @@ function extractCandidate(body) {
     ) {
       throw clientError("invalid_structure");
     }
+    // MiniMax M2.7 can include reasoning content beside a valid tool call.
+    // Only the validated tool arguments are eligible for persistence.
     return parseJsonObject(call.function.arguments);
   }
   if (hasFinishReason && choice.finish_reason !== "stop") {
@@ -530,7 +530,7 @@ class MiniMaxDailyDigestClient {
     getApiKey,
     baseUrl = DEFAULT_BASE_URL,
     model = DEFAULT_MODEL,
-    timeoutMs = 60_000,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
     maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES,
     maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
     logger = () => {},
@@ -613,6 +613,7 @@ class MiniMaxDailyDigestClient {
           type: "function",
           function: { name: "submit_jarvis_daily_digest" },
         },
+        reasoning_split: true,
         temperature: 0.1,
         max_completion_tokens: 4_096,
         stream: false,

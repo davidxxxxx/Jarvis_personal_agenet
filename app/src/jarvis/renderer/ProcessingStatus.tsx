@@ -61,6 +61,23 @@ function speakerRetryLabel(deferral: JarvisRuntimeDeferral, observedAt: number) 
   return `${Math.max(1, Math.ceil(waitMs / 60_000))} 分钟后重试`;
 }
 
+function ApplicationCaptureStatus({ timeline }: { timeline: JarvisSessionTimeline }) {
+  const capture = timeline.application_capture;
+  if (!capture || (capture.exact_duration_ms === 0 && capture.fallback_duration_ms === 0)) {
+    return null;
+  }
+  return (
+    <p className="text-xs text-muted-foreground">
+      应用音频：
+      {capture.exact_coverage_pct === null ? "覆盖率待计算" : `精确来源 ${capture.exact_coverage_pct}%`}
+      {capture.degraded_intervals.length > 0
+        ? ` · ${capture.degraded_intervals.length} 个降级时段`
+        : " · 无降级"}
+      {capture.recovery_points.length > 0 ? ` · 已恢复 ${capture.recovery_points.length} 次` : null}
+    </p>
+  );
+}
+
 function primaryRuntimeLabel(status: JarvisRuntimeStatus) {
   const capture = status.capture;
   if (capture.status === "degraded") return "正在恢复麦克风";
@@ -94,8 +111,14 @@ function formatMinutes(value: number) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value);
 }
 
-function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
-  const primary = primaryRuntimeLabel(status);
+function RuntimeProcessingStatus({
+  status,
+  selectedSessionReady = false,
+}: {
+  status: JarvisRuntimeStatus;
+  selectedSessionReady?: boolean;
+}) {
+  const primary = selectedSessionReady ? "此会话处理完成" : primaryRuntimeLabel(status);
   const work = activeWorkLabel(status);
   const recordingContinues =
     status.capture.status === "recording" || status.capture.status === "degraded";
@@ -104,9 +127,11 @@ function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
       ? "CUDA"
       : status.backend.actualBackend === "cpu"
         ? "CPU"
-        : status.backend.actualBackend === "cloud"
+      : status.backend.actualBackend === "cloud"
           ? "云端"
-          : "尚未运行";
+          : ["recording", "degraded", "finalizing"].includes(status.capture.status)
+            ? "尚未运行"
+            : "按需启动（当前空闲）";
   const coverage = `${
     status.queue.provisionalCoveragePct === null
       ? "临时覆盖 --"
@@ -125,10 +150,17 @@ function RuntimeProcessingStatus({ status }: { status: JarvisRuntimeStatus }) {
         <p role="status" className="font-medium text-foreground">
           {primary}
         </p>
-        {work && <p className="text-muted-foreground">{work}</p>}
+        {work && (
+          <p className="text-muted-foreground">
+            {selectedSessionReady ? `全局后台任务：${work}` : work}
+          </p>
+        )}
         {recordingContinues && work && <p className="text-muted-foreground">录音继续安全保存</p>}
       </div>
       <div className="grid gap-1 text-muted-foreground sm:grid-cols-2">
+        {selectedSessionReady && (
+          <p className="font-medium text-foreground sm:col-span-2">以下为全局后台状态</p>
+        )}
         <p>
           后端 {backend}
           {status.backend.actualBackend === "cuda" && status.backend.cudaGpuUuid
@@ -198,8 +230,22 @@ export default function ProcessingStatus({
   timeline: JarvisSessionTimeline;
   runtimeStatus?: JarvisRuntimeStatus | null;
 }) {
-  if (runtimeStatus) return <RuntimeProcessingStatus status={runtimeStatus} />;
   const counts = timeline.processing_counts;
+  const selectedSessionReady =
+    timeline.processing_state === "ready" &&
+    counts.blocked === 0 &&
+    (timeline.status === "completed" || timeline.status === "recovered");
+  if (runtimeStatus) {
+    return (
+      <div className="space-y-3">
+        <RuntimeProcessingStatus
+          status={runtimeStatus}
+          selectedSessionReady={selectedSessionReady}
+        />
+        <ApplicationCaptureStatus timeline={timeline} />
+      </div>
+    );
+  }
   const captureLabel =
     timeline.status === "recording"
       ? "正在录音"
@@ -229,6 +275,7 @@ export default function ProcessingStatus({
       <div className="space-y-2">
         <p role="status">{captureLabel}</p>
         {preview}
+        <ApplicationCaptureStatus timeline={timeline} />
         {blockedAlert}
       </div>
     );
@@ -237,6 +284,7 @@ export default function ProcessingStatus({
     return (
       <div className="space-y-2">
         {preview}
+        <ApplicationCaptureStatus timeline={timeline} />
         {blockedAlert}
       </div>
     );
@@ -246,6 +294,7 @@ export default function ProcessingStatus({
       <div className="space-y-2">
         <p role="status">处理完成</p>
         {preview}
+        <ApplicationCaptureStatus timeline={timeline} />
       </div>
     );
   }
@@ -257,6 +306,7 @@ export default function ProcessingStatus({
         {counts.completed}/{counts.total}
       </p>
       {preview}
+      <ApplicationCaptureStatus timeline={timeline} />
     </div>
   );
 }

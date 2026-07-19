@@ -326,6 +326,15 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
             {t(actionError ? "jarvis.operationError" : recordingErrorKey)}
           </p>
         )}
+        {recording.transcriptionWarning &&
+          ["recording", "paused", "finalizing"].includes(session.status) && (
+            <p
+              role="status"
+              className="mt-3 rounded-md bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {t("jarvis.transcriptionPaused")}
+            </p>
+          )}
         {showsRetentionRuntime &&
           effectiveRetentionMode === "continuous_fallback" &&
           retentionDegradedReason && (

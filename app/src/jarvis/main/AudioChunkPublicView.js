@@ -47,11 +47,29 @@ const RENDERER_AUDIO_TRACK_FIELDS = Object.freeze([
   "id",
   "session_id",
   "source_type",
+  "track_kind",
+  "application_key",
+  "application_display_name",
+  "attribution_state",
+  "capture_generation",
   "sample_rate",
   "channels",
   "started_at",
   "ended_at",
   "state",
+]);
+
+const RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS = Object.freeze([
+  "id",
+  "session_id",
+  "track_id",
+  "interval_kind",
+  "application_key",
+  "attribution_state",
+  "capture_generation",
+  "started_at",
+  "ended_at",
+  "reason",
 ]);
 
 const RENDERER_AUDIO_GAP_FIELDS = Object.freeze([
@@ -87,6 +105,45 @@ function toRendererAudioTrack(row) {
   return {
     ...projectFields(row, RENDERER_AUDIO_TRACK_FIELDS),
     gaps: Array.isArray(row.gaps) ? row.gaps.map(toRendererAudioGap) : [],
+  };
+}
+
+function toRendererApplicationAudioInterval(row) {
+  return projectFields(row, RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS);
+}
+
+function summarizeApplicationAudio(intervals) {
+  const closed = intervals.filter(
+    (interval) =>
+      Number.isSafeInteger(interval.started_at) &&
+      Number.isSafeInteger(interval.ended_at) &&
+      interval.ended_at > interval.started_at
+  );
+  const exact = closed.filter((interval) => interval.attribution_state === "exact");
+  const fallback = closed.filter((interval) => interval.attribution_state === "mixed_unknown");
+  const duration = (entries) =>
+    entries.reduce((total, interval) => total + interval.ended_at - interval.started_at, 0);
+  const exactDurationMs = duration(exact);
+  const fallbackDurationMs = duration(fallback);
+  const totalDurationMs = exactDurationMs + fallbackDurationMs;
+  const recoveryPoints = exact
+    .filter((interval) =>
+      fallback.some(
+        (degraded) =>
+          degraded.capture_generation === interval.capture_generation &&
+          degraded.ended_at === interval.started_at
+      )
+    )
+    .map((interval) => interval.started_at)
+    .filter((at, index, values) => values.indexOf(at) === index)
+    .sort((left, right) => left - right);
+  return {
+    exact_duration_ms: exactDurationMs,
+    fallback_duration_ms: fallbackDurationMs,
+    exact_coverage_pct:
+      totalDurationMs === 0 ? null : Math.round((exactDurationMs * 10_000) / totalDurationMs) / 100,
+    degraded_intervals: fallback.map(toRendererApplicationAudioInterval),
+    recovery_points: recoveryPoints,
   };
 }
 
@@ -152,6 +209,14 @@ function toRendererSessionTimeline(timeline, previewStatus = null) {
       "ready_at",
     ]),
     tracks: Array.isArray(timeline.tracks) ? timeline.tracks.map(toRendererAudioTrack) : [],
+    application_audio_intervals: Array.isArray(timeline.application_audio_intervals)
+      ? timeline.application_audio_intervals.map(toRendererApplicationAudioInterval)
+      : [],
+    application_capture: summarizeApplicationAudio(
+      Array.isArray(timeline.application_audio_intervals)
+        ? timeline.application_audio_intervals
+        : []
+    ),
     gaps: Array.isArray(timeline.gaps) ? timeline.gaps.map(toRendererAudioGap) : [],
     chunks: Array.isArray(timeline.chunks) ? timeline.chunks.map(toRendererAudioChunk) : [],
     segments: Array.isArray(timeline.segments) ? timeline.segments : [],
@@ -171,11 +236,14 @@ module.exports = {
   PUBLIC_AUDIO_CHUNK_FIELDS,
   RENDERER_AUDIO_CHUNK_FIELDS,
   RENDERER_AUDIO_TRACK_FIELDS,
+  RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS,
   RENDERER_AUDIO_GAP_FIELDS,
   toPublicAudioChunk,
   toRendererAudioChunk,
   toRendererAudioGap,
   toRendererAudioTrack,
+  toRendererApplicationAudioInterval,
+  summarizeApplicationAudio,
   toRendererSession,
   toPublicSessionDetail,
   toRendererSessionTimeline,

@@ -132,6 +132,26 @@ test("speech gaps of three seconds remain one retained region", () => {
   assert.deepEqual(mergeRanges(writes), [{ startMs: 0, endMs: 5_000 }]);
 });
 
+test("audible-signal safeguard retains sound when VAD confidence is falsely low", () => {
+  const gate = new SpeechTriggeredCaptureGate({
+    sampleRate: SAMPLE_RATE,
+    preRollMs: 0,
+    postRollMs: 0,
+    mergeGapMs: 0,
+  });
+
+  const result = gate.accept({
+    sourceType: "system",
+    pcm: pcm(1_000, 2_048),
+    capturedAt: 0,
+    speechProbability: 0.01,
+    signalDetected: true,
+  });
+
+  assert.equal(result.retain, true);
+  assert.deepEqual(mergeRanges(result.writes), [{ startMs: 0, endMs: 1_000 }]);
+});
+
 test("mergeGapMs extends the retained bridge when it is longer than post-roll", () => {
   const gate = new SpeechTriggeredCaptureGate({
     sampleRate: SAMPLE_RATE,

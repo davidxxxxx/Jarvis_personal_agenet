@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const CudaWhisperVerifier = require("../../src/jarvis/main/CudaWhisperVerifier");
-const { createRealProbeServer } = CudaWhisperVerifier;
+const { createRealProbeServer, queryGpuProcessTelemetry } = CudaWhisperVerifier;
 
 function verifierFor({ inference, evidence, telemetry, launchError } = {}) {
   let stopped = 0;
@@ -75,6 +75,79 @@ test("accepts only inference plus CUDA evidence and matching PID telemetry", asy
     gpuUuid: "GPU-a",
     peakVramMb: 128,
   });
+});
+
+test("accepts WDDM PID memory only after inference and matching CUDA server evidence", async () => {
+  const { verifier } = verifierFor({
+    telemetry: { gpuUuid: null, processFound: true, vramMb: 256, source: "wddm" },
+  });
+
+  assert.deepEqual(
+    await verifier.verify({ runtimeDir: "x", binaryPath: "b", modelPath: "m", gpuUuid: "GPU-a" }),
+    {
+      ok: true,
+      backend: "cuda",
+      gpuUuid: "GPU-a",
+      reason: "verified",
+    }
+  );
+  assert.deepEqual(verifier.getLastProofMetadata(), {
+    gpuUuid: "GPU-a",
+    peakVramMb: 256,
+  });
+});
+
+test("WDDM PID memory cannot substitute for mismatched server GPU evidence", async () => {
+  const { verifier } = verifierFor({
+    evidence: { backend: "cuda", gpuUuid: "GPU-b" },
+    telemetry: { gpuUuid: null, processFound: true, vramMb: 256, source: "wddm" },
+  });
+
+  assert.deepEqual(
+    await verifier.verify({ runtimeDir: "x", binaryPath: "b", modelPath: "m", gpuUuid: "GPU-a" }),
+    {
+      ok: false,
+      backend: "cuda",
+      gpuUuid: null,
+      reason: "server_gpu_uuid_mismatch",
+    }
+  );
+});
+
+test("Windows telemetry falls back to exact-PID GPU process memory when WDDM hides VRAM", async () => {
+  const calls = [];
+  const telemetry = await queryGpuProcessTelemetry(41, {
+    platform: "win32",
+    execFileImpl(file, args, options, callback) {
+      calls.push({ file, args, options });
+      if (file === "nvidia-smi") {
+        process.nextTick(() => callback(null, "41, GPU-a, [N/A]\n", ""));
+        return;
+      }
+      process.nextTick(() =>
+        callback(
+          null,
+          JSON.stringify({
+            processFound: true,
+            dedicatedBytes: 200 * 1024 * 1024,
+            sharedBytes: 56 * 1024 * 1024,
+          }),
+          ""
+        )
+      );
+    },
+  });
+
+  assert.deepEqual(telemetry, {
+    gpuUuid: "GPU-a",
+    processFound: true,
+    vramMb: 256,
+    source: "wddm",
+  });
+  assert.equal(calls[1].file.toLowerCase(), "powershell.exe");
+  assert.equal(calls[1].args.includes("-NonInteractive"), true);
+  assert.match(calls[1].args[calls[1].args.indexOf("-Command") + 1], /^& \{/u);
+  assert.equal(calls[1].options.windowsHide, true);
 });
 
 test("always stops the probe after malformed inference", async () => {

@@ -513,6 +513,39 @@ test("ready sessions enqueue final analysis before exact-session digest and clou
   assert.equal(calls.indexOf("digest_stop") < calls.indexOf("cloud_stop"), true);
 });
 
+test("startup repairs one missed ready-session analysis before starting the cloud dispatcher", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => calls.push("recover_leases"),
+      runOnce: async () => 0,
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: async () => calls.push("recover_analysis"),
+      analyzeSession() {},
+    },
+    cloudDispatcher: {
+      start: () => calls.push("cloud_start"),
+      drainOnce() {},
+      stop() {},
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  await runtime.start();
+  await runtime.stop();
+  assert.equal(calls.indexOf("recover_analysis") > calls.indexOf("recover_leases"), true);
+  assert.equal(calls.indexOf("recover_analysis") < calls.indexOf("cloud_start"), true);
+});
+
 test("ready notification failures are isolated so analysis and digest both get a chance", async () => {
   const phases = [];
   const runtime = new JarvisProcessingRuntime({
@@ -2204,6 +2237,101 @@ test("idle runtime admits claimable retention and storage before preview, then f
     "storage_recovery_compress",
     "preview",
     "final_transcription",
+  ]);
+});
+
+test("generic recovery runs while fullscreen and its first-exit recovery stay paused", async () => {
+  const calls = [];
+  const snapshots = [
+    {
+      state: "busy",
+      reason: "recovery_hysteresis",
+      fullscreenActivityActive: false,
+      restrictiveForMs: 0,
+      previewEnabled: true,
+    },
+    {
+      state: "busy",
+      reason: "fullscreen_game",
+      fullscreenActivityActive: true,
+      restrictiveForMs: 0,
+      previewEnabled: true,
+    },
+    {
+      state: "busy",
+      reason: "recovery_hysteresis",
+      fullscreenActivityActive: false,
+      restrictiveForMs: 0,
+      previewEnabled: true,
+    },
+  ];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases() {},
+      async runOnce() {
+        calls.push("job");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => {
+        calls.push("sessions");
+        return [];
+      },
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: {
+      reconcileSession() {
+        calls.push("reconcile");
+      },
+    },
+    deduper: { dedupe() {} },
+    governor: {
+      sample: async () => snapshots.shift(),
+    },
+    previewScheduler: {
+      request() {},
+      status: () => ({ mode: "paused" }),
+      tick: async (snapshot) => calls.push(`preview:${snapshot.reason}`),
+    },
+    cloudDispatcher: {
+      start() {},
+      drainOnce() {
+        calls.push("cloud");
+      },
+      stop() {},
+    },
+    dailyDigestScheduler: {
+      start() {},
+      tick() {
+        calls.push("digest");
+      },
+      onSessionReady() {},
+      stop() {},
+    },
+    onResourceSnapshot: (snapshot) => calls.push(`resource:${snapshot.reason}`),
+    prepareTranscriptionJobs() {
+      calls.push("prepare");
+    },
+    now: () => 0,
+  });
+
+  assert.equal(await runtime.drainOnce(), 0);
+  await runtime.previewInFlight;
+  assert.ok(calls.includes("job"), "generic recovery must not engage fullscreen yielding");
+  assert.ok(calls.includes("digest"), "generic recovery must keep background phases eligible");
+  calls.length = 0;
+
+  assert.equal(await runtime.drainOnce(), 0);
+  await runtime.previewInFlight;
+  assert.equal(await runtime.drainOnce(), 0);
+  await runtime.previewInFlight;
+  assert.deepEqual(calls, [
+    "resource:fullscreen_game",
+    "preview:fullscreen_game",
+    "resource:recovery_hysteresis",
+    "preview:recovery_hysteresis",
   ]);
 });
 

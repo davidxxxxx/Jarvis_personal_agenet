@@ -662,6 +662,7 @@ test(
     const base = await fsp.mkdtemp(path.join(os.tmpdir(), "jarvis-all-day-soak-"));
     const oldRoot = path.join(base, "old-root");
     const newRoot = path.join(base, "new-root");
+    const restartedRoot = path.join(base, "new-root-restarted");
     const journalRoot = path.join(base, "migration-journal");
     const recordingsRoot = path.join(oldRoot, "recordings");
     const dbPath = path.join(oldRoot, "jarvis.db");
@@ -1123,19 +1124,30 @@ test(
     assert.equal(repository.db.open, true);
 
     const restartedMigrator = new DataDirectoryMigrator(migrationOptions);
+    await assert.rejects(
+      withTimeout(
+        restartedMigrator.migrate({ from: oldRoot, to: newRoot }),
+        "same-destination data-root migration retry"
+      ),
+      /migration source changed; restart migration with a new destination/
+    );
+    assert.equal(configuredRoot, oldRoot);
+    assert.equal(repository.db.open, true);
+
+    const recoveryMigrator = new DataDirectoryMigrator(migrationOptions);
     const migrated = await withTimeout(
-      restartedMigrator.migrate({ from: oldRoot, to: newRoot }),
-      "restarted data-root migration"
+      recoveryMigrator.migrate({ from: oldRoot, to: restartedRoot }),
+      "fresh-destination data-root migration retry"
     );
     assert.equal(migrated.switched, true);
-    assert.equal(migrated.currentRoot, newRoot);
-    assert.equal(configuredRoot, newRoot);
+    assert.equal(migrated.currentRoot, restartedRoot);
+    assert.equal(configuredRoot, restartedRoot);
     assert.equal(fs.existsSync(oldRoot), true);
-    assert.deepEqual(await nonDatabaseFileHashes(newRoot), sourceHashes);
+    assert.deepEqual(await nonDatabaseFileHashes(restartedRoot), sourceHashes);
     assert.ok(migrationEvents.includes("reopen:old-root"));
-    assert.ok(migrationEvents.includes("reopen:new-root"));
+    assert.ok(migrationEvents.includes("reopen:new-root-restarted"));
 
-    const migratedRecordingsRoot = path.join(newRoot, "recordings");
+    const migratedRecordingsRoot = path.join(restartedRoot, "recordings");
     reader = new AudioEvidenceReader({
       decoder: codec,
       recordingsRoot: migratedRecordingsRoot,

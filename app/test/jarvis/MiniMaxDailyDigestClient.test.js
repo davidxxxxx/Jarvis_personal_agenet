@@ -118,6 +118,15 @@ function responseEnvelope(result = digestCandidate(), usage = {}) {
   };
 }
 
+test("allows long MiniMax daily-digest reasoning with a finite timeout", () => {
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(responseEnvelope()),
+  });
+
+  assert.equal(client.timeoutMs, 240_000);
+});
+
 function jsonResponse(body, init = {}) {
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -144,6 +153,7 @@ test("sends one operation-specific request and returns validated usage and byte 
   assert.equal(captured[0].options.redirect, "error");
   const requestBody = JSON.parse(captured[0].options.body);
   assert.equal(requestBody.tools[0].function.name, "submit_jarvis_daily_digest");
+  assert.equal(requestBody.reasoning_split, true);
   assert.equal(requestBody.messages[1].content, clientInput().cloudPayloadJson);
   assert.deepEqual(result, {
     result: digestCandidate(),
@@ -151,6 +161,20 @@ test("sends one operation-specific request and returns validated usage and byte 
     requestBytes: Buffer.byteLength(captured[0].options.body, "utf8"),
     responseBytes: Buffer.byteLength(JSON.stringify(envelope), "utf8"),
   });
+});
+
+test("accepts documented MiniMax reasoning content beside a valid digest tool call", async () => {
+  const envelope = responseEnvelope();
+  envelope.choices[0].message.content =
+    "<think>Private reasoning stays outside the persisted daily digest.</think>";
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(envelope),
+  });
+
+  const result = await client.generate(clientInput());
+
+  assert.equal(result.result.schemaVersion, "jarvis-daily-digest-v1");
 });
 
 function expectClientError(code, retryable = false) {

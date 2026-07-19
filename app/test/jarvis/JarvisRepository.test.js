@@ -269,6 +269,105 @@ test("session timeline returns deterministic source evidence, visible text, and 
   );
 });
 
+test("session timeline exposes distinct application tracks and conservative fallback intervals", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "application-session",
+    startedAt: 1_000,
+    micDeviceId: "mic-1",
+    captureMode: "dual",
+  });
+  repo.createTracks([
+    {
+      id: "track-mic",
+      sessionId: "application-session",
+      sourceType: "mic",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_000,
+    },
+    {
+      id: "track-mix",
+      sessionId: "application-session",
+      sourceType: "system",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_000,
+    },
+    {
+      id: "track-chrome",
+      sessionId: "application-session",
+      sourceType: "system",
+      applicationKey: "chrome",
+      applicationDisplayName: "Chrome",
+      captureGeneration: 1,
+      strategy: "include-process-tree",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_050,
+    },
+    {
+      id: "track-kook",
+      sessionId: "application-session",
+      sourceType: "system",
+      applicationKey: "kook",
+      applicationDisplayName: "KOOK",
+      captureGeneration: 1,
+      strategy: "include-process-tree",
+      sampleRate: 24_000,
+      channels: 1,
+      startedAt: 1_060,
+    },
+  ]);
+  repo.createApplicationAudioInterval({
+    id: "chrome-active",
+    sessionId: "application-session",
+    trackId: "track-chrome",
+    intervalKind: "application_active",
+    applicationKey: "chrome",
+    attributionState: "exact",
+    captureGeneration: 1,
+    startedAt: 1_050,
+    endedAt: 2_000,
+  });
+  repo.createApplicationAudioInterval({
+    id: "chrome-fallback",
+    sessionId: "application-session",
+    trackId: "track-mix",
+    intervalKind: "mixed_fallback",
+    attributionState: "mixed_unknown",
+    captureGeneration: 2,
+    startedAt: 2_000,
+    endedAt: 2_500,
+    reason: "application_process_restarted",
+  });
+
+  const timeline = repo.getSessionTimeline("application-session");
+  assert.deepEqual(
+    timeline.tracks.map((track) => [track.id, track.track_kind, track.application_key]),
+    [
+      ["track-mic", "mic", null],
+      ["track-chrome", "application", "chrome"],
+      ["track-kook", "application", "kook"],
+      ["track-mix", "system_mix", null],
+    ]
+  );
+  assert.deepEqual(
+    timeline.application_audio_intervals.map((interval) => [
+      interval.id,
+      interval.attribution_state,
+      interval.application_key,
+    ]),
+    [
+      ["chrome-active", "exact", "chrome"],
+      ["chrome-fallback", "mixed_unknown", null],
+    ]
+  );
+  assert.equal(repo.getSessionApplicationTrack("application-session", "chrome").id, "track-chrome");
+  assert.equal(repo.getSessionApplicationTrack("application-session", "dota2"), null);
+});
+
 test("system-only session persistence cannot retain a microphone device id", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -1258,6 +1357,45 @@ test("derived memory analysis is idempotent and queryable from every Jarvis view
   assert.equal(repo.setTodoStatus(todo.id, "completed", 70_000).status, "completed");
   assert.equal(repo.setTodoStatus(todo.id, "open", 80_000).completed_at, null);
   repo.close();
+});
+
+test("session detail and search expose the active v2 summary when no legacy summary exists", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({ id: "v2-summary-session", startedAt: 1_000, micDeviceId: null });
+  repo.db
+    .prepare(
+      `INSERT INTO session_summary_revisions (
+         id, session_id, revision, previous_revision_id, completeness, lifecycle,
+         content_json, source_analysis_input_id, provenance, created_at
+       ) VALUES (?, ?, 1, NULL, 'final', 'active', ?, NULL, 'evidence_linked', ?)`
+    )
+    .run(
+      "v2-summary-revision",
+      "v2-summary-session",
+      JSON.stringify({
+        title: "Project Northstar",
+        summary: "The unique v2 summary is visible in the completed session.",
+      }),
+      2_000
+    );
+
+  assert.deepEqual(repo.getSessionDetail("v2-summary-session").summary, {
+    session_id: "v2-summary-session",
+    summary: "The unique v2 summary is visible in the completed session.",
+    decisions_json: "[]",
+    suggestions_json: "[]",
+    updated_at: 2_000,
+    is_final: 1,
+  });
+  assert.deepEqual(
+    repo.searchMemory("Northstar", 10).map((session) => session.id),
+    ["v2-summary-session"]
+  );
+  assert.deepEqual(
+    repo.searchMemory("unique v2 summary", 10).map((session) => session.id),
+    ["v2-summary-session"]
+  );
 });
 
 test("analysis evidence must belong to the target session and rolls back as a unit", () => {

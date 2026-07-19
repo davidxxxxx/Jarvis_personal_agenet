@@ -63,6 +63,33 @@ function safeLegacySuggestions(value: string | null | undefined): LegacySuggesti
   }
 }
 
+function analysisErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (
+    /MEMORY_OWNER_OUT_OF_SCOPE|MEMORY_INPUT_(?:EMPTY|STALE)|analysis_input_(?:empty|invalid)/iu.test(
+      message
+    )
+  ) {
+    return "最终转写和说话人识别尚未完成，完成后会自动生成总结。";
+  }
+  if (/rate.?limit|quota|budget|预算|额度/iu.test(message)) {
+    return "MiniMax 云端额度或预算暂不可用，请检查云预算后重试。";
+  }
+  if (/unauthorized|forbidden|invalid.?key|api.?key|401|403/iu.test(message)) {
+    return "MiniMax Key 无效或未配置，请在设置中检查后重试。";
+  }
+  if (/analysis_runtime_not_ready|offline/iu.test(message)) {
+    return "云端分析暂不可用，恢复连接后会自动重试。";
+  }
+  if (/usage_unknown/iu.test(message)) {
+    return "上次云端请求的用量无法确认。有限预算模式已停止自动重试，避免重复计费；可切换为不设上限后手动重试。";
+  }
+  if (/invalid_response/iu.test(message)) {
+    return "MiniMax 返回的数据格式无效，请稍后重试。";
+  }
+  return "总结未能加入后台队列，请稍后重试。";
+}
+
 export default function MemoryView() {
   const storedSessions = useJarvisStore((state) => state.sessions);
   const selectedSessionId = useJarvisStore((state) => state.selectedSessionId);
@@ -112,6 +139,46 @@ export default function MemoryView() {
       window.clearInterval(timer);
     };
   }, [detail?.session.id, timeline]);
+
+  useEffect(() => {
+    const sessionId = detail?.session.id;
+    if (!sessionId || detail.summary || timeline?.processing_state !== "ready") return;
+    let cancelled = false;
+    let requestInFlight = false;
+    let timer: number | null = null;
+    const schedule = (delay: number) => {
+      if (cancelled || requestInFlight || timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void refresh();
+      }, delay);
+    };
+    const refresh = async () => {
+      if (cancelled || requestInFlight) return;
+      requestInFlight = true;
+      let summaryLoaded = false;
+      try {
+        const status = await window.electronAPI.jarvis.getAnalysisStatus(sessionId);
+        if (status.state === "ready") {
+          const nextDetail = await window.electronAPI.jarvis.getSessionDetail(sessionId);
+          if (!cancelled && nextDetail?.summary) {
+            summaryLoaded = true;
+            setDetail(nextDetail);
+          }
+        }
+      } catch {
+        // Summary completion is durable. A transient read failure can safely retry locally.
+      } finally {
+        requestInFlight = false;
+        if (!summaryLoaded) schedule(2_500);
+      }
+    };
+    schedule(500);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [detail?.session.id, detail?.summary, timeline?.processing_state]);
 
   useEffect(() => {
     const sessionId = detail?.session.id;
@@ -239,18 +306,44 @@ export default function MemoryView() {
 
   const analyze = async () => {
     if (!detail) return;
+    const sessionId = detail.session.id;
+    const generation = detailRequestGeneration.current;
     setLoading(true);
     setError(null);
     try {
-      await window.electronAPI.jarvis.analyzeSession(detail.session.id, "final");
+      let status = await window.electronAPI.jarvis.analyzeSession(sessionId, "final");
+      if (["blocked", "quota_limited", "retry_needed"].includes(status.state)) {
+        setError(analysisErrorMessage(status.errorCode));
+        return;
+      }
+      for (let attempt = 0; attempt < 180 && ["queued", "analyzing"].includes(status.state); attempt += 1) {
+        if (generation !== detailRequestGeneration.current) return;
+        try {
+          status = await window.electronAPI.jarvis.getAnalysisStatus(sessionId);
+        } catch {
+          // A transient status read must not abandon a running cloud analysis.
+        }
+        if (!["queued", "analyzing"].includes(status.state)) break;
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 2_000));
+      }
+      if (generation !== detailRequestGeneration.current) return;
+      if (["blocked", "quota_limited", "retry_needed"].includes(status.state)) {
+        setError(analysisErrorMessage(status.errorCode));
+        return;
+      }
+      if (status.state !== "ready") {
+        setError("总结仍在后台处理中，请稍后重新打开这次录音查看。");
+        return;
+      }
       const [nextDetail, nextTimeline] = await Promise.all([
-        window.electronAPI.jarvis.getSessionDetail(detail.session.id),
-        window.electronAPI.jarvis.getSessionTimeline(detail.session.id),
+        window.electronAPI.jarvis.getSessionDetail(sessionId),
+        window.electronAPI.jarvis.getSessionTimeline(sessionId),
       ]);
+      if (generation !== detailRequestGeneration.current) return;
       setDetail(nextDetail);
       setTimeline(nextTimeline);
-    } catch {
-      setError("分析失败，请检查 MiniMax 设置后重试。");
+    } catch (analysisError) {
+      setError(analysisErrorMessage(analysisError));
     } finally {
       setLoading(false);
     }
@@ -259,6 +352,14 @@ export default function MemoryView() {
   if (detail) {
     const decisions = safeStringArray(detail.summary?.decisions_json);
     const suggestions = safeLegacySuggestions(detail.summary?.suggestions_json);
+    const hasVisibleTranscript = detail.segments.length > 0 || (timeline?.segments.length ?? 0) > 0;
+    const summaryInputReady = timeline?.processing_state === "ready";
+    const sessionStatusLabel =
+      detail.session.status === "completed" && !summaryInputReady
+        ? "录音已完成 · 后台处理中"
+        : summaryInputReady
+          ? "处理完成"
+          : detail.session.status;
     const evidenceContext =
       "context" in evidenceNavigation && evidenceNavigation.context.sessionId === detail.session.id
         ? evidenceNavigation.context
@@ -296,11 +397,12 @@ export default function MemoryView() {
               {new Date(detail.session.started_at).toLocaleString("zh-CN")}
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
-              时长 {duration(detail.session)} · {detail.session.status}
+              时长 {duration(detail.session)} · {sessionStatusLabel}
             </p>
           </div>
           {!detail.summary &&
-            (detail.segments.length > 0 || (timeline?.segments.length ?? 0) > 0) && (
+            hasVisibleTranscript &&
+            (summaryInputReady ? (
               <button
                 type="button"
                 onClick={() => void analyze()}
@@ -309,7 +411,11 @@ export default function MemoryView() {
               >
                 {loading ? "正在分析…" : "生成总结"}
               </button>
-            )}
+            ) : (
+              <p className="max-w-xs rounded-lg border border-border/50 bg-muted/30 px-4 py-2 text-sm text-muted-foreground">
+                处理完成后自动生成总结
+              </p>
+            ))}
         </div>
         {error && (
           <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
@@ -340,7 +446,10 @@ export default function MemoryView() {
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
           <h2 className="font-semibold">完整总结</h2>
           <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
-            {detail.summary?.summary ?? "尚未生成总结。录音和转写已安全保存。"}
+            {detail.summary?.summary ??
+              (summaryInputReady
+                ? "尚未生成总结。录音和转写已安全保存。"
+                : "正在完成最终转写和说话人识别，完成后会自动生成总结。")}
           </p>
           {decisions.length > 0 && (
             <div className="mt-4">

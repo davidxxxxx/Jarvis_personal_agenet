@@ -15,7 +15,14 @@ const BINARY_NAME = "windows-system-audio-helper.exe";
 // default render device), process loopback hears every application on every
 // output device and excludes OpenWhispr's own audio.
 class WindowsLoopbackAudioManager {
-  constructor() {
+  constructor({
+    spawnImpl = spawn,
+    platform = process.platform,
+    processId = process.pid,
+  } = {}) {
+    this.spawnImpl = spawnImpl;
+    this.platform = platform;
+    this.processId = processId;
     this.process = null;
     this.stderrBuffer = "";
     this.onChunk = null;
@@ -28,7 +35,7 @@ class WindowsLoopbackAudioManager {
   }
 
   isSupported() {
-    return process.platform === "win32";
+    return this.platform === "win32";
   }
 
   isAvailable() {
@@ -108,10 +115,15 @@ class WindowsLoopbackAudioManager {
     return !capability.available && /activation_timeout/i.test(capability.error || "");
   }
 
-  async start({ onChunk, onError, onWarning } = {}) {
+  async start({ mode = "mixed", targetPid = null, onChunk, onError, onWarning } = {}) {
     const capability = await this.getCapability();
     if (!capability.available) {
       throw new Error(capability.error || "Windows system audio helper is unavailable.");
+    }
+    if (mode === "application" && !capability.supportsApplicationCapture) {
+      throw new Error(
+        `Application audio capture requires Windows build ${capability.minimumWindowsBuild ?? 20348}.`
+      );
     }
 
     if (this.process) {
@@ -122,16 +134,10 @@ class WindowsLoopbackAudioManager {
     }
 
     const binaryPath = this.resolveBinary();
-    const args = [
-      "start",
-      "--exclude-pid",
-      String(process.pid),
-      "--sample-rate",
-      String(SAMPLE_RATE),
-    ];
+    const args = this._buildStartArgs({ mode, targetPid });
 
     // stdin stays piped so the helper can detect parent death via EOF.
-    const child = spawn(binaryPath, args, {
+    const child = this.spawnImpl(binaryPath, args, {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -283,12 +289,36 @@ class WindowsLoopbackAudioManager {
     const result = await this._runJsonCommand(["probe"], PROBE_TIMEOUT_MS);
     return {
       available: !!result?.ok,
+      supportsApplicationCapture: result?.supportsApplicationCapture === true,
+      supportsSessionWatch: result?.supportsSessionWatch === true,
+      minimumWindowsBuild: Number.isSafeInteger(result?.minimumWindowsBuild)
+        ? result.minimumWindowsBuild
+        : 20348,
+      windowsBuild: Number.isSafeInteger(result?.windowsBuild) ? result.windowsBuild : null,
+      source: typeof result?.source === "string" ? result.source : "wasapi-process-loopback",
       error: typeof result?.error === "string" ? result.error : null,
     };
   }
 
+  _buildStartArgs({ mode = "mixed", targetPid = null } = {}) {
+    if (mode !== "mixed" && mode !== "application") {
+      throw new TypeError("mode must be mixed or application");
+    }
+    const args = ["start"];
+    if (mode === "mixed") {
+      args.push("--exclude-pid", String(this.processId));
+    } else {
+      if (!Number.isSafeInteger(targetPid) || targetPid <= 0 || targetPid > 0xffffffff) {
+        throw new TypeError("targetPid must be a positive Windows process id");
+      }
+      args.push("--include-pid", String(targetPid));
+    }
+    args.push("--sample-rate", String(SAMPLE_RATE));
+    return args;
+  }
+
   _runJsonCommand(args, timeoutMs) {
-    const child = spawn(this.resolveBinary(), args, {
+    const child = this.spawnImpl(this.resolveBinary(), args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

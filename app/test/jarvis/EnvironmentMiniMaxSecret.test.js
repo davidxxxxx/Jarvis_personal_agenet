@@ -80,6 +80,56 @@ async function writeEncryptedKey(directory, value) {
   return target;
 }
 
+test("resource governance settings persist and reload with advanced overrides", () =>
+  withTempDirectory(async (directory) => {
+    const keys = [
+      "JARVIS_RESOURCE_PROFILE",
+      "JARVIS_EXTERNAL_GPU_THRESHOLD_PCT",
+      "JARVIS_RESOURCE_RECOVERY_WAIT_MS",
+    ];
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    for (const key of keys) delete process.env[key];
+
+    const { EnvironmentManager } = loadEnvironmentManager({
+      userDataDirectory: directory,
+      secretCrypto: createSecretCrypto(),
+    });
+
+    try {
+      const first = new EnvironmentManager();
+      assert.deepEqual(first.getJarvisResourceSettings(), {
+        profile: "balanced",
+        externalGpuThresholdPct: 45,
+        recoveryWaitMs: 60_000,
+      });
+
+      const saved = await first.saveJarvisResourceSettings({
+        profile: "game_priority",
+        externalGpuThresholdPct: 30,
+        recoveryWaitMs: 180_000,
+      });
+      assert.deepEqual(saved, {
+        profile: "game_priority",
+        externalGpuThresholdPct: 30,
+        recoveryWaitMs: 180_000,
+      });
+
+      const persisted = await fsPromises.readFile(path.join(directory, ".env"), "utf8");
+      assert.match(persisted, /^JARVIS_RESOURCE_PROFILE=game_priority$/m);
+      assert.match(persisted, /^JARVIS_EXTERNAL_GPU_THRESHOLD_PCT=30$/m);
+      assert.match(persisted, /^JARVIS_RESOURCE_RECOVERY_WAIT_MS=180000$/m);
+
+      for (const key of keys) delete process.env[key];
+      const reloaded = new EnvironmentManager();
+      assert.deepEqual(reloaded.getJarvisResourceSettings(), saved);
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  }));
+
 test("MiniMax save is awaited and changes the process value only after atomic rename", () =>
   withTempDirectory(async (directory) => {
     const previous = process.env.MINIMAX_API_KEY;

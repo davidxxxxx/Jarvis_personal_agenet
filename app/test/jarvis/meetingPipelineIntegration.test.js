@@ -160,6 +160,58 @@ test("main routes exact mic and system PCM once before every derived consumer", 
   }
 });
 
+test("fullscreen yield preserves exact PCM and levels before pausing derived meeting work", () => {
+  const mainSource = fs.readFileSync(path.join(appRoot, "main.js"), "utf8");
+  const ipcSource = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
+  const windowSource = fs.readFileSync(path.join(appRoot, "src/helpers/windowManager.js"), "utf8");
+  const sendSection = ipcSource.slice(
+    ipcSource.indexOf("const sendMeetingAudio"),
+    ipcSource.indexOf("const startManagedMeetingSystemAudio")
+  );
+
+  assert.match(mainSource, /onResourceSnapshot:\s*async\s*\(snapshot\)\s*=>/);
+  assert.match(
+    mainSource,
+    /resolveFullscreenYieldActive\(\s*snapshot,\s*jarvisFullscreenYieldActive\s*\)/
+  );
+  assert.match(
+    mainSource,
+    /ipcHandlers\?\.setJarvisFullscreenYield\(jarvisFullscreenYieldActive\)/
+  );
+  assert.match(
+    mainSource,
+    /windowManager\?\.setFullscreenYieldActive\(jarvisFullscreenYieldActive\)/
+  );
+  assert.match(windowSource, /setFullscreenYieldActive\(active\)/);
+  assert.match(windowSource, /if \(this\._fullscreenYieldActive\)/);
+  assert.match(
+    windowSource,
+    /this\.mainWindow\.on\("show",[\s\S]*?this\._fullscreenYieldActive[\s\S]*?this\.mainWindow\.hide\(\)/
+  );
+  assert.match(
+    ipcSource,
+    /liveSpeakerRouter\.stop\(LIVE_SPEAKER_SCOPES\.JARVIS\)/
+  );
+
+  const persistIndex = sendSection.indexOf("this.jarvisService.appendPcm");
+  const levelIndex = sendSection.indexOf("publishMeetingSystemAudioLevel");
+  const yieldIndex = sendSection.indexOf("this._jarvisFullscreenYieldActive");
+  assert.ok(persistIndex >= 0 && persistIndex < levelIndex);
+  assert.ok(levelIndex < yieldIndex);
+  for (const derivedConsumer of [
+    "recordSystemChunk",
+    "processSystemBuffer",
+    "liveSpeakerRouter.feed",
+    "writeMeetingDiarizationPcm",
+    "dispatchMeetingAudioBuffer",
+  ]) {
+    assert.ok(
+      yieldIndex < sendSection.indexOf(derivedConsumer),
+      `${derivedConsumer} must remain behind fullscreen yield`
+    );
+  }
+});
+
 test("meeting IPC has one live-speaker router and no direct lifecycle bypass", () => {
   const source = fs.readFileSync(path.join(appRoot, "src/helpers/ipcHandlers.js"), "utf8");
   const meetingSection = source.slice(

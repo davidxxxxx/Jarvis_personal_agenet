@@ -1148,6 +1148,55 @@ test("analysis work state ignores old jobs after the desired head advances", () 
   }
 });
 
+test("manual analysis retry marks a blocked paid response for one explicit replacement attempt", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'analysis_invalid_response', completed_at = 7100
+       WHERE id = ?`
+    ).run(job.id);
+
+    const retried = store.authorizeManualAnalysisRetry(job.id, {
+      allowUsageUnknown: false,
+      at: 7_200,
+    });
+    assert.equal(retried.state, "retry");
+    assert.equal(retried.error_code, "ANALYSIS_MANUAL_RETRY_AUTHORIZED");
+    assert.equal(retried.next_retry_at, 7_200);
+    assert.equal(retried.completed_at, null);
+  } finally {
+    db.close();
+  }
+});
+
+test("candidate apply failure is shown as invalid and can be retried explicitly", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    db.prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'analysis_candidate_apply_failed', completed_at = 7100
+       WHERE id = ?`
+    ).run(job.id);
+
+    assert.equal(repository.getAnalysisWorkState("session-1").errorCode, "invalid_response");
+    const retried = store.authorizeManualAnalysisRetry(job.id, {
+      allowUsageUnknown: false,
+      at: 7_200,
+    });
+    assert.equal(retried.state, "retry");
+    assert.equal(retried.error_code, "ANALYSIS_MANUAL_RETRY_AUTHORIZED");
+  } finally {
+    db.close();
+  }
+});
+
 test("a reopened repository and new scheduler report durable analysis status", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-analysis-status-"));
   const filename = path.join(directory, "jarvis.sqlite");
@@ -5041,6 +5090,51 @@ test("cloud authorization is derived only from selected payload segments and the
     assert.equal(
       db.prepare("SELECT candidate_hash FROM analysis_inputs").get().candidate_hash,
       null
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input skips unattributed segments without blocking attributable evidence", () => {
+  const db = createFixture();
+  try {
+    db.prepare(
+      "DELETE FROM speaker_cluster_segments WHERE transcript_segment_id = 'segment-omitted'"
+    ).run();
+    db.prepare(
+      "UPDATE transcript_segments SET person_id = NULL WHERE id = 'segment-omitted'"
+    ).run();
+    const repository = createRepository(db);
+    const request = validInput({ segmentIds: ["segment-1", "segment-omitted"] });
+    const prepared = repository.prepareAnalysisInput(request);
+
+    assert.deepEqual(prepared.segmentIds, ["segment-1"]);
+    assert.deepEqual(
+      prepared.segments.map(({ ordinal, segmentId, speakerBindingLabel }) => ({
+        ordinal,
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [{ ordinal: 0, segmentId: "segment-1", speakerBindingLabel: "SELF" }]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [{ label: "SELF", subjectId: "person-self" }]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input remains blocked when every segment is unattributed", () => {
+  const db = createFixture();
+  try {
+    db.prepare("UPDATE transcript_segments SET person_id = NULL WHERE id = 'segment-1'").run();
+    const repository = createRepository(db);
+    assert.throws(
+      () => repository.prepareAnalysisInput(validInput({ segmentIds: ["segment-1"] })),
+      { code: "MEMORY_OWNER_OUT_OF_SCOPE" }
     );
   } finally {
     db.close();

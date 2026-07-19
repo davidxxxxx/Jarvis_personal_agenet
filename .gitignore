@@ -11,3 +11,4 @@ release/
 userdata/
 recordings/
 /.private/speaker-eval/
+.planning/debug/

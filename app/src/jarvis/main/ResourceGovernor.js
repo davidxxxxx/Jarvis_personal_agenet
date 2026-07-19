@@ -1,6 +1,10 @@
 const os = require("os");
 const { execFile } = require("node:child_process");
 const { sampleNvidiaGpuTelemetry } = require("../../utils/gpuDetection");
+const {
+  RESOURCE_GOVERNANCE_PRESETS,
+  normalizeResourceGovernanceSettings,
+} = require("../shared/contracts");
 
 const RESOURCE_STATES = Object.freeze(["available", "busy", "constrained", "unavailable"]);
 const ADMISSION_ACTIONS = Object.freeze(["run_cuda", "run_cpu", "defer", "pause_preview"]);
@@ -18,9 +22,9 @@ const JOB_PRIORITY = Object.freeze({
 const DEFAULT_SAMPLING_INTERVAL_MS = 15_000;
 const DEFAULT_VRAM_SAFETY_MARGIN_MB = 1_024;
 const MAX_CPU_FALLBACK_THREADS = 4;
-const CPU_UNSAFE_LOAD_PCT = 90;
+const CPU_UNSAFE_LOAD_PCT = 70;
 const GPU_UNSAFE_UTILIZATION_PCT = 90;
-const CLOUD_BUSY_CPU_LOAD_PCT = 75;
+const CLOUD_BUSY_CPU_LOAD_PCT = 65;
 const CLOUD_BUSY_MEMORY_LOAD_PCT = 80;
 const CLOUD_UNSAFE_MEMORY_LOAD_PCT = 90;
 const CLOUD_LOW_BATTERY_PCT = 20;
@@ -53,6 +57,83 @@ $batteryLevelPct = if ($batteryPresent -and $status.BatteryLifePercent -ne 255) 
   batteryPresent = $batteryPresent
   batteryLevelPct = $batteryLevelPct
   batterySaver = [bool]($status.SystemStatusFlag -eq 1)
+} | ConvertTo-Json -Compress
+`;
+const WINDOWS_FOREGROUND_ACTIVITY_SCRIPT = String.raw`
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class JarvisForegroundActivity {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT {
+    public int Left;
+    public int Top;
+    public int Right;
+    public int Bottom;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+  public struct MONITORINFO {
+    public int cbSize;
+    public RECT rcMonitor;
+    public RECT rcWork;
+    public uint dwFlags;
+  }
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll")]
+  public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
+  [DllImport("user32.dll", CharSet = CharSet.Auto)]
+  [return: MarshalAs(UnmanagedType.Bool)]
+  public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll", CharSet = CharSet.Auto)]
+  public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+}
+'@
+$window = [JarvisForegroundActivity]::GetForegroundWindow()
+if ($window -eq [IntPtr]::Zero) {
+  [pscustomobject]@{ active = $false; pid = $null; processName = $null; windowClass = $null } |
+    ConvertTo-Json -Compress
+  exit 0
+}
+$rect = New-Object JarvisForegroundActivity+RECT
+$monitorInfo = New-Object JarvisForegroundActivity+MONITORINFO
+$monitorInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($monitorInfo)
+$monitor = [JarvisForegroundActivity]::MonitorFromWindow($window, 2)
+if (
+  -not [JarvisForegroundActivity]::GetWindowRect($window, [ref]$rect) -or
+  $monitor -eq [IntPtr]::Zero -or
+  -not [JarvisForegroundActivity]::GetMonitorInfo($monitor, [ref]$monitorInfo)
+) { exit 2 }
+$pidValue = [uint32]0
+[void][JarvisForegroundActivity]::GetWindowThreadProcessId($window, [ref]$pidValue)
+$classBuilder = New-Object Text.StringBuilder 256
+[void][JarvisForegroundActivity]::GetClassName($window, $classBuilder, $classBuilder.Capacity)
+$windowClass = $classBuilder.ToString()
+$processName = $null
+try { $processName = (Get-Process -Id $pidValue -ErrorAction Stop).ProcessName } catch {}
+$tolerance = 2
+$coversMonitor =
+  $rect.Left -le ($monitorInfo.rcMonitor.Left + $tolerance) -and
+  $rect.Top -le ($monitorInfo.rcMonitor.Top + $tolerance) -and
+  $rect.Right -ge ($monitorInfo.rcMonitor.Right - $tolerance) -and
+  $rect.Bottom -ge ($monitorInfo.rcMonitor.Bottom - $tolerance)
+$shellClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')
+$shellProcesses = @('explorer', 'SearchHost', 'StartMenuExperienceHost', 'LockApp')
+$active =
+  $coversMonitor -and
+  $shellClasses -notcontains $windowClass -and
+  $shellProcesses -notcontains $processName
+[pscustomobject]@{
+  active = [bool]$active
+  pid = if ($pidValue -gt 0) { [int]$pidValue } else { $null }
+  processName = $processName
+  windowClass = $windowClass
 } | ConvertTo-Json -Compress
 `;
 
@@ -167,6 +248,40 @@ function unknownPowerReading() {
   };
 }
 
+function inactiveForegroundActivityReading(telemetryAvailable = true) {
+  return {
+    active: false,
+    pid: null,
+    processName: null,
+    windowClass: null,
+    telemetryAvailable,
+  };
+}
+
+function normalizeForegroundActivityReading(reading, ownedPids = []) {
+  const pid = Number.isSafeInteger(reading?.pid) && reading.pid > 0 ? reading.pid : null;
+  const owned = new Set(
+    Array.isArray(ownedPids)
+      ? ownedPids.filter((candidate) => Number.isSafeInteger(candidate) && candidate > 0)
+      : []
+  );
+  const processName =
+    typeof reading?.processName === "string" && reading.processName.length <= 260
+      ? reading.processName
+      : null;
+  const windowClass =
+    typeof reading?.windowClass === "string" && reading.windowClass.length <= 260
+      ? reading.windowClass
+      : null;
+  return {
+    active: reading?.active === true && (pid === null || !owned.has(pid)),
+    pid,
+    processName,
+    windowClass,
+    telemetryAvailable: reading?.telemetryAvailable !== false,
+  };
+}
+
 function normalizePowerReading(reading) {
   const batteryLevelPct = reading?.batteryLevelPct;
   const batteryLevelKnown =
@@ -250,6 +365,67 @@ function createWindowsPowerProvider({
   };
 }
 
+function createWindowsForegroundActivityProvider({
+  platform = process.platform,
+  execFileImpl = execFile,
+  now = Date.now,
+  cacheMs = DEFAULT_SAMPLING_INTERVAL_MS,
+} = {}) {
+  if (typeof execFileImpl !== "function") throw new TypeError("execFileImpl must be a function");
+  if (typeof now !== "function") throw new TypeError("now must be a function");
+  if (!Number.isSafeInteger(cacheMs) || cacheMs <= 0) {
+    throw new RangeError("cacheMs must be a positive safe integer");
+  }
+  let latest = null;
+  let sampledAt = null;
+  let inFlight = null;
+  return async ({ ownedPids = [] } = {}) => {
+    const at = now();
+    if (latest && sampledAt !== null && at - sampledAt >= 0 && at - sampledAt < cacheMs) {
+      return normalizeForegroundActivityReading(latest, ownedPids);
+    }
+    if (!inFlight) {
+      inFlight = new Promise((resolve) => {
+        if (platform !== "win32") {
+          resolve(inactiveForegroundActivityReading(false));
+          return;
+        }
+        execFileImpl(
+          "powershell.exe",
+          [
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_FOREGROUND_ACTIVITY_SCRIPT,
+          ],
+          { timeout: 5_000, windowsHide: true, maxBuffer: 16 * 1024 },
+          (error, stdout) => {
+            if (error) {
+              resolve(inactiveForegroundActivityReading(false));
+              return;
+            }
+            try {
+              resolve(
+                normalizeForegroundActivityReading(JSON.parse(String(stdout).trim()), ownedPids)
+              );
+            } catch {
+              resolve(inactiveForegroundActivityReading(false));
+            }
+          }
+        );
+      });
+    }
+    try {
+      latest = await inFlight;
+      sampledAt = now();
+      return normalizeForegroundActivityReading(latest, ownedPids);
+    } finally {
+      inFlight = null;
+    }
+  };
+}
+
 function orderJobs(kinds) {
   return kinds
     .map((kind, index) => ({ kind, index }))
@@ -286,7 +462,10 @@ function projectCloudPressure(snapshot) {
     batteryLevelPct <= 100;
   let state = "normal";
   let reason = null;
-  if (snapshot?.batterySaver === true) {
+  if (snapshot?.fullscreenActivityActive === true) {
+    state = "busy";
+    reason = "fullscreen_game";
+  } else if (snapshot?.batterySaver === true) {
     state = "battery_saver";
     reason = "battery_saver";
   } else if (!cpuKnown || !memoryKnown || !powerKnown) {
@@ -336,10 +515,12 @@ class ResourceGovernor {
     cpuProvider = null,
     memoryProvider = null,
     powerProvider = null,
+    foregroundActivityProvider = async () => inactiveForegroundActivityReading(),
     ownedPidsProvider = () => [process.pid],
     previewEnabled = true,
     safetyMarginMb = DEFAULT_VRAM_SAFETY_MARGIN_MB,
     sampleIntervalMs = DEFAULT_SAMPLING_INTERVAL_MS,
+    resourceSettings = RESOURCE_GOVERNANCE_PRESETS.balanced,
   } = {}) {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     const effectiveCpuProvider = cpuProvider ?? createWindowsCpuProvider();
@@ -351,6 +532,7 @@ class ResourceGovernor {
       cpuProvider: effectiveCpuProvider,
       memoryProvider: effectiveMemoryProvider,
       powerProvider: effectivePowerProvider,
+      foregroundActivityProvider,
       ownedPidsProvider,
     })) {
       if (typeof provider !== "function") throw new TypeError(`${name} must be a function`);
@@ -361,19 +543,47 @@ class ResourceGovernor {
     if (!Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs <= 0) {
       throw new RangeError("sampleIntervalMs must be a positive safe integer");
     }
+    const normalizedResourceSettings = normalizeResourceGovernanceSettings(resourceSettings);
     this.now = now;
     this.telemetryProvider = telemetryProvider;
     this.cudaProvider = cudaProvider;
     this.cpuProvider = effectiveCpuProvider;
     this.memoryProvider = effectiveMemoryProvider;
     this.powerProvider = effectivePowerProvider;
+    this.foregroundActivityProvider = foregroundActivityProvider;
     this.ownedPidsProvider = ownedPidsProvider;
     this.previewEnabled = previewEnabled !== false;
     this.safetyMarginMb = safetyMarginMb;
     this.sampleIntervalMs = sampleIntervalMs;
+    this.resourceProfile = normalizedResourceSettings.profile;
+    this.externalGpuThresholdPct = normalizedResourceSettings.externalGpuThresholdPct;
+    this.recoveryWaitMs = normalizedResourceSettings.recoveryWaitMs;
     this.latestSnapshot = null;
     this.restrictiveSince = null;
     this.healthySamples = 0;
+    this.healthySince = null;
+    this.hasObservedRestriction = false;
+  }
+
+  getSettings() {
+    return {
+      profile: this.resourceProfile,
+      externalGpuThresholdPct: this.externalGpuThresholdPct,
+      recoveryWaitMs: this.recoveryWaitMs,
+    };
+  }
+
+  configure(input) {
+    const normalized = normalizeResourceGovernanceSettings(input);
+    this.resourceProfile = normalized.profile;
+    this.externalGpuThresholdPct = normalized.externalGpuThresholdPct;
+    this.recoveryWaitMs = normalized.recoveryWaitMs;
+    this.latestSnapshot = null;
+    this.restrictiveSince = null;
+    this.healthySamples = 0;
+    this.healthySince = null;
+    this.hasObservedRestriction = false;
+    return this.getSettings();
   }
 
   async sample() {
@@ -383,13 +593,14 @@ class ResourceGovernor {
       return this.latestSnapshot;
     }
     const ownedPids = this.ownedPidsProvider();
-    const [telemetryResult, cudaResult, cpuResult, memoryResult, powerResult] =
+    const [telemetryResult, cudaResult, cpuResult, memoryResult, powerResult, foregroundResult] =
       await Promise.allSettled([
         this.telemetryProvider({ ownedPids }),
         this.cudaProvider(),
         this.cpuProvider(),
         this.memoryProvider(),
         this.powerProvider(),
+        this.foregroundActivityProvider({ ownedPids }),
       ]);
     const telemetry =
       telemetryResult.status === "fulfilled"
@@ -422,13 +633,17 @@ class ResourceGovernor {
       powerResult.status === "fulfilled"
         ? normalizePowerReading(powerResult.value)
         : unknownPowerReading();
+    const foregroundActivity =
+      foregroundResult.status === "fulfilled"
+        ? normalizeForegroundActivityReading(foregroundResult.value, ownedPids)
+        : inactiveForegroundActivityReading(false);
     const selectedGpuUuid = cuda?.gpuUuid || null;
     const gpu = telemetry?.gpus?.find((candidate) => candidate.uuid === selectedGpuUuid) ?? null;
     const selectedProcesses = (telemetry?.processes ?? []).filter(
       (entry) => entry.gpuUuid === selectedGpuUuid
     );
     const owned = new Set(telemetry?.ownedPids ?? ownedPids ?? []);
-    const externalGpuBusy = selectedProcesses.some((entry) => !owned.has(entry.pid));
+    const externalGpuProcessPresent = selectedProcesses.some((entry) => !owned.has(entry.pid));
     const cpuLoadPct = cpu?.loadPct;
     const cpuTelemetryAvailable =
       cpu?.telemetryAvailable !== false &&
@@ -448,10 +663,17 @@ class ResourceGovernor {
       Number.isFinite(gpu.freeVramMb) &&
       gpu.freeVramMb >= 0
     );
+    const externalGpuBusy =
+      externalGpuProcessPresent &&
+      gpuTelemetryValid &&
+      gpu.utilizationPct >= this.externalGpuThresholdPct;
 
     let candidateState = "available";
     let reason = "resources_available";
-    if (
+    if (foregroundActivity.active) {
+      candidateState = "busy";
+      reason = "fullscreen_game";
+    } else if (
       cuda?.installed !== true ||
       cuda?.verified !== true ||
       cuda?.quarantined === true ||
@@ -491,16 +713,31 @@ class ResourceGovernor {
 
     let state = candidateState;
     if (candidateState === "available") {
-      this.healthySamples += 1;
-      if (this.healthySamples < 2) {
+      if (this.hasObservedRestriction) {
+        if (this.healthySince === null) this.healthySince = sampledAt;
+        if (sampledAt - this.healthySince < this.recoveryWaitMs) {
+          state = "constrained";
+          reason = "recovery_hysteresis";
+        } else {
+          this.hasObservedRestriction = false;
+          this.healthySince = null;
+          this.restrictiveSince = null;
+          this.healthySamples = 2;
+        }
+      } else {
+        this.healthySamples += 1;
+      }
+      if (!this.hasObservedRestriction && this.healthySamples < 2) {
         state = "constrained";
         reason = "recovery_hysteresis";
         if (this.restrictiveSince === null) this.restrictiveSince = sampledAt;
-      } else {
+      } else if (state === "available") {
         this.restrictiveSince = null;
       }
     } else {
       this.healthySamples = 0;
+      this.healthySince = null;
+      this.hasObservedRestriction = true;
       if (this.restrictiveSince === null) this.restrictiveSince = sampledAt;
     }
 
@@ -510,10 +747,17 @@ class ResourceGovernor {
       reason,
       selectedGpuUuid,
       gpuUtilizationPct: gpu?.utilizationPct ?? null,
+      externalGpuThresholdPct: this.externalGpuThresholdPct,
+      recoveryWaitMs: this.recoveryWaitMs,
       totalVramMb: gpu?.totalVramMb ?? null,
       usedVramMb: gpu?.usedVramMb ?? null,
       freeVramMb: gpu?.freeVramMb ?? null,
       externalGpuBusy,
+      fullscreenActivityActive: foregroundActivity.active,
+      foregroundActivityPid: foregroundActivity.pid,
+      foregroundActivityProcessName: foregroundActivity.processName,
+      foregroundActivityWindowClass: foregroundActivity.windowClass,
+      foregroundActivityTelemetryAvailable: foregroundActivity.telemetryAvailable,
       cpuLoadPct: cpuTelemetryAvailable ? cpuLoadPct : null,
       cpuTelemetryAvailable,
       memoryLoadPct: memory.loadPct,
@@ -576,10 +820,16 @@ class ResourceGovernor {
         reason: "battery_saver",
       };
     }
+    if (snapshot.fullscreenActivityActive === true) {
+      return {
+        action: kind === "preview" ? "pause_preview" : "defer",
+        reason: "fullscreen_game",
+      };
+    }
     if (snapshot.state === "busy" || snapshot.externalGpuBusy === true) {
       return {
         action: kind === "preview" ? "pause_preview" : "defer",
-        reason: "external_gpu_busy",
+        reason: snapshot.reason || "external_gpu_busy",
       };
     }
     if (snapshot.state === "constrained") {
@@ -595,22 +845,21 @@ class ResourceGovernor {
       if (storageCritical.has(kind) && cpuSafe && powerKnown) {
         return { action: "run_cpu", reason: "storage_critical" };
       }
-      if (kind === "preview") {
-        if (snapshot.previewEnabled === false) {
-          return { action: "pause_preview", reason: "preview_disabled" };
-        }
-        if (!cpuTelemetryKnown || !powerKnown || snapshot.batterySaver !== false) {
-          return { action: "pause_preview", reason: "telemetry_unavailable" };
-        }
-        if (!cpuSafe) return { action: "pause_preview", reason: "cpu_load_high" };
-        return { action: "run_cpu", reason: "cuda_unavailable" };
+      if (kind === "preview" && snapshot.previewEnabled === false) {
+        return { action: "pause_preview", reason: "preview_disabled" };
       }
-      if (cpuOnlySpeaker) {
+      const boundedCpuFallback =
+        ["preview", "final_transcription", "maintenance"].includes(kind) || cpuOnlySpeaker;
+      if (boundedCpuFallback) {
+        const restrictiveAction = kind === "preview" ? "pause_preview" : "defer";
         if (!cpuTelemetryKnown || !powerKnown || snapshot.batterySaver !== false) {
-          return { action: "defer", reason: "telemetry_unavailable" };
+          return { action: restrictiveAction, reason: "telemetry_unavailable" };
         }
-        if (!cpuSafe) return { action: "defer", reason: "cpu_load_high" };
-        return { action: "run_cpu", reason: "cuda_unavailable_cpu_backend" };
+        if (!cpuSafe) return { action: restrictiveAction, reason: "cpu_load_high" };
+        return {
+          action: "run_cpu",
+          reason: cpuOnlySpeaker ? "cuda_unavailable_cpu_backend" : "cuda_unavailable",
+        };
       }
       return { action: "defer", reason: "cuda_unavailable" };
     }
@@ -647,4 +896,5 @@ module.exports.GPU_UNSAFE_UTILIZATION_PCT = GPU_UNSAFE_UTILIZATION_PCT;
 module.exports.createWindowsCpuProvider = createWindowsCpuProvider;
 module.exports.createSystemMemoryProvider = createSystemMemoryProvider;
 module.exports.createWindowsPowerProvider = createWindowsPowerProvider;
+module.exports.createWindowsForegroundActivityProvider = createWindowsForegroundActivityProvider;
 module.exports.projectCloudPressure = projectCloudPressure;

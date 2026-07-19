@@ -122,6 +122,38 @@ export interface JarvisSessionQuery {
   limit?: number;
 }
 
+export type JarvisActivityCategory =
+  | "work_meeting"
+  | "learning"
+  | "social_call"
+  | "in_person_conversation"
+  | "entertainment"
+  | "gaming"
+  | "other"
+  | "unknown";
+
+export type JarvisActivityDecision = "adopted" | "tentative" | "unknown";
+
+export interface JarvisActivityClassification {
+  id: string;
+  sessionId: string;
+  startedAt: number;
+  endedAt: number;
+  category: JarvisActivityCategory;
+  confidence: number;
+  decision: JarvisActivityDecision;
+  source: "local" | "minimax" | "user";
+  reason: string;
+  sourceAttribution: "application" | "microphone" | "application_and_microphone" | "mixed_unknown";
+  applications: string[];
+  allowSummary: boolean;
+  allowSuggestions: boolean;
+  allowTodos: boolean;
+  evidenceSegmentIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type JarvisEvidenceOwnerType =
   | "memory_value"
   | "topic_revision"
@@ -350,12 +382,30 @@ export interface JarvisAudioTrack {
   id: string;
   session_id: string;
   source_type: "mic" | "system";
+  track_kind: "mic" | "system_mix" | "application";
+  application_key: string | null;
+  application_display_name: string | null;
+  attribution_state: "exact" | "mixed_unknown";
+  capture_generation: number;
   sample_rate: number;
   channels: number;
   started_at: number;
   ended_at: number | null;
   state: string;
   gaps: JarvisAudioGap[];
+}
+
+export interface JarvisApplicationAudioInterval {
+  id: string;
+  session_id: string;
+  track_id: string;
+  interval_kind: "application_active" | "mixed_fallback";
+  application_key: string | null;
+  attribution_state: "exact" | "mixed_unknown";
+  capture_generation: number;
+  started_at: number;
+  ended_at: number | null;
+  reason: string | null;
 }
 
 export interface JarvisProcessingJobCounts {
@@ -450,6 +500,14 @@ export interface JarvisSessionTimeline {
   finalized_at: number | null;
   ready_at: number | null;
   tracks: JarvisAudioTrack[];
+  application_audio_intervals: JarvisApplicationAudioInterval[];
+  application_capture?: {
+    exact_duration_ms: number;
+    fallback_duration_ms: number;
+    exact_coverage_pct: number | null;
+    degraded_intervals: JarvisApplicationAudioInterval[];
+    recovery_points: number[];
+  };
   gaps: JarvisAudioGap[];
   chunks: JarvisAudioChunk[];
   segments: JarvisTranscriptSegment[];
@@ -810,6 +868,43 @@ export interface JarvisAnalysisBudgetInput {
   timezone: string;
 }
 
+export type JarvisResourceGovernanceProfile = "game_priority" | "balanced" | "processing_priority";
+
+export interface JarvisResourceGovernanceSettings {
+  profile: JarvisResourceGovernanceProfile;
+  externalGpuThresholdPct: number;
+  recoveryWaitMs: number;
+}
+
+export interface JarvisApplicationAudioSettings {
+  enabled: boolean;
+  trackLimit: number;
+}
+
+export interface JarvisApplicationAudioRuntimeStatus {
+  running: boolean;
+  configuredLimit: number;
+  effectiveLimit: number;
+  fullscreen: boolean;
+  activeTracks: Array<{
+    applicationKey: string;
+    applicationDisplayName: string;
+    captureGeneration: number;
+    state: "recording";
+  }>;
+  fallbacks: Array<{
+    applicationKey: string;
+    applicationDisplayName: string;
+    reason: string;
+    retryAt: number | null;
+    state: "mixed_unknown";
+  }>;
+}
+
+export interface JarvisApplicationAudioStatus extends JarvisApplicationAudioSettings {
+  runtime: JarvisApplicationAudioRuntimeStatus;
+}
+
 export interface JarvisVoiceEnrollmentSession {
   sessionId: string;
   expiresAt: number;
@@ -826,10 +921,26 @@ export interface JarvisVoiceEnrollmentStatus {
   windowCount: number;
   selfConsistency: number | null;
   updatedAt: number | null;
+  models?: JarvisVoiceEnrollmentModelStatus[];
 }
 
 export type JarvisVoiceEnrollmentOutcome =
-  "accepted" | "insufficient_speech" | "inconsistent_samples" | "model_error";
+  | "accepted"
+  | "insufficient_speech"
+  | "inconsistent_samples"
+  | "unsupported_microphone"
+  | "model_error";
+
+export interface JarvisVoiceEnrollmentModelStatus {
+  role: "primary" | "review";
+  modelId: string;
+  embeddingSpace: string;
+  enrolled?: boolean;
+  acceptedSpeechMs?: number;
+  windowCount?: number;
+  selfConsistency: number | null;
+  updatedAt?: number | null;
+}
 
 export interface JarvisVoiceEnrollmentResult {
   status: JarvisVoiceEnrollmentOutcome;
@@ -837,6 +948,7 @@ export interface JarvisVoiceEnrollmentResult {
   acceptedSpeechMs: number;
   windowCount: number;
   selfConsistency: number | null;
+  models?: JarvisVoiceEnrollmentModelStatus[] | null;
 }
 
 export type JarvisCloudBudgetBlockedReason =
@@ -901,6 +1013,11 @@ export interface JarvisVoiceEnrollmentPayload {
   channels: 1;
   format: "float32";
   recordedSampleCount: number;
+  source: {
+    kind: "microphone";
+    deviceId: string;
+    label: string;
+  };
   windows: JarvisVoiceEnrollmentWindow[];
 }
 

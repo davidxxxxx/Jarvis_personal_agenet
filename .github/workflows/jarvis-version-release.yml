@@ -1,0 +1,67 @@
+name: Jarvis version and release tracking
+
+on:
+  pull_request:
+    paths:
+      - "CHANGELOG.md"
+      - "docs/VERSIONING.md"
+      - "app/package.json"
+      - "app/package-lock.json"
+      - "app/scripts/jarvis-release-version.js"
+      - "app/test/jarvis/VersionGovernance.test.js"
+      - ".github/workflows/jarvis-version-release.yml"
+  push:
+    tags:
+      - "jarvis-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  version-gate:
+    name: Verify Jarvis version identity
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Validate package, lockfile, changelog, and tag
+        shell: pwsh
+        run: |
+          $arguments = @("app/scripts/jarvis-release-version.js")
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $arguments += @("--tag", "${{ github.ref_name }}")
+          }
+          node @arguments
+
+      - name: Run version-governance tests
+        shell: pwsh
+        run: node --test app/test/jarvis/VersionGovernance.test.js
+
+      - name: Create immutable draft GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag -replace "^jarvis-v", ""
+          if (gh release view $tag 2>$null) {
+            Write-Host "Release $tag already exists; leaving it unchanged."
+            exit 0
+          }
+          $arguments = @(
+            "release", "create", $tag,
+            "--verify-tag",
+            "--draft",
+            "--generate-notes",
+            "--title", "Jarvis Memory $version"
+          )
+          if ($version.Contains("-")) {
+            $arguments += "--prerelease"
+          }
+          gh @arguments

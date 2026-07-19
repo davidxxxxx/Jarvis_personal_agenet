@@ -15,6 +15,7 @@ const {
 } = require("../../scripts/build-windows");
 
 const appRoot = path.resolve(__dirname, "../..");
+const appVersion = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8")).version;
 
 test("unsigned Windows packaging config cannot inherit an environment file", () => {
   assert.doesNotThrow(() =>
@@ -89,8 +90,8 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
   const signedResult = {
     status: 0,
     stdout: JSON.stringify([
-      { name: "Jarvis Memory Setup 0.1.0.exe", status: "Valid" },
-      { name: "Jarvis Memory 0.1.0.exe", status: "NotSigned" },
+      { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "Valid" },
+      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
     ]),
   };
 
@@ -115,8 +116,8 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
       spawnSyncImpl: () => ({
         status: 0,
         stdout: JSON.stringify([
-          { name: "Jarvis Memory Setup 0.1.0.exe", status: "NotSigned" },
-          { name: "Jarvis Memory 0.1.0.exe", status: "NotSigned" },
+          { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
+          { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
         ]),
       }),
     })

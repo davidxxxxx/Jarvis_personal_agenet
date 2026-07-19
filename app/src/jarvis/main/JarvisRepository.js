@@ -10,6 +10,7 @@ const {
 const CaptureEvidenceStore = require("./CaptureEvidenceStore");
 const MemoryRepository = require("./MemoryRepository");
 const SpeakerIdentityRepository = require("./SpeakerIdentityRepository");
+const ActivityClassificationRepository = require("./ActivityClassificationRepository");
 const {
   applyJarvisMigrations,
   transcriptSegmentsSchema,
@@ -25,6 +26,10 @@ const {
   assertExactIdentityResolutionPolicy,
   buildIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
+const {
+  SPEAKER_MODEL_KEYS,
+  getSpeakerModelManifest,
+} = require("./SpeakerModelManifest");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -45,6 +50,17 @@ const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   recovered: "recovered",
   failed: "failed",
 });
+const DUAL_SPEAKER_MANIFESTS = Object.freeze([
+  getSpeakerModelManifest(SPEAKER_MODEL_KEYS.PRIMARY),
+  getSpeakerModelManifest(SPEAKER_MODEL_KEYS.REVIEW),
+]);
+const IDENTITY_PROFILE_DIMENSIONS = new Map([
+  [SPEAKER_IDENTITY_RESOLUTION_POLICY.modelId, 512],
+  ...DUAL_SPEAKER_MANIFESTS.map((manifest) => [
+    manifest.modelId,
+    manifest.embeddingDimension,
+  ]),
+]);
 
 function runtimeJobStage({ job_type: jobType, state, priority }) {
   if (state === "retention_urgent" || (jobType === "transcribe_chunk" && priority === 0)) {
@@ -324,6 +340,33 @@ function normalizedKey(value) {
   return value.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
 }
 
+function projectSessionSummaryRevision(row, sessionId) {
+  if (!row) return null;
+  let content;
+  try {
+    content = JSON.parse(row.content_json);
+  } catch {
+    return null;
+  }
+  if (
+    !content ||
+    typeof content !== "object" ||
+    Array.isArray(content) ||
+    typeof content.summary !== "string" ||
+    !content.summary.trim()
+  ) {
+    return null;
+  }
+  return {
+    session_id: sessionId,
+    summary: content.summary,
+    decisions_json: "[]",
+    suggestions_json: "[]",
+    updated_at: row.created_at,
+    is_final: row.completeness === "final" ? 1 : 0,
+  };
+}
+
 function derivedId(prefix, ...parts) {
   const digest = crypto.createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
   return `${prefix}_${digest}`;
@@ -389,6 +432,7 @@ class JarvisRepository {
       now: memoryDependencies.now ?? Date.now,
       validateRedactedCloudPayload:
         memoryDependencies.validateRedactedCloudPayload ?? (() => false),
+      embeddingCipher: memoryDependencies.embeddingCipher ?? null,
     };
     this._open(dbPath);
   }
@@ -413,6 +457,10 @@ class JarvisRepository {
       });
       this.speakerIdentityRepository = new SpeakerIdentityRepository(this.db, {
         createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
+        embeddingCipher: this.memoryDependencies.embeddingCipher,
+      });
+      this.activityClassificationRepository = new ActivityClassificationRepository(this.db, {
+        now: this.memoryDependencies.now,
       });
     } catch (error) {
       this.db.close();
@@ -645,6 +693,36 @@ class JarvisRepository {
           )
         ORDER BY turn.started_at, turn.ended_at, turn.id
       `),
+      listSpeakerIdentityAudioWindows: this.db.prepare(`
+        SELECT
+          turn.id,
+          turn.chunk_id,
+          turn.started_at,
+          turn.ended_at,
+          turn.echo_state,
+          turn.duplicate_of_turn_id,
+          turn.excluded_from_centroid,
+          track.track_kind,
+          track.attribution_state,
+          EXISTS (
+            SELECT 1
+            FROM speaker_turns AS overlap
+            WHERE overlap.run_id = turn.run_id
+              AND overlap.cluster_id <> turn.cluster_id
+              AND overlap.started_at < turn.ended_at
+              AND turn.started_at < overlap.ended_at
+          ) AS overlap_detected
+        FROM speaker_turns AS turn
+        JOIN speaker_diarization_runs AS run ON run.id = turn.run_id
+        JOIN audio_chunks AS chunk ON chunk.id = turn.chunk_id
+        JOIN audio_tracks AS track ON track.id = chunk.track_id
+        WHERE run.session_id = @sessionId
+          AND run.id = @evidenceRunId
+          AND turn.cluster_id = @clusterId
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+        ORDER BY turn.started_at, turn.ended_at, turn.id
+      `),
       insertDiarizationRun: this.db.prepare(`
         INSERT INTO speaker_diarization_runs (
           id, session_id, track_id, transcript_revision, policy_id,
@@ -773,6 +851,12 @@ class JarvisRepository {
         JOIN people AS person ON person.id = sample.person_id
         WHERE sample.model_id = ?
         ORDER BY sample.person_id, sample.id
+      `),
+      listIdentityResolutionProfilesAll: this.db.prepare(`
+        SELECT sample.*, person.is_self
+        FROM voice_profile_samples AS sample
+        JOIN people AS person ON person.id = sample.person_id
+        ORDER BY sample.model_id, sample.person_id, sample.id
       `),
       insertIdentityResolutionJob: this.db.prepare(`
         INSERT OR IGNORE INTO processing_jobs (
@@ -956,16 +1040,24 @@ class JarvisRepository {
         WHERE id = @finalId AND result_kind = 'final'
       `),
       listTranscriptDedupeCandidates: this.db.prepare(`
-        SELECT * FROM transcript_segments
-        WHERE session_id = ? AND superseded_by IS NULL AND duplicate_of IS NULL
-        ORDER BY started_at ASC, id ASC
+        SELECT
+          segment.*,
+          track.track_kind,
+          track.application_key,
+          track.application_display_name,
+          track.capture_generation
+        FROM transcript_segments AS segment
+        JOIN audio_tracks AS track ON track.id = segment.track_id
+        WHERE segment.session_id = ?
+          AND segment.superseded_by IS NULL
+          AND segment.duplicate_of IS NULL
+        ORDER BY segment.started_at ASC, segment.id ASC
       `),
       markTranscriptDuplicate: this.db.prepare(`
         UPDATE transcript_segments
-        SET duplicate_of = @systemId
-        WHERE id = @micId
+        SET duplicate_of = @masterId
+        WHERE id = @duplicateId
           AND session_id = @sessionId
-          AND source_type = 'mic'
           AND superseded_by IS NULL
           AND duplicate_of IS NULL
       `),
@@ -1042,7 +1134,23 @@ class JarvisRepository {
       listSessionTimelineTracks: this.db.prepare(`
         SELECT * FROM audio_tracks
         WHERE session_id = ?
-        ORDER BY CASE source_type WHEN 'mic' THEN 0 ELSE 1 END, started_at ASC, id ASC
+        ORDER BY CASE track_kind
+          WHEN 'mic' THEN 0
+          WHEN 'application' THEN 1
+          ELSE 2
+        END, application_key ASC, started_at ASC, id ASC
+      `),
+      listSessionApplicationAudioIntervals: this.db.prepare(`
+        SELECT * FROM application_audio_intervals
+        WHERE session_id = ?
+        ORDER BY started_at ASC, id ASC
+      `),
+      getSessionApplicationTrack: this.db.prepare(`
+        SELECT * FROM audio_tracks
+        WHERE session_id = @sessionId
+          AND track_kind = 'application'
+          AND application_key = @applicationKey
+        LIMIT 1
       `),
       listSessionTimelineGaps: this.db.prepare(`
         SELECT gap.* FROM audio_gaps AS gap
@@ -1077,7 +1185,7 @@ class JarvisRepository {
           COUNT(*) AS count,
           MIN(next_retry_at) AS next_retry_at
         FROM processing_jobs
-        WHERE state NOT IN ('completed', 'superseded')
+        WHERE state NOT IN ('completed', 'superseded', 'audio_expired_before_processing')
         GROUP BY job_type, state, priority, blocked_reason
         ORDER BY job_type ASC, state ASC, priority ASC, blocked_reason ASC
       `),
@@ -1090,13 +1198,13 @@ class JarvisRepository {
             SELECT 1 FROM processing_jobs AS job
             WHERE job.chunk_id = chunk.id
               AND job.job_type = 'transcribe_chunk'
-              AND job.state NOT IN ('completed', 'superseded')
+              AND job.state NOT IN ('completed', 'superseded', 'audio_expired_before_processing')
           )
       `),
       getRuntimeOldestProcessingJob: this.db.prepare(`
         SELECT MIN(created_at) AS oldest_created_at
         FROM processing_jobs
-        WHERE state NOT IN ('completed', 'superseded')
+        WHERE state NOT IN ('completed', 'superseded', 'audio_expired_before_processing')
       `),
       getActiveProcessingExecutionDevice: this.db.prepare(`
         SELECT execution_device
@@ -1167,6 +1275,12 @@ class JarvisRepository {
       getSessionSourceTrack: this.db.prepare(`
         SELECT * FROM audio_tracks
         WHERE session_id = ? AND source_type = ?
+        ORDER BY CASE track_kind
+          WHEN 'mic' THEN 0
+          WHEN 'system_mix' THEN 1
+          ELSE 2
+        END, application_key, id
+        LIMIT 1
       `),
       insertLegacyMicTrack: this.db.prepare(`
         INSERT INTO audio_tracks (
@@ -1486,31 +1600,39 @@ class JarvisRepository {
       const assigned = new Set();
       let duplicatesMarked = 0;
       for (const assignment of assignments) {
-        const micId = assertId(assignment?.micId, "micSegmentId");
-        const systemId = assertId(assignment?.systemId, "systemSegmentId");
-        if (assigned.has(micId)) {
-          throw new Error("mic segment has multiple duplicate assignments");
+        const duplicateId = assertId(assignment?.duplicateId, "duplicateSegmentId");
+        const masterId = assertId(assignment?.masterId, "masterSegmentId");
+        if (assigned.has(duplicateId)) {
+          throw new Error("transcript segment has multiple duplicate assignments");
         }
-        assigned.add(micId);
-        const mic = rowsById.get(micId);
-        const system = rowsById.get(systemId);
+        assigned.add(duplicateId);
+        const duplicate = rowsById.get(duplicateId);
+        const master = rowsById.get(masterId);
+        const isMicEcho =
+          duplicate?.source_type === "mic" &&
+          duplicate?.track_kind === "mic" &&
+          duplicate?.echo_score !== null &&
+          duplicate?.echo_score >= 0.8 &&
+          new Set(["system_mix", "application"]).has(master?.track_kind);
+        const isMixedSystemCopy =
+          duplicate?.source_type === "system" &&
+          duplicate?.track_kind === "system_mix" &&
+          master?.track_kind === "application";
         if (
-          !mic ||
-          !system ||
-          mic.source_type !== "mic" ||
-          system.source_type !== "system" ||
-          mic.session_id !== system.session_id ||
-          mic.echo_score === null ||
-          mic.echo_score < 0.8 ||
-          !(mic.started_at < system.ended_at) ||
-          !(system.started_at < mic.ended_at)
+          !duplicate ||
+          !master ||
+          master.source_type !== "system" ||
+          duplicate.session_id !== master.session_id ||
+          (!isMicEcho && !isMixedSystemCopy) ||
+          !(duplicate.started_at < master.ended_at) ||
+          !(master.started_at < duplicate.ended_at)
         ) {
           throw new Error("invalid transcript duplicate assignment");
         }
         duplicatesMarked += this.statements.markTranscriptDuplicate.run({
           sessionId,
-          micId,
-          systemId,
+          duplicateId,
+          masterId,
         }).changes;
       }
       return { duplicatesMarked };
@@ -1819,7 +1941,7 @@ class JarvisRepository {
         .map((candidate) => ({
           ...candidate,
           normalizedEmbedding: l2NormalizeEmbedding(
-            SpeakerIdentityRepository.decodeEmbedding(candidate.embedding, 512)
+            this.speakerIdentityRepository.decodeStoredEmbedding(candidate.embedding, 512)
           ),
         }))
         .filter((candidate) => candidate.normalizedEmbedding !== null);
@@ -1828,7 +1950,7 @@ class JarvisRepository {
         .map((cluster) => ({
           ...cluster,
           normalizedEmbedding: l2NormalizeEmbedding(
-            SpeakerIdentityRepository.decodeEmbedding(cluster.embedding, 512)
+            this.speakerIdentityRepository.decodeStoredEmbedding(cluster.embedding, 512)
           ),
         }))
         .filter((cluster) => cluster.normalizedEmbedding !== null);
@@ -1891,6 +2013,10 @@ class JarvisRepository {
       const usedStableIds = new Set(stableCandidates.map((cluster) => cluster.id));
       const usedStableLabels = new Set(stableCandidates.map((cluster) => cluster.local_label));
       for (const cluster of input.clusters) {
+        const storedEmbedding =
+          cluster.embedding === null
+            ? null
+            : this.speakerIdentityRepository.protectEncodedEmbedding(cluster.embedding, 512);
         let stableId = persistedClusterIds.get(cluster.id) ?? null;
         if (!stableId) {
           stableId = cluster.id;
@@ -1913,7 +2039,7 @@ class JarvisRepository {
             trackId: input.run.trackId,
             localLabel: stableLabel,
             modelId: input.run.embeddingModelId,
-            embedding: cluster.embedding,
+            embedding: storedEmbedding,
             speechMs: cluster.speechMs,
             windowCount: cluster.windowCount,
             qualityScore: cluster.qualityScore,
@@ -1931,7 +2057,7 @@ class JarvisRepository {
           runId: input.run.id,
           clusterId: stable.id,
           localLabel: cluster.localLabel,
-          embedding: cluster.embedding,
+          embedding: storedEmbedding,
           speechMs: cluster.speechMs,
           windowCount: cluster.windowCount,
           qualityScore: cluster.qualityScore,
@@ -2315,8 +2441,37 @@ class JarvisRepository {
       })
       .map((row) => ({
         ...row,
-        embedding: SpeakerIdentityRepository.decodeEmbedding(row.embedding, 512),
+        embedding: this.speakerIdentityRepository.decodeStoredEmbedding(row.embedding, 512),
       }));
+  }
+
+  listSpeakerIdentityAudioWindows({ sessionId, evidenceRunId, clusterId } = {}) {
+    return this.statements.listSpeakerIdentityAudioWindows
+      .all({
+        sessionId: assertId(sessionId, "sessionId"),
+        evidenceRunId: assertId(evidenceRunId, "evidenceRunId"),
+        clusterId: assertId(clusterId, "clusterId"),
+      })
+      .map((row) => ({
+        id: row.id,
+        startMs: row.started_at,
+        endMs: row.ended_at,
+        trackKind: row.track_kind,
+        attributionState: row.attribution_state,
+        overlapDetected: row.overlap_detected === 1,
+        echoDetected: row.echo_state !== "none" || row.duplicate_of_turn_id !== null,
+        excludedFromCentroid: row.excluded_from_centroid === 1,
+        chunk: this.statements.getAudioChunk.get(row.chunk_id) ?? null,
+      }))
+      .filter((row) => row.chunk !== null);
+  }
+
+  replaceSpeakerClusterModelEmbeddings(input) {
+    return this.speakerIdentityRepository.replaceClusterModelEmbeddings(input);
+  }
+
+  listSpeakerClusterModelEmbeddings(clusterId) {
+    return this.speakerIdentityRepository.listClusterModelEmbeddings(clusterId);
   }
 
   enqueueDiarizationJobs(sessionId, { at = Date.now(), policy, speakerProcessingPolicy } = {}) {
@@ -2453,7 +2608,7 @@ class JarvisRepository {
           embedding =
             cluster.embedding === null
               ? null
-              : SpeakerIdentityRepository.decodeEmbedding(cluster.embedding, 512);
+              : this.speakerIdentityRepository.decodeStoredEmbedding(cluster.embedding, 512);
         } catch {
           embedding = null;
         }
@@ -2478,7 +2633,9 @@ class JarvisRepository {
       .createHash("sha256")
       .update(JSON.stringify(evidenceRuns))
       .digest("hex");
-    const rawProfiles = this.statements.listIdentityResolutionProfiles.all(policy.modelId);
+    const rawProfiles = this.statements.listIdentityResolutionProfilesAll
+      .all()
+      .filter((sample) => IDENTITY_PROFILE_DIMENSIONS.has(sample.model_id));
     const profileRevisionInput = rawProfiles.map((sample) => ({
       id: sample.id,
       personId: sample.person_id,
@@ -2498,7 +2655,10 @@ class JarvisRepository {
     const samples = rawProfiles.map((sample) => {
       let embedding = null;
       try {
-        embedding = SpeakerIdentityRepository.decodeEmbedding(sample.embedding, 512);
+        embedding = this.speakerIdentityRepository.decodeStoredEmbedding(
+          sample.embedding,
+          IDENTITY_PROFILE_DIMENSIONS.get(sample.model_id)
+        );
       } catch {
         embedding = null;
       }
@@ -3154,9 +3314,22 @@ class JarvisRepository {
     const sessionId = assertId(id, "sessionId");
     const session = this.getSession(sessionId);
     if (!session) return null;
+    const legacySummary = this.db
+      .prepare("SELECT * FROM session_summaries WHERE session_id = ?")
+      .get(sessionId);
     const summary =
-      this.db.prepare("SELECT * FROM session_summaries WHERE session_id = ?").get(sessionId) ??
-      null;
+      legacySummary ??
+      projectSessionSummaryRevision(
+        this.db
+          .prepare(
+            `SELECT content_json, completeness, created_at
+             FROM session_summary_revisions
+             WHERE session_id = ? AND lifecycle = 'active'
+             ORDER BY revision DESC LIMIT 1`
+          )
+          .get(sessionId),
+        sessionId
+      );
     return {
       session,
       summary,
@@ -3338,13 +3511,22 @@ class JarvisRepository {
       SELECT DISTINCT s.* FROM sessions s
       LEFT JOIN session_summaries ss ON ss.session_id=s.id
       WHERE ss.summary LIKE ? ESCAPE '\\'
+        OR EXISTS (
+          SELECT 1 FROM session_summary_revisions sr
+          WHERE sr.session_id = s.id
+            AND sr.lifecycle = 'active'
+            AND (
+              json_extract(sr.content_json, '$.title') LIKE ? ESCAPE '\\'
+              OR json_extract(sr.content_json, '$.summary') LIKE ? ESCAPE '\\'
+            )
+        )
         OR EXISTS (SELECT 1 FROM transcript_segments ts WHERE ts.session_id=s.id AND ts.text LIKE ? ESCAPE '\\')
         OR EXISTS (SELECT 1 FROM session_topics st JOIN topics t ON t.id=st.topic_id WHERE st.session_id=s.id AND (t.canonical_title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\'))
         OR EXISTS (SELECT 1 FROM transcript_segments ts JOIN people p ON p.id=ts.person_id WHERE ts.session_id=s.id AND p.display_name LIKE ? ESCAPE '\\')
       ORDER BY s.started_at DESC LIMIT ?
     `
       )
-      .all(like, like, like, like, like, limit);
+      .all(like, like, like, like, like, like, like, limit);
   }
 
   getTodayInsights(sessionId) {
@@ -3496,6 +3678,31 @@ class JarvisRepository {
 
   createTracks(tracks) {
     return this.captureEvidenceStore.createTracks(tracks);
+  }
+
+  createApplicationAudioInterval(interval) {
+    return this.captureEvidenceStore.createApplicationAudioInterval(interval);
+  }
+
+  closeApplicationAudioInterval(id, endedAt) {
+    return this.captureEvidenceStore.closeApplicationAudioInterval(id, endedAt);
+  }
+
+  listApplicationAudioIntervals(sessionId) {
+    return this.captureEvidenceStore.listApplicationAudioIntervals(sessionId);
+  }
+
+  getSessionApplicationTrack(sessionId, applicationKey) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (typeof applicationKey !== "string" || !/^[a-z0-9._-]{1,64}$/.test(applicationKey)) {
+      throw new TypeError("applicationKey must be a canonical lowercase identifier");
+    }
+    return (
+      this.statements.getSessionApplicationTrack.get({
+        sessionId: safeSessionId,
+        applicationKey,
+      }) ?? null
+    );
   }
 
   setTrackState(id, state, endedAt) {
@@ -3677,6 +3884,8 @@ class JarvisRepository {
       finalized_at: session.finalized_at,
       ready_at: session.ready_at,
       tracks,
+      application_audio_intervals:
+        this.statements.listSessionApplicationAudioIntervals.all(sessionId),
       gaps,
       chunks: this.statements.listSessionTimelineChunks.all(sessionId).map(toPublicAudioChunk),
       segments: this.listTranscriptSegments(sessionId),
@@ -3853,6 +4062,10 @@ class JarvisRepository {
     return this.speakerIdentityRepository.replaceEnrollmentSamples(input);
   }
 
+  replaceVoiceEnrollmentSampleSets(input) {
+    return this.speakerIdentityRepository.replaceEnrollmentSampleSets(input);
+  }
+
   importLegacyVoiceProfile(input) {
     return this.speakerIdentityRepository.importLegacyProfile(input);
   }
@@ -3893,6 +4106,22 @@ class JarvisRepository {
 
   listSpeakerResolutionHistory(clusterId) {
     return this.speakerIdentityRepository.listResolutionHistory(clusterId);
+  }
+
+  listSpeakerResolutionModelEvidence(resolutionId) {
+    return this.speakerIdentityRepository.listResolutionModelEvidence(resolutionId);
+  }
+
+  saveActivityClassificationBatch(input) {
+    return this.activityClassificationRepository.saveBatch(input);
+  }
+
+  listSessionActivityClassificationHistory(sessionId) {
+    return this.activityClassificationRepository.listSessionHistory(sessionId);
+  }
+
+  listSessionActivityClassifications(sessionId) {
+    return this.activityClassificationRepository.listSessionEffective(sessionId);
   }
 
   undoSpeakerCorrection(clusterId) {

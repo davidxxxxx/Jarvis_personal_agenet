@@ -54,6 +54,11 @@ function payload(windows) {
     channels: 1,
     format: "float32",
     recordedSampleCount: 24_000 * 30,
+    source: {
+      kind: "microphone",
+      deviceId: "physical-mic-1",
+      label: "Physical microphone",
+    },
     windows,
   };
 }
@@ -115,14 +120,26 @@ test("preload exposes only scalar-date daily digest controls", async () => {
 
   assert.equal(await api.getDailyDigest("2026-07-17"), "invoked");
   assert.equal(await api.regenerateDailyDigest("2026-07-17"), "invoked");
+  assert.equal(await api.regenerateDailyDigest("2026-07-17", true), "invoked");
   assert.deepEqual(invokes, [
     ["jarvis:memory:daily-digest", { localDate: "2026-07-17" }],
-    ["jarvis:analysis:daily-digest:regenerate", { localDate: "2026-07-17" }],
+    [
+      "jarvis:analysis:daily-digest:regenerate",
+      { localDate: "2026-07-17", allowUsageUnknown: false },
+    ],
+    [
+      "jarvis:analysis:daily-digest:regenerate",
+      { localDate: "2026-07-17", allowUsageUnknown: true },
+    ],
   ]);
   assert.equal("getDailyDigestStatus" in api, false);
   assert.throws(() => api.getDailyDigest({ localDate: "2026-07-17", timezone: "UTC" }));
   assert.throws(() => api.regenerateDailyDigest("2026-02-29"), /valid calendar date/i);
-  assert.equal(invokes.length, 2);
+  assert.throws(
+    () => api.regenerateDailyDigest("2026-07-17", "yes"),
+    /allowUsageUnknown.*boolean/i
+  );
+  assert.equal(invokes.length, 3);
 });
 
 test("preload exposes narrow v2 knowledge reads and actions", async () => {

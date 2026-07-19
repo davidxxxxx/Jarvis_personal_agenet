@@ -4,6 +4,7 @@ const TERMINAL_TRACK_STATES = new Set(["ended", "recovered", "failed"]);
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const RESTORATION_TARGET_STATES = new Set(["active", "paused"]);
 const SOURCE_LIFECYCLE_SESSION_STATUSES = new Set(["recording", "paused"]);
+const APPLICATION_KEY_PATTERN = /^[a-z0-9._-]{1,64}$/;
 const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   completed: "ended",
   recovered: "recovered",
@@ -53,12 +54,36 @@ class CaptureEvidenceStore {
     this.statements = {
       createTrack: db.prepare(`
         INSERT INTO audio_tracks (
-          id, session_id, source_type, device_id, device_label, strategy,
+          id, session_id, source_type, application_key, application_display_name,
+          capture_generation, device_id, device_label, strategy,
           sample_rate, channels, started_at, state
         ) VALUES (
-          @id, @sessionId, @sourceType, @deviceId, @deviceLabel, @strategy,
+          @id, @sessionId, @sourceType, @applicationKey, @applicationDisplayName,
+          @captureGeneration, @deviceId, @deviceLabel, @strategy,
           @sampleRate, @channels, @startedAt, @state
         )
+      `),
+      createApplicationAudioInterval: db.prepare(`
+        INSERT INTO application_audio_intervals (
+          id, session_id, track_id, interval_kind, application_key,
+          attribution_state, capture_generation, started_at, ended_at, reason, created_at
+        ) VALUES (
+          @id, @sessionId, @trackId, @intervalKind, @applicationKey,
+          @attributionState, @captureGeneration, @startedAt, @endedAt, @reason, @createdAt
+        )
+      `),
+      closeApplicationAudioInterval: db.prepare(`
+        UPDATE application_audio_intervals
+        SET ended_at = @endedAt
+        WHERE id = @id AND ended_at IS NULL AND @endedAt > started_at
+      `),
+      getApplicationAudioInterval: db.prepare(
+        "SELECT * FROM application_audio_intervals WHERE id = ?"
+      ),
+      listApplicationAudioIntervals: db.prepare(`
+        SELECT * FROM application_audio_intervals
+        WHERE session_id = ?
+        ORDER BY started_at, id
       `),
       setTrackState: db.prepare(`
         UPDATE audio_tracks
@@ -592,6 +617,33 @@ class CaptureEvidenceStore {
           AND digest_input_id IS NULL
           AND chunk_id IS NULL
       `),
+      authorizeManualAnalysisRetry: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            completed_at = NULL,
+            next_retry_at = @at,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'ANALYSIS_MANUAL_RETRY_AUTHORIZED',
+            blocked_reason = NULL,
+            execution_device = NULL
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'analyze_session'
+          AND state = 'blocked'
+          AND completed_at IS NOT NULL
+          AND (
+            error_code IN (
+              'analysis_invalid_response',
+              'analysis_reconciled_without_candidate',
+              'analysis_candidate_apply_failed'
+            )
+            OR (
+              @allowUsageUnknown = 1
+              AND error_code = 'analysis_usage_unknown'
+            )
+          )
+      `),
       getDailyDigestInputIdentity: db.prepare(`
         SELECT id, source_hash, model_version
         FROM daily_digest_inputs
@@ -621,6 +673,32 @@ class CaptureEvidenceStore {
           AND state IN ('pending','retry')
           AND completed_at IS NULL
           AND (next_retry_at IS NULL OR next_retry_at > @at)
+      `),
+      authorizeManualDailyDigestRetry: db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'retry',
+            completed_at = NULL,
+            next_retry_at = @at,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED',
+            blocked_reason = NULL,
+            execution_device = NULL
+        WHERE id = @id
+          AND lane = 'cloud'
+          AND job_type = 'generate_daily_digest'
+          AND state = 'blocked'
+          AND completed_at IS NOT NULL
+          AND (
+            error_code IN (
+              'daily_digest_invalid_response',
+              'daily_digest_reconciled_without_candidate'
+            )
+            OR (
+              @allowUsageUnknown = 1
+              AND error_code = 'daily_digest_usage_unknown'
+            )
+          )
       `),
       listClaimableCloudJobs: db.prepare(`
         SELECT * FROM processing_jobs
@@ -1102,7 +1180,11 @@ class CaptureEvidenceStore {
             next_retry_at = @nextRetryAt,
             lease_owner = NULL,
             lease_expires_at = NULL,
-            error_code = NULL,
+            error_code = CASE
+              WHEN @preserveManualRetry = 1
+              THEN 'ANALYSIS_MANUAL_RETRY_AUTHORIZED'
+              ELSE NULL
+            END,
             blocked_reason = @reason,
             execution_device = NULL
         WHERE id = @id
@@ -1645,9 +1727,11 @@ class CaptureEvidenceStore {
       if (!session || session.status !== "recording") {
         throw new Error(`session ${sessionId} must be recording`);
       }
-      const tracks = this.statements.listTracksForSession.all(sessionId);
+      const tracks = this.statements.listTracksForSession
+        .all(sessionId)
+        .filter((track) => !TERMINAL_TRACK_STATES.has(track.state));
       if (sources.length !== tracks.length) {
-        throw new Error("power restoration must include every session track exactly once");
+        throw new Error("power restoration must include every session track that is open exactly once");
       }
       const seen = new Set();
       for (const source of sources) {
@@ -1773,8 +1857,10 @@ class CaptureEvidenceStore {
             const closed = this.closeGap(gap.id, at, null);
             if (closed.changes !== 1) throw new Error(`gap ${gap.id} was not finalized`);
           }
-          const updated = this.setTrackState(track.id, trackState, at);
-          if (updated.changes !== 1) throw new Error(`track ${track.id} was not finalized`);
+          if (!TERMINAL_TRACK_STATES.has(track.state)) {
+            const updated = this.setTrackState(track.id, trackState, at);
+            if (updated.changes !== 1) throw new Error(`track ${track.id} was not finalized`);
+          }
         }
         const finalized = this.statements.finalizeSession.run({ sessionId, sessionStatus, at });
         if (finalized.changes !== 1) throw new Error(`session ${sessionId} was not finalized`);
@@ -1790,8 +1876,33 @@ class CaptureEvidenceStore {
     if (track.channels !== 1) {
       throw new RangeError("capture evidence tracks must be mono");
     }
+    const applicationKey = track.applicationKey ?? null;
+    const applicationDisplayName = track.applicationDisplayName ?? null;
+    if (track.sourceType === "mic" && (applicationKey !== null || applicationDisplayName !== null)) {
+      throw new TypeError("microphone tracks cannot have application attribution");
+    }
+    if ((applicationKey === null) !== (applicationDisplayName === null)) {
+      throw new TypeError("application key and display name must be provided together");
+    }
+    if (applicationKey !== null && !APPLICATION_KEY_PATTERN.test(applicationKey)) {
+      throw new TypeError("application key must be a canonical lowercase identifier");
+    }
+    if (
+      applicationDisplayName !== null &&
+      (typeof applicationDisplayName !== "string" ||
+        applicationDisplayName.trim().length < 1 ||
+        applicationDisplayName.trim().length > 80 ||
+        /[\\/:]/u.test(applicationDisplayName))
+    ) {
+      throw new TypeError("application display name must not contain path data");
+    }
+    const captureGeneration = track.captureGeneration ?? 0;
+    this._assertNonNegativeSafeInteger(captureGeneration, "captureGeneration");
     return this.statements.createTrack.run({
       ...track,
+      applicationKey,
+      applicationDisplayName,
+      captureGeneration,
       deviceId: track.deviceId ?? null,
       deviceLabel: track.deviceLabel ?? null,
       strategy: track.strategy ?? null,
@@ -1802,6 +1913,60 @@ class CaptureEvidenceStore {
   createTracks(tracks) {
     if (!Array.isArray(tracks)) throw new TypeError("tracks must be an array");
     return this.createTracksTransaction(tracks);
+  }
+
+  createApplicationAudioInterval(interval) {
+    if (!interval || typeof interval !== "object" || Array.isArray(interval)) {
+      throw new TypeError("application audio interval is required");
+    }
+    const id = interval.id ?? this.createId("application-audio-interval");
+    this._assertIdentifier(id, "intervalId");
+    this._assertIdentifier(interval.sessionId, "sessionId");
+    this._assertIdentifier(interval.trackId, "trackId");
+    this._assertNonNegativeSafeInteger(interval.captureGeneration ?? 0, "captureGeneration");
+    this._assertNonNegativeSafeInteger(interval.startedAt, "interval startedAt");
+    const endedAt = interval.endedAt ?? null;
+    if (endedAt !== null) {
+      this._assertNonNegativeSafeInteger(endedAt, "interval endedAt");
+      if (endedAt <= interval.startedAt) {
+        throw new RangeError("application audio interval endedAt must be after startedAt");
+      }
+    }
+    const applicationKey = interval.applicationKey ?? null;
+    if (applicationKey !== null && !APPLICATION_KEY_PATTERN.test(applicationKey)) {
+      throw new TypeError("application key must be a canonical lowercase identifier");
+    }
+    const createdAt = interval.createdAt ?? this.now();
+    this._assertNonNegativeSafeInteger(createdAt, "interval createdAt");
+    this.statements.createApplicationAudioInterval.run({
+      id,
+      sessionId: interval.sessionId,
+      trackId: interval.trackId,
+      intervalKind: interval.intervalKind,
+      applicationKey,
+      attributionState: interval.attributionState,
+      captureGeneration: interval.captureGeneration ?? 0,
+      startedAt: interval.startedAt,
+      endedAt,
+      reason: interval.reason ?? null,
+      createdAt,
+    });
+    return this.statements.getApplicationAudioInterval.get(id);
+  }
+
+  closeApplicationAudioInterval(id, endedAt) {
+    this._assertIdentifier(id, "intervalId");
+    this._assertNonNegativeSafeInteger(endedAt, "interval endedAt");
+    const result = this.statements.closeApplicationAudioInterval.run({ id, endedAt });
+    return {
+      changes: result.changes,
+      interval: this.statements.getApplicationAudioInterval.get(id) ?? null,
+    };
+  }
+
+  listApplicationAudioIntervals(sessionId) {
+    this._assertIdentifier(sessionId, "sessionId");
+    return this.statements.listApplicationAudioIntervals.all(sessionId);
   }
 
   setTrackState(id, state, endedAt = null) {
@@ -2042,6 +2207,20 @@ class CaptureEvidenceStore {
     return row;
   }
 
+  authorizeManualAnalysisRetry(id, { allowUsageUnknown = false, at = this.now() } = {}) {
+    this._assertIdentifier(id, "jobId");
+    if (typeof allowUsageUnknown !== "boolean") {
+      throw new TypeError("allowUsageUnknown must be a boolean");
+    }
+    this._assertNonNegativeSafeInteger(at, "manual retry at");
+    const changed = this.statements.authorizeManualAnalysisRetry.run({
+      id,
+      allowUsageUnknown: allowUsageUnknown ? 1 : 0,
+      at,
+    }).changes;
+    return changed === 1 ? this.statements.getProcessingJob.get(id) : null;
+  }
+
   enqueueDailyDigestJob(inputRequest) {
     assertExactPlainObject(
       inputRequest,
@@ -2108,6 +2287,23 @@ class CaptureEvidenceStore {
     if (!existing) throw new Error(`daily digest job for ${digestInputId} does not exist`);
     this.statements.wakeDailyDigestJob.run({ digestInputId, at });
     return this.statements.getDailyDigestJobByInput.get(digestInputId);
+  }
+
+  authorizeManualDailyDigestRetry(
+    id,
+    { allowUsageUnknown = false, at = this.now() } = {}
+  ) {
+    this._assertIdentifier(id, "jobId");
+    if (typeof allowUsageUnknown !== "boolean") {
+      throw new TypeError("allowUsageUnknown must be a boolean");
+    }
+    this._assertNonNegativeSafeInteger(at, "manual retry at");
+    const changed = this.statements.authorizeManualDailyDigestRetry.run({
+      id,
+      allowUsageUnknown: allowUsageUnknown ? 1 : 0,
+      at,
+    }).changes;
+    return changed === 1 ? this.statements.getProcessingJob.get(id) : null;
   }
 
   claimJobs({ owner, at, leaseMs, limit, priorityBefore = Number.MAX_SAFE_INTEGER }) {
@@ -2263,12 +2459,25 @@ class CaptureEvidenceStore {
     return this.statements.retryLeasedJob.run({ ...input, nextRetryAt, errorCode }).changes === 1;
   }
 
-  deferJob(id, { owner, at, nextRetryAt = at + 15_000, reason }) {
+  deferJob(
+    id,
+    { owner, at, nextRetryAt = at + 15_000, reason, preserveManualRetry = false }
+  ) {
     const input = this._assertJobLeaseTransition(id, { owner, at });
     this._assertIdentifier(reason, "reason");
+    if (typeof preserveManualRetry !== "boolean") {
+      throw new TypeError("preserveManualRetry must be a boolean");
+    }
     this._assertNonNegativeSafeInteger(nextRetryAt, "nextRetryAt");
     if (nextRetryAt < at) throw new RangeError("nextRetryAt must not be before at");
-    return this.statements.deferLeasedJob.run({ ...input, nextRetryAt, reason }).changes === 1;
+    return (
+      this.statements.deferLeasedJob.run({
+        ...input,
+        nextRetryAt,
+        reason,
+        preserveManualRetry: preserveManualRetry ? 1 : 0,
+      }).changes === 1
+    );
   }
 
   blockJob(id, { owner, at, errorCode }) {
@@ -2413,9 +2622,11 @@ class CaptureEvidenceStore {
     if (at < session.started_at) {
       throw new RangeError("transition at must not be before session startedAt");
     }
-    const sessionTracks = this.statements.listTracksForSession.all(sessionId);
+    const sessionTracks = this.statements.listTracksForSession
+      .all(sessionId)
+      .filter((track) => !TERMINAL_TRACK_STATES.has(track.state));
     if (sources.length !== sessionTracks.length) {
-      throw new Error("transition must include every session track exactly once");
+      throw new Error("transition must include every session track that is open exactly once");
     }
 
     const seenTrackIds = new Set();
@@ -2455,7 +2666,7 @@ class CaptureEvidenceStore {
       return { track, openGap, source };
     });
     if (sessionTracks.some((track) => !seenTrackIds.has(track.id))) {
-      throw new Error("transition must include every session track exactly once");
+      throw new Error("transition must include every session track that is open exactly once");
     }
     return evidence;
   }

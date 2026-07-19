@@ -108,7 +108,7 @@ function isWavFormat(buffer) {
 }
 
 function convertToWav(inputPath, outputPath, options = {}) {
-  const { sampleRate = 16000, channels = 1 } = options;
+  const { sampleRate = 16000, channels = 1, redactPaths = false } = options;
 
   return new Promise((resolve, reject) => {
     const ffmpegPath = getFFmpegPath();
@@ -130,12 +130,17 @@ function convertToWav(inputPath, outputPath, options = {}) {
       outputPath,
     ];
 
-    debugLogger.debug("Converting audio with FFmpeg", {
-      input: inputPath,
-      output: outputPath,
-      sampleRate,
-      channels,
-    });
+    debugLogger.debug(
+      "Converting audio with FFmpeg",
+      redactPaths
+        ? { sampleRate, channels }
+        : {
+            input: inputPath,
+            output: outputPath,
+            sampleRate,
+            channels,
+          }
+    );
 
     const proc = spawn(ffmpegPath, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -155,7 +160,10 @@ function convertToWav(inputPath, outputPath, options = {}) {
     proc.on("close", (code) => {
       if (code !== 0) {
         const stderrPreview = stderr.slice(-500).trim();
-        debugLogger.debug("FFmpeg conversion failed", { code, stderr: stderrPreview });
+        debugLogger.debug(
+          "FFmpeg conversion failed",
+          redactPaths ? { code } : { code, stderr: stderrPreview }
+        );
         reject(
           new Error(`FFmpeg exited with code ${code}${stderrPreview ? `: ${stderrPreview}` : ""}`)
         );

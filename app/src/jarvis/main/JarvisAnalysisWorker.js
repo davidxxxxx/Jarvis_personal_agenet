@@ -238,7 +238,7 @@ class JarvisAnalysisWorker {
     }
   }
 
-  _defer(jobId, reason) {
+  _defer(jobId, reason, { preserveManualRetry = false } = {}) {
     const at = this._at();
     if (
       this.store.deferJob(jobId, {
@@ -246,6 +246,7 @@ class JarvisAnalysisWorker {
         at,
         nextRetryAt: at + 15_000,
         reason,
+        preserveManualRetry,
       }) !== true
     ) {
       throw codedError("JOB_LEASE_LOST");
@@ -370,6 +371,12 @@ class JarvisAnalysisWorker {
       return { status: "blocked", reason: "usage_unknown", jobId: job.id };
     }
     if (latest.state === "usage_unknown") {
+      if (
+        job.error_code === "ANALYSIS_MANUAL_RETRY_AUTHORIZED" &&
+        this.budgetGuard.getStatus?.({})?.mode === "unlimited"
+      ) {
+        return { attemptNumber };
+      }
       this._block(job.id, "analysis_usage_unknown");
       return { status: "blocked", reason: "usage_unknown", jobId: job.id };
     }
@@ -381,6 +388,9 @@ class JarvisAnalysisWorker {
       ) {
         return { attemptNumber };
       }
+      if (job.error_code === "ANALYSIS_MANUAL_RETRY_AUTHORIZED") {
+        return { attemptNumber };
+      }
       this._block(job.id, "analysis_reconciled_without_candidate");
       return { status: "blocked", reason: "reconciled_without_candidate", jobId: job.id };
     }
@@ -390,6 +400,7 @@ class JarvisAnalysisWorker {
 
   async execute(claimedJob) {
     const job = this._validateClaimedJob(claimedJob);
+    const preserveManualRetry = job.error_code === "ANALYSIS_MANUAL_RETRY_AUTHORIZED";
     const initial = this._loadState(job);
     const recoverable = initial.candidates.find((candidate) => candidate.jobId === job.id);
     if (recoverable) {
@@ -407,7 +418,7 @@ class JarvisAnalysisWorker {
     }
     const initialDecision = this._evaluate(job, initial.analysisInput, initial.head);
     if (initialDecision.eligible !== true) {
-      this._defer(job.id, "analysis_deferred_for_local_work");
+      this._defer(job.id, "analysis_deferred_for_local_work", { preserveManualRetry });
       return {
         status: "deferred",
         reason: initialDecision.reason,
@@ -415,7 +426,7 @@ class JarvisAnalysisWorker {
       };
     }
     if (typeof this.client.isConfigured === "function" && !this.client.isConfigured()) {
-      this._defer(job.id, "analysis_configuration_required");
+      this._defer(job.id, "analysis_configuration_required", { preserveManualRetry });
       return { status: "deferred", reason: "configuration_required", jobId: job.id };
     }
 
@@ -429,7 +440,7 @@ class JarvisAnalysisWorker {
       estimatedUsage: this.estimatedUsage,
     });
     if (reservation?.ok !== true) {
-      this._defer(job.id, "analysis_budget_denied");
+      this._defer(job.id, "analysis_budget_denied", { preserveManualRetry });
       return { status: "deferred", reason: reservation?.reason ?? "budget_denied", jobId: job.id };
     }
     if (
@@ -453,7 +464,7 @@ class JarvisAnalysisWorker {
     const finalDecision = this._evaluate(job, reloadedInput, reloadedHead);
     if (finalDecision.eligible !== true) {
       this.budgetGuard.release({ requestId, reasonCode: "admission_revoked" });
-      this._defer(job.id, "analysis_deferred_for_local_work");
+      this._defer(job.id, "analysis_deferred_for_local_work", { preserveManualRetry });
       return { status: "deferred", reason: finalDecision.reason, jobId: job.id };
     }
 
@@ -539,12 +550,21 @@ class JarvisAnalysisWorker {
     ) {
       throw codedError("ANALYSIS_CANDIDATE_PERSIST_INVALID");
     }
-    const applied = this.memoryRepository.applyStoredAnalysisCandidate({
-      candidateId: persisted.candidateId,
-      jobId: job.id,
-      owner: this.owner,
-      at: this._at(),
-    });
+    let applied;
+    try {
+      applied = this.memoryRepository.applyStoredAnalysisCandidate({
+        candidateId: persisted.candidateId,
+        jobId: job.id,
+        owner: this.owner,
+        at: this._at(),
+      });
+    } catch (error) {
+      if (error?.code === "JOB_LEASE_LOST" || error?.code === "MEMORY_CANDIDATE_LEASE_LOST") {
+        throw error;
+      }
+      this._block(job.id, "analysis_candidate_apply_failed");
+      return { status: "blocked", reason: "candidate_apply_failed", jobId: job.id };
+    }
     if (!applied || !new Set(["applied", "already_applied", "superseded"]).has(applied.status)) {
       throw codedError("ANALYSIS_CANDIDATE_APPLY_INVALID");
     }
@@ -576,12 +596,21 @@ class JarvisAnalysisWorker {
     }
     let status = "already_applied";
     if (recovery.candidateState === "validated") {
-      const applied = this.memoryRepository.applyStoredAnalysisCandidate({
-        candidateId,
-        jobId,
-        owner: this.owner,
-        at,
-      });
+      let applied;
+      try {
+        applied = this.memoryRepository.applyStoredAnalysisCandidate({
+          candidateId,
+          jobId,
+          owner: this.owner,
+          at,
+        });
+      } catch (error) {
+        if (error?.code === "JOB_LEASE_LOST" || error?.code === "MEMORY_CANDIDATE_LEASE_LOST") {
+          throw error;
+        }
+        this._block(jobId, "analysis_candidate_apply_failed");
+        return { status: "blocked", reason: "candidate_apply_failed", jobId };
+      }
       if (!applied || !new Set(["applied", "already_applied", "superseded"]).has(applied.status)) {
         throw codedError("ANALYSIS_CANDIDATE_RECOVERY_INVALID");
       }

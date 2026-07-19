@@ -9,6 +9,7 @@ const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
 const DEFAULT_MAX_REQUEST_BYTES = 128 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
+const DEFAULT_TIMEOUT_MS = 240_000;
 const OFFICIAL_HOSTS = new Set(["api.minimaxi.com", "api.minimax.io"]);
 const LOG_KEYS = new Set([
   "requestId",
@@ -25,12 +26,13 @@ const LOG_KEYS = new Set([
 ]);
 
 class AnalysisClientError extends Error {
-  constructor(code, { retryable = false, issueCode } = {}) {
+  constructor(code, { retryable = false, issueCode, authoritativeUsage } = {}) {
     super("MiniMax analysis request failed");
     this.name = "AnalysisClientError";
     this.code = code;
     this.retryable = retryable === true;
     if (issueCode !== undefined) this.issueCode = issueCode;
+    if (authoritativeUsage !== undefined) this.authoritativeUsage = authoritativeUsage;
   }
 }
 
@@ -124,73 +126,127 @@ function normalizeInput(input) {
   };
 }
 
-function parseJsonObject(text, { ambiguityIsStructure = false } = {}) {
-  if (typeof text !== "string") throw clientError("invalid_structure");
+function parseJsonObject(
+  text,
+  { ambiguityIsStructure = false, issuePrefix = "envelope.content" } = {}
+) {
+  if (typeof text !== "string") {
+    throw clientError("invalid_structure", false, `${issuePrefix}.type`);
+  }
   const trimmed = text.trim();
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-    throw clientError("invalid_structure");
+    throw clientError("invalid_structure", false, `${issuePrefix}.shape`);
   }
   if (ambiguityIsStructure && /\}\s*\{/u.test(trimmed)) {
-    throw clientError("invalid_structure");
+    throw clientError("invalid_structure", false, `${issuePrefix}.ambiguous`);
   }
   let parsed;
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    throw clientError("invalid_json");
+    throw clientError("invalid_json", false, `${issuePrefix}.json`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw clientError("invalid_structure");
+    throw clientError("invalid_structure", false, `${issuePrefix}.object`);
   }
   return parsed;
 }
 
 function extractCandidate(body) {
   if (!body || typeof body !== "object" || Array.isArray(body) || !Array.isArray(body.choices)) {
-    throw clientError("invalid_structure");
+    throw clientError("invalid_structure", false, "envelope.body");
   }
-  if (body.choices.length !== 1) throw clientError("invalid_structure");
+  if (body.choices.length !== 1) {
+    throw clientError("invalid_structure", false, "envelope.choices_count");
+  }
   const message = body.choices[0]?.message;
   if (!message || typeof message !== "object" || Array.isArray(message)) {
-    throw clientError("invalid_structure");
+    throw clientError("invalid_structure", false, "envelope.message");
   }
-  if (Object.prototype.hasOwnProperty.call(message, "function_call")) {
-    throw clientError("invalid_structure");
-  }
+
+  const legacyCall = message.function_call;
   const toolCalls = message.tool_calls;
-  if (toolCalls !== undefined && (!Array.isArray(toolCalls) || toolCalls.length > 0)) {
-    if (!Array.isArray(toolCalls) || toolCalls.length !== 1) {
-      throw clientError("invalid_structure");
+  if (toolCalls !== undefined && !Array.isArray(toolCalls)) {
+    throw clientError("invalid_structure", false, "envelope.tool_calls_type");
+  }
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+    if (toolCalls.length !== 1) {
+      throw clientError("invalid_structure", false, "envelope.tool_calls_count");
     }
-    if (typeof message.content === "string" && message.content.trim() !== "") {
-      throw clientError("invalid_structure");
-    }
-    if (message.content !== undefined && message.content !== null && message.content !== "") {
-      throw clientError("invalid_structure");
+    if (legacyCall !== undefined && legacyCall !== null) {
+      throw clientError("invalid_structure", false, "envelope.conflicting_function_call");
     }
     const call = toolCalls[0];
     if (
+      call?.type !== "function" ||
       call?.function?.name !== "submit_jarvis_analysis" ||
       typeof call?.function?.arguments !== "string"
     ) {
-      throw clientError("invalid_structure");
+      throw clientError("invalid_structure", false, "envelope.tool_call_shape");
     }
-    return parseJsonObject(call.function.arguments);
+    // MiniMax may include null or structured reasoning/content beside a valid
+    // tool call. The analysis candidate lives exclusively in the arguments,
+    // so unrelated assistant content is deliberately ignored.
+    return parseJsonObject(call.function.arguments, {
+      issuePrefix: "envelope.tool_arguments",
+    });
   }
 
-  if (typeof message.content !== "string") throw clientError("invalid_structure");
+  if (legacyCall !== undefined && legacyCall !== null) {
+    if (
+      typeof legacyCall !== "object" ||
+      Array.isArray(legacyCall) ||
+      legacyCall.name !== "submit_jarvis_analysis" ||
+      typeof legacyCall.arguments !== "string"
+    ) {
+      throw clientError("invalid_structure", false, "envelope.legacy_function_call_shape");
+    }
+    return parseJsonObject(legacyCall.arguments, {
+      issuePrefix: "envelope.legacy_function_arguments",
+    });
+  }
+
+  if (typeof message.content !== "string") {
+    throw clientError("invalid_structure", false, "envelope.content_type");
+  }
   const content = message.content.trim();
   if (content.startsWith("```")) {
     const match = /^```json\s*\r?\n?([\s\S]*?)\r?\n?```$/iu.exec(content);
-    if (!match || match[1].includes("```")) throw clientError("invalid_structure");
-    return parseJsonObject(match[1], { ambiguityIsStructure: true });
+    if (!match || match[1].includes("```")) {
+      throw clientError("invalid_structure", false, "envelope.content_fence");
+    }
+    return parseJsonObject(match[1], {
+      ambiguityIsStructure: true,
+      issuePrefix: "envelope.content",
+    });
   }
-  if (content.includes("```")) throw clientError("invalid_structure");
-  return parseJsonObject(content, { ambiguityIsStructure: true });
+  if (content.includes("```")) {
+    throw clientError("invalid_structure", false, "envelope.content_fence");
+  }
+  return parseJsonObject(content, {
+    ambiguityIsStructure: true,
+    issuePrefix: "envelope.content",
+  });
 }
 
 function safeTokenCount(value) {
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function extractAuthoritativeUsage(body) {
+  const raw = body?.usage;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const inputTokens = safeTokenCount(raw.prompt_tokens ?? raw.input_tokens);
+  const outputTokens = safeTokenCount(raw.completion_tokens ?? raw.output_tokens);
+  if (inputTokens === null || outputTokens === null) return null;
+  return { inputTokens, outputTokens };
+}
+
+function attachAuthoritativeUsage(error, authoritativeUsage) {
+  if (error instanceof AnalysisClientError && authoritativeUsage) {
+    error.authoritativeUsage = authoritativeUsage;
+  }
+  return error;
 }
 
 async function readResponseBytes(response, maxBytes, controller) {
@@ -237,7 +293,7 @@ class MiniMaxAnalysisClient {
     getApiKey,
     baseUrl = DEFAULT_BASE_URL,
     model = DEFAULT_MODEL,
-    timeoutMs = 60_000,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
     maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES,
     maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
     logger = () => {},
@@ -308,14 +364,15 @@ class MiniMaxAnalysisClient {
           {
             role: "system",
             content:
-              "Analyze only the supplied pseudonymous transcript text. Return exactly one jarvis-analysis-v2 object through submit_jarvis_analysis. Every factual item must cite only supplied segment IDs. Never invent IDs, state, dates, or calendar actions.",
+              "Analyze only the supplied pseudonymous transcript text. Call submit_jarvis_analysis exactly once with one concise jarvis-analysis-v2 object; do not answer with prose. Use at most 20 memories, 12 topics, 20 todos, and 12 suggestions, with 1-6 strongest evidence IDs per item. Every factual item must cite only supplied segment IDs. Never invent IDs, state, dates, or calendar actions.",
           },
           { role: "user", content: normalized.cloudPayloadJson },
         ],
         tools: [ANALYSIS_TOOL],
-        tool_choice: { type: "function", function: { name: "submit_jarvis_analysis" } },
-        temperature: 0.1,
-        max_completion_tokens: 2048,
+        tool_choice: "auto",
+        reasoning_split: true,
+        temperature: 1,
+        max_completion_tokens: 8192,
         stream: false,
       });
       requestBytes = Buffer.byteLength(body, "utf8");
@@ -365,7 +422,13 @@ class MiniMaxAnalysisClient {
         } catch {
           throw clientError("invalid_json");
         }
-        const parsed = extractCandidate(envelopeBody);
+        const authoritativeUsage = extractAuthoritativeUsage(envelopeBody);
+        let parsed;
+        try {
+          parsed = extractCandidate(envelopeBody);
+        } catch (error) {
+          throw attachAuthoritativeUsage(error, authoritativeUsage);
+        }
         let result;
         try {
           result = validateCandidateAnalysis(parsed, {
@@ -374,18 +437,14 @@ class MiniMaxAnalysisClient {
           });
         } catch (error) {
           if (error instanceof AnalysisSchemaError) {
-            throw clientError("invalid_structure", false, error.issueCode);
+            throw attachAuthoritativeUsage(
+              clientError("invalid_structure", false, error.issueCode),
+              authoritativeUsage
+            );
           }
           throw error;
         }
-        const usage = {
-          inputTokens: safeTokenCount(
-            envelopeBody?.usage?.prompt_tokens ?? envelopeBody?.usage?.input_tokens
-          ),
-          outputTokens: safeTokenCount(
-            envelopeBody?.usage?.completion_tokens ?? envelopeBody?.usage?.output_tokens
-          ),
-        };
+        if (!authoritativeUsage) throw clientError("usage_unknown");
         this._log({
           requestId,
           inputHash,
@@ -393,12 +452,12 @@ class MiniMaxAnalysisClient {
           responseBytes,
           durationMs: Math.max(0, this.now() - startedAt),
           model: this.model,
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
+          inputTokens: authoritativeUsage.inputTokens,
+          outputTokens: authoritativeUsage.outputTokens,
         });
         return {
           result,
-          usage,
+          usage: authoritativeUsage,
           model: this.model,
           requestId,
           inputHash,
@@ -418,6 +477,8 @@ class MiniMaxAnalysisClient {
         responseBytes,
         durationMs: Math.max(0, this.now() - startedAt),
         model: this.model,
+        inputTokens: safeError.authoritativeUsage?.inputTokens,
+        outputTokens: safeError.authoritativeUsage?.outputTokens,
         errorCode: safeError.code,
         validatorIssueCode: safeError.issueCode,
       });
@@ -432,3 +493,4 @@ module.exports.DEFAULT_BASE_URL = DEFAULT_BASE_URL;
 module.exports.DEFAULT_MODEL = DEFAULT_MODEL;
 module.exports.DEFAULT_MAX_REQUEST_BYTES = DEFAULT_MAX_REQUEST_BYTES;
 module.exports.DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_MAX_RESPONSE_BYTES;
+module.exports.DEFAULT_TIMEOUT_MS = DEFAULT_TIMEOUT_MS;

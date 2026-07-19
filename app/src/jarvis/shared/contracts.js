@@ -6,6 +6,7 @@ const CHANNELS = Object.freeze({
   upsertSegments: "jarvis:segments:upsert",
   syncSegments: "jarvis:segments:sync",
   listSegments: "jarvis:segments:list",
+  listActivityClassifications: "jarvis:activity:list-session",
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
   listSessionSpeakerClusters: "jarvis:speaker:list-session",
@@ -40,6 +41,10 @@ const CHANNELS = Object.freeze({
   getAnalysisStatus: "jarvis:analysis:status",
   getAnalysisBudget: "jarvis:analysis-budget:get",
   setAnalysisBudget: "jarvis:analysis-budget:set",
+  getResourceGovernance: "jarvis:resource-governance:get",
+  setResourceGovernance: "jarvis:resource-governance:set",
+  getApplicationAudioSettings: "jarvis:application-audio:get",
+  setApplicationAudioSettings: "jarvis:application-audio:set",
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
   clearMiniMaxKey: "jarvis:minimax:clear-key",
@@ -148,6 +153,17 @@ function normalizeDailyDigestDateRequest(input) {
     throw new TypeError("daily digest localDate must be a valid calendar date");
   }
   return { localDate: input.localDate };
+}
+
+function normalizeDailyDigestRegenerateRequest(input) {
+  exactPlainObject(input, ["localDate", "allowUsageUnknown"], "daily digest regenerate request");
+  if (typeof input.allowUsageUnknown !== "boolean") {
+    throw new TypeError("allowUsageUnknown must be a boolean");
+  }
+  return {
+    ...normalizeDailyDigestDateRequest({ localDate: input.localDate }),
+    allowUsageUnknown: input.allowUsageUnknown,
+  };
 }
 
 function exactPlainObject(input, keys, name) {
@@ -351,6 +367,68 @@ function normalizeMiniMaxConfig(input) {
   };
 }
 
+const RESOURCE_GOVERNANCE_PRESETS = Object.freeze({
+  game_priority: Object.freeze({
+    profile: "game_priority",
+    externalGpuThresholdPct: 20,
+    recoveryWaitMs: 120_000,
+  }),
+  balanced: Object.freeze({
+    profile: "balanced",
+    externalGpuThresholdPct: 45,
+    recoveryWaitMs: 60_000,
+  }),
+  processing_priority: Object.freeze({
+    profile: "processing_priority",
+    externalGpuThresholdPct: 75,
+    recoveryWaitMs: 15_000,
+  }),
+});
+
+function normalizeResourceGovernanceSettings(input) {
+  exactEnumerableObject(
+    input,
+    ["profile", "externalGpuThresholdPct", "recoveryWaitMs"],
+    "resource governance settings"
+  );
+  if (!Object.prototype.hasOwnProperty.call(RESOURCE_GOVERNANCE_PRESETS, input.profile)) {
+    throw new TypeError("resource governance profile is invalid");
+  }
+  if (
+    !Number.isSafeInteger(input.externalGpuThresholdPct) ||
+    input.externalGpuThresholdPct < 10 ||
+    input.externalGpuThresholdPct > 85
+  ) {
+    throw new RangeError("externalGpuThresholdPct must be between 10 and 85");
+  }
+  if (
+    !Number.isSafeInteger(input.recoveryWaitMs) ||
+    input.recoveryWaitMs < 15_000 ||
+    input.recoveryWaitMs > 300_000
+  ) {
+    throw new RangeError("recoveryWaitMs must be between 15000 and 300000");
+  }
+  return {
+    profile: input.profile,
+    externalGpuThresholdPct: input.externalGpuThresholdPct,
+    recoveryWaitMs: input.recoveryWaitMs,
+  };
+}
+
+function normalizeApplicationAudioSettings(input) {
+  exactEnumerableObject(input, ["enabled", "trackLimit"], "application audio settings");
+  if (typeof input.enabled !== "boolean") {
+    throw new TypeError("application audio enabled must be a boolean");
+  }
+  if (!Number.isSafeInteger(input.trackLimit) || input.trackLimit < 1 || input.trackLimit > 8) {
+    throw new RangeError("application audio trackLimit must be between 1 and 8");
+  }
+  return {
+    enabled: input.enabled,
+    trackLimit: input.trackLimit,
+  };
+}
+
 function normalizeAnalysisBudgetInput(input) {
   const hasMode =
     input && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "mode");
@@ -366,11 +444,7 @@ function normalizeAnalysisBudgetInput(input) {
   ) {
     throw new RangeError("monthlyLimitMicrousd must be between 0 and 1000000000000");
   }
-  const mode = hasMode
-    ? input.mode
-    : input.monthlyLimitMicrousd === 0
-      ? "off"
-      : "capped";
+  const mode = hasMode ? input.mode : input.monthlyLimitMicrousd === 0 ? "off" : "capped";
   if (!new Set(["off", "capped", "unlimited"]).has(mode)) {
     throw new TypeError("analysis budget mode is invalid");
   }
@@ -511,6 +585,7 @@ module.exports = {
   assertId,
   normalizeSpeakerConfirmationInput,
   normalizeDailyDigestDateRequest,
+  normalizeDailyDigestRegenerateRequest,
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
@@ -518,6 +593,9 @@ module.exports = {
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
   normalizeMiniMaxConfig,
+  RESOURCE_GOVERNANCE_PRESETS,
+  normalizeResourceGovernanceSettings,
+  normalizeApplicationAudioSettings,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,

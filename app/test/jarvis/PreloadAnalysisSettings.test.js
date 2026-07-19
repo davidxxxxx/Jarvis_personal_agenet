@@ -61,6 +61,44 @@ const budget = {
   rawError: "C:\\private\\ledger.db",
 };
 
+const resourceSettings = {
+  profile: "balanced",
+  externalGpuThresholdPct: 45,
+  recoveryWaitMs: 60_000,
+  privatePath: "C:\\private\\resource.json",
+};
+
+const applicationAudioStatus = {
+  enabled: true,
+  trackLimit: 4,
+  runtime: {
+    running: true,
+    configuredLimit: 4,
+    effectiveLimit: 2,
+    fullscreen: true,
+    activeTracks: [
+      {
+        applicationKey: "chrome",
+        applicationDisplayName: "Chrome",
+        captureGeneration: 7,
+        state: "recording",
+        processId: 1234,
+      },
+    ],
+    fallbacks: [
+      {
+        applicationKey: "kook",
+        applicationDisplayName: "KOOK",
+        reason: "capture_failed",
+        retryAt: 9_000,
+        state: "mixed_unknown",
+        executablePath: "C:\\private\\kook.exe",
+      },
+    ],
+  },
+  privatePath: "C:\\private\\application-audio.json",
+};
+
 test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe responses", async () => {
   const { api, invokes } = loadPreloadApi({
     responder(channel) {
@@ -121,6 +159,99 @@ test("preload rejects malformed MiniMax and analysis-budget inputs before IPC", 
   assert.deepEqual(invokes, []);
 });
 
+test("preload validates resource governance updates and strips private response fields", async () => {
+  const { api, invokes } = loadPreloadApi({ responder: () => resourceSettings });
+
+  assert.deepEqual(await api.getResourceGovernance(), {
+    profile: "balanced",
+    externalGpuThresholdPct: 45,
+    recoveryWaitMs: 60_000,
+  });
+  assert.deepEqual(
+    await api.setResourceGovernance({
+      profile: "game_priority",
+      externalGpuThresholdPct: 25,
+      recoveryWaitMs: 180_000,
+    }),
+    {
+      profile: "balanced",
+      externalGpuThresholdPct: 45,
+      recoveryWaitMs: 60_000,
+    }
+  );
+  assert.deepEqual(invokes, [
+    ["jarvis:resource-governance:get"],
+    [
+      "jarvis:resource-governance:set",
+      {
+        profile: "game_priority",
+        externalGpuThresholdPct: 25,
+        recoveryWaitMs: 180_000,
+      },
+    ],
+  ]);
+
+  for (const input of [
+    { profile: "unknown", externalGpuThresholdPct: 45, recoveryWaitMs: 60_000 },
+    { profile: "balanced", externalGpuThresholdPct: 9, recoveryWaitMs: 60_000 },
+    { profile: "balanced", externalGpuThresholdPct: 45, recoveryWaitMs: 300_001 },
+  ]) {
+    assert.throws(() => api.setResourceGovernance(input));
+  }
+  assert.equal(invokes.length, 2);
+});
+
+test("preload validates application audio settings and strips process identity fields", async () => {
+  const { api, invokes } = loadPreloadApi({ responder: () => applicationAudioStatus });
+
+  const expected = {
+    enabled: true,
+    trackLimit: 4,
+    runtime: {
+      running: true,
+      configuredLimit: 4,
+      effectiveLimit: 2,
+      fullscreen: true,
+      activeTracks: [
+        {
+          applicationKey: "chrome",
+          applicationDisplayName: "Chrome",
+          captureGeneration: 7,
+          state: "recording",
+        },
+      ],
+      fallbacks: [
+        {
+          applicationKey: "kook",
+          applicationDisplayName: "KOOK",
+          reason: "capture_failed",
+          retryAt: 9_000,
+          state: "mixed_unknown",
+        },
+      ],
+    },
+  };
+  assert.deepEqual(await api.getApplicationAudioSettings(), expected);
+  assert.deepEqual(
+    await api.setApplicationAudioSettings({ enabled: false, trackLimit: 8 }),
+    expected
+  );
+  assert.deepEqual(invokes, [
+    ["jarvis:application-audio:get"],
+    ["jarvis:application-audio:set", { enabled: false, trackLimit: 8 }],
+  ]);
+
+  for (const input of [
+    { enabled: "yes", trackLimit: 4 },
+    { enabled: true, trackLimit: 0 },
+    { enabled: true, trackLimit: 9 },
+    { enabled: true, trackLimit: 4, extra: true },
+  ]) {
+    assert.throws(() => api.setApplicationAudioSettings(input));
+  }
+  assert.equal(invokes.length, 2);
+});
+
 test("preload strips private analysis status fields and masks raw IPC failures", async () => {
   const status = {
     sessionId: "session-1",
@@ -155,6 +286,15 @@ test("preload strips private analysis status fields and masks raw IPC failures",
     () => failed.api.clearMiniMaxKey(),
     () => failed.api.getAnalysisBudget(),
     () => failed.api.setAnalysisBudget({ monthlyLimitMicrousd: 5_000_000, timezone: "UTC" }),
+    () => failed.api.getResourceGovernance(),
+    () =>
+      failed.api.setResourceGovernance({
+        profile: "balanced",
+        externalGpuThresholdPct: 45,
+        recoveryWaitMs: 60_000,
+      }),
+    () => failed.api.getApplicationAudioSettings(),
+    () => failed.api.setApplicationAudioSettings({ enabled: true, trackLimit: 4 }),
     () => failed.api.getAnalysisStatus("session-1"),
     () => failed.api.analyzeSession("session-1", "final"),
   ]) {

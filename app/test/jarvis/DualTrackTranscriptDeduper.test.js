@@ -27,6 +27,19 @@ function fixture(t, { sessionId = "session-1" } = {}) {
       startedAt: 0,
     });
   }
+  repository.createTrack({
+    id: `${sessionId}-track-app-chrome`,
+    sessionId,
+    sourceType: "system",
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    captureGeneration: 1,
+    deviceLabel: "Chrome",
+    strategy: "wasapi-application-loopback",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 0,
+  });
   return {
     repository,
     deduper: new DualTrackTranscriptDeduper({ repository }),
@@ -58,22 +71,61 @@ function segment(repository, {
   return repository.getTranscriptSegment(id);
 }
 
-function rawChunk(repository, { id, sourceType, sequenceNumber }) {
-  const sessionId = "session-1";
+function rawChunk(repository, {
+  id,
+  sourceType,
+  sequenceNumber,
+  sessionId = "session-1",
+  trackId = `${sessionId}-track-${sourceType}`,
+  startedAt = 100,
+  endedAt = 200,
+}) {
   repository.commitChunk({
     id,
     sessionId,
-    trackId: `${sessionId}-track-${sourceType}`,
+    trackId,
     sourceType,
     sequenceNumber,
     path: `${id}.wav`,
-    startedAt: 100,
-    endedAt: 200,
-    durationMs: 100,
+    startedAt,
+    endedAt,
+    durationMs: endedAt - startedAt,
     sha256: crypto.createHash("sha256").update(id).digest("hex"),
     expiresAt: 1_000_000,
   });
   return repository.getAudioChunk(id);
+}
+
+function finalApplicationSegment(repository, {
+  id,
+  sessionId = "session-1",
+  applicationKey = "chrome",
+  startedAt = 100,
+  endedAt = 200,
+  text,
+  sequenceNumber = 0,
+}) {
+  const chunkId = `${id}-chunk`;
+  rawChunk(repository, {
+    id: chunkId,
+    sessionId,
+    sourceType: "system",
+    trackId: `${sessionId}-track-app-${applicationKey}`,
+    sequenceNumber,
+    startedAt,
+    endedAt,
+  });
+  repository.commitChunkTranscript({
+    chunk: repository.getAudioChunk(chunkId),
+    result: { text, confidence: 0.95 },
+    modelVersion: "whisper-test-v1",
+    completedAt: endedAt + 1,
+  });
+  return repository.getTranscriptSegment(
+    repository.db
+      .prepare("SELECT id FROM transcript_segments WHERE chunk_id = ? AND result_kind = 'final'")
+      .get(chunkId).id
+  );
 }
 
 test("marks an acoustically proven MIC echo while retaining both rows and raw evidence", (t) => {
@@ -190,6 +242,94 @@ test("ordinary overlap and double-talk without explicit acoustic evidence stay v
   assert.deepEqual(
     repository.getVisibleTranscript("session-1").map((row) => row.id),
     ["system", "mic"]
+  );
+});
+
+test("keeps the exact application transcript as master over the mixed-system safety copy", (t) => {
+  const { repository, deduper } = fixture(t);
+  const mixedChunkBefore = rawChunk(repository, {
+    id: "mixed-raw",
+    sourceType: "system",
+    sequenceNumber: 0,
+  });
+  const application = finalApplicationSegment(repository, {
+    id: "chrome-final",
+    text: "今晚八点观看英超比赛",
+  });
+  segment(repository, {
+    id: "mixed-segment",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "今晚八点，观看英超比赛。",
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mixed-segment").duplicate_of, application.id);
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id),
+    [application.id]
+  );
+  assert.deepEqual(repository.getAudioChunk("mixed-raw"), mixedChunkBefore);
+  assert.ok(repository.getAudioChunk("chrome-final-chunk"));
+});
+
+test("prefers the application master when MIC echo matches both application and mixed system", (t) => {
+  const { repository, deduper } = fixture(t);
+  const application = finalApplicationSegment(repository, {
+    id: "chrome-final",
+    text: "release Friday",
+  });
+  segment(repository, {
+    id: "system-mix",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 200,
+    text: "release Friday",
+  });
+  segment(repository, {
+    id: "mic-echo",
+    sourceType: "mic",
+    startedAt: 110,
+    endedAt: 190,
+    text: "release Friday",
+    echoScore: 0.95,
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 2 });
+  assert.equal(repository.getTranscriptSegment("system-mix").duplicate_of, application.id);
+  assert.equal(repository.getTranscriptSegment("mic-echo").duplicate_of, application.id);
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+});
+
+test("never merges one exact application track into another application track", (t) => {
+  const { repository, deduper } = fixture(t);
+  repository.createTrack({
+    id: "session-1-track-app-kook",
+    sessionId: "session-1",
+    sourceType: "system",
+    applicationKey: "kook",
+    applicationDisplayName: "KOOK",
+    captureGeneration: 1,
+    strategy: "wasapi-application-loopback",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 0,
+  });
+  const chrome = finalApplicationSegment(repository, {
+    id: "chrome-final",
+    text: "今晚开黑",
+  });
+  const kook = finalApplicationSegment(repository, {
+    id: "kook-final",
+    applicationKey: "kook",
+    text: "今晚开黑",
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+  assert.deepEqual(
+    repository.getVisibleTranscript("session-1").map((row) => row.id).sort(),
+    [chrome.id, kook.id].sort()
   );
 });
 
@@ -345,6 +485,18 @@ test("schema rejects invalid echo scores and invalid MIC-to-SYSTEM relations", (
   );
   assert.throws(
     () => repository.db.prepare("UPDATE transcript_segments SET duplicate_of = 'mic' WHERE id = 'system'").run(),
+    /invalid transcript duplicate/
+  );
+  const application = finalApplicationSegment(repository, {
+    id: "chrome-final",
+    text: "same",
+    sequenceNumber: 2,
+  });
+  assert.throws(
+    () =>
+      repository.db
+        .prepare("UPDATE transcript_segments SET duplicate_of = ? WHERE id = ?")
+        .run("system", application.id),
     /invalid transcript duplicate/
   );
   assert.throws(

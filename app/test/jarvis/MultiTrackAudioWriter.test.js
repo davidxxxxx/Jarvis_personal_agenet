@@ -73,6 +73,48 @@ test("writes mic and system chunks independently", () => {
   });
 });
 
+test("writes several application tracks independently while preserving system compatibility", () => {
+  withTempDir((baseDir) => {
+    const chunks = [];
+    const writer = new MultiTrackAudioWriter({
+      sessionId: "s1",
+      baseDir,
+      now: () => 1000,
+      tracks: {
+        mic: { id: "track-mic", sourceType: "mic", startedAt: 10 },
+        "application:chrome": {
+          id: "track-chrome",
+          sourceType: "system",
+          applicationKey: "chrome",
+          startedAt: 20,
+        },
+        "application:kook": {
+          id: "track-kook",
+          sourceType: "system",
+          applicationKey: "kook",
+          startedAt: 30,
+        },
+      },
+      onChunk: (chunk) => chunks.push(chunk),
+    });
+
+    writer.append("application:chrome", Buffer.alloc(48, 3));
+    writer.append("application:kook", Buffer.alloc(48, 4));
+    writer.closeAll(2000);
+
+    assert.deepEqual(
+      chunks.map((chunk) => [chunk.trackId, chunk.sourceType, chunk.sequenceNumber]),
+      [
+        ["track-chrome", "system", 0],
+        ["track-kook", "system", 0],
+      ]
+    );
+    assert.equal(path.dirname(chunks[0].path), path.join(baseDir, "track-chrome"));
+    assert.equal(path.dirname(chunks[1].path), path.join(baseDir, "track-kook"));
+    assert.notEqual(chunks[0].path, chunks[1].path);
+  });
+});
+
 test("rejects appends for inactive sources", () => {
   withTempDir((baseDir) => {
     const writer = new MultiTrackAudioWriter({

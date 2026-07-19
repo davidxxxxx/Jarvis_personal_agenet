@@ -3,6 +3,26 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+const MEBIBYTE = 1024 * 1024;
+const WINDOWS_GPU_PROCESS_MEMORY_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+$pidValue = [int]$args[0]
+$rows = @(
+  Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory |
+    Where-Object { ([string]$_.Name) -match "(^|_)pid_$pidValue(_|$)" }
+)
+[uint64]$dedicatedBytes = 0
+[uint64]$sharedBytes = 0
+foreach ($row in $rows) {
+  $dedicatedBytes += [uint64]$row.DedicatedUsage
+  $sharedBytes += [uint64]$row.SharedUsage
+}
+[pscustomobject]@{
+  processFound = [bool]($rows.Count -gt 0)
+  dedicatedBytes = $dedicatedBytes
+  sharedBytes = $sharedBytes
+} | ConvertTo-Json -Compress
+`;
 
 function result(ok, backend, gpuUuid, reason) {
   return { ok, backend, gpuUuid, reason };
@@ -44,14 +64,90 @@ function queryNvidiaTelemetry(pid, { execFileImpl = execFile } = {}) {
           .split(/\r?\n/)
           .map((line) => line.split(",").map((value) => value.trim()))
           .find((parts) => Number(parts[0]) === Number(pid));
+        const gpuUuid = /^GPU-[A-Za-z0-9-]+$/.test(row?.[1] || "") ? row[1] : null;
         resolve({
-          gpuUuid: row?.[1] || null,
+          gpuUuid,
           processFound: !!row,
           vramMb: row ? Number.parseInt(row[2], 10) || 0 : 0,
         });
       }
     );
   });
+}
+
+function queryWindowsGpuProcessMemory(
+  pid,
+  { execFileImpl = execFile, platform = process.platform } = {}
+) {
+  return new Promise((resolve) => {
+    const unavailable = { processFound: false, vramMb: 0 };
+    if (platform !== "win32" || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) {
+      resolve(unavailable);
+      return;
+    }
+    execFileImpl(
+      "powershell.exe",
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `& {${WINDOWS_GPU_PROCESS_MEMORY_SCRIPT}}`,
+        String(pid),
+      ],
+      { timeout: 10_000, windowsHide: true, maxBuffer: 16 * 1024 },
+      (error, stdout) => {
+        if (error || !stdout) {
+          resolve(unavailable);
+          return;
+        }
+        try {
+          const reading = JSON.parse(String(stdout).trim());
+          const dedicatedBytes = Number(reading?.dedicatedBytes);
+          const sharedBytes = Number(reading?.sharedBytes);
+          const totalBytes = dedicatedBytes + sharedBytes;
+          if (
+            reading?.processFound !== true ||
+            !Number.isSafeInteger(dedicatedBytes) ||
+            dedicatedBytes < 0 ||
+            !Number.isSafeInteger(sharedBytes) ||
+            sharedBytes < 0 ||
+            !Number.isSafeInteger(totalBytes) ||
+            totalBytes <= 0
+          ) {
+            resolve(unavailable);
+            return;
+          }
+          resolve({
+            processFound: true,
+            vramMb: Math.max(1, Math.ceil(totalBytes / MEBIBYTE)),
+          });
+        } catch {
+          resolve(unavailable);
+        }
+      }
+    );
+  });
+}
+
+async function queryGpuProcessTelemetry(
+  pid,
+  { execFileImpl = execFile, platform = process.platform } = {}
+) {
+  const nvidia = await queryNvidiaTelemetry(pid, { execFileImpl });
+  if (nvidia.processFound && nvidia.vramMb > 0) {
+    return { ...nvidia, source: "nvidia-smi" };
+  }
+  const wddm = await queryWindowsGpuProcessMemory(pid, { execFileImpl, platform });
+  if (wddm.processFound && wddm.vramMb > 0) {
+    return {
+      gpuUuid: nvidia.gpuUuid,
+      processFound: true,
+      vramMb: wddm.vramMb,
+      source: "wddm",
+    };
+  }
+  return { ...nvidia, source: "nvidia-smi" };
 }
 
 async function createRealProbeServer(
@@ -90,7 +186,7 @@ function classifyError(error) {
 class CudaWhisperVerifier {
   constructor({
     createProbeServer = createRealProbeServer,
-    queryTelemetry = queryNvidiaTelemetry,
+    queryTelemetry = queryGpuProcessTelemetry,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     readFile = (filePath) => fs.readFileSync(filePath),
   } = {}) {
@@ -156,7 +252,7 @@ class CudaWhisperVerifier {
           return result(false, backend, evidence?.gpuUuid || null, "cuda_not_active");
         }
         const telemetry = await this.queryTelemetry(server.pid, { gpuUuid: gpuUuid || null });
-        const observedUuid = telemetry?.gpuUuid || null;
+        let observedUuid = telemetry?.gpuUuid || null;
         if (!telemetry?.processFound || !(Number(telemetry.vramMb) > 0)) {
           return result(
             false,
@@ -165,14 +261,22 @@ class CudaWhisperVerifier {
             "gpu_process_not_observed"
           );
         }
+        if (gpuUuid && evidence?.gpuUuid && evidence.gpuUuid !== gpuUuid) {
+          return result(false, "cuda", observedUuid, "server_gpu_uuid_mismatch");
+        }
+        if (
+          !observedUuid &&
+          telemetry?.source === "wddm" &&
+          gpuUuid &&
+          evidence?.gpuUuid === gpuUuid
+        ) {
+          observedUuid = gpuUuid;
+        }
         if (!observedUuid) {
           return result(false, "cuda", null, "gpu_telemetry_missing");
         }
         if (gpuUuid && observedUuid !== gpuUuid) {
           return result(false, "cuda", observedUuid, "gpu_uuid_mismatch");
-        }
-        if (gpuUuid && evidence?.gpuUuid && evidence.gpuUuid !== gpuUuid) {
-          return result(false, "cuda", observedUuid, "server_gpu_uuid_mismatch");
         }
         this.lastProofMetadata = {
           gpuUuid: observedUuid,
@@ -225,4 +329,6 @@ class CudaWhisperVerifier {
 module.exports = CudaWhisperVerifier;
 module.exports.createSilentProbeWav = createSilentProbeWav;
 module.exports.queryNvidiaTelemetry = queryNvidiaTelemetry;
+module.exports.queryWindowsGpuProcessMemory = queryWindowsGpuProcessMemory;
+module.exports.queryGpuProcessTelemetry = queryGpuProcessTelemetry;
 module.exports.createRealProbeServer = createRealProbeServer;

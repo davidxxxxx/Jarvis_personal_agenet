@@ -9,22 +9,24 @@ const {
   buildUnsignedWindows,
   createElectronNativeRebuildInvocation,
   createNodeNativeRestoreInvocation,
+  createUnsignedBuilderInvocation,
   verifyNativeAbi,
 } = require("../../scripts/build-windows");
 
 const appRoot = path.resolve(__dirname, "../..");
+const appVersion = JSON.parse(fs.readFileSync(path.join(appRoot, "package.json"), "utf8")).version;
 
 function successfulAuthenticodeResult() {
   return {
     status: 0,
     stdout: JSON.stringify([
-      { name: "Jarvis Memory Setup 0.1.0.exe", status: "NotSigned" },
-      { name: "Jarvis Memory 0.1.0.exe", status: "NotSigned" },
+      { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
+      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
     ]),
   };
 }
 
-test("Electron native rebuild is forced and pinned to Electron 41.10.0 win32-x64", () => {
+test("Electron native install uses the pinned prebuild for Electron 41.10.0 win32-x64", () => {
   assert.equal(typeof createElectronNativeRebuildInvocation, "function");
   const invocation = createElectronNativeRebuildInvocation({ appRoot });
 
@@ -32,30 +34,45 @@ test("Electron native rebuild is forced and pinned to Electron 41.10.0 win32-x64
   assert.equal(path.isAbsolute(invocation.command), true);
   assert.equal(path.isAbsolute(invocation.args[0]), true);
   assert.deepEqual(invocation.args.slice(1), [
-    "--version",
+    "--runtime",
+    "electron",
+    "--target",
     "41.10.0",
     "--arch",
     "x64",
-    "--platform",
-    "win32",
-    "--force",
-    "--only",
-    "better-sqlite3",
-    "--module-dir",
-    appRoot,
   ]);
+  assert.equal(invocation.options.cwd, path.join(appRoot, "node_modules", "better-sqlite3"));
   assert.equal(invocation.options.shell, false);
 });
 
-test("Node native restore uses trusted Node and npm CLI paths without a shell", () => {
+test("Node native restore uses the pinned current-Node prebuild without a shell", () => {
   assert.equal(typeof createNodeNativeRestoreInvocation, "function");
   const invocation = createNodeNativeRestoreInvocation({ appRoot });
 
   assert.equal(invocation.command, process.execPath);
   assert.equal(path.isAbsolute(invocation.command), true);
   assert.equal(path.isAbsolute(invocation.args[0]), true);
-  assert.deepEqual(invocation.args.slice(1), ["rebuild", "better-sqlite3"]);
+  assert.deepEqual(invocation.args.slice(1), [
+    "--runtime",
+    "node",
+    "--target",
+    process.versions.node,
+    "--arch",
+    process.arch,
+  ]);
+  assert.equal(invocation.options.cwd, path.join(appRoot, "node_modules", "better-sqlite3"));
   assert.equal(invocation.options.shell, false);
+});
+
+test("directory-only Windows packaging adds --dir without changing the trusted builder entry", () => {
+  const invocation = createUnsignedBuilderInvocation({ appRoot, dirOnly: true });
+
+  assert.deepEqual(invocation.args.slice(1), [
+    "--win",
+    "--config",
+    path.join(appRoot, "electron-builder.unsigned-win.json"),
+    "--dir",
+  ]);
 });
 
 test("unsigned artifact verification retries a transient Windows signature result", () => {
@@ -81,8 +98,8 @@ test("unsigned artifact verification retries a transient Windows signature resul
         return {
           status: 0,
           stdout: JSON.stringify([
-            { name: "Jarvis Memory Setup 0.1.0.exe", status: "UnknownError" },
-            { name: "Jarvis Memory 0.1.0.exe", status: "NotSigned" },
+            { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "UnknownError" },
+            { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
           ]),
         };
       }
@@ -195,8 +212,8 @@ test("native verifier executes SELECT 1 through the real current Node runtime", 
 test("unsigned build enforces native rebuild, runtime smokes, scans, and Node restore order", () => {
   const order = [];
   const spawnSyncImpl = (command, args) => {
-    if (args.includes("--only")) order.push("electron-rebuild");
-    else if (args.includes("rebuild")) order.push("node-restore");
+    if (args.includes("--runtime") && args.includes("electron")) order.push("electron-prebuild");
+    else if (args.includes("--runtime") && args.includes("node")) order.push("node-restore");
     else if (args.includes("--win")) order.push("builder");
     else {
       order.push("auth-spawn");
@@ -225,12 +242,49 @@ test("unsigned build enforces native rebuild, runtime smokes, scans, and Node re
 
   assert.deepEqual(order, [
     "setup",
-    "electron-rebuild",
+    "electron-prebuild",
     "source-electron",
     "builder",
     "packaged-electron",
     "package-scan",
     "auth-scan",
+    "node-restore",
+    "source-node",
+  ]);
+});
+
+test("directory-only build still verifies ABI and scans package but skips installer signature checks", () => {
+  const order = [];
+
+  buildUnsignedWindows({
+    appRoot,
+    dirOnly: true,
+    spawnSyncImpl(_command, args) {
+      if (args.includes("--runtime") && args.includes("electron")) {
+        order.push("electron-prebuild");
+      } else if (args.includes("--runtime") && args.includes("node")) {
+        order.push("node-restore");
+      } else if (args.includes("--win")) {
+        order.push(args.includes("--dir") ? "builder-dir" : "builder");
+      }
+      return { status: 0, stdout: "" };
+    },
+    assertSafeBuilderConfigImpl: () => order.push("setup"),
+    verifyNativeAbiImpl: ({ label }) => {
+      order.push(label);
+      return { ok: true, abi: label === "source-node" ? process.versions.modules : "145", value: 1 };
+    },
+    assertSafeArtifactTreeImpl: () => order.push("package-scan"),
+    assertUnsignedWindowsArtifactsImpl: () => order.push("auth-scan"),
+  });
+
+  assert.deepEqual(order, [
+    "setup",
+    "electron-prebuild",
+    "source-electron",
+    "builder-dir",
+    "packaged-electron",
+    "package-scan",
     "node-restore",
     "source-node",
   ]);
@@ -247,8 +301,11 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
           platform: "win32",
           systemRoot: String.raw`C:\Windows`,
           spawnSyncImpl(command, args) {
-            if (args.includes("--only")) order.push("electron-rebuild");
-            else if (args.includes("rebuild")) order.push("node-restore");
+            if (args.includes("--runtime") && args.includes("electron")) {
+              order.push("electron-prebuild");
+            } else if (args.includes("--runtime") && args.includes("node")) {
+              order.push("node-restore");
+            }
             else if (args.includes("--win")) {
               order.push("builder");
               return { status: 17, stdout: "" };
@@ -271,7 +328,7 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
     );
     assert.deepEqual(order, [
       "setup",
-      "electron-rebuild",
+      "electron-prebuild",
       "source-electron",
       "builder",
       "node-restore",

@@ -10,9 +10,12 @@ const DailyDigestService = require("./DailyDigestService");
 const JarvisAnalysisWorker = require("./JarvisAnalysisWorker");
 const MiniMaxAnalysisClient = require("./MiniMaxAnalysisClient");
 const MiniMaxDailyDigestClient = require("./MiniMaxDailyDigestClient");
+const MiniMaxActivityClassifier = require("./MiniMaxActivityClassifier");
+const ActivityClassificationService = require("./ActivityClassificationService");
+const SessionActivityBuilder = require("./SessionActivityBuilder");
 
 const MODEL = MiniMaxAnalysisClient.DEFAULT_MODEL;
-const ANALYSIS_ESTIMATED_USAGE = Object.freeze({ inputTokens: 6_000, outputTokens: 2_048 });
+const ANALYSIS_ESTIMATED_USAGE = Object.freeze({ inputTokens: 6_000, outputTokens: 8_192 });
 const DIGEST_ESTIMATED_USAGE = Object.freeze({ inputTokens: 10_000, outputTokens: 4_096 });
 
 function requiredMethod(value, method, name) {
@@ -149,6 +152,21 @@ function createProductionAgentCloudComposition({
     now,
     logger: (entry) => log({ phase: "daily_digest_transport", ...entry }),
   });
+  const activityClient = new MiniMaxActivityClassifier({
+    fetchImpl,
+    getApiKey,
+    model: MODEL,
+    now,
+    logger: (entry) => log({ phase: "activity_classification_transport", ...entry }),
+  });
+  const activityClassificationService = new ActivityClassificationService({
+    repository: repository.activityClassificationRepository,
+    cloudClient: activityClient,
+    budgetGuard,
+    now,
+    createRequestId,
+  });
+  const activityBuilder = new SessionActivityBuilder(repository.db);
   const commonAdmission = (job, priorityBefore) => ({
     backlog: store.listAgentAdmissionBacklog({ priorityBefore, excludeJobId: job.id }),
     captureActive: Boolean(
@@ -229,6 +247,8 @@ function createProductionAgentCloudComposition({
     memoryRepository,
     inputBuilder,
     desiredIdentityProvider: createDesiredIdentity,
+    activityClassificationService,
+    activityBuilder,
     cloudQueue: store,
     cloudTransportEnabled: true,
     now,
@@ -238,6 +258,7 @@ function createProductionAgentCloudComposition({
     dailyDigestScheduler,
     cloudDispatcher,
     analysisBudgetGuard: budgetGuard,
+    activityClassificationService,
   });
 }
 

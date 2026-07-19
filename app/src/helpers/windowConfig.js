@@ -44,7 +44,9 @@ const MAIN_WINDOW_CONFIG = {
     preload: path.join(__dirname, "..", "..", "preload.js"),
     nodeIntegration: false,
     contextIsolation: true,
-    sandbox: true,
+    // preload.js imports local bridge helpers, so Electron's restricted
+    // sandboxed-preload runtime cannot initialize window.electronAPI.
+    sandbox: false,
   },
   frame: false,
   alwaysOnTop: true,

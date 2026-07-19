@@ -230,7 +230,7 @@ function createRepresentativeV23Database() {
 test("latest migration retains the durable v25 budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 31);
+    assert.equal(TARGET_VERSION, 34);
     assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 
@@ -256,6 +256,17 @@ test("latest migration retains the durable v25 budget schema and reviewed MiniMa
         )
         .all(),
       [
+        {
+          provider: "minimax",
+          model: "MiniMax-M2.7",
+          operation: "activity_classification",
+          price_version: "minimax-m2.7-standard-2026-07-16",
+          currency: "USD",
+          input_per_million_microusd: 300_000,
+          output_per_million_microusd: 1_200_000,
+          billing_basis: "paygo_list_price_equivalent",
+          created_at: Date.UTC(2026, 6, 16),
+        },
         {
           provider: "minimax",
           model: "MiniMax-M2.7",

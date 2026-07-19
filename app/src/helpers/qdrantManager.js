@@ -18,16 +18,28 @@ const STARTUP_POLL_INTERVAL_MS = 100;
 const HEALTH_CHECK_INTERVAL_MS = 5000;
 const HEALTH_CHECK_TIMEOUT_MS = 2000;
 
-const STORAGE_DIR = path.join(os.homedir(), ".cache", "openwhispr", "qdrant-data");
+function resolveQdrantStorageDir({
+  dataRoot = process.env.JARVIS_DATA_ROOT,
+  homeDir = os.homedir(),
+} = {}) {
+  if (typeof dataRoot === "string" && path.isAbsolute(dataRoot)) {
+    return path.join(dataRoot, "qdrant-data");
+  }
+  return path.join(homeDir, ".cache", "openwhispr", "qdrant-data");
+}
 
 class QdrantManager {
-  constructor() {
+  constructor({ storageDirResolver = resolveQdrantStorageDir } = {}) {
+    if (typeof storageDirResolver !== "function") {
+      throw new TypeError("storageDirResolver must be a function");
+    }
     this.process = null;
     this.port = null;
     this.ready = false;
     this.startupPromise = null;
     this.healthCheckInterval = null;
     this.cachedBinaryPath = null;
+    this.storageDirResolver = storageDirResolver;
   }
 
   getBinaryPath() {
@@ -62,13 +74,17 @@ class QdrantManager {
   async _doStart() {
     const binaryPath = this.getBinaryPath();
     if (!binaryPath) throw new Error("qdrant binary not found");
+    const storageDir = this.storageDirResolver();
+    if (typeof storageDir !== "string" || !path.isAbsolute(storageDir)) {
+      throw new Error("qdrant storage directory must be absolute");
+    }
 
     this.port = await findAvailablePort(PORT_RANGE_START, PORT_RANGE_END);
 
-    fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    fs.mkdirSync(storageDir, { recursive: true });
 
-    const configPath = path.join(STORAGE_DIR, "config.yaml");
-    const storagePath = path.join(STORAGE_DIR, "storage");
+    const configPath = path.join(storageDir, "config.yaml");
+    const storagePath = path.join(storageDir, "storage");
     const configContent = [
       "storage:",
       `  storage_path: ${storagePath}`,
@@ -90,7 +106,7 @@ class QdrantManager {
     });
 
     this.process = spawn(binaryPath, ["--config-path", configPath], {
-      cwd: STORAGE_DIR,
+      cwd: storageDir,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
@@ -242,3 +258,4 @@ class QdrantManager {
 }
 
 module.exports = QdrantManager;
+module.exports.resolveQdrantStorageDir = resolveQdrantStorageDir;

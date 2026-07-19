@@ -228,7 +228,7 @@ test("desired vector mismatches supersede every stale immutable input", () => {
   );
 });
 
-test("admits only terminal ready final stable current non-duplicate durable subjects", () => {
+test("admits only terminal ready final stable current non-duplicate resolved subjects", () => {
   const mutations = [
     (input) => (input.manifest.sessionState = "active"),
     (input) => (input.manifest.processingState = "processing"),
@@ -236,7 +236,6 @@ test("admits only terminal ready final stable current non-duplicate durable subj
     (input) => (input.manifest.segments[0].stable = false),
     (input) => (input.manifest.segments[0].current = false),
     (input) => (input.manifest.segments[0].duplicate = true),
-    (input) => (input.manifest.segments[0].identityKind = "temporary_subject"),
     (input) => (input.manifest.segments[0].identityKind = "unresolved"),
   ];
 
@@ -253,6 +252,14 @@ test("admits only terminal ready final stable current non-duplicate durable subj
   const recovered = admissionSnapshot();
   recovered.manifest.sessionState = "recovered_terminal";
   assert.equal(evaluate(recovered).eligible, true);
+
+  const temporary = admissionSnapshot();
+  temporary.manifest.segments[0].identityKind = "temporary_subject";
+  assert.deepEqual(evaluate(temporary), {
+    eligible: true,
+    reason: null,
+    priority: 70,
+  });
 });
 
 test("pending, running, and future-retry local work all preempt analysis", () => {

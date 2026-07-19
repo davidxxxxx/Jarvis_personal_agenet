@@ -53,6 +53,9 @@ function overlapDuration(left, right) {
 
 function compareWinner(left, right) {
   if (left.similarity !== right.similarity) return right.similarity - left.similarity;
+  const leftApplication = left.segment.track_kind === "application" ? 1 : 0;
+  const rightApplication = right.segment.track_kind === "application" ? 1 : 0;
+  if (leftApplication !== rightApplication) return rightApplication - leftApplication;
   const leftFinal = left.segment.result_kind === "final" ? 1 : 0;
   const rightFinal = right.segment.result_kind === "final" ? 1 : 0;
   if (leftFinal !== rightFinal) return rightFinal - leftFinal;
@@ -84,7 +87,22 @@ class DualTrackTranscriptDeduper {
   dedupe(sessionId) {
     return this.repository.dedupeTranscriptTransaction(sessionId, (rows) => {
       const systems = rows.filter((row) => row.source_type === "system");
+      const applicationSegments = systems.filter((row) => row.track_kind === "application");
       const assignments = [];
+      for (const mixed of systems.filter((row) => row.track_kind === "system_mix")) {
+        const winner = applicationSegments
+          .filter((application) => strictlyOverlaps(mixed, application))
+          .map((application) => ({
+            segment: application,
+            similarity: normalizedSimilarity(mixed.text, application.text),
+            overlap: overlapDuration(mixed, application),
+          }))
+          .filter((candidate) => candidate.similarity >= TEXT_SIMILARITY_THRESHOLD)
+          .sort(compareWinner)[0];
+        if (winner) {
+          assignments.push({ duplicateId: mixed.id, masterId: winner.segment.id });
+        }
+      }
       for (const mic of rows) {
         if (mic.source_type !== "mic" || mic.echo_score === null || mic.echo_score < ECHO_SCORE_THRESHOLD) {
           continue;
@@ -98,7 +116,7 @@ class DualTrackTranscriptDeduper {
           }))
           .filter((candidate) => candidate.similarity >= TEXT_SIMILARITY_THRESHOLD)
           .sort(compareWinner)[0];
-        if (winner) assignments.push({ micId: mic.id, systemId: winner.segment.id });
+        if (winner) assignments.push({ duplicateId: mic.id, masterId: winner.segment.id });
       }
       return assignments;
     });

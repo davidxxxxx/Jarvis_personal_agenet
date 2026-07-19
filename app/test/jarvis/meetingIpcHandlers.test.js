@@ -55,6 +55,7 @@ function createFixture({
   managedStopDeferred = null,
   aecStartDeferred = null,
   transcribeLocalWhisper = async () => ({ success: true, text: "" }),
+  stopLocalWhisper = async () => {},
   maybeCorrect = null,
   warmStreaming = false,
   realtimeConnectDeferred = null,
@@ -64,6 +65,7 @@ function createFixture({
   speakerDiarizationEnabled = false,
   liveSpeakerIdentifier = null,
   nativeSystemAudio = false,
+  applicationAudioCapturePool = null,
 } = {}) {
   const handles = new Map();
   const listeners = new Map();
@@ -75,6 +77,7 @@ function createFixture({
   const derivedCalls = [];
   const lifecycle = [];
   const whisperCalls = [];
+  const whisperStops = [];
   const correctionCalls = [];
   const transcriptRevisions = [];
   const realtimeInstances = [];
@@ -238,14 +241,19 @@ function createFixture({
     },
   });
   const instance = Object.assign(Object.create(IPCHandlers.prototype), {
-    environmentManager: realtimeConnectDeferred
-      ? { getOpenAIKey: () => "test-placeholder-key" }
-      : {},
+    environmentManager: {
+      ...(realtimeConnectDeferred ? { getOpenAIKey: () => "test-placeholder-key" } : {}),
+      getApplicationAudioSettings: () => ({ enabled: true, trackLimit: 4 }),
+    },
     databaseManager: {},
     whisperManager: {
       transcribeLocalWhisper: async (...args) => {
         whisperCalls.push(args);
         return transcribeLocalWhisper(...args);
+      },
+      stopServer: async () => {
+        whisperStops.push("stop");
+        return stopLocalWhisper();
       },
     },
     parakeetManager: {},
@@ -259,6 +267,7 @@ function createFixture({
       : null,
     linuxPortalAudioManager: null,
     windowsLoopbackAudioManager,
+    applicationAudioCapturePool,
     meetingAecManager,
     jarvisService: { appendPcm, sourceInterrupted, sourceRestored },
     jarvisRepository: {
@@ -291,6 +300,7 @@ function createFixture({
     managerStops,
     lifecycle,
     whisperCalls,
+    whisperStops,
     correctionCalls,
     transcriptRevisions,
     realtimeInstances,
@@ -355,6 +365,146 @@ test("Jarvis IPC start, dual-source send, and stop never touch the live identifi
 
   assert.equal(started.success, true);
   assert.deepEqual(probe.lifecycle, []);
+});
+
+test("Windows Jarvis capture starts, yields, and stops the bounded application audio pool", async (t) => {
+  const calls = [];
+  const applicationAudioCapturePool = {
+    start: async (options) => calls.push(["start", options]),
+    setFullscreen: async (active) => calls.push(["fullscreen", active]),
+    stop: async () => calls.push(["stop"]),
+  };
+  const fixture = createFixture({
+    systemAvailable: true,
+    applicationAudioCapturePool,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const stop = fixture.handles.get("meeting-transcription-stop");
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", jarvisSessionId: "jarvis-app-audio-pool" }
+  );
+  assert.equal(started.success, true);
+  assert.deepEqual(calls[0], [
+    "start",
+    {
+      sessionId: "jarvis-app-audio-pool",
+      configuredLimit: 4,
+      fullscreen: false,
+    },
+  ]);
+
+  await fixture.instance.setJarvisFullscreenYield(true);
+  assert.equal(
+    calls.some(([kind, active]) => kind === "fullscreen" && active === true),
+    true
+  );
+  await stop({ sender: fixture.sender });
+  assert.equal(calls.filter(([kind]) => kind === "stop").length, 1);
+});
+
+test("fullscreen yield drains an in-flight Jarvis Whisper call without buffering yielded PCM", async (t) => {
+  const periodicTranscriptionDeferred = createDeferred();
+  const originalSetInterval = global.setInterval;
+  const localTicks = [];
+  global.setInterval = (callback, delay, ...args) => {
+    if (delay === 12_000) localTicks.push(callback);
+    return originalSetInterval(() => {}, delay, ...args);
+  };
+  t.after(() => {
+    global.setInterval = originalSetInterval;
+  });
+
+  let transcriptionCall = 0;
+  const persisted = [];
+  const fixture = createFixture({
+    appendPcm: (sessionId, source, buffer) => {
+      persisted.push([sessionId, source, Buffer.from(buffer)]);
+      return true;
+    },
+    transcribeLocalWhisper: async () => {
+      transcriptionCall += 1;
+      if (transcriptionCall === 1) return periodicTranscriptionDeferred.promise;
+      return { success: true, text: "" };
+    },
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+  const pcm = createPcm16(4_800, () => 12_000);
+
+  const started = await start(
+    { sender: fixture.sender },
+    { provider: "local", micOnly: true, jarvisSessionId: "jarvis-fullscreen-yield" }
+  );
+  assert.equal(localTicks.length, 1);
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  localTicks[0]();
+  await waitFor(() => fixture.whisperCalls.length === 1, "the active Whisper call");
+
+  const yieldPromise = fixture.instance.setJarvisFullscreenYield(true);
+  await waitFor(() => fixture.whisperStops.length === 1, "the first Whisper stop");
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  localTicks[0]();
+  assert.equal(fixture.whisperCalls.length, 1);
+
+  periodicTranscriptionDeferred.resolve({ success: true, text: "stale fullscreen result" });
+  assert.equal(await yieldPromise, true);
+  assert.equal(fixture.whisperStops.length, 2);
+  assert.equal(await fixture.instance.setJarvisFullscreenYield(true), true);
+  assert.equal(fixture.whisperStops.length, 2);
+  assert.equal(persisted.length, 2, "yielded PCM must still be persisted");
+
+  assert.equal(await fixture.instance.setJarvisFullscreenYield(false), false);
+  assert.equal(localTicks.length, 2, "stable exit must rebuild the local transcription timer");
+  assert.equal(fixture.whisperCalls.length, 1, "yielded PCM must not be replayed from RAM");
+  send({ sender: fixture.sender }, pcm, "mic", started.inputGeneration);
+  localTicks[1]();
+  await waitFor(() => fixture.whisperCalls.length === 2, "post-yield Whisper restart");
+});
+
+test("fullscreen yield stops and restores legacy voiceprint and AEC lifecycle once", async (t) => {
+  const probe = createLiveSpeakerProbe();
+  const fixture = createFixture({
+    liveSpeakerIdentifier: probe.identifier,
+    speakerDiarizationEnabled: true,
+    nativeSystemAudio: true,
+    aecAvailable: true,
+  });
+  t.after(fixture.cleanup);
+  const start = fixture.handles.get("meeting-transcription-start");
+  const send = fixture.listeners.get("meeting-transcription-send");
+
+  const started = await start({ sender: fixture.sender }, { provider: "local" });
+  assert.equal(started.success, true);
+  assert.deepEqual(
+    probe.lifecycle.map(([operation]) => operation),
+    ["start"]
+  );
+
+  assert.equal(await fixture.instance.setJarvisFullscreenYield(true), true);
+  assert.equal(await fixture.instance.setJarvisFullscreenYield(true), true);
+  const derivedBeforeYieldedSend = fixture.derivedCalls.length;
+  send({ sender: fixture.sender }, Buffer.from([1, 2, 3, 4]), "system", started.inputGeneration);
+  assert.equal(fixture.derivedCalls.length, derivedBeforeYieldedSend);
+  assert.ok(
+    fixture.sent.some(([channel, payload]) => {
+      return channel === "meeting-transcription-audio-level" && payload.source === "system";
+    }),
+    "system volume publication must remain active while derived work is yielded"
+  );
+
+  assert.equal(await fixture.instance.setJarvisFullscreenYield(false), false);
+  assert.deepEqual(
+    probe.lifecycle.map(([operation]) => operation),
+    ["start", "stop", "start"]
+  );
+  assert.deepEqual(
+    fixture.lifecycle.filter((operation) => operation === "aec-start" || operation === "aec-stop"),
+    ["aec-start", "aec-stop", "aec-start"]
+  );
 });
 
 test("legacy meeting IPC delegates live start, system feed, and stop", async (t) => {

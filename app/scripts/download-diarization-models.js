@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 const { downloadFile, parseArgs } = require("./lib/download-utils");
+const {
+  SPEAKER_MODEL_KEYS,
+  SPEAKER_MODEL_MANIFESTS,
+  SpeakerModelInstaller,
+  resolveSpeakerModelDirectory,
+  verifySpeakerModelArtifact,
+} = require("../src/jarvis/main/SpeakerModelManifest");
 
 const SEGMENTATION_URL =
   "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
@@ -27,7 +33,7 @@ function getModelDir() {
     return path.resolve(process.env.DIARIZATION_MODEL_DIR);
   }
 
-  return path.join(os.homedir(), ".cache", "openwhispr", "diarization-models");
+  return resolveSpeakerModelDirectory();
 }
 
 function extractTarBz2(archivePath, destDir) {
@@ -48,13 +54,6 @@ async function main() {
   const segModelPath = path.join(modelDir, SEGMENTATION_DIR, SEGMENTATION_FILE);
   const embModelPath = path.join(modelDir, EMBEDDING_FILE);
   const vadModelPath = path.join(modelDir, VAD_FILE);
-
-  const allExist =
-    fs.existsSync(segModelPath) && fs.existsSync(embModelPath) && fs.existsSync(vadModelPath);
-  if (allExist && !args.isForce) {
-    console.log("[diarization-models] Model files already exist (use --force to re-download)\n");
-    return;
-  }
 
   fs.mkdirSync(modelDir, { recursive: true });
 
@@ -137,7 +136,37 @@ async function main() {
     console.log("[diarization-models] VAD model already exists, skipping");
   }
 
+  const identityInstaller = new SpeakerModelInstaller({ rootDirectory: modelDir });
+  for (const modelKey of [SPEAKER_MODEL_KEYS.PRIMARY, SPEAKER_MODEL_KEYS.REVIEW]) {
+    const manifest = SPEAKER_MODEL_MANIFESTS[modelKey];
+    const modelPath = path.join(modelDir, manifest.fileName);
+    let force = args.isForce;
+    if (fs.existsSync(modelPath) && !force) {
+      try {
+        await verifySpeakerModelArtifact(modelPath, manifest);
+        console.log(`[diarization-models] ${manifest.modelId} already verified, skipping`);
+        continue;
+      } catch {
+        force = true;
+      }
+    }
+    console.log(`[diarization-models] Installing ${manifest.modelId}`);
+    await identityInstaller.install(modelKey, {
+      force,
+      async downloadTo({ url, destination }) {
+        await downloadFile(url, destination);
+      },
+    });
+  }
+
   console.log(`\n[diarization-models] Models ready at ${modelDir}\n`);
 }
 
-main().catch(console.error);
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`[diarization-models] ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { getModelDir, main };

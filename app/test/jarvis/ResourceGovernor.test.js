@@ -9,6 +9,8 @@ const {
   createWindowsCpuProvider,
   createSystemMemoryProvider,
   createWindowsPowerProvider,
+  createWindowsForegroundActivityProvider,
+  CPU_UNSAFE_LOAD_PCT,
   projectCloudPressure,
 } = require("../../src/jarvis/main/ResourceGovernor");
 const {
@@ -135,7 +137,8 @@ test("cloud pressure projects CPU, memory, and power constraints without GPU fie
     cudaVerified: false,
   };
 
-  assert.equal(projectCloudPressure({ ...healthy, cpuLoadPct: 75 }).state, "busy");
+  assert.equal(projectCloudPressure({ ...healthy, cpuLoadPct: 65 }).state, "busy");
+  assert.equal(projectCloudPressure({ ...healthy, cpuLoadPct: 70 }).state, "constrained");
   assert.deepEqual(projectCloudPressure({ ...healthy, cpuLoadPct: 95 }).reason, "cpu_load_high");
   assert.equal(projectCloudPressure({ ...healthy, memoryLoadPct: 80 }).state, "busy");
   assert.deepEqual(
@@ -190,6 +193,88 @@ test("external GPU work immediately defers final work and pauses preview", () =>
     action: "pause_preview",
     reason: "external_gpu_busy",
   });
+});
+
+test("fullscreen activity pauses every background job while capture remains outside the governor", async () => {
+  const governor = new ResourceGovernor({
+    now: () => 1_000,
+    telemetryProvider: async () => healthyTelemetry(),
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 20 }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryPresent: false,
+      batteryLevelPct: null,
+      batterySaver: false,
+    }),
+    foregroundActivityProvider: async () => ({
+      active: true,
+      pid: 42,
+      processName: "game",
+      windowClass: "GameWindow",
+      telemetryAvailable: true,
+    }),
+  });
+
+  const snapshot = await governor.sample();
+  assert.equal(snapshot.state, "busy");
+  assert.equal(snapshot.reason, "fullscreen_game");
+  assert.equal(snapshot.fullscreenActivityActive, true);
+  assert.equal(snapshot.foregroundActivityProcessName, "game");
+  assert.equal(governor.cloudPressure(snapshot).reason, "fullscreen_game");
+
+  for (const kind of [
+    "retention_urgent",
+    "storage_recovery_compress",
+    "final_transcription",
+    "speaker",
+    "identity",
+    "maintenance",
+    "analysis",
+    "daily_digest",
+  ]) {
+    assert.deepEqual(governor.admit(kind, snapshot), {
+      action: "defer",
+      reason: "fullscreen_game",
+    });
+  }
+  assert.deepEqual(governor.admit("preview", snapshot), {
+    action: "pause_preview",
+    reason: "fullscreen_game",
+  });
+});
+
+test("background work resumes only after the configured healthy wait following fullscreen exit", async () => {
+  let at = 1_000;
+  let fullscreen = true;
+  const governor = new ResourceGovernor({
+    now: () => at,
+    telemetryProvider: async () => healthyTelemetry(),
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 20 }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryPresent: false,
+      batteryLevelPct: null,
+      batterySaver: false,
+    }),
+    foregroundActivityProvider: async () => ({
+      active: fullscreen,
+      pid: fullscreen ? 42 : null,
+      processName: fullscreen ? "game" : null,
+      windowClass: fullscreen ? "GameWindow" : null,
+      telemetryAvailable: true,
+    }),
+  });
+
+  assert.equal((await governor.sample()).reason, "fullscreen_game");
+  fullscreen = false;
+  at += 15_000;
+  assert.equal((await governor.sample()).reason, "recovery_hysteresis");
+  at += 45_000;
+  assert.equal((await governor.sample()).reason, "recovery_hysteresis");
+  at += 15_000;
+  assert.equal((await governor.sample()).state, "available");
 });
 
 test("CPU-only speaker capability is truthful and still yields under resource pressure", () => {
@@ -249,12 +334,18 @@ test("unavailable local diarization models defer durably before resource admissi
   );
 });
 
-test("a sampled external process makes the selected GPU busy in one sampling interval", async () => {
+test("a sampled external process makes the selected GPU busy only above the configured threshold", async () => {
   let at = 1_000;
   const governor = new ResourceGovernor({
     now: () => at,
     telemetryProvider: async () =>
       healthyTelemetry({
+        gpus: [
+          {
+            ...healthyTelemetry().gpus[0],
+            utilizationPct: 50,
+          },
+        ],
         processes: [{ pid: 88, gpuUuid: "GPU-a", usedVramMb: 256 }],
         externalGpuBusy: true,
       }),
@@ -272,6 +363,33 @@ test("a sampled external process makes the selected GPU busy in one sampling int
     action: "defer",
     reason: "external_gpu_busy",
   });
+});
+
+test("light external GPU use remains available after startup hysteresis", async () => {
+  let at = 1_000;
+  const governor = new ResourceGovernor({
+    now: () => at,
+    telemetryProvider: async () =>
+      healthyTelemetry({
+        gpus: [
+          {
+            ...healthyTelemetry().gpus[0],
+            utilizationPct: 44,
+          },
+        ],
+        processes: [{ pid: 88, gpuUuid: "GPU-a", usedVramMb: 256 }],
+      }),
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 25 }),
+    powerProvider: async () => ({ onAcPower: true, batteryLevelPct: 100, batterySaver: false }),
+  });
+
+  assert.equal((await governor.sample()).reason, "recovery_hysteresis");
+  at += 15_000;
+  const snapshot = await governor.sample();
+  assert.equal(snapshot.state, "available");
+  assert.equal(snapshot.externalGpuBusy, false);
+  assert.equal(snapshot.externalGpuThresholdPct, 45);
 });
 
 test("external work on another GPU does not mark the verified selected GPU busy", async () => {
@@ -366,7 +484,7 @@ test("production sampling interval reuses a snapshot until 15000 ms has elapsed"
   assert.equal(calls, 2);
 });
 
-test("requires peak plus 1024 MiB and two healthy samples before recovery", async () => {
+test("requires peak plus 1024 MiB and the configured healthy duration before recovery", async () => {
   let freeVramMb = 5_119;
   let at = 10_000;
   const governor = new ResourceGovernor({
@@ -396,6 +514,8 @@ test("requires peak plus 1024 MiB and two healthy samples before recovery", asyn
   const firstHealthy = await governor.sample();
   assert.equal(firstHealthy.state, "constrained");
   assert.equal(firstHealthy.reason, "recovery_hysteresis");
+  at += 45_000;
+  assert.equal((await governor.sample()).reason, "recovery_hysteresis");
   at += 15_000;
   const recovered = await governor.sample();
   assert.equal(recovered.state, "available");
@@ -403,6 +523,36 @@ test("requires peak plus 1024 MiB and two healthy samples before recovery", asyn
     action: "run_cuda",
     reason: "resources_available",
   });
+});
+
+test("resource profiles and advanced values reconfigure the live governor", () => {
+  const governor = new ResourceGovernor();
+  assert.deepEqual(governor.getSettings(), {
+    profile: "balanced",
+    externalGpuThresholdPct: 45,
+    recoveryWaitMs: 60_000,
+  });
+  assert.deepEqual(
+    governor.configure({
+      profile: "processing_priority",
+      externalGpuThresholdPct: 80,
+      recoveryWaitMs: 30_000,
+    }),
+    {
+      profile: "processing_priority",
+      externalGpuThresholdPct: 80,
+      recoveryWaitMs: 30_000,
+    }
+  );
+  assert.throws(
+    () =>
+      governor.configure({
+        profile: "balanced",
+        externalGpuThresholdPct: 90,
+        recoveryWaitMs: 60_000,
+      }),
+    /externalGpuThresholdPct/
+  );
 });
 
 test("battery saver admits only storage rescue and pauses or defers AI work", () => {
@@ -471,6 +621,26 @@ test("high Windows CPU load constrains GPU admission", async () => {
     action: "defer",
     reason: "cpu_load_high",
   });
+});
+
+test("active yielding begins at seventy percent CPU load", async () => {
+  assert.equal(CPU_UNSAFE_LOAD_PCT, 70);
+  const governor = new ResourceGovernor({
+    now: () => 1_000,
+    telemetryProvider: async () => healthyTelemetry(),
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: CPU_UNSAFE_LOAD_PCT }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryPresent: false,
+      batteryLevelPct: null,
+      batterySaver: false,
+    }),
+  });
+
+  const snapshot = await governor.sample();
+  assert.equal(snapshot.state, "constrained");
+  assert.equal(snapshot.reason, "cpu_load_high");
 });
 
 test("invalid CPU or missing power readings remain fail-closed after hysteresis", async (t) => {
@@ -579,7 +749,47 @@ test("Windows power sampling coalesces concurrent calls and caches beyond govern
   assert.equal(calls, 2);
 });
 
-test("CUDA unavailable allows optional CPU preview but not ordinary final backlog", () => {
+test("Windows fullscreen provider caches Win32 results and ignores Jarvis-owned windows", async () => {
+  let at = 1_000;
+  let calls = 0;
+  const provider = createWindowsForegroundActivityProvider({
+    platform: "win32",
+    now: () => at,
+    execFileImpl(file, args, options, callback) {
+      calls += 1;
+      assert.equal(file.toLowerCase(), "powershell.exe");
+      assert.equal(args.includes("-NonInteractive"), true);
+      assert.equal(options.windowsHide, true);
+      process.nextTick(() =>
+        callback(
+          null,
+          JSON.stringify({
+            active: true,
+            pid: 123,
+            processName: "game",
+            windowClass: "GameWindow",
+          }),
+          ""
+        )
+      );
+    },
+  });
+
+  assert.deepEqual(await provider({ ownedPids: [] }), {
+    active: true,
+    pid: 123,
+    processName: "game",
+    windowClass: "GameWindow",
+    telemetryAvailable: true,
+  });
+  assert.equal((await provider({ ownedPids: [123] })).active, false);
+  assert.equal(calls, 1);
+  at += 15_000;
+  assert.equal((await provider({ ownedPids: [] })).active, true);
+  assert.equal(calls, 2);
+});
+
+test("CUDA unavailable allows safe bounded CPU preview, final backlog, and maintenance", () => {
   const governor = new ResourceGovernor();
   const unavailable = {
     state: "unavailable",
@@ -596,7 +806,11 @@ test("CUDA unavailable allows optional CPU preview but not ordinary final backlo
     reason: "cuda_unavailable",
   });
   assert.deepEqual(governor.admit("final_transcription", unavailable), {
-    action: "defer",
+    action: "run_cpu",
+    reason: "cuda_unavailable",
+  });
+  assert.deepEqual(governor.admit("maintenance", unavailable), {
+    action: "run_cpu",
     reason: "cuda_unavailable",
   });
   assert.deepEqual(governor.admit("preview", { ...unavailable, previewEnabled: false }), {

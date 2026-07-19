@@ -1157,6 +1157,10 @@ test("analysis input segments accept only current final same-session manifest ev
           .run(),
       /manifested transcript segment is immutable/
     );
+    assert.throws(
+      () => db.prepare("DELETE FROM transcript_segments WHERE id = 'segment-1'").run(),
+      /manifested transcript segment is immutable/
+    );
   } finally {
     db.close();
   }

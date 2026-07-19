@@ -31,6 +31,9 @@ const VAD_FRAME_MS = 100;
 const VAD_FRAME_BYTES = (WAV_SAMPLE_RATE * WAV_BYTES_PER_SAMPLE * VAD_FRAME_MS) / 1_000;
 const DEFAULT_MAX_VAD_QUEUE_MS = 10_000;
 const DEFAULT_VAD_TIMEOUT_MS = 5_000;
+const AUDIBLE_SIGNAL_RMS_FLOOR = 0.006;
+const AUDIBLE_SIGNAL_PEAK_FLOOR = 0.08;
+const APPLICATION_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const RECOVERY_SIDECAR_KEYS = Object.freeze([
   "durationMs",
   "endedAt",
@@ -50,6 +53,46 @@ class DiskSpaceError extends Error {
     this.name = "DiskSpaceError";
     this.code = code;
   }
+}
+
+function hasAudibleSignal(pcm) {
+  if (!Buffer.isBuffer(pcm) || pcm.length < WAV_BYTES_PER_SAMPLE) return false;
+  let squaredTotal = 0;
+  let peak = 0;
+  const sampleCount = pcm.length / WAV_BYTES_PER_SAMPLE;
+  for (let offset = 0; offset < pcm.length; offset += WAV_BYTES_PER_SAMPLE) {
+    const normalized = pcm.readInt16LE(offset) / 32_768;
+    const absolute = Math.abs(normalized);
+    squaredTotal += normalized * normalized;
+    if (absolute > peak) peak = absolute;
+  }
+  const rms = Math.sqrt(squaredTotal / sampleCount);
+  return rms >= AUDIBLE_SIGNAL_RMS_FLOOR || peak >= AUDIBLE_SIGNAL_PEAK_FLOOR;
+}
+
+function assertApplicationIdentity(applicationKey, applicationDisplayName) {
+  if (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey)) {
+    throw new TypeError("applicationKey must be a canonical lowercase identifier");
+  }
+  if (
+    typeof applicationDisplayName !== "string" ||
+    applicationDisplayName.trim().length < 1 ||
+    applicationDisplayName.trim().length > 80 ||
+    /[\\/:]/u.test(applicationDisplayName)
+  ) {
+    throw new TypeError("applicationDisplayName must not contain path data");
+  }
+  return {
+    applicationKey,
+    applicationDisplayName: applicationDisplayName.trim(),
+  };
+}
+
+function assertCaptureGeneration(captureGeneration) {
+  if (!Number.isSafeInteger(captureGeneration) || captureGeneration < 1) {
+    throw new TypeError("captureGeneration must be a positive safe integer");
+  }
+  return captureGeneration;
 }
 
 class JarvisService {
@@ -222,6 +265,9 @@ class JarvisService {
     this.vadSessionReset = false;
     this.interruptingSources = new Set();
     this.writer = null;
+    this.applicationSources = new Map();
+    this.applicationTrackEvidence = new Map();
+    this.applicationAttributionIntervals = new Map();
     this.closing = false;
     this.closed = false;
     this.completedRestorations = new Map();
@@ -286,6 +332,9 @@ class JarvisService {
     this.storageGovernor.ensureReserve();
     this.fs.mkdirSync(this.recordingsDir, { recursive: true });
     this.completedRestorations.clear();
+    this.applicationSources.clear();
+    this.applicationTrackEvidence.clear();
+    this.applicationAttributionIntervals.clear();
     this.retentionGeneration += 1;
     const classifierReady = this._isVadReady();
     const effectiveRetentionMode =
@@ -379,6 +428,213 @@ class JarvisService {
       throw error;
     }
     return this._publish(normalized.startedAt);
+  }
+
+  startApplicationAudioTrack({
+    sessionId,
+    applicationKey,
+    applicationDisplayName,
+    captureGeneration,
+    startedAt,
+  }) {
+    this._assertOpen();
+    this._assertActive(sessionId, ["recording", "degraded"]);
+    this._assertTime(startedAt, "startedAt");
+    const identity = assertApplicationIdentity(applicationKey, applicationDisplayName);
+    const generation = assertCaptureGeneration(captureGeneration);
+    const existing = this.applicationSources.get(identity.applicationKey);
+    if (existing) {
+      if (existing.captureGeneration === generation) return { ...existing };
+      throw new Error(`application audio track is already active: ${identity.applicationKey}`);
+    }
+    if (!this.writer) throw new Error("capture writer is unavailable");
+
+    const trackId = `track-${crypto.randomUUID()}`;
+    const trackKey = `application:${identity.applicationKey}:${generation}`;
+    const track = {
+      ...identity,
+      captureGeneration: generation,
+      trackId,
+      trackKey,
+      startedAt,
+    };
+    let writerOpened = false;
+    let persisted = false;
+    try {
+      this.writer.reopenSource(trackKey, {
+        id: trackId,
+        sourceType: "system",
+        storageKey: trackId,
+        startedAt,
+      });
+      writerOpened = true;
+      this.repository.createTrack({
+        id: trackId,
+        sessionId: this.state.sessionId,
+        sourceType: "system",
+        applicationKey: identity.applicationKey,
+        applicationDisplayName: identity.applicationDisplayName,
+        captureGeneration: generation,
+        deviceId: null,
+        deviceLabel: null,
+        strategy: "wasapi-application-loopback",
+        sampleRate: WAV_SAMPLE_RATE,
+        channels: 1,
+        startedAt,
+        state: "active",
+      });
+      persisted = true;
+      this.applicationSources.set(identity.applicationKey, track);
+      this.applicationTrackEvidence.set(trackId, { trackId, gapId: null });
+      return { ...track };
+    } catch (error) {
+      if (writerOpened) {
+        try {
+          this.writer.closeSource(trackKey, startedAt);
+        } catch {}
+      }
+      if (persisted) {
+        try {
+          this.repository.setTrackState(trackId, "failed", startedAt);
+        } catch {}
+      }
+      throw error;
+    }
+  }
+
+  appendApplicationAudioPcm({
+    sessionId,
+    applicationKey,
+    captureGeneration,
+    pcm,
+  }) {
+    if (this.closing || this.closed) return false;
+    this._assertActive(sessionId, ["recording", "degraded"]);
+    if (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey)) {
+      throw new TypeError("applicationKey must be a canonical lowercase identifier");
+    }
+    const generation = assertCaptureGeneration(captureGeneration);
+    if (!Buffer.isBuffer(pcm) || pcm.length === 0 || pcm.length % WAV_BYTES_PER_SAMPLE !== 0) {
+      throw new TypeError("application PCM must be a non-empty aligned Buffer");
+    }
+    const track = this.applicationSources.get(applicationKey);
+    if (!track) throw new Error(`application audio track is not active: ${applicationKey}`);
+    if (track.captureGeneration !== generation) {
+      throw new Error(`application audio generation mismatch: ${applicationKey}`);
+    }
+    this.writer.append(track.trackKey, pcm);
+    return true;
+  }
+
+  stopApplicationAudioTrack({
+    sessionId,
+    applicationKey,
+    captureGeneration,
+    endedAt,
+    state = "ended",
+  }) {
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
+    this._assertTime(endedAt, "endedAt");
+    if (state !== "ended" && state !== "failed") {
+      throw new TypeError("application track state must be ended or failed");
+    }
+    const generation = assertCaptureGeneration(captureGeneration);
+    const track = this.applicationSources.get(applicationKey);
+    if (!track) return false;
+    if (track.captureGeneration !== generation) {
+      throw new Error(`application audio generation mismatch: ${applicationKey}`);
+    }
+    this.applicationSources.delete(applicationKey);
+    this.writer?.closeSource(track.trackKey, endedAt);
+    this.repository.setTrackState(track.trackId, state, endedAt);
+    return true;
+  }
+
+  recordApplicationAudioAttribution({
+    sessionId,
+    applicationKey,
+    captureGeneration,
+    attributionState,
+    at,
+    reason,
+  }) {
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
+    this._assertTime(at, "at");
+    if (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey)) {
+      throw new TypeError("applicationKey must be a canonical lowercase identifier");
+    }
+    const generation = assertCaptureGeneration(captureGeneration);
+    if (attributionState !== "exact" && attributionState !== "mixed_unknown") {
+      throw new TypeError("attributionState must be exact or mixed_unknown");
+    }
+    const previous = this.applicationAttributionIntervals.get(applicationKey);
+    if (
+      previous?.attributionState === attributionState &&
+      previous.captureGeneration === generation
+    ) {
+      return { ...previous };
+    }
+    const transitionAt = previous ? Math.max(at, previous.startedAt + 1) : at;
+    if (previous) {
+      const closed = this.repository.closeApplicationAudioInterval(previous.id, transitionAt);
+      if (closed?.changes !== 1) {
+        throw new Error(`application attribution interval did not close: ${applicationKey}`);
+      }
+      this.applicationAttributionIntervals.delete(applicationKey);
+    }
+
+    let trackId;
+    let intervalKind;
+    if (attributionState === "exact") {
+      const track = this.applicationSources.get(applicationKey);
+      if (!track || track.captureGeneration !== generation) {
+        throw new Error(`exact application attribution requires an active matching track`);
+      }
+      trackId = track.trackId;
+      intervalKind = "application_active";
+    } else {
+      const systemMix = this.state.sources.system;
+      if (!systemMix?.trackId) {
+        throw new Error("mixed application fallback requires the system mix track");
+      }
+      trackId = systemMix.trackId;
+      intervalKind = "mixed_fallback";
+    }
+    const interval = this.repository.createApplicationAudioInterval({
+      sessionId: this.state.sessionId,
+      trackId,
+      intervalKind,
+      applicationKey: attributionState === "exact" ? applicationKey : null,
+      attributionState,
+      captureGeneration: generation,
+      startedAt: transitionAt,
+      endedAt: null,
+      reason,
+      createdAt: transitionAt,
+    });
+    const active = {
+      id: interval.id,
+      applicationKey,
+      attributionState,
+      captureGeneration: generation,
+      startedAt: interval.started_at ?? interval.startedAt ?? transitionAt,
+    };
+    this.applicationAttributionIntervals.set(applicationKey, active);
+    return { ...active };
+  }
+
+  endApplicationAudioAttribution({ sessionId, applicationKey, at }) {
+    this._assertActive(sessionId, ["recording", "degraded", "paused"]);
+    this._assertTime(at, "at");
+    const previous = this.applicationAttributionIntervals.get(applicationKey);
+    if (!previous) return false;
+    const endedAt = Math.max(at, previous.startedAt + 1);
+    const closed = this.repository.closeApplicationAudioInterval(previous.id, endedAt);
+    if (closed?.changes !== 1) {
+      throw new Error(`application attribution interval did not close: ${applicationKey}`);
+    }
+    this.applicationAttributionIntervals.delete(applicationKey);
+    return true;
   }
 
   async prepareStorageMigration() {
@@ -1100,6 +1356,7 @@ class JarvisService {
         return this.state.status === "failed" ? this._publicState(at) : this._failForAudioWrite(at);
       }
       try {
+        this._closeAllApplicationAttributions(at);
         this.writer.closeAll(at);
         for (const source of Object.values(this.state.sources)) source.writerOpen = false;
       } catch (error) {
@@ -1127,6 +1384,7 @@ class JarvisService {
         return this._publicState(at);
       }
       try {
+        this._closeAllApplicationAttributions(at);
         this.writer.closeAll(at);
         for (const source of Object.values(this.state.sources)) source.writerOpen = false;
       } catch {
@@ -1204,6 +1462,7 @@ class JarvisService {
         if (!this.writer) return;
       }
       try {
+        this._closeAllApplicationAttributions(at);
         this.writer.closeAll(at);
         for (const source of Object.values(this.state.sources)) source.writerOpen = false;
       } catch (error) {
@@ -1325,6 +1584,7 @@ class JarvisService {
             pcm: frame.pcm,
             capturedAt: frame.startedAt,
             speechProbability,
+            signalDetected: hasAudibleSignal(frame.pcm),
           });
           if (frame.persistOnDecision) {
             if (!this._applyGateDecision(source, gateDecision)) return;
@@ -2382,9 +2642,19 @@ class JarvisService {
     this._cancelAllVadWork();
     const sessionId = this.state.sessionId;
     this._resetVadSessionOnce(sessionId);
+    this._closeAllApplicationAttributions(at);
     const sources = Object.values(this.state.sources);
-    const evidenceSources =
-      durableSources ?? sources.map((source) => ({ trackId: source.trackId, gapId: source.gapId }));
+    const evidenceSources = [
+      ...(durableSources ??
+        sources.map((source) => ({ trackId: source.trackId, gapId: source.gapId }))),
+    ];
+    const includedTrackIds = new Set(evidenceSources.map((source) => source.trackId));
+    for (const evidence of this.applicationTrackEvidence.values()) {
+      if (!includedTrackIds.has(evidence.trackId)) {
+        evidenceSources.push({ ...evidence });
+        includedTrackIds.add(evidence.trackId);
+      }
+    }
 
     for (const source of sources) {
       source.state = trackState;
@@ -2401,6 +2671,9 @@ class JarvisService {
         sessionStatus,
         at,
       });
+      this.applicationSources.clear();
+      this.applicationTrackEvidence.clear();
+      this.applicationAttributionIntervals.clear();
     } catch (error) {
       if (sessionStatus !== "failed") {
         for (const source of sources) source.state = "failed";
@@ -2415,6 +2688,17 @@ class JarvisService {
       this._schedulePreviewCleanup(sessionId);
     }
     return this._publish(at);
+  }
+
+  _closeAllApplicationAttributions(at) {
+    for (const [applicationKey, interval] of [...this.applicationAttributionIntervals]) {
+      const endedAt = Math.max(at, interval.startedAt + 1);
+      const closed = this.repository.closeApplicationAudioInterval(interval.id, endedAt);
+      if (closed?.changes !== 1) {
+        throw new Error(`application attribution interval did not close: ${applicationKey}`);
+      }
+      this.applicationAttributionIntervals.delete(applicationKey);
+    }
   }
 
   _schedulePreviewCleanup(sessionId) {

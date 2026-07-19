@@ -58,6 +58,8 @@ const RUNTIME_ANALYSIS_ERROR_CODES = new Set([
 const INVALID_ANALYSIS_ERROR_CODES = new Set([
   "invalid_json",
   "invalid_structure",
+  "analysis_invalid_response",
+  "analysis_candidate_apply_failed",
   "ANALYSIS_RESPONSE_INVALID",
 ]);
 
@@ -68,7 +70,8 @@ function codedError(code) {
 }
 
 function publicAnalysisErrorCode(errorCode, blockedReason, fallback = "analysis_failed") {
-  const raw = errorCode ?? blockedReason;
+  const raw =
+    errorCode === "ANALYSIS_MANUAL_RETRY_AUTHORIZED" ? blockedReason : (errorCode ?? blockedReason);
   if (PUBLIC_ANALYSIS_ERROR_CODES.has(raw)) return raw;
   if (OFFLINE_ANALYSIS_ERROR_CODES.has(raw)) return "offline";
   if (BUDGET_ANALYSIS_ERROR_CODES.has(raw)) return "budget_exceeded";
@@ -340,7 +343,8 @@ class MemoryRepository {
           (right?.ended_at ?? Number.MAX_SAFE_INTEGER) ||
         String(left?.id ?? "").localeCompare(String(right?.id ?? ""))
     );
-    const segments = selectedSegments.map((segment, ordinal) => {
+    let selectedOrdinal = 0;
+    const segments = selectedSegments.flatMap((segment) => {
       if (
         !segment ||
         segment.session_id !== sessionId ||
@@ -364,7 +368,7 @@ class MemoryRepository {
         const person = this.db
           .prepare("SELECT id, display_name, is_self FROM people WHERE id = ?")
           .get(segment.person_id);
-        if (!person?.display_name?.trim()) throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
+        if (!person?.display_name?.trim()) return [];
         if (person.is_self !== 1) {
           const confirmed = this.db
             .prepare(
@@ -372,7 +376,7 @@ class MemoryRepository {
                WHERE session_id = ? AND person_id = ? AND link_state = 'confirmed' LIMIT 1`
             )
             .get(sessionId, person.id);
-          if (!confirmed) throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
+          if (!confirmed) return [];
         }
         subject = {
           key: `person:${person.id}`,
@@ -391,7 +395,7 @@ class MemoryRepository {
              ORDER BY cluster.id LIMIT 1`
           )
           .get(segment.id, sessionId);
-        if (!cluster?.local_label?.trim()) throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
+        if (!cluster?.local_label?.trim()) return [];
         subject = {
           key: `speaker_cluster:${cluster.id}`,
           subjectKind: "speaker_cluster",
@@ -412,8 +416,8 @@ class MemoryRepository {
           subjectDisplayNameSnapshot: subject.subjectDisplayNameSnapshot,
         });
       }
-      return {
-        ordinal,
+      return [{
+        ordinal: selectedOrdinal++,
         segmentId: segment.id,
         segmentVersion: segment.version,
         textHash: sha256(segment.text),
@@ -426,8 +430,9 @@ class MemoryRepository {
         startedAt: segment.started_at,
         endedAt: segment.ended_at,
         speakerBindingLabel: label,
-      };
+      }];
     });
+    if (segments.length === 0) throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
 
     bindings.sort((left, right) => {
       if (left.label === "SELF") return -1;
@@ -444,7 +449,7 @@ class MemoryRepository {
       transcriptRevision,
       identityRevision,
       promptVersion,
-      segmentIds: [...segmentIds],
+      segmentIds: segments.map((segment) => segment.segmentId),
       segments,
       speakerBindings: bindings,
       redactionTerms: {

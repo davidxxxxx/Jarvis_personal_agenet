@@ -61,6 +61,48 @@ function assertResolutionScore(value, name, { maximum = 1, minimum = -1 } = {}) 
   return value;
 }
 
+function normalizeResolutionModels(value) {
+  if (value === null || value === undefined) return [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("resolution model evidence must be an object");
+  }
+  const entries = Object.values(value);
+  if (entries.length !== 2) {
+    throw new TypeError("dual resolution evidence must contain exactly two models");
+  }
+  const modelIds = new Set();
+  const spaces = new Set();
+  return entries.map((entry) => {
+    const modelId = assertText(entry?.modelId, "resolution modelId");
+    const artifactVersion = assertText(entry?.artifactVersion, "resolution artifactVersion");
+    const embeddingSpace = assertText(entry?.embeddingSpace, "resolution embeddingSpace");
+    if (modelIds.has(modelId) || spaces.has(embeddingSpace)) {
+      throw new TypeError("resolution model evidence must use isolated model spaces");
+    }
+    modelIds.add(modelId);
+    spaces.add(embeddingSpace);
+    if (typeof entry.passed !== "boolean") {
+      throw new TypeError("resolution model passed must be a boolean");
+    }
+    const similarity = assertResolutionScore(entry.similarity, "resolution similarity");
+    const margin = assertResolutionScore(entry.margin, "resolution model margin", {
+      minimum: 0,
+      maximum: 2,
+    });
+    if (similarity === null || margin === null) {
+      throw new TypeError("resolution model scores are required");
+    }
+    return {
+      modelId,
+      artifactVersion,
+      embeddingSpace,
+      similarity,
+      margin,
+      passed: entry.passed,
+    };
+  });
+}
+
 function deterministicResolutionId(...parts) {
   return `speaker_resolution_${crypto
     .createHash("sha256")
@@ -171,7 +213,7 @@ function mapResolution(row) {
 }
 
 class SpeakerIdentityRepository {
-  constructor(db, { createId, now = Date.now } = {}) {
+  constructor(db, { createId, now = Date.now, embeddingCipher = null } = {}) {
     if (!db || typeof db.prepare !== "function" || typeof db.transaction !== "function") {
       throw new TypeError("db must be a better-sqlite3 database");
     }
@@ -179,6 +221,13 @@ class SpeakerIdentityRepository {
       throw new TypeError("createId must be a function");
     }
     if (typeof now !== "function") throw new TypeError("now must be a function");
+    if (
+      embeddingCipher !== null &&
+      (typeof embeddingCipher.encryptBuffer !== "function" ||
+        typeof embeddingCipher.decryptBuffer !== "function")
+    ) {
+      throw new TypeError("embeddingCipher must implement encryptBuffer and decryptBuffer");
+    }
     this.db = db;
     this.createId =
       createId ??
@@ -187,6 +236,7 @@ class SpeakerIdentityRepository {
         return `${prefix}_${random}`;
       });
     this.now = now;
+    this.embeddingCipher = embeddingCipher;
     this.statements = {
       insertCluster: db.prepare(`
         INSERT INTO speaker_clusters (
@@ -246,6 +296,24 @@ class SpeakerIdentityRepository {
       listProfiles: db.prepare(`
         SELECT * FROM voice_profile_samples
         WHERE model_id = ? ORDER BY person_id, created_at, id
+      `),
+      deleteClusterModelEmbeddings: db.prepare(`
+        DELETE FROM speaker_cluster_model_embeddings WHERE cluster_id = ?
+      `),
+      insertClusterModelEmbedding: db.prepare(`
+        INSERT INTO speaker_cluster_model_embeddings (
+          cluster_id, model_id, artifact_version, embedding_space, embedding,
+          source_kind, attribution_state, speech_ms, window_count, quality_score,
+          overlap_detected, echo_detected, created_at
+        ) VALUES (
+          @clusterId, @modelId, @artifactVersion, @embeddingSpace, @embedding,
+          @sourceKind, @attributionState, @speechMs, @windowCount, @qualityScore,
+          @overlapDetected, @echoDetected, @createdAt
+        )
+      `),
+      listClusterModelEmbeddings: db.prepare(`
+        SELECT * FROM speaker_cluster_model_embeddings
+        WHERE cluster_id = ? ORDER BY model_id
       `),
       getProfileAggregate: db.prepare(`
         SELECT * FROM voice_profile_aggregates
@@ -427,6 +495,23 @@ class SpeakerIdentityRepository {
             projection_applied = @projectionApplied
         WHERE id = @id AND actor = 'system'
       `),
+      deleteResolutionModelEvidence: db.prepare(`
+        DELETE FROM speaker_identity_resolution_model_evidence
+        WHERE resolution_id = ?
+      `),
+      insertResolutionModelEvidence: db.prepare(`
+        INSERT INTO speaker_identity_resolution_model_evidence (
+          resolution_id, model_id, artifact_version, embedding_space,
+          similarity, margin, passed, created_at
+        ) VALUES (
+          @resolutionId, @modelId, @artifactVersion, @embeddingSpace,
+          @similarity, @margin, @passed, @createdAt
+        )
+      `),
+      listResolutionModelEvidence: db.prepare(`
+        SELECT * FROM speaker_identity_resolution_model_evidence
+        WHERE resolution_id = ? ORDER BY model_id
+      `),
       listResolutionRunResults: db.prepare(`
         SELECT * FROM speaker_identity_resolutions
         WHERE resolution_run_id = ? AND actor = 'system'
@@ -566,7 +651,7 @@ class SpeakerIdentityRepository {
           { ...cluster, person_id: input.personId },
           createdAt
         );
-        this.statements.wakeResolvedSessionsForModel.run(cluster.model_id);
+        this._wakeResolvedSessionsForClusterModels(cluster);
         return outcome;
       }
       return { profileSampleAdded: false, profileSampleReason: "session_scope" };
@@ -684,6 +769,7 @@ class SpeakerIdentityRepository {
             reason: result.reason,
             projectionApplied,
           });
+          this._replaceResolutionModelEvidence(row.id, result.models, input.at);
           if (projectionApplied === 1) {
             this.statements.updateClusterLink.run({
               clusterId: result.clusterId,
@@ -765,6 +851,7 @@ class SpeakerIdentityRepository {
           projectionApplied,
           createdAt: input.at,
         });
+        this._replaceResolutionModelEvidence(id, result.models, input.at);
         if (projectionApplied === 1) {
           this.statements.updateClusterLink.run({
             clusterId: result.clusterId,
@@ -807,7 +894,7 @@ class SpeakerIdentityRepository {
           },
           undoneAt
         );
-        this.statements.wakeResolvedSessionsForModel.run(cluster.model_id);
+        this._wakeResolvedSessionsForClusterModels(cluster);
       }
       this.statements.markCorrectionUndone.run(undoneAt, correction.id);
       const newerSystemResolution = this.statements.getLatestSystemResolutionAfter.get({
@@ -918,6 +1005,15 @@ class SpeakerIdentityRepository {
       this.statements.wakeResolvedSessionsForModel.run(values.modelId);
     });
 
+    this._replaceEnrollmentSampleSets = db.transaction((sets) => {
+      for (const values of sets) {
+        this.statements.deleteEnrollmentProfiles.run(values.personId, values.modelId);
+        for (const sample of values.samples) this.statements.insertProfile.run(sample);
+        this.statements.upsertProfileAggregate.run(values.aggregate);
+        this.statements.wakeResolvedSessionsForModel.run(values.modelId);
+      }
+    });
+
     this._insertProfileAndWake = db.transaction((values) => {
       this.statements.insertProfile.run(values);
       this.statements.wakeResolvedSessionsForModel.run(values.modelId);
@@ -935,6 +1031,188 @@ class SpeakerIdentityRepository {
       this.statements.wakeResolvedSessionsForModel.run(values.sample.modelId);
       return true;
     });
+
+    this._replaceClusterModelEmbeddings = db.transaction((input) => {
+      this._requireCluster(input.clusterId);
+      this.statements.deleteClusterModelEmbeddings.run(input.clusterId);
+      for (const model of input.models) {
+        this.statements.insertClusterModelEmbedding.run({
+          ...input,
+          ...model,
+          overlapDetected: input.overlapDetected ? 1 : 0,
+          echoDetected: input.echoDetected ? 1 : 0,
+        });
+      }
+      return this.statements.listClusterModelEmbeddings.all(input.clusterId);
+    });
+  }
+
+  _encodeStoredEmbedding(embedding) {
+    const plaintext = encodeEmbedding(embedding);
+    if (!this.embeddingCipher) return plaintext;
+    try {
+      return this.embeddingCipher.encryptBuffer(plaintext);
+    } finally {
+      plaintext.fill(0);
+    }
+  }
+
+  _decodeStoredEmbedding(blob, expectedDimension = null) {
+    if (!this.embeddingCipher) return decodeEmbedding(blob, expectedDimension);
+    const plaintext = this.embeddingCipher.decryptBuffer(blob);
+    try {
+      return decodeEmbedding(plaintext, expectedDimension);
+    } finally {
+      plaintext.fill(0);
+    }
+  }
+
+  decodeStoredEmbedding(blob, expectedDimension = null) {
+    return this._decodeStoredEmbedding(blob, expectedDimension);
+  }
+
+  encodeStoredEmbedding(embedding) {
+    return this._encodeStoredEmbedding(embedding);
+  }
+
+  protectEncodedEmbedding(blob, expectedDimension = null) {
+    const embedding = decodeEmbedding(blob, expectedDimension);
+    try {
+      return this._encodeStoredEmbedding(embedding);
+    } finally {
+      embedding.fill(0);
+    }
+  }
+
+  replaceClusterModelEmbeddings(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("cluster model evidence is required");
+    }
+    const sourceKind = assertEnum(
+      input.sourceKind,
+      new Set(["mic", "application", "system_mix"]),
+      "sourceKind"
+    );
+    const attributionState = assertEnum(
+      input.attributionState,
+      new Set(["exact", "mixed_unknown"]),
+      "attributionState"
+    );
+    const overlapDetected = input.overlapDetected === true;
+    const echoDetected = input.echoDetected === true;
+    if (
+      (attributionState === "exact" && sourceKind === "system_mix") ||
+      (attributionState === "mixed_unknown" && sourceKind !== "system_mix")
+    ) {
+      throw new TypeError("source attribution does not match source kind");
+    }
+    if (attributionState === "exact" && (overlapDetected || echoDetected)) {
+      throw new TypeError("exact speaker evidence cannot contain overlap or echo");
+    }
+    if (!Array.isArray(input.models) || input.models.length !== 2) {
+      throw new TypeError("exactly two isolated speaker models are required");
+    }
+    const modelIds = new Set();
+    const embeddingSpaces = new Set();
+    const models = input.models.map((model) => {
+      const modelId = assertText(model?.modelId, "modelId");
+      const artifactVersion = assertText(model?.artifactVersion, "artifactVersion");
+      const embeddingSpace = assertText(model?.embeddingSpace, "embeddingSpace");
+      if (modelIds.has(modelId) || embeddingSpaces.has(embeddingSpace)) {
+        throw new TypeError("speaker model ids and embedding spaces must be unique");
+      }
+      modelIds.add(modelId);
+      embeddingSpaces.add(embeddingSpace);
+      if (!(model.embedding instanceof Float32Array) || model.embedding.length !== 192) {
+        throw new TypeError("dual speaker embeddings must contain 192 Float32 values");
+      }
+      return {
+        modelId,
+        artifactVersion,
+        embeddingSpace,
+        embedding: this._encodeStoredEmbedding(model.embedding),
+        qualityScore: assertOptionalScore(model.qualityScore, "model qualityScore"),
+      };
+    });
+    const safe = {
+      clusterId: assertId(input.clusterId, "clusterId"),
+      sourceKind,
+      attributionState,
+      speechMs: assertNonNegativeInteger(input.speechMs, "speechMs"),
+      windowCount: assertNonNegativeInteger(input.windowCount, "windowCount"),
+      qualityScore: assertOptionalScore(input.qualityScore, "qualityScore"),
+      overlapDetected,
+      echoDetected,
+      createdAt: assertNonNegativeInteger(input.createdAt ?? this.now(), "createdAt"),
+      models: models.map((model) => ({
+        ...model,
+        qualityScore: model.qualityScore ?? assertOptionalScore(input.qualityScore, "qualityScore"),
+      })),
+    };
+    if (safe.qualityScore === null || safe.models.some((model) => model.qualityScore === null)) {
+      throw new TypeError("dual speaker quality scores are required");
+    }
+    return this._replaceClusterModelEmbeddings.immediate(safe).map((row) => ({
+      clusterId: row.cluster_id,
+      modelId: row.model_id,
+      artifactVersion: row.artifact_version,
+      embeddingSpace: row.embedding_space,
+      sourceKind: row.source_kind,
+      attributionState: row.attribution_state,
+      speechMs: row.speech_ms,
+      windowCount: row.window_count,
+      qualityScore: row.quality_score,
+      overlapDetected: row.overlap_detected === 1,
+      echoDetected: row.echo_detected === 1,
+      createdAt: row.created_at,
+    }));
+  }
+
+  listClusterModelEmbeddings(clusterId) {
+    return this.statements.listClusterModelEmbeddings
+      .all(assertId(clusterId, "clusterId"))
+      .map((row) => ({
+        clusterId: row.cluster_id,
+        modelId: row.model_id,
+        artifactVersion: row.artifact_version,
+        embeddingSpace: row.embedding_space,
+        embedding: this._decodeStoredEmbedding(row.embedding, 192),
+        sourceKind: row.source_kind,
+        attributionState: row.attribution_state,
+        speechMs: row.speech_ms,
+        windowCount: row.window_count,
+        qualityScore: row.quality_score,
+        overlapDetected: row.overlap_detected === 1,
+        echoDetected: row.echo_detected === 1,
+        createdAt: row.created_at,
+      }));
+  }
+
+  _replaceResolutionModelEvidence(resolutionId, models, createdAt) {
+    this.statements.deleteResolutionModelEvidence.run(resolutionId);
+    for (const model of models) {
+      this.statements.insertResolutionModelEvidence.run({
+        resolutionId,
+        ...model,
+        passed: model.passed ? 1 : 0,
+        createdAt,
+      });
+    }
+  }
+
+  listResolutionModelEvidence(resolutionId) {
+    return this.statements.listResolutionModelEvidence
+      .all(assertId(resolutionId, "resolutionId"))
+      .map((row) => ({
+        resolutionId: row.resolution_id,
+        modelId: row.model_id,
+        artifactVersion: row.artifact_version,
+        embeddingSpace: row.embedding_space,
+        similarity: row.similarity,
+        margin: row.margin,
+        passed: row.passed === 1,
+        createdAt: row.created_at,
+      }));
   }
 
   _tableExists(table) {
@@ -958,7 +1236,7 @@ class SpeakerIdentityRepository {
   _assertModelDimension(modelId, embedding) {
     let expectedDimension = null;
     for (const row of this.statements.listModelEmbeddings.all(modelId, modelId)) {
-      const stored = decodeEmbedding(row.embedding, expectedDimension);
+      const stored = this._decodeStoredEmbedding(row.embedding, expectedDimension);
       expectedDimension ??= stored.length;
     }
     if (expectedDimension !== null && embedding.length !== expectedDimension) {
@@ -976,7 +1254,7 @@ class SpeakerIdentityRepository {
       trackId: row.track_id,
       localLabel: row.local_label,
       modelId: row.model_id,
-      embedding: row.embedding === null ? null : decodeEmbedding(row.embedding),
+      embedding: row.embedding === null ? null : this._decodeStoredEmbedding(row.embedding),
       speechMs: row.speech_ms,
       windowCount: row.window_count,
       qualityScore: row.quality_score,
@@ -1059,7 +1337,7 @@ class SpeakerIdentityRepository {
       id: row.id,
       personId: row.person_id,
       modelId: row.model_id,
-      embedding: decodeEmbedding(row.embedding),
+      embedding: this._decodeStoredEmbedding(row.embedding),
       sourceClusterId: row.source_cluster_id,
       sourceKind: row.source_kind,
       speechMs: row.speech_ms,
@@ -1073,7 +1351,7 @@ class SpeakerIdentityRepository {
     return {
       personId: row.person_id,
       modelId: row.model_id,
-      embedding: decodeEmbedding(row.embedding),
+      embedding: this._decodeStoredEmbedding(row.embedding),
       acceptedSpeechMs: row.accepted_speech_ms,
       windowCount: row.window_count,
       selfConsistency: row.self_consistency,
@@ -1116,10 +1394,90 @@ class SpeakerIdentityRepository {
     });
   }
 
+  _wakeResolvedSessionsForClusterModels(cluster) {
+    const modelIds = new Set([cluster.model_id]);
+    for (const row of this.statements.listClusterModelEmbeddings.all(cluster.id)) {
+      modelIds.add(row.model_id);
+    }
+    for (const modelId of modelIds) {
+      this.statements.wakeResolvedSessionsForModel.run(modelId);
+    }
+  }
+
+  _dualProfileSampleSkipReason(rows, person) {
+    if (rows.length !== 2) return "missing_embedding";
+    const allowedSources =
+      person.is_self === 1 ? new Set(["mic"]) : new Set(["mic", "application"]);
+    if (
+      rows.some(
+        (row) =>
+          row.attribution_state !== "exact" ||
+          row.overlap_detected !== 0 ||
+          row.echo_detected !== 0 ||
+          !allowedSources.has(row.source_kind)
+      )
+    ) {
+      return "insufficient_quality";
+    }
+    if (rows.some((row) => row.speech_ms < PROFILE_SAMPLE_QUALITY_GATE.minimumSpeechMs)) {
+      return "insufficient_speech";
+    }
+    if (rows.some((row) => row.window_count < PROFILE_SAMPLE_QUALITY_GATE.minimumWindows)) {
+      return "insufficient_windows";
+    }
+    if (
+      rows.some(
+        (row) =>
+          row.quality_score === null ||
+          row.quality_score < PROFILE_SAMPLE_QUALITY_GATE.minimumQualityScore
+      )
+    ) {
+      return "insufficient_quality";
+    }
+    return null;
+  }
+
   _syncConfirmedProfileSample(cluster, createdAt) {
     if (!cluster.person_id) {
       this.statements.deleteConfirmedClusterProfiles.run(cluster.id);
       return { profileSampleAdded: false, profileSampleReason: "missing_embedding" };
+    }
+    const dualRows = this.statements.listClusterModelEmbeddings.all(cluster.id);
+    if (dualRows.length > 0) {
+      const person = this._requirePerson(cluster.person_id);
+      const skipReason = this._dualProfileSampleSkipReason(dualRows, person);
+      if (skipReason) {
+        this.statements.deleteConfirmedClusterProfiles.run(cluster.id);
+        return { profileSampleAdded: false, profileSampleReason: skipReason };
+      }
+      const allPresent = dualRows.every((row) =>
+        this.statements.getConfirmedClusterProfile.get({
+          clusterId: cluster.id,
+          personId: cluster.person_id,
+          modelId: row.model_id,
+        })
+      );
+      if (allPresent) {
+        return { profileSampleAdded: false, profileSampleReason: "already_present" };
+      }
+      this.statements.deleteConfirmedClusterProfiles.run(cluster.id);
+      let inserted = 0;
+      for (const row of dualRows) {
+        inserted += this.statements.insertProfileIfMissing.run({
+          id: this.createId("voice_profile_sample"),
+          personId: cluster.person_id,
+          modelId: row.model_id,
+          embedding: row.embedding,
+          sourceClusterId: cluster.id,
+          speechMs: row.speech_ms,
+          windowCount: row.window_count,
+          createdAt,
+        }).changes;
+      }
+      return {
+        profileSampleAdded: inserted === dualRows.length,
+        profileSampleReason: inserted === dualRows.length ? "added" : "already_present",
+      };
     }
     const skipReason = this._profileSampleSkipReason(cluster);
     if (skipReason) {
@@ -1171,7 +1529,7 @@ class SpeakerIdentityRepository {
           : assertId(input.trackId, "trackId"),
       localLabel: assertText(input.localLabel, "localLabel"),
       modelId,
-      embedding: embedding ? encodeEmbedding(embedding) : null,
+      embedding: embedding ? this._encodeStoredEmbedding(embedding) : null,
       speechMs: assertNonNegativeInteger(input.speechMs ?? 0, "speechMs"),
       windowCount: assertNonNegativeInteger(input.windowCount ?? 0, "windowCount"),
       qualityScore: assertOptionalScore(input.qualityScore, "qualityScore"),
@@ -1268,7 +1626,7 @@ class SpeakerIdentityRepository {
       throw new TypeError("embedding must be a non-empty Float32Array");
     }
     this._assertModelDimension(modelId, input.embedding);
-    const encodedEmbedding = encodeEmbedding(input.embedding);
+    const encodedEmbedding = this._encodeStoredEmbedding(input.embedding);
     const sourceClusterId =
       input.sourceClusterId === null || input.sourceClusterId === undefined
         ? null
@@ -1292,8 +1650,18 @@ class SpeakerIdentityRepository {
       if (!this._passesProfileSampleQuality(sourceCluster)) {
         throw new Error("user-confirmed profile sample did not pass the quality gate");
       }
-      if (!Buffer.from(sourceCluster.embedding).equals(encodedEmbedding)) {
-        throw new Error("user-confirmed profile sample must match the cluster embedding");
+      const sourceEmbedding = this._decodeStoredEmbedding(
+        sourceCluster.embedding,
+        input.embedding.length
+      );
+      try {
+        for (let index = 0; index < sourceEmbedding.length; index += 1) {
+          if (sourceEmbedding[index] !== input.embedding[index]) {
+            throw new Error("user-confirmed profile sample must match the cluster embedding");
+          }
+        }
+      } finally {
+        sourceEmbedding.fill(0);
       }
       if (speechMs !== sourceCluster.speech_ms || windowCount !== sourceCluster.window_count) {
         throw new Error("user-confirmed profile sample must match the cluster evidence counts");
@@ -1329,7 +1697,7 @@ class SpeakerIdentityRepository {
     );
   }
 
-  replaceEnrollmentSamples(input) {
+  _prepareEnrollmentValues(input) {
     if (!input || typeof input !== "object") throw new TypeError("enrollment profile is required");
     const personId = assertId(input.personId, "personId");
     const modelId = assertText(input.modelId, "modelId");
@@ -1341,7 +1709,7 @@ class SpeakerIdentityRepository {
       throw new TypeError("enrollment centroid must be a Float32Array");
     }
     const dimension = input.centroid.length;
-    const encodedCentroid = encodeEmbedding(input.centroid);
+    const encodedCentroid = this._encodeStoredEmbedding(input.centroid);
     const acceptedSpeechMs = assertNonNegativeInteger(input.acceptedSpeechMs, "acceptedSpeechMs");
     const windowCount = assertNonNegativeInteger(input.windowCount, "windowCount");
     const selfConsistency = assertOptionalScore(input.selfConsistency, "selfConsistency");
@@ -1354,7 +1722,7 @@ class SpeakerIdentityRepository {
         id: this.createId("voice_profile_sample"),
         personId,
         modelId,
-        embedding: encodeEmbedding(embedding),
+        embedding: this._encodeStoredEmbedding(embedding),
         sourceClusterId: null,
         sourceKind: "enrollment",
         speechMs: assertNonNegativeInteger(input.sampleSpeechMs?.[index] ?? 0, "sampleSpeechMs"),
@@ -1363,7 +1731,7 @@ class SpeakerIdentityRepository {
       };
     });
     this._assertModelDimension(modelId, input.centroid);
-    this._replaceEnrollmentSamples({
+    return {
       personId,
       modelId,
       samples,
@@ -1376,8 +1744,26 @@ class SpeakerIdentityRepository {
         selfConsistency,
         updatedAt,
       },
-    });
-    return this.getProfileAggregate(personId, modelId);
+    };
+  }
+
+  replaceEnrollmentSamples(input) {
+    const values = this._prepareEnrollmentValues(input);
+    this._replaceEnrollmentSamples(values);
+    return this.getProfileAggregate(values.personId, values.modelId);
+  }
+
+  replaceEnrollmentSampleSets(inputs) {
+    if (!Array.isArray(inputs) || inputs.length < 2) {
+      throw new TypeError("at least two enrollment profile sets are required");
+    }
+    const values = inputs.map((input) => this._prepareEnrollmentValues(input));
+    const identities = new Set(values.map((entry) => `${entry.personId}\0${entry.modelId}`));
+    if (identities.size !== values.length) {
+      throw new TypeError("enrollment profile sets must use distinct person and model pairs");
+    }
+    this._replaceEnrollmentSampleSets(values);
+    return values.map((entry) => this.getProfileAggregate(entry.personId, entry.modelId));
   }
 
   importLegacyProfile(input) {
@@ -1391,7 +1777,7 @@ class SpeakerIdentityRepository {
       throw new TypeError("legacy embedding must be a Float32Array");
     }
     const importedAt = assertNonNegativeInteger(input.importedAt ?? this.now(), "importedAt");
-    const embedding = encodeEmbedding(input.embedding);
+    const embedding = this._encodeStoredEmbedding(input.embedding);
     return this._importLegacyProfile({
       markerKey,
       importedAt,
@@ -1541,6 +1927,7 @@ class SpeakerIdentityRepository {
             maximum: 2,
           }),
           reason: assertText(result.reason, "reason"),
+          models: normalizeResolutionModels(result.models),
         };
       }),
       at: assertNonNegativeInteger(input.at ?? this.now(), "at"),

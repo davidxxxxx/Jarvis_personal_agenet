@@ -419,6 +419,7 @@ class IPCHandlers {
     this.audioTapManager = managers.audioTapManager;
     this.linuxPortalAudioManager = managers.linuxPortalAudioManager;
     this.windowsLoopbackAudioManager = managers.windowsLoopbackAudioManager;
+    this.applicationAudioCapturePool = managers.applicationAudioCapturePool;
     this.meetingAecManager = managers.meetingAecManager;
     this.jarvisService = managers.jarvisService;
     this.jarvisRepository = managers.jarvisRepository;
@@ -435,6 +436,9 @@ class IPCHandlers {
     this._dictationPreviewEnabled = false;
     this._meetingMicStreaming = null;
     this._meetingSystemStreaming = null;
+    this._jarvisFullscreenYieldActive = false;
+    this._jarvisFullscreenYieldTransition = Promise.resolve(false);
+    this._applyJarvisFullscreenYield = null;
     this._hotkeyCaptureMode = false;
     this._autoLearnEnabled = true; // Default on, synced from renderer
     this._autoLearnDebounceTimer = null;
@@ -470,6 +474,24 @@ class IPCHandlers {
       whisperManager: this.whisperManager,
       model,
     });
+  }
+
+  setJarvisFullscreenYield(active) {
+    const next = active === true;
+    if (next === this._jarvisFullscreenYieldActive) {
+      return this._jarvisFullscreenYieldTransition || Promise.resolve(next);
+    }
+
+    this._jarvisFullscreenYieldActive = next;
+    let result;
+    try {
+      result = this._applyJarvisFullscreenYield?.(next);
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    const transition = Promise.resolve(result).then(() => next);
+    this._jarvisFullscreenYieldTransition = transition;
+    return transition;
   }
 
   _getWhisperVadSettings() {
@@ -5190,6 +5212,9 @@ class IPCHandlers {
 
     const startMeetingAec = async (systemAudioMode) => {
       meetingAecEnabled = false;
+      if (this._jarvisFullscreenYieldActive) {
+        return false;
+      }
       if (systemAudioMode === "unsupported" || !this.meetingAecManager?.isAvailable()) {
         return false;
       }
@@ -5295,6 +5320,9 @@ class IPCHandlers {
       micOnly = false
     ) => {
       await stopLiveSpeakerIdentification(meetingLiveSpeakerBinding);
+      if (this._jarvisFullscreenYieldActive) {
+        return false;
+      }
 
       const liveSpeakerScope = inputBinding?.liveSpeakerScope;
       if (liveSpeakerScope === LIVE_SPEAKER_SCOPES.JARVIS) {
@@ -5407,6 +5435,7 @@ class IPCHandlers {
     };
 
     const transcribeLocalMeetingChunk = async (source) => {
+      if (this._jarvisFullscreenYieldActive) return;
       const transcriptionGeneration = meetingLocalGeneration;
       const chunks = meetingLocalBuffers[source];
       if (!chunks.length) return;
@@ -5475,7 +5504,12 @@ class IPCHandlers {
           });
         }
 
-        if (transcriptionGeneration !== meetingLocalGeneration) return;
+        if (
+          transcriptionGeneration !== meetingLocalGeneration ||
+          this._jarvisFullscreenYieldActive
+        ) {
+          return;
+        }
 
         if (result?.success && result.text?.trim()) {
           let text = result.text.trim();
@@ -5683,6 +5717,7 @@ class IPCHandlers {
     };
 
     const transcribeAllLocalBuffers = () => {
+      if (this._jarvisFullscreenYieldActive) return Promise.resolve();
       if (meetingLocalTranscriptionPromise) return meetingLocalTranscriptionPromise;
       const transcriptionPromise = (async () => {
         meetingLocalTranscribing = true;
@@ -5701,6 +5736,85 @@ class IPCHandlers {
       };
       void transcriptionPromise.then(clearTranscriptionPromise, clearTranscriptionPromise);
       return transcriptionPromise;
+    };
+
+    const startMeetingLocalTimer = () => {
+      if (!meetingLocalMode || meetingLocalTimer || this._jarvisFullscreenYieldActive) {
+        return false;
+      }
+      meetingLocalTimer = setInterval(
+        () => {
+          transcribeAllLocalBuffers();
+        },
+        activeJarvisSessionId ? JARVIS_STABLE_WINDOW_MS : 5000
+      );
+      return true;
+    };
+
+    this._applyJarvisFullscreenYield = async (yieldActive) => {
+      const inputBinding = activeMeetingInputBinding;
+      const liveSpeakerScope = inputBinding?.liveSpeakerScope;
+      await this.applicationAudioCapturePool?.setFullscreen(yieldActive).catch((error) => {
+        debugLogger.warn(
+          "Application audio pool could not apply fullscreen limit",
+          { error: error.message },
+          "meeting"
+        );
+      });
+
+      if (yieldActive) {
+        const transcriptionAtEntry = meetingLocalTranscriptionPromise;
+        meetingLocalGeneration += 1;
+        if (meetingLocalTimer) {
+          clearInterval(meetingLocalTimer);
+          meetingLocalTimer = null;
+        }
+        meetingLocalBuffers = { mic: [], system: [] };
+        meetingPendingMicChunks = [];
+        resetPendingMicFinals();
+
+        await stopMeetingAec().catch(() => {});
+        if (liveSpeakerScope === LIVE_SPEAKER_SCOPES.JARVIS) {
+          await liveSpeakerRouter.stop(LIVE_SPEAKER_SCOPES.JARVIS).catch(() => {});
+        } else {
+          await stopLiveSpeakerIdentification(inputBinding).catch(() => {});
+        }
+
+        if (
+          meetingLocalMode &&
+          meetingLocalProvider === "whisper" &&
+          typeof this.whisperManager?.stopServer === "function"
+        ) {
+          await this.whisperManager.stopServer().catch(() => {});
+          await Promise.resolve(transcriptionAtEntry).catch(() => {});
+          await this.whisperManager.stopServer().catch(() => {});
+        }
+        return true;
+      }
+
+      if (
+        !inputBinding ||
+        inputBinding !== activeMeetingInputBinding ||
+        inputBinding.active !== true ||
+        inputBinding.cancelled === true
+      ) {
+        return false;
+      }
+
+      const win = meetingLocalWin || BrowserWindow.fromWebContents(inputBinding.owner);
+      if (liveSpeakerScope === LIVE_SPEAKER_SCOPES.JARVIS) {
+        await liveSpeakerRouter.start(LIVE_SPEAKER_SCOPES.JARVIS, {}).catch(() => {});
+      } else {
+        await startLiveSpeakerIdentification(
+          inputBinding,
+          win,
+          activeMeetingCaptureMode.systemAudioMode,
+          activeMeetingCaptureMode.micOnly
+        ).catch(() => {});
+      }
+      await startMeetingAec(activeMeetingCaptureMode.systemAudioMode).catch(() => false);
+      startMeetingLocalTimer();
+      return false;
     };
 
     const waitForPendingMeetingCorrections = async () => {
@@ -5881,6 +5995,9 @@ class IPCHandlers {
       if (inputBinding?.teardownPromise) return inputBinding.teardownPromise;
 
       const teardownPromise = (async () => {
+        if (this.applicationAudioCapturePool) {
+          await this.applicationAudioCapturePool.stop().catch(() => {});
+        }
         if (this.audioTapManager) {
           await this.audioTapManager.stop().catch(() => {});
         }
@@ -6305,12 +6422,7 @@ class IPCHandlers {
           await startMeetingAec(systemAudioMode);
           assertMeetingTranscriptionStartCurrent();
 
-          meetingLocalTimer = setInterval(
-            () => {
-              transcribeAllLocalBuffers();
-            },
-            activeJarvisSessionId ? JARVIS_STABLE_WINDOW_MS : 5000
-          );
+          startMeetingLocalTimer();
 
           ({ systemAudioMode, systemAudioStrategy } = await startMeetingSystemAudio(
             event,
@@ -6454,6 +6566,10 @@ class IPCHandlers {
         afterPersist: (buffer, persistedSource) => {
           const inputBinding = activeMeetingInputBinding;
           const derivedBuffer = activeJarvisSessionId ? Buffer.from(buffer) : buffer;
+          if (persistedSource === "system") {
+            publishMeetingSystemAudioLevel(inputBinding, derivedBuffer);
+          }
+          if (this._jarvisFullscreenYieldActive) return true;
           const routeLiveSpeakerAudio = () => {
             const liveSpeakerScope = inputBinding?.liveSpeakerScope;
             if (!liveSpeakerScope) return null;
@@ -6468,7 +6584,6 @@ class IPCHandlers {
 
           if (persistedSource === "system") {
             const receivedAt = Date.now();
-            publishMeetingSystemAudioLevel(inputBinding, derivedBuffer);
             meetingEchoLeakDetector.recordSystemChunk(derivedBuffer, receivedAt);
             if (meetingAecEnabled && !this.meetingAecManager?.processSystemBuffer(derivedBuffer)) {
               meetingAecEnabled = false;
@@ -7077,6 +7192,27 @@ class IPCHandlers {
             this.windowsLoopbackAudioManager,
             "Windows system audio warning"
           );
+          if (
+            activeJarvisSessionId &&
+            this.applicationAudioCapturePool &&
+            this.environmentManager.getApplicationAudioSettings?.().enabled !== false
+          ) {
+            const applicationAudioSettings =
+              this.environmentManager.getApplicationAudioSettings?.() ?? {};
+            await this.applicationAudioCapturePool
+              .start({
+                sessionId: activeJarvisSessionId,
+                configuredLimit: applicationAudioSettings.trackLimit,
+                fullscreen: this._jarvisFullscreenYieldActive === true,
+              })
+              .catch((error) => {
+                debugLogger.warn(
+                  "Application audio capture unavailable; mixed system evidence remains active",
+                  { error: error.message },
+                  "meeting"
+                );
+              });
+          }
           return { systemAudioMode, systemAudioStrategy };
         } catch (error) {
           debugLogger.warn(
@@ -7135,6 +7271,9 @@ class IPCHandlers {
       clearActiveMeetingInputBinding(stopInputBinding);
       this.meetingDetectionEngine?.setUserRecording(false);
       try {
+        if (this.applicationAudioCapturePool) {
+          await this.applicationAudioCapturePool.stop().catch(() => {});
+        }
         if (this.audioTapManager) {
           await this.audioTapManager.stop();
         }

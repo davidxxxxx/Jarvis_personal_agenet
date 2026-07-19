@@ -78,7 +78,7 @@ function desiredIdentity(overrides = {}) {
   };
 }
 
-function harness({ sendable = true } = {}) {
+function harness({ sendable = true, jobState = "pending" } = {}) {
   const events = [];
   let inputCreated = false;
   let identity = desiredIdentity();
@@ -121,7 +121,11 @@ function harness({ sendable = true } = {}) {
   const cloudQueue = {
     enqueueCloudJob(input) {
       events.push(["enqueue", input]);
-      return { id: `job-${input.desiredHeadHash[0]}`, state: "pending" };
+      return { id: `job-${input.desiredHeadHash[0]}`, state: jobState };
+    },
+    authorizeManualAnalysisRetry(id, options) {
+      events.push(["manual_retry", id, options]);
+      return { id, state: "retry" };
     },
   };
   const scheduler = new AnalysisScheduler({
@@ -225,6 +229,23 @@ test("ten-minute and final triggers target the same durable identity without dir
   );
 });
 
+test("only an explicit manual request requeues a blocked analysis job", async () => {
+  const { scheduler, events } = harness({ jobState: "blocked" });
+
+  assert.equal((await scheduler.analyzeSession("s1", "final")).state, "queued");
+  assert.equal(events.some(([name]) => name === "manual_retry"), false);
+
+  const retried = await scheduler.analyzeSession("s1", "final", {
+    manual: true,
+    allowUsageUnknown: true,
+  });
+  assert.equal(retried.state, "queued");
+  assert.deepEqual(events.find(([name]) => name === "manual_retry").slice(1), [
+    "job-1",
+    { allowUsageUnknown: true, at: 10 },
+  ]);
+});
+
 test("changed schema or subject identity targets a replacement desired-head job", async () => {
   const { scheduler, setIdentity } = harness();
 
@@ -299,4 +320,65 @@ test("getStatus prefers durable state and uses memory only during synchronous pr
     errorCode: null,
     updatedAt: 10,
   });
+});
+
+test("startup recovery schedules one newest ready session that never received durable analysis work", async () => {
+  const { scheduler, events } = harness();
+  scheduler.repository.listSessions = () => [
+    {
+      id: "already-summarized",
+      status: "completed",
+      processing_state: "ready",
+    },
+    {
+      id: "s1",
+      status: "completed",
+      processing_state: "ready",
+    },
+    {
+      id: "older-missed",
+      status: "completed",
+      processing_state: "ready",
+    },
+  ];
+  scheduler.repository.getSessionDetail = (sessionId) => {
+    if (sessionId === "already-summarized") {
+      return { ...sessionDetail(), summary: { summary: "already durable" } };
+    }
+    return sessionDetail();
+  };
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "waiting",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 0,
+    updatedAt: null,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  assert.equal(events.find(([name]) => name === "enqueue")[1].sessionId, "s1");
+});
+
+test("startup recovery does not duplicate a ready session with durable analysis work", async () => {
+  const { scheduler, events } = harness();
+  scheduler.repository.listSessions = () => [
+    {
+      id: "s1",
+      status: "completed",
+      processing_state: "ready",
+    },
+  ];
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "queued",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 0,
+    updatedAt: 9,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 0);
+  assert.equal(events.length, 0);
 });

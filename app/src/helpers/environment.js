@@ -5,6 +5,10 @@ const { app } = require("electron");
 const debugLogger = require("./debugLogger");
 const { normalizeUiLanguage } = require("./i18nMain");
 const secretCrypto = require("./secretCrypto");
+const {
+  RESOURCE_GOVERNANCE_PRESETS,
+  normalizeResourceGovernanceSettings,
+} = require("../jarvis/shared/contracts");
 
 const SECRET_KEYS = [
   "MINIMAX_API_KEY",
@@ -35,6 +39,7 @@ const PERSISTED_KEYS = [
   "LOCAL_TRANSCRIPTION_PROVIDER",
   "PARAKEET_MODEL",
   "LOCAL_WHISPER_MODEL",
+  "JARVIS_WHISPER_MODEL",
   "CLEANUP_PROVIDER",
   "LOCAL_CLEANUP_MODEL",
   "DICTATION_AGENT_PROVIDER",
@@ -55,6 +60,11 @@ const PERSISTED_KEYS = [
   "TRANSCRIPTION_GPU_UUID",
   "INTELLIGENCE_GPU_UUID",
   "JARVIS_RECORDINGS_DIR",
+  "JARVIS_RESOURCE_PROFILE",
+  "JARVIS_EXTERNAL_GPU_THRESHOLD_PCT",
+  "JARVIS_RESOURCE_RECOVERY_WAIT_MS",
+  "JARVIS_APPLICATION_AUDIO_ENABLED",
+  "JARVIS_APPLICATION_AUDIO_TRACK_LIMIT",
   "BEDROCK_REGION",
   "BEDROCK_PROFILE",
   "AZURE_OPENAI_ENDPOINT",
@@ -605,6 +615,60 @@ class EnvironmentManager {
     const result = this._saveKey("PANEL_START_POSITION", position);
     this.saveAllKeysToEnvFile().catch(() => {});
     return result;
+  }
+
+  getJarvisResourceSettings() {
+    const profile = this._getKey("JARVIS_RESOURCE_PROFILE");
+    const preset =
+      RESOURCE_GOVERNANCE_PRESETS[profile] ?? RESOURCE_GOVERNANCE_PRESETS.balanced;
+    const threshold = Number.parseInt(this._getKey("JARVIS_EXTERNAL_GPU_THRESHOLD_PCT"), 10);
+    const recoveryWaitMs = Number.parseInt(this._getKey("JARVIS_RESOURCE_RECOVERY_WAIT_MS"), 10);
+    try {
+      return normalizeResourceGovernanceSettings({
+        profile: preset.profile,
+        externalGpuThresholdPct: Number.isSafeInteger(threshold)
+          ? threshold
+          : preset.externalGpuThresholdPct,
+        recoveryWaitMs: Number.isSafeInteger(recoveryWaitMs)
+          ? recoveryWaitMs
+          : preset.recoveryWaitMs,
+      });
+    } catch {
+      return { ...preset };
+    }
+  }
+
+  async saveJarvisResourceSettings(input) {
+    const normalized = normalizeResourceGovernanceSettings(input);
+    this._saveKey("JARVIS_RESOURCE_PROFILE", normalized.profile);
+    this._saveKey(
+      "JARVIS_EXTERNAL_GPU_THRESHOLD_PCT",
+      String(normalized.externalGpuThresholdPct)
+    );
+    this._saveKey("JARVIS_RESOURCE_RECOVERY_WAIT_MS", String(normalized.recoveryWaitMs));
+    await this.saveAllKeysToEnvFile();
+    return normalized;
+  }
+
+  getApplicationAudioSettings() {
+    const rawLimit = Number.parseInt(this._getKey("JARVIS_APPLICATION_AUDIO_TRACK_LIMIT"), 10);
+    return {
+      enabled: this._getKey("JARVIS_APPLICATION_AUDIO_ENABLED") !== "false",
+      trackLimit: Number.isSafeInteger(rawLimit) ? Math.max(1, Math.min(8, rawLimit)) : 4,
+    };
+  }
+
+  async saveApplicationAudioSettings({ enabled = true, trackLimit = 4 } = {}) {
+    const normalized = {
+      enabled: enabled !== false,
+      trackLimit: Number.isFinite(trackLimit)
+        ? Math.max(1, Math.min(8, Math.round(trackLimit)))
+        : 4,
+    };
+    this._saveKey("JARVIS_APPLICATION_AUDIO_ENABLED", String(normalized.enabled));
+    this._saveKey("JARVIS_APPLICATION_AUDIO_TRACK_LIMIT", String(normalized.trackLimit));
+    await this.saveAllKeysToEnvFile();
+    return normalized;
   }
 
   getUiLanguage() {

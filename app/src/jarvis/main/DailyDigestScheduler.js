@@ -27,6 +27,34 @@ function exactLocalDateInput(value, name) {
   return value;
 }
 
+function exactRegenerateInput(value, name) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new TypeError(`${name} must be a plain object`);
+  }
+  const keys = Object.keys(value);
+  if (
+    !Object.prototype.hasOwnProperty.call(value, "localDate") ||
+    keys.some((key) => key !== "localDate" && key !== "allowUsageUnknown")
+  ) {
+    throw new TypeError(`${name} must contain only localDate and allowUsageUnknown`);
+  }
+  const allowUsageUnknown = Object.prototype.hasOwnProperty.call(value, "allowUsageUnknown")
+    ? value.allowUsageUnknown
+    : false;
+  if (typeof allowUsageUnknown !== "boolean") {
+    throw new TypeError("allowUsageUnknown must be a boolean");
+  }
+  return {
+    ...exactLocalDateInput({ localDate: value.localDate }, name),
+    allowUsageUnknown,
+  };
+}
+
 function timestamp(value, name = "scheduler clock") {
   if (!Number.isSafeInteger(value) || !Number.isFinite(new Date(value).getTime())) {
     throw new TypeError(`${name} must be a supported safe integer`);
@@ -195,7 +223,7 @@ class DailyDigestScheduler {
   }
 
   regenerate(input) {
-    const request = exactLocalDateInput(input, "daily digest regenerate input");
+    const request = exactRegenerateInput(input, "daily digest regenerate input");
     resolveLocalDate({ localDate: request.localDate, timezone: this._timezone() });
     if (!this.active) {
       const error = new Error("daily digest runtime is unavailable");

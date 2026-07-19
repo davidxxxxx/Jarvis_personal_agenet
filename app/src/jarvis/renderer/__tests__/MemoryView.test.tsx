@@ -36,6 +36,7 @@ const timeline: JarvisSessionTimeline = {
   finalized_at: 2_000,
   ready_at: null,
   tracks: [],
+  application_audio_intervals: [],
   gaps: [],
   chunks: [],
   segments: [],
@@ -338,6 +339,179 @@ describe("MemoryView processing timeline", () => {
     act(() => poll?.());
 
     expect(await screen.findByRole("button", { name: "生成总结" })).toBeInTheDocument();
+  });
+
+  it("does not offer summary generation until final transcription and speaker processing are ready", async () => {
+    const getSessionTimeline = vi.fn(async () => ({
+      ...timeline,
+      segments: [visibleSegment],
+    }));
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => ({
+            ...detailFor(session),
+            segments: [visibleSegment],
+          })),
+          getSessionTimeline,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect(await screen.findByText("处理完成后自动生成总结")).toBeInTheDocument();
+    expect(screen.getByText(/录音已完成 · 后台处理中/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "生成总结" })).not.toBeInTheDocument();
+    expect(window.electronAPI.jarvis.analyzeSession).not.toHaveBeenCalled();
+  });
+
+  it("reports incomplete speaker processing instead of blaming MiniMax", async () => {
+    const incompleteError = new Error(
+      "Error invoking remote method 'jarvis:analysis:run': Error: MEMORY_OWNER_OUT_OF_SCOPE"
+    );
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => ({
+            ...detailFor(session),
+            segments: [visibleSegment],
+          })),
+          getSessionTimeline: vi.fn(async () => ({
+            ...timeline,
+            processing_state: "ready",
+            ready_at: 3_000,
+            segments: [visibleSegment],
+          })),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(async () => {
+            throw incompleteError;
+          }),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成总结" }));
+
+    expect(
+      await screen.findByText("最终转写和说话人识别尚未完成，完成后会自动生成总结。")
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/请检查 MiniMax 设置/)).not.toBeInTheDocument();
+  });
+
+  it("waits for queued cloud analysis and renders the completed summary in the current view", async () => {
+    const completedDetail = {
+      ...detailFor(session),
+      segments: [visibleSegment],
+      summary: {
+        id: "summary-1",
+        session_id: session.id,
+        title: "完成的总结",
+        summary: "这是后台完成后自动刷新的完整总结。",
+        decisions_json: "[]",
+        suggestions_json: "[]",
+        created_at: 4_000,
+      },
+    };
+    const getSessionDetail = vi
+      .fn()
+      .mockResolvedValueOnce({ ...detailFor(session), segments: [visibleSegment] })
+      .mockResolvedValueOnce(completedDetail);
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail,
+          getSessionTimeline: vi.fn(async () => ({
+            ...timeline,
+            processing_state: "ready",
+            ready_at: 3_000,
+            segments: [visibleSegment],
+          })),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(async () => ({
+            sessionId: session.id,
+            state: "queued",
+            errorCode: null,
+            updatedAt: 3_000,
+          })),
+          getAnalysisStatus: vi.fn(async () => ({
+            sessionId: session.id,
+            state: "ready",
+            errorCode: null,
+            updatedAt: 4_000,
+          })),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成总结" }));
+
+    expect(await screen.findByText("这是后台完成后自动刷新的完整总结。")).toBeInTheDocument();
+    expect(getSessionDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes a summary that finishes after the ready session detail first opens", async () => {
+    const completedDetail = {
+      ...detailFor(session),
+      segments: [visibleSegment],
+      summary: {
+        session_id: session.id,
+        summary: "后台恢复完成后，当前详情页自动显示这份总结。",
+        decisions_json: "[]",
+        suggestions_json: "[]",
+        updated_at: 4_000,
+        is_final: 1,
+      },
+    };
+    const getSessionDetail = vi
+      .fn()
+      .mockResolvedValueOnce({ ...detailFor(session), segments: [visibleSegment] })
+      .mockResolvedValueOnce(completedDetail);
+    const getAnalysisStatus = vi.fn(async () => ({
+      sessionId: session.id,
+      state: "ready" as const,
+      errorCode: null,
+      updatedAt: 4_000,
+    }));
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail,
+          getSessionTimeline: vi.fn(async () => ({
+            ...timeline,
+            processing_state: "ready",
+            ready_at: 3_000,
+            segments: [visibleSegment],
+          })),
+          getAnalysisStatus,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect(await screen.findByText("尚未生成总结。录音和转写已安全保存。")).toBeInTheDocument();
+    expect(
+      await screen.findByText("后台恢复完成后，当前详情页自动显示这份总结。", undefined, {
+        timeout: 3_000,
+      })
+    ).toBeInTheDocument();
+    expect(getAnalysisStatus).toHaveBeenCalledWith(session.id);
+    expect(getSessionDetail).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the latest session when an earlier detail request resolves last", async () => {

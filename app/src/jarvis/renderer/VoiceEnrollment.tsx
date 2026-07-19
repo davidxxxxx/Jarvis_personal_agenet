@@ -83,6 +83,7 @@ export default function VoiceEnrollment() {
   const timerRef = useRef<number | null>(null);
   const deadlineRef = useRef(0);
   const capturedSampleCountRef = useRef(0);
+  const microphoneSourceRef = useRef<JarvisVoiceEnrollmentPayload["source"] | null>(null);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
@@ -102,6 +103,7 @@ export default function VoiceEnrollment() {
     for (const chunk of chunksRef.current) chunk.fill(0);
     chunksRef.current = [];
     capturedSampleCountRef.current = 0;
+    microphoneSourceRef.current = null;
   }, []);
 
   const cancelPendingSession = useCallback(async () => {
@@ -222,6 +224,20 @@ export default function VoiceEnrollment() {
         },
       });
       streamRef.current = stream;
+      const microphoneTrack = stream.getAudioTracks()[0];
+      const microphoneSettings = microphoneTrack?.getSettings?.();
+      const microphoneLabel = microphoneTrack?.label?.trim() ?? "";
+      const microphoneDeviceId =
+        microphoneSettings?.deviceId?.trim() ||
+        (selectedId && selectedId !== "default" ? selectedId : "");
+      if (!microphoneTrack || !microphoneLabel || !microphoneDeviceId) {
+        throw new Error("physical microphone identity is unavailable");
+      }
+      microphoneSourceRef.current = {
+        kind: "microphone",
+        deviceId: microphoneDeviceId,
+        label: microphoneLabel,
+      };
       if (!mountedRef.current) throw new Error("enrollment view closed");
 
       const context = new AudioContext({ sampleRate: session.sampleRate });
@@ -303,11 +319,18 @@ export default function VoiceEnrollment() {
       offset += chunk.length;
     }
     const windowSamples = session.sampleRate * WINDOW_SECONDS;
+    const microphoneSource = microphoneSourceRef.current;
+    if (!microphoneSource) {
+      setState("error");
+      operationRef.current = false;
+      return;
+    }
     const payload: JarvisVoiceEnrollmentPayload = {
       sampleRate: session.sampleRate,
       channels: session.channels,
       format: session.format,
       recordedSampleCount: samples.length,
+      source: microphoneSource,
       windows: [0, 1, 2].map((index) => {
         const startSample = index * windowSamples;
         const endSample = startSample + windowSamples;

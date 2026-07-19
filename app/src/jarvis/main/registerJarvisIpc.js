@@ -7,6 +7,7 @@ const {
   assertRetentionMode,
   normalizeSpeakerConfirmationInput,
   normalizeDailyDigestDateRequest,
+  normalizeDailyDigestRegenerateRequest,
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
@@ -14,6 +15,8 @@ const {
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
   normalizeMiniMaxConfig,
+  normalizeResourceGovernanceSettings,
+  normalizeApplicationAudioSettings,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,
@@ -72,6 +75,40 @@ function assertExactKeys(input, expected, name) {
   if (JSON.stringify(actual) !== JSON.stringify(required)) {
     throw new TypeError(`${name} has an invalid structure`);
   }
+}
+
+function toPublicActivityClassification(entry) {
+  const applications = (
+    Array.isArray(entry?.evidence?.applicationKeys) ? entry.evidence.applicationKeys : []
+  )
+    .filter(
+      (value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,79}$/.test(value)
+    )
+    .slice(0, 8);
+  const evidenceSegmentIds = (
+    Array.isArray(entry?.evidence?.evidenceSegmentIds) ? entry.evidence.evidenceSegmentIds : []
+  )
+    .slice(0, 100)
+    .map((value) => assertId(value, "evidenceSegmentId"));
+  return {
+    id: assertId(entry?.id, "activityClassificationId"),
+    sessionId: assertId(entry?.sessionId, "sessionId"),
+    startedAt: entry.startedAt,
+    endedAt: entry.endedAt,
+    category: entry.category,
+    confidence: entry.confidence,
+    decision: entry.decision,
+    source: entry.source,
+    reason: entry.reason,
+    sourceAttribution: entry.sourceAttribution,
+    applications,
+    allowSummary: entry?.evidence?.allowSummary === true,
+    allowSuggestions: entry?.evidence?.allowSuggestions === true,
+    allowTodos: entry?.evidence?.allowTodos === true,
+    evidenceSegmentIds,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
 }
 
 function toPublicAmbiguousSpeakerFailure(error) {
@@ -422,6 +459,85 @@ function publicBoundaryError(code, message) {
   return error;
 }
 
+function toPublicResourceGovernanceSettings(input) {
+  return normalizeResourceGovernanceSettings({
+    profile: input?.profile,
+    externalGpuThresholdPct: input?.externalGpuThresholdPct,
+    recoveryWaitMs: input?.recoveryWaitMs,
+  });
+}
+
+function assertApplicationKey(value) {
+  if (typeof value !== "string" || !/^[a-z0-9._-]{1,64}$/.test(value)) {
+    throw new TypeError("application audio key is invalid");
+  }
+  return value;
+}
+
+function assertApplicationDisplayName(value) {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    Array.from(value.trim()).length > 80 ||
+    /[\\/:]/u.test(value)
+  ) {
+    throw new TypeError("application audio display name is invalid");
+  }
+  return value.trim();
+}
+
+function toPublicApplicationAudioStatus(input) {
+  const settings = normalizeApplicationAudioSettings({
+    enabled: input?.enabled,
+    trackLimit: input?.trackLimit,
+  });
+  const runtime = input?.runtime;
+  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
+    throw new TypeError("application audio runtime status is required");
+  }
+  const activeTracks = Array.isArray(runtime.activeTracks) ? runtime.activeTracks : [];
+  const fallbacks = Array.isArray(runtime.fallbacks) ? runtime.fallbacks : [];
+  const boundedInteger = (value, name, minimum, maximum) => {
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+      throw new RangeError(`${name} is invalid`);
+    }
+    return value;
+  };
+  return {
+    ...settings,
+    runtime: {
+      running: runtime.running === true,
+      configuredLimit: boundedInteger(runtime.configuredLimit, "configuredLimit", 1, 8),
+      effectiveLimit: boundedInteger(runtime.effectiveLimit, "effectiveLimit", 1, 8),
+      fullscreen: runtime.fullscreen === true,
+      activeTracks: activeTracks.slice(0, 8).map((track) => ({
+        applicationKey: assertApplicationKey(track?.applicationKey),
+        applicationDisplayName: assertApplicationDisplayName(track?.applicationDisplayName),
+        captureGeneration: boundedInteger(
+          track?.captureGeneration,
+          "captureGeneration",
+          1,
+          Number.MAX_SAFE_INTEGER
+        ),
+        state: "recording",
+      })),
+      fallbacks: fallbacks.slice(0, 256).map((fallback) => ({
+        applicationKey: assertApplicationKey(fallback?.applicationKey),
+        applicationDisplayName: assertApplicationDisplayName(fallback?.applicationDisplayName),
+        reason:
+          typeof fallback?.reason === "string" && /^[a-z0-9_-]{1,64}$/i.test(fallback.reason)
+            ? fallback.reason
+            : "application_capture_unavailable",
+        retryAt:
+          Number.isSafeInteger(fallback?.retryAt) && fallback.retryAt >= 0
+            ? fallback.retryAt
+            : null,
+        state: "mixed_unknown",
+      })),
+    },
+  };
+}
+
 function safePublicCall(operation, normalize, code, message) {
   try {
     return normalize(operation());
@@ -447,6 +563,8 @@ function registerJarvisIpc({
   environmentManager,
   analysisScheduler,
   analysisBudgetGuard = null,
+  resourceSettings = null,
+  applicationAudioSettings = null,
   dailyDigestScheduler = null,
   audioEvidenceReader,
   storageManager,
@@ -501,6 +619,20 @@ function registerJarvisIpc({
   ) {
     throw new TypeError("analysisBudgetGuard public methods are required");
   }
+  if (
+    resourceSettings !== null &&
+    (typeof resourceSettings.getStatus !== "function" ||
+      typeof resourceSettings.setPolicy !== "function")
+  ) {
+    throw new TypeError("resourceSettings public methods are required");
+  }
+  if (
+    applicationAudioSettings !== null &&
+    (typeof applicationAudioSettings.getStatus !== "function" ||
+      typeof applicationAudioSettings.setPolicy !== "function")
+  ) {
+    throw new TypeError("applicationAudioSettings public methods are required");
+  }
 
   const cloudBudgetStatus = () => ({
     ...repository.getCloudBudgetStatus(),
@@ -544,6 +676,17 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.listSegments, (_event, sessionId) =>
     repository.listTranscriptSegments(assertId(sessionId, "sessionId"))
   );
+  ipcMain.handle(CHANNELS.listActivityClassifications, (_event, ...args) => {
+    if (args.length !== 1) {
+      throw new TypeError("activity classification request requires one sessionId");
+    }
+    if (typeof repository.listSessionActivityClassifications !== "function") {
+      throw new Error("Activity classification is unavailable");
+    }
+    return repository
+      .listSessionActivityClassifications(assertId(args[0], "sessionId"))
+      .map(toPublicActivityClassification);
+  });
   ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
   ipcMain.handle(CHANNELS.listSessionSpeakerClusters, (_event, sessionId) =>
@@ -794,7 +937,7 @@ function registerJarvisIpc({
     });
     ipcMain.handle(CHANNELS.regenerateDailyDigest, async (_event, ...args) => {
       if (args.length !== 1) throw new TypeError("daily digest request requires one argument");
-      const input = normalizeDailyDigestDateRequest(args[0]);
+      const input = normalizeDailyDigestRegenerateRequest(args[0]);
       await Promise.resolve(dailyDigestScheduler.regenerate(input));
       return toPublicDailyDigestStatus(
         await Promise.resolve(dailyDigestScheduler.getPublicStatus(input))
@@ -811,8 +954,14 @@ function registerJarvisIpc({
       if (kind !== "incremental" && kind !== "final") {
         throw new TypeError("invalid analysis kind");
       }
+      const allowUsageUnknown =
+        kind === "final" && analysisBudgetGuard?.getStatus?.({})?.mode === "unlimited";
       return safePublicCallAsync(
-        () => analysisScheduler.analyzeSession(sessionId, kind),
+        () =>
+          analysisScheduler.analyzeSession(sessionId, kind, {
+            manual: true,
+            allowUsageUnknown,
+          }),
         normalizeAnalysisStatus,
         "ANALYSIS_STATUS_UNAVAILABLE",
         "Analysis status is unavailable"
@@ -847,6 +996,49 @@ function registerJarvisIpc({
         normalizeAnalysisBudgetStatus,
         "ANALYSIS_BUDGET_UNAVAILABLE",
         "Analysis budget is unavailable"
+      );
+    });
+  }
+  if (resourceSettings) {
+    ipcMain.handle(CHANNELS.getResourceGovernance, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("resource governance status takes no arguments");
+      return safePublicCall(
+        () => resourceSettings.getStatus(),
+        toPublicResourceGovernanceSettings,
+        "RESOURCE_GOVERNANCE_UNAVAILABLE",
+        "Resource governance settings are unavailable"
+      );
+    });
+    ipcMain.handle(CHANNELS.setResourceGovernance, (_event, ...args) => {
+      if (args.length !== 1)
+        throw new TypeError("resource governance update requires one argument");
+      const input = normalizeResourceGovernanceSettings(args[0]);
+      return safePublicCallAsync(
+        () => resourceSettings.setPolicy(input),
+        toPublicResourceGovernanceSettings,
+        "RESOURCE_GOVERNANCE_UNAVAILABLE",
+        "Resource governance settings are unavailable"
+      );
+    });
+  }
+  if (applicationAudioSettings) {
+    ipcMain.handle(CHANNELS.getApplicationAudioSettings, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("application audio status takes no arguments");
+      return safePublicCall(
+        () => applicationAudioSettings.getStatus(),
+        toPublicApplicationAudioStatus,
+        "APPLICATION_AUDIO_SETTINGS_UNAVAILABLE",
+        "Application audio settings are unavailable"
+      );
+    });
+    ipcMain.handle(CHANNELS.setApplicationAudioSettings, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("application audio update requires one argument");
+      const input = normalizeApplicationAudioSettings(args[0]);
+      return safePublicCallAsync(
+        () => applicationAudioSettings.setPolicy(input),
+        toPublicApplicationAudioStatus,
+        "APPLICATION_AUDIO_SETTINGS_UNAVAILABLE",
+        "Application audio settings are unavailable"
       );
     });
   }

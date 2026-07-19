@@ -84,6 +84,14 @@ function requireInteger(value, issueCode) {
   return value;
 }
 
+function requireNullableInterval(startedAt, endedAt, issueCode) {
+  if (startedAt === null && endedAt === null) return;
+  if (startedAt === null || endedAt === null) validationFail(issueCode);
+  requireInteger(startedAt, issueCode);
+  requireInteger(endedAt, issueCode);
+  if (endedAt < startedAt) validationFail(issueCode);
+}
+
 function requireArray(value, issueCode) {
   if (!Array.isArray(value)) validationFail(issueCode);
   return value;
@@ -659,9 +667,7 @@ function validateExisting(existing) {
       requireId(item.id, "malformed_existing");
       if (memoryOccurrenceIds.has(item.id)) validationFail("malformed_existing");
       memoryOccurrenceIds.add(item.id);
-      requireInteger(item.startedAt, "malformed_existing");
-      requireInteger(item.endedAt, "malformed_existing");
-      if (item.endedAt < item.startedAt) validationFail("malformed_existing");
+      requireNullableInterval(item.startedAt, item.endedAt, "malformed_existing");
       validateIdSet(item.evidenceSegmentIds, {
         issueCode: "malformed_existing",
         allowEmpty: true,
@@ -839,9 +845,7 @@ function validateExisting(existing) {
       if (todoOccurrenceById.has(item.id) || !revisionIds.has(item.revisionId)) {
         validationFail("malformed_existing");
       }
-      requireInteger(item.startedAt, "malformed_existing");
-      requireInteger(item.endedAt, "malformed_existing");
-      if (item.endedAt < item.startedAt) validationFail("malformed_existing");
+      requireNullableInterval(item.startedAt, item.endedAt, "malformed_existing");
       validateIdSet(item.evidenceSegmentIds, {
         issueCode: "malformed_existing",
         allowEmpty: true,
@@ -951,6 +955,7 @@ function validateExisting(existing) {
       (row.sourceOccurrenceId !== null &&
         (!sourceOccurrence ||
           sourceOccurrence.todoId !== row.nextTodoId ||
+          sourceOccurrence.startedAt === null ||
           sourceOccurrence.startedAt <= previousTodo.completedAt))
     ) {
       validationFail("malformed_existing");
@@ -1437,6 +1442,11 @@ function planMemories({
       if (memory.kind === "event") {
         const candidateBounds = evidenceBoundsFor(memory.evidenceSegmentIds, segmentById);
         const reusableEvent = exactMemory.occurrences
+          .filter(
+            (occurrence) =>
+              Number.isSafeInteger(occurrence.startedAt) &&
+              Number.isSafeInteger(occurrence.endedAt)
+          )
           .map((occurrence) => {
             const gap = Math.max(
               0,

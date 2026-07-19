@@ -138,6 +138,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       }) => void)
     | null;
   let segmentListenerDetached: boolean;
+  let transcriptionErrorListener: ((error: string) => void) | null;
   let inputRejectedListener:
     | ((payload: {
         source: "mic" | "system";
@@ -171,6 +172,7 @@ describe("Jarvis shutdown final meeting segment integration", () => {
     track = new FakeTrack();
     segmentListener = null;
     segmentListenerDetached = false;
+    transcriptionErrorListener = null;
     inputRejectedListener = null;
     inputRejectedListeners = [];
     sourceStateListener = null;
@@ -226,7 +228,12 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       }),
       onMeetingSpeakerIdentified: vi.fn(() => () => {}),
       onMeetingSpeakersMerged: vi.fn(() => () => {}),
-      onMeetingTranscriptionError: vi.fn(() => () => {}),
+      onMeetingTranscriptionError: vi.fn((callback) => {
+        transcriptionErrorListener = callback;
+        return () => {
+          transcriptionErrorListener = null;
+        };
+      }),
       onMeetingTranscriptionInputRejected: vi.fn((callback) => {
         inputRejectedListener = callback;
         inputRejectedListeners.push(callback);
@@ -257,6 +264,44 @@ describe("Jarvis shutdown final meeting segment integration", () => {
       segments: [],
       transcript: "",
       error: null,
+      transcriptionWarning: null,
+    });
+  });
+
+  it("keeps audio capture active for a transcription outage and clears the warning after stop", async () => {
+    await startRecording({
+      noteId: null,
+      noteTitle: "Jarvis",
+      folderId: null,
+      captureSystemAudio: false,
+      captureMicrophone: true,
+      micOnly: true,
+      requireAllSources: true,
+      jarvisSessionId: "s-transcription-warning",
+    });
+
+    transcriptionErrorListener?.("Whisper is paused for fullscreen yield");
+
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: true,
+      error: null,
+      transcriptionWarning: "Whisper is paused for fullscreen yield",
+      captureSourceStates: { mic: "recording", system: "idle" },
+    });
+
+    segmentListener?.({
+      text: "transcription resumed",
+      source: "mic",
+      type: "partial",
+    });
+    expect(useMeetingRecordingStore.getState().transcriptionWarning).toBeNull();
+
+    transcriptionErrorListener?.("Whisper paused again");
+    await expect(stopRecording()).resolves.toMatchObject({ success: true });
+    expect(useMeetingRecordingStore.getState()).toMatchObject({
+      isRecording: false,
+      error: null,
+      transcriptionWarning: null,
     });
   });
 

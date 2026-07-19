@@ -59,6 +59,8 @@ class AnalysisScheduler {
     memoryRepository = repository?.memoryRepository,
     inputBuilder,
     desiredIdentityProvider,
+    activityClassificationService = null,
+    activityBuilder = null,
     cloudQueue = repository?.captureEvidenceStore,
     cloudTransportEnabled = false,
     now = Date.now,
@@ -86,14 +88,33 @@ class AnalysisScheduler {
       if (!isCallable(cloudQueue, "enqueueCloudJob")) {
         throw new TypeError("durable analysis cloud queue is required");
       }
+      if (!isCallable(cloudQueue, "authorizeManualAnalysisRetry")) {
+        throw new TypeError("manual analysis retry queue is required");
+      }
       if (typeof desiredIdentityProvider !== "function") {
         throw new TypeError("desiredIdentityProvider must be a function");
       }
+    }
+    if ((activityClassificationService === null) !== (activityBuilder === null)) {
+      throw new TypeError(
+        "activityClassificationService and activityBuilder must be configured together"
+      );
+    }
+    if (
+      activityClassificationService !== null &&
+      typeof activityClassificationService.classifySession !== "function"
+    ) {
+      throw new TypeError("activityClassificationService.classifySession is required");
+    }
+    if (activityBuilder !== null && typeof activityBuilder.build !== "function") {
+      throw new TypeError("activityBuilder.build is required");
     }
     this.repository = repository;
     this.memoryRepository = memoryRepository;
     this.inputBuilder = inputBuilder;
     this.desiredIdentityProvider = desiredIdentityProvider;
+    this.activityClassificationService = activityClassificationService;
+    this.activityBuilder = activityBuilder;
     this.cloudQueue = cloudQueue;
     this.cloudTransportEnabled = cloudTransportEnabled;
     this.now = now;
@@ -132,9 +153,54 @@ class AnalysisScheduler {
     };
   }
 
-  analyzeSession(sessionId, kind = "incremental") {
+  async recoverReadySessions({ limit = 1 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError("analysis recovery limit must be between 1 and 100");
+    }
+    if (
+      this.quiesced ||
+      !this.cloudTransportEnabled ||
+      !isCallable(this.repository, "listSessions")
+    ) {
+      return 0;
+    }
+
+    const sessions = this.repository.listSessions({ limit: 1_000 });
+    let attempted = 0;
+    let scheduled = 0;
+    for (const session of sessions) {
+      if (attempted >= limit) break;
+      if (
+        !session?.id ||
+        !new Set(["completed", "recovered"]).has(session.status) ||
+        session.processing_state !== "ready"
+      ) {
+        continue;
+      }
+      const detail = this.repository.getSessionDetail(session.id);
+      if (!detail || detail.summary || eligibleSegments(detail).length === 0) continue;
+      if (this.getStatus(session.id).state !== "waiting") continue;
+
+      attempted += 1;
+      const status = await this.analyzeSession(session.id, "final");
+      if (status.state === "queued" || status.state === "ready") scheduled += 1;
+    }
+    return scheduled;
+  }
+
+  analyzeSession(
+    sessionId,
+    kind = "incremental",
+    { manual = false, allowUsageUnknown = false } = {}
+  ) {
     const id = assertId(sessionId, "sessionId");
     if (kind !== "incremental" && kind !== "final") throw new TypeError("invalid analysis kind");
+    if (typeof manual !== "boolean" || typeof allowUsageUnknown !== "boolean") {
+      throw new TypeError("analysis retry options are invalid");
+    }
+    if (allowUsageUnknown && !manual) {
+      throw new TypeError("usage-unknown retry requires a manual request");
+    }
     if (this.quiesced) {
       const error = new Error("storage migration in progress");
       error.code = "STORAGE_MIGRATION_IN_PROGRESS";
@@ -152,7 +218,7 @@ class AnalysisScheduler {
     }
     if (plan.status) return Promise.resolve(plan.status);
     try {
-      return Promise.resolve(this._enqueue(plan));
+      return Promise.resolve(this._enqueue({ ...plan, manual, allowUsageUnknown }));
     } catch (error) {
       this._setFailureStatus(id, error);
       throw error;
@@ -228,7 +294,16 @@ class AnalysisScheduler {
     return { sessionId, kind, persisted, prepared, segments, people };
   }
 
-  _enqueue({ sessionId, kind, persisted, prepared, segments, people }) {
+  _enqueue({
+    sessionId,
+    kind,
+    persisted,
+    prepared,
+    segments,
+    people,
+    manual,
+    allowUsageUnknown,
+  }) {
     const identity = this.desiredIdentityProvider({
       sessionId,
       kind,
@@ -260,7 +335,7 @@ class AnalysisScheduler {
       error.code = "analysis_desired_head_invalid";
       throw error;
     }
-    const job = this.cloudQueue.enqueueCloudJob({
+    let job = this.cloudQueue.enqueueCloudJob({
       sessionId,
       jobType: "analyze_session",
       analysisInputId: persisted.analysisInputId,
@@ -269,11 +344,19 @@ class AnalysisScheduler {
       inputVersion: 1,
       modelVersion: identity.modelVersion,
     });
+    if (manual && job?.state === "blocked") {
+      job =
+        this.cloudQueue.authorizeManualAnalysisRetry(job.id, {
+          allowUsageUnknown,
+          at: this.now(),
+        }) ?? job;
+    }
     if (!job || typeof job.id !== "string" || !job.id) {
       const error = new Error("analysis cloud job unavailable");
       error.code = "analysis_cloud_job_invalid";
       throw error;
     }
+    this._scheduleActivityClassification(sessionId, job.id);
     const reused = persisted.status === "existing";
     const state =
       reused && persisted.candidateState === "applied" && job.state === "completed"
@@ -284,6 +367,44 @@ class AnalysisScheduler {
       desiredVectorHash: head.desiredVectorHash,
       reused,
     });
+  }
+
+  _scheduleActivityClassification(sessionId, jobId) {
+    if (
+      this.activityClassificationService === null ||
+      this.quiesced ||
+      this.inFlight.has(sessionId)
+    ) {
+      return;
+    }
+    if (
+      isCallable(this.repository, "listSessionActivityClassifications") &&
+      this.repository.listSessionActivityClassifications(sessionId).length > 0
+    ) {
+      return;
+    }
+    let prepared;
+    try {
+      prepared = this.activityBuilder.build(sessionId);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(prepared?.activities) || prepared.activities.length === 0) return;
+    const operation = Promise.resolve()
+      .then(() =>
+        this.activityClassificationService.classifySession({
+          sessionId,
+          jobId,
+          activities: prepared.activities,
+          redactionTerms: prepared.redactionTerms,
+          cloudReview: true,
+        })
+      )
+      .catch(() => null)
+      .finally(() => {
+        if (this.inFlight.get(sessionId) === operation) this.inFlight.delete(sessionId);
+      });
+    this.inFlight.set(sessionId, operation);
   }
 }
 

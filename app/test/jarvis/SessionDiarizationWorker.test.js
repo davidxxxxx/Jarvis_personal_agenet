@@ -434,6 +434,7 @@ test("exports one immutable versioned diarization policy for the actual CPU mode
     sampleRate: 16000,
     minimumEmbeddingMs: 1500,
     maximumEmbeddingMs: 8000,
+    turnBoundaryToleranceMs: 100,
     inputVersion: 1,
     clusterSimilarityThreshold: 0.72,
     echoSimilarityThreshold: 0.95,
@@ -564,6 +565,7 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
   const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
   const snapshot = immutableWorkerSnapshot();
   let commits = 0;
+  let lastCommit = null;
   const createWorker = (diarizeAudio, embedWindow) =>
     new SessionDiarizationWorker({
       speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
@@ -571,8 +573,9 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
         getDiarizationEvidenceSnapshot: () => snapshot,
         getDiarizationRun: () => null,
         listDiarizationEchoCandidates: () => [],
-        commitDiarizationRun: () => {
+        commitDiarizationRun: (input) => {
           commits += 1;
+          lastCommit = input;
         },
       },
       audioEvidenceReader: {
@@ -596,6 +599,25 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
     model_version: "jarvis-session-diarization-v1",
   };
 
+  await createWorker(
+    async ({ chunk }) =>
+      chunk.id === "chunk-1" ? [{ start: 2.5, end: 4.077, speaker: "raw" }] : [],
+    async () => unitEmbedding(0)
+  ).run(job);
+  assert.equal(commits, 1);
+  assert.equal(lastCommit.turns[0].endedAt, snapshot.chunks[0].ended_at);
+
+  commits = 0;
+  lastCommit = null;
+  await assert.rejects(
+    createWorker(
+      async ({ chunk }) =>
+        chunk.id === "chunk-1" ? [{ start: 2.5, end: 4.101, speaker: "raw" }] : [],
+      async () => unitEmbedding(0)
+    ).run(job),
+    { code: "DIARIZATION_INVALID_TURN" }
+  );
+
   await assert.rejects(
     createWorker(
       async () => [{ start: -1, end: 2, speaker: "raw" }],
@@ -610,7 +632,7 @@ test("worker rejects invalid turn bounds and non-finite 512D embeddings before c
       async () => [{ start: 0, end: 2, speaker: "raw" }],
       async () => invalid
     ).run(job),
-    { code: "DIARIZATION_INVALID_EMBEDDING" }
+    { code: "DIARIZATION_EMBEDDING_NONFINITE" }
   );
   assert.equal(commits, 0);
 });

@@ -189,6 +189,7 @@ class DailyDigestService {
     for (const method of [
       "enqueueDailyDigestJob",
       "wakeDailyDigestJob",
+      "authorizeManualDailyDigestRetry",
       "completeJob",
       "deferJob",
       "blockJob",
@@ -248,6 +249,37 @@ class DailyDigestService {
   _localDateInput(input, name) {
     exactPlainObject(input, ["localDate"], name);
     return text(input.localDate, "localDate", 10);
+  }
+
+  _regenerateInput(input) {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      Object.getPrototypeOf(input) !== Object.prototype
+    ) {
+      throw new TypeError("daily digest regenerate input must be a plain object");
+    }
+    const keys = Object.keys(input);
+    if (
+      !Object.prototype.hasOwnProperty.call(input, "localDate") ||
+      keys.some((key) => key !== "localDate" && key !== "allowUsageUnknown")
+    ) {
+      throw new TypeError("daily digest regenerate input has invalid keys");
+    }
+    const allowUsageUnknown = Object.prototype.hasOwnProperty.call(
+      input,
+      "allowUsageUnknown"
+    )
+      ? input.allowUsageUnknown
+      : false;
+    if (typeof allowUsageUnknown !== "boolean") {
+      throw new TypeError("allowUsageUnknown must be a boolean");
+    }
+    return {
+      localDate: text(input.localDate, "localDate", 10),
+      allowUsageUnknown,
+    };
   }
 
   _timezone() {
@@ -345,9 +377,23 @@ class DailyDigestService {
   }
 
   regenerate(input) {
-    this._localDateInput(input, "daily digest regenerate input");
-    const prepared = this.prepare(input);
+    const request = this._regenerateInput(input);
+    const prepared = this.prepare({ localDate: request.localDate });
     if (prepared.status === "empty") return prepared;
+    if (prepared.jobState === "blocked") {
+      const authorized = this.store.authorizeManualDailyDigestRetry(prepared.jobId, {
+        allowUsageUnknown: request.allowUsageUnknown,
+        at: timestamp(this.now(), "at"),
+      });
+      if (authorized) {
+        return {
+          ...prepared,
+          status: "woken",
+          jobId: text(authorized.id, "jobId"),
+          jobState: text(authorized.state, "jobState", 64),
+        };
+      }
+    }
     if (!REGENERATE_WAKE_STATES.has(prepared.jobState)) {
       return {
         ...prepared,
@@ -618,7 +664,7 @@ class DailyDigestService {
     }
   }
 
-  _defer(jobId, reason) {
+  _defer(jobId, reason, { preserveManualRetry = false } = {}) {
     const at = this._at();
     if (
       this.store.deferJob(jobId, {
@@ -626,6 +672,7 @@ class DailyDigestService {
         at,
         nextRetryAt: at + 15_000,
         reason,
+        preserveManualRetry,
       }) !== true
     ) {
       throw codedError("JOB_LEASE_LOST");
@@ -709,6 +756,12 @@ class DailyDigestService {
       return { status: "blocked", reason: "usage_unknown", jobId: job.id };
     }
     if (latest.state === "usage_unknown") {
+      if (
+        job.error_code === "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED" &&
+        this.budgetGuard.getStatus?.({})?.mode === "unlimited"
+      ) {
+        return { attemptNumber };
+      }
       this._block(job.id, "daily_digest_usage_unknown");
       return { status: "blocked", reason: "usage_unknown", jobId: job.id };
     }
@@ -718,6 +771,9 @@ class DailyDigestService {
         latest.actualOutputTokens === 0 &&
         latest.actualMicrousd === 0
       ) {
+        return { attemptNumber };
+      }
+      if (job.error_code === "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED") {
         return { attemptNumber };
       }
       this._block(job.id, "daily_digest_reconciled_without_candidate");
@@ -852,6 +908,8 @@ class DailyDigestService {
 
   async execute(claimedJob) {
     const job = this._validateClaimedJob(claimedJob);
+    const preserveManualRetry =
+      job.error_code === "DAILY_DIGEST_MANUAL_RETRY_AUTHORIZED";
     const initial = this._loadDurableState(job);
     const recoverable = this._matchingCandidate(job, initial.input, initial.candidates);
     if (recoverable) {
@@ -869,11 +927,15 @@ class DailyDigestService {
     }
     const initialDecision = this._decision(job, initial.input);
     if (!initialDecision.eligible) {
-      this._defer(job.id, "daily_digest_deferred_for_local_work");
+      this._defer(job.id, "daily_digest_deferred_for_local_work", {
+        preserveManualRetry,
+      });
       return { status: "deferred", reason: initialDecision.reason, jobId: job.id };
     }
     if (typeof this.client.isConfigured === "function" && !this.client.isConfigured()) {
-      this._defer(job.id, "daily_digest_configuration_required");
+      this._defer(job.id, "daily_digest_configuration_required", {
+        preserveManualRetry,
+      });
       return { status: "deferred", reason: "configuration_required", jobId: job.id };
     }
 
@@ -896,7 +958,9 @@ class DailyDigestService {
         error.cause = cause;
         throw error;
       }
-      this._defer(job.id, "daily_digest_budget_denied");
+      this._defer(job.id, "daily_digest_budget_denied", {
+        preserveManualRetry,
+      });
       return { status: "deferred", reason: reservation.reason, jobId: job.id };
     }
     try {
@@ -943,7 +1007,9 @@ class DailyDigestService {
         this.budgetGuard.release({ requestId, reasonCode: "admission_revoked" }),
         { requestId, state: "released" }
       );
-      this._defer(job.id, "daily_digest_deferred_for_local_work");
+      this._defer(job.id, "daily_digest_deferred_for_local_work", {
+        preserveManualRetry,
+      });
       return { status: "deferred", reason: finalDecision.reason, jobId: job.id };
     }
 

@@ -16,7 +16,12 @@ let mode = null;
 let masterKey = null;
 
 function _backupPath() {
-  return path.join(app.getPath("userData"), "secure-keys", BACKUP_FILE);
+  const dataRoot = process.env.JARVIS_DATA_ROOT;
+  const root =
+    typeof dataRoot === "string" && path.isAbsolute(dataRoot)
+      ? dataRoot
+      : app.getPath("userData");
+  return path.join(root, "secure-keys", BACKUP_FILE);
 }
 
 function _saveMasterKeyBackup() {

@@ -43,6 +43,8 @@ class WindowManager {
     this.winPushState = null;
     this._cachedActivationMode = "tap";
     this._floatingIconAutoHide = false;
+    this._fullscreenYieldActive = false;
+    this._restoreMainWindowAfterFullscreenYield = false;
     this._agentAnimationState = null;
     this._panelStartPosition = "bottom-right";
     this._isDictatingToggle = false;
@@ -1054,6 +1056,10 @@ class WindowManager {
 
   showDictationPanel(options = {}) {
     const { focus = false } = options;
+    if (this._fullscreenYieldActive) {
+      if (!this._floatingIconAutoHide) this._restoreMainWindowAfterFullscreenYield = true;
+      return;
+    }
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this._repositionToCursorDisplay();
 
@@ -1091,6 +1097,22 @@ class WindowManager {
     }
   }
 
+  setFullscreenYieldActive(active) {
+    const next = active === true;
+    if (next === this._fullscreenYieldActive) return;
+    this._fullscreenYieldActive = next;
+    if (next) {
+      this._restoreMainWindowAfterFullscreenYield =
+        this.isDictationPanelVisible() ||
+        (!this.mainWindow && !this._floatingIconAutoHide);
+      this.hideDictationPanel();
+      return;
+    }
+    const shouldRestore = this._restoreMainWindowAfterFullscreenYield;
+    this._restoreMainWindowAfterFullscreenYield = false;
+    if (shouldRestore && !this._floatingIconAutoHide) this.showDictationPanel();
+  }
+
   isDictationPanelVisible() {
     if (!this.mainWindow || this.mainWindow.isDestroyed()) {
       return false;
@@ -1114,7 +1136,8 @@ class WindowManager {
         this.mainWindow &&
         !this.mainWindow.isDestroyed() &&
         !this.mainWindow.isVisible() &&
-        !this._floatingIconAutoHide
+        !this._floatingIconAutoHide &&
+        !this._fullscreenYieldActive
       ) {
         this.showDictationPanel();
       }
@@ -1123,7 +1146,11 @@ class WindowManager {
     this.mainWindow.once("ready-to-show", () => {
       clearTimeout(showTimeout);
       this.enforceMainWindowOnTop();
-      if (!this.mainWindow.isVisible() && !this._floatingIconAutoHide) {
+      if (
+        !this.mainWindow.isVisible() &&
+        !this._floatingIconAutoHide &&
+        !this._fullscreenYieldActive
+      ) {
         if (typeof this.mainWindow.showInactive === "function") {
           this.mainWindow.showInactive();
         } else {
@@ -1133,6 +1160,13 @@ class WindowManager {
     });
 
     this.mainWindow.on("show", () => {
+      if (this._fullscreenYieldActive) {
+        if (!this._floatingIconAutoHide) {
+          this._restoreMainWindowAfterFullscreenYield = true;
+        }
+        this.mainWindow.hide();
+        return;
+      }
       this.enforceMainWindowOnTop();
     });
 

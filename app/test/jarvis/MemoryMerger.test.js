@@ -712,6 +712,57 @@ test("events reuse occurrences on overlap and an inclusive 30-minute gap only", 
   assert.deepEqual(late.occurrenceLinks[0].evidenceSegmentIds, ["event-gap-late"]);
 });
 
+test("legacy event occurrences may have unknown bounds but are never reused for time dedupe", () => {
+  const mergerModule = loadMemoryMerger();
+  const canonicalSlotKey = mergerModule.canonicalTupleHash(["memory", "event", "launch", []]);
+  const canonicalValueKey = mergerModule.canonicalTupleHash([
+    "memory_value",
+    canonicalSlotKey,
+    "api v2 launched.",
+  ]);
+  const existingMemory = {
+    id: "event-memory",
+    kind: "event",
+    canonicalSlotKey,
+    canonicalValueKey,
+    title: "Launch",
+    body: "API v2 launched.",
+    lifecycle: "active",
+    relatedSubjects: [],
+    occurrences: [
+      {
+        id: "legacy-event-occurrence",
+        startedAt: null,
+        endedAt: null,
+        evidenceSegmentIds: [],
+      },
+    ],
+  };
+  const input = planFixture({
+    candidate: plannerCandidate({
+      memories: [
+        {
+          kind: "event",
+          title: "Launch",
+          body: "API v2 launched.",
+          confidence: 0.9,
+          evidenceSegmentIds: ["seg-2"],
+        },
+      ],
+    }),
+    existing: { ...planFixture().existing, memories: [existingMemory] },
+  });
+
+  const result = new mergerModule.MemoryMerger().plan(input);
+  assert.equal(result.occurrenceLinks.length, 1);
+  assert.equal(result.occurrenceLinks[0].mode, "create_occurrence");
+  assert.equal(result.occurrenceLinks[0].memoryId, "event-memory");
+
+  const halfKnown = structuredClone(input);
+  halfKnown.existing.memories[0].occurrences[0].startedAt = 0;
+  assertValidationIssue(mergerModule, halfKnown, "malformed_existing");
+});
+
 test("todos reuse active instances and keep terminal history closed unless evidence is later", () => {
   const mergerModule = loadMemoryMerger();
   const canonicalTuple = ["todo", "publish notes", "person-1"];
@@ -844,6 +895,47 @@ test("todos reuse active instances and keep terminal history closed unless evide
     evidenceSegmentIds: ["todo-after"],
     reason: "later_evidence",
   });
+});
+
+test("legacy todo occurrences accept only a fully unknown interval", () => {
+  const mergerModule = loadMemoryMerger();
+  const title = "Publish notes";
+  const canonicalBaseKey = mergerModule.canonicalTupleHash(["todo", "publish notes", null]);
+  const existingTodo = {
+    id: "legacy-todo",
+    canonicalBaseKey,
+    title,
+    ownerSubjectKind: null,
+    ownerSubjectId: null,
+    status: "completed",
+    completedAt: 10_000,
+    revisions: [
+      {
+        id: "legacy-todo-revision",
+        revision: 1,
+        title,
+        dueText: null,
+      },
+    ],
+    occurrences: [
+      {
+        id: "legacy-todo-occurrence",
+        revisionId: "legacy-todo-revision",
+        startedAt: null,
+        endedAt: null,
+        evidenceSegmentIds: [],
+      },
+    ],
+  };
+  const input = planFixture({
+    existing: { ...planFixture().existing, todos: [existingTodo] },
+  });
+
+  assert.doesNotThrow(() => new mergerModule.MemoryMerger().plan(input));
+
+  const halfKnown = structuredClone(input);
+  halfKnown.existing.todos[0].occurrences[0].endedAt = 10_000;
+  assertValidationIssue(mergerModule, halfKnown, "malformed_existing");
 });
 
 test("suggestions stay suggestions while proposed items reuse and terminal states remain terminal", () => {

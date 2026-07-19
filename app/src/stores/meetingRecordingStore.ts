@@ -105,6 +105,7 @@ interface MeetingRecordingState {
   sessionExpectedCount: number;
   userTouchedStepper: boolean;
   error: string | null;
+  transcriptionWarning: string | null;
   currentMicLevel: number;
   currentSystemLevel: number;
   activeMicLabel: string | null;
@@ -549,6 +550,7 @@ export const useMeetingRecordingStore = create<MeetingRecordingState>()(() => ({
   sessionExpectedCount: DEFAULT_EXPECTED_SPEAKER_COUNT,
   userTouchedStepper: false,
   error: null,
+  transcriptionWarning: null,
   currentMicLevel: 0,
   currentSystemLevel: 0,
   activeMicLabel: null,
@@ -1166,6 +1168,7 @@ export async function startRecording(
     systemPartialSpeakerName: null,
     diarizationSessionId: null,
     error: null,
+    transcriptionWarning: null,
     currentMicLevel: 0,
     currentSystemLevel: 0,
     activeMicLabel: null,
@@ -1646,6 +1649,9 @@ export async function startRecording(
         confidence?: number;
         echoScore?: number | null;
       }) => {
+        if (useMeetingRecordingStore.getState().transcriptionWarning) {
+          useMeetingRecordingStore.setState({ transcriptionWarning: null });
+        }
         if (data.type === "correction") {
           const current = useMeetingRecordingStore.getState().segments;
           let changed = false;
@@ -1771,7 +1777,7 @@ export async function startRecording(
     if (mergeCleanup) ipcCleanups.push(mergeCleanup);
 
     const errorCleanup = window.electronAPI?.onMeetingTranscriptionError?.((err) => {
-      useMeetingRecordingStore.setState({ error: err });
+      useMeetingRecordingStore.setState({ transcriptionWarning: err });
       logger.error("Meeting transcription stream error", { error: err }, "meeting");
     });
     if (errorCleanup) ipcCleanups.push(errorCleanup);
@@ -3060,6 +3066,7 @@ function resetStoppedMeetingState(): void {
     micFallbackActive: false,
     micRecoveryStatus: "idle",
     micRecoveryAttempt: 0,
+    transcriptionWarning: null,
     captureSourceStates: { mic: "idle", system: "idle" },
   });
 }

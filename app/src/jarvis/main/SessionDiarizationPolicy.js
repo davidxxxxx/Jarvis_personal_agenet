@@ -1,5 +1,9 @@
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const REVISION = /^[0-9a-f]{64}$/;
+const {
+  SPEAKER_MODEL_KEYS,
+  getSpeakerModelManifest,
+} = require("./SpeakerModelManifest");
 
 const SESSION_DIARIZATION_POLICY = Object.freeze({
   policyId: "jarvis-session-diarization-v1",
@@ -9,9 +13,34 @@ const SESSION_DIARIZATION_POLICY = Object.freeze({
   sampleRate: 16_000,
   minimumEmbeddingMs: 1_500,
   maximumEmbeddingMs: 8_000,
+  turnBoundaryToleranceMs: 100,
   inputVersion: 1,
   clusterSimilarityThreshold: 0.72,
   echoSimilarityThreshold: 0.95,
+});
+
+const primaryIdentityModel = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.PRIMARY);
+const reviewIdentityModel = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.REVIEW);
+const SPEAKER_IDENTITY_MODEL_POLICY = Object.freeze({
+  policyId: "jarvis-dual-speaker-identity-v1",
+  automaticAssociationMinimumPrecision: 0.95,
+  automaticAssociationEnabled: false,
+  primary: Object.freeze({
+    modelKey: primaryIdentityModel.key,
+    modelId: primaryIdentityModel.modelId,
+    artifactVersion: primaryIdentityModel.artifactVersion,
+    embeddingDimension: primaryIdentityModel.embeddingDimension,
+    embeddingSpace: primaryIdentityModel.embeddingSpace,
+    thresholds: primaryIdentityModel.thresholds,
+  }),
+  review: Object.freeze({
+    modelKey: reviewIdentityModel.key,
+    modelId: reviewIdentityModel.modelId,
+    artifactVersion: reviewIdentityModel.artifactVersion,
+    embeddingDimension: reviewIdentityModel.embeddingDimension,
+    embeddingSpace: reviewIdentityModel.embeddingSpace,
+    thresholds: reviewIdentityModel.thresholds,
+  }),
 });
 
 function safeId(value, name) {
@@ -59,6 +88,7 @@ function parseDiarizationJobKey(value) {
 
 module.exports = {
   SESSION_DIARIZATION_POLICY,
+  SPEAKER_IDENTITY_MODEL_POLICY,
   buildDiarizationJobKey,
   parseDiarizationJobKey,
 };

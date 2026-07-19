@@ -219,7 +219,7 @@ test("v27 fresh schema creates stable immutable memory subject identity", () => 
   const db = new Database(":memory:");
   try {
     db.pragma("foreign_keys = ON");
-    assert.equal(TARGET_VERSION, 31);
+    assert.equal(TARGET_VERSION, 34);
     assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     assert.ok(schemaNames(db, "table").includes("memory_item_subjects"));
     assert.ok(schemaNames(db, "table").includes("memory_item_canonical_slots"));

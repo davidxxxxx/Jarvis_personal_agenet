@@ -1391,6 +1391,7 @@ export interface UseJarvisRecordingResult {
   preparationStage?: JarvisPreparationStage | null;
   operation: JarvisControlAction | null;
   error: string | null;
+  transcriptionWarning?: string | null;
   start: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
@@ -1415,6 +1416,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const [preparationStage, setPreparationStage] = useState<JarvisPreparationStage | null>(null);
   const captureSourceStates = useMeetingRecordingStore((state) => state.captureSourceStates);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
+  const transcriptionWarning = useMeetingRecordingStore((state) => state.transcriptionWarning);
   const sessionsRefreshRef = useRef<LatestRefresh<JarvisSession[]> | null>(null);
   const peopleRefreshRef = useRef<LatestRefresh<JarvisPerson[]> | null>(null);
   const controllerRef = useRef<RecordingController | null>(null);
@@ -1685,6 +1687,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     preparationStage,
     operation,
     error: upstreamError ?? controllerError,
+    transcriptionWarning,
     start,
     pause,
     resume,

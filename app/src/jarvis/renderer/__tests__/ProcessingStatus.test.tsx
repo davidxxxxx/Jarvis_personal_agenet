@@ -14,6 +14,7 @@ function timeline(overrides: Partial<JarvisSessionTimeline> = {}): JarvisSession
     finalized_at: 2_000,
     ready_at: null,
     tracks: [],
+    application_audio_intervals: [],
     gaps: [],
     chunks: [],
     segments: [],
@@ -236,6 +237,55 @@ describe("ProcessingStatus", () => {
     expect(screen.getByText(/最终覆盖 72%/)).toBeVisible();
     expect(screen.getByText(/CUDA · GPU-verified/)).toBeVisible();
     expect(screen.getByText("等待 GPU")).toBeVisible();
+  });
+
+  it("keeps a completed historical session distinct from the global idle backend", () => {
+    render(
+      <ProcessingStatus
+        timeline={timeline({ processing_state: "ready", ready_at: 2_500 })}
+        runtimeStatus={runtime({
+          capture: {
+            sessionId: null,
+            status: "idle",
+            captureMode: null,
+            retentionMode: null,
+            errorCode: null,
+          },
+          backend: { actualBackend: null, cudaGpuUuid: null },
+          resources: { ...runtime().resources, state: "available", reason: "within_limits" },
+          queue: {
+            ...runtime().queue,
+            pending: 0,
+            total: 0,
+            byStage: {},
+            backlogMinutes: 0,
+            oldestJobAgeMs: null,
+          },
+          preview: null,
+          nextRecoveryAction: null,
+        })}
+      />
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("此会话处理完成");
+    expect(screen.getByText("以下为全局后台状态")).toBeVisible();
+    expect(screen.getByText("后端 按需启动（当前空闲）")).toBeVisible();
+    expect(screen.queryByText("后端 尚未运行")).not.toBeInTheDocument();
+  });
+
+  it("labels unrelated global queue work without regressing a ready session", () => {
+    render(
+      <ProcessingStatus
+        timeline={timeline({ processing_state: "ready", ready_at: 2_500 })}
+        runtimeStatus={runtime({
+          capture: { ...runtime().capture, sessionId: null, status: "idle" },
+          resources: { ...runtime().resources, state: "available", reason: "within_limits" },
+        })}
+      />
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("此会话处理完成");
+    expect(screen.getByText("全局后台任务：后台处理中")).toBeVisible();
   });
 
   it.each([

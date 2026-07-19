@@ -36,8 +36,7 @@ const intraOpNumThreads = Math.min(4, Math.max(2, Math.floor((os.cpus()?.length 
 
 let port = null;
 let ort = null;
-let speakerSession = null;
-let speakerInputName = null;
+const speakerSessions = new Map();
 let textSession = null;
 let textTokenizer = null;
 let vadRuntime = null;
@@ -190,42 +189,73 @@ function computeFbank(samples) {
   return { features, numFrames };
 }
 
-async function speakerLoad({ modelPath }) {
-  if (speakerSession) return { ok: true };
+function normalizeSpeakerModelKey(modelKey) {
+  const normalized = modelKey ?? "legacy_campplus_voxceleb_v1";
+  if (typeof normalized !== "string" || !/^[a-z0-9_-]{1,128}$/.test(normalized)) {
+    throw new TypeError("speaker model key is invalid");
+  }
+  return normalized;
+}
+
+async function speakerLoad({
+  modelKey,
+  modelId = null,
+  modelPath,
+  embeddingDimension = 512,
+  maximumSamples = SPEAKER_MAX_SAMPLES,
+}) {
+  const key = normalizeSpeakerModelKey(modelKey);
+  if (speakerSessions.has(key)) return { ok: true };
+  if (!Number.isSafeInteger(embeddingDimension) || embeddingDimension < 1) {
+    throw new TypeError("speaker embedding dimension is invalid");
+  }
+  if (!Number.isSafeInteger(maximumSamples) || maximumSamples < FBANK_FRAME_LENGTH) {
+    throw new TypeError("speaker maximum samples is invalid");
+  }
   loadOrt();
-  speakerSession = await ort.InferenceSession.create(modelPath, SESSION_OPTIONS);
-  speakerInputName = speakerSession.inputNames[0];
-  log("info", "speaker session loaded", { modelPath });
+  const session = await ort.InferenceSession.create(modelPath, SESSION_OPTIONS);
+  speakerSessions.set(key, {
+    session,
+    inputName: session.inputNames[0],
+    embeddingDimension,
+    maximumSamples,
+  });
+  log("info", "speaker session loaded", { modelKey: key, modelId });
   return { ok: true };
 }
 
 async function speakerExtract(payload) {
+  const key = normalizeSpeakerModelKey(payload?.modelKey);
+  const runtime = speakerSessions.get(key);
   return withRequiredAudioRuntime(
     payload,
-    speakerSession,
+    runtime,
     "speaker session not loaded",
-    async () => {
+    async (speakerRuntime) => {
       const { samplesBuffer } = payload || {};
       const allSamples = new Float32Array(samplesBuffer);
       const samples =
-        allSamples.length > SPEAKER_MAX_SAMPLES
-          ? allSamples.subarray(allSamples.length - SPEAKER_MAX_SAMPLES)
+        allSamples.length > speakerRuntime.maximumSamples
+          ? allSamples.subarray(allSamples.length - speakerRuntime.maximumSamples)
           : allSamples;
 
       const fbank = computeFbank(samples);
-      if (!fbank) return { embeddingBuffer: null };
+      if (!fbank) return { embedding: null, reason: "insufficient_samples" };
 
       const feeds = {
-        [speakerInputName]: new ort.Tensor("float32", fbank.features, [
+        [speakerRuntime.inputName]: new ort.Tensor("float32", fbank.features, [
           1,
           fbank.numFrames,
           FBANK_NUM_MELS,
         ]),
       };
-      const results = await speakerSession.run(feeds);
+      const results = await speakerRuntime.session.run(feeds);
       const output = results[Object.keys(results)[0]];
       const data = new Float32Array(output.data);
-      return { embeddingBuffer: data.buffer };
+      if (data.length !== speakerRuntime.embeddingDimension) {
+        throw new Error("speaker embedding dimension mismatch");
+      }
+      return { embedding: Array.from(data) };
     }
   );
 }
@@ -387,7 +417,12 @@ function vadResetSession({ sessionId }) {
 const handlers = {
   ping: () => ({
     ok: true,
-    sessions: { speaker: !!speakerSession, text: !!textSession, vad: !!vadRuntime?.session },
+    sessions: {
+      speaker: speakerSessions.size > 0,
+      speakerModelKeys: Array.from(speakerSessions.keys()),
+      text: !!textSession,
+      vad: !!vadRuntime?.session,
+    },
   }),
   "speaker.load": speakerLoad,
   "speaker.extract": speakerExtract,

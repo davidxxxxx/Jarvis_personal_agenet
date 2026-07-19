@@ -16,6 +16,9 @@ test("startup and IPC gate CUDA on verification and inject the data-root resolve
     /setCudaBinaryResolver\(\(\)\s*=>\s*\n?\s*whisperCudaManager\.getCudaBinaryPath\(\)/
   );
   assert.match(main, /whisperCudaManager\?\.getVerifiedStartOptions\(\)/);
+  assert.match(main, /resolveJarvisWhisperModel\(\{/);
+  assert.match(main, /modelName:\s*resolveConfiguredJarvisWhisperModel\(\)/);
+  assert.match(main, /ownedPidsProvider:\s*jarvisOwnedPidsProvider/);
   assert.match(ipc, /startWhisperServerWithVerifiedCuda\(\{/);
   assert.doesNotMatch(
     ipc,

@@ -7,6 +7,7 @@ import DailyReviewView from "./DailyReviewView";
 import LiveTranscript from "./LiveTranscript";
 import MiniMaxAgentSettingsCard from "./MiniMaxAgentSettingsCard";
 import RecordingControls from "./RecordingControls";
+import ResourceGovernanceSettingsCard from "./ResourceGovernanceSettingsCard";
 import SessionSummaryPanel from "./SessionSummaryPanel";
 import TranscriptionQualityCard from "./TranscriptionQualityCard";
 import VoiceEnrollment from "./VoiceEnrollment";
@@ -115,6 +116,7 @@ export default function TodayView({ recording }: TodayViewProps) {
               </Button>
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+              <ResourceGovernanceSettingsCard />
               <MiniMaxAgentSettingsCard />
               <TranscriptionQualityCard />
               <VoiceEnrollment />

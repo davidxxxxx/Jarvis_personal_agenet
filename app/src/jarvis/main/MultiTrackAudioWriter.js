@@ -20,49 +20,49 @@ class MultiTrackAudioWriter {
     this.nextSequenceNumbers = new Map();
     this.tracks = new Map(Object.entries(tracks));
     if (openSources) {
-      for (const [sourceType, track] of this.tracks) {
-        this._openSource(sourceType, track);
+      for (const [trackKey, track] of this.tracks) {
+        this._openSource(trackKey, track);
       }
     }
   }
 
-  hasSource(sourceType) {
-    return this.writers.has(sourceType);
+  hasSource(trackKey) {
+    return this.writers.has(trackKey);
   }
 
-  append(sourceType, pcm) {
-    const writer = this.writers.get(sourceType);
-    if (!writer) throw new Error(`inactive audio source: ${sourceType}`);
+  append(trackKey, pcm) {
+    const writer = this.writers.get(trackKey);
+    if (!writer) throw new Error(`inactive audio source: ${trackKey}`);
     writer.append(pcm);
   }
 
-  closeSource(sourceType, at) {
-    const writer = this.writers.get(sourceType);
+  closeSource(trackKey, at) {
+    const writer = this.writers.get(trackKey);
     if (!writer) return;
     try {
       writer.close(at);
     } finally {
-      this.nextSequenceNumbers.set(sourceType, writer.sequenceNumber);
-      this.writers.delete(sourceType);
+      this.nextSequenceNumbers.set(trackKey, writer.sequenceNumber);
+      this.writers.delete(trackKey);
     }
   }
 
-  reopenSource(sourceType, track) {
-    if (this.writers.has(sourceType)) throw new Error(`audio source is already active: ${sourceType}`);
-    const definition = { ...(this.tracks.get(sourceType) || {}), ...track };
-    this.tracks.set(sourceType, definition);
-    this._openSource(sourceType, definition);
+  reopenSource(trackKey, track) {
+    if (this.writers.has(trackKey)) throw new Error(`audio source is already active: ${trackKey}`);
+    const definition = { ...(this.tracks.get(trackKey) || {}), ...track };
+    this.tracks.set(trackKey, definition);
+    this._openSource(trackKey, definition);
   }
 
   closeAll(at) {
     const errors = [];
     const failedSources = [];
-    for (const sourceType of [...this.writers.keys()]) {
+    for (const trackKey of [...this.writers.keys()]) {
       try {
-        this.closeSource(sourceType, at);
+        this.closeSource(trackKey, at);
       } catch (error) {
-        failedSources.push(sourceType);
-        errors.push(new Error(`failed to close audio source: ${sourceType}`, { cause: error }));
+        failedSources.push(trackKey);
+        errors.push(new Error(`failed to close audio source: ${trackKey}`, { cause: error }));
       }
     }
     if (errors.length > 0) {
@@ -71,26 +71,34 @@ class MultiTrackAudioWriter {
   }
 
   abortAll() {
-    for (const [sourceType, writer] of this.writers) {
+    for (const [trackKey, writer] of this.writers) {
       writer.abort();
-      this.nextSequenceNumbers.set(sourceType, writer.sequenceNumber);
+      this.nextSequenceNumbers.set(trackKey, writer.sequenceNumber);
     }
     this.writers.clear();
   }
 
-  _openSource(sourceType, track) {
+  _openSource(trackKey, track) {
+    const sourceType = track.sourceType ?? (trackKey === "mic" ? "mic" : "system");
+    if (sourceType !== "mic" && sourceType !== "system") {
+      throw new TypeError(`invalid source type for ${trackKey}`);
+    }
+    const storageKey = track.storageKey ?? (trackKey === sourceType ? sourceType : track.id);
+    if (typeof storageKey !== "string" || !/^[a-zA-Z0-9._-]{1,128}$/.test(storageKey)) {
+      throw new TypeError(`invalid audio track storage key for ${trackKey}`);
+    }
     const writer = new AudioChunkWriter({
       sessionId: this.sessionId,
       trackId: track.id,
       sourceType,
-      baseDir: path.join(this.baseDir, sourceType),
+      baseDir: path.join(this.baseDir, storageKey),
       startedAt: track.startedAt,
-      sequenceNumber: this.nextSequenceNumbers.get(sourceType) ?? 0,
+      sequenceNumber: this.nextSequenceNumbers.get(trackKey) ?? 0,
       now: this.now,
       beforeChunk: this.beforeChunk,
       onChunk: this.onChunk,
     });
-    this.writers.set(sourceType, writer);
+    this.writers.set(trackKey, writer);
   }
 }
 

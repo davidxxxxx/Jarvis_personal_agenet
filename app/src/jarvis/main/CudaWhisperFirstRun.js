@@ -1,5 +1,40 @@
 const fs = require("node:fs");
 
+async function resolveInstalledWhisperModel({
+  whisperManager,
+  modelName,
+  fileExists = fs.existsSync,
+}) {
+  if (typeof whisperManager?.getModelPath !== "function") return null;
+  const tryModel = (candidate) => {
+    if (typeof candidate !== "string" || !candidate.trim()) return null;
+    const normalized = candidate.trim();
+    try {
+      const modelPath = whisperManager.getModelPath(normalized);
+      return fileExists(modelPath) ? { modelName: normalized, modelPath } : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const preferred = tryModel(modelName);
+  if (preferred) return preferred;
+  if (typeof whisperManager.listWhisperModels !== "function") return null;
+
+  let inventory;
+  try {
+    inventory = await whisperManager.listWhisperModels();
+  } catch {
+    return null;
+  }
+  for (const candidate of inventory?.models ?? []) {
+    if (candidate?.downloaded !== true) continue;
+    const resolved = tryModel(candidate.model);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 async function maybeOfferCudaWhisper({
   manager,
   verifier,
@@ -22,15 +57,13 @@ async function maybeOfferCudaWhisper({
         reason: manager.isDownloaded() ? "already_installed" : "previously_declined",
       };
     }
-    if (!modelName || !whisperManager?.getModelPath)
-      return { offered: false, reason: "model_missing" };
-    let modelPath;
-    try {
-      modelPath = whisperManager.getModelPath(modelName);
-    } catch {
-      return { offered: false, reason: "model_missing" };
-    }
-    if (!fileExists(modelPath)) return { offered: false, reason: "model_missing" };
+    const installedModel = await resolveInstalledWhisperModel({
+      whisperManager,
+      modelName,
+      fileExists,
+    });
+    if (!installedModel) return { offered: false, reason: "model_missing" };
+    const { modelName: resolvedModelName, modelPath } = installedModel;
     const [gpuInfo, gpuList] = await Promise.all([detectGpu(), listGpus()]);
     if (!gpuInfo?.hasNvidiaGpu) return { offered: false, reason: "nvidia_gpu_missing" };
     const gpuUuid = selectedGpuUuid || gpuList.find((gpu) => gpu.uuid)?.uuid || null;
@@ -56,12 +89,12 @@ async function maybeOfferCudaWhisper({
       modelPath,
       gpuUuid,
       driver: gpuInfo.driverVersion || null,
-      modelId: modelName,
+      modelId: resolvedModelName,
     };
     const installed = await manager.installPinnedCudaRuntime({ consent: true, verification });
     const enabled =
       installed?.verification?.ok === true && manager.isVerified({ gpuUuid }) === true;
-    if (enabled) await activateCuda({ modelName, gpuUuid });
+    if (enabled) await activateCuda({ modelName: resolvedModelName, gpuUuid });
     await persistEnabled(enabled);
     return {
       offered: true,
@@ -75,3 +108,4 @@ async function maybeOfferCudaWhisper({
 }
 
 module.exports = { maybeOfferCudaWhisper };
+module.exports.resolveInstalledWhisperModel = resolveInstalledWhisperModel;

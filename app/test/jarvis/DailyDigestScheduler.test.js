@@ -166,6 +166,28 @@ test("date reads and regeneration accept only a canonical trusted local date", a
     localDate: "2026-07-17",
   });
   assert.equal(calls.at(-1)[0], "regenerate");
+  assert.deepEqual(
+    await scheduler.regenerate({
+      localDate: "2026-07-17",
+      allowUsageUnknown: true,
+    }),
+    {
+      status: "woken",
+      localDate: "2026-07-17",
+    }
+  );
+  assert.deepEqual(calls.at(-1), [
+    "regenerate",
+    { localDate: "2026-07-17", allowUsageUnknown: true },
+  ]);
+  await assert.rejects(
+    async () =>
+      scheduler.regenerate({
+        localDate: "2026-07-17",
+        allowUsageUnknown: "yes",
+      }),
+    /allowUsageUnknown.*boolean/i
+  );
   assert.throws(() => scheduler.getLatest({ localDate: "2026-02-29" }), /localDate|local date/i);
   await assert.rejects(
     async () => scheduler.regenerate({ localDate: "2026-07-17", timezone: "UTC" }),

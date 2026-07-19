@@ -46,7 +46,7 @@ class SpeechTriggeredCaptureGate {
     preRollMs = 2_000,
     postRollMs = 3_000,
     mergeGapMs = 3_000,
-    speechThreshold = 0.5,
+    speechThreshold = 0.35,
     mode = "speech_triggered",
   } = {}) {
     if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0) {
@@ -98,7 +98,11 @@ class SpeechTriggeredCaptureGate {
       return output;
     }
 
-    const isSpeech = input.speechProbability >= this.speechThreshold;
+    if (input.signalDetected !== undefined && typeof input.signalDetected !== "boolean") {
+      throw new TypeError("signalDetected must be a boolean when provided");
+    }
+    const isSpeech =
+      input.speechProbability >= this.speechThreshold || input.signalDetected === true;
     if (isSpeech) {
       this._commitSuppression(output, state);
       for (const buffered of state.ring.drain()) this._retain(output, buffered);

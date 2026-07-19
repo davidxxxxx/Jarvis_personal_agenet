@@ -1895,7 +1895,7 @@ test("a stale restoration retry cannot close a newer interruption gap", async ()
   }
 });
 
-test("start track persistence failure leaves no active public session or tracks", () => {
+test("start track persistence failure leaves no active public session or tracks", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-start-rollback-"));
   const repository = createRepository();
   repository.createTracks = () => {
@@ -1930,7 +1930,7 @@ test("start track persistence failure leaves no active public session or tracks"
     assert.equal(repository.tracks.length, 0);
     assert.equal(service.appendPcm("s1", "mic", Buffer.alloc(48)), false);
   } finally {
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

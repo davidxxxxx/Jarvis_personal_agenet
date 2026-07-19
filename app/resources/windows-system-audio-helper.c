@@ -2,15 +2,16 @@
  * Windows System Audio Helper
  *
  * Captures system audio for meeting transcription via WASAPI process
- * loopback (VAD\Process_Loopback, Windows 10 2004+). Runs in EXCLUDE mode
- * against OpenWhispr's own process tree, so it hears every application on
- * every render endpoint — independent of the default output device — while
- * never re-capturing OpenWhispr's own sounds.
+ * loopback (VAD\Process_Loopback). It supports both the existing EXCLUDE
+ * process-tree safety mix and an INCLUDE process-tree mode for one active
+ * application. Application capture and session watch require Windows build
+ * 20348 or newer.
  *
  * Commands:
  *   windows-system-audio-helper.exe probe
  *     Prints a single JSON capability object to stdout and exits.
- *   windows-system-audio-helper.exe start [--exclude-pid N] [--sample-rate N]
+ *   windows-system-audio-helper.exe start
+ *     [--exclude-pid N | --include-pid N] [--sample-rate N]
  *     Streams raw PCM (mono, 16-bit signed little-endian, --sample-rate Hz,
  *     default 24000) to stdout. Emits line-delimited JSON events to stderr:
  *       {"type":"start"} once capture is running,
@@ -19,6 +20,10 @@
  *     Exits when stdin closes (parent death), on Ctrl+C/SIGTERM, or on a
  *     fatal capture error. Injects silence while no application renders
  *     audio so the output timeline stays continuous.
+ *   windows-system-audio-helper.exe watch-sessions [--exclude-pid N]
+ *     Emits line-delimited JSON containing only PID, state and peak level.
+ *     It never reads or emits executable paths, command lines, or window
+ *     titles.
  *
  * Compile with: cl /O2 windows-system-audio-helper.c /Fe:windows-system-audio-helper.exe ole32.lib mmdevapi.lib
  * Or with MinGW: gcc -O2 windows-system-audio-helper.c -o windows-system-audio-helper.exe -lole32 -lmmdevapi
@@ -32,6 +37,8 @@
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
+#include <endpointvolume.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdarg.h>
@@ -39,18 +46,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* IID_IAudioClient, IID_IAudioCaptureClient, and
- * IID_IActivateAudioInterfaceCompletionHandler are declared via
- * MIDL_INTERFACE (__declspec(uuid)) in <audioclient.h> / <mmdeviceapi.h>, so
- * no import library defines them and <initguid.h> does not emit them in C
- * mode. Define them here — INITGUID is active via <initguid.h> above — so the
- * C references to these IIDs resolve at link time (fixes LNK2019). */
-DEFINE_GUID(IID_IAudioClient,
-    0x1cb9ad4c, 0xdbfa, 0x4c32, 0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2);
-DEFINE_GUID(IID_IAudioCaptureClient,
-    0xc8adbd64, 0xe71e, 0x48a0, 0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17);
-DEFINE_GUID(IID_IActivateAudioInterfaceCompletionHandler,
-    0x41d949ab, 0x9862, 0x444a, 0x80, 0xf6, 0xc2, 0x61, 0x33, 0x4d, 0xa5, 0xeb);
+DEFINE_GUID(HELPER_CLSID_MMDeviceEnumerator,
+    0xbcde0395, 0xe52f, 0x467c, 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e);
+DEFINE_GUID(HELPER_IID_IMMDeviceEnumerator,
+    0xa95664d2, 0x9614, 0x4f35, 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6);
+DEFINE_GUID(HELPER_IID_IAudioSessionManager2,
+    0x77aa99a0, 0x1bd6, 0x484f, 0x8b, 0xc7, 0x2c, 0x65, 0x4c, 0x9a, 0x9b, 0x6f);
+DEFINE_GUID(HELPER_IID_IAudioSessionControl2,
+    0xbfb7ff88, 0x7239, 0x4fc9, 0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d);
 
 #if defined(__has_include)
 #if __has_include(<audioclientactivationparams.h>)
@@ -96,6 +99,7 @@ DEFINE_GUID(HELPER_IID_IAgileObject,
     0x94ea2b94, 0xe9cc, 0x49e0, 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90);
 
 #define DEFAULT_SAMPLE_RATE 24000
+#define MIN_APPLICATION_CAPTURE_BUILD 20348
 #define CAPTURE_CHANNELS 2
 #define BYTES_PER_SAMPLE 2
 #define ACTIVATION_TIMEOUT_MS 4000
@@ -107,6 +111,9 @@ DEFINE_GUID(HELPER_IID_IAgileObject,
 #define SILENCE_GAP_MAX_MS 5000
 #define SILENCE_FILL_CHUNK_FRAMES 2400
 #define BUFFER_DURATION_HNS 200000 /* 20 ms, matches the Microsoft sample */
+#define SESSION_WATCH_INTERVAL_MS 500
+#define SESSION_PEAK_THRESHOLD 0.0005f
+#define MAX_ACTIVE_SESSION_PROCESSES 512
 
 static volatile LONG g_running = TRUE;
 
@@ -133,17 +140,60 @@ static void emit_event(const char *type, const char *code, const char *format, .
     fflush(stderr);
 }
 
-static void emit_probe_result(BOOL ok, const char *error, HRESULT hr)
+static DWORD get_windows_build_number(void)
 {
+    typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn rtlGetVersion;
+    OSVERSIONINFOW version;
+
+    if (!ntdll) {
+        return 0;
+    }
+    rtlGetVersion = (RtlGetVersionFn)GetProcAddress(ntdll, "RtlGetVersion");
+    if (!rtlGetVersion) {
+        return 0;
+    }
+    ZeroMemory(&version, sizeof(version));
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (rtlGetVersion(&version) != 0) {
+        return 0;
+    }
+    return version.dwBuildNumber;
+}
+
+static void emit_probe_result(BOOL ok, const char *error, HRESULT hr, DWORD windowsBuild)
+{
+    BOOL supportsApplications = windowsBuild >= MIN_APPLICATION_CAPTURE_BUILD;
     if (ok) {
         printf("{\"ok\":true,\"supportsSystemAudio\":true,\"supportsNativeCapture\":true,"
-               "\"source\":\"wasapi-process-loopback\"}\n");
+               "\"supportsApplicationCapture\":%s,\"supportsSessionWatch\":%s,"
+               "\"minimumWindowsBuild\":%lu,\"windowsBuild\":%lu,"
+               "\"source\":\"wasapi-process-loopback\"}\n",
+               supportsApplications ? "true" : "false",
+               supportsApplications ? "true" : "false",
+               (unsigned long)MIN_APPLICATION_CAPTURE_BUILD,
+               (unsigned long)windowsBuild);
     } else {
         printf("{\"ok\":false,\"supportsSystemAudio\":false,\"supportsNativeCapture\":false,"
+               "\"supportsApplicationCapture\":false,\"supportsSessionWatch\":false,"
+               "\"minimumWindowsBuild\":%lu,\"windowsBuild\":%lu,"
                "\"source\":\"wasapi-process-loopback\",\"error\":\"%s (hr=0x%08lx)\"}\n",
-               error, (unsigned long)hr);
+               (unsigned long)MIN_APPLICATION_CAPTURE_BUILD,
+               (unsigned long)windowsBuild, error, (unsigned long)hr);
     }
     fflush(stdout);
+}
+
+static void emit_capture_start(PROCESS_LOOPBACK_MODE loopbackMode, DWORD targetPid)
+{
+    fprintf(stderr,
+            "{\"type\":\"start\",\"captureMode\":\"%s\",\"targetPid\":%lu}\n",
+            loopbackMode == PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+                ? "include-process-tree"
+                : "exclude-process-tree",
+            (unsigned long)targetPid);
+    fflush(stderr);
 }
 
 /* ========================================================================
@@ -229,7 +279,8 @@ static CompletionHandler *create_completion_handler(void)
  * ======================================================================== */
 
 static HRESULT activate_process_loopback(
-    DWORD excludePid, UINT32 sampleRate, IAudioClient **outClient, const char **outErrorCode)
+    DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT32 sampleRate,
+    IAudioClient **outClient, const char **outErrorCode)
 {
     AUDIOCLIENT_ACTIVATION_PARAMS activationParams;
     PROPVARIANT activateParams;
@@ -246,9 +297,8 @@ static HRESULT activate_process_loopback(
 
     ZeroMemory(&activationParams, sizeof(activationParams));
     activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = excludePid;
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode =
-        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+    activationParams.ProcessLoopbackParams.TargetProcessId = targetPid;
+    activationParams.ProcessLoopbackParams.ProcessLoopbackMode = loopbackMode;
 
     PropVariantInit(&activateParams);
     activateParams.vt = VT_BLOB;
@@ -360,7 +410,7 @@ static BOOL write_silence(size_t frames)
     return TRUE;
 }
 
-static int run_capture(DWORD excludePid, UINT32 sampleRate)
+static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT32 sampleRate)
 {
     IAudioClient *audioClient = NULL;
     IAudioCaptureClient *captureClient = NULL;
@@ -374,7 +424,7 @@ static int run_capture(DWORD excludePid, UINT32 sampleRate)
     HRESULT hr;
     int exitCode = 0;
 
-    hr = activate_process_loopback(excludePid, sampleRate, &audioClient, &errorCode);
+    hr = activate_process_loopback(targetPid, loopbackMode, sampleRate, &audioClient, &errorCode);
     if (FAILED(hr)) {
         emit_event("error", errorCode, "Process loopback activation failed (hr=0x%08lx)",
                    (unsigned long)hr);
@@ -412,7 +462,7 @@ static int run_capture(DWORD excludePid, UINT32 sampleRate)
 
     QueryPerformanceFrequency(&qpcFrequency);
     QueryPerformanceCounter(&captureStart);
-    emit_event("start", NULL, NULL);
+    emit_capture_start(loopbackMode, targetPid);
 
     while (InterlockedCompareExchange(&g_running, TRUE, TRUE)) {
         UINT32 packetFrames = 0;
@@ -534,6 +584,181 @@ done:
 }
 
 /* ========================================================================
+ * Active render-session watch
+ * ======================================================================== */
+
+typedef struct {
+    DWORD pid;
+    float peak;
+} ActiveSessionProcess;
+
+static int find_session_process(
+    const ActiveSessionProcess *processes, UINT32 processCount, DWORD pid)
+{
+    UINT32 index;
+    for (index = 0; index < processCount; index++) {
+        if (processes[index].pid == pid) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+static void emit_session_event(const char *state, DWORD pid, float peak)
+{
+    printf("{\"type\":\"session\",\"state\":\"%s\",\"pid\":%lu,\"peak\":%.6f}\n",
+           state, (unsigned long)pid, (double)peak);
+    fflush(stdout);
+}
+
+static HRESULT collect_active_session_processes(
+    DWORD excludedPid, ActiveSessionProcess *processes, UINT32 *processCount)
+{
+    IMMDeviceEnumerator *deviceEnumerator = NULL;
+    IMMDeviceCollection *deviceCollection = NULL;
+    UINT32 count = 0;
+    UINT deviceCount = 0;
+    UINT deviceIndex;
+    HRESULT hr;
+
+    *processCount = 0;
+    hr = CoCreateInstance(
+        &HELPER_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+        &HELPER_IID_IMMDeviceEnumerator, (void **)&deviceEnumerator);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = IMMDeviceEnumerator_EnumAudioEndpoints(
+        deviceEnumerator, eRender, DEVICE_STATE_ACTIVE, &deviceCollection);
+    if (FAILED(hr)) {
+        IMMDeviceEnumerator_Release(deviceEnumerator);
+        return hr;
+    }
+    hr = IMMDeviceCollection_GetCount(deviceCollection, &deviceCount);
+    if (FAILED(hr)) {
+        IMMDeviceCollection_Release(deviceCollection);
+        IMMDeviceEnumerator_Release(deviceEnumerator);
+        return hr;
+    }
+
+    for (deviceIndex = 0; deviceIndex < deviceCount; deviceIndex++) {
+        IMMDevice *device = NULL;
+        IAudioSessionManager2 *sessionManager = NULL;
+        IAudioSessionEnumerator *sessionEnumerator = NULL;
+        int sessionCount = 0;
+        int sessionIndex;
+
+        if (FAILED(IMMDeviceCollection_Item(deviceCollection, deviceIndex, &device))) {
+            continue;
+        }
+        hr = IMMDevice_Activate(
+            device, &HELPER_IID_IAudioSessionManager2, CLSCTX_ALL, NULL,
+            (void **)&sessionManager);
+        IMMDevice_Release(device);
+        if (FAILED(hr)) {
+            continue;
+        }
+        hr = IAudioSessionManager2_GetSessionEnumerator(sessionManager, &sessionEnumerator);
+        if (FAILED(hr)) {
+            IAudioSessionManager2_Release(sessionManager);
+            continue;
+        }
+        if (FAILED(IAudioSessionEnumerator_GetCount(sessionEnumerator, &sessionCount))) {
+            IAudioSessionEnumerator_Release(sessionEnumerator);
+            IAudioSessionManager2_Release(sessionManager);
+            continue;
+        }
+
+        for (sessionIndex = 0; sessionIndex < sessionCount; sessionIndex++) {
+            IAudioSessionControl *sessionControl = NULL;
+            IAudioSessionControl2 *sessionControl2 = NULL;
+            AudioSessionState sessionState;
+            DWORD pid = 0;
+            float peak = 1.0f;
+            int existing;
+
+            if (FAILED(IAudioSessionEnumerator_GetSession(
+                    sessionEnumerator, sessionIndex, &sessionControl))) {
+                continue;
+            }
+            if (FAILED(IAudioSessionControl_GetState(sessionControl, &sessionState)) ||
+                sessionState != AudioSessionStateActive ||
+                FAILED(IAudioSessionControl_QueryInterface(
+                    sessionControl, &HELPER_IID_IAudioSessionControl2,
+                    (void **)&sessionControl2)) ||
+                FAILED(IAudioSessionControl2_GetProcessId(sessionControl2, &pid)) ||
+                pid == 0 || pid == excludedPid || pid == GetCurrentProcessId()) {
+                if (sessionControl2) IAudioSessionControl2_Release(sessionControl2);
+                IAudioSessionControl_Release(sessionControl);
+                continue;
+            }
+
+            existing = find_session_process(processes, count, pid);
+            if (existing >= 0) {
+                if (peak > processes[existing].peak) processes[existing].peak = peak;
+            } else if (count < MAX_ACTIVE_SESSION_PROCESSES) {
+                processes[count].pid = pid;
+                processes[count].peak = peak;
+                count++;
+            }
+            IAudioSessionControl2_Release(sessionControl2);
+            IAudioSessionControl_Release(sessionControl);
+        }
+        IAudioSessionEnumerator_Release(sessionEnumerator);
+        IAudioSessionManager2_Release(sessionManager);
+    }
+
+    IMMDeviceCollection_Release(deviceCollection);
+    IMMDeviceEnumerator_Release(deviceEnumerator);
+    *processCount = count;
+    return S_OK;
+}
+
+static int run_session_watch(DWORD excludedPid)
+{
+    ActiveSessionProcess previous[MAX_ACTIVE_SESSION_PROCESSES];
+    UINT32 previousCount = 0;
+    DWORD windowsBuild = get_windows_build_number();
+
+    if (windowsBuild < MIN_APPLICATION_CAPTURE_BUILD) {
+        emit_event("error", "unsupported_windows_build",
+                   "Application audio capture requires Windows build %lu",
+                   (unsigned long)MIN_APPLICATION_CAPTURE_BUILD);
+        return 2;
+    }
+    printf("{\"type\":\"ready\",\"windowsBuild\":%lu,\"minimumWindowsBuild\":%lu}\n",
+           (unsigned long)windowsBuild, (unsigned long)MIN_APPLICATION_CAPTURE_BUILD);
+    fflush(stdout);
+
+    while (InterlockedCompareExchange(&g_running, TRUE, TRUE)) {
+        ActiveSessionProcess current[MAX_ACTIVE_SESSION_PROCESSES];
+        UINT32 currentCount = 0;
+        UINT32 index;
+        HRESULT hr = collect_active_session_processes(excludedPid, current, &currentCount);
+        if (FAILED(hr)) {
+            emit_event("warning", "session_enumeration_failed",
+                       "Audio session enumeration failed (hr=0x%08lx)",
+                       (unsigned long)hr);
+            Sleep(SESSION_WATCH_INTERVAL_MS);
+            continue;
+        }
+
+        for (index = 0; index < currentCount; index++) {
+            emit_session_event("active", current[index].pid, current[index].peak);
+        }
+        for (index = 0; index < previousCount; index++) {
+            if (find_session_process(current, currentCount, previous[index].pid) < 0) {
+                emit_session_event("inactive", previous[index].pid, 0.0f);
+            }
+        }
+        memcpy(previous, current, currentCount * sizeof(ActiveSessionProcess));
+        previousCount = currentCount;
+        Sleep(SESSION_WATCH_INTERVAL_MS);
+    }
+    return 0;
+}
+
+/* ========================================================================
  * Probe
  * ======================================================================== */
 
@@ -541,17 +766,19 @@ static int run_probe(void)
 {
     IAudioClient *audioClient = NULL;
     const char *errorCode = NULL;
+    DWORD windowsBuild = get_windows_build_number();
     HRESULT hr;
 
-    hr = activate_process_loopback(GetCurrentProcessId(), DEFAULT_SAMPLE_RATE, &audioClient,
-                                   &errorCode);
+    hr = activate_process_loopback(
+        GetCurrentProcessId(), PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        DEFAULT_SAMPLE_RATE, &audioClient, &errorCode);
     if (FAILED(hr)) {
-        emit_probe_result(FALSE, errorCode, hr);
+        emit_probe_result(FALSE, errorCode, hr, windowsBuild);
         return 0;
     }
 
     IAudioClient_Release(audioClient);
-    emit_probe_result(TRUE, NULL, S_OK);
+    emit_probe_result(TRUE, NULL, S_OK, windowsBuild);
     return 0;
 }
 
@@ -583,34 +810,75 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrlType)
 int main(int argc, char *argv[])
 {
     const char *command = argc > 1 ? argv[1] : NULL;
-    DWORD excludePid = GetCurrentProcessId();
+    DWORD targetPid = GetCurrentProcessId();
+    PROCESS_LOOPBACK_MODE loopbackMode = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+    BOOL pidModeSpecified = FALSE;
     UINT32 sampleRate = DEFAULT_SAMPLE_RATE;
+    DWORD windowsBuild;
     HRESULT hr;
     int exitCode;
     int i;
 
-    if (!command || (strcmp(command, "probe") != 0 && strcmp(command, "start") != 0)) {
-        fprintf(stderr, "Usage: windows-system-audio-helper <probe|start> "
-                        "[--exclude-pid N] [--sample-rate N]\n");
+    if (!command ||
+        (strcmp(command, "probe") != 0 && strcmp(command, "start") != 0 &&
+         strcmp(command, "watch-sessions") != 0)) {
+        fprintf(stderr, "Usage: windows-system-audio-helper <probe|start|watch-sessions> "
+                        "[--exclude-pid N | --include-pid N] [--sample-rate N]\n");
         return 1;
     }
 
-    for (i = 2; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--exclude-pid") == 0) {
-            excludePid = (DWORD)strtoul(argv[++i], NULL, 10);
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--exclude-pid") == 0 ||
+            strcmp(argv[i], "--include-pid") == 0) {
+            if (pidModeSpecified || i + 1 >= argc) {
+                fprintf(stderr, "Specify exactly one process-tree capture mode\n");
+                return 1;
+            }
+            loopbackMode = strcmp(argv[i], "--include-pid") == 0
+                               ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+                               : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+            targetPid = (DWORD)strtoul(argv[++i], NULL, 10);
+            pidModeSpecified = TRUE;
         } else if (strcmp(argv[i], "--sample-rate") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing --sample-rate value\n");
+                return 1;
+            }
             sampleRate = (UINT32)strtoul(argv[++i], NULL, 10);
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            return 1;
         }
     }
-    if (excludePid == 0 || sampleRate == 0) {
-        fprintf(stderr, "Invalid --exclude-pid or --sample-rate value\n");
+    if (targetPid == 0 || sampleRate == 0) {
+        fprintf(stderr, "Invalid process id or sample-rate value\n");
         return 1;
+    }
+    if (strcmp(command, "watch-sessions") == 0 &&
+        loopbackMode == PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE) {
+        fprintf(stderr, "watch-sessions accepts only --exclude-pid\n");
+        return 1;
+    }
+    windowsBuild = get_windows_build_number();
+    if ((strcmp(command, "watch-sessions") == 0 ||
+         loopbackMode == PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE) &&
+        windowsBuild < MIN_APPLICATION_CAPTURE_BUILD) {
+        if (strcmp(command, "watch-sessions") == 0) {
+            emit_event("error", "unsupported_windows_build",
+                       "Application audio capture requires Windows build %lu",
+                       (unsigned long)MIN_APPLICATION_CAPTURE_BUILD);
+        } else {
+            emit_event("error", "unsupported_windows_build",
+                       "Include-process capture requires Windows build %lu",
+                       (unsigned long)MIN_APPLICATION_CAPTURE_BUILD);
+        }
+        return 2;
     }
 
     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         if (strcmp(command, "probe") == 0) {
-            emit_probe_result(FALSE, "com_init_failed", hr);
+            emit_probe_result(FALSE, "com_init_failed", hr, windowsBuild);
             return 0;
         }
         emit_event("error", "com_init_failed", "COM initialization failed (hr=0x%08lx)",
@@ -621,7 +889,6 @@ int main(int argc, char *argv[])
     if (strcmp(command, "probe") == 0) {
         exitCode = run_probe();
     } else {
-        _setmode(_fileno(stdout), _O_BINARY);
         SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
         HANDLE stdinThread = CreateThread(NULL, 0, stdin_monitor_thread, NULL, 0, NULL);
         if (stdinThread) {
@@ -629,7 +896,12 @@ int main(int argc, char *argv[])
         } else {
             emit_event("warning", "stdin_monitor_failed", "Parent-death detection unavailable");
         }
-        exitCode = run_capture(excludePid, sampleRate);
+        if (strcmp(command, "start") == 0) {
+            _setmode(_fileno(stdout), _O_BINARY);
+            exitCode = run_capture(targetPid, loopbackMode, sampleRate);
+        } else {
+            exitCode = run_session_watch(targetPid);
+        }
     }
 
     CoUninitialize();

@@ -4,6 +4,7 @@ const Database = require("better-sqlite3");
 const CaptureEvidenceStore = require("../../src/jarvis/main/CaptureEvidenceStore");
 const ProcessingJobRunner = require("../../src/jarvis/main/ProcessingJobRunner");
 const HeavyJobGate = require("../../src/jarvis/main/HeavyJobGate");
+const ResourceGovernor = require("../../src/jarvis/main/ResourceGovernor");
 const PreviewTranscriptionScheduler = require("../../src/jarvis/main/PreviewTranscriptionScheduler");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const { applyJarvisMigrations } = require("../../src/jarvis/main/JarvisMigrations");
@@ -719,6 +720,93 @@ test("admitted heavy work receives bounded context and stores the actual device"
       error_code: null,
       execution_device: "cuda",
     }
+  );
+});
+
+test("CUDA-unavailable final transcription and compression drain durably on bounded CPU", async (t) => {
+  const governor = new ResourceGovernor({
+    now: () => 2_000,
+    telemetryProvider: async () => ({
+      telemetryAvailable: true,
+      processTelemetryAvailable: true,
+      gpus: [],
+      processes: [],
+      ownedPids: [],
+      externalGpuBusy: false,
+    }),
+    cudaProvider: async () => ({
+      installed: false,
+      verified: false,
+      quarantined: false,
+      gpuUuid: null,
+      peakVramMb: null,
+    }),
+    cpuProvider: async () => ({ loadPct: 20, telemetryAvailable: true }),
+    memoryProvider: async () => ({ loadPct: 20, telemetryAvailable: true }),
+    powerProvider: async () => ({
+      onAcPower: true,
+      batteryPresent: false,
+      batteryLevelPct: null,
+      batterySaver: false,
+      telemetryAvailable: true,
+    }),
+  });
+  const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+  seedJob(db, { id: "final-job", priority: 30 });
+  seedJob(db, {
+    id: "compression-job",
+    jobType: "compress_chunk",
+    priority: 60,
+    inputHash: "compression-input",
+  });
+  const contexts = [];
+  const handle = async (job, context) => {
+    contexts.push({ id: job.id, ...context });
+    return { executionDevice: "cpu" };
+  };
+  runner.register("transcribe_chunk", handle);
+  runner.register("compress_chunk", handle);
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(contexts, [
+    {
+      id: "final-job",
+      action: "run_cpu",
+      device: "cpu",
+      cpuThreads: 4,
+      lowPriority: true,
+      selectedGpuUuid: null,
+    },
+    {
+      id: "compression-job",
+      action: "run_cpu",
+      device: "cpu",
+      cpuThreads: 4,
+      lowPriority: true,
+      selectedGpuUuid: null,
+    },
+  ]);
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT id, state, blocked_reason, execution_device FROM processing_jobs ORDER BY priority"
+      )
+      .all(),
+    [
+      {
+        id: "final-job",
+        state: "completed",
+        blocked_reason: null,
+        execution_device: "cpu",
+      },
+      {
+        id: "compression-job",
+        state: "completed",
+        blocked_reason: null,
+        execution_device: "cpu",
+      },
+    ]
   );
 });
 

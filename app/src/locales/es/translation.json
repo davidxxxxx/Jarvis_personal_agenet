@@ -99,6 +99,7 @@
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
+      "unsupported_microphone": "Choose a physical microphone. Virtual and loopback devices cannot be used to bind your voice.",
       "model_error": "The local voice model is temporarily unavailable. Retry after the model is ready."
     },
     "audioLevel": "Audio level",
@@ -109,10 +110,16 @@
     "localOnly": "Local only",
     "defaultMicrophone": "System default microphone",
     "micLevel": "Microphone level",
+    "micLevelState": {
+      "idle": "Waiting to record",
+      "quiet": "No sound detected",
+      "audible": "Sound detected"
+    },
     "micReconnecting": "Microphone disconnected. Reconnecting (attempt {{count}})…",
     "micRestored": "Microphone restored: {{device}}",
     "micFallback": "Preferred microphone disconnected. Continuing with {{device}}.",
     "recordingError": "Recording could not continue. Check the microphone and try again.",
+    "transcriptionPaused": "Live transcription is paused. Audio is still being saved and will be completed later.",
     "operationError": "Operation failed. Please try again.",
     "capture": {
       "groupLabel": "Capture audio",
@@ -233,10 +240,16 @@
       "keyRemoved": "MiniMax key removed.",
       "budgetTitle": "Personal-agent cloud budget",
       "budgetLabel": "MiniMax monthly hard limit (USD)",
+      "budgetModeLabel": "MiniMax budget mode",
+      "modeOff": "Off",
+      "modeCapped": "Monthly limit",
+      "modeUnlimited": "No limit",
+      "unlimitedWarning": "No limit may create ongoing charges. Usage is still tracked, but requests will not stop at an amount.",
       "applyBudget": "Apply MiniMax budget",
       "budgetSaved": "MiniMax budget updated.",
       "period": "{{monthKey}} · {{timezone}}",
       "usageSummary": "Spent {{spent}} · Reserved {{reserved}} · Remaining {{remaining}}",
+      "usageUnlimitedSummary": "Spent {{spent}} · Reserved {{reserved}} · No limit",
       "disabled": "MiniMax cloud analysis is disabled by the $0 limit.",
       "usageUnknown": "Usage could not be verified. MiniMax analysis is blocked for this month.",
       "overLimit": "The saved limit is below this month's committed usage.",
@@ -244,6 +257,57 @@
       "invalidBudget": "Enter a monthly limit from $0 to $10.",
       "settingsError": "MiniMax settings are temporarily unavailable.",
       "retrySettings": "Retry MiniMax settings"
+    },
+    "preparation": {
+      "checking_model": "Checking speech model…",
+      "downloading_model": "Downloading speech model…",
+      "checking_microphone": "Checking microphone…",
+      "starting_audio": "Starting audio capture…"
+    },
+    "settingsDrawer": {
+      "title": "Assistant settings",
+      "description": "Cloud budget, transcription quality, and voice profile.",
+      "open": "Open assistant settings",
+      "close": "Close assistant settings",
+      "dismiss": "Dismiss assistant settings"
+    },
+    "resourceGovernance": {
+      "title": "All-day resource priority",
+      "description": "Choose how quickly Jarvis yields the GPU and resumes background processing.",
+      "loading": "Loading resource settings…",
+      "profiles": {
+        "game_priority": { "title": "Game priority", "description": "Yield early and resume slowly." },
+        "balanced": { "title": "Balanced", "description": "Ignore light GPU use and share safely." },
+        "processing_priority": { "title": "Processing priority", "description": "Use more idle GPU capacity." }
+      },
+      "applicationAudio": {
+        "title": "Separar el audio del ordenador por aplicación",
+        "description": "Seguir solo las aplicaciones que emiten sonido. Si falla, usar la mezcla del sistema sin adivinar el origen.",
+        "trackLimit": "Máximo de pistas de aplicaciones simultáneas",
+        "runtime": "Grabando {{active}} pistas de aplicaciones (límite {{limit}}) · {{fallback}} fuentes degradadas",
+        "idle": "Se iniciará con la próxima grabación; los juegos a pantalla completa conservan como máximo dos pistas."
+      },
+      "fullscreenGuarantee": "Full-screen games always take priority. Safe audio capture continues while background work pauses.",
+      "advanced": "Advanced settings",
+      "customized": "Customized",
+      "gpuThreshold": "External GPU busy threshold (%)",
+      "gpuThresholdHelp": "Jarvis yields only when another process is using the selected GPU and total utilization reaches this level.",
+      "recoveryWait": "Recovery wait (seconds)",
+      "recoveryWaitHelp": "Continuous healthy time required before paused background work resumes.",
+      "applyAdvanced": "Apply advanced settings",
+      "saving": "Saving…",
+      "saved": "Resource priority updated.",
+      "error": "Resource settings are temporarily unavailable.",
+      "retry": "Retry resource settings"
+    },
+    "currentSummary": {
+      "title": "This recording's summary",
+      "loading": "Generating the final summary…",
+      "unavailable": "The summary is not available yet. Your recording and transcript are saved.",
+      "retry": "Retry summary",
+      "decisions": "Key decisions",
+      "todos": "To-dos",
+      "suggestions": "Suggestions"
     },
     "status": {
       "idle": "Not recording",

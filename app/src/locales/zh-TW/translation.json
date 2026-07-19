@@ -99,6 +99,7 @@
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
+      "unsupported_microphone": "Choose a physical microphone. Virtual and loopback devices cannot be used to bind your voice.",
       "model_error": "The local voice model is temporarily unavailable. Retry after the model is ready."
     },
     "audioLevel": "Audio level",
@@ -109,10 +110,16 @@
     "localOnly": "Local only",
     "defaultMicrophone": "System default microphone",
     "micLevel": "Microphone level",
+    "micLevelState": {
+      "idle": "等待開始錄音",
+      "quiet": "目前沒有聲音",
+      "audible": "偵測到聲音"
+    },
     "micReconnecting": "Microphone disconnected. Reconnecting (attempt {{count}})…",
     "micRestored": "Microphone restored: {{device}}",
     "micFallback": "Preferred microphone disconnected. Continuing with {{device}}.",
     "recordingError": "Recording could not continue. Check the microphone and try again.",
+    "transcriptionPaused": "即時轉寫已暫停，音訊仍在安全儲存，稍後會自動補齊。",
     "operationError": "Operation failed. Please try again.",
     "capture": {
       "groupLabel": "Capture audio",
@@ -233,10 +240,16 @@
       "keyRemoved": "MiniMax Key 已移除。",
       "budgetTitle": "個人助理雲端預算",
       "budgetLabel": "MiniMax 每月硬預算上限（美元）",
+      "budgetModeLabel": "MiniMax 預算模式",
+      "modeOff": "關閉",
+      "modeCapped": "每月上限",
+      "modeUnlimited": "不設上限",
+      "unlimitedWarning": "不設上限可能產生持續費用。Jarvis 仍會記錄用量，但不會因金額停止請求。",
       "applyBudget": "套用 MiniMax 預算",
       "budgetSaved": "MiniMax 預算已更新。",
       "period": "{{monthKey}} · {{timezone}}",
       "usageSummary": "已花費 {{spent}} · 已預留 {{reserved}} · 剩餘 {{remaining}}",
+      "usageUnlimitedSummary": "已用 {{spent}} · 已預留 {{reserved}} · 不設上限",
       "disabled": "$0 上限已停用 MiniMax 雲端分析。",
       "usageUnknown": "費用無法核實，本月 MiniMax 分析已安全阻止。",
       "overLimit": "目前儲存的上限低於本月已確認用量。",
@@ -244,6 +257,66 @@
       "invalidBudget": "請輸入 $0 到 $10 的每月上限。",
       "settingsError": "MiniMax 設定暫時無法使用。",
       "retrySettings": "重試 MiniMax 設定"
+    },
+    "preparation": {
+      "checking_model": "正在檢查語音模型…",
+      "downloading_model": "正在下載語音模型…",
+      "checking_microphone": "正在檢查麥克風…",
+      "starting_audio": "正在啟動音訊擷取…"
+    },
+    "settingsDrawer": {
+      "title": "助理設定",
+      "description": "集中管理雲端預算、轉寫品質和聲紋檔案。",
+      "open": "開啟助理設定",
+      "close": "關閉助理設定",
+      "dismiss": "收起助理設定"
+    },
+    "resourceGovernance": {
+      "title": "全天運行資源優先級",
+      "description": "控制 Jarvis 何時主動讓出 GPU，以及何時恢復背景補齊。",
+      "loading": "正在載入資源設定…",
+      "profiles": {
+        "game_priority": {
+          "title": "遊戲優先",
+          "description": "更早讓路，穩定後較慢恢復。"
+        },
+        "balanced": {
+          "title": "平衡",
+          "description": "忽略輕量 GPU 佔用，安全共享資源。"
+        },
+        "processing_priority": {
+          "title": "處理優先",
+          "description": "更多利用閒置 GPU 能力。"
+        }
+      },
+      "applicationAudio": {
+        "title": "按應用程式分離電腦聲音",
+        "description": "只追蹤正在發聲的應用程式；失敗時退回系統混音，確保不漏音且不猜來源。",
+        "trackLimit": "最多同時保留的獨立應用程式音軌",
+        "runtime": "正在錄製 {{active}} 個應用程式音軌（上限 {{limit}}）· {{fallback}} 個來源已降級",
+        "idle": "將在下次錄音時啟動；全螢幕遊戲期間最多保留兩個應用程式音軌。"
+      },
+      "fullscreenGuarantee": "全螢幕遊戲始終絕對優先。安全錄音繼續，即時轉寫、聲紋、壓縮、總結和 GPU 推理暫停。",
+      "advanced": "進階設定",
+      "customized": "已自訂",
+      "gpuThreshold": "外部 GPU 忙碌門檻（%）",
+      "gpuThresholdHelp": "只有其他程序正在使用選定 GPU，且總利用率達到此值時，Jarvis 才主動讓路。",
+      "recoveryWait": "恢復等待時間（秒）",
+      "recoveryWaitHelp": "資源持續健康達到此時間後，暫停的背景工作才恢復。",
+      "applyAdvanced": "套用進階設定",
+      "saving": "正在儲存…",
+      "saved": "資源優先級已更新。",
+      "error": "資源設定暫時無法使用。",
+      "retry": "重試資源設定"
+    },
+    "currentSummary": {
+      "title": "本次錄音摘要",
+      "loading": "正在產生完整摘要…",
+      "unavailable": "摘要暫時無法使用，錄音和完整轉寫已安全儲存。",
+      "retry": "重試摘要",
+      "decisions": "關鍵決定",
+      "todos": "待辦事項",
+      "suggestions": "建議"
     },
     "status": {
       "idle": "Not recording",

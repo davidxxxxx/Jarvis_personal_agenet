@@ -468,4 +468,53 @@ describe("RecordingControls microphone recovery", () => {
       "Voice activity detection is unavailable. Audio is being kept continuously."
     );
   });
+
+  it("shows transcription suspension as non-fatal while recording continues", async () => {
+    await i18n.changeLanguage("en");
+    useJarvisStore.setState({
+      sourceStates: { mic: "recording", system: "idle" },
+    });
+
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          transcriptionWarning: "Whisper is paused for fullscreen yield",
+        })}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        "Live transcription is paused. Audio is still being saved and will be completed later."
+      )
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Recording could not continue. Check the microphone and try again.")
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not retain a transcription warning after a recording is completed", async () => {
+    await i18n.changeLanguage("en");
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: "s1",
+            status: "completed",
+            startedAt: 0,
+            activeSince: null,
+            accumulatedMs: 100,
+            errorCode: null,
+          },
+          transcriptionWarning: "Whisper is paused for fullscreen yield",
+        })}
+      />
+    );
+
+    expect(
+      screen.queryByText(
+        "Live transcription is paused. Audio is still being saved and will be completed later."
+      )
+    ).not.toBeInTheDocument();
+  });
 });

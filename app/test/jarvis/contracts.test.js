@@ -7,6 +7,8 @@ const {
   assertCaptureMode,
   assertSourceType,
   assertRetentionMode,
+  normalizeResourceGovernanceSettings,
+  normalizeApplicationAudioSettings,
 } = require("../../src/jarvis/shared/contracts");
 const registerJarvisIpcImpl = require("../../src/jarvis/main/registerJarvisIpc");
 
@@ -81,6 +83,85 @@ function createRepository(overrides = {}) {
     ...overrides,
   };
 }
+
+test("activity classification IPC exposes only decision evidence and normalized applications", () => {
+  const handlers = new Map();
+  const repository = createRepository({
+    listSessionActivityClassifications: (sessionId) => [
+      {
+        id: "classification-1",
+        sessionId,
+        startedAt: 1_000,
+        endedAt: 91_000,
+        category: "learning",
+        confidence: 0.88,
+        decision: "adopted",
+        source: "minimax",
+        reason: "course-like explanatory content",
+        sourceAttribution: "application_and_microphone",
+        evidence: {
+          activityId: "activity-1",
+          applicationKeys: ["Chrome", "C:\\private\\chrome.exe", "Chrome"],
+          allowSummary: true,
+          allowSuggestions: false,
+          allowTodos: false,
+          evidenceSegmentIds: ["segment-1"],
+          inputHash: "private-input-hash",
+        },
+        supersedesId: "private-history-id",
+        userCorrectedAt: null,
+        createdAt: 100_000,
+        updatedAt: 100_000,
+        embedding: [0.5],
+        windowTitle: "private title",
+      },
+    ],
+  });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository,
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const result = handlers.get(CHANNELS.listActivityClassifications)(null, "session-1");
+  assert.deepEqual(result, [
+    {
+      id: "classification-1",
+      sessionId: "session-1",
+      startedAt: 1_000,
+      endedAt: 91_000,
+      category: "learning",
+      confidence: 0.88,
+      decision: "adopted",
+      source: "minimax",
+      reason: "course-like explanatory content",
+      sourceAttribution: "application_and_microphone",
+      applications: ["Chrome", "Chrome"],
+      allowSummary: true,
+      allowSuggestions: false,
+      allowTodos: false,
+      evidenceSegmentIds: ["segment-1"],
+      createdAt: 100_000,
+      updatedAt: 100_000,
+    },
+  ]);
+  const serialized = JSON.stringify(result);
+  for (const privateValue of [
+    "private-input-hash",
+    "private-history-id",
+    "private title",
+    "private\\chrome.exe",
+    "embedding",
+  ]) {
+    assert.equal(serialized.includes(privateValue), false);
+  }
+  assert.throws(() => handlers.get(CHANNELS.listActivityClassifications)(null, "../escape"));
+  assert.throws(() =>
+    handlers.get(CHANNELS.listActivityClassifications)(null, "session-1", "extra")
+  );
+});
 
 test("v2 knowledge IPC projects bounded safe fields and keeps action ownership in main", async () => {
   const calls = [];
@@ -332,6 +413,16 @@ function createIpcHarness(overrides = {}) {
       return { ...this.getStatus(), ...input };
     },
   };
+  const resourceSettings = {
+    getStatus: () => ({
+      profile: "balanced",
+      externalGpuThresholdPct: 45,
+      recoveryWaitMs: 60_000,
+    }),
+    setPolicy(input) {
+      return input;
+    },
+  };
   registerJarvisIpc({
     ipcMain,
     repository,
@@ -340,6 +431,7 @@ function createIpcHarness(overrides = {}) {
     environmentManager,
     analysisScheduler,
     analysisBudgetGuard,
+    resourceSettings,
   });
   return {
     handlers,
@@ -349,6 +441,7 @@ function createIpcHarness(overrides = {}) {
     environmentManager,
     analysisScheduler,
     analysisBudgetGuard,
+    resourceSettings,
   };
 }
 
@@ -635,6 +728,11 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
     id: "track_1",
     session_id: "s1",
     source_type: "mic",
+    track_kind: "mic",
+    application_key: null,
+    application_display_name: null,
+    attribution_state: "exact",
+    capture_generation: 0,
     device_id: "private-device-id",
     device_label: "Private microphone",
     strategy: "private-capture-strategy",
@@ -644,6 +742,21 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
     ended_at: 5_000,
     state: "ended",
     gaps: [privateGap],
+  };
+  const privateApplicationInterval = {
+    id: "interval_1",
+    session_id: "s1",
+    track_id: "track_1",
+    interval_kind: "mixed_fallback",
+    application_key: null,
+    attribution_state: "mixed_unknown",
+    capture_generation: 1,
+    started_at: 2_000,
+    ended_at: 2_500,
+    reason: "application_capture_failed",
+    raw_process_path: "C:\\private\\chrome.exe",
+    raw_window_title: "Private meeting title",
+    created_at: 2_000,
   };
   const privateChunk = {
     id: "chunk_1",
@@ -675,6 +788,7 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
         finalized_at: 5_100,
         ready_at: 5_200,
         tracks: [privateTrack],
+        application_audio_intervals: [privateApplicationInterval],
         gaps: [privateGap],
         chunks: [privateChunk],
         segments: [],
@@ -692,6 +806,11 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
     "id",
     "session_id",
     "source_type",
+    "track_kind",
+    "application_key",
+    "application_display_name",
+    "attribution_state",
+    "capture_generation",
     "sample_rate",
     "channels",
     "started_at",
@@ -699,6 +818,38 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
     "state",
     "gaps",
   ]);
+  assert.deepEqual(Object.keys(result.application_audio_intervals[0]), [
+    "id",
+    "session_id",
+    "track_id",
+    "interval_kind",
+    "application_key",
+    "attribution_state",
+    "capture_generation",
+    "started_at",
+    "ended_at",
+    "reason",
+  ]);
+  assert.deepEqual(result.application_capture, {
+    exact_duration_ms: 0,
+    fallback_duration_ms: 500,
+    exact_coverage_pct: 0,
+    degraded_intervals: [
+      {
+        id: "interval_1",
+        session_id: "s1",
+        track_id: "track_1",
+        interval_kind: "mixed_fallback",
+        application_key: null,
+        attribution_state: "mixed_unknown",
+        capture_generation: 1,
+        started_at: 2_000,
+        ended_at: 2_500,
+        reason: "application_capture_failed",
+      },
+    ],
+    recovery_points: [],
+  });
   assert.deepEqual(Object.keys(result.gaps[0]), [
     "id",
     "track_id",
@@ -894,11 +1045,13 @@ test("contract exposes only the named Jarvis channels", () => {
       "finishCapture",
       "getAnalysisBudget",
       "getAnalysisStatus",
+      "getApplicationAudioSettings",
       "getCloudBudget",
       "getDailyDigest",
       "getEvidenceContext",
       "getKnowledgeOverview",
       "getMiniMaxConfig",
+      "getResourceGovernance",
       "getPersonDetail",
       "getRuntimeStatus",
       "getSession",
@@ -910,6 +1063,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "getVoiceEnrollmentStatus",
       "analyzeSession",
       "listAudioChunks",
+      "listActivityClassifications",
       "readAudioChunk",
       "listMemories",
       "listPeople",
@@ -932,8 +1086,10 @@ test("contract exposes only the named Jarvis channels", () => {
       "resumeCapture",
       "clearMiniMaxKey",
       "setAnalysisBudget",
+      "setApplicationAudioSettings",
       "setCloudBudget",
       "setMiniMaxKey",
+      "setResourceGovernance",
       "setSessionStatus",
       "setRetentionMode",
       "setTodoStatus",
@@ -961,6 +1117,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.createSession,
       CHANNELS.getSession,
       CHANNELS.listAudioChunks,
+      CHANNELS.listActivityClassifications,
       CHANNELS.readAudioChunk,
       CHANNELS.listPeople,
       CHANNELS.listSegments,
@@ -1008,10 +1165,12 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.analyzeSession,
       CHANNELS.getAnalysisStatus,
       CHANNELS.getAnalysisBudget,
+      CHANNELS.getResourceGovernance,
       CHANNELS.getMiniMaxConfig,
       CHANNELS.clearMiniMaxKey,
       CHANNELS.setMiniMaxKey,
       CHANNELS.setAnalysisBudget,
+      CHANNELS.setResourceGovernance,
       CHANNELS.decideKnowledgeSuggestion,
       CHANNELS.resolveKnowledgeConflict,
     ].sort()
@@ -1133,9 +1292,13 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
     assert.equal(serialized.includes(privateValue), false, privateValue);
   }
   assert.deepEqual(
-    await handlers.get(CHANNELS.regenerateDailyDigest)(null, { localDate: "2026-07-17" }),
+    await handlers.get(CHANNELS.regenerateDailyDigest)(null, {
+      localDate: "2026-07-17",
+      allowUsageUnknown: true,
+    }),
     result.status
   );
+  assert.deepEqual(calls[2], ["regenerate", { localDate: "2026-07-17", allowUsageUnknown: true }]);
   assert.deepEqual(
     calls.map(([name]) => name),
     ["get", "status", "regenerate", "status"]
@@ -1147,6 +1310,21 @@ test("daily digest IPC accepts only localDate and rebuilds a private-safe public
         timezone: "UTC",
       }),
     /only localDate|invalid structure/i
+  );
+  await assert.rejects(
+    async () =>
+      handlers.get(CHANNELS.regenerateDailyDigest)(null, {
+        localDate: "2026-07-17",
+      }),
+    /allowUsageUnknown|invalid structure|exact keys/i
+  );
+  await assert.rejects(
+    async () =>
+      handlers.get(CHANNELS.regenerateDailyDigest)(null, {
+        localDate: "2026-07-17",
+        allowUsageUnknown: "yes",
+      }),
+    /allowUsageUnknown.*boolean/i
   );
   await assert.rejects(
     async () => handlers.get(CHANNELS.getDailyDigest)(null, { localDate: "2026-02-29" }),
@@ -1425,6 +1603,157 @@ test("analysis budget IPC enforces exact policy input and returns a safe allowli
     assert.throws(() => handlers.get(CHANNELS.setAnalysisBudget)(null, invalid));
   }
   assert.equal(calls.length, 1);
+});
+
+test("resource governance IPC enforces exact presets and bounded advanced values", async () => {
+  const calls = [];
+  const { handlers, resourceSettings } = createIpcHarness();
+  resourceSettings.getStatus = () => ({
+    profile: "balanced",
+    externalGpuThresholdPct: 45,
+    recoveryWaitMs: 60_000,
+    privatePath: "C:\\private\\resource.json",
+  });
+  resourceSettings.setPolicy = async (input) => {
+    calls.push(input);
+    return { ...input, privatePath: "C:\\private\\resource.json" };
+  };
+
+  assert.deepEqual(await handlers.get(CHANNELS.getResourceGovernance)(null), {
+    profile: "balanced",
+    externalGpuThresholdPct: 45,
+    recoveryWaitMs: 60_000,
+  });
+  assert.deepEqual(
+    await handlers.get(CHANNELS.setResourceGovernance)(null, {
+      profile: "processing_priority",
+      externalGpuThresholdPct: 80,
+      recoveryWaitMs: 30_000,
+    }),
+    {
+      profile: "processing_priority",
+      externalGpuThresholdPct: 80,
+      recoveryWaitMs: 30_000,
+    }
+  );
+  assert.deepEqual(calls, [
+    {
+      profile: "processing_priority",
+      externalGpuThresholdPct: 80,
+      recoveryWaitMs: 30_000,
+    },
+  ]);
+  for (const invalid of [
+    { profile: "unknown", externalGpuThresholdPct: 45, recoveryWaitMs: 60_000 },
+    { profile: "balanced", externalGpuThresholdPct: 9, recoveryWaitMs: 60_000 },
+    { profile: "balanced", externalGpuThresholdPct: 45, recoveryWaitMs: 14_999 },
+    {
+      profile: "balanced",
+      externalGpuThresholdPct: 45,
+      recoveryWaitMs: 60_000,
+      extra: true,
+    },
+  ]) {
+    assert.throws(() => normalizeResourceGovernanceSettings(invalid));
+    assert.throws(() => handlers.get(CHANNELS.setResourceGovernance)(null, invalid));
+  }
+  assert.equal(calls.length, 1);
+});
+
+test("application audio IPC exposes bounded runtime state and exact 1-8 track settings", async () => {
+  const handlers = new Map();
+  const calls = [];
+  const applicationAudioSettings = {
+    getStatus: () => ({
+      enabled: true,
+      trackLimit: 4,
+      runtime: {
+        running: true,
+        configuredLimit: 4,
+        effectiveLimit: 2,
+        fullscreen: true,
+        activeTracks: [
+          {
+            applicationKey: "chrome",
+            applicationDisplayName: "Chrome",
+            captureGeneration: 3,
+            state: "recording",
+            processId: 1234,
+          },
+        ],
+        fallbacks: [
+          {
+            applicationKey: "kook",
+            applicationDisplayName: "KOOK",
+            reason: "capture_failed",
+            retryAt: 9_000,
+            state: "mixed_unknown",
+            executablePath: "C:\\private\\kook.exe",
+          },
+        ],
+      },
+      privatePath: "C:\\private\\application-audio.json",
+    }),
+    setPolicy: async (input) => {
+      calls.push(input);
+      return { ...applicationAudioSettings.getStatus(), ...input };
+    },
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository(),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    applicationAudioSettings,
+  });
+
+  const status = await handlers.get(CHANNELS.getApplicationAudioSettings)(null);
+  assert.deepEqual(status, {
+    enabled: true,
+    trackLimit: 4,
+    runtime: {
+      running: true,
+      configuredLimit: 4,
+      effectiveLimit: 2,
+      fullscreen: true,
+      activeTracks: [
+        {
+          applicationKey: "chrome",
+          applicationDisplayName: "Chrome",
+          captureGeneration: 3,
+          state: "recording",
+        },
+      ],
+      fallbacks: [
+        {
+          applicationKey: "kook",
+          applicationDisplayName: "KOOK",
+          reason: "capture_failed",
+          retryAt: 9_000,
+          state: "mixed_unknown",
+        },
+      ],
+    },
+  });
+  assert.deepEqual(
+    await handlers.get(CHANNELS.setApplicationAudioSettings)(null, {
+      enabled: false,
+      trackLimit: 8,
+    }),
+    { ...status, enabled: false, trackLimit: 8 }
+  );
+  assert.deepEqual(calls, [{ enabled: false, trackLimit: 8 }]);
+
+  for (const invalid of [
+    { enabled: "yes", trackLimit: 4 },
+    { enabled: true, trackLimit: 0 },
+    { enabled: true, trackLimit: 9 },
+    { enabled: true, trackLimit: 4, extra: true },
+  ]) {
+    assert.throws(() => normalizeApplicationAudioSettings(invalid));
+    assert.throws(() => handlers.get(CHANNELS.setApplicationAudioSettings)(null, invalid));
+  }
 });
 
 test("MiniMax and analysis budget IPC failures expose only fixed safe errors", async () => {

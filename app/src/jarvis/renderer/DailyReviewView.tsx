@@ -48,6 +48,8 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
+  const [confirmingPaidRetry, setConfirmingPaidRetry] = useState(false);
+  const [regenerationUncertain, setRegenerationUncertain] = useState(false);
   const generation = useRef(0);
   const pollState = status?.state ?? null;
 
@@ -61,8 +63,10 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
         setSaved(result.digest);
         setStatus(result.status);
         setFailed(false);
+        return true;
       } catch {
         if (generation.current === request) setFailed(true);
+        return false;
       } finally {
         if (showLoading && generation.current === request) setLoading(false);
       }
@@ -106,14 +110,38 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
     };
   }, [pollState, refresh]);
 
-  const regenerate = async () => {
+  const regenerate = async (allowUsageUnknown = false) => {
+    if (regenerating) return;
+    setRegenerating(true);
+    setRegenerationUncertain(false);
+    try {
+      setStatus(
+        allowUsageUnknown
+          ? await window.electronAPI.jarvis.regenerateDailyDigest(localDate, true)
+          : await window.electronAPI.jarvis.regenerateDailyDigest(localDate)
+      );
+      setConfirmingPaidRetry(false);
+      setFailed(false);
+    } catch {
+      setRegenerationUncertain(true);
+      const reconciled = await refresh(false);
+      if (reconciled) {
+        setConfirmingPaidRetry(false);
+        setRegenerationUncertain(false);
+      }
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  const reconcileUncertainRegeneration = async () => {
     if (regenerating) return;
     setRegenerating(true);
     try {
-      setStatus(await window.electronAPI.jarvis.regenerateDailyDigest(localDate));
-      setFailed(false);
-    } catch {
-      setFailed(true);
+      if (await refresh(false)) {
+        setConfirmingPaidRetry(false);
+        setRegenerationUncertain(false);
+      }
     } finally {
       setRegenerating(false);
     }
@@ -134,6 +162,12 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
         blocked: t("jarvis.dailyReview.status.blocked", { defaultValue: "Blocked / 暂时受阻" }),
       }[status.state]
     : null;
+  const usageUnknownBlocked =
+    status?.state === "blocked" && status.errorCode === "usage_unknown";
+  const regularRegenerateAvailable =
+    status?.retryable ||
+    status?.state === "not_generated" ||
+    (status?.state === "blocked" && !usageUnknownBlocked);
 
   return (
     <section className="rounded-xl border border-border/50 bg-card/70 p-4" aria-busy={loading}>
@@ -227,7 +261,7 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
         )
       )}
 
-      {(status?.retryable || status?.state === "not_generated") && (
+      {regularRegenerateAvailable && !regenerationUncertain && (
         <button
           type="button"
           disabled={regenerating}
@@ -238,6 +272,76 @@ export default function DailyReviewView({ localDate = currentLocalDate() }: Dail
             ? t("jarvis.dailyReview.regenerating", { defaultValue: "Queuing… / 正在排队…" })
             : t("jarvis.dailyReview.regenerate", { defaultValue: "Regenerate / 重新生成" })}
         </button>
+      )}
+      {usageUnknownBlocked && !confirmingPaidRetry && !regenerationUncertain && (
+        <button
+          type="button"
+          disabled={regenerating}
+          onClick={() => setConfirmingPaidRetry(true)}
+          className="mt-4 rounded-lg border border-amber-500/50 px-3 py-1.5 text-xs text-amber-700 disabled:opacity-50 dark:text-amber-300"
+        >
+          {t("jarvis.dailyReview.retryAnyway", {
+            defaultValue: "Retry anyway / 仍然重试",
+          })}
+        </button>
+      )}
+      {usageUnknownBlocked && confirmingPaidRetry && (
+        <div className="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+          <p className="text-xs leading-5 text-foreground">
+            {regenerationUncertain
+              ? t("jarvis.dailyReview.submissionUncertain", {
+                  defaultValue:
+                    "The request may already have been accepted. Check its status before any retry. / 请求可能已经被接受，请先查询状态，不能再次付费重试。",
+                })
+              : t("jarvis.dailyReview.usageUnknownWarning", {
+                  defaultValue:
+                    "The previous request may already have been charged. Retrying sends one new paid request. / 上一次请求可能已经计费，再次重试会发送一个新的付费请求。",
+                })}
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {regenerationUncertain ? (
+              <button
+                type="button"
+                disabled={regenerating}
+                onClick={() => void reconcileUncertainRegeneration()}
+                className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+              >
+                {regenerating
+                  ? t("jarvis.dailyReview.checkingStatus", {
+                      defaultValue: "Checking… / 正在查询…",
+                    })
+                  : t("jarvis.dailyReview.checkStatus", {
+                      defaultValue: "Check status / 查询状态",
+                    })}
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  disabled={regenerating}
+                  onClick={() => void regenerate(true)}
+                  className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+                >
+                  {regenerating
+                    ? t("jarvis.dailyReview.regenerating", {
+                        defaultValue: "Queuing… / 正在排队…",
+                      })
+                    : t("jarvis.dailyReview.confirmPaidRetry", {
+                        defaultValue: "Confirm paid retry / 确认再次付费重试",
+                      })}
+                </button>
+                <button
+                  type="button"
+                  disabled={regenerating}
+                  onClick={() => setConfirmingPaidRetry(false)}
+                  className="rounded-lg border border-border px-3 py-1.5 text-xs disabled:opacity-50"
+                >
+                  {t("common.cancel", { defaultValue: "Cancel / 取消" })}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </section>
   );

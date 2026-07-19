@@ -3,6 +3,9 @@ const JarvisTranscriptionWorker = require("./JarvisTranscriptionWorker");
 const SessionDiarizationWorker = require("./SessionDiarizationWorker");
 const SpeakerProcessingPolicy = require("./SpeakerProcessingPolicy");
 const SpeakerIdentityResolutionWorker = require("./SpeakerIdentityResolutionWorker");
+const DualSpeakerVerifier = require("./DualSpeakerVerifier");
+const DualSpeakerEvidenceProvider = require("./DualSpeakerEvidenceProvider");
+const DualSpeakerIdentityResolver = require("./DualSpeakerIdentityResolver");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
 const ResourceGovernor = require("./ResourceGovernor");
@@ -11,7 +14,10 @@ const HeavyJobGate = require("./HeavyJobGate");
 const PreviewTranscriptionScheduler = require("./PreviewTranscriptionScheduler");
 const { createHash } = require("node:crypto");
 const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
+const { resolveFullscreenYieldActive } = require("./FullscreenYieldPolicy");
 const defaultSpeakerEmbeddingHelper = require("../../helpers/speakerEmbeddings");
+const { SpeakerEmbeddings } = require("../../helpers/speakerEmbeddings");
+const { SPEAKER_MODEL_KEYS } = require("./SpeakerModelManifest");
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
@@ -157,6 +163,7 @@ class JarvisProcessingRuntime {
     clearIntervalImpl = clearInterval,
     log = () => {},
     governor = null,
+    onResourceSnapshot = () => {},
     whisperController = null,
     startupBarrier = null,
     previewScheduler = null,
@@ -165,6 +172,7 @@ class JarvisProcessingRuntime {
     analysisBudgetGuard = null,
     dailyDigestScheduler = null,
     speakerProcessingPolicy = null,
+    dualSpeakerVerifier = null,
     prepareTranscriptionJobs = null,
   } = {}) {
     if (
@@ -193,6 +201,9 @@ class JarvisProcessingRuntime {
       throw new TypeError("interval functions are required");
     }
     if (typeof log !== "function") throw new TypeError("log must be a function");
+    if (typeof onResourceSnapshot !== "function") {
+      throw new TypeError("onResourceSnapshot must be a function");
+    }
     if (startupBarrier !== null && typeof startupBarrier?.then !== "function") {
       throw new TypeError("startupBarrier must be a promise or null");
     }
@@ -250,6 +261,13 @@ class JarvisProcessingRuntime {
     ) {
       throw new TypeError("speakerProcessingPolicy must be immutable and implement evaluate");
     }
+    if (
+      dualSpeakerVerifier !== null &&
+      (typeof dualSpeakerVerifier.screen !== "function" ||
+        typeof dualSpeakerVerifier.verify !== "function")
+    ) {
+      throw new TypeError("dualSpeakerVerifier must implement screen and verify");
+    }
     if (prepareTranscriptionJobs !== null && typeof prepareTranscriptionJobs !== "function") {
       throw new TypeError("prepareTranscriptionJobs must be a function or null");
     }
@@ -267,6 +285,7 @@ class JarvisProcessingRuntime {
     this.clearInterval = clearIntervalImpl;
     this.log = log;
     this.governor = governor;
+    this.onResourceSnapshot = onResourceSnapshot;
     this.whisperController = whisperController;
     this.startupBarrier = startupBarrier;
     this.previewScheduler = previewScheduler;
@@ -275,8 +294,10 @@ class JarvisProcessingRuntime {
     this.analysisBudgetGuard = analysisBudgetGuard;
     this.dailyDigestScheduler = dailyDigestScheduler;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
+    this.dualSpeakerVerifier = dualSpeakerVerifier;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
+    this.fullscreenYieldActive = false;
     this.timer = null;
     this.inFlight = null;
     this.startPromise = null;
@@ -302,6 +323,12 @@ class JarvisProcessingRuntime {
         this.log({ phase: "recovery", error });
       }
       await Promise.resolve(this.dailyDigestScheduler?.start?.());
+      if (this.stopping) return 0;
+      try {
+        await Promise.resolve(this.analysisScheduler?.recoverReadySessions?.());
+      } catch (error) {
+        this.log({ phase: "analysis_recovery", error });
+      }
       if (this.stopping) return 0;
       this._tickCloud({ startup: true });
       this.timer = this.setInterval(() => {
@@ -481,6 +508,22 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
+    if (this.stopping || !this.running) return 0;
+    try {
+      await Promise.resolve(this.onResourceSnapshot(resourceSnapshot));
+    } catch (error) {
+      this.log({ phase: "resource_snapshot", error });
+    }
+    if (this.stopping || !this.running) return 0;
+    this.fullscreenYieldActive = resolveFullscreenYieldActive(
+      resourceSnapshot,
+      this.fullscreenYieldActive
+    );
+    if (this.fullscreenYieldActive || resourceSnapshot?.reason === "cpu_load_high") {
+      this._tickPreview(resourceSnapshot);
+      return 0;
+    }
     try {
       await Promise.resolve(this.dailyDigestScheduler?.tick?.());
     } catch (error) {
@@ -488,8 +531,6 @@ class JarvisProcessingRuntime {
     }
     this._tickCloud();
     if (this.prepareTranscriptionJobs) await this.prepareTranscriptionJobs();
-    if (this.stopping || !this.running) return 0;
-    const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
     if (this.stopping || !this.running) return 0;
     let processed = await this._runJobPhase(startedAt, {
       priorityBefore: JOB_PRIORITY.preview,
@@ -594,6 +635,10 @@ function createJarvisProcessingRuntime({
   telemetryProvider,
   cpuProvider,
   powerProvider,
+  ownedPidsProvider = null,
+  foregroundActivityProvider,
+  onResourceSnapshot = () => {},
+  resourceSettings,
   previewEnabled = true,
   previewExecutor = null,
   previewPersist = null,
@@ -603,6 +648,10 @@ function createJarvisProcessingRuntime({
   sessionDiarizationWorker = null,
   speakerIdentityResolutionWorker = null,
   speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
+  primarySpeakerEmbeddingHelper = null,
+  reviewSpeakerEmbeddingHelper = null,
+  dualSpeakerVerifier = null,
+  speakerIdentityReleaseEvidence = null,
   cloudCompositionFactory = null,
   ...runtimeOptions
 } = {}) {
@@ -629,6 +678,9 @@ function createJarvisProcessingRuntime({
   }
   if (cloudCompositionFactory !== null && typeof cloudCompositionFactory !== "function") {
     throw new TypeError("cloudCompositionFactory must be a function or null");
+  }
+  if (ownedPidsProvider !== null && typeof ownedPidsProvider !== "function") {
+    throw new TypeError("ownedPidsProvider must be a function or null");
   }
   const configuredModel = model.trim();
   if (typeof service.configureTranscriptionModelVersion !== "function") {
@@ -700,11 +752,6 @@ function createJarvisProcessingRuntime({
     "listRejectedSpeakerPersonIds",
     "applySystemSpeakerResolutions",
   ].every((method) => typeof repository[method] === "function");
-  const effectiveIdentityResolutionWorker =
-    speakerIdentityResolutionWorker ??
-    (canBuildIdentityResolutionWorker
-      ? new SpeakerIdentityResolutionWorker({ repository, clock: now })
-      : null);
   const diarizationCapability = () => {
     if (sessionDiarizationWorker !== null) return { executionDevice: "cpu" };
     if (!canBuildDiarizationWorker) {
@@ -735,11 +782,15 @@ function createJarvisProcessingRuntime({
       ...(telemetryProvider ? { telemetryProvider } : {}),
       ...(cpuProvider ? { cpuProvider } : {}),
       ...(powerProvider ? { powerProvider } : {}),
+      ...(foregroundActivityProvider ? { foregroundActivityProvider } : {}),
+      ...(resourceSettings ? { resourceSettings } : {}),
       previewEnabled,
-      ownedPidsProvider: () =>
-        [process.pid, whisperManager?.serverManager?.process?.pid].filter(
-          (pid) => Number.isSafeInteger(pid) && pid > 0
-        ),
+      ownedPidsProvider:
+        ownedPidsProvider ??
+        (() =>
+          [process.pid, whisperManager?.serverManager?.process?.pid].filter(
+            (pid) => Number.isSafeInteger(pid) && pid > 0
+          )),
       cudaProvider: async () => {
         const startOptions = cudaManager?.getVerifiedStartOptions?.() ?? {
           useCuda: false,
@@ -756,6 +807,47 @@ function createJarvisProcessingRuntime({
       },
     });
   const effectiveGate = heavyGate ?? new HeavyJobGate();
+  const effectivePrimarySpeakerEmbeddingHelper =
+    primarySpeakerEmbeddingHelper ??
+    new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.PRIMARY });
+  const effectiveReviewSpeakerEmbeddingHelper =
+    reviewSpeakerEmbeddingHelper ??
+    new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.REVIEW });
+  const effectiveDualSpeakerVerifier =
+    dualSpeakerVerifier ??
+    new DualSpeakerVerifier({
+      primaryEmbeddings: effectivePrimarySpeakerEmbeddingHelper,
+      reviewEmbeddings: effectiveReviewSpeakerEmbeddingHelper,
+      resourceGovernor: effectiveGovernor,
+      releaseEvidence: speakerIdentityReleaseEvidence,
+    });
+  const canBuildDualIdentityResolutionWorker =
+    canBuildIdentityResolutionWorker &&
+    typeof repository.listSpeakerIdentityAudioWindows === "function" &&
+    typeof repository.replaceSpeakerClusterModelEmbeddings === "function" &&
+    typeof effectivePrimarySpeakerEmbeddingHelper.extractEmbedding === "function" &&
+    typeof effectiveReviewSpeakerEmbeddingHelper.extractEmbedding === "function";
+  const effectiveIdentityResolutionWorker =
+    speakerIdentityResolutionWorker ??
+    (canBuildIdentityResolutionWorker
+      ? new SpeakerIdentityResolutionWorker({
+          repository,
+          clock: now,
+          ...(canBuildDualIdentityResolutionWorker
+            ? {
+                dualEvidenceProvider: new DualSpeakerEvidenceProvider({
+                  repository,
+                  audioEvidenceReader: service.audioEvidenceReader,
+                  primaryEmbeddings: effectivePrimarySpeakerEmbeddingHelper,
+                  reviewEmbeddings: effectiveReviewSpeakerEmbeddingHelper,
+                }),
+                dualResolver: new DualSpeakerIdentityResolver({
+                  releaseEvidence: speakerIdentityReleaseEvidence,
+                }),
+              }
+            : {}),
+        })
+      : null);
   if (previewExecutor !== null && typeof previewExecutor !== "function") {
     throw new TypeError("previewExecutor must be a function or null");
   }
@@ -856,9 +948,11 @@ function createJarvisProcessingRuntime({
     now,
     log,
     governor: effectiveGovernor,
+    onResourceSnapshot,
     whisperController: effectiveWhisperController,
     previewScheduler: effectivePreviewScheduler,
     speakerProcessingPolicy,
+    dualSpeakerVerifier: effectiveDualSpeakerVerifier,
     prepareTranscriptionJobs: effectivePrepareTranscriptionJobs,
     ...runtimeOptions,
     ...(cloudComposition ?? {}),

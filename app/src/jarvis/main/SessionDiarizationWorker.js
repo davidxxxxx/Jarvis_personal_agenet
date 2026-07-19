@@ -32,16 +32,18 @@ function normalizeEmbedding(value, dimension) {
       input[index] = view.getFloat32(index * Float32Array.BYTES_PER_ELEMENT, true);
     }
   } else {
-    throw codedError("DIARIZATION_INVALID_EMBEDDING");
+    throw codedError("DIARIZATION_EMBEDDING_MISSING");
   }
-  if (input.length !== dimension) throw codedError("DIARIZATION_INVALID_EMBEDDING");
+  if (input.length !== dimension) {
+    throw codedError("DIARIZATION_EMBEDDING_DIMENSION_MISMATCH");
+  }
   let normSquared = 0;
   for (const component of input) {
-    if (!Number.isFinite(component)) throw codedError("DIARIZATION_INVALID_EMBEDDING");
+    if (!Number.isFinite(component)) throw codedError("DIARIZATION_EMBEDDING_NONFINITE");
     normSquared += component * component;
   }
   if (!Number.isFinite(normSquared) || normSquared <= 0) {
-    throw codedError("DIARIZATION_INVALID_EMBEDDING");
+    throw codedError("DIARIZATION_EMBEDDING_ZERO_NORM");
   }
   const norm = Math.sqrt(normSquared);
   const normalized = new Float32Array(dimension);
@@ -65,18 +67,21 @@ function normalizedTurn(raw, chunk, policy) {
   }
   const startMs = raw.startMs ?? raw.start * 1000;
   const endMs = raw.endMs ?? raw.end * 1000;
+  const boundaryToleranceMs = Number.isSafeInteger(policy.turnBoundaryToleranceMs)
+    ? policy.turnBoundaryToleranceMs
+    : 0;
   if (
     !Number.isFinite(startMs) ||
     !Number.isFinite(endMs) ||
     startMs < 0 ||
     endMs <= startMs ||
-    endMs > chunk.duration_ms
+    endMs > chunk.duration_ms + boundaryToleranceMs
   ) {
     throw codedError("DIARIZATION_INVALID_TURN");
   }
   const roundedStart = Math.round(startMs);
-  const roundedEnd = Math.round(endMs);
-  if (roundedEnd <= roundedStart || roundedEnd > chunk.duration_ms) {
+  const roundedEnd = Math.min(chunk.duration_ms, Math.round(endMs));
+  if (roundedEnd <= roundedStart) {
     throw codedError("DIARIZATION_INVALID_TURN");
   }
   const rawDurationMs = roundedEnd - roundedStart;

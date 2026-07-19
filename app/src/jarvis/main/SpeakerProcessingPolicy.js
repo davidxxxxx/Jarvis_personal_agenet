@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { SPEAKER_IDENTITY_MODEL_POLICY } = require("./SessionDiarizationPolicy");
 
 const TERMINAL_SESSION_STATES = new Set(["completed", "recovered", "failed"]);
 const TERMINAL_TRACK_STATES = new Set(["ended", "recovered", "failed"]);
@@ -196,15 +197,27 @@ function segmentRevisionRow(segment) {
 }
 
 class SpeakerProcessingPolicy {
-  constructor({ transcriptionInputVersion = 1, transcriptionModelVersion } = {}) {
+  constructor({
+    transcriptionInputVersion = 1,
+    transcriptionModelVersion,
+    identityModelPolicy = SPEAKER_IDENTITY_MODEL_POLICY,
+  } = {}) {
     if (!Number.isSafeInteger(transcriptionInputVersion) || transcriptionInputVersion < 1) {
       throw new TypeError("transcriptionInputVersion must be a positive safe integer");
     }
     if (typeof transcriptionModelVersion !== "string" || !transcriptionModelVersion.trim()) {
       throw new TypeError("transcriptionModelVersion must be a non-empty string");
     }
+    if (
+      !identityModelPolicy ||
+      !Object.isFrozen(identityModelPolicy) ||
+      identityModelPolicy.primary?.embeddingSpace === identityModelPolicy.review?.embeddingSpace
+    ) {
+      throw new TypeError("identityModelPolicy must contain immutable isolated model spaces");
+    }
     this.transcriptionInputVersion = transcriptionInputVersion;
     this.transcriptionModelVersion = transcriptionModelVersion.trim();
+    this.identityModelPolicy = identityModelPolicy;
     Object.freeze(this);
   }
 

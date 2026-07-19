@@ -61,6 +61,7 @@ function timeline(): JarvisSessionTimeline {
     finalized_at: 4_000,
     ready_at: 4_100,
     tracks: [],
+    application_audio_intervals: [],
     gaps: [],
     chunks: [],
     segments: [segment],
@@ -173,7 +174,7 @@ describe("MemoryView evidence navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: /录音/ }));
     fireEvent.click(await screen.findByRole("button", { name: /生成总结/ }));
 
-    expect(await screen.findByText(/分析失败/)).toBeInTheDocument();
+    expect(await screen.findByText("总结未能加入后台队列，请稍后重试。")).toBeInTheDocument();
     expect(screen.queryByText(/secret-provider-response-body/)).not.toBeInTheDocument();
   });
 });
