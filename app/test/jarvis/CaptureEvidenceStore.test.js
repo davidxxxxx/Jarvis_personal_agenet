@@ -397,6 +397,7 @@ test("stores track state and gap lifecycle evidence", (t) => {
     started_at: 10,
     ended_at: 50,
     state: "ended",
+    failure_code: null,
   });
   assert.deepEqual(db.prepare("SELECT * FROM audio_gaps WHERE id = 'g1'").get(), {
     id: "g1",

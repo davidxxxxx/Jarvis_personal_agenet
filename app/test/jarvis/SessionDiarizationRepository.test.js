@@ -5,17 +5,35 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const VoiceEmbeddingCipher = require("../../src/jarvis/main/VoiceEmbeddingCipher");
 const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
 
 function vector(index) {
   const value = new Float32Array(512);
   value[index] = 1;
   return value;
+}
+
+function encryptedVoiceCipher() {
+  return new VoiceEmbeddingCipher({
+    secretCrypto: {
+      isAvailable: () => true,
+      encrypt(value) {
+        return Buffer.from(`sealed:${value}`, "utf8");
+      },
+      decrypt(value) {
+        const text = Buffer.from(value).toString("utf8");
+        if (!text.startsWith("sealed:")) throw new Error("invalid test ciphertext");
+        return { value: text.slice("sealed:".length), needsReencrypt: false };
+      },
+    },
+  });
 }
 
 function scaledVector(index, scale) {
@@ -134,6 +152,172 @@ test("repository exposes raw speaker evidence before final-evidence policy filte
   assert.deepEqual(
     raw.chunks[0].transcriptSegments.map((segment) => segment.id),
     ["segment-cas"]
+  );
+});
+
+test("historical v1 sessions enqueue v2 locally without overwriting legacy evidence", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.db.prepare(`
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'legacy-run', 'session-cas', 'track-cas', ?, ?,
+      'legacy-diarizer', '3dspeaker-campplus-voxceleb-16k-v1', ?,
+      512, 16000, 1, 'cpu', 1, 5000, 5100
+    )
+  `).run(snapshot.evidenceRevision, SESSION_DIARIZATION_POLICY.policyId, "f".repeat(64));
+  repo.db.prepare(
+    "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+  ).run();
+
+  assert.deepEqual(
+    repo.listHistoricalHybridCandidates({
+      at: 6000,
+      policy: HYBRID_DIARIZATION_POLICY,
+      limit: 25,
+    }).map((session) => session.id),
+    ["session-cas"]
+  );
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
+  assert.equal(repo.getSession("session-cas").processing_state, "processing");
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM speaker_diarization_runs").get().count,
+    1
+  );
+  const hybridJob = repo.db.prepare(`
+    SELECT input_version, model_version, state
+    FROM processing_jobs
+    WHERE job_type = 'diarize_track' AND model_version = ?
+  `).get(HYBRID_DIARIZATION_POLICY.policyId);
+  assert.deepEqual(hybridJob, {
+    input_version: 2,
+    model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    state: "pending",
+  });
+});
+
+test("historical sessions without legacy speaker results are also eligible for local v2 analysis", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.prepare(
+    "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+  ).run();
+
+  assert.deepEqual(
+    repo.listHistoricalHybridCandidates({
+      at: 6000,
+      policy: HYBRID_DIARIZATION_POLICY,
+      limit: 25,
+    }).map((session) => session.id),
+    ["session-cas"]
+  );
+
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get().count,
+    0
+  );
+});
+
+test("v2 speaker-count changes preserve the old summary and only recommend a refresh", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "summary_v1"));
+  repo.db.exec(`
+    INSERT INTO analysis_runs (
+      id, session_id, kind, window_start, window_end, input_hash,
+      model, status, attempt_count, created_at, completed_at
+    ) VALUES (
+      'analysis-old', 'session-cas', 'final', 1000, 5000, 'old-summary-input',
+      'MiniMax-M2.7', 'completed', 1, 6000, 6000
+    );
+    INSERT INTO session_summaries (
+      session_id, summary, decisions_json, suggestions_json,
+      analysis_run_id, updated_at, is_final
+    ) VALUES (
+      'session-cas', 'keep this paid summary', '[]', '[]',
+      'analysis-old', 6000, 1
+    );
+  `);
+  const hybrid = commitInput(snapshot, "summary_v2");
+  hybrid.run = {
+    ...hybrid.run,
+    id: "diarization_run_summary_v2",
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    diarizerModelId: HYBRID_DIARIZATION_POLICY.diarizerModelId,
+    inputVersion: 2,
+    executionDevice: "cuda",
+    pipelineMetadata: { schemaVersion: 1 },
+    speakerCount: { minimum: 2, maximum: 2, confidence: 0.94 },
+    overlapMs: 0,
+    overlapSeparationState: "not_needed",
+    modelPackVersion: HYBRID_DIARIZATION_POLICY.modelPackVersion,
+    completedAt: 6100,
+  };
+  hybrid.validatedAt = 6100;
+  const secondCluster = {
+    id: "speaker_cluster_session_cas_2",
+    localLabel: "speaker_2",
+    embedding: vector(1),
+    speechMs: 1600,
+    windowCount: 1,
+    qualityScore: 0.98,
+    firstAppearanceAt: 2900,
+  };
+  hybrid.clusters[0] = { ...hybrid.clusters[0], speechMs: 1600, windowCount: 1 };
+  hybrid.clusters.push(secondCluster);
+  hybrid.turns[1] = {
+    ...hybrid.turns[1],
+    clusterId: secondCluster.id,
+    localLabel: secondCluster.localLabel,
+    rawLabel: "raw_b",
+    embedding: vector(1),
+  };
+  hybrid.segmentLinks.push({
+    clusterId: secondCluster.id,
+    transcriptSegmentId: "segment-cas",
+  });
+
+  assert.equal(repo.commitDiarizationRun(hybrid).status, "completed");
+  assert.equal(
+    repo.db.prepare("SELECT summary FROM session_summaries WHERE session_id = 'session-cas'").get()
+      .summary,
+    "keep this paid summary"
+  );
+  assert.deepEqual(
+    repo.db.prepare(`
+      SELECT recommended, reason, basis_policy_id, latest_policy_id
+      FROM session_summary_refresh_state WHERE session_id = 'session-cas'
+    `).get(),
+    {
+      recommended: 1,
+      reason: "speaker_count_changed",
+      basis_policy_id: SESSION_DIARIZATION_POLICY.policyId,
+      latest_policy_id: HYBRID_DIARIZATION_POLICY.policyId,
+    }
+  );
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get().count,
+    0
   );
 });
 
@@ -524,6 +708,35 @@ test("atomic diarization commit is idempotent and preserves revision history", (
     { runs: 2, run_clusters: 2, stable_clusters: 1, turns: 4 }
   );
   assert.equal(repo.listDiarizationRuns("session-cas").length, 2);
+});
+
+test("diarization commits encrypt cluster and turn embeddings under the v35 envelope constraint", (t) => {
+  const repo = new JarvisRepository(":memory:", { embeddingCipher: encryptedVoiceCipher() });
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+
+  assert.equal(repo.commitDiarizationRun(commitInput(snapshot, "encrypted_v35")).status, "completed");
+  const blobs = repo.db
+    .prepare(
+      `SELECT embedding FROM speaker_clusters
+       UNION ALL SELECT embedding FROM speaker_diarization_run_clusters
+       UNION ALL SELECT embedding FROM speaker_turns`
+    )
+    .all();
+  assert.equal(blobs.length, 4);
+  assert.equal(
+    blobs.every(
+      ({ embedding }) =>
+        Buffer.isBuffer(embedding) &&
+        embedding.subarray(0, 4).equals(Buffer.from("JVE1")) &&
+        embedding.length > 2048
+    ),
+    true
+  );
+  assert.equal(
+    repo.speakerIdentityRepository.decodeStoredEmbedding(blobs[0].embedding, 512).length,
+    512
+  );
 });
 
 test("stale diarization CAS rolls back run clusters turns and links", (t) => {

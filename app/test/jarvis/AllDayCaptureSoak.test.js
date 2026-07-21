@@ -24,8 +24,11 @@ const BYTES_PER_SECOND = SAMPLE_RATE * 2;
 const VIRTUAL_HOUR_MS = 60 * 60 * 1_000;
 const THREE_HOURS_MS = 3 * VIRTUAL_HOUR_MS;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1_000;
-const OPERATION_TIMEOUT_MS = 20_000;
-const TEST_TIMEOUT_MS = 120_000;
+// The migration phase verifies and relocates the complete three-hour evidence tree.
+// Windows antivirus and concurrent test workers can make that legitimate I/O exceed
+// the old 20-second unit-scale deadline without indicating a deadlock.
+const OPERATION_TIMEOUT_MS = 60_000;
+const TEST_TIMEOUT_MS = 180_000;
 
 const pcmCache = new Map();
 

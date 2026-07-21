@@ -309,7 +309,8 @@ test("refuses malformed current-model evidence before the repository transaction
     enrollment({ samples: [new Float32Array(512), normalized(0), normalized(0)] }),
     enrollment({ centroid: new Float32Array(512) }),
     enrollment({ windowCount: 2 }),
-    enrollment({ acceptedSpeechMs: 29_999 }),
+    enrollment({ sampleSpeechMs: [6_000, 6_000, 5_999], acceptedSpeechMs: 17_999 }),
+    enrollment({ sampleSpeechMs: [10_000, 4_999, 10_000], acceptedSpeechMs: 24_999 }),
     enrollment({ selfConsistency: 0.77 }),
   ]) {
     assert.throws(() => store.saveEnrollment(bad), /quality|embedding|centroid|evidence/);

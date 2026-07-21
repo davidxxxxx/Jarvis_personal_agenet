@@ -14,9 +14,22 @@ test("native helper declares include-process capture and audio-session watch wit
   assert.match(source, /PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE/);
   assert.match(source, /--include-pid/);
   assert.match(source, /watch-sessions/);
+  assert.match(source, /nativeCode/);
   assert.match(source, /IAudioSessionManager2_GetSessionEnumerator/);
   assert.match(source, /GetProcessId/);
   assert.doesNotMatch(source, /GetWindowText|windowTitle|processPath|commandLine/);
+});
+
+test("native HRESULTs become stable privacy-safe failure codes", () => {
+  const manager = new WindowsLoopbackAudioManager({ platform: "win32" });
+  const error = manager._buildProcessError({
+    code: "activation_failed",
+    nativeCode: "0x88890004",
+    message: "Process loopback activation failed",
+  });
+  assert.equal(error.code, "activation_failed");
+  assert.equal(error.nativeCode, "0x88890004");
+  assert.equal(error.failureCode, "activation_failed_0x88890004");
 });
 test("loopback manager builds disjoint mixed and application process-tree arguments", () => {
   const manager = new WindowsLoopbackAudioManager({

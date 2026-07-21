@@ -5,6 +5,8 @@ const {
 
 const REQUIRED_WINDOWS = 3;
 const MINIMUM_SPEECH_MS = 12_000;
+const MINIMUM_WINDOW_MS = 1_500;
+const MAXIMUM_WINDOWS = 8;
 
 function normalize(value, manifest) {
   if (!(value instanceof Float32Array) || value.length !== manifest.embeddingDimension) {
@@ -37,7 +39,7 @@ function cosine(left, right) {
 }
 
 function selectWindows(windows) {
-  return windows
+  const ranked = windows
     .filter(
       (entry) =>
         entry &&
@@ -48,6 +50,7 @@ function selectWindows(windows) {
         Number.isSafeInteger(entry.startMs) &&
         Number.isSafeInteger(entry.endMs) &&
         entry.endMs > entry.startMs &&
+        entry.endMs - entry.startMs >= MINIMUM_WINDOW_MS &&
         entry.chunk
     )
     .sort(
@@ -55,9 +58,16 @@ function selectWindows(windows) {
         right.endMs - right.startMs - (left.endMs - left.startMs) ||
         left.startMs - right.startMs ||
         String(left.id).localeCompare(String(right.id), "en")
-    )
-    .slice(0, REQUIRED_WINDOWS)
-    .sort((left, right) => left.startMs - right.startMs);
+    );
+  const selected = [];
+  let speechMs = 0;
+  for (const entry of ranked) {
+    if (selected.length >= MAXIMUM_WINDOWS) break;
+    selected.push(entry);
+    speechMs += entry.endMs - entry.startMs;
+    if (selected.length >= REQUIRED_WINDOWS && speechMs >= MINIMUM_SPEECH_MS) break;
+  }
+  return selected.sort((left, right) => left.startMs - right.startMs);
 }
 
 class DualSpeakerEvidenceProvider {
@@ -114,6 +124,13 @@ class DualSpeakerEvidenceProvider {
           : "insufficient_windows",
       };
     }
+    const speechMs = windows.reduce(
+      (total, entry) => total + entry.endMs - entry.startMs,
+      0
+    );
+    if (speechMs < MINIMUM_SPEECH_MS) {
+      return { eligible: false, reason: "insufficient_speech" };
+    }
     const modelEntries = [
       {
         role: "primary",
@@ -149,15 +166,8 @@ class DualSpeakerEvidenceProvider {
           }
         });
       }
-      if (modelEntries.some((entry) => entry.embeddings.length < REQUIRED_WINDOWS)) {
+      if (modelEntries.some((entry) => entry.embeddings.length !== windows.length)) {
         return { eligible: false, reason: "dual_embedding_missing" };
-      }
-      const speechMs = windows.reduce(
-        (total, entry) => total + entry.endMs - entry.startMs,
-        0
-      );
-      if (speechMs < MINIMUM_SPEECH_MS) {
-        return { eligible: false, reason: "insufficient_speech" };
       }
       const models = {};
       for (const entry of modelEntries) {
@@ -182,7 +192,7 @@ class DualSpeakerEvidenceProvider {
         overlapDetected: false,
         echoDetected: false,
         speechMs,
-        windowCount: REQUIRED_WINDOWS,
+        windowCount: windows.length,
         qualityScore,
         createdAt,
         models: Object.values(models),
@@ -194,7 +204,7 @@ class DualSpeakerEvidenceProvider {
         overlapDetected: false,
         echoDetected: false,
         speechMs,
-        windowCount: REQUIRED_WINDOWS,
+        windowCount: windows.length,
         qualityScore,
         models,
         persisted,

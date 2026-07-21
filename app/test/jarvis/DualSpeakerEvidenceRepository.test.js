@@ -31,8 +31,8 @@ function embeddingCipher() {
 
 function seed(repository) {
   repository.db.exec(`
-    INSERT INTO sessions (id, started_at, ended_at, status, created_at)
-    VALUES ('session-dual-repo', 1000, 20000, 'completed', 1000);
+    INSERT INTO sessions (id, started_at, ended_at, status, mic_device_id, created_at)
+    VALUES ('session-dual-repo', 1000, 20000, 'completed', 'physical-mic', 1000);
     INSERT INTO audio_tracks (
       id, session_id, source_type, device_id, device_label, strategy,
       sample_rate, channels, started_at, ended_at, state
@@ -161,6 +161,41 @@ test("repository exposes exact safe windows and encrypts both isolated model spa
   assert.equal(decoded.find((entry) => entry.modelId === primary.modelId).embedding[0], 1);
   assert.equal(decoded.find((entry) => entry.modelId === review.modelId).embedding[1], 1);
   for (const entry of decoded) entry.embedding.fill(0);
+});
+
+test("repository exposes a bounded historical microphone turn for explicit SELF recovery", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  seed(repository);
+
+  assert.deepEqual(repository.getHistoricalVoiceTurn("turn-2"), {
+    id: "turn-2",
+    clusterId: "cluster-dual-repo",
+    startMs: 7_000,
+    endMs: 12_000,
+    overlapDetected: false,
+    echoDetected: false,
+    excludedFromCentroid: false,
+    sourceType: "mic",
+    micDeviceId: "physical-mic",
+    chunk: {
+      id: "chunk-dual-repo",
+      path: "G:\\\\JarvisData\\\\chunk.wav",
+      started_at: 1_000,
+      ended_at: 20_000,
+      duration_ms: 19_000,
+      sha256: "a".repeat(64),
+      expires_at: 999_999,
+      source_type: "mic",
+      write_state: "committed",
+      deleted_at: null,
+      format: "wav",
+      file_sha256: null,
+      sample_rate: 24_000,
+      channels: 1,
+    },
+  });
+  assert.equal(repository.getHistoricalVoiceTurn("missing"), null);
 });
 
 test("persistent confirmation learns both encrypted model spaces and undo removes them", (t) => {

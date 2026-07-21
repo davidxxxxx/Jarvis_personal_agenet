@@ -6,6 +6,7 @@ import ContinuousSessionPlayer from "../ContinuousSessionPlayer";
 class FakeAudio {
   currentTime = 0;
   onended: (() => void) | null = null;
+  ontimeupdate: (() => void) | null = null;
   play = vi.fn(async () => undefined);
   pause = vi.fn();
 
@@ -291,7 +292,7 @@ describe("ContinuousSessionPlayer", () => {
     expect(screen.getByText(/device_interrupted/)).toBeInTheDocument();
   });
 
-  it("starts the matching chunk at the transcript timestamp offset", async () => {
+  it("plays only the selected transcript time range and then stops", async () => {
     const readChunk = vi.fn(async () => new Uint8Array([1]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
 
@@ -300,5 +301,28 @@ describe("ContinuousSessionPlayer", () => {
     await waitFor(() => expect(readChunk).toHaveBeenCalledWith("system-1"));
     await waitFor(() => expect(createdAudio).toHaveLength(1));
     expect(createdAudio[0].currentTime).toBe(0.25);
+    expect(
+      screen.getByRole("button", { name: /停止这条转写：点击定位到这句话/ })
+    ).toBeInTheDocument();
+
+    createdAudio[0].currentTime = 0.4;
+    createdAudio[0].ontimeupdate?.();
+
+    await waitFor(() => expect(createdAudio[0].pause).toHaveBeenCalled());
+    expect(
+      screen.getByRole("button", { name: /播放这条转写：点击定位到这句话/ })
+    ).toBeInTheDocument();
+  });
+
+  it("lets the transcript row stop its own playback immediately", async () => {
+    const readChunk = vi.fn(async () => new Uint8Array([1]));
+    render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /播放这条转写/ }));
+    await waitFor(() => expect(createdAudio).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: /停止这条转写/ }));
+
+    expect(createdAudio[0].pause).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /播放这条转写/ })).toBeInTheDocument();
   });
 });

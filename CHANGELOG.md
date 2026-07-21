@@ -10,6 +10,34 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.3 - 2026-07-21
+
+This prerelease adds the high-accuracy, offline, post-recording speaker pipeline and safe
+historical reprocessing foundation.
+
+### Added
+
+- GPU-idle pyannote Community-1 final diarization with a second local diarizer for conservative
+  speaker-count consensus.
+- MossFormer2 overlap-window review that protects long-term voice profiles from mixed speech.
+- Five-minute on-demand model lifetime, exact selected-GPU binding, real CUDA inference checks,
+  and immediate release when the active GPU changes.
+- A separately versioned, per-file SHA-256 verified offline AI model component that is adopted
+  atomically under `JARVIS_DATA_ROOT` and never installed on the Windows system drive.
+- Local-only historical backfill for every retained completed session, including sessions that
+  never had legacy speaker results.
+- Memory speaker-processing detail showing final speaker count, SELF status, anonymous people,
+  overlap review, CUDA state, and a paid-summary-refresh action when evidence changed.
+
+### Changed
+
+- Historical reprocessing reuses paid summaries and does not enqueue MiniMax analysis or daily
+  review. A refresh is recommended only when durable speaker evidence materially changes.
+- Overlapped turns remain transcribed but are excluded from durable SELF/person centroid learning.
+- Windows release preparation now fails closed unless the preinstalled offline model component
+  passes a complete digest and dependency verification.
+- Database target advanced to v36 and the application version to `0.2.0-alpha.3`.
+
 ## 0.2.0-alpha.2 - 2026-07-20
 
 Phase 2 adds private local speaker identity and evidence-gated activity classification.

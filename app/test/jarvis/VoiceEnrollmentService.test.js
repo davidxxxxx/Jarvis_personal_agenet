@@ -129,7 +129,8 @@ test("exports one exact CAMPPlus model policy with the approved SELF quality gat
   assert.equal(MAX_EMBEDDING_SECONDS, 10);
   assert.deepEqual(SELF_PROFILE_POLICY, {
     modelId: SPEAKER_EMBEDDING_MODEL_ID,
-    minimumSpeechMs: 30_000,
+    minimumSpeechMs: 18_000,
+    minimumSpeechMsPerWindow: 5_000,
     minimumWindows: 3,
     minimumSelfConsistency: 0.78,
   });
@@ -165,11 +166,25 @@ test("accepts three near-identical ten-second windows and persists normalized ev
   );
 });
 
+test("accepts natural pauses when every window and the total speech pass the quality gates", async () => {
+  const harness = createHarness({ speechDurations: [7_000, 6_500, 7_000] });
+  const result = await harness.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: begin(harness).sessionId,
+    payload: validPayload(),
+  });
+
+  assert.equal(result.status, "accepted");
+  assert.equal(result.acceptedSpeechMs, 20_500);
+  assert.equal(result.windowCount, 3);
+  assert.equal(harness.saves.length, 1);
+});
+
 test("uses measured VAD speech duration instead of treating finite embeddings as speech", async (t) => {
   for (const [name, speechDurations, expectedMs] of [
     ["silence", [0, 0, 0], 0],
     ["stable noise", [1_200, 800, 1_000], 3_000],
-    ["partial speech", [10_000, 9_500, 10_000], 29_500],
+    ["one mostly silent window", [9_000, 4_999, 9_000], 22_999],
   ]) {
     await t.test(name, async () => {
       const harness = createHarness({ speechDurations });
@@ -181,6 +196,7 @@ test("uses measured VAD speech duration instead of treating finite embeddings as
 
       assert.equal(result.status, "insufficient_speech");
       assert.equal(result.acceptedSpeechMs, expectedMs);
+      assert.deepEqual(result.sampleSpeechMs, speechDurations);
       assert.equal(result.windowCount, 3);
       assert.equal(harness.extractedLengths.length, 3);
       assert.equal(harness.saves.length, 0);
@@ -201,8 +217,8 @@ test("returns model_error when production speech measurement is unavailable", as
   assert.equal(harness.saves.length, 0);
 });
 
-test("rejects exactly 29,999 measured speech milliseconds", async () => {
-  const harness = createHarness({ speechDurations: [10_000, 10_000, 9_999] });
+test("rejects exactly 17,999 measured speech milliseconds", async () => {
+  const harness = createHarness({ speechDurations: [6_000, 6_000, 5_999] });
   const result = await harness.service.complete({
     ownerId: OWNER_ID,
     sessionId: begin(harness).sessionId,
@@ -210,7 +226,7 @@ test("rejects exactly 29,999 measured speech milliseconds", async () => {
   });
 
   assert.equal(result.status, "insufficient_speech");
-  assert.equal(result.acceptedSpeechMs, 29_999);
+  assert.equal(result.acceptedSpeechMs, 17_999);
   assert.equal(harness.saves.length, 0);
 });
 
@@ -268,6 +284,7 @@ test("returns insufficient_speech without writing when any accepted window is mi
     acceptedSpeechMs: 20_000,
     windowCount: 2,
     selfConsistency: null,
+    sampleSpeechMs: [10_000, 10_000],
   });
   assert.equal(harness.saves.length, 0);
   assert.equal(

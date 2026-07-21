@@ -2441,11 +2441,15 @@ class MemoryRepository {
           candidateHash: candidateRow.candidate_hash,
         };
       }
+      const context = this._candidateContext({
+        id: candidateRow.analysis_input_id,
+        session_id: inputRow.session_id,
+      });
+      const projectionCandidate = this._cloudActionProjectionCandidate(inputRow, candidate, context);
       const result = this.applyCandidateAnalysis({
         analysisInputId: candidateRow.analysis_input_id,
         inputHash: inputRow.input_hash,
-        candidate,
-        claimedCandidateHash: candidateRow.candidate_hash,
+        candidate: projectionCandidate,
       });
       const applied = this.db
         .prepare(
@@ -2455,7 +2459,11 @@ class MemoryRepository {
         )
         .run(at, candidateId);
       if (applied.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
-      return result;
+      return {
+        ...result,
+        candidateHash: candidateRow.candidate_hash,
+        rawCandidateHash: candidateRow.candidate_hash,
+      };
     });
     return transaction.immediate();
   }
@@ -2470,7 +2478,8 @@ class MemoryRepository {
         `SELECT manifest.ordinal, manifest.segment_id, manifest.segment_version,
                 manifest.text_hash, manifest.text_snapshot, manifest.speaker_binding_label,
                 segment.session_id, segment.started_at, segment.ended_at, segment.version,
-                segment.text, segment.result_kind, segment.is_stable, segment.superseded_by,
+                segment.text, segment.source_type, segment.result_kind, segment.is_stable,
+                segment.superseded_by,
                 segment.duplicate_of, segment.chunk_id, segment.track_id,
                 chunk.deleted_at
          FROM analysis_input_segments AS manifest
@@ -2841,6 +2850,110 @@ class MemoryRepository {
       existing: this._existingPlannerSnapshot(),
       trustedTranscriptReplacements: [],
     };
+  }
+
+  _cloudActionProjectionCandidate(inputRow, candidate, context) {
+    const selfBinding = context.bindingByLabel.get("SELF");
+    if (!selfBinding || selfBinding.subject_kind !== "person") {
+      return { ...candidate, todos: [], suggestions: [] };
+    }
+
+    const sourcePriority = { local: 1, minimax: 2, user: 3 };
+    const effectiveByInterval = new Map();
+    for (const row of this.db
+      .prepare(
+        `SELECT started_at, ended_at, category, confidence, decision, source,
+                source_attribution, evidence_json, updated_at, id
+         FROM activity_classifications
+         WHERE session_id = ?
+         ORDER BY started_at, ended_at, updated_at, id`
+      )
+      .all(inputRow.session_id)) {
+      const key = `${row.started_at}\0${row.ended_at}`;
+      const current = effectiveByInterval.get(key);
+      if (
+        !current ||
+        sourcePriority[row.source] > sourcePriority[current.source] ||
+        (sourcePriority[row.source] === sourcePriority[current.source] &&
+          (row.updated_at > current.updated_at ||
+            (row.updated_at === current.updated_at && row.id > current.id)))
+      ) {
+        effectiveByInterval.set(key, row);
+      }
+    }
+    const classifications = [...effectiveByInterval.values()].map((row) => {
+      let evidence = null;
+      try {
+        evidence = JSON.parse(row.evidence_json);
+      } catch {
+        // A malformed local policy record must fail closed for projected actions.
+      }
+      return { ...row, evidence };
+    });
+    const actionCategories = new Set([
+      "work_meeting",
+      "learning",
+      "social_call",
+      "in_person_conversation",
+    ]);
+    const classificationMatchesSource = (classification, segment) => {
+      if (segment.source_type === "mic") {
+        return new Set(["microphone", "application_and_microphone"]).has(
+          classification.source_attribution
+        );
+      }
+      return new Set(["application", "application_and_microphone", "mixed_unknown"]).has(
+        classification.source_attribution
+      );
+    };
+    const evidenceAllowed = (segmentIds, permission) =>
+      segmentIds.length > 0 &&
+      segmentIds.every((segmentId) => {
+        const segment = context.manifestById.get(segmentId);
+        if (!segment) return false;
+        const matching = classifications.filter(
+          (classification) =>
+            classification.started_at < segment.ended_at &&
+            segment.started_at < classification.ended_at &&
+            classificationMatchesSource(classification, segment)
+        );
+        return (
+          matching.length > 0 &&
+          matching.every(
+            (classification) =>
+              classification.decision === "adopted" &&
+              classification.confidence >= 0.8 &&
+              classification.source_attribution !== "mixed_unknown" &&
+              actionCategories.has(classification.category) &&
+              classification.evidence?.[permission] === true
+          )
+        );
+      });
+    const isSelfEvidence = (segmentId) =>
+      context.manifestById.get(segmentId)?.speaker_binding_label === "SELF";
+    const selfCommitmentEvidence = new Set(
+      candidate.memories
+        .filter((memory) => memory.kind === "commitment")
+        .flatMap((memory) => memory.evidenceSegmentIds)
+        .filter(isSelfEvidence)
+    );
+
+    const todos = candidate.todos.filter(
+      (todo) =>
+        todo.ownerLabel === "SELF" &&
+        todo.evidenceSegmentIds.some(isSelfEvidence) &&
+        todo.evidenceSegmentIds.some((segmentId) => selfCommitmentEvidence.has(segmentId)) &&
+        evidenceAllowed(todo.evidenceSegmentIds, "allowTodos")
+    );
+    const suggestions = candidate.suggestions.filter(
+      (suggestion) =>
+        suggestion.basedOnEvidenceSegmentIds.some(isSelfEvidence) &&
+        evidenceAllowed(suggestion.basedOnEvidenceSegmentIds, "allowSuggestions")
+    );
+    if (todos.length === candidate.todos.length && suggestions.length === candidate.suggestions.length) {
+      return candidate;
+    }
+    return { ...candidate, todos, suggestions };
   }
 
   applyCandidateAnalysis(input) {
@@ -5345,46 +5458,20 @@ class MemoryRepository {
       const todos = this.db
         .prepare(
           `SELECT todo.id, todo.title, todo.status, todo.completed_at, todo.dismissed_at,
-                  todo.provenance, todo.created_at, todo.updated_at,
-                  todo.owner_display_name_snapshot AS owner_label
+                  todo.source_analysis_input_id, todo.provenance,
+                  todo.created_at, todo.updated_at,
+                  todo.owner_display_name_snapshot AS owner_label,
+                  EXISTS(
+                    SELECT 1 FROM todo_occurrences AS occurrence
+                    WHERE occurrence.todo_instance_id = todo.id
+                      AND occurrence.legacy_session_id IS NOT NULL
+                  ) AS has_legacy_occurrence
            FROM todos_v2 AS todo ORDER BY todo.updated_at DESC, todo.id
            LIMIT ?`
         )
         .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
-        .map((row) => ({
-          id: row.id,
-          title: row.title,
-          ownerLabel: row.owner_label,
-          status: row.status,
-          completedAt: row.completed_at,
-          dismissedAt: row.dismissed_at,
-          provenance: row.provenance,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-          revisions: todoRevisions
-            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
-            .reverse()
-            .map((revision) => ({
-              id: revision.id,
-              revision: revision.revision,
-              title: revision.title,
-              dueText: revision.due_text,
-              provenance: revision.provenance,
-              createdAt: revision.created_at,
-            })),
-          occurrences: todoOccurrences
-            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
-            .reverse()
-            .map((occurrence) => ({
-              id: occurrence.id,
-              sessionId: occurrence.session_id,
-              revisionId: occurrence.todo_revision_id,
-              startedAt: occurrence.started_at,
-              endedAt: occurrence.ended_at,
-              createdAt: occurrence.created_at,
-              evidence: evidenceFor("todo_occurrence", occurrence.id, "todo_instance", row.id),
-            })),
-          transitions: todoTransitions
+        .map((row) => {
+          const transitions = todoTransitions
             .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
             .reverse()
             .map((transition) => ({
@@ -5394,8 +5481,56 @@ class MemoryRepository {
               reason: transition.reason,
               actor: transition.actor,
               occurredAt: transition.occurred_at,
-            })),
-        }));
+            }));
+          const userConfirmed = transitions.some((transition) => transition.actor === "user");
+          const systemGenerated =
+            row.source_analysis_input_id !== null ||
+            row.has_legacy_occurrence === 1 ||
+            transitions.some((transition) =>
+              ["analysis_created", "recurrence"].includes(transition.reason)
+            );
+          const verificationState =
+            userConfirmed ||
+            (row.provenance !== "legacy_unverified" && !systemGenerated)
+              ? "confirmed"
+              : "pending_confirmation";
+          return {
+            id: row.id,
+            title: row.title,
+            ownerLabel: row.owner_label,
+            status: row.status,
+            completedAt: row.completed_at,
+            dismissedAt: row.dismissed_at,
+            provenance: row.provenance,
+            verificationState,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            revisions: todoRevisions
+              .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+              .reverse()
+              .map((revision) => ({
+                id: revision.id,
+                revision: revision.revision,
+                title: revision.title,
+                dueText: revision.due_text,
+                provenance: revision.provenance,
+                createdAt: revision.created_at,
+              })),
+            occurrences: todoOccurrences
+              .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+              .reverse()
+              .map((occurrence) => ({
+                id: occurrence.id,
+                sessionId: occurrence.session_id,
+                revisionId: occurrence.todo_revision_id,
+                startedAt: occurrence.started_at,
+                endedAt: occurrence.ended_at,
+                createdAt: occurrence.created_at,
+                evidence: evidenceFor("todo_occurrence", occurrence.id, "todo_instance", row.id),
+              })),
+            transitions,
+          };
+        });
 
       const suggestionOccurrences = this.db.prepare(
         `SELECT occurrence.id, occurrence.created_at,

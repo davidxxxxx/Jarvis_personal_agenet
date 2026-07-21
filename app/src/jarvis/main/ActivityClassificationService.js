@@ -125,6 +125,19 @@ class ActivityClassificationService {
       };
     }
     const requestId = this.createRequestId();
+    const cloudRequest = {
+      cloudPayloadJson: built.cloudPayloadJson,
+      inputHash: built.inputHash,
+      validationContext: built.validationContext,
+    };
+    try {
+      this.cloudClient.validateInput?.(cloudRequest);
+    } catch {
+      return {
+        classifications: this.repository.listSessionEffective(sessionId),
+        cloudStatus: "local_preflight_failed",
+      };
+    }
     const reservation = this.budgetGuard.reserveNextAttempt({
       requestId,
       jobId,
@@ -141,11 +154,7 @@ class ActivityClassificationService {
     }
     this.budgetGuard.markStarted(requestId);
     try {
-      const cloud = await this.cloudClient.classify({
-        cloudPayloadJson: built.cloudPayloadJson,
-        inputHash: built.inputHash,
-        validationContext: built.validationContext,
-      });
+      const cloud = await this.cloudClient.classify(cloudRequest);
       this.budgetGuard.reconcile({ requestId, usage: cloud.usage });
       this.repository.saveBatch({
         sessionId,
@@ -163,11 +172,13 @@ class ActivityClassificationService {
         inputHash: built.inputHash,
       };
     } catch (error) {
-      if (error?.requestSent === true) {
-        this.budgetGuard.markUsageUnknown({
-          requestId,
-          reasonCode: error?.usage ? "usage_invalid" : "transport_ambiguous",
-        });
+      if (
+        Number.isSafeInteger(error?.usage?.inputTokens) &&
+        error.usage.inputTokens >= 0 &&
+        Number.isSafeInteger(error?.usage?.outputTokens) &&
+        error.usage.outputTokens >= 0
+      ) {
+        this.budgetGuard.reconcile({ requestId, usage: error.usage });
       } else {
         this.budgetGuard.markUsageUnknown({
           requestId,

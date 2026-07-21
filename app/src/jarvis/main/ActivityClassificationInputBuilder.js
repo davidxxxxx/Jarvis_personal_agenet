@@ -7,6 +7,7 @@ const INPUT_CONTRACT_VERSION = "jarvis-activity-classification-input-v1";
 const DEFAULT_MAX_PAYLOAD_BYTES = 96 * 1024;
 const MAX_ACTIVITIES_PER_BATCH = 32;
 const MAX_SEGMENTS_PER_ACTIVITY = 256;
+const MAX_SOURCE_SEGMENTS_PER_ACTIVITY = 10_000;
 const MAX_TRANSCRIPT_CODE_POINTS = 12_000;
 const ANONYMOUS_SPEAKER_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
@@ -192,9 +193,9 @@ function normalizeStatistics(statistics, applications) {
 }
 
 function normalizeSegments(segments, allowedSpeakerLabels, redact) {
-  if (!Array.isArray(segments) || segments.length > MAX_SEGMENTS_PER_ACTIVITY) {
+  if (!Array.isArray(segments) || segments.length > MAX_SOURCE_SEGMENTS_PER_ACTIVITY) {
     throw new TypeError(
-      `segments must be an array with at most ${MAX_SEGMENTS_PER_ACTIVITY} entries`
+      `segments must be an array with at most ${MAX_SOURCE_SEGMENTS_PER_ACTIVITY} entries`
     );
   }
   const segmentIds = new Set();
@@ -231,6 +232,47 @@ function normalizeSegments(segments, allowedSpeakerLabels, redact) {
       text,
     };
   });
+}
+
+function representativeSegments(segments, limit) {
+  if (segments.length <= limit) return segments;
+  if (limit === 1) return [segments[Math.floor((segments.length - 1) / 2)]];
+  const selected = [];
+  let previousIndex = -1;
+  for (let slot = 0; slot < limit; slot += 1) {
+    const index = Math.round((slot * (segments.length - 1)) / (limit - 1));
+    if (index === previousIndex) continue;
+    selected.push(segments[index]);
+    previousIndex = index;
+  }
+  return selected;
+}
+
+function boundedActivities(activities, maxPayloadBytes) {
+  const payloadWithLimit = (limit) => ({
+    inputVersion: INPUT_CONTRACT_VERSION,
+    activities: activities.map((activity) => ({
+      ...activity,
+      segments: representativeSegments(
+        activity.segments,
+        Math.min(limit, MAX_SEGMENTS_PER_ACTIVITY)
+      ),
+    })),
+  });
+  let low = 1;
+  let high = MAX_SEGMENTS_PER_ACTIVITY;
+  let best = null;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = payloadWithLimit(middle);
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= maxPayloadBytes) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
 }
 
 function normalizeActivity(activity, redact) {
@@ -450,22 +492,19 @@ class ActivityClassificationInputBuilder {
     if (new Set(activities.map((activity) => activity.activityId)).size !== activities.length) {
       throw new TypeError("activityId must be unique within a batch");
     }
-    const cloudPayload = {
-      inputVersion: INPUT_CONTRACT_VERSION,
-      activities,
-    };
-    const cloudPayloadJson = JSON.stringify(cloudPayload);
-    const inputBytes = Buffer.byteLength(cloudPayloadJson, "utf8");
-    if (inputBytes > this.maxPayloadBytes) {
+    const cloudPayload = boundedActivities(activities, this.maxPayloadBytes);
+    if (cloudPayload === null) {
       throw new RangeError("activity classification payload exceeds the byte limit");
     }
+    const cloudPayloadJson = JSON.stringify(cloudPayload);
+    const inputBytes = Buffer.byteLength(cloudPayloadJson, "utf8");
     return {
       inputContractVersion: INPUT_CONTRACT_VERSION,
       cloudPayload,
       cloudPayloadJson,
       inputHash: sha256(cloudPayloadJson),
       inputBytes,
-      validationContext: validationContextFor(activities),
+      validationContext: validationContextFor(cloudPayload.activities),
     };
   }
 

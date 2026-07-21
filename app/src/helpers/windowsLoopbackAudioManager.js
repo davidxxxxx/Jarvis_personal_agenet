@@ -9,6 +9,20 @@ const PROBE_TIMEOUT_MS = 5000;
 const TRANSIENT_CAPABILITY_TTL_MS = 30000;
 const SAMPLE_RATE = 24000;
 const BINARY_NAME = "windows-system-audio-helper.exe";
+const SAFE_FAILURE_CODE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function codedCaptureError(code, message, nativeCode = null) {
+  const error = new Error(message);
+  error.code = code;
+  const normalizedNative =
+    typeof nativeCode === "string" && /^0x[0-9a-f]{8}$/i.test(nativeCode)
+      ? nativeCode.toLowerCase()
+      : null;
+  const combined = normalizedNative ? `${code}_${normalizedNative}` : code;
+  error.nativeCode = normalizedNative;
+  error.failureCode = SAFE_FAILURE_CODE.test(combined) ? combined : code;
+  return error;
+}
 
 // Captures system audio on Windows via a native WASAPI process-loopback
 // helper. Unlike Chromium's display-media loopback (which only hears the
@@ -153,7 +167,14 @@ class WindowsLoopbackAudioManager {
       let settled = false;
       let fatalErrorReported = false;
       const timeout = setTimeout(() => {
-        finish(reject, new Error("Timed out starting Windows system audio capture."), true);
+        finish(
+          reject,
+          codedCaptureError(
+            "capture_start_timeout",
+            "Timed out starting Windows system audio capture."
+          ),
+          true
+        );
       }, START_TIMEOUT_MS);
 
       const finish = (callback, value, shouldStop = false) => {
@@ -211,7 +232,8 @@ class WindowsLoopbackAudioManager {
         if (!settled) {
           finish(
             reject,
-            new Error(
+            codedCaptureError(
+              `helper_exit_${Number.isInteger(code) && code >= 0 ? code : "unknown"}`,
               `Windows system audio helper exited before start (code ${code ?? "null"}, signal ${signal ?? "null"}).`
             )
           );
@@ -223,7 +245,8 @@ class WindowsLoopbackAudioManager {
         // clobbered by the generic one.
         if (!wasStopping && !fatalErrorReported) {
           this.onError?.(
-            new Error(
+            codedCaptureError(
+              `helper_exit_${Number.isInteger(code) && code >= 0 ? code : "unknown"}`,
               `Windows system audio helper exited unexpectedly (code ${code ?? "null"}, signal ${signal ?? "null"}).`
             )
           );
@@ -408,9 +431,15 @@ class WindowsLoopbackAudioManager {
   }
 
   _buildProcessError(message) {
-    const error = new Error(message.message || "Windows system audio capture failed");
-    error.code = message.code;
-    return error;
+    const code =
+      typeof message.code === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(message.code)
+        ? message.code
+        : "application_capture_failed";
+    return codedCaptureError(
+      code,
+      message.message || "Windows system audio capture failed",
+      message.nativeCode
+    );
   }
 }
 

@@ -191,6 +191,10 @@ build/
 
 # Generated Globe listener binary
 resources/bin/
+resources/ai-model-pack/prebuilt/*
+!resources/ai-model-pack/prebuilt/.gitkeep
+resources/ai-model-pack/runtime/__pycache__/
+resources/ai-model-pack/runtime/*.pyc
 native/meeting-aec-helper/build/
 native/meeting-aec-helper/third_party/
 

@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const {
   ANALYSIS_TOOL,
   AnalysisSchemaError,
+  salvageCandidateAnalysis,
   validateCandidateAnalysis,
 } = require("./JarvisAnalysisSchema");
 
@@ -364,14 +365,17 @@ class MiniMaxAnalysisClient {
           {
             role: "system",
             content:
-              "Analyze only the supplied pseudonymous transcript text. Call submit_jarvis_analysis exactly once with one concise jarvis-analysis-v2 object; do not answer with prose. Use at most 20 memories, 12 topics, 20 todos, and 12 suggestions, with 1-6 strongest evidence IDs per item. Every factual item must cite only supplied segment IDs. Never invent IDs, state, dates, or calendar actions.",
+              "Analyze only the supplied pseudonymous transcript text. Call submit_jarvis_analysis exactly once with one concise jarvis-analysis-v2 object; do not answer with prose. Copy evidenceSegmentIds character-for-character only from supplied segmentId values; never invent, shorten, translate, or reformat an ID. Use ownerLabel only when it is exactly one supplied speakerLabel, otherwise use null. A todo is allowed only for an explicit SELF commitment or an assignment that SELF explicitly accepts; otherwise omit it. Never turn commands, tactics, or dialogue from games, videos, streams, podcasts, courses, or entertainment into a todo. Suggestions require SELF participation and must be omitted for games, entertainment, passive media, or uncertain activity. Omit any optional item that cannot cite an exact supplied segment ID. Use at most 20 memories, 12 topics, 20 todos, and 12 suggestions, with 1-6 strongest evidence IDs per item. Never invent state, dates, or calendar actions.",
           },
           { role: "user", content: normalized.cloudPayloadJson },
         ],
         tools: [ANALYSIS_TOOL],
-        tool_choice: "auto",
+        tool_choice: {
+          type: "function",
+          function: { name: "submit_jarvis_analysis" },
+        },
         reasoning_split: true,
-        temperature: 1,
+        temperature: 0.1,
         max_completion_tokens: 8192,
         stream: false,
       });
@@ -431,10 +435,16 @@ class MiniMaxAnalysisClient {
         }
         let result;
         try {
-          result = validateCandidateAnalysis(parsed, {
+          const validationContext = {
             allowedSegmentIds: normalized.allowedSegmentIds,
             allowedOwnerLabels: normalized.allowedOwnerLabels,
-          });
+          };
+          try {
+            result = validateCandidateAnalysis(parsed, validationContext);
+          } catch (error) {
+            if (!(error instanceof AnalysisSchemaError)) throw error;
+            result = salvageCandidateAnalysis(parsed, validationContext);
+          }
         } catch (error) {
           if (error instanceof AnalysisSchemaError) {
             throw attachAuthoritativeUsage(

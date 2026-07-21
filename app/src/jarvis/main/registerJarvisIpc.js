@@ -381,6 +381,7 @@ function toPublicKnowledgeOverview(snapshot) {
     status: item.status,
     completedAt: item.completedAt,
     dismissedAt: item.dismissedAt,
+    verificationState: item.verificationState,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({

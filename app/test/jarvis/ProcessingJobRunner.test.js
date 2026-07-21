@@ -371,6 +371,44 @@ test("permit draining preserves durable retry and resource deferral transitions"
   );
 });
 
+test("a running CUDA job yields durably when resources become busy", async (t) => {
+  let admissions = 0;
+  const governor = {
+    sample: async () => ({ state: admissions === 0 ? "available" : "busy", selectedGpuUuid: "GPU-1" }),
+    admit: () => {
+      admissions += 1;
+      return admissions === 1
+        ? { action: "run_cuda", reason: "resources_available" }
+        : { action: "defer", reason: "external_gpu_busy" };
+    },
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+  seedJob(db, { priority: 30 });
+  runner.register("transcribe_chunk", async (_job, context) => {
+    assert.equal(context.device, "cuda");
+    await context.checkResources();
+    assert.fail("resource checkpoint should have yielded");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db.prepare(`
+      SELECT state, attempt_count, next_retry_at, error_code, blocked_reason,
+             lease_owner, lease_expires_at
+      FROM processing_jobs WHERE id = 'j1'
+    `).get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 17_000,
+      error_code: null,
+      blocked_reason: "external_gpu_busy",
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
 test("local runner leaves unknown and cloud work unclaimed instead of classifying maintenance", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, { jobType: "unknown_job" });
@@ -452,6 +490,41 @@ test("records handler failure with backoff without losing durable input metadata
       lease_expires_at: null,
     }
   );
+});
+
+test("blocks deterministic database constraints after one attempt instead of retrying forever", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 40,
+    modelVersion: "jarvis-session-diarization-v1",
+  });
+  runner.register("diarize_track", async () => {
+    const error = new Error("encrypted embedding violates an obsolete schema constraint");
+    error.code = "SQLITE_CONSTRAINT_CHECK";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "SQLITE_CONSTRAINT_CHECK",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+  assert.equal(await runner.runOnce(), 0);
 });
 
 test("blocks a transcription lineage mismatch instead of retrying obsolete work", async (t) => {

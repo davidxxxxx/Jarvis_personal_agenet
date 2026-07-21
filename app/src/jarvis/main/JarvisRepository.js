@@ -405,6 +405,78 @@ function assertDiarizationModelId(value, name) {
   return value;
 }
 
+function normalizeDiarizationPipelineMetadata(value, inputVersion) {
+  const metadata = value ?? {};
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new TypeError("run.pipelineMetadata must be an object");
+  }
+  if (inputVersion === 2 && metadata.schemaVersion !== 1) {
+    throw new TypeError("hybrid diarization metadata schemaVersion must be 1");
+  }
+  let encoded;
+  try {
+    encoded = JSON.stringify(metadata);
+  } catch {
+    throw new TypeError("run.pipelineMetadata must be JSON serializable");
+  }
+  if (Buffer.byteLength(encoded, "utf8") > 256 * 1024) {
+    throw new RangeError("run.pipelineMetadata is too large");
+  }
+  return encoded;
+}
+
+function projectDiarizationRun(row) {
+  let metadata = {};
+  try {
+    const parsed = JSON.parse(row.pipeline_metadata_json ?? "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) metadata = parsed;
+  } catch {}
+  const speakerCount =
+    row.speaker_count_min === null || row.speaker_count_max === null
+      ? null
+      : {
+          minimum: row.speaker_count_min,
+          maximum: row.speaker_count_max,
+          preferred: Number.isSafeInteger(metadata?.speakerCount?.preferred)
+            ? metadata.speakerCount.preferred
+            : row.speaker_count_min === row.speaker_count_max
+              ? row.speaker_count_min
+              : null,
+          confidence: row.speaker_count_confidence,
+          state:
+            typeof metadata?.speakerCount?.state === "string"
+              ? metadata.speakerCount.state
+              : row.speaker_count_min === row.speaker_count_max
+                ? "exact"
+                : "range",
+        };
+  const modelValues = metadata?.chunks
+    ?.flatMap((chunk) => Object.values(chunk?.models ?? {}))
+    .filter((value) => typeof value === "string" && value.length <= 200);
+  return {
+    id: row.id,
+    trackId: row.track_id,
+    policyId: row.policy_id,
+    inputVersion: row.input_version,
+    executionDevice: row.execution_device,
+    speakerCount,
+    overlapMs: row.overlap_ms ?? 0,
+    overlapSeparationState: row.overlap_separation_state ?? "not_needed",
+    modelPackVersion: row.model_pack_version ?? null,
+    models: [...new Set(modelValues ?? [])],
+    commitSequence: row.commit_sequence,
+    completedAt: row.completed_at,
+  };
+}
+
+function assertSpeakerCount(value, name) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 64) {
+    throw new RangeError(`${name} must be between 0 and 64 or null`);
+  }
+  return value;
+}
+
 function codedError(code) {
   const error = new Error(code);
   error.code = code;
@@ -459,6 +531,7 @@ class JarvisRepository {
         createId: (prefix) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`,
         embeddingCipher: this.memoryDependencies.embeddingCipher,
       });
+      this._encryptLegacySpeakerEmbeddings();
       this.activityClassificationRepository = new ActivityClassificationRepository(this.db, {
         now: this.memoryDependencies.now,
       });
@@ -466,6 +539,144 @@ class JarvisRepository {
       this.db.close();
       throw error;
     }
+  }
+
+  _encryptLegacySpeakerEmbeddings() {
+    if (!this.memoryDependencies.embeddingCipher) return { encrypted: 0 };
+    const legacyClusters = this.db
+      .prepare(
+        `SELECT id, embedding FROM speaker_clusters
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    const legacyRunClusters = this.db
+      .prepare(
+        `SELECT run_id, local_label, embedding
+         FROM speaker_diarization_run_clusters
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    const legacyTurns = this.db
+      .prepare(
+        `SELECT id, embedding FROM speaker_turns
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    const legacyClusterModels = this.db
+      .prepare(
+        `SELECT cluster_id, model_id, embedding FROM speaker_cluster_model_embeddings
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    const legacyProfileSamples = this.db
+      .prepare(
+        `SELECT id, embedding FROM voice_profile_samples
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    const legacyProfileAggregates = this.db
+      .prepare(
+        `SELECT person_id, model_id, embedding FROM voice_profile_aggregates
+         WHERE typeof(embedding) = 'blob'
+           AND length(embedding) > 0
+           AND length(embedding) % 4 = 0
+           AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+      )
+      .all();
+    if (
+      legacyClusters.length +
+        legacyRunClusters.length +
+        legacyTurns.length +
+        legacyClusterModels.length +
+        legacyProfileSamples.length +
+        legacyProfileAggregates.length ===
+      0
+    ) {
+      return { encrypted: 0 };
+    }
+
+    const updateCluster = this.db.prepare(
+      `UPDATE speaker_clusters SET embedding = ?
+       WHERE id = ? AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const updateRunCluster = this.db.prepare(
+      `UPDATE speaker_diarization_run_clusters SET embedding = ?
+       WHERE run_id = ? AND local_label = ?
+         AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const updateTurn = this.db.prepare(
+      `UPDATE speaker_turns SET embedding = ?
+       WHERE id = ? AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const updateClusterModel = this.db.prepare(
+      `UPDATE speaker_cluster_model_embeddings SET embedding = ?
+       WHERE cluster_id = ? AND model_id = ? AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const updateProfileSample = this.db.prepare(
+      `UPDATE voice_profile_samples SET embedding = ?
+       WHERE id = ? AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const updateProfileAggregate = this.db.prepare(
+      `UPDATE voice_profile_aggregates SET embedding = ?
+       WHERE person_id = ? AND model_id = ? AND typeof(embedding) = 'blob'
+         AND hex(substr(embedding, 1, 4)) <> '4A564531'`
+    );
+    const encrypt = (blob) => this.speakerIdentityRepository.protectEncodedEmbedding(blob);
+    const migrate = this.db.transaction(() => {
+      let encrypted = 0;
+      for (const row of legacyClusters) {
+        encrypted += updateCluster.run(encrypt(row.embedding), row.id).changes;
+      }
+      for (const row of legacyRunClusters) {
+        encrypted += updateRunCluster.run(
+          encrypt(row.embedding),
+          row.run_id,
+          row.local_label
+        ).changes;
+      }
+      for (const row of legacyTurns) {
+        encrypted += updateTurn.run(encrypt(row.embedding), row.id).changes;
+      }
+      for (const row of legacyClusterModels) {
+        encrypted += updateClusterModel.run(
+          encrypt(row.embedding),
+          row.cluster_id,
+          row.model_id
+        ).changes;
+      }
+      for (const row of legacyProfileSamples) {
+        encrypted += updateProfileSample.run(encrypt(row.embedding), row.id).changes;
+      }
+      for (const row of legacyProfileAggregates) {
+        encrypted += updateProfileAggregate.run(
+          encrypt(row.embedding),
+          row.person_id,
+          row.model_id
+        ).changes;
+      }
+      return { encrypted };
+    });
+    return migrate.immediate();
   }
 
   reopen(dbPath = this.dbPath) {
@@ -627,6 +838,24 @@ class JarvisRepository {
       listSessionReadinessTracks: this.db.prepare(`
         SELECT * FROM audio_tracks WHERE session_id = ? ORDER BY source_type, id
       `),
+      listSessionIdentityTracks: this.db.prepare(`
+        SELECT track.*
+        FROM audio_tracks AS track
+        WHERE track.session_id = ?
+          AND (
+            EXISTS (
+              SELECT 1 FROM audio_chunks AS chunk
+              WHERE chunk.session_id = track.session_id
+                AND chunk.track_id = track.id
+            )
+            OR EXISTS (
+              SELECT 1 FROM speaker_diarization_runs AS run
+              WHERE run.session_id = track.session_id
+                AND run.track_id = track.id
+            )
+          )
+        ORDER BY track.source_type, track.id
+      `),
       listSessionReadinessChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
         WHERE session_id = ? AND write_state = 'committed' AND deleted_at IS NULL
@@ -723,17 +952,58 @@ class JarvisRepository {
           AND chunk.deleted_at IS NULL
         ORDER BY turn.started_at, turn.ended_at, turn.id
       `),
+      getHistoricalVoiceTurn: this.db.prepare(`
+        SELECT
+          turn.id AS turn_id,
+          turn.cluster_id,
+          turn.started_at AS turn_started_at,
+          turn.ended_at AS turn_ended_at,
+          turn.echo_state,
+          turn.duplicate_of_turn_id,
+          turn.excluded_from_centroid,
+          chunk.id AS chunk_id,
+          chunk.path AS chunk_path,
+          chunk.started_at AS chunk_started_at,
+          chunk.ended_at AS chunk_ended_at,
+          chunk.duration_ms AS chunk_duration_ms,
+          chunk.sha256 AS chunk_sha256,
+          chunk.expires_at AS chunk_expires_at,
+          chunk.source_type,
+          chunk.write_state,
+          chunk.deleted_at,
+          chunk.format,
+          chunk.file_sha256,
+          chunk.sample_rate,
+          chunk.channels,
+          session.mic_device_id,
+          EXISTS (
+            SELECT 1
+            FROM speaker_turns AS overlap
+            WHERE overlap.run_id = turn.run_id
+              AND overlap.cluster_id <> turn.cluster_id
+              AND overlap.started_at < turn.ended_at
+              AND turn.started_at < overlap.ended_at
+          ) AS overlap_detected
+        FROM speaker_turns AS turn
+        JOIN audio_chunks AS chunk ON chunk.id = turn.chunk_id
+        JOIN sessions AS session ON session.id = chunk.session_id
+        WHERE turn.id = ?
+      `),
       insertDiarizationRun: this.db.prepare(`
         INSERT INTO speaker_diarization_runs (
           id, session_id, track_id, transcript_revision, policy_id,
           diarizer_model_id, embedding_model_id, model_artifact_sha256,
-          embedding_dimension, sample_rate, input_version, execution_device, commit_sequence,
-          created_at, completed_at
+          embedding_dimension, sample_rate, input_version, execution_device,
+          pipeline_metadata_json, speaker_count_min, speaker_count_max,
+          speaker_count_confidence, overlap_ms, overlap_separation_state,
+          model_pack_version, commit_sequence, created_at, completed_at
         ) VALUES (
           @id, @sessionId, @trackId, @transcriptRevision, @policyId,
           @diarizerModelId, @embeddingModelId, @modelArtifactSha256,
-          @embeddingDimension, @sampleRate, @inputVersion, @executionDevice, @commitSequence,
-          @createdAt, @completedAt
+          @embeddingDimension, @sampleRate, @inputVersion, @executionDevice,
+          @pipelineMetadataJson, @speakerCountMin, @speakerCountMax,
+          @speakerCountConfidence, @overlapMs, @overlapSeparationState,
+          @modelPackVersion, @commitSequence, @createdAt, @completedAt
         )
       `),
       nextDiarizationCommitSequence: this.db.prepare(`
@@ -895,6 +1165,98 @@ class JarvisRepository {
       countSessionDiarizationJobs: this.db.prepare(`
         SELECT count(*) AS count FROM processing_jobs
         WHERE session_id = ? AND job_type = 'diarize_track'
+      `),
+      listHistoricalDiarizedSessionIds: this.db.prepare(`
+        SELECT DISTINCT session.id
+        FROM sessions AS session
+        JOIN speaker_diarization_runs AS run ON run.session_id = session.id
+        WHERE session.status IN ('completed', 'recovered')
+          AND session.ended_at IS NOT NULL
+        ORDER BY COALESCE(session.finalized_at, session.ended_at), session.id
+      `),
+      listHistoricalHybridCandidates: this.db.prepare(`
+        SELECT session.*
+        FROM sessions AS session
+        WHERE session.status IN ('completed','recovered')
+          AND session.ended_at IS NOT NULL
+          AND session.processing_state = 'ready'
+          AND EXISTS (
+            SELECT 1
+            FROM audio_tracks AS track
+            JOIN audio_chunks AS chunk ON chunk.track_id = track.id
+            WHERE track.session_id = session.id
+              AND chunk.deleted_at IS NULL
+              AND chunk.write_state = 'committed'
+              AND chunk.expires_at > @at
+              AND length(chunk.path) > 0
+              AND NOT EXISTS (
+                SELECT 1 FROM speaker_diarization_runs AS current
+                WHERE current.session_id = session.id
+                  AND current.track_id = track.id
+                  AND current.policy_id = @policyId
+              )
+          )
+        ORDER BY COALESCE(session.finalized_at, session.ended_at) DESC, session.id DESC
+        LIMIT @limit
+      `),
+      upsertHistoricalReprocessingState: this.db.prepare(`
+        INSERT INTO session_reprocessing_state (
+          session_id, policy_id, mode, state, started_at, completed_at
+        ) VALUES (@sessionId, @policyId, 'historical_local_only', 'queued', @at, NULL)
+        ON CONFLICT(session_id) DO UPDATE SET
+          policy_id = excluded.policy_id,
+          mode = excluded.mode,
+          state = 'queued',
+          started_at = excluded.started_at,
+          completed_at = NULL
+      `),
+      getSessionReprocessingState: this.db.prepare(`
+        SELECT * FROM session_reprocessing_state WHERE session_id = ?
+      `),
+      completeHistoricalReprocessingState: this.db.prepare(`
+        UPDATE session_reprocessing_state
+        SET state = 'completed', completed_at = @at
+        WHERE session_id = @sessionId
+          AND mode = 'historical_local_only'
+          AND state IN ('queued','processing')
+      `),
+      getPriorDiarizationSpeakerCount: this.db.prepare(`
+        SELECT run.id, run.policy_id,
+               (SELECT count(*) FROM speaker_diarization_run_clusters AS cluster
+                WHERE cluster.run_id = run.id) AS speaker_count
+        FROM speaker_diarization_runs AS run
+        WHERE run.session_id = @sessionId
+          AND run.track_id = @trackId
+          AND run.input_version < @inputVersion
+        ORDER BY run.commit_sequence DESC
+        LIMIT 1
+      `),
+      sessionHasRetainedSummary: this.db.prepare(`
+        SELECT EXISTS(
+          SELECT 1 FROM session_summary_revisions
+          WHERE session_id = ? AND lifecycle = 'active'
+          UNION ALL
+          SELECT 1 FROM session_summaries WHERE session_id = ?
+        ) AS value
+      `),
+      upsertSummaryRefreshState: this.db.prepare(`
+        INSERT INTO session_summary_refresh_state (
+          session_id, basis_policy_id, latest_policy_id,
+          recommended, reason, updated_at
+        ) VALUES (
+          @sessionId, @basisPolicyId, @latestPolicyId,
+          @recommended, @reason, @at
+        )
+        ON CONFLICT(session_id) DO UPDATE SET
+          basis_policy_id = COALESCE(session_summary_refresh_state.basis_policy_id, excluded.basis_policy_id),
+          latest_policy_id = excluded.latest_policy_id,
+          recommended = MAX(session_summary_refresh_state.recommended, excluded.recommended),
+          reason = CASE
+            WHEN session_summary_refresh_state.recommended = 1
+              THEN session_summary_refresh_state.reason
+            ELSE excluded.reason
+          END,
+          updated_at = excluded.updated_at
       `),
       countIdentityResolutionSystemResults: this.db.prepare(`
         SELECT count(*) AS count FROM speaker_identity_resolutions
@@ -1150,6 +1512,7 @@ class JarvisRepository {
         WHERE session_id = @sessionId
           AND track_kind = 'application'
           AND application_key = @applicationKey
+        ORDER BY capture_generation DESC, started_at DESC, id DESC
         LIMIT 1
       `),
       listSessionTimelineGaps: this.db.prepare(`
@@ -1915,6 +2278,15 @@ class JarvisRepository {
       });
       if (existing) return { status: "already_completed", runId: existing.id };
 
+      const priorSpeakerEvidence =
+        input.run.inputVersion > 1
+          ? this.statements.getPriorDiarizationSpeakerCount.get({
+              sessionId: input.run.sessionId,
+              trackId: input.run.trackId,
+              inputVersion: input.run.inputVersion,
+            })
+          : null;
+
       const current = this.getDiarizationEvidenceSnapshot({
         sessionId: input.run.sessionId,
         trackId: input.run.trackId,
@@ -2094,6 +2466,10 @@ class JarvisRepository {
           ...turn,
           runId: input.run.id,
           clusterId,
+          embedding: this.speakerIdentityRepository.protectEncodedEmbedding(
+            turn.embedding,
+            512
+          ),
           excludedFromCentroid: turn.excludedFromCentroid ? 1 : 0,
           createdAt: input.run.completedAt,
         });
@@ -2112,6 +2488,24 @@ class JarvisRepository {
           clusterId,
           transcriptSegmentId: link.transcriptSegmentId,
         });
+      }
+      if (input.run.inputVersion === 2 && priorSpeakerEvidence) {
+        const hasSummary =
+          this.statements.sessionHasRetainedSummary.get(
+            input.run.sessionId,
+            input.run.sessionId
+          )?.value === 1;
+        if (hasSummary) {
+          const changed = priorSpeakerEvidence.speaker_count !== input.clusters.length;
+          this.statements.upsertSummaryRefreshState.run({
+            sessionId: input.run.sessionId,
+            basisPolicyId: priorSpeakerEvidence.policy_id,
+            latestPolicyId: input.run.policyId,
+            recommended: changed ? 1 : 0,
+            reason: changed ? "speaker_count_changed" : null,
+            at: input.run.completedAt,
+          });
+        }
       }
       return { status: "completed", runId: input.run.id };
     });
@@ -2432,6 +2826,46 @@ class JarvisRepository {
     return this.statements.listDiarizationRuns.all(assertId(sessionId, "sessionId"));
   }
 
+  getSessionSpeakerProcessing(sessionId) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const allRuns = this.statements.listDiarizationRuns.all(safeSessionId);
+    const preferredInputVersion = allRuns.some((run) => run.input_version === 2) ? 2 : 1;
+    const latestByTrack = new Map();
+    for (const run of allRuns) {
+      if (run.input_version !== preferredInputVersion) continue;
+      const previous = latestByTrack.get(run.track_id);
+      if (!previous || previous.commit_sequence < run.commit_sequence) {
+        latestByTrack.set(run.track_id, run);
+      }
+    }
+    const latestRuns = [...latestByTrack.values()].sort(
+      (left, right) => left.commit_sequence - right.commit_sequence
+    );
+    const clusterIds = new Set(
+      latestRuns.flatMap((run) =>
+        this.statements.listIdentityResolutionRunClusters
+          .all(run.id)
+          .map((cluster) => cluster.cluster_id)
+      )
+    );
+    const speakers = this.speakerIdentityRepository
+      .listSessionClusterViews(safeSessionId)
+      .filter((cluster) => clusterIds.has(cluster.id));
+    const summaryRefresh =
+      this.db
+        .prepare("SELECT * FROM session_summary_refresh_state WHERE session_id = ?")
+        .get(safeSessionId) ?? null;
+    const reprocessing = this.statements.getSessionReprocessingState.get(safeSessionId) ?? null;
+    return {
+      preferredInputVersion,
+      latestRuns: latestRuns.map(projectDiarizationRun),
+      history: allRuns.map(projectDiarizationRun),
+      speakers,
+      summaryRefresh,
+      reprocessing,
+    };
+  }
+
   listDiarizationEchoCandidates({ sessionId, excludeTrackId, policyId } = {}) {
     return this.statements.listDiarizationEchoCandidates
       .all({
@@ -2466,6 +2900,40 @@ class JarvisRepository {
       .filter((row) => row.chunk !== null);
   }
 
+  getHistoricalVoiceTurn(turnId) {
+    const row = this.statements.getHistoricalVoiceTurn.get(
+      assertId(turnId, "historicalVoiceTurnId")
+    );
+    if (!row) return null;
+    return {
+      id: row.turn_id,
+      clusterId: row.cluster_id,
+      startMs: row.turn_started_at,
+      endMs: row.turn_ended_at,
+      overlapDetected: row.overlap_detected === 1,
+      echoDetected: row.echo_state !== "none" || row.duplicate_of_turn_id !== null,
+      excludedFromCentroid: row.excluded_from_centroid === 1,
+      sourceType: row.source_type,
+      micDeviceId: row.mic_device_id,
+      chunk: {
+        id: row.chunk_id,
+        path: row.chunk_path,
+        started_at: row.chunk_started_at,
+        ended_at: row.chunk_ended_at,
+        duration_ms: row.chunk_duration_ms,
+        sha256: row.chunk_sha256,
+        expires_at: row.chunk_expires_at,
+        source_type: row.source_type,
+        write_state: row.write_state,
+        deleted_at: row.deleted_at,
+        format: row.format,
+        file_sha256: row.file_sha256,
+        sample_rate: row.sample_rate,
+        channels: row.channels,
+      },
+    };
+  }
+
   replaceSpeakerClusterModelEmbeddings(input) {
     return this.speakerIdentityRepository.replaceClusterModelEmbeddings(input);
   }
@@ -2481,14 +2949,14 @@ class JarvisRepository {
       !policy ||
       typeof policy !== "object" ||
       typeof policy.policyId !== "string" ||
-      policy.inputVersion !== 1
+      !new Set([1, 2]).has(policy.inputVersion)
     ) {
       throw new TypeError("a versioned diarization policy is required");
     }
     if (!speakerProcessingPolicy || typeof speakerProcessingPolicy.evaluate !== "function") {
       throw new TypeError("speakerProcessingPolicy.evaluate is required");
     }
-    const tracks = this.statements.listSessionReadinessTracks.all(safeSessionId);
+    const tracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
     const jobs = [];
     const skipped = [];
     let enqueued = 0;
@@ -2528,8 +2996,80 @@ class JarvisRepository {
         jobs.push(job);
       }
     });
-    enqueue.immediate();
+    if (this.db.inTransaction) enqueue();
+    else enqueue.immediate();
     return { enqueued, jobs, skipped };
+  }
+
+  listHistoricalHybridCandidates({
+    at = Date.now(),
+    policy,
+    limit = 25,
+  } = {}) {
+    const safeAt = assertNonNegativeInteger(at, "at");
+    if (!policy || policy.inputVersion !== 2 || typeof policy.policyId !== "string") {
+      throw new TypeError("the v2 hybrid diarization policy is required");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError("historical hybrid candidate limit must be between 1 and 100");
+    }
+    return this.statements.listHistoricalHybridCandidates.all({
+      at: safeAt,
+      policyId: policy.policyId,
+      limit,
+    });
+  }
+
+  enqueueHistoricalHybridReprocessing(
+    sessionId,
+    { at = Date.now(), policy, speakerProcessingPolicy } = {}
+  ) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeAt = assertNonNegativeInteger(at, "at");
+    if (!policy || policy.inputVersion !== 2 || typeof policy.policyId !== "string") {
+      throw new TypeError("the v2 hybrid diarization policy is required");
+    }
+    const operation = this.db.transaction(() => {
+      this.statements.upsertHistoricalReprocessingState.run({
+        sessionId: safeSessionId,
+        policyId: policy.policyId,
+        at: safeAt,
+      });
+      const result = this.enqueueDiarizationJobs(safeSessionId, {
+        at: safeAt,
+        policy,
+        speakerProcessingPolicy,
+      });
+      if (result.enqueued > 0) {
+        this.statements.markSessionProcessing.run(safeSessionId);
+      } else {
+        this.statements.completeHistoricalReprocessingState.run({
+          sessionId: safeSessionId,
+          at: safeAt,
+        });
+      }
+      return result;
+    });
+    return operation.immediate();
+  }
+
+  isHistoricalLocalOnlyReprocessing(sessionId) {
+    const row = this.statements.getSessionReprocessingState.get(assertId(sessionId, "sessionId"));
+    return Boolean(
+      row &&
+        row.mode === "historical_local_only" &&
+        new Set(["queued", "processing"]).has(row.state)
+    );
+  }
+
+  completeHistoricalLocalOnlyReprocessing(sessionId, at = Date.now()) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeAt = assertNonNegativeInteger(at, "at");
+    this.statements.completeHistoricalReprocessingState.run({
+      sessionId: safeSessionId,
+      at: safeAt,
+    });
+    return this.statements.getSessionReprocessingState.get(safeSessionId) ?? null;
   }
 
   getSpeakerIdentityResolutionSnapshot({
@@ -2545,7 +3085,7 @@ class JarvisRepository {
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
       return { eligible: false, reason: "session_not_terminal" };
     }
-    const tracks = this.statements.listSessionReadinessTracks.all(safeSessionId);
+    const tracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
     if (tracks.length === 0) return { eligible: false, reason: "no_tracks" };
     const evidenceRuns = [];
     const clusters = [];
@@ -2743,6 +3283,19 @@ class JarvisRepository {
       sampleRate: run.sampleRate,
       inputVersion: run.inputVersion,
       executionDevice: run.executionDevice,
+      pipelineMetadataJson: normalizeDiarizationPipelineMetadata(
+        run.pipelineMetadata,
+        run.inputVersion
+      ),
+      speakerCountMin: assertSpeakerCount(run.speakerCount?.minimum, "run.speakerCount.minimum"),
+      speakerCountMax: assertSpeakerCount(run.speakerCount?.maximum, "run.speakerCount.maximum"),
+      speakerCountConfidence: assertOptionalUnitScore(
+        run.speakerCount?.confidence,
+        "run.speakerCount.confidence"
+      ),
+      overlapMs: assertNonNegativeInteger(run.overlapMs ?? 0, "run.overlapMs"),
+      overlapSeparationState: run.overlapSeparationState ?? "not_needed",
+      modelPackVersion: run.modelPackVersion ?? null,
       createdAt: assertNonNegativeInteger(run.createdAt, "run.createdAt"),
       completedAt: assertNonNegativeInteger(run.completedAt, "run.completedAt"),
     };
@@ -2752,8 +3305,18 @@ class JarvisRepository {
       !/^[0-9a-f]{64}$/.test(normalizedRun.modelArtifactSha256) ||
       normalizedRun.embeddingDimension !== 512 ||
       normalizedRun.sampleRate !== 16_000 ||
-      normalizedRun.inputVersion !== 1 ||
-      normalizedRun.executionDevice !== "cpu" ||
+      !new Set([1, 2]).has(normalizedRun.inputVersion) ||
+      normalizedRun.executionDevice !== (normalizedRun.inputVersion === 2 ? "cuda" : "cpu") ||
+      (normalizedRun.speakerCountMin === null) !== (normalizedRun.speakerCountMax === null) ||
+      (normalizedRun.speakerCountMin !== null &&
+        normalizedRun.speakerCountMin > normalizedRun.speakerCountMax) ||
+      !new Set(["not_needed", "completed", "partial", "failed"]).has(
+        normalizedRun.overlapSeparationState
+      ) ||
+      (normalizedRun.modelPackVersion !== null &&
+        (typeof normalizedRun.modelPackVersion !== "string" ||
+          !/^[A-Za-z0-9_.-]{1,200}$/.test(normalizedRun.modelPackVersion))) ||
+      (normalizedRun.inputVersion === 2 && normalizedRun.modelPackVersion === null) ||
       normalizedRun.completedAt < normalizedRun.createdAt
     ) {
       throw new TypeError("invalid diarization run metadata");
@@ -2862,6 +3425,27 @@ class JarvisRepository {
 
   refreshSessionReadiness(sessionId, at = Date.now()) {
     return this._refreshSessionReadiness(assertId(sessionId, "sessionId"), assertInteger(at, "at"));
+  }
+
+  reconcileHistoricalSpeakerReadiness(at = Date.now()) {
+    const safeAt = assertNonNegativeInteger(at, "at");
+    const rows = this.statements.listHistoricalDiarizedSessionIds.all();
+    const result = {
+      inspected: rows.length,
+      woken: 0,
+      ready: 0,
+      processing: 0,
+    };
+    for (const row of rows) {
+      const before = this.statements.getSession.get(row.id);
+      const after = this._refreshSessionReadiness(row.id, safeAt);
+      if (before?.processing_state === "ready" && after?.processing_state === "processing") {
+        result.woken += 1;
+      }
+      if (after?.processing_state === "ready") result.ready += 1;
+      if (after?.processing_state === "processing") result.processing += 1;
+    }
+    return result;
   }
 
   upsertTranscriptSegments(sessionId, segments) {
@@ -3364,6 +3948,7 @@ class JarvisRepository {
       `
         )
         .all(sessionId),
+      speakerProcessing: this.getSessionSpeakerProcessing(sessionId),
     };
   }
 
@@ -3705,8 +4290,8 @@ class JarvisRepository {
     );
   }
 
-  setTrackState(id, state, endedAt) {
-    return this.captureEvidenceStore.setTrackState(id, state, endedAt);
+  setTrackState(id, state, endedAt, failureCode = null) {
+    return this.captureEvidenceStore.setTrackState(id, state, endedAt, failureCode);
   }
 
   openGap(gap) {

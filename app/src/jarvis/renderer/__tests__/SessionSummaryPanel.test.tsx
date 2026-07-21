@@ -47,6 +47,7 @@ function detailWithSummary(): JarvisSessionDetail {
       },
     ],
     memories: [],
+    speakerProcessing: null,
   };
 }
 

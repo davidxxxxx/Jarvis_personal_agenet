@@ -16,6 +16,9 @@ const {
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
 const {
+  HYBRID_DIARIZATION_POLICY,
+} = require("../../src/jarvis/main/HybridDiarizationPolicy");
+const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
   createCommittedAudioPreviewExecutor,
@@ -513,7 +516,36 @@ test("ready sessions enqueue final analysis before exact-session digest and clou
   assert.equal(calls.indexOf("digest_stop") < calls.indexOf("cloud_stop"), true);
 });
 
-test("startup repairs one missed ready-session analysis before starting the cloud dispatcher", async () => {
+test("historical local-only reprocessing preserves summaries and never queues cloud analysis", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [{ id: "historical-session" }],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+      isHistoricalLocalOnlyReprocessing: () => true,
+      completeHistoricalLocalOnlyReprocessing: (sessionId) =>
+        calls.push(`local_complete:${sessionId}`),
+    },
+    reconciler: { reconcileSession: () => calls.push("reconcile") },
+    deduper: { dedupe: () => calls.push("dedupe") },
+    analysisScheduler: {
+      analyzeSession: () => calls.push("unexpected_cloud_analysis"),
+    },
+    dailyDigestScheduler: {
+      start() {},
+      tick() {},
+      onSessionReady: () => calls.push("unexpected_digest_refresh"),
+      stop() {},
+    },
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(calls, ["reconcile", "dedupe", "local_complete:historical-session"]);
+});
+
+test("startup repairs a bounded historical analysis batch before starting the cloud dispatcher", async () => {
   const calls = [];
   const runtime = new JarvisProcessingRuntime({
     runner: {
@@ -528,10 +560,12 @@ test("startup repairs one missed ready-session analysis before starting the clou
     reconciler: { reconcileSession() {} },
     deduper: { dedupe() {} },
     analysisScheduler: {
-      recoverReadySessions: async () => calls.push("recover_analysis"),
+      recoverReadySessions: async (options) =>
+        calls.push(`recover_analysis:${options?.limit ?? "missing"}`),
       analyzeSession() {},
     },
     cloudDispatcher: {
+      recoverStartup: () => calls.push("recover_budget"),
       start: () => calls.push("cloud_start"),
       drainOnce() {},
       stop() {},
@@ -542,8 +576,43 @@ test("startup repairs one missed ready-session analysis before starting the clou
 
   await runtime.start();
   await runtime.stop();
-  assert.equal(calls.indexOf("recover_analysis") > calls.indexOf("recover_leases"), true);
-  assert.equal(calls.indexOf("recover_analysis") < calls.indexOf("cloud_start"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") > calls.indexOf("recover_leases"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") > calls.indexOf("recover_budget"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") < calls.indexOf("cloud_start"), true);
+});
+
+test("failed budget recovery prevents direct activity recovery until the cloud gate can retry", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: () => calls.push("unsafe_activity_recovery"),
+      analyzeSession() {},
+    },
+    cloudDispatcher: {
+      recoverStartup: async () => {
+        throw new Error("budget database unavailable");
+      },
+      start: () => calls.push("cloud_retry"),
+      drainOnce() {},
+      stop() {},
+    },
+    log: ({ phase }) => calls.push(phase),
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  await runtime.start();
+  await runtime.stop();
+  assert.equal(calls.includes("unsafe_activity_recovery"), false);
+  assert.deepEqual(calls, ["analysis_budget_recovery", "cloud_retry"]);
 });
 
 test("ready notification failures are isolated so analysis and digest both get a chance", async () => {
@@ -997,6 +1066,83 @@ test("production composition registers diarize_track as CPU speaker work", async
   );
 });
 
+test("offline model pack selects v2 CUDA diarization and is disposed on shutdown", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  const revision = "d".repeat(64);
+  repository.db.prepare(`
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'hybrid-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
+      ?, 2, ?, 100
+    )
+  `).run(
+    buildDiarizationJobKey({
+      sessionId: "s1",
+      trackId: "track-mic",
+      evidenceRevision: revision,
+      policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    }),
+    HYBRID_DIARIZATION_POLICY.policyId
+  );
+  let disposed = 0;
+  const capabilities = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: configurableService({
+      audioEvidenceReader: { withVerifiedWav: async () => null },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    }),
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    hybridDiarizationManager: {
+      isAvailable: () => true,
+      diarizeStrict: async () => [],
+      getModelArtifactSha256: async () => "e".repeat(64),
+      dispose: async () => {
+        disposed += 1;
+      },
+    },
+    sessionDiarizationWorker: {
+      run: async (_job, context) => {
+        assert.equal(context.device, "cuda");
+        assert.equal(context.selectedGpuUuid, "GPU-hybrid");
+        return { executionDevice: "cuda" };
+      },
+    },
+    model: "large-v3-turbo",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({ state: "available", selectedGpuUuid: "GPU-hybrid" }),
+      admit: (kind, _snapshot, capability) => {
+        capabilities.push({ kind, capability });
+        return { action: "run_cuda", reason: "resources_available" };
+      },
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(runtime.diarizationPolicy, HYBRID_DIARIZATION_POLICY);
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(capabilities, [
+    { kind: "speaker", capability: { executionDevice: "cuda" } },
+  ]);
+  assert.equal(
+    repository.db.prepare("SELECT execution_device FROM processing_jobs WHERE id = 'hybrid-job'").get()
+      .execution_device,
+    "cuda"
+  );
+  await runtime.stop();
+  assert.equal(disposed, 1);
+});
+
 test("production composition builds the durable diarization worker from local managers", async (t) => {
   const repository = new JarvisRepository(":memory:");
   t.after(() => repository.close());
@@ -1092,12 +1238,16 @@ test("production composition builds the durable diarization worker from local ma
   });
 
   assert.equal(await runtime.drainOnce(), 1);
-  assert.deepEqual(capabilities, [
-    {
-      kind: "speaker",
-      capability: { executionDevice: "cpu", available: true },
-    },
-  ]);
+  assert.ok(capabilities.length >= 2);
+  assert.equal(
+    capabilities.every(
+      (entry) =>
+        entry.kind === "speaker" &&
+        entry.capability.executionDevice === "cpu" &&
+        entry.capability.available === true
+    ),
+    true
+  );
   assert.deepEqual(calls, [
     ["diarize", "verified-final.wav"],
     ["embed", "verified-final.wav", 0, 2],

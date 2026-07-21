@@ -14,6 +14,9 @@ const HeavyJobGate = require("./HeavyJobGate");
 const PreviewTranscriptionScheduler = require("./PreviewTranscriptionScheduler");
 const { createHash } = require("node:crypto");
 const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("./HybridDiarizationPolicy");
+const HybridDiarizationManager = require("./HybridDiarizationManager");
+const HistoricalDiarizationBackfillService = require("./HistoricalDiarizationBackfillService");
 const { resolveFullscreenYieldActive } = require("./FullscreenYieldPolicy");
 const defaultSpeakerEmbeddingHelper = require("../../helpers/speakerEmbeddings");
 const { SpeakerEmbeddings } = require("../../helpers/speakerEmbeddings");
@@ -23,6 +26,7 @@ const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
 const DEFAULT_MAX_DRAIN_MS = 5_000;
 const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
+const DEFAULT_ANALYSIS_RECOVERY_LIMIT = 25;
 const PREVIEW_CONTEXT_ROW_LIMIT = 16;
 const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
 
@@ -172,6 +176,9 @@ class JarvisProcessingRuntime {
     analysisBudgetGuard = null,
     dailyDigestScheduler = null,
     speakerProcessingPolicy = null,
+    diarizationPolicy = SESSION_DIARIZATION_POLICY,
+    diarizationRuntime = null,
+    historicalBackfillService = null,
     dualSpeakerVerifier = null,
     prepareTranscriptionJobs = null,
   } = {}) {
@@ -262,6 +269,22 @@ class JarvisProcessingRuntime {
       throw new TypeError("speakerProcessingPolicy must be immutable and implement evaluate");
     }
     if (
+      !diarizationPolicy ||
+      typeof diarizationPolicy.policyId !== "string" ||
+      !new Set([1, 2]).has(diarizationPolicy.inputVersion)
+    ) {
+      throw new TypeError("a versioned diarizationPolicy is required");
+    }
+    if (diarizationRuntime !== null && typeof diarizationRuntime.dispose !== "function") {
+      throw new TypeError("diarizationRuntime.dispose must be a function");
+    }
+    if (
+      historicalBackfillService !== null &&
+      typeof historicalBackfillService.runOnce !== "function"
+    ) {
+      throw new TypeError("historicalBackfillService.runOnce must be a function");
+    }
+    if (
       dualSpeakerVerifier !== null &&
       (typeof dualSpeakerVerifier.screen !== "function" ||
         typeof dualSpeakerVerifier.verify !== "function")
@@ -294,6 +317,9 @@ class JarvisProcessingRuntime {
     this.analysisBudgetGuard = analysisBudgetGuard;
     this.dailyDigestScheduler = dailyDigestScheduler;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
+    this.diarizationPolicy = diarizationPolicy;
+    this.diarizationRuntime = diarizationRuntime;
+    this.historicalBackfillService = historicalBackfillService;
     this.dualSpeakerVerifier = dualSpeakerVerifier;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
@@ -322,10 +348,30 @@ class JarvisProcessingRuntime {
       } catch (error) {
         this.log({ phase: "recovery", error });
       }
+      try {
+        await Promise.resolve(this.historicalBackfillService?.runOnce?.());
+      } catch (error) {
+        this.log({ phase: "historical_diarization_backfill", error });
+      }
+      if (this.stopping) return 0;
       await Promise.resolve(this.dailyDigestScheduler?.start?.());
       if (this.stopping) return 0;
+      let cloudRecoveryReady = true;
       try {
-        await Promise.resolve(this.analysisScheduler?.recoverReadySessions?.());
+        await Promise.resolve(this.cloudDispatcher?.recoverStartup?.());
+      } catch (error) {
+        cloudRecoveryReady = false;
+        this.log({ phase: "analysis_budget_recovery", error });
+      }
+      if (this.stopping) return 0;
+      try {
+        if (cloudRecoveryReady) {
+          await Promise.resolve(
+            this.analysisScheduler?.recoverReadySessions?.({
+              limit: DEFAULT_ANALYSIS_RECOVERY_LIMIT,
+            })
+          );
+        }
       } catch (error) {
         this.log({ phase: "analysis_recovery", error });
       }
@@ -477,7 +523,7 @@ class JarvisProcessingRuntime {
         await this.deduper.dedupe(session.id);
         this.repository.enqueueDiarizationJobs?.(session.id, {
           at: this.now(),
-          policy: SESSION_DIARIZATION_POLICY,
+          policy: this.diarizationPolicy,
           speakerProcessingPolicy: this.speakerProcessingPolicy,
         });
         this.repository.enqueueSpeakerIdentityResolutionJob?.(session.id, {
@@ -485,15 +531,21 @@ class JarvisProcessingRuntime {
         });
         const readiness = this.repository.refreshSessionReadiness(session.id, this.now());
         if (readiness?.processing_state === "ready") {
-          try {
-            await Promise.resolve(this.analysisScheduler?.analyzeSession?.(session.id, "final"));
-          } catch (error) {
-            this.log({ phase: "analysis_ready", sessionId: session.id, error });
-          }
-          try {
-            await Promise.resolve(this.dailyDigestScheduler?.onSessionReady?.(session.id));
-          } catch (error) {
-            this.log({ phase: "daily_digest_ready", sessionId: session.id, error });
+          const localOnly =
+            this.repository.isHistoricalLocalOnlyReprocessing?.(session.id) === true;
+          if (!localOnly) {
+            try {
+              await Promise.resolve(this.analysisScheduler?.analyzeSession?.(session.id, "final"));
+            } catch (error) {
+              this.log({ phase: "analysis_ready", sessionId: session.id, error });
+            }
+            try {
+              await Promise.resolve(this.dailyDigestScheduler?.onSessionReady?.(session.id));
+            } catch (error) {
+              this.log({ phase: "daily_digest_ready", sessionId: session.id, error });
+            }
+          } else {
+            this.repository.completeHistoricalLocalOnlyReprocessing?.(session.id, this.now());
           }
         }
       } catch (error) {
@@ -603,6 +655,11 @@ class JarvisProcessingRuntime {
         primaryError ??= error;
       }
       try {
+        await Promise.resolve(this.diarizationRuntime?.dispose?.());
+      } catch (error) {
+        primaryError ??= error;
+      }
+      try {
         await Promise.resolve(this.cloudInFlight);
       } catch (error) {
         primaryError ??= error;
@@ -646,6 +703,9 @@ function createJarvisProcessingRuntime({
   whisperController = null,
   prepareTranscriptionJobs = undefined,
   sessionDiarizationWorker = null,
+  diarizationPolicy = null,
+  hybridDiarizationManager = null,
+  historicalBackfillService = null,
   speakerIdentityResolutionWorker = null,
   speakerEmbeddingHelper = defaultSpeakerEmbeddingHelper,
   primarySpeakerEmbeddingHelper = null,
@@ -669,6 +729,15 @@ function createJarvisProcessingRuntime({
   }
   if (sessionDiarizationWorker !== null && typeof sessionDiarizationWorker?.run !== "function") {
     throw new TypeError("sessionDiarizationWorker.run must be a function");
+  }
+  if (
+    hybridDiarizationManager !== null &&
+    (typeof hybridDiarizationManager.diarizeStrict !== "function" ||
+      typeof hybridDiarizationManager.getModelArtifactSha256 !== "function" ||
+      typeof hybridDiarizationManager.isAvailable !== "function" ||
+      typeof hybridDiarizationManager.dispose !== "function")
+  ) {
+    throw new TypeError("hybridDiarizationManager must implement the hybrid runtime interface");
   }
   if (
     speakerIdentityResolutionWorker !== null &&
@@ -696,7 +765,28 @@ function createJarvisProcessingRuntime({
   });
   const whisperManager = ipcHandlers.whisperManager || null;
   const cudaManager = ipcHandlers.whisperCudaManager || null;
-  const diarizationManager = ipcHandlers.diarizationManager || null;
+  const legacyDiarizationManager = ipcHandlers.diarizationManager || null;
+  let discoveredHybridManager = hybridDiarizationManager;
+  if (discoveredHybridManager === null && typeof process.env.JARVIS_DATA_ROOT === "string") {
+    try {
+      const candidate = new HybridDiarizationManager({
+        verifierDiarizer: legacyDiarizationManager,
+        log,
+      });
+      if (candidate.isAvailable()) discoveredHybridManager = candidate;
+    } catch (error) {
+      log({ phase: "hybrid_diarization_discovery", error });
+    }
+  }
+  const selectedDiarizationPolicy =
+    diarizationPolicy ??
+    (discoveredHybridManager?.isAvailable?.() === true
+      ? HYBRID_DIARIZATION_POLICY
+      : SESSION_DIARIZATION_POLICY);
+  const diarizationManager =
+    selectedDiarizationPolicy.inputVersion === 2
+      ? discoveredHybridManager
+      : legacyDiarizationManager;
   const canBuildDiarizationWorker = Boolean(
     diarizationManager &&
     typeof diarizationManager.diarizeStrict === "function" &&
@@ -735,7 +825,8 @@ function createJarvisProcessingRuntime({
       ? new SessionDiarizationWorker({
           repository,
           audioEvidenceReader: service.audioEvidenceReader,
-          diarizeAudio: ({ wavPath }) => diarizationManager.diarizeStrict(wavPath),
+          diarizeAudio: ({ wavPath, executionContext }) =>
+            diarizationManager.diarizeStrict(wavPath, { executionContext }),
           embedWindow: ({ wavPath, turn }) =>
             speakerEmbeddingHelper.extractEmbedding(
               wavPath,
@@ -743,7 +834,12 @@ function createJarvisProcessingRuntime({
               turn.embeddingEndMs / 1_000
             ),
           modelArtifactSha256: combinedDiarizationArtifactHash,
+          policy: selectedDiarizationPolicy,
           speakerProcessingPolicy,
+          releaseResources:
+            selectedDiarizationPolicy.inputVersion === 2
+              ? () => discoveredHybridManager?.dispose?.()
+              : null,
           clock: now,
         })
       : null);
@@ -753,10 +849,12 @@ function createJarvisProcessingRuntime({
     "applySystemSpeakerResolutions",
   ].every((method) => typeof repository[method] === "function");
   const diarizationCapability = () => {
-    if (sessionDiarizationWorker !== null) return { executionDevice: "cpu" };
+    if (sessionDiarizationWorker !== null) {
+      return { executionDevice: selectedDiarizationPolicy.executionDevice ?? "cpu" };
+    }
     if (!canBuildDiarizationWorker) {
       return {
-        executionDevice: "cpu",
+        executionDevice: selectedDiarizationPolicy.executionDevice ?? "cpu",
         available: false,
         unavailableReason: "diarization_runtime_unavailable",
       };
@@ -770,7 +868,7 @@ function createJarvisProcessingRuntime({
       available = false;
     }
     return {
-      executionDevice: "cpu",
+      executionDevice: selectedDiarizationPolicy.executionDevice ?? "cpu",
       available,
       ...(available ? {} : { unavailableReason: "diarization_model_unavailable" }),
     };
@@ -788,7 +886,11 @@ function createJarvisProcessingRuntime({
       ownedPidsProvider:
         ownedPidsProvider ??
         (() =>
-          [process.pid, whisperManager?.serverManager?.process?.pid].filter(
+          [
+            process.pid,
+            whisperManager?.serverManager?.process?.pid,
+            ...(discoveredHybridManager?.ownedPids?.() ?? []),
+          ].filter(
             (pid) => Number.isSafeInteger(pid) && pid > 0
           )),
       cudaProvider: async () => {
@@ -833,6 +935,7 @@ function createJarvisProcessingRuntime({
       ? new SpeakerIdentityResolutionWorker({
           repository,
           clock: now,
+          diarizationPolicy: selectedDiarizationPolicy,
           ...(canBuildDualIdentityResolutionWorker
             ? {
                 dualEvidenceProvider: new DualSpeakerEvidenceProvider({
@@ -940,6 +1043,19 @@ function createJarvisProcessingRuntime({
         modelVersion: speakerProcessingPolicy.transcriptionModelVersion,
         at: now(),
       }));
+  const effectiveHistoricalBackfillService =
+    historicalBackfillService ??
+    (selectedDiarizationPolicy.inputVersion === 2 &&
+    typeof repository.listHistoricalHybridCandidates === "function" &&
+    typeof repository.enqueueHistoricalHybridReprocessing === "function"
+      ? new HistoricalDiarizationBackfillService({
+          repository,
+          speakerProcessingPolicy,
+          policy: selectedDiarizationPolicy,
+          now,
+          log,
+        })
+      : null);
   return new JarvisProcessingRuntime({
     runner,
     repository,
@@ -952,6 +1068,10 @@ function createJarvisProcessingRuntime({
     whisperController: effectiveWhisperController,
     previewScheduler: effectivePreviewScheduler,
     speakerProcessingPolicy,
+    diarizationPolicy: selectedDiarizationPolicy,
+    diarizationRuntime:
+      selectedDiarizationPolicy.inputVersion === 2 ? discoveredHybridManager : null,
+    historicalBackfillService: effectiveHistoricalBackfillService,
     dualSpeakerVerifier: effectiveDualSpeakerVerifier,
     prepareTranscriptionJobs: effectivePrepareTranscriptionJobs,
     ...runtimeOptions,

@@ -5,6 +5,7 @@ const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const RESTORATION_TARGET_STATES = new Set(["active", "paused"]);
 const SOURCE_LIFECYCLE_SESSION_STATUSES = new Set(["recording", "paused"]);
 const APPLICATION_KEY_PATTERN = /^[a-z0-9._-]{1,64}$/;
+const APPLICATION_FAILURE_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   completed: "ended",
   recovered: "recovered",
@@ -56,20 +57,22 @@ class CaptureEvidenceStore {
         INSERT INTO audio_tracks (
           id, session_id, source_type, application_key, application_display_name,
           capture_generation, device_id, device_label, strategy,
-          sample_rate, channels, started_at, state
+          sample_rate, channels, started_at, state, failure_code
         ) VALUES (
           @id, @sessionId, @sourceType, @applicationKey, @applicationDisplayName,
           @captureGeneration, @deviceId, @deviceLabel, @strategy,
-          @sampleRate, @channels, @startedAt, @state
+          @sampleRate, @channels, @startedAt, @state, @failureCode
         )
       `),
       createApplicationAudioInterval: db.prepare(`
         INSERT INTO application_audio_intervals (
           id, session_id, track_id, interval_kind, application_key,
-          attribution_state, capture_generation, started_at, ended_at, reason, created_at
+          attribution_state, capture_generation, started_at, ended_at, reason,
+          failure_code, created_at
         ) VALUES (
           @id, @sessionId, @trackId, @intervalKind, @applicationKey,
-          @attributionState, @captureGeneration, @startedAt, @endedAt, @reason, @createdAt
+          @attributionState, @captureGeneration, @startedAt, @endedAt, @reason,
+          @failureCode, @createdAt
         )
       `),
       closeApplicationAudioInterval: db.prepare(`
@@ -87,7 +90,7 @@ class CaptureEvidenceStore {
       `),
       setTrackState: db.prepare(`
         UPDATE audio_tracks
-        SET state = @state, ended_at = @endedAt
+        SET state = @state, ended_at = @endedAt, failure_code = @failureCode
         WHERE id = @id
       `),
       openGap: db.prepare(`
@@ -1898,6 +1901,12 @@ class CaptureEvidenceStore {
     }
     const captureGeneration = track.captureGeneration ?? 0;
     this._assertNonNegativeSafeInteger(captureGeneration, "captureGeneration");
+    const state = track.state ?? "active";
+    let failureCode = track.failureCode ?? null;
+    if (failureCode !== null && !APPLICATION_FAILURE_CODE_PATTERN.test(failureCode)) {
+      throw new TypeError("application failure code must be a safe bounded identifier");
+    }
+    if (state !== "failed") failureCode = null;
     return this.statements.createTrack.run({
       ...track,
       applicationKey,
@@ -1906,7 +1915,8 @@ class CaptureEvidenceStore {
       deviceId: track.deviceId ?? null,
       deviceLabel: track.deviceLabel ?? null,
       strategy: track.strategy ?? null,
-      state: track.state ?? "active",
+      state,
+      failureCode,
     });
   }
 
@@ -1938,6 +1948,10 @@ class CaptureEvidenceStore {
     }
     const createdAt = interval.createdAt ?? this.now();
     this._assertNonNegativeSafeInteger(createdAt, "interval createdAt");
+    const failureCode = interval.failureCode ?? null;
+    if (failureCode !== null && !APPLICATION_FAILURE_CODE_PATTERN.test(failureCode)) {
+      throw new TypeError("application failure code must be a safe bounded identifier");
+    }
     this.statements.createApplicationAudioInterval.run({
       id,
       sessionId: interval.sessionId,
@@ -1949,6 +1963,7 @@ class CaptureEvidenceStore {
       startedAt: interval.startedAt,
       endedAt,
       reason: interval.reason ?? null,
+      failureCode,
       createdAt,
     });
     return this.statements.getApplicationAudioInterval.get(id);
@@ -1969,8 +1984,12 @@ class CaptureEvidenceStore {
     return this.statements.listApplicationAudioIntervals.all(sessionId);
   }
 
-  setTrackState(id, state, endedAt = null) {
-    return this.statements.setTrackState.run({ id, state, endedAt });
+  setTrackState(id, state, endedAt = null, failureCode = null) {
+    if (failureCode !== null && !APPLICATION_FAILURE_CODE_PATTERN.test(failureCode)) {
+      throw new TypeError("application failure code must be a safe bounded identifier");
+    }
+    if (state !== "failed") failureCode = null;
+    return this.statements.setTrackState.run({ id, state, endedAt, failureCode });
   }
 
   openGap(gap) {

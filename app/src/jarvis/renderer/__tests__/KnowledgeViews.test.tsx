@@ -77,6 +77,7 @@ const overview: JarvisKnowledgeOverview = {
       status: "open",
       completedAt: null,
       dismissedAt: null,
+      verificationState: "confirmed",
       createdAt: 1,
       updatedAt: 2,
       revisions: [
@@ -88,8 +89,41 @@ const overview: JarvisKnowledgeOverview = {
           createdAt: 1,
         },
       ],
-      occurrences: [],
+      occurrences: [
+        {
+          id: "todo_occurrence_1",
+          sessionId: "session_1",
+          revisionId: "todo_revision_1",
+          startedAt: 30,
+          endedAt: 40,
+          createdAt: 2,
+          evidence: [
+            {
+              sessionId: "session_1",
+              segmentId: "todo_segment_1",
+              startedAt: 30,
+              endedAt: 40,
+              quote: "I will prepare the release build.",
+              audioState: "available",
+            },
+          ],
+        },
+      ],
       transitions: [{ id: "transition_1", fromStatus: null, toStatus: "open", occurredAt: 1 }],
+    },
+    {
+      id: "todo_pending",
+      title: "Review game commentary",
+      ownerLabel: null,
+      status: "open",
+      completedAt: null,
+      dismissedAt: null,
+      verificationState: "pending_confirmation",
+      createdAt: 1,
+      updatedAt: 2,
+      revisions: [],
+      occurrences: [],
+      transitions: [],
     },
     {
       id: "todo_done",
@@ -98,6 +132,7 @@ const overview: JarvisKnowledgeOverview = {
       status: "completed",
       completedAt: 3,
       dismissedAt: null,
+      verificationState: "confirmed",
       createdAt: 1,
       updatedAt: 3,
       revisions: [],
@@ -171,7 +206,9 @@ describe("durable knowledge views", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Project Atlas/ }));
 
     expect(screen.getAllByText("Release plan")).not.toHaveLength(0);
+    fireEvent.click(screen.getByText("查看版本历史"));
     expect(screen.getByText("Initial plan")).toBeVisible();
+    fireEvent.click(screen.getByText(/查看来源证据/));
     expect(
       screen.getByText((_, element) =>
         Boolean(element?.tagName === "LI" && element.textContent?.includes("Ship Atlas Friday."))
@@ -196,11 +233,39 @@ describe("durable knowledge views", () => {
     expect(window.electronAPI.jarvis.listTodos).not.toHaveBeenCalled();
   });
 
+  it("keeps todo evidence out of the overview until the user opens the item", async () => {
+    render(<TodosView />);
+    await screen.findByText("Prepare release build");
+    expect(screen.queryByText("I will prepare the release build.")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /查看待办 Prepare release build/ }));
+    fireEvent.click(screen.getByText(/查看来源依据/));
+    expect(screen.getByText("I will prepare the release build.")).toBeVisible();
+  });
+
+  it("keeps unverified analysis out of formal todos and explains the pending state", async () => {
+    render(<TodosView />);
+    expect(await screen.findByText("现在要做 1")).toBeVisible();
+    expect(screen.queryByText("Review game commentary")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "待你确认 1" }));
+    expect(screen.getByText("Review game commentary")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Complete / 完成 Review game commentary" })
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /查看待办 Review game commentary/ }));
+    expect(screen.getByText(/尚无可靠 SELF 承诺或用户确认/)).toBeVisible();
+  });
+
   it("keeps suggestions and conflicts explicit user decisions", async () => {
     render(<KnowledgeMemoryPanel />);
     expect((await screen.findAllByText("Use local-first storage.")).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: /查看长期记忆 Deployment choice/ }));
+    fireEvent.click(screen.getByText(/查看来源证据/));
     expect(screen.getByText("Keep it local.")).toBeVisible();
 
+    fireEvent.click(screen.getByText(/候选建议/));
     fireEvent.click(screen.getByRole("button", { name: /accept|接受/i }));
     await waitFor(() =>
       expect(window.electronAPI.jarvis.decideKnowledgeSuggestion).toHaveBeenCalledWith(
@@ -208,6 +273,7 @@ describe("durable knowledge views", () => {
         "accept"
       )
     );
+    fireEvent.click(screen.getByText(/待确认冲突/));
     fireEvent.click(screen.getByRole("button", { name: /choose|选择/i }));
     await waitFor(() =>
       expect(window.electronAPI.jarvis.resolveKnowledgeConflict).toHaveBeenCalledWith(

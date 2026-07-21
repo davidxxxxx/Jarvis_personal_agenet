@@ -210,7 +210,23 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
           },
         ],
         topics: [],
-        todos: [],
+        todos: [
+          {
+            id: "todo_1",
+            title: "Unverified legacy task",
+            ownerLabel: null,
+            status: "open",
+            completedAt: null,
+            dismissedAt: null,
+            verificationState: "pending_confirmation",
+            provenance: "private-provenance",
+            createdAt: 1,
+            updatedAt: 2,
+            revisions: [],
+            occurrences: [],
+            transitions: [],
+          },
+        ],
         suggestions: [],
         memoryConflicts: [],
         dailyDigests: [{ sourceHash: "private-source" }],
@@ -247,6 +263,7 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
     ownerId: "memory_1",
     evidenceId: "evidence_1",
   });
+  assert.equal(overview.todos[0].verificationState, "pending_confirmation");
   const serialized = JSON.stringify(overview);
   for (const secret of [
     "private-provenance",

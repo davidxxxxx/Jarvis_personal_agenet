@@ -15,6 +15,12 @@ function safeReason(error, fallback = "application_capture_unavailable") {
   return /^[a-z0-9_-]{1,64}$/i.test(candidate) ? candidate : fallback;
 }
 
+function safeFailureCode(error, fallback = "application_capture_unavailable") {
+  const candidate =
+    typeof error?.failureCode === "string" ? error.failureCode : safeReason(error, fallback);
+  return /^[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : fallback;
+}
+
 function isAudiblePcm(pcm) {
   if (!Buffer.isBuffer(pcm) || pcm.length < 2) return false;
   for (let offset = 0; offset + 1 < pcm.length; offset += 16) {
@@ -352,7 +358,9 @@ class ApplicationAudioCapturePool {
       const retryAt = at + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
-      this._setFallback(track, safeReason(error, "capture_start_failed"), retryAt);
+      const reason = safeReason(error, "capture_start_failed");
+      const failureCode = safeFailureCode(error, reason);
+      this._setFallback(track, reason, retryAt, failureCode);
       try {
         this.onAttributionChange({
           sessionId: this.sessionId,
@@ -361,7 +369,8 @@ class ApplicationAudioCapturePool {
           captureGeneration,
           attributionState: "mixed_unknown",
           at,
-          reason: safeReason(error, "capture_start_failed"),
+          reason,
+          failureCode,
         });
       } catch (callbackError) {
         this.onError(callbackError);
@@ -407,7 +416,8 @@ class ApplicationAudioCapturePool {
       const retryAt = at + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
-      this._setFallback(track, "evidence_registration_failed", retryAt);
+      const failureCode = safeFailureCode(error, "evidence_registration_failed");
+      this._setFallback(track, "evidence_registration_failed", retryAt, failureCode);
       try {
         this.onTrackEnded({
           sessionId: this.sessionId,
@@ -417,13 +427,14 @@ class ApplicationAudioCapturePool {
           captureGeneration: track.captureGeneration,
           endedAt: at,
           reason: "evidence_registration_failed",
+          failureCode,
         });
       } catch {}
       this.onError(error);
     }
   }
 
-  async _stopTrack(applicationKey, reason, at) {
+  async _stopTrack(applicationKey, reason, at, failureCode = null) {
     const track = this.activeTracks.get(applicationKey);
     if (!track) return;
     this.activeTracks.delete(applicationKey);
@@ -436,10 +447,10 @@ class ApplicationAudioCapturePool {
         code: safeReason(error, "capture_stop_failed"),
       });
     }
-    this._notifyTrackStopped(track, reason, at, this.sessionId);
+    this._notifyTrackStopped(track, reason, at, this.sessionId, failureCode);
   }
 
-  _notifyTrackStopped(track, reason, at, sessionId) {
+  _notifyTrackStopped(track, reason, at, sessionId, failureCode = null) {
     try {
       this.onAttributionChange({
         sessionId,
@@ -449,6 +460,7 @@ class ApplicationAudioCapturePool {
         attributionState: "mixed_unknown",
         at,
         reason,
+        failureCode,
       });
       this.onTrackEnded({
         sessionId,
@@ -458,6 +470,7 @@ class ApplicationAudioCapturePool {
         captureGeneration: track.captureGeneration,
         endedAt: at,
         reason,
+        failureCode,
       });
     } catch (error) {
       this.onError(error);
@@ -487,31 +500,34 @@ class ApplicationAudioCapturePool {
     if (this.activeTracks.get(track.applicationKey) !== track) return;
     const at = this.now();
     const reason = safeReason(error);
+    const failureCode = safeFailureCode(error, reason);
     const retryAt = at + this.retryDelayMs;
     const candidate = this.candidates.get(track.applicationKey);
     if (candidate) candidate.blockedUntil = retryAt;
-    this._setFallback(track, reason, retryAt);
-    await this._stopTrack(track.applicationKey, reason, at);
+    this._setFallback(track, reason, retryAt, failureCode);
+    await this._stopTrack(track.applicationKey, reason, at, failureCode);
     await this._reconcile(at);
   }
 
   async _handleWatcherError(error) {
     const at = this.now();
     const reason = safeReason(error, "session_watch_unavailable");
+    const failureCode = safeFailureCode(error, reason);
     for (const track of this.activeTracks.values()) {
-      this._setFallback(track, reason, at + this.retryDelayMs);
+      this._setFallback(track, reason, at + this.retryDelayMs, failureCode);
     }
     for (const applicationKey of [...this.activeTracks.keys()]) {
-      await this._stopTrack(applicationKey, reason, at);
+      await this._stopTrack(applicationKey, reason, at, failureCode);
     }
     this.onError(error);
   }
 
-  _setFallback(track, reason, retryAt) {
+  _setFallback(track, reason, retryAt, failureCode = null) {
     this.fallbacks.set(track.applicationKey, {
       applicationKey: track.applicationKey,
       applicationDisplayName: track.applicationDisplayName,
       reason,
+      failureCode,
       retryAt,
     });
   }

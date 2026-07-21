@@ -34,6 +34,7 @@ const DEFAULT_VAD_TIMEOUT_MS = 5_000;
 const AUDIBLE_SIGNAL_RMS_FLOOR = 0.006;
 const AUDIBLE_SIGNAL_PEAK_FLOOR = 0.08;
 const APPLICATION_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const APPLICATION_FAILURE_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const RECOVERY_SIDECAR_KEYS = Object.freeze([
   "durationMs",
   "endedAt",
@@ -93,6 +94,18 @@ function assertCaptureGeneration(captureGeneration) {
     throw new TypeError("captureGeneration must be a positive safe integer");
   }
   return captureGeneration;
+}
+
+function applicationFailureCode(value, fallback = "application_capture_failed") {
+  const candidate =
+    typeof value === "string"
+      ? value
+      : typeof value?.failureCode === "string"
+        ? value.failureCode
+        : typeof value?.code === "string"
+          ? value.code
+          : fallback;
+  return APPLICATION_FAILURE_CODE_PATTERN.test(candidate) ? candidate : fallback;
 }
 
 class JarvisService {
@@ -495,7 +508,12 @@ class JarvisService {
       }
       if (persisted) {
         try {
-          this.repository.setTrackState(trackId, "failed", startedAt);
+          this.repository.setTrackState(
+            trackId,
+            "failed",
+            startedAt,
+            applicationFailureCode(error, "evidence_registration_failed")
+          );
         } catch {}
       }
       throw error;
@@ -532,6 +550,7 @@ class JarvisService {
     captureGeneration,
     endedAt,
     state = "ended",
+    failureCode = null,
   }) {
     this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(endedAt, "endedAt");
@@ -546,7 +565,12 @@ class JarvisService {
     }
     this.applicationSources.delete(applicationKey);
     this.writer?.closeSource(track.trackKey, endedAt);
-    this.repository.setTrackState(track.trackId, state, endedAt);
+    this.repository.setTrackState(
+      track.trackId,
+      state,
+      endedAt,
+      state === "failed" ? applicationFailureCode(failureCode) : null
+    );
     return true;
   }
 
@@ -557,6 +581,7 @@ class JarvisService {
     attributionState,
     at,
     reason,
+    failureCode = null,
   }) {
     this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(at, "at");
@@ -609,7 +634,11 @@ class JarvisService {
       captureGeneration: generation,
       startedAt: transitionAt,
       endedAt: null,
-      reason,
+      reason: attributionState === "exact" ? null : reason,
+      failureCode:
+        attributionState === "exact" || failureCode === null
+          ? null
+          : applicationFailureCode(failureCode),
       createdAt: transitionAt,
     });
     const active = {

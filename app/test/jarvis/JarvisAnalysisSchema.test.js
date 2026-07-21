@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   AnalysisSchemaError,
+  salvageCandidateAnalysis,
   validateCandidateAnalysis,
   ANALYSIS_TOOL,
 } = require("../../src/jarvis/main/JarvisAnalysisSchema");
@@ -134,6 +135,36 @@ test("allows ungrounded suggestions but validates any supplied suggestion eviden
     }),
     "schema.evidence_out_of_scope"
   );
+});
+
+test("salvages valid grounded output while dropping malformed optional items", () => {
+  const input = candidate({
+    sessionSummary: {
+      ...candidate().sessionSummary,
+      evidenceSegmentIds: ["seg-other", "seg-1", "seg-1"],
+    },
+    topics: [
+      candidate().topics[0],
+      { ...candidate().topics[0], name: "Invented", evidenceSegmentIds: ["seg-other"] },
+    ],
+    todos: [
+      candidate().todos[0],
+      { ...candidate().todos[0], ownerLabel: "Alice" },
+    ],
+    suggestions: [
+      {
+        ...candidate().suggestions[0],
+        basedOnEvidenceSegmentIds: ["seg-other", "seg-2"],
+      },
+    ],
+  });
+
+  const result = salvageCandidateAnalysis(input, context);
+
+  assert.deepEqual(result.sessionSummary.evidenceSegmentIds, ["seg-1"]);
+  assert.equal(result.topics.length, 1);
+  assert.equal(result.todos.length, 1);
+  assert.deepEqual(result.suggestions[0].basedOnEvidenceSegmentIds, ["seg-2"]);
 });
 
 test("rejects invalid memory kinds confidence owner labels and due text", () => {

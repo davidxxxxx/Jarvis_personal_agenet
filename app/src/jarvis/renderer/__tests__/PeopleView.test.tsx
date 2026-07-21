@@ -120,6 +120,7 @@ describe("PeopleView durable identity detail", () => {
   it("renders localized identity metadata and complete correction provenance without private data", async () => {
     render(<PeopleView />);
     fireEvent.click(await screen.findByRole("button", { name: /Source Person/ }));
+    fireEvent.click(await screen.findByText("声纹与识别详情"));
 
     expect(await screen.findByText("campplus-v1")).toBeInTheDocument();
     expect(screen.getByText(/18,000 ms/)).toBeInTheDocument();
@@ -232,7 +233,9 @@ describe("PeopleView durable identity detail", () => {
     mergePeople.mockResolvedValue(detail(target));
     render(<PeopleView />);
     fireEvent.click(await screen.findByRole("button", { name: /Source Person/ }));
+    fireEvent.click(await screen.findByText("声纹与识别详情"));
     await screen.findByText("campplus-v1");
+    fireEvent.click(screen.getByText("人物管理（高级）"));
     fireEvent.change(screen.getByLabelText("Merge into"), { target: { value: "p-target" } });
     fireEvent.click(screen.getByRole("button", { name: "Review merge" }));
 
@@ -255,6 +258,7 @@ describe("PeopleView durable identity detail", () => {
   it("does not offer self as a merge source", async () => {
     render(<PeopleView />);
     fireEvent.click(await screen.findByRole("button", { name: /Me/ }));
+    fireEvent.click(await screen.findByText("声纹与识别详情"));
     await screen.findByText("campplus-v1");
     expect(screen.queryByLabelText("Merge into")).not.toBeInTheDocument();
   });

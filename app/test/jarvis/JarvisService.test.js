@@ -2335,7 +2335,7 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
   }
 });
 
-test("resume rejects while all sources are automatically recovering without side effects", () => {
+test("resume rejects while all sources are automatically recovering without side effects", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-recovering-resume-"));
   const repository = createRepository();
   let resumeCalls = 0;
@@ -2386,7 +2386,8 @@ test("resume rejects while all sources are automatically recovering without side
     assert.equal(state.sources.mic.state, "reconnecting");
     assert.equal(state.sources.system.state, "reconnecting");
   } finally {
-    service.shutdown();
+    await service.shutdown();
+    await service.whenRetentionIdle();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

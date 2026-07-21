@@ -1,0 +1,7 @@
+# Jarvis offline diarization runtime, Python 3.11 x64.
+# Install the CUDA wheels first from the official PyTorch cu128 index, then
+# install the remaining pinned top-level packages from PyPI.
+pyannote-audio==4.0.7
+clearvoice==0.1.2
+soundfile==0.13.1
+huggingface-hub==0.35.3

@@ -106,6 +106,13 @@ test("v21 creates revisioned diarization evidence with constrained foreign keys"
       "sample_rate",
       "input_version",
       "execution_device",
+      "pipeline_metadata_json",
+      "speaker_count_min",
+      "speaker_count_max",
+      "speaker_count_confidence",
+      "overlap_ms",
+      "overlap_separation_state",
+      "model_pack_version",
       "commit_sequence",
       "created_at",
       "completed_at",
@@ -1226,6 +1233,199 @@ test("worker persists minimum centroid consistency instead of perfect synthetic 
   assert.ok(committed.clusters[0].qualityScore > 0.7);
   assert.ok(committed.clusters[0].qualityScore < 0.8);
   assert.notEqual(committed.clusters[0].qualityScore, 1);
+});
+
+test("v2 worker persists CUDA count consensus and overlap separation metadata", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+  const snapshot = immutableWorkerSnapshot();
+  let committed;
+  const worker = new SessionDiarizationWorker({
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: (input) => {
+        committed = input;
+        return { status: "completed", runId: input.run.id };
+      },
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
+    },
+    diarizeAudio: async ({ chunk, executionContext }) => {
+      assert.equal(executionContext.device, "cuda");
+      const turns = [{ start: 0, end: 1.6, speaker: `raw_${chunk.id}` }];
+      Object.defineProperty(turns, "metadata", {
+        value: {
+          schemaVersion: 1,
+          speakerCount:
+            chunk.id === "chunk-1"
+              ? { minimum: 1, maximum: 2, preferred: 1, confidence: 0.55, state: "models_disagree" }
+              : { minimum: 1, maximum: 1, preferred: 1, confidence: 0.94, state: "models_agree" },
+          overlapWindows: chunk.id === "chunk-1" ? [{ startMs: 400, endMs: 1400 }] : [],
+          overlapSeparation: {
+            state: chunk.id === "chunk-1" ? "completed" : "not_needed",
+          },
+        },
+      });
+      return turns;
+    },
+    embedWindow: async () => unitEmbedding(0),
+    modelArtifactSha256: "a".repeat(64),
+    clock: () => 10_000,
+  });
+  const result = await worker.run(
+    {
+      id: "job-hybrid",
+      session_id: "session-worker",
+      track_id: "track-worker",
+      input_hash: buildDiarizationJobKey({
+        sessionId: "session-worker",
+        trackId: "track-worker",
+        evidenceRevision: snapshot.evidenceRevision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    },
+    { device: "cuda", renewLease: () => true, checkResources: async () => true }
+  );
+
+  assert.deepEqual(result, { executionDevice: "cuda", status: "completed" });
+  assert.equal(committed.run.modelPackVersion, HYBRID_DIARIZATION_POLICY.modelPackVersion);
+  assert.deepEqual(committed.run.speakerCount, {
+    minimum: 1,
+    maximum: 2,
+    preferred: 1,
+    confidence: 0.55,
+    state: "models_disagree",
+  });
+  assert.equal(committed.run.overlapMs, 1000);
+  assert.equal(committed.run.overlapSeparationState, "completed");
+  assert.equal(committed.run.pipelineMetadata.chunks.length, 2);
+});
+
+test("v2 worker keeps overlap speech out of durable identity centroids", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+  const snapshot = immutableWorkerSnapshot();
+  let committed;
+  const worker = new SessionDiarizationWorker({
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: (input) => {
+        committed = input;
+        return { status: "completed", runId: input.run.id };
+      },
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
+    },
+    diarizeAudio: async ({ chunk }) => {
+      if (chunk.id !== "chunk-1") return [];
+      const turns = [
+        { start: 0, end: 1.6, speaker: "S1" },
+        { start: 0.5, end: 1.5, speaker: "S2" },
+        { start: 2, end: 3.6, speaker: "S1" },
+      ];
+      Object.defineProperty(turns, "metadata", {
+        value: {
+          speakerCount: {
+            minimum: 2,
+            maximum: 2,
+            preferred: 2,
+            confidence: 0.9,
+            state: "models_agree",
+          },
+          overlapWindows: [{ startMs: 400, endMs: 1_700 }],
+          overlapSeparation: { state: "completed", processed: 1, total: 1 },
+        },
+      });
+      return turns;
+    },
+    embedWindow: async ({ turn }) => unitEmbedding(turn.rawLabel === "S1" ? 0 : 1),
+    modelArtifactSha256: "a".repeat(64),
+    clock: () => 10_000,
+  });
+
+  await worker.run(
+    {
+      id: "job-overlap-centroid",
+      session_id: "session-worker",
+      track_id: "track-worker",
+      input_hash: buildDiarizationJobKey({
+        sessionId: "session-worker",
+        trackId: "track-worker",
+        evidenceRevision: snapshot.evidenceRevision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    },
+    { device: "cuda", renewLease: () => true, checkResources: async () => true }
+  );
+
+  const byLabel = new Map(committed.clusters.map((cluster) => [cluster.localLabel, cluster]));
+  assert.equal(byLabel.get("speaker_1").windowCount, 1);
+  assert.equal(byLabel.get("speaker_2").windowCount, 0);
+  assert.equal(committed.turns.filter((turn) => turn.overlapExcludedFromCentroid).length, 2);
+  assert.equal(committed.run.pipelineMetadata.chunks[0].overlapCentroidExcludedTurns, 2);
+});
+
+test("v2 worker releases loaded models before yielding to a newly busy GPU", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+  const snapshot = immutableWorkerSnapshot();
+  let releases = 0;
+  const worker = new SessionDiarizationWorker({
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: () => assert.fail("yielded work must not commit"),
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async () => assert.fail("resource checkpoint runs before reading audio"),
+    },
+    diarizeAudio: async () => [],
+    embedWindow: async () => unitEmbedding(0),
+    modelArtifactSha256: "a".repeat(64),
+    releaseResources: async () => {
+      releases += 1;
+    },
+    clock: () => 10_000,
+  });
+  const busy = new Error("JOB_RESOURCE_YIELD");
+  busy.code = "JOB_RESOURCE_YIELD";
+  await assert.rejects(
+    worker.run(
+      {
+        id: "job-yield",
+        session_id: "session-worker",
+        track_id: "track-worker",
+        input_hash: buildDiarizationJobKey({
+          sessionId: "session-worker",
+          trackId: "track-worker",
+          evidenceRevision: snapshot.evidenceRevision,
+          policyId: HYBRID_DIARIZATION_POLICY.policyId,
+        }),
+        model_version: HYBRID_DIARIZATION_POLICY.policyId,
+      },
+      { device: "cuda", renewLease: () => true, checkResources: async () => { throw busy; } }
+    ),
+    /JOB_RESOURCE_YIELD/
+  );
+  assert.equal(releases, 1);
 });
 
 test("embedding normalization accepts an unaligned Buffer view", () => {

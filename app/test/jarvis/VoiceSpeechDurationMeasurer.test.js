@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const VoiceSpeechDurationMeasurer = require("../../src/jarvis/main/VoiceSpeechDurationMeasurer");
+const { SPEECH_THRESHOLD } = VoiceSpeechDurationMeasurer;
 
 const SAMPLE_RATE = 24_000;
 const VAD_FRAME_SAMPLES = 768;
@@ -9,6 +10,36 @@ const VAD_FRAME_SAMPLES = 768;
 function tenSeconds(value = 0.2) {
   return new Float32Array(SAMPLE_RATE * 10).fill(value);
 }
+
+test("uses the calibrated physical-microphone enrollment threshold", async () => {
+  assert.equal(SPEECH_THRESHOLD, 0.3);
+  let call = 0;
+  const classifier = {
+    isReady: () => true,
+    async classifyDetailed({ pcm }) {
+      call += 1;
+      const windowCount = pcm.length / (VAD_FRAME_SAMPLES * 2);
+      const probability = call === 1 ? SPEECH_THRESHOLD : SPEECH_THRESHOLD - 0.001;
+      return {
+        probability,
+        windowCount,
+        probabilities: new Array(windowCount).fill(probability),
+      };
+    },
+    async reset() {},
+  };
+  const measurer = new VoiceSpeechDurationMeasurer({ classifier });
+
+  assert.equal(
+    await measurer.measureSpeechMs({
+      sessionId: "enrollment-threshold",
+      windowIndex: 0,
+      sampleRate: SAMPLE_RATE,
+      samples: tenSeconds(),
+    }),
+    9_984
+  );
+});
 
 test("measures full frames and the verified real-audio tail without double counting", async () => {
   const pcmReferences = [];

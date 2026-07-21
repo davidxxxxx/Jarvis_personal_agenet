@@ -47,6 +47,7 @@ function detail(summary: JarvisSessionDetail["summary"] = null): JarvisSessionDe
     topics: [],
     todos: [],
     memories: [],
+    speakerProcessing: null,
   };
 }
 

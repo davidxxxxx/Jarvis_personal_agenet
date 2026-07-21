@@ -245,9 +245,9 @@ test("uses only the official HTTPS endpoint and privacy-preserving fetch options
   assert.equal(captured.options.useSessionCookies, false);
   assert.equal(captured.body.stream, false);
   assert.equal(captured.body.tools[0].function.name, "submit_jarvis_analysis");
-  assert.equal(captured.body.tool_choice, "auto");
+  assert.equal(captured.body.tool_choice.function.name, "submit_jarvis_analysis");
   assert.equal(captured.body.reasoning_split, true);
-  assert.equal(captured.body.temperature, 1);
+  assert.equal(captured.body.temperature, 0.1);
   assert.equal(captured.body.max_completion_tokens, 8192);
   assert.equal(captured.body.messages[1].content, analysisInput().cloudPayloadJson);
   assert.equal("allowedSegmentIds" in captured.body, false);

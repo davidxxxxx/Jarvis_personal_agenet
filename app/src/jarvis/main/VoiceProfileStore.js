@@ -4,6 +4,7 @@ const {
   DUAL_SELF_PROFILE_POLICY,
   SELF_PROFILE_POLICY,
   SELF_VOICE_PROFILE_ID,
+  satisfiesSpeechPolicy,
 } = require("./VoiceEnrollmentService");
 
 const SELF_PERSON_ID = "self";
@@ -71,7 +72,7 @@ function validateEnrollmentEvidence(input) {
   const acceptedSpeechMs = input.sampleSpeechMs.reduce((sum, speechMs) => sum + speechMs, 0);
   if (
     input.acceptedSpeechMs !== acceptedSpeechMs ||
-    acceptedSpeechMs < SELF_PROFILE_POLICY.minimumSpeechMs ||
+    !satisfiesSpeechPolicy(input.sampleSpeechMs, SELF_PROFILE_POLICY) ||
     input.windowCount !== input.samples.length ||
     input.windowCount < SELF_PROFILE_POLICY.minimumWindows
   ) {
@@ -242,7 +243,7 @@ class VoiceProfileStore {
     const acceptedSpeechMs = input.sampleSpeechMs.reduce((sum, value) => sum + value, 0);
     if (
       acceptedSpeechMs !== input.acceptedSpeechMs ||
-      acceptedSpeechMs < DUAL_SELF_PROFILE_POLICY.minimumSpeechMs ||
+      !satisfiesSpeechPolicy(input.sampleSpeechMs, DUAL_SELF_PROFILE_POLICY) ||
       input.windowCount !== DUAL_SELF_PROFILE_POLICY.minimumWindows
     ) {
       throw new TypeError("dual voice enrollment does not satisfy the evidence policy");

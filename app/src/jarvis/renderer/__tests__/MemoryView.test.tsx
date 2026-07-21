@@ -123,6 +123,7 @@ function detailFor(value: JarvisSession): JarvisSessionDetail {
     topics: [],
     todos: [],
     memories: [],
+    speakerProcessing: null,
   };
 }
 
@@ -672,5 +673,140 @@ describe("MemoryView processing timeline", () => {
 
     expect((await screen.findAllByText(visibleSegment.text)).length).toBeGreaterThan(0);
     expect(await screen.findByRole("button", { name: /Alice/ })).toBeInTheDocument();
+  });
+
+  it("shows final speaker count, SELF status, local naming entry, and opt-in paid refresh", async () => {
+    const speakers = [
+      {
+        id: "cluster-self",
+        sessionId: session.id,
+        trackId: "mic-track",
+        localLabel: "说话人 1",
+        linkState: "confirmed" as const,
+        person: { id: "self", displayName: "我", isSelf: true },
+        suggestedPerson: null,
+        lastRejectedPerson: null,
+        score: 0.97,
+        margin: 0.25,
+        reason: "dual_model_match",
+        policyId: "hybrid-v2",
+        diarizationRevision: "a".repeat(64),
+        profileRevision: "b".repeat(64),
+        evidenceSegmentIds: [visibleSegment.id],
+        canUndo: false,
+        updatedAt: 4_000,
+      },
+      {
+        id: "cluster-unknown",
+        sessionId: session.id,
+        trackId: "mic-track",
+        localLabel: "说话人 2",
+        linkState: "unknown" as const,
+        person: null,
+        suggestedPerson: null,
+        lastRejectedPerson: null,
+        score: null,
+        margin: null,
+        reason: "no_candidate",
+        policyId: "hybrid-v2",
+        diarizationRevision: "c".repeat(64),
+        profileRevision: "d".repeat(64),
+        evidenceSegmentIds: [],
+        canUndo: false,
+        updatedAt: 4_000,
+      },
+    ];
+    const completedDetail: JarvisSessionDetail = {
+      ...detailFor(session),
+      segments: [visibleSegment],
+      speakerProcessing: {
+        preferredInputVersion: 2,
+        latestRuns: [
+          {
+            id: "run-v2",
+            trackId: "mic-track",
+            policyId: "hybrid-v2",
+            inputVersion: 2,
+            executionDevice: "cuda",
+            speakerCount: {
+              minimum: 2,
+              maximum: 3,
+              preferred: 2,
+              confidence: 0.82,
+              state: "models_disagree",
+            },
+            overlapMs: 900,
+            overlapSeparationState: "completed",
+            modelPackVersion: "jarvis-ai-model-pack-2026.07.1",
+            models: ["pyannote/speaker-diarization-community-1"],
+            commitSequence: 2,
+            completedAt: 4_000,
+          },
+        ],
+        history: [],
+        speakers,
+        summaryRefresh: {
+          basis_policy_id: "legacy-v1",
+          latest_policy_id: "hybrid-v2",
+          recommended: 1,
+          reason: "speaker_count_changed",
+          updated_at: 4_000,
+        },
+        reprocessing: {
+          policy_id: "hybrid-v2",
+          mode: "historical_local_only",
+          state: "completed",
+          started_at: 3_000,
+          completed_at: 4_000,
+        },
+      },
+    };
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => completedDetail),
+          getSessionTimeline: vi.fn(async () => ({
+            ...timeline,
+            processing_state: "ready",
+            ready_at: 4_000,
+            tracks: [
+              {
+                id: "mic-track",
+                session_id: session.id,
+                source_type: "mic",
+                track_kind: "mic",
+                application_key: null,
+                application_display_name: null,
+                attribution_state: "exact",
+                capture_generation: 0,
+                sample_rate: 16_000,
+                channels: 1,
+                started_at: session.started_at,
+                ended_at: session.ended_at,
+                state: "completed",
+                gaps: [],
+              },
+            ],
+            segments: [visibleSegment],
+          })),
+          listSessionSpeakerClusters: vi.fn(async () => speakers),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect(await screen.findByText("本次识别到 2–3 人")).toBeInTheDocument();
+    expect(screen.getByText("本人声纹已确认")).toBeInTheDocument();
+    expect(screen.getByText("说话人 2")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "未知说话人" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "付费刷新总结" })).toBeInTheDocument();
+    fireEvent.click(screen.getByText("处理详情与后台进度"));
+    expect(screen.getByText("CUDA")).toBeInTheDocument();
+    expect(screen.getByText("重叠分离：completed")).toBeInTheDocument();
   });
 });

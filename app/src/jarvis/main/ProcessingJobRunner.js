@@ -7,6 +7,13 @@ const TERMINAL_OBSOLETE_ERRORS = new Set([
   "IDENTITY_RESOLUTION_STALE_INPUT",
   "IDENTITY_RESOLUTION_SUPERSEDED",
 ]);
+const TERMINAL_DATABASE_ERRORS = new Set([
+  "SQLITE_CONSTRAINT_CHECK",
+  "SQLITE_CONSTRAINT_FOREIGNKEY",
+  "SQLITE_CONSTRAINT_NOTNULL",
+  "SQLITE_CONSTRAINT_UNIQUE",
+  "SQLITE_CONSTRAINT_PRIMARYKEY",
+]);
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
@@ -226,6 +233,32 @@ class ProcessingJobRunner {
       configurable: false,
       writable: false,
     });
+    Object.defineProperty(context, "checkResources", {
+      value: async () => {
+        if (!this.governor) return true;
+        let snapshot;
+        let admission;
+        try {
+          snapshot = await this.governor.sample();
+          admission = this.governor.admit(kind, snapshot, capability);
+        } catch {
+          admission = { action: "defer", reason: "telemetry_unavailable" };
+        }
+        const nextDevice = admission.action === "run_cuda" ? "cuda" : "cpu";
+        if (
+          ["defer", "pause_preview"].includes(admission.action) ||
+          nextDevice !== context.device
+        ) {
+          const error = codedError("JOB_RESOURCE_YIELD");
+          error.resourceReason = admission.reason || "resources_changed";
+          throw error;
+        }
+        return true;
+      },
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     const heartbeat = this.setInterval(
       () => {
         try {
@@ -271,11 +304,25 @@ class ProcessingJobRunner {
       if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
       const errorCode = normalizeErrorCode(error);
       const failedAt = this.now();
+      if (errorCode === "JOB_RESOURCE_YIELD") {
+        const deferred = this.store.deferJob(job.id, {
+          owner: this.owner,
+          at: failedAt,
+          nextRetryAt: Math.min(Number.MAX_SAFE_INTEGER, failedAt + 15_000),
+          reason:
+            typeof error.resourceReason === "string" &&
+            ERROR_CODE_PATTERN.test(error.resourceReason)
+              ? error.resourceReason
+              : "resources_changed",
+        });
+        if (!deferred) throw codedError("JOB_LEASE_LOST");
+        return 1;
+      }
       const terminalObsoleteJob =
         (job.job_type === "transcribe_chunk" && errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
         (["diarize_track", "resolve_identities"].includes(job.job_type) &&
           TERMINAL_OBSOLETE_ERRORS.has(errorCode));
-      if (terminalObsoleteJob) {
+      if (terminalObsoleteJob || TERMINAL_DATABASE_ERRORS.has(errorCode)) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,
           at: failedAt,

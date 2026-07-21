@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { UserRound } from "lucide-react";
+import { Fingerprint, ShieldCheck, UserRound, UsersRound } from "lucide-react";
 import type {
   JarvisPersonDetail,
   JarvisPersonOverview,
@@ -110,9 +110,48 @@ export default function PeopleView() {
   };
 
   return (
-    <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
-      <h1 className="text-2xl font-semibold">{t("jarvis.peopleTitle")}</h1>
-      <p className="mt-1 text-sm text-muted-foreground">{t("jarvis.peopleDescription")}</p>
+    <main className="jarvis-scroll-region min-w-0 overflow-y-scroll p-6 lg:col-span-2">
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">人物 People</h1>
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+            这里显示你本人和高置信度确认过的长期人物。没有确认的声音会继续保留为匿名说话人。
+          </p>
+        </div>
+        <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+          {people.length} 个长期人物
+        </span>
+      </header>
+
+      <section className="mt-5 grid gap-3 rounded-xl border border-border/50 bg-card p-4 md:grid-cols-3">
+        <div className="flex gap-3">
+          <UsersRound className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-medium">先区分会话内说话人</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              相似声音会聚成“说话人 1、说话人 2”，不是每个片段都算一个人。
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-3">
+          <Fingerprint className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-medium">再匹配本人和历史人物</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              CAM++ 与 ERes2NetV2 都通过时，才会关联到 SELF 或匿名人物。
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-3">
+          <ShieldCheck className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-medium">不确定就不强认</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              回声、多人重叠、视频声音和低置信度匹配不会更新长期人物声纹。
+            </p>
+          </div>
+        </div>
+      </section>
       {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
       <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {people.map((person) => (
@@ -127,10 +166,16 @@ export default function PeopleView() {
                 <UserRound className="size-5" aria-hidden="true" />
               </span>
               <div>
-                <p className="font-medium">{personName(person, selfLabel)}</p>
+                <p className="font-medium">
+                  {personName(person, selfLabel)}
+                  {person.is_self && (
+                    <span className="ml-2 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                      SELF
+                    </span>
+                  )}
+                </p>
                 <p className="text-xs text-muted-foreground">
-                  {person.session_count} {t("jarvis.peopleSessions")} · {person.open_todo_count}{" "}
-                  {t("jarvis.peopleOpenTodos")}
+                  已确认会话 {person.session_count} · 未完成待办 {person.open_todo_count}
                 </p>
               </div>
             </div>
@@ -138,7 +183,13 @@ export default function PeopleView() {
         ))}
       </div>
       {!people.length && !error && (
-        <p className="mt-8 text-sm text-muted-foreground">{t("jarvis.peopleEmpty")}</p>
+        <div className="mt-6 rounded-xl border border-dashed border-border p-10 text-center">
+          <UsersRound className="mx-auto size-8 text-muted-foreground" aria-hidden="true" />
+          <p className="mt-3 font-medium">还没有确认的长期人物</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            会话里的匿名说话人只有经过双模型高置信度匹配或由你命名后，才会出现在这里。
+          </p>
+        </div>
       )}
       {detail && (
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
@@ -247,7 +298,12 @@ export default function PeopleView() {
               </ul>
             )}
           </section>
-          <div className="mt-6 grid gap-4 lg:grid-cols-3">
+          <details className="mt-5 rounded-lg border border-border/50 p-4">
+            <summary className="cursor-pointer text-sm font-semibold">声纹与识别详情</summary>
+            <p className="mt-2 text-xs text-muted-foreground">
+              这里是模型样本、出现记录和人工纠错等高级信息，日常使用不需要查看。
+            </p>
+            <div className="mt-4 grid gap-4 lg:grid-cols-3">
             <section>
               <h3 className="text-sm font-semibold">{t("jarvis.peopleSamples")}</h3>
               <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
@@ -303,9 +359,12 @@ export default function PeopleView() {
                 ))}
               </ul>
             </section>
-          </div>
+            </div>
+          </details>
           {!detail.person.is_self && (
-            <section className="mt-6 border-t border-border/50 pt-4">
+            <details className="mt-4 rounded-lg border border-border/50 p-4">
+              <summary className="cursor-pointer text-sm font-semibold">人物管理（高级）</summary>
+              <section className="mt-4">
               <label className="block text-sm font-medium" htmlFor="people-merge-target">
                 {t("jarvis.peopleMergeInto")}
               </label>
@@ -364,7 +423,8 @@ export default function PeopleView() {
                   </div>
                 </div>
               )}
-            </section>
+              </section>
+            </details>
           )}
         </section>
       )}

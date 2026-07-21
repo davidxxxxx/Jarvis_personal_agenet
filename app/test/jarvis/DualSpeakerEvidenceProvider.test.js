@@ -31,6 +31,28 @@ function windows({ attributionState = "exact", overlap = false } = {}) {
   }));
 }
 
+function adaptiveWindows() {
+  return [4_523, 3_493, 3_442, 3_577, 1_000].map((durationMs, index) => ({
+    id: `adaptive-turn-${index}`,
+    startMs: 1_000 + index * 6_000,
+    endMs: 1_000 + index * 6_000 + durationMs,
+    attributionState: "exact",
+    trackKind: "mic",
+    overlapDetected: false,
+    echoDetected: false,
+    excludedFromCentroid: false,
+    chunk: {
+      id: `adaptive-chunk-${index}`,
+      started_at: 1_000 + index * 6_000,
+      ended_at: 1_000 + index * 6_000 + durationMs,
+      expires_at: 99_000,
+      path: `G:\\private\\adaptive-chunk-${index}.wav`,
+      format: "wav",
+      pcm_sha256: "b".repeat(64),
+    },
+  }));
+}
+
 function runtime(baseIndex) {
   let call = 0;
   return {
@@ -86,6 +108,41 @@ test("provider extracts three exact non-overlapping windows in both isolated mod
   assert.equal(current.review.calls.length, 3);
   assert.equal(current.persisted.length, 1);
   assert.equal(current.persisted[0].models.every((entry) => entry.embedding.length === 192), true);
+});
+
+test("provider safely adds clean historical turns until the 12 second evidence gate is met", async () => {
+  const current = harness(adaptiveWindows());
+  const result = await current.provider.buildClusterEvidence({
+    sessionId: "s1",
+    evidenceRunId: "run1",
+    clusterId: "c1",
+    createdAt: 50_000,
+  });
+
+  assert.equal(result.eligible, true);
+  assert.equal(result.speechMs, 15_035);
+  assert.equal(result.windowCount, 4);
+  assert.equal(current.primary.calls.length, 4);
+  assert.equal(current.review.calls.length, 4);
+});
+
+test("provider rejects short historical turns before invoking either embedding model", async () => {
+  const short = adaptiveWindows().map((entry, index) => ({
+    ...entry,
+    endMs: entry.startMs + 1_499 - index,
+  }));
+  const current = harness(short);
+  const result = await current.provider.buildClusterEvidence({
+    sessionId: "s1",
+    evidenceRunId: "run1",
+    clusterId: "c1",
+    createdAt: 50_000,
+  });
+
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "insufficient_windows");
+  assert.equal(current.primary.calls.length, 0);
+  assert.equal(current.review.calls.length, 0);
 });
 
 test("provider does not run identity inference for mixed attribution or insufficient safe windows", async () => {

@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  parseNvidiaPmonTelemetry,
   parseNvidiaSmiTelemetry,
   sampleNvidiaGpuTelemetry,
 } = require("../../src/utils/gpuDetection");
@@ -30,7 +31,7 @@ test("NVIDIA telemetry still rejects used plus free memory above total VRAM", ()
   assert.equal(result.error, "invalid_gpu_telemetry");
 });
 
-function wddmExecFile({ engineOutput, engineError = null }) {
+function pmonExecFile({ pmonOutput, pmonError = null }) {
   return (command, args, _options, callback) => {
     if (command === "nvidia-smi" && args[0].startsWith("--query-gpu=")) {
       callback(null, GPU_OUTPUT);
@@ -40,43 +41,70 @@ function wddmExecFile({ engineOutput, engineError = null }) {
       callback(null, "101, GPU-test, [N/A]\n202, GPU-test, [N/A]");
       return;
     }
-    if (command === "powershell.exe") {
-      callback(engineError, engineOutput);
+    if (command === "nvidia-smi" && args[0] === "pmon") {
+      callback(pmonError, pmonOutput);
       return;
     }
     callback(new Error(`unexpected command: ${command}`));
   };
 }
 
-test("Windows WDDM fallback keeps only actively busy GPU processes", async () => {
+test("NVIDIA pmon ignores headers and inactive WDDM graphics processes", () => {
+  const result = parseNvidiaPmonTelemetry(
+    [
+      "# gpu pid type sm mem enc dec jpg ofa fb ccpm command",
+      "# Idx # C/G % % % % % % MB MB name",
+      "0 101 C+G 42 3 - - - - 512 0 jarvis.exe",
+      "0 202 G 3 2 - - - - 256 0 game.exe",
+    ].join("\n"),
+    [{ index: 0, uuid: "GPU-test" }]
+  );
+
+  assert.deepEqual(result, [
+    {
+      pid: 101,
+      gpuUuid: "GPU-test",
+      usedVramMb: 512,
+      utilizationPct: 42,
+    },
+  ]);
+});
+
+test("Windows WDDM fallback uses NVIDIA pmon and keeps only actively busy processes", async () => {
   const result = await sampleNvidiaGpuTelemetry({
     platform: "win32",
     ownedPids: [101],
-    execFileImpl: wddmExecFile({
-      engineOutput: "101,42\n202,3",
+    execFileImpl: pmonExecFile({
+      pmonOutput: [
+        "0 101 C+G 42 3 - - - - 512 0 jarvis.exe",
+        "0 202 G 3 2 - - - - 256 0 game.exe",
+      ].join("\n"),
     }),
   });
 
   assert.equal(result.telemetryAvailable, true);
   assert.equal(result.processTelemetryAvailable, true);
-  assert.equal(result.telemetrySource, "windows_wddm");
+  assert.equal(result.telemetrySource, "nvidia_pmon");
   assert.deepEqual(result.processes, [
     {
       pid: 101,
       gpuUuid: "GPU-test",
-      usedVramMb: 0,
+      usedVramMb: 512,
       utilizationPct: 42,
     },
   ]);
   assert.equal(result.externalGpuBusy, false);
 });
 
-test("Windows WDDM fallback reports a materially active external GPU process", async () => {
+test("Windows WDDM fallback reports a materially active external pmon process", async () => {
   const result = await sampleNvidiaGpuTelemetry({
     platform: "win32",
     ownedPids: [101],
-    execFileImpl: wddmExecFile({
-      engineOutput: "101,2\n202,25",
+    execFileImpl: pmonExecFile({
+      pmonOutput: [
+        "0 101 C+G 2 1 - - - - 512 0 jarvis.exe",
+        "0 202 G 25 8 - - - - 4096 0 game.exe",
+      ].join("\n"),
     }),
   });
 
@@ -93,9 +121,9 @@ test("Windows WDDM failure remains fail-closed", async () => {
   const result = await sampleNvidiaGpuTelemetry({
     platform: "win32",
     ownedPids: [101],
-    execFileImpl: wddmExecFile({
-      engineOutput: "",
-      engineError: new Error("WMI unavailable"),
+    execFileImpl: pmonExecFile({
+      pmonOutput: "",
+      pmonError: new Error("pmon unavailable"),
     }),
   });
 

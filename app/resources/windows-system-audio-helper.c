@@ -196,6 +196,15 @@ static void emit_capture_start(PROCESS_LOOPBACK_MODE loopbackMode, DWORD targetP
     fflush(stderr);
 }
 
+static void emit_hresult_error(const char *code, const char *message, HRESULT hr)
+{
+    fprintf(stderr,
+            "{\"type\":\"error\",\"code\":\"%s\",\"nativeCode\":\"0x%08lx\","
+            "\"message\":\"%s (hr=0x%08lx)\"}\n",
+            code, (unsigned long)hr, message, (unsigned long)hr);
+    fflush(stderr);
+}
+
 /* ========================================================================
  * IActivateAudioInterfaceCompletionHandler implementation
  * ======================================================================== */
@@ -426,16 +435,18 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = activate_process_loopback(targetPid, loopbackMode, sampleRate, &audioClient, &errorCode);
     if (FAILED(hr)) {
-        emit_event("error", errorCode, "Process loopback activation failed (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error(errorCode, "Process loopback activation failed", hr);
         return 2;
     }
 
     samplesReadyEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!samplesReadyEvent ||
-        FAILED(hr = IAudioClient_SetEventHandle(audioClient, samplesReadyEvent))) {
-        emit_event("error", "initialize_failed", "Failed to attach capture event (hr=0x%08lx)",
-                   (unsigned long)hr);
+    if (!samplesReadyEvent) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    } else {
+        hr = IAudioClient_SetEventHandle(audioClient, samplesReadyEvent);
+    }
+    if (FAILED(hr)) {
+        emit_hresult_error("initialize_failed", "Failed to attach capture event", hr);
         IAudioClient_Release(audioClient);
         if (samplesReadyEvent) CloseHandle(samplesReadyEvent);
         return 2;
@@ -443,8 +454,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = IAudioClient_GetService(audioClient, &IID_IAudioCaptureClient, (void **)&captureClient);
     if (FAILED(hr)) {
-        emit_event("error", "initialize_failed", "Failed to get capture client (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error("initialize_failed", "Failed to get capture client", hr);
         IAudioClient_Release(audioClient);
         CloseHandle(samplesReadyEvent);
         return 2;
@@ -452,8 +462,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = IAudioClient_Start(audioClient);
     if (FAILED(hr)) {
-        emit_event("error", "start_failed", "Failed to start capture (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error("start_failed", "Failed to start capture", hr);
         IAudioCaptureClient_Release(captureClient);
         IAudioClient_Release(audioClient);
         CloseHandle(samplesReadyEvent);
@@ -529,8 +538,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
         }
 
         if (FAILED(hr) && hr != AUDCLNT_S_BUFFER_EMPTY) {
-            emit_event("error", "wasapi_capture_failed", "Capture read failed (hr=0x%08lx)",
-                       (unsigned long)hr);
+            emit_hresult_error("wasapi_capture_failed", "Capture read failed", hr);
             exitCode = 2;
             goto done;
         }

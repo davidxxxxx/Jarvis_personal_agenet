@@ -91,6 +91,19 @@ test("startup backfills legacy evidence before constructing retention cleanup", 
   assert.ok(retentionIndex > backfillIndex);
 });
 
+test("startup reconciles historical speaker readiness after loading the durable SELF profile", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+  const profileIndex = mainSource.indexOf("const voiceProfileStore = new VoiceProfileStore");
+  const reconciliationIndex = mainSource.indexOf(
+    "jarvisRepository.reconcileHistoricalSpeakerReadiness"
+  );
+  const runtimeIndex = mainSource.indexOf("startJarvisProcessingRuntime();", reconciliationIndex);
+
+  assert.ok(profileIndex >= 0);
+  assert.ok(reconciliationIndex > profileIndex);
+  assert.ok(runtimeIndex > reconciliationIndex);
+});
+
 test("model download wiring reports VAD recovery only after verified initialization", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
 

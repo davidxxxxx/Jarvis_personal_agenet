@@ -1,7 +1,10 @@
 const VAD_SAMPLE_RATE = 24_000;
 const VAD_WINDOW_MS = 32;
 const VAD_WINDOW_SAMPLES = (VAD_SAMPLE_RATE * VAD_WINDOW_MS) / 1_000;
-const SPEECH_THRESHOLD = 0.5;
+// Enrollment already requires three physical-microphone windows plus dual-model
+// consistency. A lower VAD gate avoids rejecting normal conversational speech
+// from quiet dynamic microphones such as the Shure MV7.
+const SPEECH_THRESHOLD = 0.3;
 
 function pcm16FromSamples(samples, startSample, sampleCount) {
   const pcm = Buffer.alloc(sampleCount * Int16Array.BYTES_PER_ELEMENT);

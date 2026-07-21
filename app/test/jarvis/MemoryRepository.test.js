@@ -1385,6 +1385,121 @@ test("persists a validated candidate linked to job input head and reconciled bud
   }
 });
 
+test("cloud action projection rejects gaming advice and requires grounded SELF commitments", () => {
+  const applyCandidate = ({ classification, candidate }) => {
+    const db = createFixture();
+    const { repository, input } = createStoredInput(db);
+    db.prepare(
+      `INSERT INTO activity_classifications (
+         id, session_id, started_at, ended_at, category, confidence, decision,
+         source, reason, source_attribution, evidence_json, supersedes_id,
+         user_corrected_at, created_at, updated_at
+       ) VALUES (?, 'session-1', 1000, 5000, ?, ?, 'adopted', 'local', ?,
+         'microphone', ?, NULL, NULL, 5500, 5500)`
+    ).run(
+      `classification-${classification.category}`,
+      classification.category,
+      classification.confidence,
+      classification.reason,
+      JSON.stringify({
+        activityId: `activity-${classification.category}`,
+        applicationKeys: [],
+        allowSummary: true,
+        allowSuggestions: classification.allowSuggestions,
+        allowTodos: classification.allowTodos,
+        evidenceSegmentIds: ["segment-1"],
+        inputHash: null,
+      })
+    );
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(
+        db,
+        job.id,
+        `budget-action-${classification.category}`
+      ),
+      candidate,
+    });
+    repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+    return { db, repository };
+  };
+
+  const gaming = applyCandidate({
+    classification: {
+      category: "gaming",
+      confidence: 0.95,
+      reason: "game application",
+      allowSuggestions: false,
+      allowTodos: false,
+    },
+    candidate: validCandidate({
+      todos: [
+        {
+          title: "Improve the item build",
+          ownerLabel: null,
+          dueText: null,
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      suggestions: [
+        {
+          title: "Farm before the team fight",
+          rationale: "A game tactic is not personal-agent advice.",
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(gaming.db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(gaming.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 0);
+  } finally {
+    gaming.db.close();
+  }
+
+  const commitment = {
+    kind: "commitment",
+    title: "Prepare the release",
+    body: "SELF explicitly committed to prepare the release.",
+    confidence: 0.98,
+    evidenceSegmentIds: ["segment-1"],
+  };
+  const work = applyCandidate({
+    classification: {
+      category: "work_meeting",
+      confidence: 0.95,
+      reason: "meeting application",
+      allowSuggestions: true,
+      allowTodos: true,
+    },
+    candidate: validCandidate({
+      memories: [commitment],
+      suggestions: [
+        {
+          title: "Review the release",
+          rationale: "SELF participated in the allowed work context.",
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(work.db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
+    assert.equal(work.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 1);
+  } finally {
+    work.db.close();
+  }
+});
+
 test("stored candidate exact retry avoids planner clock and ID work while returning both hashes", () => {
   const db = createFixture();
   const counters = { ids: 0, clocks: 0 };
@@ -1767,7 +1882,7 @@ test("two SQLite connections serialize contending application of the same stored
     );
     assert.equal(secondPlannerCalls, 0);
     assert.equal(secondDb.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
-    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 4);
+    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 3);
   } finally {
     secondDb.close();
     firstDb.close();
@@ -2677,6 +2792,10 @@ test("post-v27 legacy memory imports persist a canonical-v1 bridge for later con
     const repository = createRepository(db);
 
     repository.importLegacyAnalysis();
+    assert.equal(
+      repository.readPublicSnapshot().todos[0].verificationState,
+      "pending_confirmation"
+    );
 
     const imported = db
       .prepare(
@@ -3073,6 +3192,10 @@ test("importLegacyAnalysis completes a todo monotonically and never reopens it",
     seedLegacyAnalysis(db);
     const repository = createRepository(db);
     repository.importLegacyAnalysis();
+    assert.equal(
+      repository.readPublicSnapshot().todos[0].verificationState,
+      "pending_confirmation"
+    );
 
     db.prepare(
       `UPDATE todos
@@ -3084,6 +3207,7 @@ test("importLegacyAnalysis completes a todo monotonically and never reopens it",
       status: "completed",
       completed_at: 5200,
     });
+    assert.equal(repository.readPublicSnapshot().todos[0].verificationState, "confirmed");
 
     db.prepare(
       `UPDATE todos
@@ -6575,6 +6699,7 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     assert.equal(snapshot.topics.length, 1);
     assert.equal(snapshot.todos.length, 1);
     assert.equal(snapshot.suggestions.length, 1);
+    assert.equal(snapshot.todos[0].verificationState, "pending_confirmation");
     const memoryEvidenceId = db
       .prepare(
         `SELECT ref.id FROM evidence_refs AS ref
@@ -6658,6 +6783,8 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     const fresh = repository.readPublicSnapshot();
     assert.equal(fresh.memories[0].title, "Deployment choice");
     assert.equal(fresh.memories[0].occurrences[0].evidence.length, 1);
+    repository.completeTodo({ todoId: snapshot.todos[0].id });
+    assert.equal(repository.readPublicSnapshot().todos[0].verificationState, "confirmed");
   } finally {
     db.close();
   }

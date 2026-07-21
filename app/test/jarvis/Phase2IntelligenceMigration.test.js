@@ -16,7 +16,7 @@ const V34_TABLES = [
 test("v34 adds encrypted dual-speaker evidence and activity classification history", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 34);
+    assert.equal(TARGET_VERSION, 36);
     applyJarvisMigrations(db);
     for (const table of V34_TABLES) {
       assert.ok(
@@ -45,7 +45,10 @@ test("v33 upgrades in place to v34 without changing existing sessions", () => {
       PRAGMA user_version = 33;
     `);
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 33, toVersion: 34 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: 33,
+      toVersion: TARGET_VERSION,
+    });
     assert.ok(db.prepare("SELECT 1 FROM sessions WHERE id = 'preserved-v33'").get());
     for (const table of V34_TABLES) {
       assert.ok(
@@ -161,7 +164,10 @@ test("v34 upgrades the existing shared budget price parent without breaking its 
     `);
     db.pragma("foreign_keys = ON");
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 33, toVersion: 34 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: 33,
+      toVersion: TARGET_VERSION,
+    });
     assert.deepEqual(
       db
         .prepare(

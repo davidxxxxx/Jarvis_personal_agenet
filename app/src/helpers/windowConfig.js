@@ -116,7 +116,9 @@ const NOTIFICATION_WINDOW_CONFIG = {
     preload: path.join(__dirname, "..", "..", "preload.js"),
     nodeIntegration: false,
     contextIsolation: true,
-    sandbox: true,
+    // This window shares preload.js, which imports local validation modules.
+    // Electron's restricted preload sandbox only permits a limited require set.
+    sandbox: false,
   },
   visibleOnAllWorkspaces: process.platform !== "win32",
   type: FLOATING_OVERLAY_TYPE,
@@ -147,7 +149,9 @@ const TRANSCRIPTION_PREVIEW_CONFIG = {
     preload: path.join(__dirname, "..", "..", "preload.js"),
     nodeIntegration: false,
     contextIsolation: true,
-    sandbox: true,
+    // This window shares preload.js, which imports local validation modules.
+    // Electron's restricted preload sandbox only permits a limited require set.
+    sandbox: false,
   },
   visibleOnAllWorkspaces: process.platform !== "win32",
   type: FLOATING_OVERLAY_TYPE,

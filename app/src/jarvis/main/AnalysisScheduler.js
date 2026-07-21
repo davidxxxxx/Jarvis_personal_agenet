@@ -173,13 +173,21 @@ class AnalysisScheduler {
       if (
         !session?.id ||
         !new Set(["completed", "recovered"]).has(session.status) ||
-        session.processing_state !== "ready"
+        session.processing_state !== "ready" ||
+        this.repository.isHistoricalLocalOnlyReprocessing?.(session.id) === true
       ) {
         continue;
       }
       const detail = this.repository.getSessionDetail(session.id);
-      if (!detail || detail.summary || eligibleSegments(detail).length === 0) continue;
-      if (this.getStatus(session.id).state !== "waiting") continue;
+      if (!detail || eligibleSegments(detail).length === 0) continue;
+      const workState = this.getStatus(session.id);
+      const needsAnalysis = !detail.summary && workState.state === "waiting";
+      const needsActivityClassification =
+        this.activityClassificationService !== null &&
+        this.activityBuilder !== null &&
+        isCallable(this.repository, "listSessionActivityClassifications") &&
+        this.repository.listSessionActivityClassifications(session.id).length === 0;
+      if (!needsAnalysis && !needsActivityClassification) continue;
 
       attempted += 1;
       const status = await this.analyzeSession(session.id, "final");

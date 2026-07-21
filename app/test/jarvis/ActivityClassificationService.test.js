@@ -37,7 +37,7 @@ function activity() {
   };
 }
 
-function fixture(t, { classifyImpl } = {}) {
+function fixture(t, { classifyImpl, validateInputImpl } = {}) {
   const jarvis = new JarvisRepository(":memory:", { now: () => 100_000 });
   t.after(() => jarvis.close());
   jarvis.createSession({ id: "session-activity", startedAt: 1_000, micDeviceId: "mic" });
@@ -63,6 +63,7 @@ function fixture(t, { classifyImpl } = {}) {
   const cloudClient = {
     model: "MiniMax-M2.7",
     isConfigured: () => true,
+    ...(validateInputImpl === undefined ? {} : { validateInput: validateInputImpl }),
     classify:
       classifyImpl ??
       (async () => ({
@@ -141,6 +142,53 @@ test("MiniMax failure keeps the conservative local result and closes budget as u
   assert.equal(result.classifications[0].source, "local");
   assert.equal(result.classifications[0].category, "gaming");
   assert.deepEqual(events.map((entry) => entry[0]), ["reserve", "started", "unknown"]);
+});
+
+test("deterministic cloud preflight failures never reserve or start a paid attempt", async (t) => {
+  let classifyCalls = 0;
+  const { service, events } = fixture(t, {
+    validateInputImpl() {
+      throw Object.assign(new Error("invalid context"), { code: "invalid_structure" });
+    },
+    classifyImpl: async () => {
+      classifyCalls += 1;
+      throw new Error("classify should not run");
+    },
+  });
+
+  const result = await service.classifySession({
+    sessionId: "session-activity",
+    jobId: "analysis-job-preflight",
+    activities: [activity()],
+  });
+
+  assert.equal(result.cloudStatus, "local_preflight_failed");
+  assert.equal(result.classifications[0].source, "local");
+  assert.equal(classifyCalls, 0);
+  assert.deepEqual(events, []);
+});
+
+test("MiniMax invalid output with authoritative usage reconciles cost instead of marking it unknown", async (t) => {
+  const error = Object.assign(new Error("invalid"), {
+    code: "invalid_structure",
+    requestSent: true,
+    usage: { inputTokens: 321, outputTokens: 45 },
+  });
+  const { service, events } = fixture(t, {
+    classifyImpl: async () => {
+      throw error;
+    },
+  });
+
+  const result = await service.classifySession({
+    sessionId: "session-activity",
+    jobId: "analysis-job-invalid",
+    activities: [activity()],
+  });
+
+  assert.equal(result.cloudStatus, "cloud_failed_local_fallback");
+  assert.deepEqual(events.map((entry) => entry[0]), ["reserve", "started", "reconciled"]);
+  assert.deepEqual(events[2][1].usage, { inputTokens: 321, outputTokens: 45 });
 });
 
 test("activity classification is charged to the shared durable MiniMax hard budget", async (t) => {

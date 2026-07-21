@@ -21,11 +21,24 @@ const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+const {
+  SPEAKER_MODEL_KEYS,
+  getSpeakerModelManifest,
+} = require("../../src/jarvis/main/SpeakerModelManifest");
 
 const MODEL_ID = "3dspeaker-campplus-voxceleb-16k-v1";
+const PRIMARY_MODEL = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.PRIMARY);
 
 function vector(...components) {
   const value = new Float32Array(512);
+  components.forEach((component, index) => {
+    value[index] = component;
+  });
+  return value;
+}
+
+function primaryVector(...components) {
+  const value = new Float32Array(PRIMARY_MODEL.embeddingDimension);
   components.forEach((component, index) => {
     value[index] = component;
   });
@@ -940,7 +953,7 @@ test("rejection, exact-job requeue, and session wake are atomic across restart",
 
 test("policy and immutable job key are exact and restart parseable", () => {
   assert.deepEqual(SPEAKER_IDENTITY_RESOLUTION_POLICY, {
-    id: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@1",
+    id: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
     modelId: MODEL_ID,
     minimumSpeechMs: 12_000,
     minimumWindows: 3,
@@ -1620,6 +1633,37 @@ test("ready snapshot uses per-run evidence and enqueue identity is strict and id
   );
 });
 
+test("zero-evidence failed application tracks do not block identity resolution", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.db
+    .prepare(
+      `
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, application_key, application_display_name,
+        capture_generation, strategy, sample_rate, channels, started_at, ended_at,
+        state, failure_code
+      ) VALUES (
+        'failed-app-track', 'session-ready', 'system', 'kook', 'KOOK', 7,
+        'wasapi-application-loopback', 24000, 1, 2000, 2000, 'failed',
+        'activation_failed_0x88890004'
+      )
+    `
+    )
+    .run();
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0"]);
+  assert.equal(
+    repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 }).enqueued,
+    1
+  );
+});
+
 test("profile revision includes the durable self flag", (t) => {
   const { repository } = seedReadyEvidence(t, { trackCount: 1 });
   addPersonAndSample(repository, { personId: "person-self-toggle", embedding: vector(1) });
@@ -1954,6 +1998,78 @@ test("profile changes wake ready historical sessions and create one new revision
   assert.equal(changed.enqueued, 1);
   assert.equal(repeated.enqueued, 0);
   assert.notEqual(changed.job.input_hash, first.job.input_hash);
+});
+
+test("a dual-model enrollment wakes historical diarization created in the legacy model space", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.renamePerson({ personId: "self", displayName: "我", isSelf: true });
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+
+  repository.addVoiceProfileSample({
+    id: "dual-primary-self",
+    personId: "self",
+    modelId: PRIMARY_MODEL.modelId,
+    embedding: primaryVector(1),
+    sourceKind: "enrollment",
+    sourceClusterId: null,
+    speechMs: 10_000,
+    windowCount: 1,
+    createdAt: 17_000,
+  });
+
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT processing_state, ready_at FROM sessions WHERE id = 'session-ready'")
+      .get(),
+    { processing_state: "processing", ready_at: null }
+  );
+});
+
+test("startup readiness reconciliation repairs a stale ready session after profile changes", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.renamePerson({ personId: "person-a", displayName: "person-a" });
+  const first = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16_000 });
+  repository.db
+    .prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 16000 WHERE id = ?")
+    .run(first.job.id);
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+  repository.addVoiceProfileSample({
+    id: "dual-primary-person-a",
+    personId: "person-a",
+    modelId: PRIMARY_MODEL.modelId,
+    embedding: primaryVector(1),
+    sourceKind: "enrollment",
+    sourceClusterId: null,
+    speechMs: 10_000,
+    windowCount: 1,
+    createdAt: 17_000,
+  });
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+
+  assert.deepEqual(repository.reconcileHistoricalSpeakerReadiness(18_000), {
+    inspected: 1,
+    woken: 1,
+    ready: 0,
+    processing: 1,
+  });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT processing_state, ready_at FROM sessions WHERE id = 'session-ready'")
+      .get(),
+    { processing_state: "processing", ready_at: null }
+  );
 });
 
 test("profile sample persistence and historical-session wake are one transaction", (t) => {

@@ -595,6 +595,8 @@ class SpeakerIdentityRepository {
         WHERE status IN ('completed','recovered')
           AND id IN (
             SELECT DISTINCT session_id FROM speaker_clusters WHERE model_id = ?
+            UNION
+            SELECT DISTINCT session_id FROM speaker_diarization_runs
           )
           AND (processing_state <> 'processing' OR ready_at IS NOT NULL)
       `),

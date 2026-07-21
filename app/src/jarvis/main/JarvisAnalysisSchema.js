@@ -205,6 +205,126 @@ function validateCandidateAnalysis(payload, context) {
   };
 }
 
+// Preserve valid, grounded output when MiniMax emits one malformed optional
+// item. The strict validator remains the final trust boundary; this helper
+// only removes invalid optional items and out-of-scope evidence references.
+function salvageCandidateAnalysis(payload, context) {
+  const { allowedSegmentIds, allowedOwnerLabels } = normalizeContext(context);
+  const input = exactObject(
+    payload,
+    ["schemaVersion", "sessionSummary", "memories", "topics", "todos", "suggestions"],
+    "schema.top_level_type"
+  );
+  if (input.schemaVersion !== ANALYSIS_SCHEMA_VERSION) fail("schema.version");
+
+  const cleanEvidence = (value) => {
+    if (!Array.isArray(value)) return [];
+    const result = [];
+    for (const id of value) {
+      if (
+        typeof id === "string" &&
+        id.length > 0 &&
+        id === id.trim() &&
+        allowedSegmentIds.has(id) &&
+        !result.includes(id)
+      ) {
+        result.push(id);
+      }
+      if (result.length >= MAX_EVIDENCE_ITEMS) break;
+    }
+    return result;
+  };
+  const keepValid = (value, field, repair) =>
+    collection(value, field).flatMap((raw) => {
+      try {
+        const repaired = repair(raw);
+        return repaired === null ? [] : [repaired];
+      } catch (error) {
+        if (error instanceof AnalysisSchemaError) return [];
+        throw error;
+      }
+    });
+
+  const rawSummary = exactObject(input.sessionSummary, ["title", "summary", "evidenceSegmentIds"]);
+  const summaryEvidence = cleanEvidence(rawSummary.evidenceSegmentIds);
+  if (summaryEvidence.length === 0) fail("schema.evidence_empty");
+  const repaired = {
+    schemaVersion: ANALYSIS_SCHEMA_VERSION,
+    sessionSummary: {
+      title: boundedString(rawSummary.title, 200),
+      summary: boundedString(rawSummary.summary, 4_000),
+      evidenceSegmentIds: summaryEvidence,
+    },
+    memories: keepValid(input.memories, "memories", (raw) => {
+      const item = exactObject(raw, ["kind", "title", "body", "confidence", "evidenceSegmentIds"]);
+      if (!MEMORY_KIND_SET.has(item.kind)) fail("schema.memory_kind");
+      if (
+        typeof item.confidence !== "number" ||
+        !Number.isFinite(item.confidence) ||
+        item.confidence < 0 ||
+        item.confidence > 1
+      ) {
+        fail("schema.confidence");
+      }
+      const evidence = cleanEvidence(item.evidenceSegmentIds);
+      return evidence.length === 0
+        ? null
+        : {
+            kind: item.kind,
+            title: boundedString(item.title, 200),
+            body: boundedString(item.body, 4_000),
+            confidence: item.confidence,
+            evidenceSegmentIds: evidence,
+          };
+    }),
+    topics: keepValid(input.topics, "topics", (raw) => {
+      const item = exactObject(raw, ["name", "summary", "evidenceSegmentIds"]);
+      const evidence = cleanEvidence(item.evidenceSegmentIds);
+      return evidence.length === 0
+        ? null
+        : {
+            name: boundedString(item.name, 200),
+            summary: boundedString(item.summary, 4_000),
+            evidenceSegmentIds: evidence,
+          };
+    }),
+    todos: keepValid(input.todos, "todos", (raw) => {
+      const item = exactObject(raw, ["title", "ownerLabel", "dueText", "evidenceSegmentIds"]);
+      if (
+        item.ownerLabel !== null &&
+        (typeof item.ownerLabel !== "string" ||
+          !OWNER_LABEL_PATTERN.test(item.ownerLabel) ||
+          !allowedOwnerLabels.has(item.ownerLabel))
+      ) {
+        return null;
+      }
+      let dueText = null;
+      if (item.dueText !== null) {
+        if (typeof item.dueText !== "string" || item.dueText.length === 0) fail("schema.due_text");
+        dueText = boundedString(item.dueText, 500);
+      }
+      const evidence = cleanEvidence(item.evidenceSegmentIds);
+      return evidence.length === 0
+        ? null
+        : {
+            title: boundedString(item.title, 500),
+            ownerLabel: item.ownerLabel,
+            dueText,
+            evidenceSegmentIds: evidence,
+          };
+    }),
+    suggestions: keepValid(input.suggestions, "suggestions", (raw) => {
+      const item = exactObject(raw, ["title", "rationale", "basedOnEvidenceSegmentIds"]);
+      return {
+        title: boundedString(item.title, 500),
+        rationale: boundedString(item.rationale, 4_000),
+        basedOnEvidenceSegmentIds: cleanEvidence(item.basedOnEvidenceSegmentIds),
+      };
+    }),
+  };
+  return validateCandidateAnalysis(repaired, { allowedSegmentIds, allowedOwnerLabels });
+}
+
 const evidenceArraySchema = (minItems) => ({
   type: "array",
   minItems,
@@ -305,6 +425,7 @@ const ANALYSIS_TOOL = Object.freeze({
 module.exports = {
   ANALYSIS_SCHEMA_VERSION,
   AnalysisSchemaError,
+  salvageCandidateAnalysis,
   validateCandidateAnalysis,
   ANALYSIS_TOOL,
 };

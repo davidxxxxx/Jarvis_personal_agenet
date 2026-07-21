@@ -172,6 +172,11 @@
       {
         "from": "src/jarvis/native/windows",
         "to": "jarvis-native"
+      },
+      {
+        "from": "resources/ai-model-pack/prebuilt",
+        "to": "jarvis-ai-model-pack",
+        "filter": ["**/*"]
       }
     ]
   },

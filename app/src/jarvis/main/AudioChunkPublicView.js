@@ -57,6 +57,7 @@ const RENDERER_AUDIO_TRACK_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "state",
+  "failure_code",
 ]);
 
 const RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS = Object.freeze([
@@ -70,6 +71,7 @@ const RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "reason",
+  "failure_code",
 ]);
 
 const RENDERER_AUDIO_GAP_FIELDS = Object.freeze([
@@ -176,6 +178,10 @@ function toPublicSessionDetail(detail) {
     topics: Array.isArray(detail.topics) ? detail.topics : [],
     todos: Array.isArray(detail.todos) ? detail.todos : [],
     memories: Array.isArray(detail.memories) ? detail.memories : [],
+    speakerProcessing:
+      detail.speakerProcessing && typeof detail.speakerProcessing === "object"
+        ? detail.speakerProcessing
+        : null,
   };
 }
 

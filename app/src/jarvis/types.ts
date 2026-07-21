@@ -573,6 +573,49 @@ export interface JarvisSessionDetail {
   topics: JarvisTopic[];
   todos: JarvisTodo[];
   memories: JarvisMemoryItem[];
+  speakerProcessing: JarvisSessionSpeakerProcessing | null;
+}
+
+export interface JarvisDiarizationRunView {
+  id: string;
+  trackId: string;
+  policyId: string;
+  inputVersion: 1 | 2;
+  executionDevice: "cpu" | "cuda";
+  speakerCount: {
+    minimum: number;
+    maximum: number;
+    preferred: number | null;
+    confidence: number | null;
+    state: string;
+  } | null;
+  overlapMs: number;
+  overlapSeparationState: "not_needed" | "completed" | "partial" | "failed";
+  modelPackVersion: string | null;
+  models: string[];
+  commitSequence: number;
+  completedAt: number;
+}
+
+export interface JarvisSessionSpeakerProcessing {
+  preferredInputVersion: 1 | 2;
+  latestRuns: JarvisDiarizationRunView[];
+  history: JarvisDiarizationRunView[];
+  speakers: JarvisSpeakerClusterView[];
+  summaryRefresh: {
+    basis_policy_id: string | null;
+    latest_policy_id: string;
+    recommended: 0 | 1;
+    reason: string | null;
+    updated_at: number;
+  } | null;
+  reprocessing: {
+    policy_id: string;
+    mode: "historical_local_only";
+    state: "queued" | "processing" | "completed";
+    started_at: number;
+    completed_at: number | null;
+  } | null;
 }
 
 export interface JarvisPersonOverview extends JarvisPerson {
@@ -734,6 +777,7 @@ export interface JarvisKnowledgeOverview {
     status: "open" | "completed" | "dismissed";
     completedAt: number | null;
     dismissedAt: number | null;
+    verificationState: "confirmed" | "pending_confirmation";
     createdAt: number;
     updatedAt: number;
     revisions: Array<{
@@ -896,6 +940,7 @@ export interface JarvisApplicationAudioRuntimeStatus {
     applicationKey: string;
     applicationDisplayName: string;
     reason: string;
+    failureCode: string | null;
     retryAt: number | null;
     state: "mixed_unknown";
   }>;
@@ -946,6 +991,7 @@ export interface JarvisVoiceEnrollmentResult {
   status: JarvisVoiceEnrollmentOutcome;
   modelId: string;
   acceptedSpeechMs: number;
+  sampleSpeechMs?: number[];
   windowCount: number;
   selfConsistency: number | null;
   models?: JarvisVoiceEnrollmentModelStatus[] | null;

@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 34;
+const TARGET_VERSION = 36;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PHASE2_INTELLIGENCE_SCHEMA = `
@@ -160,6 +160,13 @@ function audioTracksV32Schema(tableName, { ifNotExists = false } = {}) {
       started_at INTEGER NOT NULL,
       ended_at INTEGER,
       state TEXT NOT NULL,
+      failure_code TEXT CHECK(
+        failure_code IS NULL OR (
+          typeof(failure_code) = 'text'
+          AND length(failure_code) BETWEEN 1 AND 128
+          AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+        )
+      ),
       CHECK(
         (application_key IS NULL AND application_display_name IS NULL)
         OR (
@@ -187,7 +194,7 @@ const APPLICATION_AUDIO_TRACK_INDEXES = `
     ON audio_tracks(session_id)
     WHERE track_kind = 'system_mix';
   CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_tracks_session_application
-    ON audio_tracks(session_id, application_key)
+    ON audio_tracks(session_id, application_key, capture_generation)
     WHERE track_kind = 'application';
   CREATE INDEX IF NOT EXISTS idx_audio_tracks_session_kind_started
     ON audio_tracks(session_id, track_kind, started_at, id);
@@ -214,6 +221,13 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
     reason TEXT,
+    failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    ),
     created_at INTEGER NOT NULL,
     CHECK(ended_at IS NULL OR ended_at > started_at),
     CHECK(reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 128)
@@ -243,6 +257,7 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
             AND track.track_kind = 'application'
             AND track.application_key = NEW.application_key
             AND NEW.reason IS NULL
+            AND NEW.failure_code IS NULL
           )
           OR (
             NEW.interval_kind = 'mixed_fallback'
@@ -257,7 +272,8 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
 
   CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_update
   BEFORE UPDATE OF session_id, track_id, interval_kind, application_key,
-                   attribution_state, capture_generation, started_at, ended_at, reason
+                   attribution_state, capture_generation, started_at, ended_at,
+                   reason, failure_code
   ON application_audio_intervals
   BEGIN
     SELECT RAISE(ABORT, 'invalid application audio interval')
@@ -274,6 +290,7 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
             AND track.track_kind = 'application'
             AND track.application_key = NEW.application_key
             AND NEW.reason IS NULL
+            AND NEW.failure_code IS NULL
           )
           OR (
             NEW.interval_kind = 'mixed_fallback'
@@ -950,11 +967,30 @@ const SESSION_DIARIZATION_SCHEMA = `
     ),
     embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
     sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
-    input_version INTEGER NOT NULL CHECK(input_version = 1),
-    execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+    input_version INTEGER NOT NULL CHECK(input_version IN (1,2)),
+    execution_device TEXT NOT NULL CHECK(execution_device IN ('cpu','cuda')),
+    pipeline_metadata_json TEXT NOT NULL DEFAULT '{}'
+      CHECK(json_valid(pipeline_metadata_json) AND json_type(pipeline_metadata_json) = 'object'),
+    speaker_count_min INTEGER CHECK(speaker_count_min IS NULL OR speaker_count_min BETWEEN 0 AND 64),
+    speaker_count_max INTEGER CHECK(speaker_count_max IS NULL OR speaker_count_max BETWEEN 0 AND 64),
+    speaker_count_confidence REAL CHECK(
+      speaker_count_confidence IS NULL OR (
+        typeof(speaker_count_confidence) IN ('integer','real')
+        AND speaker_count_confidence BETWEEN 0 AND 1
+      )
+    ),
+    overlap_ms INTEGER NOT NULL DEFAULT 0 CHECK(overlap_ms >= 0),
+    overlap_separation_state TEXT NOT NULL DEFAULT 'not_needed'
+      CHECK(overlap_separation_state IN ('not_needed','completed','partial','failed')),
+    model_pack_version TEXT,
     commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
     created_at INTEGER NOT NULL,
     completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+    CHECK(
+      (speaker_count_min IS NULL AND speaker_count_max IS NULL) OR
+      (speaker_count_min IS NOT NULL AND speaker_count_max IS NOT NULL
+       AND speaker_count_min <= speaker_count_max)
+    ),
     UNIQUE(session_id, track_id, transcript_revision, policy_id)
   );
   CREATE TABLE IF NOT EXISTS speaker_diarization_run_clusters (
@@ -962,7 +998,13 @@ const SESSION_DIARIZATION_SCHEMA = `
     cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
     local_label TEXT NOT NULL,
     embedding BLOB CHECK(
-      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      embedding IS NULL OR (
+        typeof(embedding) = 'blob' AND (
+          length(embedding) = 2048 OR (
+            length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+          )
+        )
+      )
     ),
     speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
     window_count INTEGER NOT NULL CHECK(window_count >= 0),
@@ -990,7 +1032,13 @@ const SESSION_DIARIZATION_SCHEMA = `
     started_at INTEGER NOT NULL,
     ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
     embedding BLOB CHECK(
-      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      embedding IS NULL OR (
+        typeof(embedding) = 'blob' AND (
+          length(embedding) = 2048 OR (
+            length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+          )
+        )
+      )
     ),
     echo_state TEXT NOT NULL DEFAULT 'none'
       CHECK(echo_state IN ('none','possible','confirmed')),
@@ -1021,6 +1069,36 @@ const SESSION_DIARIZATION_SCHEMA = `
     ON speaker_turns(transcript_segment_id, run_id);
   CREATE INDEX IF NOT EXISTS idx_diarization_run_cluster_segments_segment
     ON speaker_diarization_run_cluster_segments(transcript_segment_id, run_id, cluster_id);
+`;
+
+const HYBRID_DIARIZATION_HISTORY_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS session_summary_refresh_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    basis_policy_id TEXT,
+    latest_policy_id TEXT NOT NULL,
+    recommended INTEGER NOT NULL DEFAULT 0 CHECK(recommended IN (0,1)),
+    reason TEXT CHECK(reason IS NULL OR reason IN (
+      'speaker_count_changed','speaker_identity_changed','application_source_changed',
+      'transcript_changed','manual_request'
+    )),
+    updated_at INTEGER NOT NULL,
+    CHECK(recommended = 1 OR reason IS NULL)
+  );
+  CREATE INDEX IF NOT EXISTS idx_summary_refresh_recommended
+    ON session_summary_refresh_state(recommended, updated_at DESC, session_id)
+    WHERE recommended = 1;
+  CREATE TABLE IF NOT EXISTS session_reprocessing_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    policy_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode = 'historical_local_only'),
+    state TEXT NOT NULL CHECK(state IN ('queued','processing','completed')),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    CHECK((state = 'completed') = (completed_at IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS idx_session_reprocessing_active
+    ON session_reprocessing_state(state, started_at, session_id)
+    WHERE state IN ('queued','processing');
 `;
 
 const SPEAKER_IDENTITY_RESOLUTION_SCHEMA = `
@@ -5876,12 +5954,12 @@ function upgradeApplicationAudioTracksV32(db) {
       INSERT INTO audio_tracks_v32 (
         id, session_id, source_type, application_key, application_display_name,
         capture_generation, device_id, device_label, strategy,
-        sample_rate, channels, started_at, ended_at, state
+        sample_rate, channels, started_at, ended_at, state, failure_code
       )
       SELECT
         id, session_id, source_type, NULL, NULL,
         0, device_id, device_label, strategy,
-        sample_rate, channels, started_at, ended_at, state
+        sample_rate, channels, started_at, ended_at, state, NULL
       FROM audio_tracks;
 
       DROP TABLE audio_tracks;
@@ -6032,6 +6110,253 @@ function upgradePhase2IntelligenceV34(db) {
   db.exec(PHASE2_INTELLIGENCE_SCHEMA);
 }
 
+function upgradeEncryptedDiarizationEvidenceV35(db) {
+  if (!tableExists(db, "speaker_diarization_run_clusters") || !tableExists(db, "speaker_turns")) {
+    throw new Error("v35 encrypted diarization evidence requires v21 speaker tables");
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  try {
+    // Some old databases contain application-owned triggers whose target
+    // columns are added by the repository schema after evidence migration.
+    // Legacy rename mode keeps those unrelated definitions untouched while
+    // these replacement tables deliberately reference their final names.
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP INDEX IF EXISTS idx_diarization_run_clusters_cluster;
+      DROP INDEX IF EXISTS idx_speaker_turns_run_time;
+      DROP INDEX IF EXISTS idx_speaker_turns_segment;
+
+      CREATE TABLE speaker_diarization_run_clusters_v35 (
+        run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+        cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+        local_label TEXT NOT NULL,
+        embedding BLOB CHECK(
+          embedding IS NULL OR (
+            typeof(embedding) = 'blob' AND (
+              length(embedding) = 2048 OR (
+                length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+              )
+            )
+          )
+        ),
+        speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
+        window_count INTEGER NOT NULL CHECK(window_count >= 0),
+        quality_score REAL CHECK(
+          quality_score IS NULL OR (
+            typeof(quality_score) IN ('integer','real') AND quality_score BETWEEN 0 AND 1
+          )
+        ),
+        first_appearance_at INTEGER NOT NULL,
+        PRIMARY KEY(run_id, local_label),
+        UNIQUE(run_id, cluster_id),
+        CHECK(
+          (window_count = 0 AND speech_ms = 0 AND embedding IS NULL AND quality_score IS NULL) OR
+          (window_count > 0 AND embedding IS NOT NULL AND quality_score IS NOT NULL)
+        )
+      );
+      CREATE TABLE speaker_turns_v35 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+        cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+        chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        transcript_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+        turn_index INTEGER NOT NULL CHECK(turn_index >= 0),
+        raw_label TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+        embedding BLOB CHECK(
+          embedding IS NULL OR (
+            typeof(embedding) = 'blob' AND (
+              length(embedding) = 2048 OR (
+                length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+              )
+            )
+          )
+        ),
+        echo_state TEXT NOT NULL DEFAULT 'none'
+          CHECK(echo_state IN ('none','possible','confirmed')),
+        duplicate_of_turn_id TEXT REFERENCES speaker_turns(id) ON DELETE SET NULL,
+        excluded_from_centroid INTEGER NOT NULL DEFAULT 0 CHECK(excluded_from_centroid IN (0,1)),
+        created_at INTEGER NOT NULL,
+        UNIQUE(run_id, chunk_id, turn_index),
+        CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
+        CHECK((echo_state = 'confirmed') = (excluded_from_centroid = 1))
+      );
+
+      INSERT INTO speaker_diarization_run_clusters_v35
+      SELECT * FROM speaker_diarization_run_clusters;
+      INSERT INTO speaker_turns_v35
+      SELECT * FROM speaker_turns;
+
+      DROP TABLE speaker_turns;
+      DROP TABLE speaker_diarization_run_clusters;
+      ALTER TABLE speaker_diarization_run_clusters_v35
+        RENAME TO speaker_diarization_run_clusters;
+      ALTER TABLE speaker_turns_v35 RENAME TO speaker_turns;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+
+  addColumn(
+    db,
+    "audio_tracks",
+    `failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "application_audio_intervals",
+    `failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    )`
+  );
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS validate_application_audio_interval_insert;
+    DROP TRIGGER IF EXISTS validate_application_audio_interval_update;
+    DROP INDEX IF EXISTS idx_audio_tracks_session_application;
+    CREATE UNIQUE INDEX idx_audio_tracks_session_application
+      ON audio_tracks(session_id, application_key, capture_generation)
+      WHERE track_kind = 'application';
+
+    UPDATE audio_tracks
+    SET failure_code = 'evidence_registration_failed_invalid_interval_reason_v34'
+    WHERE state = 'failed'
+      AND track_kind = 'application'
+      AND ended_at = started_at
+      AND failure_code IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM application_audio_intervals AS interval
+        WHERE interval.session_id = audio_tracks.session_id
+          AND interval.capture_generation = audio_tracks.capture_generation
+          AND interval.interval_kind = 'mixed_fallback'
+          AND interval.reason = 'dynamic_start_prebuffer'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM application_audio_intervals AS interval
+        WHERE interval.session_id = audio_tracks.session_id
+          AND interval.capture_generation = audio_tracks.capture_generation
+          AND interval.interval_kind = 'application_active'
+      );
+
+    UPDATE application_audio_intervals
+    SET failure_code = 'capture_start_failed_legacy_detail_unavailable'
+    WHERE interval_kind = 'mixed_fallback'
+      AND reason = 'capture_start_failed'
+      AND failure_code IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending', next_retry_at = NULL,
+        lease_owner = NULL, lease_expires_at = NULL,
+        error_code = NULL, blocked_reason = NULL,
+        execution_device = NULL, completed_at = NULL
+    WHERE job_type IN ('diarize_track','resolve_identities')
+      AND state IN ('running','retry','blocked');
+  `);
+  db.exec(SESSION_DIARIZATION_SCHEMA);
+  db.exec(APPLICATION_AUDIO_TRACK_INDEXES);
+  db.exec(APPLICATION_AUDIO_INTERVALS_SCHEMA);
+}
+
+function upgradeHybridDiarizationV36(db) {
+  if (!tableExists(db, "speaker_diarization_runs")) {
+    throw new Error("v36 hybrid diarization requires v21 speaker tables");
+  }
+  const existingColumns = columns(db, "speaker_diarization_runs");
+  if (existingColumns.has("pipeline_metadata_json")) {
+    db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+    return;
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP INDEX IF EXISTS idx_diarization_run_revision;
+      DROP INDEX IF EXISTS idx_diarization_runs_session_sequence;
+
+      CREATE TABLE speaker_diarization_runs_v36 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        transcript_revision TEXT NOT NULL CHECK(
+          length(transcript_revision) = 64 AND
+          transcript_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        policy_id TEXT NOT NULL,
+        diarizer_model_id TEXT NOT NULL,
+        embedding_model_id TEXT NOT NULL,
+        model_artifact_sha256 TEXT NOT NULL CHECK(
+          length(model_artifact_sha256) = 64 AND
+          model_artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
+        sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+        input_version INTEGER NOT NULL CHECK(input_version IN (1,2)),
+        execution_device TEXT NOT NULL CHECK(execution_device IN ('cpu','cuda')),
+        pipeline_metadata_json TEXT NOT NULL DEFAULT '{}'
+          CHECK(json_valid(pipeline_metadata_json) AND json_type(pipeline_metadata_json) = 'object'),
+        speaker_count_min INTEGER CHECK(speaker_count_min IS NULL OR speaker_count_min BETWEEN 0 AND 64),
+        speaker_count_max INTEGER CHECK(speaker_count_max IS NULL OR speaker_count_max BETWEEN 0 AND 64),
+        speaker_count_confidence REAL CHECK(
+          speaker_count_confidence IS NULL OR (
+            typeof(speaker_count_confidence) IN ('integer','real')
+            AND speaker_count_confidence BETWEEN 0 AND 1
+          )
+        ),
+        overlap_ms INTEGER NOT NULL DEFAULT 0 CHECK(overlap_ms >= 0),
+        overlap_separation_state TEXT NOT NULL DEFAULT 'not_needed'
+          CHECK(overlap_separation_state IN ('not_needed','completed','partial','failed')),
+        model_pack_version TEXT,
+        commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+        CHECK(
+          (speaker_count_min IS NULL AND speaker_count_max IS NULL) OR
+          (speaker_count_min IS NOT NULL AND speaker_count_max IS NOT NULL
+           AND speaker_count_min <= speaker_count_max)
+        ),
+        UNIQUE(session_id, track_id, transcript_revision, policy_id)
+      );
+
+      INSERT INTO speaker_diarization_runs_v36 (
+        id, session_id, track_id, transcript_revision, policy_id,
+        diarizer_model_id, embedding_model_id, model_artifact_sha256,
+        embedding_dimension, sample_rate, input_version, execution_device,
+        pipeline_metadata_json, speaker_count_min, speaker_count_max,
+        speaker_count_confidence, overlap_ms, overlap_separation_state,
+        model_pack_version, commit_sequence, created_at, completed_at
+      )
+      SELECT id, session_id, track_id, transcript_revision, policy_id,
+             diarizer_model_id, embedding_model_id, model_artifact_sha256,
+             embedding_dimension, sample_rate, input_version, execution_device,
+             '{}', NULL, NULL, NULL, 0, 'not_needed', NULL,
+             commit_sequence, created_at, completed_at
+      FROM speaker_diarization_runs;
+
+      DROP TABLE speaker_diarization_runs;
+      ALTER TABLE speaker_diarization_runs_v36 RENAME TO speaker_diarization_runs;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(SESSION_DIARIZATION_SCHEMA);
+  db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -6057,10 +6382,18 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     fromVersion < 34 &&
     typeof budgetPriceSql === "string" &&
     !budgetPriceSql.includes("activity_classification");
+  const rebuildsEncryptedDiarizationEvidence =
+    fromVersion < 35 &&
+    tableExists(db, "speaker_diarization_run_clusters") &&
+    tableExists(db, "speaker_turns");
+  const rebuildsHybridDiarization =
+    fromVersion < 36 && tableExists(db, "speaker_diarization_runs");
   const rebuildsReferencedSchema =
     rebuildsTranscriptSegments ||
     rebuildsApplicationAudioTracks ||
-    rebuildsAnalysisBudgetPrices;
+    rebuildsAnalysisBudgetPrices ||
+    rebuildsEncryptedDiarizationEvidence ||
+    rebuildsHybridDiarization;
   const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
   if (rebuildsReferencedSchema && db.inTransaction) {
     throw new Error("referenced schema migration must own the outer transaction");
@@ -6325,6 +6658,12 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 34) {
         upgradePhase2IntelligenceV34(db);
       }
+      if (fromVersion < 35) {
+        upgradeEncryptedDiarizationEvidenceV35(db);
+      }
+      if (fromVersion < 36) {
+        upgradeHybridDiarizationV36(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -6349,6 +6688,7 @@ module.exports = {
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
   SPEAKER_IDENTITY_SCHEMA,
   SESSION_DIARIZATION_SCHEMA,
+  HYBRID_DIARIZATION_HISTORY_SCHEMA,
   AGENT_WORKLOAD_SCHEMA,
   upgradeAgentWorkloadV26,
   upgradeDailyDigestV29,
@@ -6358,4 +6698,6 @@ module.exports = {
   upgradeApplicationAudioTracksV32,
   PHASE2_INTELLIGENCE_SCHEMA,
   upgradePhase2IntelligenceV34,
+  upgradeEncryptedDiarizationEvidenceV35,
+  upgradeHybridDiarizationV36,
 };

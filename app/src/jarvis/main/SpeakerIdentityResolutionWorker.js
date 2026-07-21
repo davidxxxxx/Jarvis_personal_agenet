@@ -5,6 +5,7 @@ const {
   assertExactIdentityResolutionPolicy,
   parseIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
+const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
 
 function codedError(code) {
   const error = new Error(code);
@@ -46,6 +47,7 @@ class SpeakerIdentityResolutionWorker {
     dualEvidenceProvider = null,
     dualResolver = null,
     policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
+    diarizationPolicy = SESSION_DIARIZATION_POLICY,
     clock = Date.now,
     yieldToEventLoop = defaultYieldToEventLoop,
   } = {}) {
@@ -74,6 +76,13 @@ class SpeakerIdentityResolutionWorker {
     }
     assertExactIdentityResolutionPolicy(policy);
     assertExactIdentityResolutionPolicy(resolver.policy);
+    if (
+      !diarizationPolicy ||
+      typeof diarizationPolicy.policyId !== "string" ||
+      !new Set([1, 2]).has(diarizationPolicy.inputVersion)
+    ) {
+      throw new TypeError("a versioned diarizationPolicy is required");
+    }
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     if (typeof yieldToEventLoop !== "function") {
       throw new TypeError("yieldToEventLoop must be a function");
@@ -83,6 +92,7 @@ class SpeakerIdentityResolutionWorker {
     this.dualEvidenceProvider = dualEvidenceProvider;
     this.dualResolver = dualResolver;
     this.policy = policy;
+    this.diarizationPolicy = diarizationPolicy;
     this.clock = clock;
     this.yieldToEventLoop = yieldToEventLoop;
   }
@@ -122,6 +132,7 @@ class SpeakerIdentityResolutionWorker {
       sessionId: identity.sessionId,
       at: this.clock(),
       policy: this.policy,
+      diarizationPolicy: this.diarizationPolicy,
     });
     if (!snapshot.eligible) throw codedError("IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE");
     if (
@@ -210,6 +221,7 @@ class SpeakerIdentityResolutionWorker {
       sessionId: identity.sessionId,
       at: this.clock(),
       policy: this.policy,
+      diarizationPolicy: this.diarizationPolicy,
     });
     if (
       !precommit.eligible ||

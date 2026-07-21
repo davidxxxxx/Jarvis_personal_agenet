@@ -306,6 +306,9 @@ const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService
 const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
 const VoiceSpeechDurationMeasurer = require("./src/jarvis/main/VoiceSpeechDurationMeasurer");
 const VoiceEmbeddingCipher = require("./src/jarvis/main/VoiceEmbeddingCipher");
+const HistoricalSelfVoiceRecoveryService = require(
+  "./src/jarvis/main/HistoricalSelfVoiceRecoveryService"
+);
 const secretCrypto = require("./src/helpers/secretCrypto");
 const {
   DataRootConfig,
@@ -333,6 +336,9 @@ const {
   RendererShutdownHandshake,
 } = require("./src/jarvis/main/GracefulShutdownCoordinator");
 const { createJarvisProcessingRuntime } = require("./src/jarvis/main/JarvisProcessingRuntime");
+const {
+  installBundledAiModelPackIfPresent,
+} = require("./src/jarvis/main/AiModelPackInstaller");
 const { resolveJarvisWhisperModel } = require("./src/jarvis/main/JarvisWhisperModel");
 const { createJarvisOwnedPidsProvider } = require("./src/jarvis/main/JarvisProcessOwnership");
 const { createWindowsForegroundActivityProvider } = require("./src/jarvis/main/ResourceGovernor");
@@ -606,6 +612,9 @@ async function initializeCoreManagers() {
     recordingsRoot,
     log: (message, details) => debugLogger.info(message, details, "jarvis"),
   });
+  // The one-time historical SELF recovery runs before the window/runtime managers
+  // are created, so VAD model resolution must already be available here.
+  diarizationManager = new DiarizationManager();
   speechVadClassifier = new SpeechVadClassifier({
     getModelPath: () => diarizationManager?.getVadModelPath?.() ?? null,
   });
@@ -737,18 +746,65 @@ async function initializeCoreManagers() {
     SpeakerEmbeddings,
     SPEAKER_MODEL_KEYS,
   } = require("./src/helpers/speakerEmbeddings");
+  const primarySpeakerEmbeddings = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
+  });
+  const reviewSpeakerEmbeddings = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.REVIEW,
+  });
+  const voiceSpeechDurationMeasurer = new VoiceSpeechDurationMeasurer({
+    classifier: speechVadClassifier,
+  });
   voiceEnrollmentService = new VoiceEnrollmentService({
-    primarySpeakerEmbeddings: new SpeakerEmbeddings({
-      modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
-    }),
-    reviewSpeakerEmbeddings: new SpeakerEmbeddings({
-      modelKey: SPEAKER_MODEL_KEYS.REVIEW,
-    }),
-    speechDurationMeasurer: new VoiceSpeechDurationMeasurer({
-      classifier: speechVadClassifier,
-    }),
+    primarySpeakerEmbeddings,
+    reviewSpeakerEmbeddings,
+    speechDurationMeasurer: voiceSpeechDurationMeasurer,
     voiceProfileStore,
   });
+  const historicalRecoveryArgument = process.argv.find((argument) =>
+    argument.startsWith("--recover-self-turn-groups=")
+  );
+  if (historicalRecoveryArgument) {
+    const serializedGroups = historicalRecoveryArgument.slice(
+      "--recover-self-turn-groups=".length
+    );
+    const turnGroups = serializedGroups
+      .split("|")
+      .map((group) => group.split("+").filter(Boolean));
+    const recoveryService = new HistoricalSelfVoiceRecoveryService({
+      repository: jarvisRepository,
+      audioEvidenceReader: jarvisService.audioEvidenceReader,
+      primarySpeakerEmbeddings,
+      reviewSpeakerEmbeddings,
+      speechDurationMeasurer: voiceSpeechDurationMeasurer,
+      voiceProfileStore,
+    });
+    try {
+      const recovery = await recoveryService.recover({ turnGroups });
+      debugLogger.info(
+        "Jarvis historical SELF voice recovery completed",
+        {
+          status: recovery.status,
+          acceptedSpeechMs: recovery.acceptedSpeechMs ?? 0,
+          selfConsistency: recovery.selfConsistency ?? null,
+        },
+        "jarvis"
+      );
+    } catch (error) {
+      debugLogger.error(
+        "Jarvis historical SELF voice recovery failed",
+        { error: error?.message ?? String(error) },
+        "jarvis"
+      );
+    }
+  }
+  const historicalSpeakerReadiness =
+    jarvisRepository.reconcileHistoricalSpeakerReadiness(Date.now());
+  debugLogger.info(
+    "Jarvis historical speaker readiness reconciliation",
+    historicalSpeakerReadiness,
+    "jarvis"
+  );
   environmentManager = new EnvironmentManager();
   jarvisAnalysisScheduler = {
     analyzeSession(sessionId, kind, options) {
@@ -1037,7 +1093,6 @@ async function initializeCoreManagers() {
     );
   }
   parakeetManager = new ParakeetManager();
-  diarizationManager = new DiarizationManager();
   speechVadClassifier.startRecovery({
     onRecovered: () => jarvisService?.reportVadRecovered(Date.now()),
   });
@@ -1086,6 +1141,7 @@ async function initializeCoreManagers() {
       jarvisService.stopApplicationAudioTrack({
         ...event,
         state:
+          event.failureCode ||
           event.reason === "evidence_delivery_failed" ||
           event.reason === "evidence_registration_failed"
             ? "failed"
@@ -1109,7 +1165,10 @@ async function initializeCoreManagers() {
     onError: (error) => {
       debugLogger?.warn(
         "Application audio capture degraded to mixed system evidence",
-        { code: error?.code ?? "application_capture_unavailable" },
+        {
+          code: error?.code ?? "application_capture_unavailable",
+          failureCode: error?.failureCode ?? null,
+        },
         "meeting"
       );
     },
@@ -1482,6 +1541,26 @@ async function startApp() {
   // Phase 1: Core managers + IPC handlers before windows
   await initializeCoreManagers();
   await environmentManager.init();
+  try {
+    const modelPack = await installBundledAiModelPackIfPresent();
+    if (modelPack.state !== "not_bundled") {
+      debugLogger?.info(
+        "Jarvis offline AI model component ready",
+        {
+          state: modelPack.state,
+          packVersion: modelPack.packVersion,
+          manifestSha256: modelPack.manifestSha256,
+        },
+        "jarvis"
+      );
+    }
+  } catch (error) {
+    debugLogger?.warn(
+      "Jarvis offline AI model component installation failed; legacy local processing remains available",
+      { code: error?.code ?? null, error: error?.message ?? String(error) },
+      "jarvis"
+    );
+  }
   startJarvisProcessingRuntime();
   registerSidecars();
   startAuthBridgeServer();

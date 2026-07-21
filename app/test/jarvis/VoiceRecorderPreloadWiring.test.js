@@ -17,6 +17,28 @@ test("voice recorder enables the preload bridge required by its renderer", () =>
   assert.match(mainWindowConfig, /sandbox:\s*false/);
 });
 
+test("every window using the shared preload disables Electron's restricted preload sandbox", () => {
+  const source = fs.readFileSync(path.join(appRoot, "src/helpers/windowConfig.js"), "utf8");
+  const windowConfigs = [
+    "MAIN_WINDOW_CONFIG",
+    "CONTROL_PANEL_CONFIG",
+    "NOTIFICATION_WINDOW_CONFIG",
+    "TRANSCRIPTION_PREVIEW_CONFIG",
+    "AGENT_OVERLAY_CONFIG",
+  ];
+
+  for (const configName of windowConfigs) {
+    const config = source.match(
+      new RegExp(`const ${configName} = \\{[\\s\\S]*?\\r?\\n\\};`)
+    )?.[0];
+
+    assert.ok(config, `${configName} should remain discoverable`);
+    assert.match(config, /preload:\s*path\.join\(/);
+    assert.match(config, /contextIsolation:\s*true/);
+    assert.match(config, /sandbox:\s*false/);
+  }
+});
+
 test("voice recorder tolerates a missing preload bridge without crashing its error boundary", () => {
   const source = fs.readFileSync(path.join(appRoot, "src/hooks/useAudioRecording.js"), "utf8");
   const guardedReads = source.match(/window\.electronAPI\?\.getSttConfig\?\.\(/g) ?? [];

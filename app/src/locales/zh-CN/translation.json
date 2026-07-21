@@ -96,6 +96,7 @@
     "voiceEnrollmentSaved": "你的本地声纹已保存。",
     "voiceEnrollmentPending": "正在准备声纹校准",
     "voiceEnrollmentWindowProgress": "第 {{current}} 段，共 {{total}} 段",
+    "voiceEnrollmentSpeechDiagnostics": "每段有效语音：{{values}} 秒；每段至少需要 {{threshold}} 秒",
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "声纹样本不足，请清晰读完三段十秒语音后重试。",
       "inconsistent_samples": "三段声音不一致，请独自在更安静的环境中重试。",

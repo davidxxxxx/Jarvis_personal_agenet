@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Clock3, Search } from "lucide-react";
+import { ArrowLeft, BrainCircuit, Clock3, Cpu, History, Search, Users } from "lucide-react";
 import type {
   JarvisRuntimeStatus,
   JarvisSession,
@@ -8,9 +8,9 @@ import type {
 } from "../types";
 import { useJarvisStore } from "./jarvisStore";
 import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
-import DurableTranscript from "./DurableTranscript";
 import KnowledgeMemoryPanel from "./KnowledgeMemoryPanel";
 import ProcessingStatus from "./ProcessingStatus";
+import SpeakerChip from "./SpeakerChip";
 
 function duration(session: JarvisSession): string {
   const ms = Math.max(0, (session.ended_at ?? Date.now()) - session.started_at);
@@ -25,6 +25,10 @@ function dateLabel(at: number): string {
     day: "numeric",
     weekday: "short",
   }).format(at);
+}
+
+function speakerCountLabel(minimum: number, maximum: number): string {
+  return minimum === maximum ? `${minimum} 人` : `${minimum}–${maximum} 人`;
 }
 
 function safeStringArray(value: string | null | undefined): string[] {
@@ -98,11 +102,14 @@ export default function MemoryView() {
   const failEvidenceSession = useJarvisStore((state) => state.failEvidenceSession);
   const acknowledgeEvidencePlayback = useJarvisStore((state) => state.acknowledgeEvidencePlayback);
   const clearEvidenceNavigation = useJarvisStore((state) => state.clearEvidenceNavigation);
+  const clustersBySession = useJarvisStore((state) => state.clustersBySession);
+  const loadSessionClusters = useJarvisStore((state) => state.loadSessionClusters);
   const [sessions, setSessions] = useState(storedSessions);
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<JarvisSessionDetail | null>(null);
   const [timeline, setTimeline] = useState<JarvisSessionTimeline | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<JarvisRuntimeStatus | null>(null);
+  const [memoryMode, setMemoryMode] = useState<"sessions" | "knowledge">("sessions");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const detailRequestGeneration = useRef(0);
@@ -228,6 +235,16 @@ export default function MemoryView() {
     };
   }, [detail?.session.id]);
 
+  useEffect(() => {
+    if (
+      !detail?.session.id ||
+      typeof window.electronAPI?.jarvis?.listSessionSpeakerClusters !== "function"
+    ) {
+      return;
+    }
+    void loadSessionClusters(detail.session.id).catch(() => undefined);
+  }, [detail?.session.id, loadSessionClusters]);
+
   const groups = useMemo(() => {
     const map = new Map<string, JarvisSession[]>();
     for (const session of sessions) {
@@ -316,7 +333,11 @@ export default function MemoryView() {
         setError(analysisErrorMessage(status.errorCode));
         return;
       }
-      for (let attempt = 0; attempt < 180 && ["queued", "analyzing"].includes(status.state); attempt += 1) {
+      for (
+        let attempt = 0;
+        attempt < 180 && ["queued", "analyzing"].includes(status.state);
+        attempt += 1
+      ) {
         if (generation !== detailRequestGeneration.current) return;
         try {
           status = await window.electronAPI.jarvis.getAnalysisStatus(sessionId);
@@ -354,6 +375,23 @@ export default function MemoryView() {
     const suggestions = safeLegacySuggestions(detail.summary?.suggestions_json);
     const hasVisibleTranscript = detail.segments.length > 0 || (timeline?.segments.length ?? 0) > 0;
     const summaryInputReady = timeline?.processing_state === "ready";
+    const speakerProcessing = detail.speakerProcessing;
+    const latestSpeakerRuns = speakerProcessing?.latestRuns ?? [];
+    const microphoneTrackIds = new Set(
+      (timeline?.tracks ?? [])
+        .filter((track) => track.source_type === "mic")
+        .map((track) => track.id)
+    );
+    const headlineSpeakerRun =
+      latestSpeakerRuns.find((run) => microphoneTrackIds.has(run.trackId)) ??
+      latestSpeakerRuns[0] ??
+      null;
+    const storedClusterUpdates = new Map(
+      (clustersBySession[detail.session.id] ?? []).map((cluster) => [cluster.id, cluster])
+    );
+    const visibleSpeakers = (speakerProcessing?.speakers ?? []).map(
+      (cluster) => storedClusterUpdates.get(cluster.id) ?? cluster
+    );
     const sessionStatusLabel =
       detail.session.status === "completed" && !summaryInputReady
         ? "录音已完成 · 后台处理中"
@@ -375,7 +413,7 @@ export default function MemoryView() {
           }
         : null;
     return (
-      <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
+      <main className="jarvis-scroll-region min-w-0 overflow-y-scroll p-6 lg:col-span-2">
         <button
           type="button"
           onClick={() => {
@@ -420,17 +458,33 @@ export default function MemoryView() {
         {error && (
           <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
         )}
-        {timeline && (
-          <div className="mt-4 rounded-xl border border-border/50 bg-card p-4">
-            <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
+        <section className="mt-5 rounded-2xl border border-border/60 bg-card p-4 shadow-sm sm:p-5">
+          <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
+            <div>
+              <h2 className="text-lg font-semibold">录音与转写</h2>
+              <p className="mt-1 text-sm text-muted-foreground">
+                播放控制已放到每条转写上，点击文字或左侧按钮即可播放该句。
+              </p>
+            </div>
+            <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+              {timeline?.segments.length ?? detail.segments.length} 条转写
+            </span>
           </div>
-        )}
-        <DurableTranscript
-          sessionId={detail.session.id}
-          segments={timeline?.segments.length ? timeline.segments : detail.segments}
-          focusSegmentId={evidenceContext?.transcriptSegmentId}
-          focusRequestId={focusRequestId}
-        />
+          {timeline ? (
+            <ContinuousSessionPlayer
+              timeline={timeline}
+              readChunk={window.electronAPI.jarvis.readAudioChunk}
+              seekRequest={seekRequest}
+              onSeekResult={acknowledgeEvidencePlayback}
+              focusSegmentId={evidenceContext?.transcriptSegmentId}
+              focusRequestId={focusRequestId}
+            />
+          ) : (
+            <p className="rounded-xl bg-muted/30 p-4 text-sm text-muted-foreground">
+              正在读取音频时间线…
+            </p>
+          )}
+        </section>
         {evidenceNavigation.phase === "transcript_only" && evidenceContext && (
           <p role="status" className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
             {evidenceNavigation.reason === "audio_expired"
@@ -444,7 +498,94 @@ export default function MemoryView() {
           </p>
         )}
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
-          <h2 className="font-semibold">完整总结</h2>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <span className="rounded-lg bg-primary/10 p-2 text-primary">
+                <Users className="size-5" aria-hidden="true" />
+              </span>
+              <div>
+                <h2 className="font-semibold">说话人与声纹</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {headlineSpeakerRun?.speakerCount
+                    ? `本次识别到 ${speakerCountLabel(
+                        headlineSpeakerRun.speakerCount.minimum,
+                        headlineSpeakerRun.speakerCount.maximum
+                      )}`
+                    : timeline?.processing_state === "ready"
+                      ? "本次没有可用的说话人结果"
+                      : "正在后台复核人数和声纹"}
+                </p>
+              </div>
+            </div>
+            {headlineSpeakerRun && (
+              <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+                {headlineSpeakerRun.inputVersion === 2
+                  ? headlineSpeakerRun.speakerCount?.state === "models_agree"
+                    ? "双模型一致"
+                    : "高精度复核"
+                  : "基础识别"}
+              </span>
+            )}
+          </div>
+          {visibleSpeakers.length > 0 ? (
+            <div className="mt-4 grid gap-2 sm:grid-cols-2">
+              {visibleSpeakers.map((cluster) => (
+                <div
+                  key={cluster.id}
+                  className="flex items-center justify-between gap-3 rounded-lg bg-muted/30 px-3 py-2.5"
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        {cluster.localLabel}
+                      </span>
+                      <SpeakerChip cluster={cluster} localLabel={cluster.localLabel} />
+                    </div>
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {cluster.person?.isSelf
+                        ? "本人声纹已确认"
+                        : cluster.linkState === "confirmed"
+                          ? "已加入长期人物档案"
+                          : cluster.suggestedPerson
+                            ? `可能是 ${cluster.suggestedPerson.displayName}`
+                            : "点击标签可指定姓名并选择是否长期学习"}
+                    </p>
+                  </div>
+                  {typeof cluster.score === "number" && (
+                    <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                      {Math.round(cluster.score * 100)}%
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-4 rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
+              {timeline?.processing_state === "ready"
+                ? "没有提取到可命名的声纹。纯系统音频或重叠不清的片段不会强行建立人物档案。"
+                : "录音已安全保存；GPU 空闲后会自动补齐说话人分离和跨会话关联。"}
+            </p>
+          )}
+        </section>
+        <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="font-semibold">完整总结</h2>
+            {speakerProcessing?.summaryRefresh?.recommended === 1 && (
+              <button
+                type="button"
+                onClick={() => void analyze()}
+                disabled={loading}
+                className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-800 disabled:opacity-50 dark:text-amber-200"
+              >
+                {loading ? "正在刷新…" : "付费刷新总结"}
+              </button>
+            )}
+          </div>
+          {speakerProcessing?.summaryRefresh?.recommended === 1 && (
+            <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
+              高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax 重新总结。
+            </p>
+          )}
           <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
             {detail.summary?.summary ??
               (summaryInputReady
@@ -508,105 +649,174 @@ export default function MemoryView() {
             </ul>
           </section>
         </div>
-        <section className="mt-4 rounded-xl border border-border/50 bg-card p-5">
-          <h2 className="font-semibold">连续会话</h2>
-          {timeline ? (
-            <div className="mt-4">
-              <ContinuousSessionPlayer
-                timeline={timeline}
-                readChunk={window.electronAPI.jarvis.readAudioChunk}
-                seekRequest={seekRequest}
-                onSeekResult={acknowledgeEvidencePlayback}
-              />
+        {timeline && (
+          <details className="mt-4 rounded-xl border border-border/50 bg-card">
+            <summary className="cursor-pointer px-5 py-4 text-sm font-semibold">
+              处理详情与后台进度
+            </summary>
+            <div className="border-t border-border/50 p-4">
+              {latestSpeakerRuns.length > 0 && (
+                <div className="mb-4 rounded-lg border border-border/50 bg-muted/20 p-3">
+                  <div className="flex items-center gap-2 text-sm font-medium">
+                    <Cpu className="size-4" aria-hidden="true" />
+                    说话人处理
+                  </div>
+                  <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
+                    {latestSpeakerRuns.map((run) => {
+                      const track = timeline.tracks.find((item) => item.id === run.trackId);
+                      const source =
+                        track?.application_display_name ||
+                        (track?.source_type === "mic" ? "麦克风" : "系统音频");
+                      return (
+                        <li key={run.id} className="flex flex-wrap gap-x-2 gap-y-1">
+                          <span className="font-medium text-foreground">{source}</span>
+                          <span>{run.executionDevice.toUpperCase()}</span>
+                          <span>
+                            {run.speakerCount
+                              ? speakerCountLabel(
+                                  run.speakerCount.minimum,
+                                  run.speakerCount.maximum
+                                )
+                              : "人数未知"}
+                          </span>
+                          <span>重叠分离：{run.overlapSeparationState}</span>
+                          {run.modelPackVersion && <span>{run.modelPackVersion}</span>}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+              <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
             </div>
-          ) : (
-            <p className="mt-3 text-sm text-muted-foreground">正在读取音频时间线…</p>
-          )}
-        </section>
+          </details>
+        )}
       </main>
     );
   }
 
   return (
-    <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
-      <h1 className="text-2xl font-semibold">记忆库</h1>
-      <p className="mt-1 text-sm text-muted-foreground">
-        所有录音会话、转写、总结和长期记忆都在这里。
-      </p>
-      <div className="mt-6">
-        <KnowledgeMemoryPanel />
-      </div>
-      <form
-        className="mt-5 flex max-w-2xl gap-2"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void search();
-        }}
-      >
-        <label className="flex flex-1 items-center gap-2 rounded-lg border border-border bg-card px-3">
-          <Search className="size-4 text-muted-foreground" />
-          <input
-            aria-label="搜索记忆"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索对话、人物或主题"
-            className="w-full bg-transparent py-2.5 text-sm outline-none"
-          />
-        </label>
+    <main className="jarvis-scroll-region min-w-0 overflow-y-scroll p-6 lg:col-span-2">
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">记忆 Memory</h1>
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+            “会话记录”保存每次录音和转写；“长期记忆”只保留跨多次对话仍然有用的信息。
+          </p>
+        </div>
+        <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+          {sessions.length} 次会话
+        </span>
+      </header>
+
+      <div className="mt-5 inline-flex rounded-lg bg-muted p-1" aria-label="记忆内容类型">
         <button
-          type="submit"
-          className="rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground"
+          type="button"
+          onClick={() => setMemoryMode("sessions")}
+          className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm ${
+            memoryMode === "sessions"
+              ? "bg-background font-medium shadow-sm"
+              : "text-muted-foreground"
+          }`}
         >
-          搜索
+          <History className="size-4" aria-hidden="true" />
+          会话记录
         </button>
-      </form>
-      {error && (
-        <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
-      )}
-      {loading && !detail && <p className="mt-6 text-sm text-muted-foreground">正在读取…</p>}
-      <div className="mt-6 space-y-7">
-        {groups.length ? (
-          groups.map(([day, items]) => (
-            <section key={day}>
-              <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{day}</h2>
-              <div className="space-y-2">
-                {items.map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    onClick={() => {
-                      clearEvidenceNavigation();
-                      void open(session.id);
-                    }}
-                    className="flex w-full items-center justify-between rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
-                  >
-                    <div>
-                      <p className="font-medium">
-                        {new Date(session.started_at).toLocaleTimeString("zh-CN", {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}{" "}
-                        的录音
-                      </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {session.status} · {session.language}
-                      </p>
-                    </div>
-                    <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <Clock3 className="size-3.5" />
-                      {duration(session)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            </section>
-          ))
-        ) : (
-          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
-            还没有符合条件的记忆。
-          </div>
-        )}
+        <button
+          type="button"
+          onClick={() => setMemoryMode("knowledge")}
+          className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm ${
+            memoryMode === "knowledge"
+              ? "bg-background font-medium shadow-sm"
+              : "text-muted-foreground"
+          }`}
+        >
+          <BrainCircuit className="size-4" aria-hidden="true" />
+          长期记忆
+        </button>
       </div>
+
+      {memoryMode === "knowledge" ? (
+        <div className="mt-6">
+          <KnowledgeMemoryPanel />
+        </div>
+      ) : (
+        <>
+          <form
+            className="mt-6 flex max-w-2xl gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void search();
+            }}
+          >
+            <label className="flex flex-1 items-center gap-2 rounded-lg border border-border bg-card px-3">
+              <Search className="size-4 text-muted-foreground" aria-hidden="true" />
+              <input
+                aria-label="搜索记忆"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索会话、转写或总结"
+                className="w-full bg-transparent py-2.5 text-sm outline-none"
+              />
+            </label>
+            <button
+              type="submit"
+              className="rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground"
+            >
+              搜索
+            </button>
+          </form>
+          {error && (
+            <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+              {error}
+            </p>
+          )}
+          {loading && !detail && <p className="mt-6 text-sm text-muted-foreground">正在读取…</p>}
+          <div className="mt-6 space-y-7">
+            {groups.length ? (
+              groups.map(([day, items]) => (
+                <section key={day}>
+                  <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{day}</h2>
+                  <div className="space-y-2">
+                    {items.map((session) => (
+                      <button
+                        key={session.id}
+                        type="button"
+                        onClick={() => {
+                          clearEvidenceNavigation();
+                          void open(session.id);
+                        }}
+                        className="flex w-full items-center justify-between rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
+                      >
+                        <div>
+                          <p className="font-medium">
+                            {new Date(session.started_at).toLocaleTimeString("zh-CN", {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}{" "}
+                            的录音
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {session.status} · {session.language}
+                          </p>
+                        </div>
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                          <Clock3 className="size-3.5" aria-hidden="true" />
+                          {duration(session)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              ))
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+                还没有符合条件的会话记录。
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </main>
   );
 }

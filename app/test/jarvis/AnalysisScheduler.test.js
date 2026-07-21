@@ -78,7 +78,7 @@ function desiredIdentity(overrides = {}) {
   };
 }
 
-function harness({ sendable = true, jobState = "pending" } = {}) {
+function harness({ sendable = true, jobState = "pending", activityClassification = false } = {}) {
   const events = [];
   let inputCreated = false;
   let identity = desiredIdentity();
@@ -86,6 +86,11 @@ function harness({ sendable = true, jobState = "pending" } = {}) {
   const repository = {
     getSessionDetail: () => sessionDetail(),
     listPeople: () => [{ id: "person-real", display_name: "real name", is_self: 0 }],
+    ...(activityClassification
+      ? {
+          listSessionActivityClassifications: () => [],
+        }
+      : {}),
   };
   const memoryRepository = {
     prepareAnalysisInput(request) {
@@ -158,6 +163,39 @@ function harness({ sendable = true, jobState = "pending" } = {}) {
     desiredIdentityProvider: () => identity,
     cloudQueue,
     cloudTransportEnabled: true,
+    ...(activityClassification
+      ? {
+          activityClassificationService: {
+            async classifySession(input) {
+              events.push(["classify_activity", input]);
+              return { classifications: [], cloudStatus: "completed" };
+            },
+          },
+          activityBuilder: {
+            build() {
+              return {
+                activities: [
+                  {
+                    activityId: "activity-1",
+                    startedAt: 2,
+                    endedAt: 3,
+                    applications: [],
+                    sourceAttribution: "microphone",
+                    speakerLabels: ["P1"],
+                    segments: [],
+                    statistics: {},
+                  },
+                ],
+                redactionTerms: {
+                  participants: [],
+                  otherPeople: [],
+                  deviceLabels: [],
+                },
+              };
+            },
+          },
+        }
+      : {}),
     now: () => 10,
   });
   return {
@@ -381,4 +419,56 @@ test("startup recovery does not duplicate a ready session with durable analysis 
 
   assert.equal(await scheduler.recoverReadySessions(), 0);
   assert.equal(events.length, 0);
+});
+
+test("startup cloud recovery skips active historical local-only reprocessing", async () => {
+  const { scheduler, events } = harness();
+  scheduler.repository.listSessions = () => [
+    { id: "historical", status: "completed", processing_state: "ready" },
+    { id: "normal", status: "completed", processing_state: "ready" },
+  ];
+  scheduler.repository.isHistoricalLocalOnlyReprocessing = (sessionId) =>
+    sessionId === "historical";
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "waiting",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 0,
+    updatedAt: null,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  assert.equal(events.find(([name]) => name === "enqueue")[1].sessionId, "normal");
+});
+
+test("startup recovery backfills activity classification for an already summarized session", async () => {
+  const { scheduler, events } = harness({
+    jobState: "completed",
+    activityClassification: true,
+  });
+  scheduler.repository.listSessions = () => [
+    {
+      id: "s1",
+      status: "completed",
+      processing_state: "ready",
+    },
+  ];
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+    summary: { summary: "already durable" },
+  });
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "ready",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 1,
+    updatedAt: 9,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  await scheduler.quiesce();
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  assert.equal(events.filter(([name]) => name === "classify_activity").length, 1);
 });
