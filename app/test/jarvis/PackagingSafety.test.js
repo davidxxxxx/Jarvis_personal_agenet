@@ -89,10 +89,7 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
   const artifactRoot = path.join(appRoot, "dist");
   const signedResult = {
     status: 0,
-    stdout: JSON.stringify([
-      { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "Valid" },
-      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
-    ]),
+    stdout: JSON.stringify([{ name: `Jarvis Memory Setup ${appVersion}.exe`, status: "Valid" }]),
   };
 
   assert.throws(
@@ -117,7 +114,6 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
         status: 0,
         stdout: JSON.stringify([
           { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
-          { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
         ]),
       }),
     })

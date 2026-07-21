@@ -47,6 +47,26 @@ function createUnsignedBuilderInvocation({
   };
 }
 
+function createWindowsModelBundleInvocation({
+  appRoot = path.resolve(__dirname, ".."),
+  env = process.env,
+  publishOnly = false,
+} = {}) {
+  const args = [path.join(appRoot, "scripts", "build-windows-model-bundle.js")];
+  if (publishOnly) args.push("--publish-only");
+  return {
+    command: process.execPath,
+    args,
+    env: sanitizeUnsignedEnvironment(env),
+    options: {
+      cwd: appRoot,
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  };
+}
+
 function createElectronNativeRebuildInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
@@ -162,10 +182,7 @@ function assertUnsignedWindowsArtifacts({
   const pkg = JSON.parse(
     require("node:fs").readFileSync(path.join(appRoot, "package.json"), "utf8")
   );
-  const expectedNames = [
-    `${pkg.productName} Setup ${pkg.version}.exe`,
-    `${pkg.productName} ${pkg.version}.exe`,
-  ];
+  const expectedNames = [`${pkg.productName} Setup ${pkg.version}.exe`];
   const artifactPaths = expectedNames.map((name) => path.join(artifactRoot, name));
   const powershellPath = path.win32.join(
     systemRoot,
@@ -238,6 +255,12 @@ function assertUnsignedWindowsArtifacts({
 function buildUnsignedWindows(options = {}) {
   const appRoot = options.appRoot ?? path.resolve(__dirname, "..");
   const invocation = createUnsignedBuilderInvocation({ ...options, appRoot });
+  const modelBundleInvocation = createWindowsModelBundleInvocation({ ...options, appRoot });
+  const modelPublishInvocation = createWindowsModelBundleInvocation({
+    ...options,
+    appRoot,
+    publishOnly: true,
+  });
   const electronRebuildInvocation = createElectronNativeRebuildInvocation({ ...options, appRoot });
   const nodeRestoreInvocation = createNodeNativeRestoreInvocation({ ...options, appRoot });
   const configPath = path.join(appRoot, "electron-builder.unsigned-win.json");
@@ -256,6 +279,13 @@ function buildUnsignedWindows(options = {}) {
 
   try {
     assertSafeBuilderConfigImpl(configPath);
+    if (!options.dirOnly) {
+      runRequiredInvocation(
+        modelBundleInvocation,
+        "Windows model component preparation",
+        spawnSyncImpl
+      );
+    }
     runRequiredInvocation(
       electronRebuildInvocation,
       "Electron native dependency prebuild install",
@@ -278,6 +308,13 @@ function buildUnsignedWindows(options = {}) {
       label: "packaged-electron",
       environment: invocation.env,
     });
+    if (!options.dirOnly) {
+      runRequiredInvocation(
+        modelPublishInvocation,
+        "Windows model component publication",
+        spawnSyncImpl
+      );
+    }
     const artifactRoot = path.join(appRoot, "dist");
     assertSafeArtifactTreeImpl(artifactRoot);
     if (!options.dirOnly) {
@@ -326,6 +363,7 @@ module.exports = {
   createElectronNativeRebuildInvocation,
   createNodeNativeRestoreInvocation,
   createUnsignedBuilderInvocation,
+  createWindowsModelBundleInvocation,
   sanitizeUnsignedEnvironment,
   verifyNativeAbi,
 };

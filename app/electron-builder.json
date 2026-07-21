@@ -159,7 +159,7 @@
     }
   },
   "win": {
-    "target": ["nsis", "portable"],
+    "target": ["nsis"],
     "icon": "src/assets/icon.ico",
     "azureSignOptions": {
       "endpoint": "https://eus.codesigning.azure.net/",
@@ -175,11 +175,6 @@
       {
         "from": "src/jarvis/native/windows",
         "to": "jarvis-native"
-      },
-      {
-        "from": "resources/ai-model-pack/prebuilt",
-        "to": "jarvis-ai-model-pack",
-        "filter": ["**/*"]
       }
     ]
   },

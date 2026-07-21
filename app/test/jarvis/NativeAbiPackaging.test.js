@@ -10,6 +10,7 @@ const {
   createElectronNativeRebuildInvocation,
   createNodeNativeRestoreInvocation,
   createUnsignedBuilderInvocation,
+  createWindowsModelBundleInvocation,
   verifyNativeAbi,
 } = require("../../scripts/build-windows");
 
@@ -21,7 +22,6 @@ function successfulAuthenticodeResult() {
     status: 0,
     stdout: JSON.stringify([
       { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
-      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
     ]),
   };
 }
@@ -75,6 +75,19 @@ test("directory-only Windows packaging adds --dir without changing the trusted b
   ]);
 });
 
+test("model component preparation and publication use trusted Node entry points", () => {
+  const prepare = createWindowsModelBundleInvocation({ appRoot });
+  const publish = createWindowsModelBundleInvocation({ appRoot, publishOnly: true });
+
+  assert.equal(prepare.command, process.execPath);
+  assert.deepEqual(prepare.args, [path.join(appRoot, "scripts", "build-windows-model-bundle.js")]);
+  assert.deepEqual(publish.args, [
+    path.join(appRoot, "scripts", "build-windows-model-bundle.js"),
+    "--publish-only",
+  ]);
+  assert.equal(prepare.options.shell, false);
+});
+
 test("unsigned artifact verification retries a transient Windows signature result", () => {
   let attempts = 0;
   const waits = [];
@@ -99,7 +112,6 @@ test("unsigned artifact verification retries a transient Windows signature resul
           status: 0,
           stdout: JSON.stringify([
             { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "UnknownError" },
-            { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
           ]),
         };
       }
@@ -215,7 +227,9 @@ test("unsigned build enforces native rebuild, runtime smokes, scans, and Node re
     if (args.includes("--runtime") && args.includes("electron")) order.push("electron-prebuild");
     else if (args.includes("--runtime") && args.includes("node")) order.push("node-restore");
     else if (args.includes("--win")) order.push("builder");
-    else {
+    else if (args[0]?.endsWith("build-windows-model-bundle.js")) {
+      order.push(args.includes("--publish-only") ? "model-publish" : "model-prepare");
+    } else {
       order.push("auth-spawn");
       return successfulAuthenticodeResult();
     }
@@ -242,10 +256,12 @@ test("unsigned build enforces native rebuild, runtime smokes, scans, and Node re
 
   assert.deepEqual(order, [
     "setup",
+    "model-prepare",
     "electron-prebuild",
     "source-electron",
     "builder",
     "packaged-electron",
+    "model-publish",
     "package-scan",
     "auth-scan",
     "node-restore",
@@ -272,7 +288,11 @@ test("directory-only build still verifies ABI and scans package but skips instal
     assertSafeBuilderConfigImpl: () => order.push("setup"),
     verifyNativeAbiImpl: ({ label }) => {
       order.push(label);
-      return { ok: true, abi: label === "source-node" ? process.versions.modules : "145", value: 1 };
+      return {
+        ok: true,
+        abi: label === "source-node" ? process.versions.modules : "145",
+        value: 1,
+      };
     },
     assertSafeArtifactTreeImpl: () => order.push("package-scan"),
     assertUnsignedWindowsArtifactsImpl: () => order.push("auth-scan"),
@@ -305,10 +325,11 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
               order.push("electron-prebuild");
             } else if (args.includes("--runtime") && args.includes("node")) {
               order.push("node-restore");
-            }
-            else if (args.includes("--win")) {
+            } else if (args.includes("--win")) {
               order.push("builder");
               return { status: 17, stdout: "" };
+            } else if (args[0]?.endsWith("build-windows-model-bundle.js")) {
+              order.push("model-prepare");
             }
             return { status: 0, stdout: "" };
           },
@@ -328,6 +349,7 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
     );
     assert.deepEqual(order, [
       "setup",
+      "model-prepare",
       "electron-prebuild",
       "source-electron",
       "builder",

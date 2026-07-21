@@ -9,27 +9,34 @@ function read(relativePath) {
   return fs.readFileSync(path.join(APP_ROOT, relativePath), "utf8");
 }
 
-test("Windows release carries the offline component and installs it before processing starts", () => {
+test("Windows release ships the model as a verified sibling component", () => {
   const builder = JSON.parse(read("electron-builder.json"));
   assert.equal(builder.toolsets?.nsis, "1.2.1");
-  assert.ok(
-    builder.win.extraResources.some(
-      (entry) =>
-        entry.from === "resources/ai-model-pack/prebuilt" && entry.to === "jarvis-ai-model-pack"
-    )
+  assert.equal(
+    builder.win.extraResources.some((entry) => entry.from === "resources/ai-model-pack/prebuilt"),
+    false
   );
+  assert.deepEqual(builder.win.target, ["nsis"]);
 
   const main = read("main.js");
   const installation = main.indexOf("await installBundledAiModelPackIfPresent()");
   const processing = main.indexOf("startJarvisProcessingRuntime();", installation);
   assert.ok(installation >= 0, "model component installation must be awaited");
   assert.ok(processing > installation, "processing must start only after model component adoption");
+
+  const nsis = read("resources/nsis/cleanup-models.nsh");
+  assert.match(nsis, /model-pack-release\.generated\.nsh/u);
+  assert.match(nsis, /StdUtils\.HashFile/u);
+  assert.match(nsis, /Nsis7z::Extract/u);
+  assert.match(nsis, /jarvis-ai-model-pack\\manifest\.json/u);
 });
 
 test("release preparation keeps staging off C and performs an offline CUDA model load test", () => {
   const packageJson = JSON.parse(read("package.json"));
   assert.match(packageJson.scripts["prepare:ai-model-pack"], /prepare-ai-model-pack\.ps1/u);
   assert.match(packageJson.scripts["prebuild:win"], /npm run verify:ai-model-pack$/u);
+  assert.match(packageJson.scripts["build:win"], /build-windows-model-bundle\.js/u);
+  assert.equal(packageJson.devDependencies["7zip-bin"], "^5.2.0");
 
   const script = read("scripts/prepare-ai-model-pack.ps1");
   assert.match(script, /G:\\Jarvis\\\.tmp/u);

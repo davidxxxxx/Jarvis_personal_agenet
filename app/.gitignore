@@ -193,6 +193,8 @@ build/
 resources/bin/
 resources/ai-model-pack/prebuilt/*
 !resources/ai-model-pack/prebuilt/.gitkeep
+resources/nsis/model-pack-release.generated.nsh
+release-components/
 resources/ai-model-pack/runtime/__pycache__/
 resources/ai-model-pack/runtime/*.pyc
 native/meeting-aec-helper/build/

@@ -1,10 +1,12 @@
 # Jarvis offline AI model component
 
 The Windows release treats the application core and the offline diarization models as two
-versioned components while keeping one installer entry. The generated component is placed in
-`resources/ai-model-pack/prebuilt` for Electron Builder and is adopted atomically into
-`JARVIS_DATA_ROOT/models/ai-model-pack` on first launch. No runtime model or cache is written to
-the Windows system drive.
+versioned components while keeping one installer entry. The verified tree is staged in
+`resources/ai-model-pack/prebuilt`; `scripts/build-windows-model-bundle.js` archives only the
+files named by its manifest and emits a SHA-512-pinned sibling component next to Setup. NSIS
+verifies and extracts that component, then Jarvis performs the per-file manifest verification and
+adopts it atomically into `JARVIS_DATA_ROOT/models/ai-model-pack` on first launch. Build models,
+caches, and temporary files stay on a non-system drive.
 
 Release inputs are intentionally predownloaded. In particular, the build machine must already
 have access to the gated `pyannote/speaker-diarization-community-1` repository; access tokens are
