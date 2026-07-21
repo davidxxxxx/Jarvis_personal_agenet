@@ -79,14 +79,17 @@ try {
   $env:TEMP = $safeTemp
   $env:TMP = $safeTemp
   $env:PIP_CACHE_DIR = $pipCache
-  New-Item -ItemType Directory -Path $stagingRoot | Out-Null
-  Copy-Item -LiteralPath $pythonSource -Destination $stagedRuntime -Recurse
-  $python = Join-Path $stagedRuntime "python.exe"
+  $runtimeForBuild = $pythonSource
+  $python = Join-Path $runtimeForBuild "python.exe"
   if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "The supplied self-contained runtime does not contain python.exe"
   }
 
   if (-not $SkipDependencyInstall) {
+    New-Item -ItemType Directory -Path $stagingRoot | Out-Null
+    Copy-Item -LiteralPath $pythonSource -Destination $stagedRuntime -Recurse
+    $runtimeForBuild = $stagedRuntime
+    $python = Join-Path $runtimeForBuild "python.exe"
     Invoke-Checked $python @("-m", "pip", "install", "--upgrade", "pip")
     Invoke-Checked $python @(
       "-m", "pip", "install",
@@ -101,12 +104,18 @@ try {
     $freeze = & $python -m pip freeze --all
     if ($LASTEXITCODE -ne 0) { throw "Unable to record the Python dependency lock" }
     $freeze | Set-Content -LiteralPath (Join-Path $stagedRuntime "JARVIS_PYTHON_LOCK.txt") -Encoding utf8
+  } else {
+    $recordedLock = Join-Path $runtimeForBuild "JARVIS_PYTHON_LOCK.txt"
+    if (-not (Test-Path -LiteralPath $recordedLock -PathType Leaf)) {
+      throw "The prepared Python runtime is missing JARVIS_PYTHON_LOCK.txt"
+    }
+    Invoke-Checked $python @("-I", "-m", "pip", "check")
   }
 
   Invoke-Checked (Get-Command node.exe).Source @(
     (Join-Path $appRoot "scripts\build-ai-model-pack.js"),
     "--output-dir", $safeOutput,
-    "--python-runtime", $stagedRuntime,
+    "--python-runtime", $runtimeForBuild,
     "--pyannote-dir", $pyannoteSource,
     "--mossformer-dir", $mossFormerSource,
     "--clearer-voice-dir", $clearerVoiceSource,

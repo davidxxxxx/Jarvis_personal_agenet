@@ -2,6 +2,9 @@
   "appId": "com.local.jarvis-memory",
   "afterPack": "scripts/afterPack.js",
   "productName": "Jarvis Memory",
+  "toolsets": {
+    "nsis": "1.2.1"
+  },
   "protocols": {
     "name": "Jarvis Memory Protocol",
     "schemes": ["jarvis-memory"]

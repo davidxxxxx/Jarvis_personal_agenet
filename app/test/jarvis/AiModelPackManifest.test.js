@@ -4,9 +4,35 @@ const path = require("node:path");
 const {
   MODEL_PACK_VERSION,
   REQUIRED_COMPONENTS,
+  mapBounded,
   normalizeManifest,
   resolveAiModelPackRoot,
 } = require("../../src/jarvis/main/AiModelPackManifest");
+
+test("bounded model hashing preserves order, caps concurrency, and joins in-flight failures", async () => {
+  let active = 0;
+  let peak = 0;
+  const ordered = await mapBounded([30, 5, 15, 1], 2, async (delay, index) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    active -= 1;
+    return index;
+  });
+  assert.deepEqual(ordered, [0, 1, 2, 3]);
+  assert.equal(peak, 2);
+
+  let inFlightFinished = false;
+  await assert.rejects(
+    mapBounded(["slow", "fail"], 2, async (value) => {
+      if (value === "fail") throw new Error("fixture hash failure");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlightFinished = true;
+    }),
+    /fixture hash failure/u
+  );
+  assert.equal(inFlightFinished, true);
+});
 
 function manifest() {
   return {
@@ -56,7 +82,19 @@ test("AI model pack permits real Python package paths but rejects traversal and 
     bytes: 10,
     sha256: "e".repeat(64),
   });
-  assert.equal(normalizeManifest(realistic).files.length, REQUIRED_COMPONENTS.length + 2);
+  realistic.files.push({
+    path: "runtime/Lib/site-packages/example/py.typed",
+    bytes: 0,
+    sha256: "0".repeat(64),
+  });
+  assert.equal(normalizeManifest(realistic).files.length, REQUIRED_COMPONENTS.length + 3);
+
+  const emptyRequired = manifest();
+  emptyRequired.files[0].bytes = 0;
+  assert.throws(
+    () => normalizeManifest(emptyRequired),
+    (error) => error.code === "AI_MODEL_PACK_INCOMPLETE"
+  );
   for (const unsafePath of ["../secret", "runtime/../../secret", "C:/secret", "/secret"]) {
     const unsafe = manifest();
     unsafe.files.push({ path: unsafePath, bytes: 1, sha256: "d".repeat(64) });

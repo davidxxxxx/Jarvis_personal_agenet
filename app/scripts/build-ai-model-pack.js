@@ -26,6 +26,27 @@ const OVERLAP_SIDECAR_SOURCE = path.join(
 );
 const NOTICES_SOURCE = path.join(APP_ROOT, "resources", "ai-model-pack", "THIRD_PARTY_NOTICES.txt");
 const OMITTED_SOURCE_DIRECTORIES = new Set([".cache", ".git", ".pytest_cache", "__pycache__"]);
+const HASH_CONCURRENCY = 8;
+
+async function mapBounded(values, limit, operation) {
+  const results = new Array(values.length);
+  let next = 0;
+  let firstError = null;
+  async function worker() {
+    while (firstError === null) {
+      const index = next++;
+      if (index >= values.length) return;
+      try {
+        results[index] = await operation(values[index], index);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, () => worker()));
+  if (firstError) throw firstError;
+  return results;
+}
 
 function parseArgs(argv) {
   const values = new Map();
@@ -159,15 +180,15 @@ async function buildAiModelPack(input, { now = () => new Date(), systemDrive } =
       path.join(staging, "vendor", "clearervoice-studio")
     );
     await copyFile(NOTICES_SOURCE, path.join(staging, "THIRD_PARTY_NOTICES.txt"));
-    const files = [];
-    for (const absolute of await listFiles(staging)) {
+    const absoluteFiles = await listFiles(staging);
+    const files = await mapBounded(absoluteFiles, HASH_CONCURRENCY, async (absolute) => {
       const stat = await fs.promises.stat(absolute);
-      files.push({
+      return {
         path: path.relative(staging, absolute).replaceAll("\\", "/"),
         bytes: stat.size,
         sha256: await sha256File(absolute),
-      });
-    }
+      };
+    });
     const manifest = {
       schemaVersion: MODEL_PACK_SCHEMA_VERSION,
       packVersion: MODEL_PACK_VERSION,
@@ -189,7 +210,9 @@ async function buildAiModelPack(input, { now = () => new Date(), systemDrive } =
       if (error?.code !== "ENOENT") throw error;
     }
     await fs.promises.rename(staging, output);
-    await verifyAiModelPack({ root: output });
+    // The complete staging tree was verified immediately before this same-volume atomic
+    // rename. Rehashing the unchanged 5+ GiB runtime a third time adds no integrity signal;
+    // release verification and first-launch adoption both independently verify the output.
     if (backupCreated) {
       await fs.promises.rm(backup, { recursive: true, force: true });
       backupCreated = false;
@@ -233,6 +256,7 @@ if (require.main === module) {
 module.exports = {
   buildAiModelPack,
   listFiles,
+  mapBounded,
   parseArgs,
   safeOutput,
 };

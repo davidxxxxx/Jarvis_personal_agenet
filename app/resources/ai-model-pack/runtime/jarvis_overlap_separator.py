@@ -8,6 +8,7 @@ still a separate process so overlap failures cannot corrupt primary diarization.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -77,16 +78,17 @@ class MossFormerModels:
             error.code = "AI_MODEL_PACK_INCOMPLETE"
             raise error
         sys.path.insert(0, str(source_root))
-        from clearvoice import ClearVoice
+        with redirect_stdout(sys.stderr):
+            from clearvoice import ClearVoice
 
-        previous = Path.cwd()
-        try:
-            os.chdir(self.model_root)
-            self.separator = ClearVoice(
-                task="speech_separation", model_names=["MossFormer2_SS_16K"]
-            )
-        finally:
-            os.chdir(previous)
+            previous = Path.cwd()
+            try:
+                os.chdir(self.model_root)
+                self.separator = ClearVoice(
+                    task="speech_separation", model_names=["MossFormer2_SS_16K"]
+                )
+            finally:
+                os.chdir(previous)
         return self.separator
 
     def self_test(self, load_model: bool) -> dict[str, Any]:
@@ -136,7 +138,8 @@ class MossFormerModels:
             if clip.shape[1] < sample_rate // 4:
                 stem_counts.append(0)
                 continue
-            separated = np.asarray(separator(clip, False), dtype=np.float32)
+            with redirect_stdout(sys.stderr):
+                separated = np.asarray(separator(clip, False), dtype=np.float32)
             if separated.ndim != 3 or separated.shape[0] < 2:
                 error = RuntimeError("MossFormer2 returned an invalid separation tensor")
                 error.code = "OVERLAP_SEPARATION_INVALID_RESULT"

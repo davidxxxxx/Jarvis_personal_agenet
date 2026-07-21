@@ -11,6 +11,7 @@ function read(relativePath) {
 
 test("Windows release carries the offline component and installs it before processing starts", () => {
   const builder = JSON.parse(read("electron-builder.json"));
+  assert.equal(builder.toolsets?.nsis, "1.2.1");
   assert.ok(
     builder.win.extraResources.some(
       (entry) =>
@@ -37,6 +38,9 @@ test("release preparation keeps staging off C and performs an offline CUDA model
   assert.match(script, /--load-separator/u);
   assert.match(script, /HF_HUB_OFFLINE/u);
   assert.match(script, /TRANSFORMERS_OFFLINE/u);
+  assert.match(script, /\$runtimeForBuild = \$pythonSource/u);
+  assert.match(script, /missing JARVIS_PYTHON_LOCK\.txt/u);
+  assert.match(script, /"-I", "-m", "pip", "check"/u);
 });
 
 test("offline dependency lock vendors ClearerVoice source without its conflicting PyPI metadata", () => {
@@ -52,4 +56,13 @@ test("offline dependency lock vendors ClearerVoice source without its conflictin
   const worker = read("resources/ai-model-pack/runtime/jarvis_overlap_separator.py");
   assert.match(worker, /vendor" \/ "clearervoice-studio/u);
   assert.match(worker, /from clearvoice import ClearVoice/u);
+  assert.match(worker, /with redirect_stdout\(sys\.stderr\)/u);
+});
+
+test("generated model component stays outside source lint and format scans", () => {
+  const eslintConfig = read("eslint.config.js");
+  const prettierIgnore = read(".prettierignore");
+
+  assert.match(eslintConfig, /resources\/ai-model-pack\/prebuilt\/\*\*/u);
+  assert.match(prettierIgnore, /^resources\/ai-model-pack\/prebuilt$/mu);
 });

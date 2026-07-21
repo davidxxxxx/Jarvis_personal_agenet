@@ -8,6 +8,7 @@ const MODEL_PACK_SCHEMA_VERSION = 1;
 const MODEL_PACK_VERSION = "jarvis-ai-model-pack-2026.07.2";
 const MANIFEST_FILE = "manifest.json";
 const SHA256 = /^[0-9a-f]{64}$/;
+const HASH_CONCURRENCY = 8;
 
 const REQUIRED_COMPONENTS = Object.freeze([
   Object.freeze({ id: "python-runtime", license: "PSF-2.0", requiredPath: "runtime/python.exe" }),
@@ -78,6 +79,26 @@ function codedError(code, message) {
   return error;
 }
 
+async function mapBounded(values, limit, operation) {
+  const results = new Array(values.length);
+  let next = 0;
+  let firstError = null;
+  async function worker() {
+    while (firstError === null) {
+      const index = next++;
+      if (index >= values.length) return;
+      try {
+        results[index] = await operation(values[index], index);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, () => worker()));
+  if (firstError) throw firstError;
+  return results;
+}
+
 function normalizeRelativePath(value) {
   if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return null;
   const relativePath = value.replaceAll("\\", "/");
@@ -119,7 +140,7 @@ function normalizeManifest(value) {
     if (
       relativePath === null ||
       !Number.isSafeInteger(entry.bytes) ||
-      entry.bytes <= 0 ||
+      entry.bytes < 0 ||
       typeof entry.sha256 !== "string" ||
       !SHA256.test(entry.sha256)
     ) {
@@ -134,7 +155,8 @@ function normalizeManifest(value) {
     );
   }
   for (const component of REQUIRED_COMPONENTS) {
-    if (!files.has(component.requiredPath)) {
+    const requiredFile = files.get(component.requiredPath);
+    if (!requiredFile || requiredFile.bytes <= 0) {
       throw codedError("AI_MODEL_PACK_INCOMPLETE", `missing ${component.requiredPath}`);
     }
   }
@@ -186,7 +208,7 @@ async function verifyAiModelPack({
       `model pack manifest is unavailable: ${error?.code || "unknown"}`
     );
   }
-  for (const entry of manifest.files) {
+  await mapBounded(manifest.files, HASH_CONCURRENCY, async (entry) => {
     const absolutePath = path.resolve(safeRoot, entry.path);
     if (absolutePath !== safeRoot && !absolutePath.startsWith(`${safeRoot}${path.sep}`)) {
       throw codedError("AI_MODEL_PACK_INVALID", "model pack path escapes its root");
@@ -199,7 +221,7 @@ async function verifyAiModelPack({
     if (digest !== entry.sha256) {
       throw codedError("AI_MODEL_PACK_ARTIFACT_INVALID", `model digest mismatch: ${entry.path}`);
     }
-  }
+  });
   const checkpointPointer = "checkpoints/MossFormer2_SS_16K/last_best_checkpoint";
   const checkpointDirectory = path.posix.dirname(checkpointPointer);
   const pointerText = await fsImpl.readFile(path.join(safeRoot, checkpointPointer), "utf8");
@@ -244,6 +266,7 @@ module.exports = {
   MODEL_PACK_VERSION,
   REQUIRED_COMPONENTS,
   isAiModelPackPresent,
+  mapBounded,
   normalizeManifest,
   resolveAiModelPackRoot,
   verifyAiModelPack,

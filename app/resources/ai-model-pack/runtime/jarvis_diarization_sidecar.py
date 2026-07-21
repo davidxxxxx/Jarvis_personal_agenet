@@ -144,7 +144,12 @@ class SeparatorWorker:
             error = RuntimeError(f"overlap separator exited ({process.poll()})")
             error.code = "OVERLAP_SEPARATOR_EXITED"
             raise error
-        response = json.loads(raw)
+        try:
+            response = json.loads(raw)
+        except json.JSONDecodeError as cause:
+            error = RuntimeError("overlap separator emitted non-protocol output")
+            error.code = "OVERLAP_SEPARATOR_PROTOCOL_ERROR"
+            raise error from cause
         if response.get("id") != request_id:
             error = RuntimeError("overlap separator protocol mismatch")
             error.code = "OVERLAP_SEPARATOR_PROTOCOL_ERROR"
