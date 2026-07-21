@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import traceback
 from typing import Any
@@ -81,11 +82,102 @@ def _overlap_windows(turns: list[dict[str, Any]], padding_ms: int, duration_ms: 
     return merged
 
 
+class SeparatorWorker:
+    def __init__(self, model_root: Path) -> None:
+        self.model_root = model_root
+        self.process: subprocess.Popen[str] | None = None
+        self.sequence = 0
+
+    def _start(self) -> subprocess.Popen[str]:
+        if self.process is not None and self.process.poll() is None:
+            return self.process
+        runtime = self.model_root / "runtime"
+        python = runtime / "python.exe"
+        script = runtime / "jarvis_overlap_separator.py"
+        if not python.is_file() or not script.is_file():
+            error = FileNotFoundError("isolated overlap runtime is incomplete")
+            error.code = "AI_MODEL_PACK_INCOMPLETE"
+            raise error
+        system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or ""
+        path_entries = [runtime, runtime / "Library" / "bin"]
+        if system_root:
+            path_entries.append(Path(system_root) / "System32")
+        env = {
+            "SystemRoot": system_root,
+            "WINDIR": os.environ.get("WINDIR", system_root),
+            "PATH": ";".join(str(entry) for entry in path_entries),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HOME": str(self.model_root / "cache"),
+            "TORCH_HOME": str(self.model_root / "cache"),
+            "JARVIS_AI_MODEL_ROOT": str(self.model_root),
+        }
+        if os.environ.get("CUDA_VISIBLE_DEVICES"):
+            env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+        creation_flags = 0x08000000 if os.name == "nt" else 0
+        self.process = subprocess.Popen(
+            [str(python), "-I", "-u", str(script), "--server", "--model-root", str(self.model_root)],
+            cwd=self.model_root,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            creationflags=creation_flags,
+        )
+        return self.process
+
+    def request(self, command: str, payload: dict[str, Any] | None = None) -> Any:
+        process = self._start()
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("overlap separator pipes are unavailable")
+        self.sequence += 1
+        request_id = f"separator_{self.sequence}"
+        request = {"id": request_id, "command": command, **(payload or {})}
+        process.stdin.write(json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        raw = process.stdout.readline()
+        if not raw:
+            error = RuntimeError(f"overlap separator exited ({process.poll()})")
+            error.code = "OVERLAP_SEPARATOR_EXITED"
+            raise error
+        response = json.loads(raw)
+        if response.get("id") != request_id:
+            error = RuntimeError("overlap separator protocol mismatch")
+            error.code = "OVERLAP_SEPARATOR_PROTOCOL_ERROR"
+            raise error
+        if response.get("ok") is not True:
+            details = response.get("error") or {}
+            error = RuntimeError(str(details.get("message") or "overlap separator failed"))
+            error.code = str(details.get("code") or "OVERLAP_SEPARATOR_FAILED")
+            raise error
+        return response.get("result")
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None and process.stdin is not None:
+                self.sequence += 1
+                process.stdin.write(
+                    json.dumps({"id": f"shutdown_{self.sequence}", "command": "shutdown"}) + "\n"
+                )
+                process.stdin.flush()
+                process.wait(timeout=5)
+        except Exception:
+            process.kill()
+
+
 class OfflineModels:
     def __init__(self, model_root: Path) -> None:
         self.model_root = model_root.resolve()
         self.primary = None
-        self.separator = None
+        self.separator = SeparatorWorker(self.model_root)
 
     def _assert_cuda(self) -> Any:
         import torch
@@ -113,30 +205,12 @@ class OfflineModels:
         return pipeline
 
     def load_separator(self) -> Any:
-        if self.separator is not None:
-            return self.separator
         self._assert_cuda()
-        checkpoint = (
-            self.model_root
-            / "checkpoints"
-            / "MossFormer2_SS_16K"
-            / "last_best_checkpoint"
-        )
-        if not checkpoint.is_file():
-            error = FileNotFoundError(f"missing offline MossFormer2 checkpoint: {checkpoint}")
-            error.code = "AI_MODEL_PACK_INCOMPLETE"
-            raise error
-        from clearvoice import ClearVoice
-
-        previous = Path.cwd()
-        try:
-            os.chdir(self.model_root)
-            self.separator = ClearVoice(
-                task="speech_separation", model_names=["MossFormer2_SS_16K"]
-            )
-        finally:
-            os.chdir(previous)
+        self.separator.request("self_test", {"loadModel": True})
         return self.separator
+
+    def close(self) -> None:
+        self.separator.close()
 
     def diarize(self, request: dict[str, Any]) -> dict[str, Any]:
         import soundfile as sf
@@ -185,44 +259,8 @@ class OfflineModels:
     ) -> dict[str, Any]:
         if not windows:
             return {"state": "not_needed", "processed": 0, "total": 0, "stemCounts": []}
-        import numpy as np
-        import soundfile as sf
-
         separator = self.load_separator()
-        audio, sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=False)
-        if sample_rate != 16000:
-            error = ValueError("final diarization input must be 16 kHz")
-            error.code = "DIARIZATION_SAMPLE_RATE_MISMATCH"
-            raise error
-        if audio.ndim > 1:
-            audio = np.mean(audio, axis=1, dtype=np.float32)
-        stem_counts: list[int] = []
-        processed = 0
-        for window in windows:
-            start = round(window["startMs"] * sample_rate / 1000)
-            end = round(window["endMs"] * sample_rate / 1000)
-            clip = np.asarray(audio[start:end], dtype=np.float32).reshape(1, -1)
-            if clip.shape[1] < sample_rate // 4:
-                stem_counts.append(0)
-                continue
-            separated = np.asarray(separator(clip, False), dtype=np.float32)
-            if separated.ndim != 3 or separated.shape[0] < 2:
-                error = RuntimeError("MossFormer2 returned an invalid separation tensor")
-                error.code = "OVERLAP_SEPARATION_INVALID_RESULT"
-                raise error
-            audible = 0
-            for stem in separated[:, 0, :]:
-                rms = float(np.sqrt(np.mean(np.square(stem), dtype=np.float64)))
-                if np.isfinite(rms) and rms >= 0.001:
-                    audible += 1
-            stem_counts.append(audible)
-            processed += 1
-        return {
-            "state": "completed" if processed == len(windows) else "partial",
-            "processed": processed,
-            "total": len(windows),
-            "stemCounts": stem_counts,
-        }
+        return separator.request("separate", {"audioPath": str(audio_path), "windows": windows})
 
 
 def _cuda_self_test(models: OfflineModels, *, load_primary: bool, load_separator: bool) -> dict[str, Any]:
@@ -249,32 +287,36 @@ def _serve(model_root: Path) -> int:
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     models = OfflineModels(model_root)
-    for raw_line in sys.stdin:
-        try:
-            request = json.loads(raw_line)
-            request_id = str(request.get("id", ""))[:128]
-            command = request.get("command")
-            if not request_id:
-                raise ValueError("request id is required")
-            if command == "shutdown":
-                _response(request_id, result={"stopped": True})
-                return 0
-            if command == "self_test":
-                _response(
-                    request_id,
-                    result=_cuda_self_test(
-                        models,
-                        load_primary=request.get("loadPrimary") is True,
-                        load_separator=request.get("loadSeparator") is True,
-                    ),
-                )
-                continue
-            if command != "diarize":
-                raise ValueError("unsupported sidecar command")
-            _response(request_id, result=models.diarize(request))
-        except Exception as error:
-            traceback.print_exc(file=sys.stderr)
-            _response(str(locals().get("request_id", "unknown")), error=error)
+    try:
+        for raw_line in sys.stdin:
+            request_id = "unknown"
+            try:
+                request = json.loads(raw_line)
+                request_id = str(request.get("id", ""))[:128]
+                command = request.get("command")
+                if not request_id:
+                    raise ValueError("request id is required")
+                if command == "shutdown":
+                    _response(request_id, result={"stopped": True})
+                    return 0
+                if command == "self_test":
+                    _response(
+                        request_id,
+                        result=_cuda_self_test(
+                            models,
+                            load_primary=request.get("loadPrimary") is True,
+                            load_separator=request.get("loadSeparator") is True,
+                        ),
+                    )
+                    continue
+                if command != "diarize":
+                    raise ValueError("unsupported sidecar command")
+                _response(request_id, result=models.diarize(request))
+            except Exception as error:
+                traceback.print_exc(file=sys.stderr)
+                _response(request_id, error=error)
+    finally:
+        models.close()
     return 0
 
 
@@ -289,11 +331,15 @@ def main() -> int:
         _lower_windows_priority()
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        result = _cuda_self_test(
-            OfflineModels(Path(args.model_root)),
-            load_primary=True,
-            load_separator=args.load_separator,
-        )
+        models = OfflineModels(Path(args.model_root))
+        try:
+            result = _cuda_self_test(
+                models,
+                load_primary=True,
+                load_separator=args.load_separator,
+            )
+        finally:
+            models.close()
         sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
         return 0
     if args.server:

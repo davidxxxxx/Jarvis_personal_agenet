@@ -5,7 +5,7 @@ const { assertNonSystemDrive } = require("./SpeakerModelManifest");
 const { HYBRID_DIARIZATION_POLICY } = require("./HybridDiarizationPolicy");
 
 const MODEL_PACK_SCHEMA_VERSION = 1;
-const MODEL_PACK_VERSION = "jarvis-ai-model-pack-2026.07.1";
+const MODEL_PACK_VERSION = "jarvis-ai-model-pack-2026.07.2";
 const MANIFEST_FILE = "manifest.json";
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -33,6 +33,22 @@ const REQUIRED_COMPONENTS = Object.freeze([
     id: "jarvis-diarization-sidecar",
     license: "MIT",
     requiredPath: "runtime/jarvis_diarization_sidecar.py",
+  }),
+  Object.freeze({
+    id: "jarvis-overlap-separator",
+    license: "MIT",
+    requiredPath: "runtime/jarvis_overlap_separator.py",
+  }),
+  Object.freeze({
+    id: "modelscope/ClearerVoice-Studio",
+    license: "Apache-2.0",
+    revision: "a170d81ae1372201d8ad14f1cb80bb95e5e7e65b",
+    requiredPath: "vendor/clearervoice-studio/clearvoice/__init__.py",
+  }),
+  Object.freeze({
+    id: "modelscope/ClearerVoice-Studio-license",
+    license: "Apache-2.0",
+    requiredPath: "vendor/clearervoice-studio/LICENSE",
   }),
   Object.freeze({
     id: "iic/speech_campplus_sv_zh-cn_16k-common",

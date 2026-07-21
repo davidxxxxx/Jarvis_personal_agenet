@@ -1,4 +1,6 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
 const test = require("node:test");
 const DiarizationSidecarClient = require("../../src/jarvis/main/DiarizationSidecarClient");
 const HybridDiarizationManager = require("../../src/jarvis/main/HybridDiarizationManager");
@@ -27,6 +29,31 @@ test("sidecar client initializes its EventEmitter base before storing runtime st
   });
   assert.equal(client.listenerCount("error"), 0);
   assert.equal(client.packRoot, "G:\\JarvisData\\models\\ai-model-pack");
+});
+
+test("sidecar keeps System32 available for the pinned NVIDIA probe without inheriting PATH", async () => {
+  let spawnOptions = null;
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: () => true,
+    pid: 1234,
+  });
+  const client = new DiarizationSidecarClient({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    spawnImpl: (_executable, _arguments, options) => {
+      spawnOptions = options;
+      return child;
+    },
+  });
+  await client.start();
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (systemRoot) {
+    assert.ok(spawnOptions.env.PATH.includes(`${systemRoot}\\System32`));
+  }
+  assert.notEqual(spawnOptions.env.PATH, process.env.PATH);
+  await client.stop();
 });
 
 test("hybrid manager exposes consensus and sends only final work through CUDA", async () => {

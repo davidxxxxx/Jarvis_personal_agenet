@@ -17,12 +17,15 @@ async function buildFixture(root) {
   const runtime = path.join(root, "python");
   const pyannote = path.join(root, "pyannote");
   const smallModels = path.join(root, "small-models");
+  const clearerVoice = path.join(root, "clearervoice-studio");
   write(path.join(runtime, "python.exe"));
   write(path.join(pyannote, "config.yaml"));
   write(path.join(smallModels, "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx"));
   write(path.join(smallModels, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "silero_vad.onnx"));
+  write(path.join(clearerVoice, "clearvoice", "__init__.py"));
+  write(path.join(clearerVoice, "LICENSE"));
   const mossformer = path.join(root, "MossFormer2_SS_16K");
   write(path.join(mossformer, "last_best_checkpoint"), "model.pt\n");
   write(path.join(mossformer, "model.pt"));
@@ -33,6 +36,7 @@ async function buildFixture(root) {
       pythonRuntime: runtime,
       pyannoteDir: pyannote,
       mossformerDir: mossformer,
+      clearerVoiceDir: clearerVoice,
       diarizationModelsDir: smallModels,
     },
     { systemDrive: "C:" }

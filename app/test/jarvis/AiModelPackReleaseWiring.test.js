@@ -38,3 +38,18 @@ test("release preparation keeps staging off C and performs an offline CUDA model
   assert.match(script, /HF_HUB_OFFLINE/u);
   assert.match(script, /TRANSFORMERS_OFFLINE/u);
 });
+
+test("offline dependency lock vendors ClearerVoice source without its conflicting PyPI metadata", () => {
+  const requirements = read("resources/ai-model-pack/requirements.lock.txt");
+  assert.match(requirements, /^numpy==2\.3\.5$/mu);
+  assert.match(requirements, /^soundfile==0\.12\.1$/mu);
+  assert.doesNotMatch(requirements, /^clearvoice(?:==|[<>])/mu);
+
+  const builder = read("scripts/build-ai-model-pack.js");
+  assert.match(builder, /clearer-voice-dir/u);
+  assert.match(builder, /vendor["'], ["']clearervoice-studio/u);
+
+  const worker = read("resources/ai-model-pack/runtime/jarvis_overlap_separator.py");
+  assert.match(worker, /vendor" \/ "clearervoice-studio/u);
+  assert.match(worker, /from clearvoice import ClearVoice/u);
+});

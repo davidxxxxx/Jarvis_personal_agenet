@@ -12,6 +12,9 @@ never passed to the pack builder or included in the output.
 
 Use `scripts/prepare-ai-model-pack.ps1` with a self-contained Python 3.11 x64 runtime, the pinned
 Community-1 snapshot, the complete `alibabasglab/MossFormer2_SS_16K` snapshot directory, and the
-downloaded sherpa/CAM++/ERes2NetV2/Silero directory. The script stages and caches only on G:, pins
-the CUDA runtime dependencies, builds a per-file SHA-256 manifest, and performs a real CUDA,
-pyannote, and MossFormer load test before the application is packaged.
+downloaded sherpa/CAM++/ERes2NetV2/Silero directory. It also requires the official
+ClearerVoice-Studio v0.1.2 inference source at revision
+`a170d81ae1372201d8ad14f1cb80bb95e5e7e65b`. Jarvis vendors that source rather than installing
+the PyPI wrapper, whose NumPy constraint conflicts with pyannote 4. The script stages and caches
+only on G:, pins the CUDA runtime dependencies, builds a per-file SHA-256 manifest, and performs
+a real CUDA, pyannote, and MossFormer load test before the application is packaged.

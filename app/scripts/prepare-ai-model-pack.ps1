@@ -9,6 +9,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$MossFormerDirectory,
 
+  [Parameter(Mandatory = $true)]
+  [string]$ClearerVoiceDirectory,
+
   [string]$DiarizationModelsDirectory,
   [string]$OutputDirectory,
   [switch]$SkipDependencyInstall,
@@ -58,6 +61,7 @@ function Invoke-Checked([string]$Command, [string[]]$Arguments) {
 $pythonSource = Resolve-RequiredPath $PythonRuntime "Python runtime" -Directory
 $pyannoteSource = Resolve-RequiredPath $PyannoteDirectory "pyannote Community-1" -Directory
 $mossFormerSource = Resolve-RequiredPath $MossFormerDirectory "MossFormer2" -Directory
+$clearerVoiceSource = Resolve-RequiredPath $ClearerVoiceDirectory "ClearerVoice-Studio" -Directory
 $diarizationSource = Resolve-RequiredPath $DiarizationModelsDirectory "Diarization models" -Directory
 $safeOutput = Assert-NonSystemDestination $OutputDirectory "Model pack"
 $safeTemp = Assert-NonSystemDestination $workspaceTemp "Temporary workspace"
@@ -105,6 +109,7 @@ try {
     "--python-runtime", $stagedRuntime,
     "--pyannote-dir", $pyannoteSource,
     "--mossformer-dir", $mossFormerSource,
+    "--clearer-voice-dir", $clearerVoiceSource,
     "--diarization-models-dir", $diarizationSource
   )
 

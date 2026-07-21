@@ -17,6 +17,13 @@ const SIDECAR_SOURCE = path.join(
   "runtime",
   "jarvis_diarization_sidecar.py"
 );
+const OVERLAP_SIDECAR_SOURCE = path.join(
+  APP_ROOT,
+  "resources",
+  "ai-model-pack",
+  "runtime",
+  "jarvis_overlap_separator.py"
+);
 const NOTICES_SOURCE = path.join(APP_ROOT, "resources", "ai-model-pack", "THIRD_PARTY_NOTICES.txt");
 const OMITTED_SOURCE_DIRECTORIES = new Set([".cache", ".git", ".pytest_cache", "__pycache__"]);
 
@@ -29,7 +36,13 @@ function parseArgs(argv) {
     }
     values.set(key.slice(2), argv[++index]);
   }
-  const required = ["python-runtime", "pyannote-dir", "mossformer-dir", "diarization-models-dir"];
+  const required = [
+    "python-runtime",
+    "pyannote-dir",
+    "mossformer-dir",
+    "clearer-voice-dir",
+    "diarization-models-dir",
+  ];
   for (const key of required) {
     if (!values.has(key)) throw new TypeError(`--${key} is required`);
   }
@@ -125,6 +138,10 @@ async function buildAiModelPack(input, { now = () => new Date(), systemDrive } =
     await fs.promises.mkdir(staging, { recursive: false });
     await copyDirectory(path.resolve(input.pythonRuntime), path.join(staging, "runtime"));
     await copyFile(SIDECAR_SOURCE, path.join(staging, "runtime", "jarvis_diarization_sidecar.py"));
+    await copyFile(
+      OVERLAP_SIDECAR_SOURCE,
+      path.join(staging, "runtime", "jarvis_overlap_separator.py")
+    );
     await copyDirectory(
       path.resolve(input.pyannoteDir),
       path.join(staging, "models", "pyannote-community-1")
@@ -136,6 +153,10 @@ async function buildAiModelPack(input, { now = () => new Date(), systemDrive } =
     await copyDirectory(
       path.resolve(input.mossformerDir),
       path.join(staging, "checkpoints", "MossFormer2_SS_16K")
+    );
+    await copyDirectory(
+      path.resolve(input.clearerVoiceDir),
+      path.join(staging, "vendor", "clearervoice-studio")
     );
     await copyFile(NOTICES_SOURCE, path.join(staging, "THIRD_PARTY_NOTICES.txt"));
     const files = [];
@@ -196,6 +217,7 @@ async function main() {
     pythonRuntime: args["python-runtime"],
     pyannoteDir: args["pyannote-dir"],
     mossformerDir: args["mossformer-dir"],
+    clearerVoiceDir: args["clearer-voice-dir"],
     diarizationModelsDir: args["diarization-models-dir"],
   });
   process.stdout.write(`Jarvis AI Model Pack ready: ${result.output}\n`);

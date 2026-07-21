@@ -58,6 +58,12 @@ class DiarizationSidecarClient extends EventEmitter {
   async start() {
     if (this.child) return this;
     const paths = this._runtimePaths();
+    const systemRoot = process.env.SystemRoot || process.env.WINDIR || "";
+    const runtimePath = [
+      path.dirname(paths.python),
+      path.join(this.packRoot, "runtime", "Library", "bin"),
+      ...(systemRoot ? [path.join(systemRoot, "System32")] : []),
+    ].join(path.delimiter);
     this.stopping = false;
     const child = this.spawn(
       paths.python,
@@ -70,7 +76,7 @@ class DiarizationSidecarClient extends EventEmitter {
         env: {
           SystemRoot: process.env.SystemRoot,
           WINDIR: process.env.WINDIR,
-          PATH: `${path.dirname(paths.python)};${path.join(this.packRoot, "runtime", "Library", "bin")}`,
+          PATH: runtimePath,
           PYTHONNOUSERSITE: "1",
           PYTHONUTF8: "1",
           HF_HUB_OFFLINE: "1",

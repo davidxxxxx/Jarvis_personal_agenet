@@ -18,6 +18,7 @@ test("model pack builder creates one verified offline component tree", async (t)
   const runtime = path.join(root, "python");
   const pyannote = path.join(root, "pyannote");
   const smallModels = path.join(root, "small-models");
+  const clearerVoice = path.join(root, "clearervoice-studio");
   write(path.join(runtime, "python.exe"));
   write(path.join(runtime, "__pycache__", "ignored.pyc"));
   write(path.join(pyannote, "config.yaml"));
@@ -27,6 +28,8 @@ test("model pack builder creates one verified offline component tree", async (t)
   write(path.join(smallModels, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "silero_vad.onnx"));
+  write(path.join(clearerVoice, "clearvoice", "__init__.py"));
+  write(path.join(clearerVoice, "LICENSE"));
   const mossformer = path.join(root, "MossFormer2_SS_16K");
   write(path.join(mossformer, "last_best_checkpoint"), "model.pt\n");
   write(path.join(mossformer, "model.pt"));
@@ -37,6 +40,7 @@ test("model pack builder creates one verified offline component tree", async (t)
       pythonRuntime: runtime,
       pyannoteDir: pyannote,
       mossformerDir: mossformer,
+      clearerVoiceDir: clearerVoice,
       diarizationModelsDir: smallModels,
     },
     { now: () => new Date("2026-07-21T00:00:00.000Z"), systemDrive: "C:" }
@@ -45,6 +49,10 @@ test("model pack builder creates one verified offline component tree", async (t)
   const verified = await verifyAiModelPack({ root: output });
   assert.equal(verified.manifest.createdAt, "2026-07-21T00:00:00.000Z");
   assert.ok(fs.existsSync(path.join(output, "runtime", "jarvis_diarization_sidecar.py")));
+  assert.ok(fs.existsSync(path.join(output, "runtime", "jarvis_overlap_separator.py")));
+  assert.ok(
+    fs.existsSync(path.join(output, "vendor", "clearervoice-studio", "clearvoice", "__init__.py"))
+  );
   assert.ok(fs.existsSync(path.join(output, "THIRD_PARTY_NOTICES.txt")));
   assert.equal(fs.existsSync(path.join(output, "runtime", "__pycache__")), false);
   assert.equal(fs.existsSync(path.join(output, "models", "pyannote-community-1", ".cache")), false);
@@ -59,6 +67,7 @@ test("model pack builder rejects a MossFormer pointer without its referenced wei
   const runtime = path.join(root, "python");
   const pyannote = path.join(root, "pyannote");
   const smallModels = path.join(root, "small-models");
+  const clearerVoice = path.join(root, "clearervoice-studio");
   const mossformer = path.join(root, "MossFormer2_SS_16K");
   write(path.join(runtime, "python.exe"));
   write(path.join(pyannote, "config.yaml"));
@@ -66,6 +75,8 @@ test("model pack builder rejects a MossFormer pointer without its referenced wei
   write(path.join(smallModels, "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx"));
   write(path.join(smallModels, "silero_vad.onnx"));
+  write(path.join(clearerVoice, "clearvoice", "__init__.py"));
+  write(path.join(clearerVoice, "LICENSE"));
   write(path.join(mossformer, "last_best_checkpoint"), "missing.pt\n");
 
   await assert.rejects(
@@ -75,6 +86,7 @@ test("model pack builder rejects a MossFormer pointer without its referenced wei
         pythonRuntime: runtime,
         pyannoteDir: pyannote,
         mossformerDir: mossformer,
+        clearerVoiceDir: clearerVoice,
         diarizationModelsDir: smallModels,
       },
       { systemDrive: "C:" }

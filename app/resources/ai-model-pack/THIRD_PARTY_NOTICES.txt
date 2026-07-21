@@ -21,6 +21,7 @@ CAM++ and ERes2NetV2 speaker models
 
 ClearerVoice-Studio and MossFormer2_SS_16K
   Source: https://github.com/modelscope/ClearerVoice-Studio
+  Source revision: a170d81ae1372201d8ad14f1cb80bb95e5e7e65b
   Model revision: 407cb030cd66340918ebb6c8cc63b18f8592cdbe
   License: Apache-2.0
 
