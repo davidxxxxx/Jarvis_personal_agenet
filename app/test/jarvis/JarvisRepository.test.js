@@ -342,6 +342,26 @@ test("session timeline exposes distinct application tracks and conservative fall
     endedAt: 2_500,
     reason: "application_process_restarted",
   });
+  repo.db
+    .prepare(
+      `INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, source_type, result_kind
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      "kook-segment",
+      "application-session",
+      1_200,
+      1_600,
+      "说话人 1",
+      "来自 KOOK 的文字",
+      0.9,
+      1,
+      "track-kook",
+      "system",
+      "provisional"
+    );
 
   const timeline = repo.getSessionTimeline("application-session");
   assert.deepEqual(
@@ -366,6 +386,32 @@ test("session timeline exposes distinct application tracks and conservative fall
   );
   assert.equal(repo.getSessionApplicationTrack("application-session", "chrome").id, "track-chrome");
   assert.equal(repo.getSessionApplicationTrack("application-session", "dota2"), null);
+  assert.deepEqual(
+    timeline.segments.map((segment) => [segment.id, segment.application_display_name]),
+    [["kook-segment", "KOOK"]]
+  );
+
+  const paged = repo.getSessionTimeline("application-session", {
+    trackOffset: 1,
+    trackLimit: 2,
+    intervalOffset: 1,
+    intervalLimit: 1,
+  });
+  assert.deepEqual(
+    paged.tracks.map((track) => track.id),
+    ["track-chrome", "track-kook"]
+  );
+  assert.deepEqual(
+    paged.application_audio_intervals.map((interval) => interval.id),
+    ["chrome-fallback"]
+  );
+  assert.deepEqual(paged.evidence_page, {
+    tracks: { total: 4, offset: 1, limit: 2 },
+    intervals: { total: 2, offset: 1, limit: 1 },
+  });
+  assert.equal(paged.application_capture.exact_duration_ms, 950);
+  assert.equal(paged.application_capture.fallback_duration_ms, 500);
+  assert.equal(paged.application_capture.degraded_interval_count, 1);
 });
 
 test("system-only session persistence cannot retain a microphone device id", (t) => {

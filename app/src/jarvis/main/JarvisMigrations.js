@@ -1,6 +1,7 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 36;
+const TARGET_VERSION = 37;
+const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PHASE2_INTELLIGENCE_SCHEMA = `
@@ -239,6 +240,10 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_application_time
     ON application_audio_intervals(application_key, started_at, id)
     WHERE application_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_recovery
+    ON application_audio_intervals(
+      session_id, capture_generation, ended_at, attribution_state
+    );
 
   CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_insert
   BEFORE INSERT ON application_audio_intervals
@@ -5846,10 +5851,7 @@ const ANALYSIS_BUDGET_MODES_V31_SCHEMA = `
 `;
 
 function upgradeAnalysisBudgetModesV31(db) {
-  for (const table of [
-    "analysis_budget_policy_revisions",
-    "analysis_budget_periods",
-  ]) {
+  for (const table of ["analysis_budget_policy_revisions", "analysis_budget_periods"]) {
     if (!tableExists(db, table)) throw new Error(`v31 analysis budget modes require ${table}`);
   }
   const hasPolicyModes = tableExists(db, "analysis_budget_policy_modes");
@@ -5973,9 +5975,7 @@ function upgradeApplicationAudioTracksV32(db) {
       })) {
       db.exec(object.sql);
     }
-    for (const object of dependentSchemaObjects.filter(
-      (candidate) => candidate.type === "index"
-    )) {
+    for (const object of dependentSchemaObjects.filter((candidate) => candidate.type === "index")) {
       db.exec(object.sql);
     }
   } catch (error) {
@@ -6357,6 +6357,73 @@ function upgradeHybridDiarizationV36(db) {
   db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
 }
 
+function upgradeSpeakerSchedulingV37(db, migratedAt) {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_recovery
+      ON application_audio_intervals(
+        session_id, capture_generation, ended_at, attribution_state
+      );
+  `);
+
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 35
+      WHEN 'system_mix' THEN 36
+      ELSE 40
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -6386,8 +6453,7 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     fromVersion < 35 &&
     tableExists(db, "speaker_diarization_run_clusters") &&
     tableExists(db, "speaker_turns");
-  const rebuildsHybridDiarization =
-    fromVersion < 36 && tableExists(db, "speaker_diarization_runs");
+  const rebuildsHybridDiarization = fromVersion < 36 && tableExists(db, "speaker_diarization_runs");
   const rebuildsReferencedSchema =
     rebuildsTranscriptSegments ||
     rebuildsApplicationAudioTracks ||
@@ -6664,6 +6730,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 36) {
         upgradeHybridDiarizationV36(db);
       }
+      if (fromVersion < 37) {
+        upgradeSpeakerSchedulingV37(db, migratedAt);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -6699,5 +6768,6 @@ module.exports = {
   PHASE2_INTELLIGENCE_SCHEMA,
   upgradePhase2IntelligenceV34,
   upgradeEncryptedDiarizationEvidenceV35,
+  upgradeSpeakerSchedulingV37,
   upgradeHybridDiarizationV36,
 };

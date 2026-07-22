@@ -244,6 +244,9 @@ export interface JarvisTranscriptSegment {
   superseded_by?: string | null;
   echo_score?: number | null;
   duplicate_of?: string | null;
+  application_key?: string | null;
+  application_display_name?: string | null;
+  track_kind?: "mic" | "system_mix" | "application" | null;
 }
 
 export interface JarvisRenamePersonInput {
@@ -392,6 +395,7 @@ export interface JarvisAudioTrack {
   started_at: number;
   ended_at: number | null;
   state: string;
+  failure_code?: string | null;
   gaps: JarvisAudioGap[];
 }
 
@@ -406,6 +410,7 @@ export interface JarvisApplicationAudioInterval {
   started_at: number;
   ended_at: number | null;
   reason: string | null;
+  failure_code?: string | null;
 }
 
 export interface JarvisProcessingJobCounts {
@@ -507,12 +512,28 @@ export interface JarvisSessionTimeline {
     exact_coverage_pct: number | null;
     degraded_intervals: JarvisApplicationAudioInterval[];
     recovery_points: number[];
+    degraded_interval_count?: number;
+    recovery_count?: number;
   };
+  evidence_page?: {
+    tracks: { offset: number; limit: number; total: number };
+    intervals: { offset: number; limit: number; total: number };
+  } | null;
   gaps: JarvisAudioGap[];
   chunks: JarvisAudioChunk[];
   segments: JarvisTranscriptSegment[];
   processing_counts: JarvisProcessingJobCounts;
   preview_status?: JarvisPreviewStatus | null;
+}
+
+export interface JarvisSessionTimelineStatus {
+  session_id: string;
+  status: JarvisSessionStatus;
+  processing_state: "pending" | "processing" | "ready";
+  timeline_version: number;
+  finalized_at: number | null;
+  ready_at: number | null;
+  processing_counts: JarvisProcessingJobCounts;
 }
 
 export interface JarvisSessionSummary {

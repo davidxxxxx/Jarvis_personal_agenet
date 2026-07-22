@@ -155,7 +155,7 @@ describe("MemoryView processing timeline", () => {
     setIntervalSpy = vi
       .spyOn(window, "setInterval")
       .mockImplementation((callback, delay, ...args) => {
-        if (delay === 2_500) {
+        if (delay === 5_000) {
           poll = callback as () => void;
           return timelinePollHandle;
         }
@@ -213,7 +213,7 @@ describe("MemoryView processing timeline", () => {
 
     expect(await screen.findByText("正在处理")).toBeInTheDocument();
     expect(getSessionTimeline).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 2_500));
+    await waitFor(() => expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 5_000));
 
     const unrelatedTimer = window.setInterval(() => undefined, 50);
 
@@ -231,6 +231,52 @@ describe("MemoryView processing timeline", () => {
     await waitFor(() => expect(clearIntervalSpy).toHaveBeenCalledWith(timelinePollHandle));
     act(() => poll?.());
     expect(getSessionTimeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("polls compact session status without reloading the paged timeline", async () => {
+    const getSessionTimeline = vi.fn(async () => timeline);
+    const getSessionTimelineStatus = vi.fn(async () => ({
+      session_id: session.id,
+      status: session.status,
+      processing_state: "processing" as const,
+      timeline_version: 2,
+      finalized_at: 2_000,
+      ready_at: null,
+      processing_counts: {
+        pending: 0,
+        leased: 0,
+        retry: 1,
+        blocked: 0,
+        completed: 0,
+        total: 1,
+      },
+    }));
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => detailFor(session)),
+          getSessionTimeline,
+          getSessionTimelineStatus,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("正在处理")).toBeInTheDocument();
+    await waitFor(() => expect(poll).not.toBeNull());
+
+    await act(async () => {
+      poll?.();
+      await Promise.resolve();
+    });
+
+    expect(getSessionTimelineStatus).toHaveBeenCalledTimes(1);
+    expect(getSessionTimeline).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/等待重试 1/)).toBeInTheDocument();
   });
 
   it("contains a failed refresh and allows the next poll to retry", async () => {
@@ -568,6 +614,123 @@ describe("MemoryView processing timeline", () => {
     expect(
       screen.queryByRole("heading", { name: new Date(session.started_at).toLocaleString("zh-CN") })
     ).not.toBeInTheDocument();
+  });
+
+  it("ignores a late source-page response after opening another session", async () => {
+    const sessionB: JarvisSession = {
+      ...session,
+      id: "session-2",
+      started_at: 2_000_000,
+      ended_at: 2_001_000,
+    };
+    const pageA = deferred<JarvisSessionTimeline>();
+    const timelineA: JarvisSessionTimeline = {
+      ...timeline,
+      tracks: [
+        {
+          id: "track-a",
+          session_id: session.id,
+          source_type: "system",
+          track_kind: "application",
+          application_key: "chrome",
+          application_display_name: "会话 A 音轨",
+          attribution_state: "exact",
+          capture_generation: 1,
+          sample_rate: 24_000,
+          channels: 1,
+          started_at: session.started_at,
+          ended_at: session.ended_at,
+          state: "ended",
+          gaps: [],
+        },
+      ],
+      evidence_page: {
+        tracks: { total: 2, offset: 0, limit: 1 },
+        intervals: { total: 0, offset: 0, limit: 200 },
+      },
+    };
+    const timelineB: JarvisSessionTimeline = {
+      ...timeline,
+      session_id: sessionB.id,
+      started_at: sessionB.started_at,
+      ended_at: sessionB.ended_at,
+      tracks: [
+        {
+          ...timelineA.tracks[0],
+          id: "track-b",
+          session_id: sessionB.id,
+          application_key: "kook",
+          application_display_name: "会话 B 音轨",
+          started_at: sessionB.started_at,
+          ended_at: sessionB.ended_at,
+        },
+      ],
+      evidence_page: {
+        tracks: { total: 1, offset: 0, limit: 1 },
+        intervals: { total: 0, offset: 0, limit: 200 },
+      },
+    };
+    const stalePageA: JarvisSessionTimeline = {
+      ...timelineA,
+      tracks: [
+        {
+          ...timelineA.tracks[0],
+          id: "track-a-stale",
+          application_display_name: "过期的 A 音轨",
+        },
+      ],
+      evidence_page: {
+        tracks: { total: 2, offset: 1, limit: 1 },
+        intervals: { total: 0, offset: 0, limit: 200 },
+      },
+    };
+    const getSessionTimeline = vi.fn((sessionId: string, page?: { trackOffset?: number }) => {
+      if (sessionId === session.id && page) return pageA.promise;
+      return Promise.resolve(sessionId === session.id ? timelineA : timelineB);
+    });
+    useJarvisStore.setState({ sessions: [session, sessionB] });
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async (sessionId: string) =>
+            detailFor(sessionId === session.id ? session : sessionB)
+          ),
+          getSessionTimeline,
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    let recordingButtons = screen
+      .getAllByRole("button")
+      .filter((button) => button.textContent?.includes("的录音"));
+    fireEvent.click(recordingButtons[0]);
+    expect(await screen.findByText("会话 A 音轨")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await waitFor(() =>
+      expect(getSessionTimeline).toHaveBeenCalledWith(
+        session.id,
+        expect.objectContaining({ trackOffset: 1 })
+      )
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "返回记忆库" }));
+    recordingButtons = screen
+      .getAllByRole("button")
+      .filter((button) => button.textContent?.includes("的录音"));
+    fireEvent.click(recordingButtons[1]);
+    expect(await screen.findByText("会话 B 音轨")).toBeInTheDocument();
+
+    await act(async () => {
+      pageA.resolve(stalePageA);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("会话 B 音轨")).toBeInTheDocument();
+    expect(screen.queryByText("过期的 A 音轨")).not.toBeInTheDocument();
   });
 
   it("polls hidden runtime status at no more than 2 Hz and never overlaps IPC", async () => {

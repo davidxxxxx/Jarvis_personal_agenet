@@ -26,10 +26,7 @@ const {
   assertExactIdentityResolutionPolicy,
   buildIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
-const {
-  SPEAKER_MODEL_KEYS,
-  getSpeakerModelManifest,
-} = require("./SpeakerModelManifest");
+const { SPEAKER_MODEL_KEYS, getSpeakerModelManifest } = require("./SpeakerModelManifest");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -42,6 +39,12 @@ const TRANSCRIPT_PROMPT_CODE_POINT_LIMIT = 1_024;
 const TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT = 800;
 const STABLE_CLUSTER_REUSE_THRESHOLD = 0.82;
 const STABLE_CLUSTER_REUSE_MARGIN = 0.05;
+const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
+const DIARIZATION_PRIORITY = Object.freeze({
+  mic: 35,
+  system_mix: 36,
+  application: 40,
+});
 const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   recording: "active",
   finalizing: "active",
@@ -56,10 +59,7 @@ const DUAL_SPEAKER_MANIFESTS = Object.freeze([
 ]);
 const IDENTITY_PROFILE_DIMENSIONS = new Map([
   [SPEAKER_IDENTITY_RESOLUTION_POLICY.modelId, 512],
-  ...DUAL_SPEAKER_MANIFESTS.map((manifest) => [
-    manifest.modelId,
-    manifest.embeddingDimension,
-  ]),
+  ...DUAL_SPEAKER_MANIFESTS.map((manifest) => [manifest.modelId, manifest.embeddingDimension]),
 ]);
 
 function runtimeJobStage({ job_type: jobType, state, priority }) {
@@ -856,6 +856,45 @@ class JarvisRepository {
           )
         ORDER BY track.source_type, track.id
       `),
+      listSessionIdentityResolutionTracks: this.db.prepare(`
+        SELECT track.*
+        FROM audio_tracks AS track
+        WHERE track.session_id = ?
+          AND (
+            (
+              track.track_kind IN ('mic','system_mix')
+              AND (
+                EXISTS (
+                  SELECT 1 FROM processing_jobs AS job
+                  WHERE job.session_id = track.session_id
+                    AND job.track_id = track.id
+                    AND job.job_type = 'diarize_track'
+                    AND job.state <> 'superseded'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM speaker_diarization_runs AS run
+                  WHERE run.session_id = track.session_id
+                    AND run.track_id = track.id
+                )
+              )
+            )
+            OR (
+              track.track_kind = 'application'
+              AND EXISTS (
+                SELECT 1 FROM processing_jobs AS job
+                WHERE job.session_id = track.session_id
+                  AND job.track_id = track.id
+                  AND job.job_type = 'diarize_track'
+                  AND job.state = 'completed'
+              )
+            )
+          )
+        ORDER BY CASE track.track_kind
+          WHEN 'mic' THEN 0
+          WHEN 'system_mix' THEN 1
+          ELSE 2
+        END, track.id
+      `),
       listSessionReadinessChunks: this.db.prepare(`
         SELECT * FROM audio_chunks
         WHERE session_id = ? AND write_state = 'committed' AND deleted_at IS NULL
@@ -1015,7 +1054,7 @@ class JarvisRepository {
           id, session_id, track_id, chunk_id, job_type, state, priority,
           input_hash, input_version, model_version, created_at
         ) VALUES (
-          @id, @sessionId, @trackId, NULL, 'diarize_track', 'pending', 40,
+          @id, @sessionId, @trackId, NULL, 'diarize_track', 'pending', @priority,
           @inputHash, @inputVersion, @modelVersion, @createdAt
         )
       `),
@@ -1330,9 +1369,14 @@ class JarvisRepository {
           AND transcript_segments.superseded_by IS NULL
       `),
       listSegments: this.db.prepare(`
-        SELECT * FROM transcript_segments
-        WHERE session_id = ? AND superseded_by IS NULL AND duplicate_of IS NULL
-        ORDER BY started_at ASC, id ASC
+        SELECT segment.*, track.application_key, track.application_display_name,
+               track.track_kind
+        FROM transcript_segments AS segment
+        LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+        WHERE segment.session_id = ?
+          AND segment.superseded_by IS NULL
+          AND segment.duplicate_of IS NULL
+        ORDER BY segment.started_at ASC, segment.id ASC
       `),
       listTranscriptHistory: this.db.prepare(`
         SELECT * FROM transcript_segments
@@ -1495,17 +1539,49 @@ class JarvisRepository {
       `),
       listSessionTimelineTracks: this.db.prepare(`
         SELECT * FROM audio_tracks
-        WHERE session_id = ?
+        WHERE session_id = @sessionId
         ORDER BY CASE track_kind
           WHEN 'mic' THEN 0
           WHEN 'application' THEN 1
           ELSE 2
         END, application_key ASC, started_at ASC, id ASC
+        LIMIT @limit OFFSET @offset
+      `),
+      countSessionTimelineTracks: this.db.prepare(`
+        SELECT count(*) AS count FROM audio_tracks WHERE session_id = ?
       `),
       listSessionApplicationAudioIntervals: this.db.prepare(`
         SELECT * FROM application_audio_intervals
-        WHERE session_id = ?
+        WHERE session_id = @sessionId
         ORDER BY started_at ASC, id ASC
+        LIMIT @limit OFFSET @offset
+      `),
+      countSessionApplicationAudioIntervals: this.db.prepare(`
+        SELECT count(*) AS count FROM application_audio_intervals WHERE session_id = ?
+      `),
+      summarizeSessionApplicationAudio: this.db.prepare(`
+        SELECT
+          COALESCE(SUM(CASE WHEN attribution_state = 'exact'
+            THEN ended_at - started_at ELSE 0 END), 0) AS exact_duration_ms,
+          COALESCE(SUM(CASE WHEN attribution_state = 'mixed_unknown'
+            THEN ended_at - started_at ELSE 0 END), 0) AS fallback_duration_ms,
+          COALESCE(SUM(CASE WHEN attribution_state = 'mixed_unknown' THEN 1 ELSE 0 END), 0)
+            AS degraded_interval_count
+        FROM application_audio_intervals
+        WHERE session_id = ?
+          AND ended_at IS NOT NULL
+          AND ended_at > started_at
+      `),
+      countSessionApplicationRecoveries: this.db.prepare(`
+        SELECT count(DISTINCT exact.started_at) AS count
+        FROM application_audio_intervals AS exact
+        JOIN application_audio_intervals AS fallback
+          ON fallback.session_id = exact.session_id
+         AND fallback.capture_generation = exact.capture_generation
+         AND fallback.ended_at = exact.started_at
+         AND fallback.attribution_state = 'mixed_unknown'
+        WHERE exact.session_id = ?
+          AND exact.attribution_state = 'exact'
       `),
       getSessionApplicationTrack: this.db.prepare(`
         SELECT * FROM audio_tracks
@@ -2466,10 +2542,7 @@ class JarvisRepository {
           ...turn,
           runId: input.run.id,
           clusterId,
-          embedding: this.speakerIdentityRepository.protectEncodedEmbedding(
-            turn.embedding,
-            512
-          ),
+          embedding: this.speakerIdentityRepository.protectEncodedEmbedding(turn.embedding, 512),
           excludedFromCentroid: turn.excludedFromCentroid ? 1 : 0,
           createdAt: input.run.completedAt,
         });
@@ -2491,10 +2564,8 @@ class JarvisRepository {
       }
       if (input.run.inputVersion === 2 && priorSpeakerEvidence) {
         const hasSummary =
-          this.statements.sessionHasRetainedSummary.get(
-            input.run.sessionId,
-            input.run.sessionId
-          )?.value === 1;
+          this.statements.sessionHasRetainedSummary.get(input.run.sessionId, input.run.sessionId)
+            ?.value === 1;
         if (hasSummary) {
           const changed = priorSpeakerEvidence.speaker_count !== input.clusters.length;
           this.statements.upsertSummaryRefreshState.run({
@@ -2972,6 +3043,14 @@ class JarvisRepository {
           skipped.push({ trackId: track.id, reason: snapshot.reason });
           continue;
         }
+        const audioMs = snapshot.chunks.reduce(
+          (total, entry) => total + (entry.audioChunk?.duration_ms ?? 0),
+          0
+        );
+        if (track.track_kind === "application" && audioMs < MIN_APPLICATION_DIARIZATION_AUDIO_MS) {
+          skipped.push({ trackId: track.id, reason: "speaker_audio_too_short" });
+          continue;
+        }
         const inputHash = buildDiarizationJobKey({
           sessionId: safeSessionId,
           trackId: track.id,
@@ -2988,6 +3067,7 @@ class JarvisRepository {
         const result = this.statements.insertDiarizationJob.run({
           id: derivedId("job_diarize", inputHash),
           ...identity,
+          priority: DIARIZATION_PRIORITY[track.track_kind] ?? DIARIZATION_PRIORITY.application,
           createdAt: safeAt,
         });
         enqueued += result.changes;
@@ -3001,11 +3081,7 @@ class JarvisRepository {
     return { enqueued, jobs, skipped };
   }
 
-  listHistoricalHybridCandidates({
-    at = Date.now(),
-    policy,
-    limit = 25,
-  } = {}) {
+  listHistoricalHybridCandidates({ at = Date.now(), policy, limit = 25 } = {}) {
     const safeAt = assertNonNegativeInteger(at, "at");
     if (!policy || policy.inputVersion !== 2 || typeof policy.policyId !== "string") {
       throw new TypeError("the v2 hybrid diarization policy is required");
@@ -3057,8 +3133,8 @@ class JarvisRepository {
     const row = this.statements.getSessionReprocessingState.get(assertId(sessionId, "sessionId"));
     return Boolean(
       row &&
-        row.mode === "historical_local_only" &&
-        new Set(["queued", "processing"]).has(row.state)
+      row.mode === "historical_local_only" &&
+      new Set(["queued", "processing"]).has(row.state)
     );
   }
 
@@ -3085,18 +3161,22 @@ class JarvisRepository {
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
       return { eligible: false, reason: "session_not_terminal" };
     }
-    const tracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
+    const tracks = this.statements.listSessionIdentityResolutionTracks.all(safeSessionId);
     if (tracks.length === 0) return { eligible: false, reason: "no_tracks" };
     const evidenceRuns = [];
     const clusters = [];
     for (const track of tracks) {
+      const primaryTrack = track.track_kind === "mic" || track.track_kind === "system_mix";
       const run = this.statements.getLatestIdentityDiarizationRun.get({
         sessionId: safeSessionId,
         trackId: track.id,
         policyId: diarizationPolicy.policyId,
         modelId: policy.modelId,
       });
-      if (!run) return { eligible: false, reason: "diarization_incomplete" };
+      if (!run) {
+        if (primaryTrack) return { eligible: false, reason: "diarization_incomplete" };
+        continue;
+      }
       const inputHash = buildDiarizationJobKey({
         sessionId: safeSessionId,
         trackId: track.id,
@@ -3110,8 +3190,9 @@ class JarvisRepository {
         inputVersion: diarizationPolicy.inputVersion,
         modelVersion: diarizationPolicy.policyId,
       });
-      if (!run || !job || job.state !== "completed") {
-        return { eligible: false, reason: "diarization_incomplete" };
+      if (!job || job.state !== "completed") {
+        if (primaryTrack) return { eligible: false, reason: "diarization_incomplete" };
+        continue;
       }
       const unfinished = this.statements.listIdentityDiarizationJobs
         .all({ sessionId: safeSessionId, trackId: track.id })
@@ -3119,9 +3200,12 @@ class JarvisRepository {
           (candidate) =>
             candidate.job_sequence > job.job_sequence && candidate.state !== "completed"
         );
-      if (unfinished) return { eligible: false, reason: "diarization_incomplete" };
+      if (unfinished && primaryTrack) {
+        return { eligible: false, reason: "diarization_incomplete" };
+      }
       if (run.embedding_model_id !== policy.modelId) {
-        return { eligible: false, reason: "diarization_model_mismatch" };
+        if (primaryTrack) return { eligible: false, reason: "diarization_model_mismatch" };
+        continue;
       }
       const runClusters = this.statements.listIdentityResolutionRunClusters.all(run.id);
       evidenceRuns.push({
@@ -3162,6 +3246,9 @@ class JarvisRepository {
           qualityScore: cluster.quality_score,
         });
       }
+    }
+    if (evidenceRuns.length === 0) {
+      return { eligible: false, reason: "diarization_incomplete" };
     }
     evidenceRuns.sort((left, right) => left.trackId.localeCompare(right.trackId));
     clusters.sort(
@@ -4445,8 +4532,22 @@ class JarvisRepository {
     };
   }
 
-  getSessionTimeline(id) {
+  getSessionTimeline(id, page = {}) {
     const sessionId = assertId(id, "sessionId");
+    const trackOffset = Number.isSafeInteger(page?.trackOffset) ? page.trackOffset : 0;
+    const trackLimit = Number.isSafeInteger(page?.trackLimit) ? page.trackLimit : 100;
+    const intervalOffset = Number.isSafeInteger(page?.intervalOffset) ? page.intervalOffset : 0;
+    const intervalLimit = Number.isSafeInteger(page?.intervalLimit) ? page.intervalLimit : 200;
+    if (
+      trackOffset < 0 ||
+      intervalOffset < 0 ||
+      trackLimit < 1 ||
+      trackLimit > 200 ||
+      intervalLimit < 1 ||
+      intervalLimit > 500
+    ) {
+      throw new RangeError("session timeline page is outside the supported bounds");
+    }
     const session = this.getSession(sessionId);
     if (!session) return null;
     const gaps = this.statements.listSessionTimelineGaps.all(sessionId);
@@ -4457,8 +4558,18 @@ class JarvisRepository {
       gapsByTrack.set(gap.track_id, trackGaps);
     }
     const tracks = this.statements.listSessionTimelineTracks
-      .all(sessionId)
+      .all({ sessionId, offset: trackOffset, limit: trackLimit })
       .map((track) => ({ ...track, gaps: gapsByTrack.get(track.id) ?? [] }));
+    const trackIds = new Set(tracks.map((track) => track.id));
+    const intervals = this.statements.listSessionApplicationAudioIntervals.all({
+      sessionId,
+      offset: intervalOffset,
+      limit: intervalLimit,
+    });
+    const applicationCapture = this.statements.summarizeSessionApplicationAudio.get(sessionId);
+    const exactDurationMs = Number(applicationCapture?.exact_duration_ms ?? 0);
+    const fallbackDurationMs = Number(applicationCapture?.fallback_duration_ms ?? 0);
+    const captureDurationMs = exactDurationMs + fallbackDurationMs;
     return {
       session_id: session.id,
       started_at: session.started_at,
@@ -4469,11 +4580,51 @@ class JarvisRepository {
       finalized_at: session.finalized_at,
       ready_at: session.ready_at,
       tracks,
-      application_audio_intervals:
-        this.statements.listSessionApplicationAudioIntervals.all(sessionId),
-      gaps,
+      application_audio_intervals: intervals,
+      application_capture: {
+        exact_duration_ms: exactDurationMs,
+        fallback_duration_ms: fallbackDurationMs,
+        exact_coverage_pct:
+          captureDurationMs === 0
+            ? null
+            : Math.round((exactDurationMs * 10_000) / captureDurationMs) / 100,
+        degraded_interval_count: Number(applicationCapture?.degraded_interval_count ?? 0),
+        recovery_count: Number(
+          this.statements.countSessionApplicationRecoveries.get(sessionId)?.count ?? 0
+        ),
+      },
+      evidence_page: {
+        tracks: {
+          offset: trackOffset,
+          limit: trackLimit,
+          total: Number(this.statements.countSessionTimelineTracks.get(sessionId)?.count ?? 0),
+        },
+        intervals: {
+          offset: intervalOffset,
+          limit: intervalLimit,
+          total: Number(
+            this.statements.countSessionApplicationAudioIntervals.get(sessionId)?.count ?? 0
+          ),
+        },
+      },
+      gaps: gaps.filter((gap) => trackIds.has(gap.track_id)),
       chunks: this.statements.listSessionTimelineChunks.all(sessionId).map(toPublicAudioChunk),
       segments: this.listTranscriptSegments(sessionId),
+      processing_counts: this.statements.getSessionProcessingCounts.get(sessionId),
+    };
+  }
+
+  getSessionTimelineStatus(id) {
+    const sessionId = assertId(id, "sessionId");
+    const session = this.getSession(sessionId);
+    if (!session) return null;
+    return {
+      session_id: session.id,
+      status: session.status,
+      processing_state: session.processing_state,
+      timeline_version: session.timeline_version,
+      finalized_at: session.finalized_at,
+      ready_at: session.ready_at,
       processing_counts: this.statements.getSessionProcessingCounts.get(sessionId),
     };
   }

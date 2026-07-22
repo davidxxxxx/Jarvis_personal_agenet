@@ -40,7 +40,10 @@ function createHarness(options = {}) {
       managers.push(manager);
       return manager;
     },
-    onTrackStarted: (event) => events.push({ type: "started", ...event }),
+    onTrackStarted: (event) => {
+      events.push({ type: "started", ...event });
+      if (options.trackStartError) throw options.trackStartError;
+    },
     onTrackEnded: (event) => events.push({ type: "ended", ...event }),
     onAttributionChange: (event) => events.push({ type: "attribution", ...event }),
     onChunk: (event) => events.push({ type: "chunk", ...event }),
@@ -48,6 +51,7 @@ function createHarness(options = {}) {
     clearIntervalImpl: options.clearIntervalImpl ?? (() => {}),
     silenceReleaseMs: options.silenceReleaseMs,
     retryDelayMs: options.retryDelayMs,
+    selectionDebounceMs: options.selectionDebounceMs,
   });
   return {
     pool,
@@ -136,6 +140,69 @@ test("pool starts at most four independent application tracks while watcher rema
   );
 });
 
+test("equal-priority watcher updates keep the original selected tracks sticky", async () => {
+  let at = 10_000;
+  const harness = createHarness({ now: () => (at += 250), selectionDebounceMs: 500 });
+  await harness.pool.start({ configuredLimit: 4 });
+  for (const [key, pid] of [
+    ["alpha", 111],
+    ["bravo", 112],
+    ["charlie", 113],
+    ["delta", 114],
+    ["echo", 115],
+  ]) {
+    await harness.emit(active(key, pid));
+  }
+  for (let index = 0; index < 20; index += 1) {
+    await harness.emit(
+      active(["alpha", "bravo", "charlie", "delta", "echo"][index % 5], 111 + (index % 5))
+    );
+  }
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["alpha", "bravo", "charlie", "delta"]
+  );
+  assert.equal(harness.events.filter((event) => event.type === "started").length, 4);
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "ended" && event.reason === "application_not_selected"
+    ),
+    false
+  );
+});
+
+test("an active application keeps its current PID while that PID remains present", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 301));
+  await harness.emit(active("chrome", 302, { peak: 1 }));
+  await harness.emit(active("chrome", 301, { peak: 0.1 }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [301]
+  );
+});
+
+test("evidence registration failures retain the original bounded error code", async () => {
+  const error = new Error("invalid application interval");
+  error.code = "SQLITE_CONSTRAINT_TRIGGER";
+  const harness = createHarness({ trackStartError: error });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 350));
+  await harness.pool.waitForIdle();
+
+  const ended = harness.events.find(
+    (event) => event.type === "ended" && event.applicationKey === "chrome"
+  );
+  assert.equal(ended.failureCode, "evidence_registration_failed_SQLITE_CONSTRAINT_TRIGGER");
+});
+
 test("fullscreen mode retains only the communication app and foreground game", async () => {
   const harness = createHarness();
   await harness.pool.start({ configuredLimit: 8 });
@@ -176,9 +243,7 @@ test("application PID replacement closes the old generation and starts a new one
   assert.equal(
     harness.events.some(
       (event) =>
-        event.type === "ended" &&
-        event.applicationKey === "chrome" &&
-        event.captureGeneration === 1
+        event.type === "ended" && event.applicationKey === "chrome" && event.captureGeneration === 1
     ),
     true
   );
@@ -192,7 +257,10 @@ test("stop closes all app helpers and the one watcher without touching the mixed
   await harness.pool.stop();
 
   assert.equal(harness.watcher.stopped, 1);
-  assert.equal(harness.managers.every((manager) => manager.stops === 1), true);
+  assert.equal(
+    harness.managers.every((manager) => manager.stops === 1),
+    true
+  );
   assert.deepEqual(harness.pool.getStatus().activeTracks, []);
   assert.equal(
     harness.events.some((event) => event.type === "ended" && event.reason === "pool_stopped"),

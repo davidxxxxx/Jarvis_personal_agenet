@@ -1781,7 +1781,7 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 1_000 });
-    assert.equal(TARGET_VERSION, 36);
+    assert.equal(TARGET_VERSION, 37);
 
     const explain = (sql, ...params) =>
       db

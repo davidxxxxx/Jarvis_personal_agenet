@@ -6,6 +6,7 @@ const { createApplicationAudioStatus } = require("./ApplicationAudioStatus");
 const DEFAULT_SILENCE_RELEASE_MS = 15_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_PREBUFFER_MS = 2_000;
+const DEFAULT_SELECTION_DEBOUNCE_MS = 2_000;
 const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
 const MAX_CANDIDATE_COUNT = 256;
@@ -19,6 +20,13 @@ function safeFailureCode(error, fallback = "application_capture_unavailable") {
   const candidate =
     typeof error?.failureCode === "string" ? error.failureCode : safeReason(error, fallback);
   return /^[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : fallback;
+}
+
+function scopedFailureCode(scope, error) {
+  const detail = safeFailureCode(error, scope);
+  if (detail === scope || detail.startsWith(`${scope}_`)) return detail;
+  const prefix = `${scope}_`;
+  return `${prefix}${detail.slice(0, 128 - prefix.length)}`;
 }
 
 function isAudiblePcm(pcm) {
@@ -40,6 +48,7 @@ class ApplicationAudioCapturePool {
     silenceReleaseMs = DEFAULT_SILENCE_RELEASE_MS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     prebufferMs = DEFAULT_PREBUFFER_MS,
+    selectionDebounceMs = DEFAULT_SELECTION_DEBOUNCE_MS,
     onTrackStarted = () => {},
     onTrackEnded = () => {},
     onAttributionChange = () => {},
@@ -56,6 +65,10 @@ class ApplicationAudioCapturePool {
     this.silenceReleaseMs = Math.max(1_000, silenceReleaseMs ?? DEFAULT_SILENCE_RELEASE_MS);
     this.retryDelayMs = Math.max(250, retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
     this.prebufferMs = Math.max(0, Math.min(10_000, prebufferMs ?? DEFAULT_PREBUFFER_MS));
+    this.selectionDebounceMs = Math.max(
+      0,
+      Math.min(10_000, selectionDebounceMs ?? DEFAULT_SELECTION_DEBOUNCE_MS)
+    );
     this.onTrackStarted = onTrackStarted;
     this.onTrackEnded = onTrackEnded;
     this.onAttributionChange = onAttributionChange;
@@ -180,6 +193,7 @@ class ApplicationAudioCapturePool {
           applicationDisplayName: event.applicationDisplayName,
           pids: new Map(),
           blockedUntil: 0,
+          firstSeenAt: at,
         };
         this.candidates.set(event.applicationKey, candidate);
       }
@@ -263,7 +277,10 @@ class ApplicationAudioCapturePool {
     const result = [];
     for (const candidate of this.candidates.values()) {
       if (candidate.blockedUntil > at || candidate.pids.size === 0) continue;
+      const activePid = this.activeTracks.get(candidate.applicationKey)?.pid;
       const process = [...candidate.pids.values()].sort((left, right) => {
+        if (left.pid === activePid && right.pid !== activePid) return -1;
+        if (right.pid === activePid && left.pid !== activePid) return 1;
         if (right.isForeground !== left.isForeground) return right.isForeground ? 1 : -1;
         if (right.peak !== left.peak) return right.peak - left.peak;
         return right.lastSeenAt - left.lastSeenAt;
@@ -276,6 +293,7 @@ class ApplicationAudioCapturePool {
         peak: process.peak,
         isForeground: process.isForeground,
         lastSeenAt: process.lastSeenAt,
+        firstSeenAt: candidate.firstSeenAt,
       });
     }
     return result;
@@ -283,9 +301,22 @@ class ApplicationAudioCapturePool {
 
   async _reconcile(at) {
     if (!this.running) return;
-    const selected = this.policy.select(this._candidateList(at), {
+    const effectiveLimit = this.policy.resolveLimit({
       configuredLimit: this.configuredLimit,
       fullscreen: this.fullscreen,
+    });
+    const activeApplicationKeys = new Set(this.activeTracks.keys());
+    const poolIsFull = this.activeTracks.size >= effectiveLimit;
+    const candidates = this._candidateList(at).filter(
+      (candidate) =>
+        activeApplicationKeys.has(candidate.applicationKey) ||
+        !poolIsFull ||
+        at - candidate.firstSeenAt >= this.selectionDebounceMs
+    );
+    const selected = this.policy.select(candidates, {
+      configuredLimit: this.configuredLimit,
+      fullscreen: this.fullscreen,
+      activeApplicationKeys,
     });
     const desired = new Map(selected.map((candidate) => [candidate.applicationKey, candidate]));
 
@@ -297,11 +328,7 @@ class ApplicationAudioCapturePool {
           : this.candidates.has(applicationKey)
             ? "application_not_selected"
             : "application_inactive";
-        await this._stopTrack(
-          applicationKey,
-          reason,
-          at
-        );
+        await this._stopTrack(applicationKey, reason, at);
       }
     }
     for (const candidate of selected) {
@@ -416,7 +443,7 @@ class ApplicationAudioCapturePool {
       const retryAt = at + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
-      const failureCode = safeFailureCode(error, "evidence_registration_failed");
+      const failureCode = scopedFailureCode("evidence_registration_failed", error);
       this._setFallback(track, "evidence_registration_failed", retryAt, failureCode);
       try {
         this.onTrackEnded({

@@ -20,6 +20,7 @@ interface ContinuousSessionPlayerProps {
   onSeekResult?: (requestId: number, result: JarvisContinuousSeekResult) => void;
   focusSegmentId?: string | null;
   focusRequestId?: number | null;
+  onTrackPageChange?: (offset: number) => void;
 }
 
 interface SegmentBoundary {
@@ -66,12 +67,14 @@ export default function ContinuousSessionPlayer({
   onSeekResult,
   focusSegmentId = null,
   focusRequestId = null,
+  onTrackPageChange,
 }: ContinuousSessionPlayerProps) {
   const [mode, setMode] = useState<PlaybackMode>("mix");
   const [playing, setPlaying] = useState(false);
   const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
   const [segmentProgress, setSegmentProgress] = useState(0);
   const [warning, setWarning] = useState<string | null>(null);
+  const [visibleSegmentLimit, setVisibleSegmentLimit] = useState(200);
   const clusters = useJarvisStore(
     (state) => state.clustersBySession[timeline.session_id] ?? EMPTY_CLUSTERS
   );
@@ -107,7 +110,7 @@ export default function ContinuousSessionPlayer({
     focusedRequestRef.current = focusRequestId;
     element.scrollIntoView({ block: "center", behavior: "smooth" });
     element.focus({ preventScroll: true });
-  }, [focusRequestId, focusSegmentId, timeline.segments]);
+  }, [focusRequestId, focusSegmentId, timeline.segments, visibleSegmentLimit]);
 
   const releaseAudio = useCallback(() => {
     if (segmentTimerRef.current !== null) {
@@ -135,7 +138,16 @@ export default function ContinuousSessionPlayer({
   useEffect(() => {
     stop();
     setWarning(null);
+    setVisibleSegmentLimit(200);
   }, [mode, stop, timeline.session_id]);
+
+  useEffect(() => {
+    if (!focusSegmentId) return;
+    const index = timeline.segments.findIndex((segment) => segment.id === focusSegmentId);
+    if (index >= visibleSegmentLimit) {
+      setVisibleSegmentLimit(Math.ceil((index + 1) / 200) * 200);
+    }
+  }, [focusSegmentId, timeline.segments, visibleSegmentLimit]);
 
   useEffect(
     () => () => {
@@ -159,6 +171,16 @@ export default function ContinuousSessionPlayer({
       mode === "mix" ? allPlayable : allPlayable.filter((chunk) => chunk.source_type === mode),
     [allPlayable, mode]
   );
+  const intervalFailures = useMemo(() => {
+    const seen = new Set<string>();
+    return timeline.application_audio_intervals.filter((interval) => {
+      if (!interval.failure_code) return false;
+      const key = `${interval.application_key ?? "unknown"}\u0000${interval.failure_code}\u0000${interval.reason ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [timeline.application_audio_intervals]);
 
   const playAt = useCallback(
     async (
@@ -431,9 +453,14 @@ export default function ContinuousSessionPlayer({
                 ) : (
                   <MonitorSpeaker className="size-4" aria-hidden="true" />
                 )}
-                {laneLabel(track.source_type)}
+                {track.application_display_name || laneLabel(track.source_type)}
               </h3>
               <p className="mt-1 text-xs text-muted-foreground">{track.state}</p>
+              {track.failure_code && (
+                <p className="mt-1 break-all text-xs text-amber-700">
+                  原始失败码：{track.failure_code}
+                </p>
+              )}
               <div className="mt-2 space-y-1">
                 {track.gaps.map((gap) => {
                   const missingSeconds =
@@ -454,6 +481,71 @@ export default function ContinuousSessionPlayer({
             </section>
           ))}
         </div>
+        {intervalFailures.length > 0 && (
+          <section
+            data-testid="application-capture-failures"
+            className="border-t border-border/50 p-3"
+          >
+            <h3 className="text-sm font-medium">应用采集降级记录</h3>
+            <div className="mt-2 space-y-2">
+              {intervalFailures.map((interval) => (
+                <p
+                  key={`${interval.id}:${interval.failure_code}`}
+                  className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800"
+                >
+                  系统音频·应用未知 · 原始失败码：
+                  <span className="break-all font-mono">{interval.failure_code}</span>
+                  {interval.reason ? ` · ${interval.reason}` : ""}
+                </p>
+              ))}
+            </div>
+          </section>
+        )}
+        {timeline.evidence_page &&
+          timeline.evidence_page.tracks.total > timeline.evidence_page.tracks.limit && (
+            <div className="flex items-center justify-between gap-3 border-t border-border/50 px-3 py-2 text-xs text-muted-foreground">
+              <span>
+                音轨 {timeline.evidence_page.tracks.offset + 1}–
+                {Math.min(
+                  timeline.evidence_page.tracks.total,
+                  timeline.evidence_page.tracks.offset + timeline.tracks.length
+                )}
+                ，共 {timeline.evidence_page.tracks.total}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={timeline.evidence_page.tracks.offset === 0}
+                  onClick={() =>
+                    onTrackPageChange?.(
+                      Math.max(
+                        0,
+                        timeline.evidence_page!.tracks.offset - timeline.evidence_page!.tracks.limit
+                      )
+                    )
+                  }
+                  className="rounded border border-border px-2 py-1 disabled:opacity-40"
+                >
+                  上一页
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    timeline.evidence_page.tracks.offset + timeline.evidence_page.tracks.limit >=
+                    timeline.evidence_page.tracks.total
+                  }
+                  onClick={() =>
+                    onTrackPageChange?.(
+                      timeline.evidence_page!.tracks.offset + timeline.evidence_page!.tracks.limit
+                    )
+                  }
+                  className="rounded border border-border px-2 py-1 disabled:opacity-40"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          )}
       </details>
 
       <section aria-labelledby="session-transcript-heading">
@@ -475,7 +567,7 @@ export default function ContinuousSessionPlayer({
         </div>
         <div className="mt-3 space-y-2">
           {timeline.segments.length ? (
-            timeline.segments.map((segment) => {
+            timeline.segments.slice(0, visibleSegmentLimit).map((segment) => {
               const isActive = activeSegmentId === segment.id && playing;
               const isFocused = segment.id === focusSegmentId;
               const hasAudio = Boolean(segment.chunk_id && playableChunkIds.has(segment.chunk_id));
@@ -536,7 +628,7 @@ export default function ContinuousSessionPlayer({
                             ) : (
                               <MonitorSpeaker className="size-3" aria-hidden="true" />
                             )}
-                            {laneLabel(source)}
+                            {segment.application_display_name || laneLabel(source)}
                           </span>
                         )}
                         {!hasAudio && (
@@ -578,6 +670,15 @@ export default function ContinuousSessionPlayer({
             </p>
           )}
         </div>
+        {visibleSegmentLimit < timeline.segments.length && (
+          <button
+            type="button"
+            onClick={() => setVisibleSegmentLimit((current) => current + 200)}
+            className="mt-3 w-full rounded-lg border border-border px-3 py-2 text-sm text-muted-foreground hover:bg-muted/50"
+          >
+            再显示 {Math.min(200, timeline.segments.length - visibleSegmentLimit)} 条转写
+          </button>
+        )}
       </section>
     </div>
   );

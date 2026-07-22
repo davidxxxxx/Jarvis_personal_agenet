@@ -77,6 +77,47 @@ function assertExactKeys(input, expected, name) {
   }
 }
 
+function normalizeTimelinePage(input) {
+  if (input === undefined || input === null) return {};
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("session timeline page must be an object");
+  }
+  const allowed = new Set(["trackOffset", "trackLimit", "intervalOffset", "intervalLimit"]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw new TypeError("session timeline page has an invalid structure");
+  }
+  const page = {};
+  for (const key of allowed) {
+    if (input[key] === undefined) continue;
+    if (!Number.isSafeInteger(input[key]) || input[key] < 0) {
+      throw new TypeError(`session timeline ${key} must be a non-negative safe integer`);
+    }
+    page[key] = input[key];
+  }
+  return page;
+}
+
+function toRendererSessionTimelineStatus(status) {
+  if (!status || typeof status !== "object") return null;
+  const counts = status.processing_counts ?? {};
+  return {
+    session_id: status.session_id,
+    status: status.status,
+    processing_state: status.processing_state,
+    timeline_version: status.timeline_version,
+    finalized_at: status.finalized_at,
+    ready_at: status.ready_at,
+    processing_counts: {
+      pending: counts.pending ?? 0,
+      leased: counts.leased ?? 0,
+      retry: counts.retry ?? 0,
+      blocked: counts.blocked ?? 0,
+      completed: counts.completed ?? 0,
+      total: counts.total ?? 0,
+    },
+  };
+}
+
 function toPublicActivityClassification(entry) {
   const applications = (
     Array.isArray(entry?.evidence?.applicationKeys) ? entry.evidence.applicationKeys : []
@@ -741,8 +782,11 @@ function registerJarvisIpc({
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
     toPublicSessionDetail(repository.getSessionDetail(assertId(sessionId, "sessionId")))
   );
-  ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId) => {
-    const timeline = repository.getSessionTimeline(assertId(sessionId, "sessionId"));
+  ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId, page) => {
+    const timeline = repository.getSessionTimeline(
+      assertId(sessionId, "sessionId"),
+      normalizeTimelinePage(page)
+    );
     if (!timeline) return null;
     const activeCapture = typeof service.getState === "function" ? service.getState() : null;
     const activelyRecording =
@@ -754,6 +798,23 @@ function registerJarvisIpc({
         ? (processingLifecycle?.runtime?.previewStatus?.() ?? null)
         : null;
     return toRendererSessionTimeline(timeline, previewStatus);
+  });
+  ipcMain.handle(CHANNELS.getSessionTimelineStatus, (_event, sessionId) => {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (typeof repository.getSessionTimelineStatus === "function") {
+      return toRendererSessionTimelineStatus(repository.getSessionTimelineStatus(safeSessionId));
+    }
+    const timeline = repository.getSessionTimeline(safeSessionId);
+    if (!timeline) return null;
+    return toRendererSessionTimelineStatus({
+      session_id: timeline.session_id,
+      status: timeline.status,
+      processing_state: timeline.processing_state,
+      timeline_version: timeline.timeline_version,
+      finalized_at: timeline.finalized_at,
+      ready_at: timeline.ready_at,
+      processing_counts: timeline.processing_counts,
+    });
   });
   ipcMain.handle(CHANNELS.getRuntimeStatus, async () => {
     const observedAt = now();

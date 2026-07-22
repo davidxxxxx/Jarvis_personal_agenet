@@ -203,6 +203,14 @@ function toRendererPreviewStatus(status) {
 
 function toRendererSessionTimeline(timeline, previewStatus = null) {
   if (!timeline || typeof timeline !== "object") return timeline;
+  const intervalPage = Array.isArray(timeline.application_audio_intervals)
+    ? timeline.application_audio_intervals
+    : [];
+  const pageCapture = summarizeApplicationAudio(intervalPage);
+  const aggregateCapture =
+    timeline.application_capture && typeof timeline.application_capture === "object"
+      ? timeline.application_capture
+      : null;
   return {
     ...projectFields(timeline, [
       "session_id",
@@ -215,14 +223,22 @@ function toRendererSessionTimeline(timeline, previewStatus = null) {
       "ready_at",
     ]),
     tracks: Array.isArray(timeline.tracks) ? timeline.tracks.map(toRendererAudioTrack) : [],
-    application_audio_intervals: Array.isArray(timeline.application_audio_intervals)
-      ? timeline.application_audio_intervals.map(toRendererApplicationAudioInterval)
-      : [],
-    application_capture: summarizeApplicationAudio(
-      Array.isArray(timeline.application_audio_intervals)
-        ? timeline.application_audio_intervals
-        : []
-    ),
+    application_audio_intervals: intervalPage.map(toRendererApplicationAudioInterval),
+    application_capture: {
+      exact_duration_ms: aggregateCapture?.exact_duration_ms ?? pageCapture.exact_duration_ms,
+      fallback_duration_ms:
+        aggregateCapture?.fallback_duration_ms ?? pageCapture.fallback_duration_ms,
+      exact_coverage_pct: aggregateCapture?.exact_coverage_pct ?? pageCapture.exact_coverage_pct,
+      degraded_intervals: pageCapture.degraded_intervals,
+      degraded_interval_count:
+        aggregateCapture?.degraded_interval_count ?? pageCapture.degraded_intervals.length,
+      recovery_points: pageCapture.recovery_points,
+      recovery_count: aggregateCapture?.recovery_count ?? pageCapture.recovery_points.length,
+    },
+    evidence_page:
+      timeline.evidence_page && typeof timeline.evidence_page === "object"
+        ? timeline.evidence_page
+        : null,
     gaps: Array.isArray(timeline.gaps) ? timeline.gaps.map(toRendererAudioGap) : [],
     chunks: Array.isArray(timeline.chunks) ? timeline.chunks.map(toRendererAudioChunk) : [],
     segments: Array.isArray(timeline.segments) ? timeline.segments : [],

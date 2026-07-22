@@ -159,7 +159,9 @@ test("historical v1 sessions enqueue v2 locally without overwriting legacy evide
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
   const snapshot = seedFinalTrack(repo);
-  repo.db.prepare(`
+  repo.db
+    .prepare(
+      `
     INSERT INTO speaker_diarization_runs (
       id, session_id, track_id, transcript_revision, policy_id,
       diarizer_model_id, embedding_model_id, model_artifact_sha256,
@@ -170,17 +172,23 @@ test("historical v1 sessions enqueue v2 locally without overwriting legacy evide
       'legacy-diarizer', '3dspeaker-campplus-voxceleb-16k-v1', ?,
       512, 16000, 1, 'cpu', 1, 5000, 5100
     )
-  `).run(snapshot.evidenceRevision, SESSION_DIARIZATION_POLICY.policyId, "f".repeat(64));
-  repo.db.prepare(
-    "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
-  ).run();
+  `
+    )
+    .run(snapshot.evidenceRevision, SESSION_DIARIZATION_POLICY.policyId, "f".repeat(64));
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
 
   assert.deepEqual(
-    repo.listHistoricalHybridCandidates({
-      at: 6000,
-      policy: HYBRID_DIARIZATION_POLICY,
-      limit: 25,
-    }).map((session) => session.id),
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
     ["session-cas"]
   );
   const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
@@ -195,11 +203,15 @@ test("historical v1 sessions enqueue v2 locally without overwriting legacy evide
     repo.db.prepare("SELECT count(*) AS count FROM speaker_diarization_runs").get().count,
     1
   );
-  const hybridJob = repo.db.prepare(`
+  const hybridJob = repo.db
+    .prepare(
+      `
     SELECT input_version, model_version, state
     FROM processing_jobs
     WHERE job_type = 'diarize_track' AND model_version = ?
-  `).get(HYBRID_DIARIZATION_POLICY.policyId);
+  `
+    )
+    .get(HYBRID_DIARIZATION_POLICY.policyId);
   assert.deepEqual(hybridJob, {
     input_version: 2,
     model_version: HYBRID_DIARIZATION_POLICY.policyId,
@@ -211,16 +223,20 @@ test("historical sessions without legacy speaker results are also eligible for l
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
   seedFinalTrack(repo);
-  repo.db.prepare(
-    "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
-  ).run();
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
 
   assert.deepEqual(
-    repo.listHistoricalHybridCandidates({
-      at: 6000,
-      policy: HYBRID_DIARIZATION_POLICY,
-      limit: 25,
-    }).map((session) => session.id),
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
     ["session-cas"]
   );
 
@@ -232,7 +248,8 @@ test("historical sessions without legacy speaker results are also eligible for l
   assert.equal(queued.enqueued, 1);
   assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
   assert.equal(
-    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get().count,
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
     0
   );
 });
@@ -304,10 +321,14 @@ test("v2 speaker-count changes preserve the old summary and only recommend a ref
     "keep this paid summary"
   );
   assert.deepEqual(
-    repo.db.prepare(`
+    repo.db
+      .prepare(
+        `
       SELECT recommended, reason, basis_policy_id, latest_policy_id
       FROM session_summary_refresh_state WHERE session_id = 'session-cas'
-    `).get(),
+    `
+      )
+      .get(),
     {
       recommended: 1,
       reason: "speaker_count_changed",
@@ -316,7 +337,8 @@ test("v2 speaker-count changes preserve the old summary and only recommend a ref
     }
   );
   assert.equal(
-    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get().count,
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
     0
   );
 });
@@ -715,7 +737,10 @@ test("diarization commits encrypt cluster and turn embeddings under the v35 enve
   t.after(() => repo.close());
   const snapshot = seedFinalTrack(repo);
 
-  assert.equal(repo.commitDiarizationRun(commitInput(snapshot, "encrypted_v35")).status, "completed");
+  assert.equal(
+    repo.commitDiarizationRun(commitInput(snapshot, "encrypted_v35")).status,
+    "completed"
+  );
   const blobs = repo.db
     .prepare(
       `SELECT embedding FROM speaker_clusters
@@ -898,7 +923,7 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
     {
       job_type: "diarize_track",
       state: "pending",
-      priority: 40,
+      priority: 35,
       input_hash: expectedKey,
       input_version: 1,
       model_version: "jarvis-session-diarization-v1",
@@ -907,6 +932,33 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
       chunk_id: null,
     }
   );
+});
+
+test("short application tracks do not fan out diarization jobs", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'chrome',
+        application_display_name = 'Chrome', capture_generation = 1,
+        ended_at = 2500
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', ended_at = 2500, duration_ms = 1500
+    WHERE track_id = 'track-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', ended_at = 2500
+    WHERE track_id = 'track-cas';
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 6000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 0);
+  assert.deepEqual(result.skipped, [{ trackId: "track-cas", reason: "speaker_audio_too_short" }]);
 });
 
 test("nonterminal latest transcription never schedules diarization", (t) => {

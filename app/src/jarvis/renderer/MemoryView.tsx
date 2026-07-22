@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowLeft, BrainCircuit, Clock3, Cpu, History, Search, Users } from "lucide-react";
 import type {
   JarvisRuntimeStatus,
@@ -111,41 +112,77 @@ export default function MemoryView() {
   const [runtimeStatus, setRuntimeStatus] = useState<JarvisRuntimeStatus | null>(null);
   const [memoryMode, setMemoryMode] = useState<"sessions" | "knowledge">("sessions");
   const [loading, setLoading] = useState(false);
+  const [sourcePageLoading, setSourcePageLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const detailRequestGeneration = useRef(0);
+  const sourcePageRequestGeneration = useRef(0);
+  const timelineRef = useRef<JarvisSessionTimeline | null>(null);
+  const sessionListRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => setSessions(storedSessions), [storedSessions]);
+
+  useEffect(() => {
+    timelineRef.current = timeline;
+  }, [timeline]);
 
   useEffect(
     () => () => {
       detailRequestGeneration.current += 1;
+      sourcePageRequestGeneration.current += 1;
     },
     []
   );
 
+  const timelineProcessingState = timeline?.processing_state;
+
   useEffect(() => {
     const sessionId = detail?.session.id;
-    if (!sessionId || !timeline || timeline.processing_state === "ready") return;
+    if (!sessionId || !timelineProcessingState || timelineProcessingState === "ready") return;
     let cancelled = false;
     let requestInFlight = false;
     const refresh = async () => {
       if (requestInFlight || cancelled) return;
       requestInFlight = true;
       try {
-        const next = await window.electronAPI.jarvis.getSessionTimeline(sessionId);
-        if (!cancelled) setTimeline(next);
+        const getStatus = window.electronAPI.jarvis.getSessionTimelineStatus;
+        if (typeof getStatus === "function") {
+          const nextStatus = await getStatus(sessionId);
+          if (!cancelled && nextStatus) {
+            const currentTimeline = timelineRef.current;
+            const becameReady =
+              currentTimeline?.processing_state !== "ready" &&
+              nextStatus.processing_state === "ready";
+            if (becameReady) {
+              const currentPage = currentTimeline?.evidence_page?.tracks;
+              const next = await window.electronAPI.jarvis.getSessionTimeline(sessionId, {
+                trackOffset: currentPage?.offset ?? 0,
+                trackLimit: currentPage?.limit ?? 100,
+              });
+              if (!cancelled) setTimeline(next);
+            } else {
+              setTimeline((current) =>
+                current && current.session_id === nextStatus.session_id
+                  ? { ...current, ...nextStatus }
+                  : current
+              );
+            }
+          }
+        } else {
+          const next = await window.electronAPI.jarvis.getSessionTimeline(sessionId);
+          if (!cancelled) setTimeline(next);
+        }
       } catch {
         // A transient IPC failure must not stop the next scheduled refresh.
       } finally {
         requestInFlight = false;
       }
     };
-    const timer = window.setInterval(() => void refresh(), 2_500);
+    const timer = window.setInterval(() => void refresh(), 5_000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [detail?.session.id, timeline]);
+  }, [detail?.session.id, timelineProcessingState]);
 
   useEffect(() => {
     const sessionId = detail?.session.id;
@@ -245,14 +282,41 @@ export default function MemoryView() {
     void loadSessionClusters(detail.session.id).catch(() => undefined);
   }, [detail?.session.id, loadSessionClusters]);
 
-  const groups = useMemo(() => {
-    const map = new Map<string, JarvisSession[]>();
+  const sessionRows = useMemo(() => {
+    const rows: Array<
+      | { type: "day"; key: string; label: string }
+      | { type: "session"; key: string; session: JarvisSession }
+    > = [];
+    let previousDay = "";
     for (const session of sessions) {
-      const key = dateLabel(session.started_at);
-      map.set(key, [...(map.get(key) ?? []), session]);
+      const day = dateLabel(session.started_at);
+      if (day !== previousDay) {
+        rows.push({ type: "day", key: `day:${day}`, label: day });
+        previousDay = day;
+      }
+      rows.push({ type: "session", key: `session:${session.id}`, session });
     }
-    return [...map.entries()];
+    return rows;
   }, [sessions]);
+
+  const sessionVirtualizer = useVirtualizer({
+    count: sessionRows.length,
+    getScrollElement: () => sessionListRef.current,
+    estimateSize: (index) => (sessionRows[index]?.type === "day" ? 36 : 82),
+    getItemKey: (index) => sessionRows[index]?.key ?? index,
+    overscan: 8,
+    initialRect: { width: 800, height: 640 },
+  });
+  const measuredSessionRows = sessionVirtualizer.getVirtualItems();
+  const visibleSessionRows = useMemo(() => {
+    if (measuredSessionRows.length > 0) return measuredSessionRows;
+    let start = 0;
+    return sessionRows.slice(0, 12).map((row, index) => {
+      const item = { index, start };
+      start += row.type === "day" ? 36 : 82;
+      return item;
+    });
+  }, [measuredSessionRows, sessionRows]);
 
   const search = async () => {
     setLoading(true);
@@ -269,6 +333,8 @@ export default function MemoryView() {
   const open = useCallback(
     async (sessionId: string, evidenceRequestId?: number) => {
       const generation = ++detailRequestGeneration.current;
+      sourcePageRequestGeneration.current += 1;
+      setSourcePageLoading(false);
       setLoading(true);
       setError(null);
       try {
@@ -295,6 +361,39 @@ export default function MemoryView() {
       }
     },
     [failEvidenceSession, markEvidenceSessionOpened]
+  );
+
+  const loadTrackPage = useCallback(
+    async (trackOffset: number) => {
+      const sessionId = detail?.session.id;
+      if (!sessionId || !timeline || sourcePageLoading) return;
+      const requestGeneration = ++sourcePageRequestGeneration.current;
+      setSourcePageLoading(true);
+      try {
+        const page = timeline.evidence_page;
+        const next = await window.electronAPI.jarvis.getSessionTimeline(sessionId, {
+          trackOffset,
+          trackLimit: page?.tracks.limit ?? 100,
+          intervalOffset: page?.intervals.offset ?? 0,
+          intervalLimit: page?.intervals.limit ?? 200,
+        });
+        if (
+          requestGeneration === sourcePageRequestGeneration.current &&
+          next?.session_id === sessionId
+        ) {
+          setTimeline((current) => (current?.session_id === sessionId ? next : current));
+        }
+      } catch {
+        if (requestGeneration === sourcePageRequestGeneration.current) {
+          setError("无法读取下一页音轨信息。");
+        }
+      } finally {
+        if (requestGeneration === sourcePageRequestGeneration.current) {
+          setSourcePageLoading(false);
+        }
+      }
+    },
+    [detail?.session.id, sourcePageLoading, timeline]
   );
 
   useEffect(() => {
@@ -418,8 +517,10 @@ export default function MemoryView() {
           type="button"
           onClick={() => {
             detailRequestGeneration.current += 1;
+            sourcePageRequestGeneration.current += 1;
             clearEvidenceNavigation();
             setLoading(false);
+            setSourcePageLoading(false);
             setDetail(null);
             setTimeline(null);
             setRuntimeStatus(null);
@@ -478,6 +579,7 @@ export default function MemoryView() {
               onSeekResult={acknowledgeEvidencePlayback}
               focusSegmentId={evidenceContext?.transcriptSegmentId}
               focusRequestId={focusRequestId}
+              onTrackPageChange={(offset) => void loadTrackPage(offset)}
             />
           ) : (
             <p className="rounded-xl bg-muted/30 p-4 text-sm text-muted-foreground">
@@ -583,7 +685,8 @@ export default function MemoryView() {
           </div>
           {speakerProcessing?.summaryRefresh?.recommended === 1 && (
             <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-              高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax 重新总结。
+              高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax
+              重新总结。
             </p>
           )}
           <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
@@ -772,43 +875,62 @@ export default function MemoryView() {
             </p>
           )}
           {loading && !detail && <p className="mt-6 text-sm text-muted-foreground">正在读取…</p>}
-          <div className="mt-6 space-y-7">
-            {groups.length ? (
-              groups.map(([day, items]) => (
-                <section key={day}>
-                  <h2 className="mb-2 text-sm font-semibold text-muted-foreground">{day}</h2>
-                  <div className="space-y-2">
-                    {items.map((session) => (
-                      <button
-                        key={session.id}
-                        type="button"
-                        onClick={() => {
-                          clearEvidenceNavigation();
-                          void open(session.id);
-                        }}
-                        className="flex w-full items-center justify-between rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
+          <div className="mt-6">
+            {sessionRows.length ? (
+              <div
+                ref={sessionListRef}
+                aria-label="会话记录列表"
+                className="jarvis-scroll-region h-[min(65vh,42rem)] min-h-80 overflow-y-auto pr-2"
+              >
+                <div
+                  className="relative w-full"
+                  style={{ height: `${sessionVirtualizer.getTotalSize()}px` }}
+                >
+                  {visibleSessionRows.map((virtualRow) => {
+                    const row = sessionRows[virtualRow.index];
+                    if (!row) return null;
+                    return (
+                      <div
+                        key={row.key}
+                        className="absolute left-0 top-0 w-full pb-2"
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
                       >
-                        <div>
-                          <p className="font-medium">
-                            {new Date(session.started_at).toLocaleTimeString("zh-CN", {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}{" "}
-                            的录音
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {session.status} · {session.language}
-                          </p>
-                        </div>
-                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                          <Clock3 className="size-3.5" aria-hidden="true" />
-                          {duration(session)}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </section>
-              ))
+                        {row.type === "day" ? (
+                          <h2 className="px-1 pt-2 text-sm font-semibold text-muted-foreground">
+                            {row.label}
+                          </h2>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              clearEvidenceNavigation();
+                              void open(row.session.id);
+                            }}
+                            className="flex w-full items-center justify-between rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
+                          >
+                            <div>
+                              <p className="font-medium">
+                                {new Date(row.session.started_at).toLocaleTimeString("zh-CN", {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                })}{" "}
+                                的录音
+                              </p>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {row.session.status} · {row.session.language}
+                              </p>
+                            </div>
+                            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                              <Clock3 className="size-3.5" aria-hidden="true" />
+                              {duration(row.session)}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             ) : (
               <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
                 还没有符合条件的会话记录。

@@ -292,6 +292,85 @@ describe("ContinuousSessionPlayer", () => {
     expect(screen.getByText(/device_interrupted/)).toBeInTheDocument();
   });
 
+  it("shows the normalized application name on its source lane and transcript", () => {
+    const sourceTimeline = timeline();
+    const applicationTrack = {
+      ...sourceTimeline.tracks[1],
+      id: "track-kook",
+      track_kind: "application" as const,
+      application_key: "kook",
+      application_display_name: "KOOK",
+      attribution_state: "exact" as const,
+    };
+    const applicationSegment = {
+      ...sourceTimeline.segments[0],
+      track_id: "track-kook",
+      application_key: "kook",
+      application_display_name: "KOOK",
+      track_kind: "application" as const,
+    };
+
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          tracks: [sourceTimeline.tracks[0], applicationTrack],
+          segments: [applicationSegment],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+
+    expect(screen.getAllByText("KOOK")).toHaveLength(2);
+  });
+
+  it("shows a raw interval failure code when application capture falls back before a track starts", () => {
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          application_audio_intervals: [
+            {
+              id: "fallback-1",
+              session_id: "session-1",
+              track_id: "track-system",
+              interval_kind: "mixed_fallback",
+              application_key: null,
+              attribution_state: "mixed_unknown",
+              capture_generation: 1,
+              started_at: 1_500,
+              ended_at: 2_500,
+              reason: "capture_start_failed",
+              failure_code: "application_native_start_E_ACCESSDENIED",
+            },
+          ],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+
+    const failures = screen.getByTestId("application-capture-failures");
+    expect(failures).toHaveTextContent("系统音频·应用未知");
+    expect(failures).toHaveTextContent("application_native_start_E_ACCESSDENIED");
+  });
+
+  it("requests the next bounded source page", () => {
+    const onTrackPageChange = vi.fn();
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          evidence_page: {
+            tracks: { total: 250, offset: 0, limit: 100 },
+            intervals: { total: 0, offset: 0, limit: 200 },
+          },
+        })}
+        readChunk={vi.fn()}
+        onTrackPageChange={onTrackPageChange}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(onTrackPageChange).toHaveBeenCalledWith(100);
+  });
+
   it("plays only the selected transcript time range and then stops", async () => {
     const readChunk = vi.fn(async () => new Uint8Array([1]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);

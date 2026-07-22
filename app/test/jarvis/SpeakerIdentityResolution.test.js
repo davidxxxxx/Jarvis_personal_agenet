@@ -1595,6 +1595,46 @@ test("snapshot requires every current diarization job terminal and revisions are
   );
 });
 
+test("completed primary tracks can start identity resolution while an application track waits", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 2, completeTracks: 1 });
+  repository.db.exec(`
+    UPDATE audio_tracks
+    SET application_key = 'kook', application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-ready-1';
+  `);
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0"]);
+  assert.equal(
+    repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 }).enqueued,
+    1
+  );
+});
+
+test("completed application diarization joins the next identity resolution revision", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 2, completeTracks: 2 });
+  repository.db.exec(`
+    UPDATE audio_tracks
+    SET application_key = 'kook', application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-ready-1';
+  `);
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0", "run-ready-1"]);
+});
+
 test("ready snapshot uses per-run evidence and enqueue identity is strict and idempotent", (t) => {
   const { repository, clusters } = seedReadyEvidence(t, { trackCount: 1 });
   addPersonAndSample(repository, { personId: "person-a", embedding: vector(1, 0) });

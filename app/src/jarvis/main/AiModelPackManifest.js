@@ -3,9 +3,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { assertNonSystemDrive } = require("./SpeakerModelManifest");
 const { HYBRID_DIARIZATION_POLICY } = require("./HybridDiarizationPolicy");
+const { MODEL_PACK_VERSION } = require("./AiModelPackVersion");
 
 const MODEL_PACK_SCHEMA_VERSION = 1;
-const MODEL_PACK_VERSION = "jarvis-ai-model-pack-2026.07.2";
 const MANIFEST_FILE = "manifest.json";
 const SHA256 = /^[0-9a-f]{64}$/;
 const HASH_CONCURRENCY = 8;

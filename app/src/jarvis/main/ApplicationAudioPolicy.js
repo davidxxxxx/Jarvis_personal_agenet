@@ -40,6 +40,8 @@ class ApplicationAudioPolicy {
 
   select(candidates, options = {}) {
     const limit = this.resolveLimit(options);
+    const activeApplicationKeys =
+      options.activeApplicationKeys instanceof Set ? options.activeApplicationKeys : new Set();
     return [...candidates]
       .filter(
         (candidate) =>
@@ -52,6 +54,9 @@ class ApplicationAudioPolicy {
       .sort((left, right) => {
         const scoreDifference = this.score(right) - this.score(left);
         if (scoreDifference !== 0) return scoreDifference;
+        const leftActive = activeApplicationKeys.has(left.applicationKey);
+        const rightActive = activeApplicationKeys.has(right.applicationKey);
+        if (leftActive !== rightActive) return rightActive ? 1 : -1;
         const timeDifference = (right.lastSeenAt ?? 0) - (left.lastSeenAt ?? 0);
         if (timeDifference !== 0) return timeDifference;
         return left.applicationKey.localeCompare(right.applicationKey);

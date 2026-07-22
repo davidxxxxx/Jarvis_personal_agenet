@@ -41,6 +41,7 @@ import type {
   JarvisSpeakerCorrectionView,
   JarvisSessionDetail,
   JarvisSessionTimeline,
+  JarvisSessionTimelineStatus,
   JarvisRuntimeStatus,
   JarvisTodayInsights,
   JarvisDailyDigestReadResult,
@@ -614,7 +615,18 @@ declare global {
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
         readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
-        getSessionTimeline: (sessionId: string) => Promise<JarvisSessionTimeline | null>;
+        getSessionTimeline: (
+          sessionId: string,
+          page?: {
+            trackOffset?: number;
+            trackLimit?: number;
+            intervalOffset?: number;
+            intervalLimit?: number;
+          }
+        ) => Promise<JarvisSessionTimeline | null>;
+        getSessionTimelineStatus: (
+          sessionId: string
+        ) => Promise<JarvisSessionTimelineStatus | null>;
         getRuntimeStatus: () => Promise<JarvisRuntimeStatus>;
         searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
         listPeopleOverview: () => Promise<JarvisPersonOverview[]>;

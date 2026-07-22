@@ -66,14 +66,16 @@ function ApplicationCaptureStatus({ timeline }: { timeline: JarvisSessionTimelin
   if (!capture || (capture.exact_duration_ms === 0 && capture.fallback_duration_ms === 0)) {
     return null;
   }
+  const degradedCount = capture.degraded_interval_count ?? capture.degraded_intervals.length;
+  const recoveryCount = capture.recovery_count ?? capture.recovery_points.length;
   return (
     <p className="text-xs text-muted-foreground">
       应用音频：
-      {capture.exact_coverage_pct === null ? "覆盖率待计算" : `精确来源 ${capture.exact_coverage_pct}%`}
-      {capture.degraded_intervals.length > 0
-        ? ` · ${capture.degraded_intervals.length} 个降级时段`
-        : " · 无降级"}
-      {capture.recovery_points.length > 0 ? ` · 已恢复 ${capture.recovery_points.length} 次` : null}
+      {capture.exact_coverage_pct === null
+        ? "覆盖率待计算"
+        : `精确来源 ${capture.exact_coverage_pct}%`}
+      {degradedCount > 0 ? ` · ${degradedCount} 个降级时段` : " · 无降级"}
+      {recoveryCount > 0 ? ` · 已恢复 ${recoveryCount} 次` : null}
     </p>
   );
 }
@@ -127,7 +129,7 @@ function RuntimeProcessingStatus({
       ? "CUDA"
       : status.backend.actualBackend === "cpu"
         ? "CPU"
-      : status.backend.actualBackend === "cloud"
+        : status.backend.actualBackend === "cloud"
           ? "云端"
           : ["recording", "degraded", "finalizing"].includes(status.capture.status)
             ? "尚未运行"

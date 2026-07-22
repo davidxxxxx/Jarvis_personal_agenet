@@ -663,6 +663,55 @@ test("session timeline IPC scopes live preview to the authoritative active captu
   assert.equal(getTimeline(null, "s3").preview_status, null);
 });
 
+test("compact session status IPC exposes only polling fields", () => {
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      getSessionTimelineStatus: () => ({
+        session_id: "s1",
+        status: "completed",
+        processing_state: "processing",
+        timeline_version: 8,
+        finalized_at: 2_000,
+        ready_at: null,
+        processing_counts: {
+          pending: 1,
+          leased: 0,
+          retry: 2,
+          blocked: 0,
+          completed: 3,
+          total: 6,
+          private_detail: "drop",
+        },
+        private_path: "G:\\private\\audio.flac",
+      }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const status = handlers.get(CHANNELS.getSessionTimelineStatus)(null, "s1");
+  assert.deepEqual(Object.keys(status), [
+    "session_id",
+    "status",
+    "processing_state",
+    "timeline_version",
+    "finalized_at",
+    "ready_at",
+    "processing_counts",
+  ]);
+  assert.deepEqual(status.processing_counts, {
+    pending: 1,
+    leased: 0,
+    retry: 2,
+    blocked: 0,
+    completed: 3,
+    total: 6,
+  });
+});
+
 test("retired provenance is private at audio IPC boundaries", () => {
   const handlers = new Map();
   const privateChunk = {
@@ -865,7 +914,9 @@ test("audio timeline IPC projects strict chunk track and gap allowlists", () => 
         reason: "application_capture_failed",
       },
     ],
+    degraded_interval_count: 1,
     recovery_points: [],
+    recovery_count: 0,
   });
   assert.deepEqual(Object.keys(result.gaps[0]), [
     "id",
@@ -1074,6 +1125,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "getSession",
       "getSessionDetail",
       "getSessionTimeline",
+      "getSessionTimelineStatus",
       "getStorageStatus",
       "getTodayInsights",
       "getTopicDetail",
@@ -1166,6 +1218,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.setCloudBudget,
       CHANNELS.getSessionDetail,
       CHANNELS.getSessionTimeline,
+      CHANNELS.getSessionTimelineStatus,
       CHANNELS.getEvidenceContext,
       CHANNELS.getKnowledgeOverview,
       CHANNELS.getRuntimeStatus,

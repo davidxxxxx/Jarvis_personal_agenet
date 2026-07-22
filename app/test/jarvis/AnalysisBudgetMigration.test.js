@@ -230,7 +230,7 @@ function createRepresentativeV23Database() {
 test("latest migration retains the durable v25 budget schema and reviewed MiniMax price rows", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 36);
+    assert.equal(TARGET_VERSION, 37);
     assert.deepEqual(migrate(db), { fromVersion: 0, toVersion: TARGET_VERSION });
     for (const table of TABLES) assert.ok(tableNames(db).includes(table), table);
 

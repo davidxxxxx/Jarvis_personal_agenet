@@ -298,8 +298,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
     readAudioChunk: (audioChunkId) => ipcRenderer.invoke("jarvis:audio:read", audioChunkId),
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),
-    getSessionTimeline: (sessionId) =>
-      ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId),
+    getSessionTimeline: (sessionId, page) =>
+      page === undefined
+        ? ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId)
+        : ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId, page),
+    getSessionTimelineStatus: (sessionId) =>
+      ipcRenderer.invoke("jarvis:memory:session-timeline-status", sessionId),
     getRuntimeStatus: () => ipcRenderer.invoke("jarvis:runtime:status"),
     searchMemory: (query, limit) => ipcRenderer.invoke("jarvis:memory:search", query, limit),
     listPeopleOverview: () => ipcRenderer.invoke("jarvis:memory:people"),

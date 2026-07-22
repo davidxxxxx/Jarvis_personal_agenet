@@ -197,7 +197,20 @@ test("preload exposes the session timeline request to the renderer", async () =>
   const { api, invokes } = loadPreloadApi();
 
   assert.equal(await api.getSessionTimeline("session-1"), "invoked");
-  assert.deepEqual(invokes, [["jarvis:memory:session-timeline", "session-1"]]);
+  assert.equal(
+    await api.getSessionTimeline("session-1", { trackOffset: 100, trackLimit: 100 }),
+    "invoked"
+  );
+  assert.equal(await api.getSessionTimelineStatus("session-1"), "invoked");
+  assert.deepEqual(invokes, [
+    ["jarvis:memory:session-timeline", "session-1"],
+    [
+      "jarvis:memory:session-timeline",
+      "session-1",
+      { trackOffset: 100, trackLimit: 100 },
+    ],
+    ["jarvis:memory:session-timeline-status", "session-1"],
+  ]);
 });
 
 test("preload exposes source interruption and restoration request-response IPC", async () => {

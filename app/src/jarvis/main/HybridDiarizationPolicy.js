@@ -1,3 +1,5 @@
+const { MODEL_PACK_VERSION } = require("./AiModelPackVersion");
+
 const HYBRID_DIARIZATION_POLICY = Object.freeze({
   policyId: "jarvis-hybrid-diarization-v2",
   diarizerModelId: "pyannote-community-1+sherpa-campplus-verifier+mossformer2-ss-16k",
@@ -9,7 +11,7 @@ const HYBRID_DIARIZATION_POLICY = Object.freeze({
   turnBoundaryToleranceMs: 100,
   inputVersion: 2,
   executionDevice: "cuda",
-  modelPackVersion: "jarvis-ai-model-pack-2026.07.1",
+  modelPackVersion: MODEL_PACK_VERSION,
   clusterSimilarityThreshold: 0.72,
   echoSimilarityThreshold: 0.95,
   minimumSpeakers: 1,

@@ -10,6 +10,31 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.5 - 2026-07-22
+
+This prerelease stabilizes application-aware capture and makes large Memory sessions responsive
+while ensuring continuous audio completes speaker identity work first.
+
+### Changed
+
+- Dynamic application-audio selection is sticky, process-affine, and debounced to prevent rapid
+  capture-generation churn when several equal-priority applications are audible.
+- Microphone and mixed-system tracks run diarization before application tracks; application shards
+  under three seconds are retired instead of repeatedly entering the high-accuracy speaker queue.
+- SELF and anonymous-person resolution advances as soon as continuous primary tracks complete, then
+  incorporates application-track evidence in a later immutable revision.
+- Memory uses a virtualized session list, paged source evidence, progressive transcript rendering,
+  and a compact five-second processing poll instead of repeatedly loading the full timeline.
+- Source lanes and transcript rows show normalized application names, and bounded native capture
+  failure codes remain available in processing details.
+- The installed AI model pack and hybrid diarization policy now share one version source.
+
+### Database
+
+- Database target advanced to v37. Existing short application diarization jobs are safely
+  superseded, continuous-track priorities are repaired, and application recovery lookups are
+  indexed without deleting historical recordings.
+
 ## 0.2.0-alpha.4 - 2026-07-22
 
 This prerelease makes the preinstalled high-accuracy speaker models deliverable through one
