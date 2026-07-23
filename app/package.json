@@ -1,7 +1,7 @@
 {
   "name": "jarvis-memory-assistant",
   "productName": "Jarvis Memory",
-  "version": "0.2.0-alpha.5",
+  "version": "0.2.0-alpha.6",
   "description": "Local-first Windows conversation memory assistant",
   "main": "main.js",
   "private": true,
@@ -38,7 +38,7 @@
     "build:mac": "npm run build:renderer && electron-builder --mac",
     "build:mac:arm64": "npm run build:renderer && electron-builder --mac --arm64",
     "build:mac:x64": "npm run build:renderer && electron-builder --mac --x64",
-    "prebuild:win": "npm run compile:native && npm run download:whisper-cpp && npm run download:llama-server && npm run download:sherpa-onnx && npm run download:qdrant && npm run download:meeting-aec-helper && npm run download:whisper-vad-model && npm run download:diarization-models -- --output-dir resources/bin/diarization-models && npm run download:nircmd && npm run download:windows-fast-paste && npm run download:windows-key-listener && npm run download:windows-mic-listener && npm run verify:ai-model-pack",
+    "prebuild:win": "npm run compile:native && npm run download:whisper-cpp && npm run download:llama-server && npm run download:sherpa-onnx && npm run download:qdrant && npm run download:meeting-aec-helper && npm run download:whisper-vad-model && npm run download:embedding-model -- --for-build && npm run download:diarization-models -- --output-dir resources/bin/diarization-models && npm run download:nircmd && npm run download:windows-fast-paste && npm run download:windows-key-listener && npm run download:windows-mic-listener && npm run verify:ai-model-pack",
     "build:win": "npm run build:renderer && node scripts/build-windows-model-bundle.js && electron-builder --win && node scripts/build-windows-model-bundle.js --publish-only",
     "build:win:unsigned": "npm run prebuild:win && npm run build:renderer && node scripts/build-windows.js",
     "prebuild:linux": "npm run compile:native && npm run download:whisper-cpp && npm run download:llama-server && npm run download:sherpa-onnx && npm run download:qdrant && npm run download:meeting-aec-helper && npm run download:whisper-vad-model && npm run download:diarization-models -- --output-dir resources/bin/diarization-models",

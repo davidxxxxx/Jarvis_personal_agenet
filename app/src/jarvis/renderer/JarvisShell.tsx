@@ -8,6 +8,7 @@ import {
   HardDrive,
   UsersRound,
 } from "lucide-react";
+import MeetingRecordingMount from "../../components/MeetingRecordingMount";
 import { useJarvisStore, type JarvisView } from "./jarvisStore";
 import { useJarvisRecording } from "./useJarvisRecording";
 import JarvisTitleBar from "./JarvisTitleBar";
@@ -56,6 +57,7 @@ export default function JarvisShell() {
 
   return (
     <div className="grid h-screen grid-rows-[40px_minmax(0,1fr)] overflow-hidden bg-background text-foreground">
+      <MeetingRecordingMount />
       <JarvisTitleBar />
       <div
         data-testid="jarvis-shell"

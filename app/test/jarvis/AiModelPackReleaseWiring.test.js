@@ -34,6 +34,10 @@ test("Windows release ships the model as a verified sibling component", () => {
 test("release preparation keeps staging off C and performs an offline CUDA model load test", () => {
   const packageJson = JSON.parse(read("package.json"));
   assert.match(packageJson.scripts["prepare:ai-model-pack"], /prepare-ai-model-pack\.ps1/u);
+  assert.match(
+    packageJson.scripts["prebuild:win"],
+    /npm run download:embedding-model -- --for-build/u
+  );
   assert.match(packageJson.scripts["prebuild:win"], /npm run verify:ai-model-pack$/u);
   assert.match(packageJson.scripts["build:win"], /build-windows-model-bundle\.js/u);
   assert.equal(packageJson.devDependencies["7zip-bin"], "^5.2.0");

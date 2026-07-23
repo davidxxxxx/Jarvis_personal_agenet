@@ -8,6 +8,10 @@ vi.mock("../../../components/WindowControls", () => ({
   default: () => <div data-testid="jarvis-window-controls">controls</div>,
 }));
 
+vi.mock("../../../components/MeetingRecordingMount", () => ({
+  default: () => <div data-testid="jarvis-microphone-level-sampler" />,
+}));
+
 vi.mock("../useJarvisRecording", () => ({
   useJarvisRecording: () => ({
     session: {
@@ -54,6 +58,12 @@ beforeEach(() => {
 });
 
 describe("JarvisShell", () => {
+  it("mounts the microphone level sampler for standalone Jarvis capture", () => {
+    render(<JarvisShell />);
+
+    expect(screen.getByTestId("jarvis-microphone-level-sampler")).toBeInTheDocument();
+  });
+
   it("provides a draggable titlebar without making window controls draggable", () => {
     render(<JarvisShell />);
 

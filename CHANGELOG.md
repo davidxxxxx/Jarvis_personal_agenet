@@ -10,6 +10,20 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.6 - 2026-07-23
+
+This prerelease fixes the packaged recording controls discovered during the first isolated
+real-data canary and makes the Windows package self-contained for local text embeddings.
+
+### Fixed
+
+- Clicking **Finish & Summarize** immediately enters the finalizing state and freezes the elapsed
+  timer while microphone and system-audio sources finish flushing safely in the background.
+- The standalone Jarvis window now mounts the existing microphone analyser sampler, so captured
+  microphone PCM drives the live waveform instead of leaving it at zero.
+- Windows builds now bundle the MiniLM ONNX embedding model and tokenizer instead of attempting a
+  first-run download.
+
 ## 0.2.0-alpha.5 - 2026-07-22
 
 This prerelease stabilizes application-aware capture and makes large Memory sessions responsive

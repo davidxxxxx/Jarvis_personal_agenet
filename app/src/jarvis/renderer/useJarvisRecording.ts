@@ -1094,12 +1094,12 @@ export function createRecordingController(deps: RecordingDependencies): Recordin
     let authoritativeStateHandled = false;
 
     try {
+      deps.setSessionState(finalizing);
       if (state.status === "recording") {
         await stopUpstream();
         upstreamStopped = true;
       }
       clearPersistTimer();
-      deps.setSessionState(finalizing);
       const stableSegments = deps.getMeetingSnapshot().segments;
       await persistSnapshot(state.id as string, state.startedAt ?? at, stableSegments);
       const runtime = await deps.jarvis.finishCapture(state.id as string, deps.now());
