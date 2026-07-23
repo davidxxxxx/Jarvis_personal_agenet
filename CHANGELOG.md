@@ -10,6 +10,19 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.7 - 2026-07-23
+
+This prerelease makes first-run speech-model preparation visible instead of appearing to leave
+Start Listening stuck at an idle audio meter.
+
+### Fixed
+
+- Start Listening now reports Whisper model download progress with a determinate progress bar.
+- The startup panel explicitly remains in a not-recording state until audio capture really starts,
+  avoiding both the misleading **Waiting to record** meter and a false recording indicator.
+- Progress events are scoped to the exact Whisper model requested by Jarvis, so unrelated model
+  downloads cannot overwrite recording startup state.
+
 ## 0.2.0-alpha.6 - 2026-07-23
 
 This prerelease fixes the packaged recording controls discovered during the first isolated

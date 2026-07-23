@@ -103,6 +103,12 @@ export interface RecordingMeetingSnapshot {
 export type JarvisPreparationStage =
   "checking_model" | "downloading_model" | "checking_microphone" | "starting_audio";
 
+export interface JarvisPreparationProgress {
+  percentage: number;
+  downloadedBytes: number;
+  totalBytes: number;
+}
+
 export interface LatestRefresh<T> {
   run: (load: () => Promise<T>) => Promise<void>;
   invalidate: () => void;
@@ -1389,6 +1395,7 @@ export interface UseJarvisRecordingResult {
   micRecoveryStatus?: "idle" | "reconnecting" | "restored";
   micRecoveryAttempt?: number;
   preparationStage?: JarvisPreparationStage | null;
+  preparationProgress?: JarvisPreparationProgress | null;
   operation: JarvisControlAction | null;
   error: string | null;
   transcriptionWarning?: string | null;
@@ -1414,6 +1421,10 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
   const micRecoveryStatus = useMeetingRecordingStore((state) => state.micRecoveryStatus);
   const micRecoveryAttempt = useMeetingRecordingStore((state) => state.micRecoveryAttempt);
   const [preparationStage, setPreparationStage] = useState<JarvisPreparationStage | null>(null);
+  const [preparationProgress, setPreparationProgress] = useState<JarvisPreparationProgress | null>(
+    null
+  );
+  const preparationModelRef = useRef<string | null>(null);
   const captureSourceStates = useMeetingRecordingStore((state) => state.captureSourceStates);
   const upstreamError = useMeetingRecordingStore((state) => state.error);
   const transcriptionWarning = useMeetingRecordingStore((state) => state.transcriptionWarning);
@@ -1449,6 +1460,8 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       ensureTranscriptionReady: async (reportStage) => {
         const settings = getSettings();
         const model = resolveJarvisWhisperModel(settings);
+        preparationModelRef.current = model;
+        setPreparationProgress(null);
         const status = await window.electronAPI.checkModelStatus(model);
         if (!status.success) {
           throw new RecordingOperationError(
@@ -1488,11 +1501,29 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
       hasRecordingConsent,
       onOperationChange: (operation) => useJarvisStore.getState().setOperation(operation),
       onError: (code) => useJarvisStore.getState().setError(code),
-      onPreparationStage: setPreparationStage,
+      onPreparationStage: (stage) => {
+        setPreparationStage(stage);
+        if (stage !== "downloading_model") setPreparationProgress(null);
+        if (stage === null) preparationModelRef.current = null;
+      },
     });
   }
 
   const controller = controllerRef.current;
+
+  useEffect(
+    () =>
+      window.electronAPI?.onWhisperDownloadProgress?.((_event, progress) => {
+        if (!preparationModelRef.current || progress.model !== preparationModelRef.current) return;
+        if (progress.type !== "progress" && progress.type !== "complete") return;
+        setPreparationProgress({
+          percentage: Math.max(0, Math.min(100, Math.round(progress.percentage ?? 0))),
+          downloadedBytes: Math.max(0, progress.downloaded_bytes ?? 0),
+          totalBytes: Math.max(0, progress.total_bytes ?? 0),
+        });
+      }),
+    []
+  );
 
   useEffect(() => {
     useJarvisStore.getState().setSourceStates(captureSourceStates);
@@ -1685,6 +1716,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
     micRecoveryStatus,
     micRecoveryAttempt,
     preparationStage,
+    preparationProgress,
     operation,
     error: upstreamError ?? controllerError,
     transcriptionWarning,

@@ -90,6 +90,36 @@ describe("RecordingControls microphone recovery", () => {
     expect(screen.queryByText("Starting…")).not.toBeInTheDocument();
   });
 
+  it("shows first-run model progress without claiming that recording has started", async () => {
+    await i18n.changeLanguage("en");
+    render(
+      <RecordingControls
+        recording={fakeRecording({
+          session: {
+            id: "session-1",
+            status: "starting",
+            startedAt: 1_000,
+            activeSince: null,
+            accumulatedMs: 0,
+            errorCode: null,
+          },
+          operation: "start",
+          preparationStage: "downloading_model",
+          preparationProgress: {
+            percentage: 73,
+            downloadedBytes: 1_186_000_000,
+            totalBytes: 1_624_555_275,
+          },
+        })}
+      />
+    );
+
+    expect(screen.getByText("Downloading speech model… 73%")).toBeInTheDocument();
+    expect(screen.getByText("Not recording")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "73");
+    expect(screen.queryByText("Waiting to record")).not.toBeInTheDocument();
+  });
+
   it("localizes system-only source status and unavailable recovery actions in English", async () => {
     await i18n.changeLanguage("en");
     useJarvisStore.setState({
