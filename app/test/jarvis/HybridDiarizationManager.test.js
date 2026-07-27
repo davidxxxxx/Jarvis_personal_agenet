@@ -97,6 +97,130 @@ test("hybrid manager rejects malformed sidecar turns before persistence", async 
   );
 });
 
+test("hybrid manager preserves sub-millisecond turns that collapse after rounding", async () => {
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: runtime({
+      durationMs: 1_000,
+      turns: [
+        { speaker: "S1", startMs: 250, endMs: 250 },
+        { speaker: "S2", startMs: 1_000, endMs: 1_000 },
+      ],
+      verifierCount: 2,
+      overlapSeparation: { state: "not_needed", processed: 0, total: 0 },
+    }),
+    fsImpl: { existsSync: () => true },
+  });
+
+  const turns = await manager.diarizeStrict("G:\\recording.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+  });
+
+  assert.deepEqual([...turns], [
+    { speaker: "S1", startMs: 250, endMs: 251 },
+    { speaker: "S2", startMs: 999, endMs: 1_000 },
+  ]);
+});
+
+test("hybrid manager corrects one or two millisecond boundary drift", async () => {
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: runtime({
+      durationMs: 1_000,
+      turns: [
+        { speaker: "S1", startMs: 251, endMs: 250 },
+        { speaker: "S2", startMs: 1_001, endMs: 1_000 },
+      ],
+      verifierCount: 2,
+      overlapSeparation: { state: "not_needed", processed: 0, total: 0 },
+    }),
+    fsImpl: { existsSync: () => true },
+  });
+
+  const turns = await manager.diarizeStrict("G:\\recording.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+  });
+
+  assert.deepEqual([...turns], [
+    { speaker: "S1", startMs: 250, endMs: 251 },
+    { speaker: "S2", startMs: 999, endMs: 1_000 },
+  ]);
+});
+
+test("hybrid manager drops padding-only turns beyond the authoritative audio tail", async () => {
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: runtime({
+      durationMs: 1_000,
+      turns: [
+        { speaker: "S1", startMs: 0, endMs: 900 },
+        { speaker: "S2", startMs: 1_020, endMs: 1_000 },
+      ],
+      verifierCount: 1,
+      overlapSeparation: { state: "not_needed", processed: 0, total: 0 },
+    }),
+    fsImpl: { existsSync: () => true },
+  });
+
+  const turns = await manager.diarizeStrict("G:\\recording.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+  });
+
+  assert.deepEqual([...turns], [{ speaker: "S1", startMs: 0, endMs: 900 }]);
+});
+
+test("hybrid manager still rejects inverted sidecar turn bounds", async () => {
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: runtime({
+      durationMs: 1_000,
+      turns: [{ speaker: "S1", startMs: 255, endMs: 250 }],
+    }),
+    fsImpl: { existsSync: () => true },
+  });
+
+  await assert.rejects(
+    manager.diarizeStrict("G:\\recording.wav", { executionContext: { device: "cuda" } }),
+    (error) => error.code === "DIARIZATION_SIDECAR_INVALID_RESULT"
+  );
+});
+
+test("hybrid manager keeps primary CUDA results when the optional verifier crashes", async () => {
+  let verifierCalls = 0;
+  const verifierError = new Error("native verifier access violation");
+  verifierError.code = "DIARIZATION_SIDECAR_EXIT_NONZERO";
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: runtime({
+      durationMs: 1_000,
+      turns: [{ speaker: "S1", startMs: 0, endMs: 1_000 }],
+      verifierCount: null,
+      overlapSeparation: { state: "not_needed", processed: 0, total: 0 },
+    }),
+    verifierDiarizer: {
+      async diarizeStrict() {
+        verifierCalls += 1;
+        throw verifierError;
+      },
+    },
+    fsImpl: { existsSync: () => true },
+  });
+
+  const first = await manager.diarizeStrict("G:\\recording.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+  });
+  const second = await manager.diarizeStrict("G:\\recording-2.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+  });
+
+  assert.equal(verifierCalls, 1);
+  assert.equal(first.metadata.speakerCount.state, "primary_only");
+  assert.equal(first.metadata.verifierState, "unavailable");
+  assert.equal(first.metadata.models.verifier, null);
+  assert.equal(second.metadata.verifierState, "unavailable");
+  assert.equal(manager.status().verifierCircuitOpen, true);
+});
+
 test("default hybrid runtime binds the admitted GPU and validates CUDA plus primary model", async () => {
   const calls = [];
   let clientOptions = null;

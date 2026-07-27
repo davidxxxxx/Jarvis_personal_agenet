@@ -27,6 +27,7 @@ const DEFAULT_MAX_JOBS_PER_DRAIN = 25;
 const DEFAULT_MAX_DRAIN_MS = 5_000;
 const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
 const DEFAULT_ANALYSIS_RECOVERY_LIMIT = 25;
+const DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS = 30_000;
 const PREVIEW_CONTEXT_ROW_LIMIT = 16;
 const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
 
@@ -163,6 +164,7 @@ class JarvisProcessingRuntime {
     maxJobsPerDrain = DEFAULT_MAX_JOBS_PER_DRAIN,
     maxDrainMs = DEFAULT_MAX_DRAIN_MS,
     maxSessionsPerDrain = DEFAULT_MAX_SESSIONS_PER_DRAIN,
+    analysisRecoveryIntervalMs = DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
     log = () => {},
@@ -304,6 +306,10 @@ class JarvisProcessingRuntime {
     this.maxJobsPerDrain = positiveSafeInteger(maxJobsPerDrain, "maxJobsPerDrain");
     this.maxDrainMs = positiveSafeInteger(maxDrainMs, "maxDrainMs");
     this.maxSessionsPerDrain = positiveSafeInteger(maxSessionsPerDrain, "maxSessionsPerDrain");
+    this.analysisRecoveryIntervalMs = positiveSafeInteger(
+      analysisRecoveryIntervalMs,
+      "analysisRecoveryIntervalMs"
+    );
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
     this.log = log;
@@ -330,6 +336,10 @@ class JarvisProcessingRuntime {
     this.stopPromise = null;
     this.previewInFlight = null;
     this.cloudInFlight = null;
+    this.analysisRecoveryInFlight = null;
+    this.lastAnalysisRecoveryAt = null;
+    this.analysisStartupReady = true;
+    this.cloudStartupReady = true;
     this.stopping = false;
     this.running = true;
     this.sessionCursor = null;
@@ -354,6 +364,18 @@ class JarvisProcessingRuntime {
         this.log({ phase: "historical_diarization_backfill", error });
       }
       if (this.stopping) return 0;
+      this.cloudStartupReady = this.cloudDispatcher === null;
+      this.analysisStartupReady = this.cloudDispatcher === null;
+      this.timer = this.setInterval(() => {
+        void this.drainOnce().catch((error) => {
+          this.log({ phase: "poll", error });
+        });
+      }, this.pollIntervalMs);
+      this.timer?.unref?.();
+      const initialDrain = this.drainOnce();
+      // Cloud crash recovery can legitimately take minutes after a paid request.
+      // Keep local evidence processing live without weakening cloud idempotency.
+      void initialDrain.catch(() => {});
       await Promise.resolve(this.dailyDigestScheduler?.start?.());
       if (this.stopping) return 0;
       let cloudRecoveryReady = true;
@@ -376,14 +398,10 @@ class JarvisProcessingRuntime {
         this.log({ phase: "analysis_recovery", error });
       }
       if (this.stopping) return 0;
+      this.analysisStartupReady = cloudRecoveryReady;
+      this.cloudStartupReady = true;
       this._tickCloud({ startup: true });
-      this.timer = this.setInterval(() => {
-        void this.drainOnce().catch((error) => {
-          this.log({ phase: "poll", error });
-        });
-      }, this.pollIntervalMs);
-      this.timer?.unref?.();
-      return this.drainOnce();
+      return initialDrain;
     });
     return this.startPromise;
   }
@@ -495,6 +513,7 @@ class JarvisProcessingRuntime {
 
   _tickCloud({ startup = false } = {}) {
     if (!this.cloudDispatcher || this.cloudInFlight || this.stopping) return;
+    if (!startup && !this.cloudStartupReady) return;
     const operation = Promise.resolve(
       startup ? this.cloudDispatcher.start() : this.cloudDispatcher.drainOnce()
     ).catch((error) => {
@@ -505,6 +524,38 @@ class JarvisProcessingRuntime {
       if (this.cloudInFlight === wrapped) this.cloudInFlight = null;
     });
     this.cloudInFlight = wrapped;
+  }
+
+  _tickReadyAnalysisRecovery() {
+    if (
+      !this.cloudStartupReady ||
+      !this.analysisStartupReady ||
+      this.stopping ||
+      this.analysisRecoveryInFlight ||
+      typeof this.analysisScheduler?.recoverReadySessions !== "function"
+    ) {
+      return;
+    }
+    const at = this.now();
+    if (
+      this.lastAnalysisRecoveryAt !== null &&
+      at - this.lastAnalysisRecoveryAt < this.analysisRecoveryIntervalMs
+    ) {
+      return;
+    }
+    this.lastAnalysisRecoveryAt = at;
+    const operation = Promise.resolve(
+      this.analysisScheduler.recoverReadySessions({ limit: 1 })
+    ).catch((error) => {
+      this.log({ phase: "analysis_ready_recovery", error });
+      return 0;
+    });
+    const wrapped = operation.finally(() => {
+      if (this.analysisRecoveryInFlight === wrapped) {
+        this.analysisRecoveryInFlight = null;
+      }
+    });
+    this.analysisRecoveryInFlight = wrapped;
   }
 
   async _runSessionPhase(sessions, startedAt, limit, visited) {
@@ -528,8 +579,11 @@ class JarvisProcessingRuntime {
         });
         this.repository.enqueueSpeakerIdentityResolutionJob?.(session.id, {
           at: this.now(),
+          diarizationPolicy: this.diarizationPolicy,
         });
-        const readiness = this.repository.refreshSessionReadiness(session.id, this.now());
+        const readiness = this.repository.refreshSessionReadiness(session.id, this.now(), {
+          diarizationPolicy: this.diarizationPolicy,
+        });
         if (readiness?.processing_state === "ready") {
           const localOnly =
             this.repository.isHistoricalLocalOnlyReprocessing?.(session.id) === true;
@@ -582,6 +636,7 @@ class JarvisProcessingRuntime {
       this.log({ phase: "daily_digest_tick", error });
     }
     this._tickCloud();
+    this._tickReadyAnalysisRecovery();
     if (this.prepareTranscriptionJobs) await this.prepareTranscriptionJobs();
     if (this.stopping || !this.running) return 0;
     let processed = await this._runJobPhase(startedAt, {
@@ -661,6 +716,11 @@ class JarvisProcessingRuntime {
       }
       try {
         await Promise.resolve(this.cloudInFlight);
+      } catch (error) {
+        primaryError ??= error;
+      }
+      try {
+        await Promise.resolve(this.analysisRecoveryInFlight);
       } catch (error) {
         primaryError ??= error;
       }
@@ -890,9 +950,7 @@ function createJarvisProcessingRuntime({
             process.pid,
             whisperManager?.serverManager?.process?.pid,
             ...(discoveredHybridManager?.ownedPids?.() ?? []),
-          ].filter(
-            (pid) => Number.isSafeInteger(pid) && pid > 0
-          )),
+          ].filter((pid) => Number.isSafeInteger(pid) && pid > 0)),
       cudaProvider: async () => {
         const startOptions = cudaManager?.getVerifiedStartOptions?.() ?? {
           useCuda: false,
@@ -913,8 +971,7 @@ function createJarvisProcessingRuntime({
     primarySpeakerEmbeddingHelper ??
     new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.PRIMARY });
   const effectiveReviewSpeakerEmbeddingHelper =
-    reviewSpeakerEmbeddingHelper ??
-    new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.REVIEW });
+    reviewSpeakerEmbeddingHelper ?? new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.REVIEW });
   const effectiveDualSpeakerVerifier =
     dualSpeakerVerifier ??
     new DualSpeakerVerifier({
@@ -964,6 +1021,7 @@ function createJarvisProcessingRuntime({
     now,
     governor: effectiveGovernor,
     heavyGate: effectiveGate,
+    log,
     classifyCapability: (job) =>
       job.job_type === "diarize_track"
         ? diarizationCapability()

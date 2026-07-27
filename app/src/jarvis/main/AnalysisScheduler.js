@@ -1,7 +1,7 @@
 const crypto = require("node:crypto");
 const { assertId } = require("../shared/contracts");
 
-const PROMPT_VERSION = "jarvis-analysis-v2";
+const PROMPT_VERSION = "jarvis-analysis-hierarchical-v3";
 
 function hashJson(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
@@ -274,7 +274,7 @@ class AnalysisScheduler {
     };
     this._setStatus(sessionId, "preparing");
     const prepared = this.memoryRepository.prepareAnalysisInput(request);
-    const built = this.inputBuilder.build(prepared);
+    const built = this.inputBuilder.build(prepared, { strategy: "hierarchical" });
     if (!built?.sendable) {
       return {
         status: this._setStatus(sessionId, "blocked", built?.reason || "analysis_input_invalid"),

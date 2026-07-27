@@ -212,6 +212,18 @@ describe("MemoryView processing timeline", () => {
     fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
 
     expect(await screen.findByText("正在处理")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "完整总结" }).closest("section")).toHaveClass(
+      "order-1"
+    );
+    expect(screen.getByRole("heading", { name: "说话人与声纹" }).closest("section")).toHaveClass(
+      "order-2"
+    );
+    expect(screen.getByRole("heading", { name: "录音与转写" }).closest("section")).toHaveClass(
+      "order-5"
+    );
+    const processingDetails = screen.getByText("处理详情与后台进度").closest("details");
+    expect(processingDetails).toHaveClass("order-4");
+    expect(processingDetails).toHaveAttribute("open");
     expect(getSessionTimeline).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 5_000));
 
@@ -733,7 +745,7 @@ describe("MemoryView processing timeline", () => {
     expect(screen.queryByText("过期的 A 音轨")).not.toBeInTheDocument();
   });
 
-  it("polls hidden runtime status at no more than 2 Hz and never overlaps IPC", async () => {
+  it("polls hidden runtime status at most once per 15 seconds and never overlaps IPC", async () => {
     const originalHidden = Object.getOwnPropertyDescriptor(document, "hidden");
     Object.defineProperty(document, "hidden", { configurable: true, value: true });
     const pendingPoll = deferred<JarvisRuntimeStatus>();
@@ -744,7 +756,7 @@ describe("MemoryView processing timeline", () => {
     let runtimePoll: (() => void) | null = null;
     const originalSetTimeout = window.setTimeout.bind(window);
     const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation((callback, delay) => {
-      if (delay === 2_000) {
+      if (delay === 15_000) {
         runtimePoll = callback as () => void;
         return 9 as unknown as ReturnType<typeof window.setTimeout>;
       }
@@ -769,7 +781,7 @@ describe("MemoryView processing timeline", () => {
       fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
 
       expect(await screen.findByText("正在监听")).toBeInTheDocument();
-      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 2_000);
+      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), 15_000);
 
       act(() => runtimePoll?.());
       act(() => runtimePoll?.());
@@ -779,7 +791,7 @@ describe("MemoryView processing timeline", () => {
         pendingPoll.resolve({ ...runtimeStatus, observedAt: 102_000 });
         await Promise.resolve();
       });
-      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 2_000);
+      expect(setTimeoutSpy).toHaveBeenLastCalledWith(expect.any(Function), 15_000);
 
       fireEvent.click(screen.getByRole("button", { name: "返回记忆库" }));
       expect(clearTimeoutSpy).toHaveBeenCalled();
@@ -908,6 +920,7 @@ describe("MemoryView processing timeline", () => {
         ],
         history: [],
         speakers,
+        fragmentedEvidenceCount: 140,
         summaryRefresh: {
           basis_policy_id: "legacy-v1",
           latest_policy_id: "hybrid-v2",
@@ -966,6 +979,7 @@ describe("MemoryView processing timeline", () => {
     expect(await screen.findByText("本次识别到 2–3 人")).toBeInTheDocument();
     expect(screen.getByText("本人声纹已确认")).toBeInTheDocument();
     expect(screen.getByText("说话人 2")).toBeInTheDocument();
+    expect(screen.getByText(/已隐藏 140 个过短或重复的声纹碎片/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "未知说话人" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "付费刷新总结" })).toBeInTheDocument();
     fireEvent.click(screen.getByText("处理详情与后台进度"));

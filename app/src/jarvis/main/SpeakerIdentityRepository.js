@@ -764,7 +764,7 @@ class SpeakerIdentityRepository {
           this.statements.updateSystemResolution.run({
             id: row.id,
             candidatePersonId: result.candidatePersonId,
-            candidatePersonRef: result.candidatePersonId,
+            candidatePersonRef: result.candidatePersonRef,
             state: result.state,
             score: result.score,
             margin: result.margin,
@@ -843,7 +843,7 @@ class SpeakerIdentityRepository {
           profileRevision: input.profileRevision,
           policyId: input.policyId,
           candidatePersonId: result.candidatePersonId,
-          candidatePersonRef: result.candidatePersonId,
+          candidatePersonRef: result.candidatePersonRef,
           state: result.state,
           score: result.score,
           margin: result.margin,
@@ -1915,13 +1915,25 @@ class SpeakerIdentityRepository {
           result.candidatePersonId === null || result.candidatePersonId === undefined
             ? null
             : assertId(result.candidatePersonId, "candidatePersonId");
+        const candidatePersonRef =
+          result.candidatePersonRef === null || result.candidatePersonRef === undefined
+            ? candidatePersonId
+            : assertId(result.candidatePersonRef, "candidatePersonRef");
         if (state !== "unknown" && candidatePersonId === null) {
           throw new TypeError("suggested and confirmed resolutions require a candidate person");
+        }
+        if (
+          candidatePersonId !== null &&
+          candidatePersonRef !== null &&
+          candidatePersonRef !== candidatePersonId
+        ) {
+          throw new TypeError("named speaker candidate reference must match its person");
         }
         return {
           evidenceRunId: assertId(result.evidenceRunId, "evidenceRunId"),
           clusterId: assertId(result.clusterId, "clusterId"),
           candidatePersonId,
+          candidatePersonRef,
           state,
           score: assertResolutionScore(result.score, "score"),
           margin: assertResolutionScore(result.margin, "margin", {

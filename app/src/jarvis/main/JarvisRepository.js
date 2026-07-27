@@ -27,6 +27,8 @@ const {
   buildIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
 const { SPEAKER_MODEL_KEYS, getSpeakerModelManifest } = require("./SpeakerModelManifest");
+const { buildBilingualPrompt, classifyTranscriptQuality } = require("./transcriptionQuality");
+const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -37,9 +39,13 @@ const MAX_CLOUD_LIMIT_MICROUSD = 10_000_000;
 const CLOUD_RESERVATION_MICROUSD = 100_000;
 const TRANSCRIPT_PROMPT_CODE_POINT_LIMIT = 1_024;
 const TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT = 800;
+const TRANSCRIPT_PROMPT_UNEXPECTED_SCRIPT =
+  /[\p{Script=Cyrillic}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Devanagari}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 const STABLE_CLUSTER_REUSE_THRESHOLD = 0.82;
 const STABLE_CLUSTER_REUSE_MARGIN = 0.05;
-const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
+const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
+const PUBLIC_SPEAKER_MIN_SPEECH_MS = 5_000;
+const PUBLIC_SPEAKER_MIN_WINDOWS = 3;
 const DIARIZATION_PRIORITY = Object.freeze({
   mic: 35,
   system_mix: 36,
@@ -61,6 +67,15 @@ const IDENTITY_PROFILE_DIMENSIONS = new Map([
   [SPEAKER_IDENTITY_RESOLUTION_POLICY.modelId, 512],
   ...DUAL_SPEAKER_MANIFESTS.map((manifest) => [manifest.modelId, manifest.embeddingDimension]),
 ]);
+
+function isPublicSpeakerCluster(cluster) {
+  return Boolean(
+    cluster &&
+      (cluster.linkState === "confirmed" ||
+        (cluster.speechMs >= PUBLIC_SPEAKER_MIN_SPEECH_MS &&
+          cluster.windowCount >= PUBLIC_SPEAKER_MIN_WINDOWS))
+  );
+}
 
 function runtimeJobStage({ job_type: jobType, state, priority }) {
   if (state === "retention_urgent" || (jobType === "transcribe_chunk" && priority === 0)) {
@@ -375,6 +390,22 @@ function derivedId(prefix, ...parts) {
 function takeCodePointTail(value, limit) {
   const points = Array.from(value);
   return points.slice(Math.max(0, points.length - limit)).join("");
+}
+
+function sanitizeTranscriptPromptText(value) {
+  const cleaned = value
+    .replace(TRANSCRIPT_PROMPT_UNEXPECTED_SCRIPT, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!cleaned) return "";
+  const quality = classifyTranscriptQuality(cleaned);
+  if (
+    quality.reasons.includes("repeated_phrase") ||
+    quality.reasons.includes("unexpected_language")
+  ) {
+    return "";
+  }
+  return cleaned;
 }
 
 function deepFreeze(value) {
@@ -1067,6 +1098,22 @@ class JarvisRepository {
           AND input_version = @inputVersion
           AND model_version = @modelVersion
       `),
+      supersedeShortApplicationDiarizationJobs: this.db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+            blocked_reason = NULL,
+            execution_device = NULL,
+            completed_at = @at
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND state IN ('pending','retry','blocked')
+          AND completed_at IS NULL
+      `),
       insertDiarizationStableCluster: this.db.prepare(`
         INSERT INTO speaker_clusters (
           id, session_id, track_id, local_label, model_id, embedding,
@@ -1167,12 +1214,58 @@ class JarvisRepository {
         JOIN people AS person ON person.id = sample.person_id
         ORDER BY sample.model_id, sample.person_id, sample.id
       `),
+      listAnonymousIdentityResolutionProfiles: this.db.prepare(`
+        WITH ranked_resolution AS (
+          SELECT
+            resolution.*,
+            run.commit_sequence,
+            ROW_NUMBER() OVER (
+              PARTITION BY resolution.cluster_id
+              ORDER BY run.commit_sequence DESC, resolution.created_at DESC, resolution.id DESC
+            ) AS rank
+          FROM speaker_identity_resolutions AS resolution
+          JOIN speaker_identity_resolution_runs AS run
+            ON run.id = resolution.resolution_run_id
+          WHERE resolution.actor = 'system'
+        )
+        SELECT
+          ranked.candidate_person_ref,
+          ranked.session_id,
+          ranked.cluster_id,
+          model.model_id,
+          model.artifact_version,
+          model.embedding_space,
+          model.embedding,
+          model.source_kind,
+          model.speech_ms,
+          model.window_count,
+          model.quality_score,
+          model.created_at
+        FROM ranked_resolution AS ranked
+        JOIN speaker_cluster_model_embeddings AS model
+          ON model.cluster_id = ranked.cluster_id
+        WHERE ranked.rank = 1
+          AND ranked.session_id <> @sessionId
+          AND ranked.candidate_person_id IS NULL
+          AND ranked.candidate_person_ref LIKE 'anonymous-speaker-%'
+          AND ranked.resolution_state = 'unknown'
+          AND ranked.reason IN (
+            'dual_model_anonymous_group',
+            'dual_model_anonymous_profile'
+          )
+          AND ranked.projection_applied = 1
+        ORDER BY
+          ranked.candidate_person_ref,
+          model.model_id,
+          ranked.session_id,
+          ranked.cluster_id
+      `),
       insertIdentityResolutionJob: this.db.prepare(`
         INSERT OR IGNORE INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state, priority,
           input_hash, input_version, model_version, created_at
         ) VALUES (
-          @id, @sessionId, NULL, NULL, 'resolve_identities', 'pending', 45,
+          @id, @sessionId, NULL, NULL, 'resolve_identities', 'pending', 37,
           @inputHash, 1, @policyId, @createdAt
         )
       `),
@@ -1409,6 +1502,17 @@ class JarvisRepository {
         ORDER BY ended_at DESC, id DESC
         LIMIT 16
       `),
+      listTranscriptPromptSegmentsByTrack: this.db.prepare(`
+        SELECT text FROM transcript_segments
+        WHERE session_id = @sessionId
+          AND track_id = @trackId
+          AND superseded_by IS NULL
+          AND duplicate_of IS NULL
+          AND is_stable = 1
+          AND length(trim(text)) > 0
+        ORDER BY ended_at DESC, id DESC
+        LIMIT 16
+      `),
       supersedeTranscriptSegment: this.db.prepare(`
         UPDATE transcript_segments
         SET superseded_by = @finalId
@@ -1451,6 +1555,7 @@ class JarvisRepository {
           track.track_kind,
           track.application_key,
           track.application_display_name,
+          track.attribution_state,
           track.capture_generation
         FROM transcript_segments AS segment
         JOIN audio_tracks AS track ON track.id = segment.track_id
@@ -2305,7 +2410,8 @@ class JarvisRepository {
       return { session, complete, isFinalized };
     };
 
-    this._refreshSessionReadiness = this.db.transaction((sessionId, at) => {
+    this._refreshSessionReadiness = this.db.transaction(
+      (sessionId, at, diarizationPolicy = SESSION_DIARIZATION_POLICY) => {
       const { session, complete, isFinalized } = this._inspectSessionTranscriptReadiness(sessionId);
       let fullyProcessed = complete;
       if (complete && this.statements.countSessionDiarizationJobs.get(sessionId).count > 0) {
@@ -2313,6 +2419,7 @@ class JarvisRepository {
           sessionId,
           at,
           policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+          diarizationPolicy,
         });
         fullyProcessed = false;
         if (snapshot.eligible) {
@@ -2343,7 +2450,8 @@ class JarvisRepository {
       const readyAt = fullyProcessed ? (session.ready_at ?? at) : null;
       this.statements.setSessionReadiness.run({ sessionId, processingState, readyAt });
       return this.statements.getSession.get(sessionId);
-    });
+      }
+    );
 
     this._commitDiarizationRun = this.db.transaction((input) => {
       const existing = this.statements.getDiarizationRun.get({
@@ -2919,9 +3027,20 @@ class JarvisRepository {
           .map((cluster) => cluster.cluster_id)
       )
     );
+    const clusterEvidence = new Map(
+      this.speakerIdentityRepository
+        .listSessionClusters(safeSessionId)
+        .map((cluster) => [cluster.id, cluster])
+    );
+    const publicClusterIds = new Set(
+      [...clusterIds].filter((clusterId) => {
+        const cluster = clusterEvidence.get(clusterId);
+        return isPublicSpeakerCluster(cluster);
+      })
+    );
     const speakers = this.speakerIdentityRepository
       .listSessionClusterViews(safeSessionId)
-      .filter((cluster) => clusterIds.has(cluster.id));
+      .filter((cluster) => publicClusterIds.has(cluster.id));
     const summaryRefresh =
       this.db
         .prepare("SELECT * FROM session_summary_refresh_state WHERE session_id = ?")
@@ -2932,6 +3051,7 @@ class JarvisRepository {
       latestRuns: latestRuns.map(projectDiarizationRun),
       history: allRuns.map(projectDiarizationRun),
       speakers,
+      fragmentedEvidenceCount: Math.max(0, clusterIds.size - publicClusterIds.size),
       summaryRefresh,
       reprocessing,
     };
@@ -3047,7 +3167,27 @@ class JarvisRepository {
           (total, entry) => total + (entry.audioChunk?.duration_ms ?? 0),
           0
         );
+        if (
+          track.track_kind === "application" &&
+          ApplicationAudioPolicy.isVirtualAudioInfrastructure({
+            applicationKey: track.application_key,
+            applicationDisplayName: track.application_display_name,
+          })
+        ) {
+          this.statements.supersedeShortApplicationDiarizationJobs.run({
+            sessionId: safeSessionId,
+            trackId: track.id,
+            at: safeAt,
+          });
+          skipped.push({ trackId: track.id, reason: "virtual_audio_infrastructure" });
+          continue;
+        }
         if (track.track_kind === "application" && audioMs < MIN_APPLICATION_DIARIZATION_AUDIO_MS) {
+          this.statements.supersedeShortApplicationDiarizationJobs.run({
+            sessionId: safeSessionId,
+            trackId: track.id,
+            at: safeAt,
+          });
           skipped.push({ trackId: track.id, reason: "speaker_audio_too_short" });
           continue;
         }
@@ -3239,6 +3379,7 @@ class JarvisRepository {
         clusters.push({
           evidenceRunId: run.id,
           clusterId: cluster.cluster_id,
+          trackId: track.id,
           modelId: run.embedding_model_id,
           embedding,
           speechMs: cluster.speech_ms,
@@ -3263,9 +3404,14 @@ class JarvisRepository {
     const rawProfiles = this.statements.listIdentityResolutionProfilesAll
       .all()
       .filter((sample) => IDENTITY_PROFILE_DIMENSIONS.has(sample.model_id));
-    const profileRevisionInput = rawProfiles.map((sample) => ({
+    const rawAnonymousProfiles = this.statements.listAnonymousIdentityResolutionProfiles
+      .all({ sessionId: safeSessionId })
+      .filter((sample) => IDENTITY_PROFILE_DIMENSIONS.has(sample.model_id));
+    const profileRevisionInput = [
+      ...rawProfiles.map((sample) => ({
       id: sample.id,
       personId: sample.person_id,
+      candidatePersonRef: sample.person_id,
       isSelf: sample.is_self === 1,
       modelId: sample.model_id,
       embeddingSha256: crypto.createHash("sha256").update(sample.embedding).digest("hex"),
@@ -3274,7 +3420,21 @@ class JarvisRepository {
       speechMs: sample.speech_ms,
       windowCount: sample.window_count,
       createdAt: sample.created_at,
-    }));
+      })),
+      ...rawAnonymousProfiles.map((sample) => ({
+        id: `${sample.candidate_person_ref}:${sample.cluster_id}:${sample.model_id}`,
+        personId: null,
+        candidatePersonRef: sample.candidate_person_ref,
+        isSelf: false,
+        modelId: sample.model_id,
+        embeddingSha256: crypto.createHash("sha256").update(sample.embedding).digest("hex"),
+        sourceClusterId: sample.cluster_id,
+        sourceKind: "system_anonymous",
+        speechMs: sample.speech_ms,
+        windowCount: sample.window_count,
+        createdAt: sample.created_at,
+      })),
+    ];
     const profileRevision = crypto
       .createHash("sha256")
       .update(JSON.stringify(profileRevisionInput))
@@ -3292,11 +3452,37 @@ class JarvisRepository {
       return {
         id: sample.id,
         personId: sample.person_id,
+        candidatePersonRef: sample.person_id,
         isSelf: sample.is_self === 1,
         modelId: sample.model_id,
+        sourceKind: sample.source_kind,
+        speechMs: sample.speech_ms,
+        windowCount: sample.window_count,
         embedding,
       };
     });
+    for (const sample of rawAnonymousProfiles) {
+      let embedding = null;
+      try {
+        embedding = this.speakerIdentityRepository.decodeStoredEmbedding(
+          sample.embedding,
+          IDENTITY_PROFILE_DIMENSIONS.get(sample.model_id)
+        );
+      } catch {
+        embedding = null;
+      }
+      samples.push({
+        id: `${sample.candidate_person_ref}:${sample.cluster_id}:${sample.model_id}`,
+        personId: null,
+        candidatePersonRef: sample.candidate_person_ref,
+        isSelf: false,
+        modelId: sample.model_id,
+        sourceKind: "system_anonymous",
+        speechMs: sample.speech_ms,
+        windowCount: sample.window_count,
+        embedding,
+      });
+    }
     return {
       eligible: true,
       reason: null,
@@ -3311,11 +3497,20 @@ class JarvisRepository {
 
   enqueueSpeakerIdentityResolutionJob(
     sessionId,
-    { at = Date.now(), policy = SPEAKER_IDENTITY_RESOLUTION_POLICY } = {}
+    {
+      at = Date.now(),
+      policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
+      diarizationPolicy = SESSION_DIARIZATION_POLICY,
+    } = {}
   ) {
     const safeAt = assertNonNegativeInteger(at, "at");
     assertExactIdentityResolutionPolicy(policy);
-    const snapshot = this.getSpeakerIdentityResolutionSnapshot({ sessionId, at: safeAt, policy });
+    const snapshot = this.getSpeakerIdentityResolutionSnapshot({
+      sessionId,
+      at: safeAt,
+      policy,
+      diarizationPolicy,
+    });
     if (!snapshot.eligible) return { enqueued: 0, job: null, reason: snapshot.reason };
     const inputHash = buildIdentityResolutionJobKey({
       sessionId: snapshot.sessionId,
@@ -3510,11 +3705,22 @@ class JarvisRepository {
     return this.getSession(safeSessionId);
   }
 
-  refreshSessionReadiness(sessionId, at = Date.now()) {
-    return this._refreshSessionReadiness(assertId(sessionId, "sessionId"), assertInteger(at, "at"));
+  refreshSessionReadiness(
+    sessionId,
+    at = Date.now(),
+    { diarizationPolicy = SESSION_DIARIZATION_POLICY } = {}
+  ) {
+    return this._refreshSessionReadiness(
+      assertId(sessionId, "sessionId"),
+      assertInteger(at, "at"),
+      diarizationPolicy
+    );
   }
 
-  reconcileHistoricalSpeakerReadiness(at = Date.now()) {
+  reconcileHistoricalSpeakerReadiness(
+    at = Date.now(),
+    { diarizationPolicy = SESSION_DIARIZATION_POLICY } = {}
+  ) {
     const safeAt = assertNonNegativeInteger(at, "at");
     const rows = this.statements.listHistoricalDiarizedSessionIds.all();
     const result = {
@@ -3525,7 +3731,7 @@ class JarvisRepository {
     };
     for (const row of rows) {
       const before = this.statements.getSession.get(row.id);
-      const after = this._refreshSessionReadiness(row.id, safeAt);
+      const after = this._refreshSessionReadiness(row.id, safeAt, diarizationPolicy);
       if (before?.processing_state === "ready" && after?.processing_state === "processing") {
         result.woken += 1;
       }
@@ -3600,21 +3806,23 @@ class JarvisRepository {
     return this._dedupeTranscript(safeSessionId, selectDuplicates);
   }
 
-  getTranscriptPrompt(sessionId) {
+  getTranscriptPrompt(sessionId, trackId = null) {
     const safeSessionId = assertId(sessionId, "sessionId");
-    const chronological = this.statements.listTranscriptPromptSegments
-      .all(safeSessionId)
+    const safeTrackId = trackId === null ? null : assertId(trackId, "trackId");
+    const rows =
+      safeTrackId === null
+        ? this.statements.listTranscriptPromptSegments.all(safeSessionId)
+        : this.statements.listTranscriptPromptSegmentsByTrack.all({
+            sessionId: safeSessionId,
+            trackId: safeTrackId,
+          });
+    const chronological = rows
       .reverse()
-      .map((row) => row.text.replace(/\s+/gu, " ").trim())
+      .map((row) => sanitizeTranscriptPromptText(row.text))
       .filter(Boolean)
       .join(" ");
     const context = takeCodePointTail(chronological, TRANSCRIPT_CONTEXT_CODE_POINT_LIMIT);
-    const instruction =
-      "这是真实的中英双语对话。中文写中文，English terms stay in English; do not translate or invent names.";
-    return takeCodePointTail(
-      context ? `${instruction}\nRecent context: ${context}` : instruction,
-      TRANSCRIPT_PROMPT_CODE_POINT_LIMIT
-    );
+    return takeCodePointTail(buildBilingualPrompt(context), TRANSCRIPT_PROMPT_CODE_POINT_LIMIT);
   }
 
   commitChunkTranscript({ chunk, result, modelVersion, completedAt }) {
@@ -3981,8 +4189,11 @@ class JarvisRepository {
     return transaction.immediate();
   }
 
-  getSessionDetail(id) {
+  getSessionDetail(id, { includeAudioChunks = true } = {}) {
     const sessionId = assertId(id, "sessionId");
+    if (typeof includeAudioChunks !== "boolean") {
+      throw new TypeError("includeAudioChunks must be a boolean");
+    }
     const session = this.getSession(sessionId);
     if (!session) return null;
     const legacySummary = this.db
@@ -4005,7 +4216,7 @@ class JarvisRepository {
       session,
       summary,
       segments: this.listTranscriptSegments(sessionId),
-      audioChunks: this.listAudioChunks(sessionId),
+      audioChunks: includeAudioChunks ? this.listAudioChunks(sessionId) : [],
       topics: this.db
         .prepare(
           `
@@ -4860,6 +5071,38 @@ class JarvisRepository {
     return this.activityClassificationRepository.listSessionEffective(sessionId);
   }
 
+  correctActivityClassification(input) {
+    return this.activityClassificationRepository.recordUserCorrection(input);
+  }
+
+  recordSuggestionDismissalFeedback(input) {
+    return this.activityClassificationRepository.recordSuggestionDismissal(input);
+  }
+
+  getSuggestionPersonalizationPenalty(summary) {
+    return this.activityClassificationRepository.suggestionPenalty(summary);
+  }
+
+  listPersonalizationRules() {
+    return this.activityClassificationRepository.listPersonalizationRules();
+  }
+
+  decidePersonalizationRule(input) {
+    return this.activityClassificationRepository.decidePersonalizationRule(input);
+  }
+
+  resetPersonalizationRules(input) {
+    return this.activityClassificationRepository.resetPersonalizationRules(input);
+  }
+
+  getNotificationPreferences() {
+    return this.activityClassificationRepository.getNotificationPreferences();
+  }
+
+  setNotificationPreferences(input) {
+    return this.activityClassificationRepository.setNotificationPreferences(input);
+  }
+
   undoSpeakerCorrection(clusterId) {
     return this.speakerIdentityRepository.undoLastCorrection(clusterId);
   }
@@ -4878,3 +5121,4 @@ class JarvisRepository {
 }
 
 module.exports = JarvisRepository;
+module.exports.isPublicSpeakerCluster = isPublicSpeakerCluster;

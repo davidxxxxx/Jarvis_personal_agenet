@@ -117,6 +117,15 @@ function createJarvisTranscribeWavAdapter({
   }
   if (typeof readFile !== "function") throw new TypeError("readFile must be a function");
   const configuredModel = model.trim();
+  const retryReasons = new Set(["unexpected_script", "unexpected_language", "repeated_phrase"]);
+  const qualityPenalty = (quality) =>
+    quality.reasons.reduce((total, reason) => {
+      if (reason === "blank_marker" || reason === "no_lexical_content") return total + 8;
+      if (reason === "unexpected_script") return total + 5;
+      if (reason === "repeated_phrase") return total + 4;
+      if (reason === "unexpected_language") return total + 3;
+      return total + 1;
+    }, 0);
   return async ({
     path: verifiedWavPath,
     language = null,
@@ -141,12 +150,49 @@ function createJarvisTranscribeWavAdapter({
           lowPriority: executionContext.device === "cpu",
         }
       : {};
-    return whisperManager.transcribeLocalWhisper(wav, {
+    const options = {
       model: configuredModel,
       language: null,
       initialPrompt: boundedPrompt || null,
       ...resourceOptions,
+    };
+    const automatic = await whisperManager.transcribeLocalWhisper(wav, options);
+    if (
+      automatic?.success === false ||
+      automatic?.noSpeech === true ||
+      typeof automatic?.text !== "string"
+    ) {
+      return automatic;
+    }
+    const automaticQuality = classifyTranscriptQuality(automatic.text);
+    if (!automaticQuality.reasons.some((reason) => retryReasons.has(reason))) {
+      return automatic;
+    }
+
+    const chineseInstruction = "主要语言是中文，保留英文术语；不要输出其他语言文字。";
+    const retryContextLimit = Math.max(
+      0,
+      JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT - Array.from(chineseInstruction).length - 1
+    );
+    const retryContext = Array.from(boundedPrompt).slice(-retryContextLimit).join("");
+    const chinesePrimary = await whisperManager.transcribeLocalWhisper(wav, {
+      ...options,
+      language: "zh",
+      initialPrompt: retryContext
+        ? `${chineseInstruction}\n${retryContext}`
+        : chineseInstruction,
     });
+    if (
+      chinesePrimary?.success === false ||
+      chinesePrimary?.noSpeech === true ||
+      typeof chinesePrimary?.text !== "string"
+    ) {
+      return automatic;
+    }
+    const retryQuality = classifyTranscriptQuality(chinesePrimary.text);
+    return qualityPenalty(retryQuality) < qualityPenalty(automaticQuality)
+      ? chinesePrimary
+      : automatic;
   };
 }
 
@@ -7154,6 +7200,31 @@ class IPCHandlers {
       await stopLiveSpeakerIdentification(inputBinding).catch(() => {});
     };
 
+    const startApplicationAudioForJarvis = async () => {
+      if (
+        !activeJarvisSessionId ||
+        !this.applicationAudioCapturePool ||
+        this.environmentManager.getApplicationAudioSettings?.().enabled === false
+      ) {
+        return;
+      }
+      const applicationAudioSettings =
+        this.environmentManager.getApplicationAudioSettings?.() ?? {};
+      await this.applicationAudioCapturePool
+        .start({
+          sessionId: activeJarvisSessionId,
+          configuredLimit: applicationAudioSettings.trackLimit,
+          fullscreen: this._jarvisFullscreenYieldActive === true,
+        })
+        .catch((error) => {
+          debugLogger.warn(
+            "Application audio capture unavailable; mixed system evidence remains active",
+            { error: error.message },
+            "meeting"
+          );
+        });
+    };
+
     const startMeetingSystemAudio = async (
       event,
       systemAudioMode,
@@ -7186,34 +7257,13 @@ class IPCHandlers {
       }
 
       if (systemAudioStrategy === "wasapi-loopback") {
+        let resolvedStrategy = systemAudioStrategy;
         try {
           await startManagedMeetingSystemAudio(
             event,
             this.windowsLoopbackAudioManager,
             "Windows system audio warning"
           );
-          if (
-            activeJarvisSessionId &&
-            this.applicationAudioCapturePool &&
-            this.environmentManager.getApplicationAudioSettings?.().enabled !== false
-          ) {
-            const applicationAudioSettings =
-              this.environmentManager.getApplicationAudioSettings?.() ?? {};
-            await this.applicationAudioCapturePool
-              .start({
-                sessionId: activeJarvisSessionId,
-                configuredLimit: applicationAudioSettings.trackLimit,
-                fullscreen: this._jarvisFullscreenYieldActive === true,
-              })
-              .catch((error) => {
-                debugLogger.warn(
-                  "Application audio capture unavailable; mixed system evidence remains active",
-                  { error: error.message },
-                  "meeting"
-                );
-              });
-          }
-          return { systemAudioMode, systemAudioStrategy };
         } catch (error) {
           debugLogger.warn(
             `Windows system audio helper failed ${context}, falling back to renderer loopback`,
@@ -7222,8 +7272,15 @@ class IPCHandlers {
           );
           // The renderer captures via Chromium's display-media loopback when
           // it sees the downgraded strategy in the start result.
-          return { systemAudioMode, systemAudioStrategy: "loopback" };
+          resolvedStrategy = "loopback";
         }
+        await startApplicationAudioForJarvis();
+        return { systemAudioMode, systemAudioStrategy: resolvedStrategy };
+      }
+
+      if (systemAudioStrategy === "loopback") {
+        await startApplicationAudioForJarvis();
+        return { systemAudioMode, systemAudioStrategy };
       }
 
       if (systemAudioStrategy !== "pipewire-loopback") {

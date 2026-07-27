@@ -430,6 +430,35 @@ test("startup finishes WAV cleanup after authority transaction crash", async (t)
   assert.equal(store.getChunk("c1").format, "flac");
 });
 
+test("startup skips deep decoding for healthy completed FLAC without crash artifacts", async (t) => {
+  const { db, store, reader, worker, makeWorker, job } = fixture(t);
+  await worker.run(job, FIXTURE_LEASE_CONTEXT);
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 101,
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE id = ?`
+  ).run(job.id);
+  let verifiedReads = 0;
+  const countingReader = {
+    async readVerifiedPcm(chunk) {
+      verifiedReads += 1;
+      return reader.readVerifiedPcm(chunk);
+    },
+  };
+
+  const recovered = await makeWorker({ reader: countingReader }).recoverStartup();
+
+  assert.deepEqual(recovered, {
+    promoted: 0,
+    deletedWavs: 0,
+    removedInvalid: 0,
+    rolledBack: 0,
+  });
+  assert.equal(verifiedReads, 0);
+  assert.equal(store.getChunk("c1").format, "flac");
+});
+
 for (const damage of ["missing", "corrupt"]) {
   test(`startup rolls ${damage} authoritative FLAC back to a verified WAV and retries`, async (t) => {
     const { db, store, pcm, wavPath, worker, makeWorker, job } = fixture(t);
@@ -1013,9 +1042,10 @@ test("retired provenance is private to the maintenance chunk API", (t) => {
 });
 
 test("startup records a diagnostic failure when neither FLAC nor sibling WAV is valid", async (t) => {
-  const { db, store, worker, makeWorker, job } = fixture(t);
+  const { db, store, wavPath, worker, makeWorker, job } = fixture(t);
   const compressed = await worker.run(job, FIXTURE_LEASE_CONTEXT);
   fs.writeFileSync(compressed.chunk.path, "corrupt-flac");
+  fs.writeFileSync(wavPath, "corrupt-wav");
 
   await makeWorker().recoverStartup();
 

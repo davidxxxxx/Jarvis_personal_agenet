@@ -219,6 +219,64 @@ test("historical v1 sessions enqueue v2 locally without overwriting legacy evide
   });
 });
 
+test("completed v2 runs are eligible for reprocessing after the clustering policy bump", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.db
+    .prepare(
+      `
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'bad-v2-run', 'session-cas', 'track-cas', ?, 'jarvis-hybrid-diarization-v2',
+      'pyannote-community-1', '3dspeaker-campplus-voxceleb-16k-v1', ?,
+      512, 16000, 2, 'cuda', 1, 5000, 5100
+    )
+  `
+    )
+    .run(snapshot.evidenceRevision, "f".repeat(64));
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
+
+  assert.deepEqual(
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
+    ["session-cas"]
+  );
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT state, input_version, model_version
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track' AND model_version = ?`
+      )
+      .get(HYBRID_DIARIZATION_POLICY.policyId),
+    {
+      state: "pending",
+      input_version: 2,
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    }
+  );
+});
+
 test("historical sessions without legacy speaker results are also eligible for local v2 analysis", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -942,23 +1000,73 @@ test("short application tracks do not fan out diarization jobs", (t) => {
     UPDATE audio_tracks
     SET source_type = 'system', application_key = 'chrome',
         application_display_name = 'Chrome', capture_generation = 1,
-        ended_at = 2500
+        ended_at = 60000
     WHERE id = 'track-cas';
     UPDATE audio_chunks
-    SET source_type = 'system', ended_at = 2500, duration_ms = 1500
+    SET source_type = 'system', ended_at = 60000, duration_ms = 59000,
+        expires_at = 200000
     WHERE track_id = 'track-cas';
     UPDATE transcript_segments
-    SET source_type = 'system', ended_at = 2500
+    SET source_type = 'system', ended_at = 60000
     WHERE track_id = 'track-cas';
+    UPDATE sessions SET ended_at = 70000 WHERE id = 'session-cas';
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-short-app-job', 'session-cas', 'track-cas', 'diarize_track', 'retry', 40,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 5500
+    );
   `);
 
   const result = enqueueFinalDiarization(repo, "session-cas", {
-    at: 6000,
+    at: 80000,
     policy: SESSION_DIARIZATION_POLICY,
   });
 
   assert.equal(result.enqueued, 0);
   assert.deepEqual(result.skipped, [{ trackId: "track-cas", reason: "speaker_audio_too_short" }]);
+  assert.deepEqual(
+    repo.db
+      .prepare("SELECT state, error_code, completed_at FROM processing_jobs WHERE id = ?")
+      .get("stale-short-app-job"),
+    {
+      state: "superseded",
+      error_code: "SPEAKER_AUDIO_TOO_SHORT",
+      completed_at: 80000,
+    }
+  );
+});
+
+test("virtual-audio infrastructure tracks never fan out diarization jobs", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'audiodg',
+        application_display_name = 'audiodg', capture_generation = 1,
+        ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', ended_at = 121000, duration_ms = 120000,
+        expires_at = 300000
+    WHERE track_id = 'track-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', ended_at = 121000
+    WHERE track_id = 'track-cas';
+    UPDATE sessions SET ended_at = 130000 WHERE id = 'session-cas';
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 140000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 0);
+  assert.deepEqual(result.skipped, [
+    { trackId: "track-cas", reason: "virtual_audio_infrastructure" },
+  ]);
 });
 
 test("nonterminal latest transcription never schedules diarization", (t) => {

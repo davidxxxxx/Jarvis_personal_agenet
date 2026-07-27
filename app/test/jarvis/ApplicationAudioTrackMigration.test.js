@@ -267,7 +267,7 @@ test("v32 records exact application and unknown fallback intervals without guess
 test("clean migrations reach the current schema and repeated source migration is idempotent", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 37);
+    assert.equal(TARGET_VERSION, 42);
     assert.deepEqual(applyJarvisMigrations(db, { now: () => 100 }), {
       fromVersion: 0,
       toVersion: TARGET_VERSION,

@@ -185,6 +185,11 @@ describe("durable knowledge views", () => {
           todoId: "todo_open",
           completedAt: 4,
         }),
+        decideKnowledgeTodo: vi.fn().mockResolvedValue({
+          status: "confirmed",
+          todoId: "todo_pending",
+          decidedAt: 4,
+        }),
         decideKnowledgeSuggestion: vi.fn().mockResolvedValue({
           status: "accepted",
           suggestionId: "suggestion_1",
@@ -217,7 +222,7 @@ describe("durable knowledge views", () => {
     expect(window.electronAPI.jarvis.listTopics).not.toHaveBeenCalled();
   });
 
-  it("allows only forward completion for v2 todos", async () => {
+  it("completes confirmed todos and allows undo from completed history", async () => {
     render(<TodosView />);
     const complete = await screen.findByRole("button", {
       name: "Complete / 完成 Prepare release build",
@@ -229,8 +234,17 @@ describe("durable knowledge views", () => {
     await waitFor(() =>
       expect(window.electronAPI.jarvis.completeKnowledgeTodo).toHaveBeenCalledWith("todo_open")
     );
-    expect(screen.queryByRole("button", { name: /reopen|重新打开/i })).not.toBeInTheDocument();
     expect(window.electronAPI.jarvis.listTodos).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: /已完成/ }));
+    fireEvent.click(screen.getByRole("button", { name: /查看待办 Review design/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Reopen|撤销完成/ }));
+    await waitFor(() =>
+      expect(window.electronAPI.jarvis.decideKnowledgeTodo).toHaveBeenCalledWith(
+        "todo_done",
+        "reopen"
+      )
+    );
   });
 
   it("keeps todo evidence out of the overview until the user opens the item", async () => {
@@ -255,7 +269,18 @@ describe("durable knowledge views", () => {
     ).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /查看待办 Review game commentary/ }));
-    expect(screen.getByText(/尚无可靠 SELF 承诺或用户确认/)).toBeVisible();
+    expect(screen.getByText(/归属证据还不足/)).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Confirm / 确认 Review game commentary",
+      })
+    );
+    await waitFor(() =>
+      expect(window.electronAPI.jarvis.decideKnowledgeTodo).toHaveBeenCalledWith(
+        "todo_pending",
+        "confirm"
+      )
+    );
   });
 
   it("keeps suggestions and conflicts explicit user decisions", async () => {

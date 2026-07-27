@@ -545,37 +545,83 @@ class CaptureEvidenceStore {
           )
       `),
       listClaimableJobs: db.prepare(`
-        SELECT * FROM processing_jobs
-        WHERE lane = 'local'
-          AND job_type IN (
+        SELECT job.* FROM processing_jobs AS job
+        WHERE job.lane = 'local'
+          AND job.job_type IN (
             'transcribe_chunk','preview_transcription','speaker',
             'diarize_track','resolve_identities','compress_chunk'
           )
-          AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
-          AND completed_at IS NULL
-          AND (next_retry_at IS NULL OR next_retry_at <= @at)
-          AND priority < @priorityBefore
-        ORDER BY priority ASC,
-          created_at ASC,
-          id ASC
+          AND job.state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
+          AND job.completed_at IS NULL
+          AND (job.next_retry_at IS NULL OR job.next_retry_at <= @at)
+          AND job.priority < @priorityBefore
+          AND NOT (
+            job.job_type = 'diarize_track'
+            AND EXISTS (
+              SELECT 1 FROM audio_tracks AS application_track
+              WHERE application_track.id = job.track_id
+                AND application_track.track_kind = 'application'
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM processing_jobs AS primary_job
+              JOIN audio_tracks AS primary_track ON primary_track.id = primary_job.track_id
+              WHERE primary_job.job_type = 'diarize_track'
+                AND primary_job.session_id = job.session_id
+                AND primary_job.completed_at IS NULL
+                AND primary_job.state NOT IN ('completed', 'superseded')
+                AND primary_track.track_kind IN ('mic', 'system_mix')
+            )
+          )
+        ORDER BY job.priority ASC,
+          CASE
+            WHEN job.job_type = 'diarize_track' THEN COALESCE(
+              (
+                SELECT COALESCE(session.ended_at, session.started_at)
+                FROM sessions AS session
+                WHERE session.id = job.session_id
+              ),
+              job.created_at
+            )
+          END DESC,
+          job.created_at ASC,
+          job.id ASC
         LIMIT @limit
       `),
       claimJob: db.prepare(`
-        UPDATE processing_jobs
+        UPDATE processing_jobs AS job
         SET state = 'running',
             attempt_count = attempt_count + 1,
             lease_owner = @owner,
             lease_expires_at = @leaseExpiresAt
-        WHERE id = @id
-          AND lane = 'local'
-          AND job_type IN (
+        WHERE job.id = @id
+          AND job.lane = 'local'
+          AND job.job_type IN (
             'transcribe_chunk','preview_transcription','speaker',
             'diarize_track','resolve_identities','compress_chunk'
           )
-          AND state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
-          AND completed_at IS NULL
-          AND (next_retry_at IS NULL OR next_retry_at <= @at)
-          AND priority < @priorityBefore
+          AND job.state IN ('pending', 'retry', 'retention_urgent', 'storage_recovery_compress')
+          AND job.completed_at IS NULL
+          AND (job.next_retry_at IS NULL OR job.next_retry_at <= @at)
+          AND job.priority < @priorityBefore
+          AND NOT (
+            job.job_type = 'diarize_track'
+            AND EXISTS (
+              SELECT 1 FROM audio_tracks AS application_track
+              WHERE application_track.id = job.track_id
+                AND application_track.track_kind = 'application'
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM processing_jobs AS primary_job
+              JOIN audio_tracks AS primary_track ON primary_track.id = primary_job.track_id
+              WHERE primary_job.job_type = 'diarize_track'
+                AND primary_job.session_id = job.session_id
+                AND primary_job.completed_at IS NULL
+                AND primary_job.state NOT IN ('completed', 'superseded')
+                AND primary_track.track_kind IN ('mic', 'system_mix')
+            )
+          )
       `),
       getProcessingJob: db.prepare("SELECT * FROM processing_jobs WHERE id = ?"),
       recoverExpiredJobLeases: db.prepare(`
@@ -1734,7 +1780,9 @@ class CaptureEvidenceStore {
         .all(sessionId)
         .filter((track) => !TERMINAL_TRACK_STATES.has(track.state));
       if (sources.length !== tracks.length) {
-        throw new Error("power restoration must include every session track that is open exactly once");
+        throw new Error(
+          "power restoration must include every session track that is open exactly once"
+        );
       }
       const seen = new Set();
       for (const source of sources) {
@@ -1881,7 +1929,10 @@ class CaptureEvidenceStore {
     }
     const applicationKey = track.applicationKey ?? null;
     const applicationDisplayName = track.applicationDisplayName ?? null;
-    if (track.sourceType === "mic" && (applicationKey !== null || applicationDisplayName !== null)) {
+    if (
+      track.sourceType === "mic" &&
+      (applicationKey !== null || applicationDisplayName !== null)
+    ) {
       throw new TypeError("microphone tracks cannot have application attribution");
     }
     if ((applicationKey === null) !== (applicationDisplayName === null)) {
@@ -2294,11 +2345,7 @@ class CaptureEvidenceStore {
   }
 
   wakeDailyDigestJob(inputRequest) {
-    assertExactPlainObject(
-      inputRequest,
-      ["digestInputId", "at"],
-      "daily digest wake input"
-    );
+    assertExactPlainObject(inputRequest, ["digestInputId", "at"], "daily digest wake input");
     const { digestInputId, at } = inputRequest;
     this._assertIdentifier(digestInputId, "digestInputId");
     this._assertNonNegativeSafeInteger(at, "at");
@@ -2308,10 +2355,7 @@ class CaptureEvidenceStore {
     return this.statements.getDailyDigestJobByInput.get(digestInputId);
   }
 
-  authorizeManualDailyDigestRetry(
-    id,
-    { allowUsageUnknown = false, at = this.now() } = {}
-  ) {
+  authorizeManualDailyDigestRetry(id, { allowUsageUnknown = false, at = this.now() } = {}) {
     this._assertIdentifier(id, "jobId");
     if (typeof allowUsageUnknown !== "boolean") {
       throw new TypeError("allowUsageUnknown must be a boolean");
@@ -2410,15 +2454,17 @@ class CaptureEvidenceStore {
   listAgentAdmissionBacklog({ priorityBefore = 70, excludeJobId = null } = {}) {
     this._assertPositiveSafeInteger(priorityBefore, "priorityBefore");
     if (excludeJobId !== null) this._assertIdentifier(excludeJobId, "excludeJobId");
-    return this.statements.listAgentAdmissionBacklog.all({ priorityBefore, excludeJobId }).map((row) => ({
-      jobType: row.job_type,
-      lane: row.lane,
-      state: ["retention_urgent", "storage_recovery_compress"].includes(row.state)
-        ? "pending"
-        : row.state,
-      priority: row.priority,
-      nextRetryAt: row.next_retry_at,
-    }));
+    return this.statements.listAgentAdmissionBacklog
+      .all({ priorityBefore, excludeJobId })
+      .map((row) => ({
+        jobType: row.job_type,
+        lane: row.lane,
+        state: ["retention_urgent", "storage_recovery_compress"].includes(row.state)
+          ? "pending"
+          : row.state,
+        priority: row.priority,
+        nextRetryAt: row.next_retry_at,
+      }));
   }
 
   countCloudLaneInFlight({ excludeJobId = null } = {}) {
@@ -2478,10 +2524,7 @@ class CaptureEvidenceStore {
     return this.statements.retryLeasedJob.run({ ...input, nextRetryAt, errorCode }).changes === 1;
   }
 
-  deferJob(
-    id,
-    { owner, at, nextRetryAt = at + 15_000, reason, preserveManualRetry = false }
-  ) {
+  deferJob(id, { owner, at, nextRetryAt = at + 15_000, reason, preserveManualRetry = false }) {
     const input = this._assertJobLeaseTransition(id, { owner, at });
     this._assertIdentifier(reason, "reason");
     if (typeof preserveManualRetry !== "boolean") {

@@ -1,7 +1,9 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 37;
-const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
+const TARGET_VERSION = 42;
+const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
+const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
+const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PHASE2_INTELLIGENCE_SCHEMA = `
@@ -6407,7 +6409,7 @@ function upgradeSpeakerSchedulingV37(db, migratedAt) {
           AND chunk.deleted_at IS NULL
       ), 0) < @minimumAudioMs
   `
-  ).run({ migratedAt, minimumAudioMs: MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+  ).run({ migratedAt, minimumAudioMs: LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS });
 
   db.exec(`
     UPDATE processing_jobs AS job
@@ -6421,6 +6423,487 @@ function upgradeSpeakerSchedulingV37(db, migratedAt) {
     WHERE job.job_type = 'diarize_track'
       AND job.state IN ('pending','retry','blocked')
       AND job.completed_at IS NULL;
+  `);
+}
+
+function upgradeRuntimeStatusIndexesV38(db) {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_processing_jobs_chunk_type_order
+    ON processing_jobs(
+      chunk_id, job_type, created_at DESC, id DESC, state, model_version
+    )
+    WHERE chunk_id IS NOT NULL;
+  `);
+}
+
+function upgradePrimarySpeakerSchedulingV39(db, migratedAt) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+          SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+        )
+          WHEN 'mic' THEN 35
+          WHEN 'system_mix' THEN 36
+          ELSE 40
+        END,
+        state = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN 'pending'
+          ELSE state
+        END,
+        next_retry_at = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE next_retry_at
+        END,
+        error_code = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE error_code
+        END,
+        blocked_reason = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE blocked_reason
+        END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+  `);
+}
+
+function upgradeSpeakerCompletionSchedulingV40(db, migratedAt) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs
+    SET priority = 37,
+        state = CASE WHEN state = 'running' THEN 'pending' ELSE state END,
+        next_retry_at = CASE WHEN state = 'running' THEN NULL ELSE next_retry_at END,
+        lease_owner = CASE WHEN state = 'running' THEN NULL ELSE lease_owner END,
+        lease_expires_at = CASE WHEN state = 'running' THEN NULL ELSE lease_expires_at END,
+        execution_device = CASE WHEN state = 'running' THEN NULL ELSE execution_device END
+    WHERE job_type = 'resolve_identities'
+      AND state IN ('pending','retry','blocked','running')
+      AND completed_at IS NULL;
+  `);
+}
+
+function upgradeTodoActionsV41(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS todo_verification_decisions (
+      id TEXT PRIMARY KEY,
+      todo_instance_id TEXT NOT NULL REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      state TEXT NOT NULL CHECK(
+        typeof(state) = 'text'
+        AND state IN ('pending_confirmation','confirmed','dismissed')
+      ),
+      reason TEXT NOT NULL CHECK(
+        typeof(reason) = 'text'
+        AND reason IN (
+          'strict_self_commitment',
+          'assigned_and_accepted',
+          'user_confirmed',
+          'user_dismissed'
+        )
+      ),
+      actor TEXT NOT NULL CHECK(typeof(actor) = 'text' AND actor IN ('system','user')),
+      source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+      occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at) = 'integer' AND occurred_at >= 0)
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_verification_decisions_latest
+      ON todo_verification_decisions(todo_instance_id, occurred_at DESC, id DESC);
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_immutable_update
+    BEFORE UPDATE OF id, todo_instance_id, state, reason, actor, occurred_at
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification decision is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_source_clear
+    BEFORE UPDATE OF source_analysis_input_id ON todo_verification_decisions
+    WHEN NOT (
+      OLD.source_analysis_input_id IS NOT NULL
+      AND NEW.source_analysis_input_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification source can only be cleared when its input is deleted');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_immutable_delete
+    BEFORE DELETE ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification decision cannot be deleted');
+    END;
+
+    DROP TRIGGER IF EXISTS todos_v2_terminal_state;
+    DROP TRIGGER IF EXISTS todos_v2_require_transition;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_insert;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_state;
+
+    CREATE TRIGGER todos_v2_terminal_state
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN OLD.status = 'dismissed' AND (
+      NEW.status IS NOT OLD.status
+      OR NEW.completed_at IS NOT OLD.completed_at
+      OR NEW.dismissed_at IS NOT OLD.dismissed_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'dismissed todo state is immutable');
+    END;
+    CREATE TRIGGER todos_v2_require_transition
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todo_state_transitions AS transition
+      WHERE transition.todo_instance_id = OLD.id
+        AND transition.id = (
+          SELECT latest.id
+          FROM todo_state_transitions AS latest
+          WHERE latest.todo_instance_id = OLD.id
+          ORDER BY latest.rowid DESC
+          LIMIT 1
+        )
+        AND (
+          (
+            transition.from_status IS NULL
+            AND OLD.status = 'open'
+            AND NEW.status = 'open'
+            AND NEW.completed_at IS NULL
+            AND NEW.dismissed_at IS NULL
+          )
+          OR (
+            transition.from_status = OLD.status
+            AND transition.to_status = NEW.status
+            AND (
+              (
+                NEW.status = 'completed'
+                AND NEW.completed_at = transition.occurred_at
+                AND NEW.dismissed_at IS NULL
+              )
+              OR (
+                NEW.status = 'dismissed'
+                AND NEW.dismissed_at = transition.occurred_at
+                AND NEW.completed_at IS NULL
+              )
+              OR (
+                OLD.status = 'completed'
+                AND NEW.status = 'open'
+                AND NEW.completed_at IS NULL
+                AND NEW.dismissed_at IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state change requires transition history');
+    END;
+    CREATE TRIGGER todo_state_transitions_validate_insert
+    BEFORE INSERT ON todo_state_transitions
+    WHEN COALESCE(
+      (
+        (
+          NEW.reason IN ('analysis_created','recurrence')
+          AND NEW.actor = 'system'
+          AND NEW.source_analysis_input_id IS NOT NULL
+          AND NEW.from_status IS NULL
+          AND NEW.to_status = 'open'
+        )
+        OR (
+          NEW.reason IN ('user_action','suggestion_acceptance')
+          AND NEW.actor = 'user'
+          AND NEW.source_analysis_input_id IS NULL
+          AND (
+            (NEW.from_status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+            OR (NEW.from_status = 'completed' AND NEW.to_status = 'open')
+          )
+        )
+      ),
+      0
+    ) = 0
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition reason contract is invalid');
+    END;
+    CREATE TRIGGER todo_state_transitions_validate_state
+    BEFORE INSERT ON todo_state_transitions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todos_v2 AS todo
+      WHERE todo.id = NEW.todo_instance_id
+        AND (
+          (
+            NEW.from_status IS NULL
+            AND NEW.to_status = 'open'
+            AND todo.status = 'open'
+          )
+          OR (
+            NEW.from_status = todo.status
+            AND (
+              (todo.status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+              OR (todo.status = 'completed' AND NEW.to_status = 'open')
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition is invalid');
+    END;
+  `);
+}
+
+function upgradePersonalizationV42(db, migratedAt) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS personalization_feedback (
+      id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      source_entity_id TEXT NOT NULL CHECK(
+        typeof(source_entity_id) = 'text'
+        AND length(trim(source_entity_id)) BETWEEN 1 AND 200
+      ),
+      original_value TEXT,
+      corrected_value TEXT NOT NULL CHECK(
+        typeof(corrected_value) = 'text'
+        AND length(trim(corrected_value)) BETWEEN 1 AND 200
+      ),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text' AND length(pattern_key) = 64
+      ),
+      feature_json TEXT NOT NULL CHECK(
+        typeof(feature_json) = 'text'
+        AND json_valid(feature_json)
+        AND json_type(feature_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      ),
+      UNIQUE(domain, source_entity_id, corrected_value)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_pattern
+    ON personalization_feedback(domain, pattern_key, corrected_value, occurred_at, id);
+
+    CREATE TABLE IF NOT EXISTS personalization_rules (
+      id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text' AND length(pattern_key) = 64
+      ),
+      target_value TEXT NOT NULL CHECK(
+        typeof(target_value) = 'text'
+        AND length(trim(target_value)) BETWEEN 1 AND 200
+      ),
+      label TEXT NOT NULL CHECK(
+        typeof(label) = 'text' AND length(trim(label)) BETWEEN 1 AND 500
+      ),
+      rule_json TEXT NOT NULL CHECK(
+        typeof(rule_json) = 'text'
+        AND json_valid(rule_json)
+        AND json_type(rule_json) = 'object'
+      ),
+      support_count INTEGER NOT NULL CHECK(
+        typeof(support_count) = 'integer' AND support_count >= 3
+      ),
+      state TEXT NOT NULL CHECK(state IN ('proposed','enabled','disabled','deleted')),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      UNIQUE(domain, pattern_key, target_value)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_rules_state
+    ON personalization_rules(domain, state, updated_at DESC, id);
+
+    CREATE TABLE IF NOT EXISTS personalization_rule_events (
+      id TEXT PRIMARY KEY,
+      rule_id TEXT REFERENCES personalization_rules(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK(action IN (
+        'proposed','enabled','disabled','edited','deleted','reset'
+      )),
+      previous_state TEXT CHECK(
+        previous_state IS NULL
+        OR previous_state IN ('proposed','enabled','disabled','deleted')
+      ),
+      next_state TEXT CHECK(
+        next_state IS NULL
+        OR next_state IN ('proposed','enabled','disabled','deleted')
+      ),
+      detail_json TEXT NOT NULL CHECK(
+        typeof(detail_json) = 'text'
+        AND json_valid(detail_json)
+        AND json_type(detail_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS jarvis_notification_preferences (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      focus_mode INTEGER NOT NULL DEFAULT 0 CHECK(focus_mode IN (0,1)),
+      muted_until INTEGER CHECK(
+        muted_until IS NULL
+        OR (typeof(muted_until) = 'integer' AND muted_until >= 0)
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= 0
+      )
+    );
+
+    INSERT OR IGNORE INTO jarvis_notification_preferences (
+      singleton, focus_mode, muted_until, updated_at
+    ) VALUES (1, 0, NULL, ${Number(migratedAt)});
+
+    UPDATE audio_tracks
+    SET application_key = 'tencent_meeting',
+        application_display_name = '腾讯会议'
+    WHERE application_key IN ('wemeetapp','wemeet','tencentmeeting');
+
+    UPDATE application_audio_intervals
+    SET application_key = 'tencent_meeting'
+    WHERE application_key IN ('wemeetapp','wemeet','tencentmeeting');
+
+    UPDATE audio_tracks
+    SET application_key = 'wechat',
+        application_display_name = '微信'
+    WHERE application_key IN ('weixin','wechat');
+
+    UPDATE application_audio_intervals
+    SET application_key = 'wechat'
+    WHERE application_key IN ('weixin','wechat');
+
+    DROP TRIGGER IF EXISTS personalization_feedback_immutable_update;
+    DROP TRIGGER IF EXISTS personalization_feedback_immutable_delete;
+    DROP TRIGGER IF EXISTS personalization_rule_events_immutable_update;
+    DROP TRIGGER IF EXISTS personalization_rule_events_immutable_delete;
+
+    CREATE TRIGGER personalization_feedback_immutable_update
+    BEFORE UPDATE ON personalization_feedback
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback is immutable');
+    END;
+
+    CREATE TRIGGER personalization_feedback_immutable_delete
+    BEFORE DELETE ON personalization_feedback
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback is immutable');
+    END;
+
+    CREATE TRIGGER personalization_rule_events_immutable_update
+    BEFORE UPDATE ON personalization_rule_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization rule events are immutable');
+    END;
+
+    CREATE TRIGGER personalization_rule_events_immutable_delete
+    BEFORE DELETE ON personalization_rule_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization rule events are immutable');
+    END;
   `);
 }
 
@@ -6733,6 +7216,21 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 37) {
         upgradeSpeakerSchedulingV37(db, migratedAt);
       }
+      if (fromVersion < 38) {
+        upgradeRuntimeStatusIndexesV38(db);
+      }
+      if (fromVersion < 39) {
+        upgradePrimarySpeakerSchedulingV39(db, migratedAt);
+      }
+      if (fromVersion < 40) {
+        upgradeSpeakerCompletionSchedulingV40(db, migratedAt);
+      }
+      if (fromVersion < 41) {
+        upgradeTodoActionsV41(db);
+      }
+      if (fromVersion < 42) {
+        upgradePersonalizationV42(db, migratedAt);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -6769,5 +7267,10 @@ module.exports = {
   upgradePhase2IntelligenceV34,
   upgradeEncryptedDiarizationEvidenceV35,
   upgradeSpeakerSchedulingV37,
+  upgradePrimarySpeakerSchedulingV39,
+  upgradeSpeakerCompletionSchedulingV40,
+  upgradeTodoActionsV41,
+  upgradePersonalizationV42,
+  upgradeRuntimeStatusIndexesV38,
   upgradeHybridDiarizationV36,
 };

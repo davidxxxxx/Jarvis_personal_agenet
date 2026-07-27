@@ -20,7 +20,12 @@ const JOB_PRIORITY = Object.freeze({
   daily_digest: 80,
 });
 const DEFAULT_SAMPLING_INTERVAL_MS = 15_000;
+const DEFAULT_RESTRICTIVE_SAMPLING_INTERVAL_MS = 60_000;
 const DEFAULT_VRAM_SAFETY_MARGIN_MB = 1_024;
+const LOW_FREQUENCY_RESOURCE_REASONS = new Set([
+  "external_gpu_busy",
+  "gpu_utilization_high",
+]);
 const MAX_CPU_FALLBACK_THREADS = 4;
 const CPU_UNSAFE_LOAD_PCT = 70;
 const GPU_UNSAFE_UTILIZATION_PCT = 90;
@@ -317,7 +322,7 @@ function createWindowsPowerProvider({
   platform = process.platform,
   execFileImpl = execFile,
   now = Date.now,
-  cacheMs = 60_000,
+  cacheMs = 5 * 60_000,
 } = {}) {
   if (typeof execFileImpl !== "function") throw new TypeError("execFileImpl must be a function");
   if (typeof now !== "function") throw new TypeError("now must be a function");
@@ -520,6 +525,7 @@ class ResourceGovernor {
     previewEnabled = true,
     safetyMarginMb = DEFAULT_VRAM_SAFETY_MARGIN_MB,
     sampleIntervalMs = DEFAULT_SAMPLING_INTERVAL_MS,
+    restrictiveSampleIntervalMs = DEFAULT_RESTRICTIVE_SAMPLING_INTERVAL_MS,
     resourceSettings = RESOURCE_GOVERNANCE_PRESETS.balanced,
   } = {}) {
     if (typeof now !== "function") throw new TypeError("now must be a function");
@@ -543,6 +549,14 @@ class ResourceGovernor {
     if (!Number.isSafeInteger(sampleIntervalMs) || sampleIntervalMs <= 0) {
       throw new RangeError("sampleIntervalMs must be a positive safe integer");
     }
+    if (
+      !Number.isSafeInteger(restrictiveSampleIntervalMs) ||
+      restrictiveSampleIntervalMs < sampleIntervalMs
+    ) {
+      throw new RangeError(
+        "restrictiveSampleIntervalMs must be a safe integer greater than or equal to sampleIntervalMs"
+      );
+    }
     const normalizedResourceSettings = normalizeResourceGovernanceSettings(resourceSettings);
     this.now = now;
     this.telemetryProvider = telemetryProvider;
@@ -555,6 +569,7 @@ class ResourceGovernor {
     this.previewEnabled = previewEnabled !== false;
     this.safetyMarginMb = safetyMarginMb;
     this.sampleIntervalMs = sampleIntervalMs;
+    this.restrictiveSampleIntervalMs = restrictiveSampleIntervalMs;
     this.resourceProfile = normalizedResourceSettings.profile;
     this.externalGpuThresholdPct = normalizedResourceSettings.externalGpuThresholdPct;
     this.recoveryWaitMs = normalizedResourceSettings.recoveryWaitMs;
@@ -589,7 +604,12 @@ class ResourceGovernor {
   async sample() {
     const sampledAt = this.now();
     const elapsed = sampledAt - (this.latestSnapshot?.sampledAt ?? sampledAt);
-    if (this.latestSnapshot && elapsed >= 0 && elapsed < this.sampleIntervalMs) {
+    const effectiveSampleIntervalMs = LOW_FREQUENCY_RESOURCE_REASONS.has(
+      this.latestSnapshot?.reason
+    )
+      ? this.restrictiveSampleIntervalMs
+      : this.sampleIntervalMs;
+    if (this.latestSnapshot && elapsed >= 0 && elapsed < effectiveSampleIntervalMs) {
       return this.latestSnapshot;
     }
     const ownedPids = this.ownedPidsProvider();
@@ -889,6 +909,8 @@ module.exports.ADMISSION_ACTIONS = ADMISSION_ACTIONS;
 module.exports.JOB_PRIORITY = JOB_PRIORITY;
 module.exports.orderJobs = orderJobs;
 module.exports.DEFAULT_SAMPLING_INTERVAL_MS = DEFAULT_SAMPLING_INTERVAL_MS;
+module.exports.DEFAULT_RESTRICTIVE_SAMPLING_INTERVAL_MS =
+  DEFAULT_RESTRICTIVE_SAMPLING_INTERVAL_MS;
 module.exports.DEFAULT_VRAM_SAFETY_MARGIN_MB = DEFAULT_VRAM_SAFETY_MARGIN_MB;
 module.exports.MAX_CPU_FALLBACK_THREADS = MAX_CPU_FALLBACK_THREADS;
 module.exports.CPU_UNSAFE_LOAD_PCT = CPU_UNSAFE_LOAD_PCT;

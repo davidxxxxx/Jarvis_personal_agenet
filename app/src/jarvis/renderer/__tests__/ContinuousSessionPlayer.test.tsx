@@ -229,7 +229,7 @@ describe("ContinuousSessionPlayer", () => {
     const readChunk = vi.fn(async () => new Uint8Array([1]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "电脑声音" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统音频·安全兜底" }));
     fireEvent.click(screen.getByRole("button", { name: "连续播放" }));
 
     await waitFor(() => expect(readChunk).toHaveBeenCalledWith("system-1"));
@@ -268,7 +268,7 @@ describe("ContinuousSessionPlayer", () => {
     );
     const view = render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
     fireEvent.click(screen.getByRole("button", { name: "连续播放" }));
-    fireEvent.click(screen.getByRole("button", { name: "电脑声音" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统音频·安全兜底" }));
     resolveRead?.(new Uint8Array([1]));
     await Promise.resolve();
     await Promise.resolve();
@@ -287,7 +287,7 @@ describe("ContinuousSessionPlayer", () => {
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={vi.fn()} />);
 
     expect(screen.getByTestId("source-lane-mic")).toHaveTextContent("麦克风");
-    expect(screen.getByTestId("source-lane-system")).toHaveTextContent("电脑声音");
+    expect(screen.getByTestId("source-lane-system")).toHaveTextContent("系统音频·安全兜底");
     expect(screen.getByText(/缺失 0.5 秒/)).toBeInTheDocument();
     expect(screen.getByText(/device_interrupted/)).toBeInTheDocument();
   });

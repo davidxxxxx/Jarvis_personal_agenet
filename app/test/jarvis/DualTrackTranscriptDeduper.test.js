@@ -274,6 +274,104 @@ test("keeps the exact application transcript as master over the mixed-system saf
   assert.ok(repository.getAudioChunk("chrome-final-chunk"));
 });
 
+test("suppresses a mixed fallback when one exact application covers the interval despite ASR drift", (t) => {
+  const { repository, deduper } = fixture(t);
+  const application = finalApplicationSegment(repository, {
+    id: "meeting-final",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "现在开始年度股东会议和财务报告",
+  });
+  segment(repository, {
+    id: "mixed-drifted",
+    sourceType: "system",
+    startedAt: 150,
+    endedAt: 1_050,
+    text: "字幕志愿者 李宗盛 感谢观看",
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mixed-drifted").duplicate_of, application.id);
+});
+
+test("suppresses a mixed fallback when one exact application dominates a short secondary app", (t) => {
+  const { repository, deduper } = fixture(t);
+  repository.createTrack({
+    id: "session-1-track-app-wechat",
+    sessionId: "session-1",
+    sourceType: "system",
+    applicationKey: "wechat",
+    applicationDisplayName: "WeChat",
+    captureGeneration: 1,
+    strategy: "wasapi-application-loopback",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 0,
+  });
+  const meeting = finalApplicationSegment(repository, {
+    id: "meeting-final",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "年度股东会议和财务报告",
+  });
+  finalApplicationSegment(repository, {
+    id: "wechat-final",
+    applicationKey: "wechat",
+    startedAt: 350,
+    endedAt: 600,
+    text: "微信短消息",
+  });
+  segment(repository, {
+    id: "mixed-drifted",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "字幕志愿者 感谢观看",
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 1 });
+  assert.equal(repository.getTranscriptSegment("mixed-drifted").duplicate_of, meeting.id);
+});
+
+test("keeps a mixed fallback when two exact applications cover the same interval", (t) => {
+  const { repository, deduper } = fixture(t);
+  repository.createTrack({
+    id: "session-1-track-app-kook",
+    sessionId: "session-1",
+    sourceType: "system",
+    applicationKey: "kook",
+    applicationDisplayName: "KOOK",
+    captureGeneration: 1,
+    strategy: "wasapi-application-loopback",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 0,
+  });
+  finalApplicationSegment(repository, {
+    id: "chrome-final",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "Chrome 视频",
+  });
+  finalApplicationSegment(repository, {
+    id: "kook-final",
+    applicationKey: "kook",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "KOOK 通话",
+  });
+  segment(repository, {
+    id: "mixed-ambiguous",
+    sourceType: "system",
+    startedAt: 100,
+    endedAt: 1_100,
+    text: "混合系统音频",
+  });
+
+  assert.deepEqual(deduper.dedupe("session-1"), { duplicatesMarked: 0 });
+  assert.equal(repository.getTranscriptSegment("mixed-ambiguous").duplicate_of, null);
+});
+
 test("prefers the application master when MIC echo matches both application and mixed system", (t) => {
   const { repository, deduper } = fixture(t);
   const application = finalApplicationSegment(repository, {

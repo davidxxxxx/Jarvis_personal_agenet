@@ -3,10 +3,11 @@ const WindowsLoopbackAudioManager = require("../../helpers/windowsLoopbackAudioM
 const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
 const { createApplicationAudioStatus } = require("./ApplicationAudioStatus");
 
-const DEFAULT_SILENCE_RELEASE_MS = 15_000;
+const DEFAULT_SILENCE_RELEASE_MS = 60_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_PREBUFFER_MS = 2_000;
 const DEFAULT_SELECTION_DEBOUNCE_MS = 2_000;
+const DEFAULT_SESSION_INACTIVE_GRACE_MS = 15_000;
 const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
 const MAX_CANDIDATE_COUNT = 256;
@@ -49,6 +50,7 @@ class ApplicationAudioCapturePool {
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     prebufferMs = DEFAULT_PREBUFFER_MS,
     selectionDebounceMs = DEFAULT_SELECTION_DEBOUNCE_MS,
+    sessionInactiveGraceMs = DEFAULT_SESSION_INACTIVE_GRACE_MS,
     onTrackStarted = () => {},
     onTrackEnded = () => {},
     onAttributionChange = () => {},
@@ -68,6 +70,10 @@ class ApplicationAudioCapturePool {
     this.selectionDebounceMs = Math.max(
       0,
       Math.min(10_000, selectionDebounceMs ?? DEFAULT_SELECTION_DEBOUNCE_MS)
+    );
+    this.sessionInactiveGraceMs = Math.max(
+      1_000,
+      Math.min(60_000, sessionInactiveGraceMs ?? DEFAULT_SESSION_INACTIVE_GRACE_MS)
     );
     this.onTrackStarted = onTrackStarted;
     this.onTrackEnded = onTrackEnded;
@@ -194,11 +200,13 @@ class ApplicationAudioCapturePool {
           pids: new Map(),
           blockedUntil: 0,
           firstSeenAt: at,
+          inactiveSinceAt: null,
         };
         this.candidates.set(event.applicationKey, candidate);
       }
       candidate.applicationDisplayName = event.applicationDisplayName;
       if (event.state === "active") {
+        candidate.inactiveSinceAt = null;
         candidate.pids.set(event.pid, {
           pid: event.pid,
           peak: event.peak,
@@ -208,8 +216,11 @@ class ApplicationAudioCapturePool {
       } else {
         candidate.pids.delete(event.pid);
         if (candidate.pids.size === 0) {
-          this.candidates.delete(event.applicationKey);
-          this.fallbacks.delete(event.applicationKey);
+          candidate.inactiveSinceAt = at;
+          if (!this.activeTracks.has(event.applicationKey)) {
+            this.candidates.delete(event.applicationKey);
+            this.fallbacks.delete(event.applicationKey);
+          }
         }
       }
       await this._reconcile(at);
@@ -242,6 +253,17 @@ class ApplicationAudioCapturePool {
         if (candidate) candidate.blockedUntil = at + this.retryDelayMs;
         this._setFallback(track, "confirmed_silence", at + this.retryDelayMs);
         await this._stopTrack(applicationKey, "confirmed_silence", at);
+      }
+      for (const [applicationKey, candidate] of [...this.candidates]) {
+        if (
+          candidate.pids.size === 0 &&
+          !this.activeTracks.has(applicationKey) &&
+          candidate.inactiveSinceAt !== null &&
+          at - candidate.inactiveSinceAt >= this.sessionInactiveGraceMs
+        ) {
+          this.candidates.delete(applicationKey);
+          this.fallbacks.delete(applicationKey);
+        }
       }
       await this._reconcile(at);
     });
@@ -276,9 +298,26 @@ class ApplicationAudioCapturePool {
   _candidateList(at) {
     const result = [];
     for (const candidate of this.candidates.values()) {
-      if (candidate.blockedUntil > at || candidate.pids.size === 0) continue;
+      if (candidate.blockedUntil > at) continue;
       const activePid = this.activeTracks.get(candidate.applicationKey)?.pid;
-      const process = [...candidate.pids.values()].sort((left, right) => {
+      let processes = [...candidate.pids.values()];
+      if (
+        processes.length === 0 &&
+        activePid &&
+        candidate.inactiveSinceAt !== null &&
+        at - candidate.inactiveSinceAt < this.sessionInactiveGraceMs
+      ) {
+        processes = [
+          {
+            pid: activePid,
+            peak: 0,
+            isForeground: false,
+            lastSeenAt: candidate.inactiveSinceAt,
+          },
+        ];
+      }
+      if (processes.length === 0) continue;
+      const process = processes.sort((left, right) => {
         if (left.pid === activePid && right.pid !== activePid) return -1;
         if (right.pid === activePid && left.pid !== activePid) return 1;
         if (right.isForeground !== left.isForeground) return right.isForeground ? 1 : -1;

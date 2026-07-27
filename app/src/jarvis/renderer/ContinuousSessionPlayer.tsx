@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import SpeakerChip from "./SpeakerChip";
 import { useJarvisStore } from "./jarvisStore";
+import { normalizeWavForPlayback } from "./playbackLoudness";
 
 type PlaybackMode = "mix" | "mic" | "system";
 
@@ -42,8 +43,53 @@ function orderedChunks(chunks: JarvisAudioChunk[]): JarvisAudioChunk[] {
     );
 }
 
+function overlapMs(left: JarvisAudioChunk, right: JarvisAudioChunk): number {
+  return Math.max(
+    0,
+    Math.min(left.ended_at, right.ended_at) -
+      Math.max(left.started_at, right.started_at)
+  );
+}
+
+export function preferredSystemChunks(
+  chunks: JarvisAudioChunk[],
+  timeline: JarvisSessionTimeline
+): JarvisAudioChunk[] {
+  const trackById = new Map(timeline.tracks.map((track) => [track.id, track]));
+  const applicationChunks = chunks.filter(
+    (chunk) =>
+      trackById.get(chunk.track_id ?? "")?.track_kind === "application" &&
+      trackById.get(chunk.track_id ?? "")?.attribution_state === "exact"
+  );
+  return chunks.filter((chunk) => {
+    if (chunk.source_type !== "system") return false;
+    if (trackById.get(chunk.track_id ?? "")?.track_kind !== "system_mix") return true;
+    const duration = Math.max(1, chunk.ended_at - chunk.started_at);
+    const covered = applicationChunks
+      .filter((candidate) => overlapMs(chunk, candidate) > 0)
+      .map((candidate) => [
+        Math.max(chunk.started_at, candidate.started_at),
+        Math.min(chunk.ended_at, candidate.ended_at),
+      ] as const)
+      .sort((left, right) => left[0] - right[0] || left[1] - right[1])
+      .reduce(
+        (state, range) => {
+          const last = state.ranges[state.ranges.length - 1];
+          if (!last || range[0] > last[1]) {
+            state.ranges.push([range[0], range[1]]);
+          } else {
+            last[1] = Math.max(last[1], range[1]);
+          }
+          return state;
+        },
+        { ranges: [] as Array<[number, number]> }
+      ).ranges.reduce((total, range) => total + range[1] - range[0], 0);
+    return covered / duration < 0.8;
+  });
+}
+
 function laneLabel(source: "mic" | "system"): string {
-  return source === "mic" ? "麦克风" : "电脑声音";
+  return source === "mic" ? "麦克风" : "系统音频·安全兜底";
 }
 
 function timeLabel(at: number): string {
@@ -158,6 +204,10 @@ export default function ContinuousSessionPlayer({
   );
 
   const allPlayable = useMemo(() => orderedChunks(timeline.chunks), [timeline.chunks]);
+  const systemPlayable = useMemo(
+    () => preferredSystemChunks(allPlayable, timeline),
+    [allPlayable, timeline]
+  );
   const playableChunkIds = useMemo(
     () => new Set(allPlayable.map((chunk) => chunk.id)),
     [allPlayable]
@@ -167,9 +217,17 @@ export default function ContinuousSessionPlayer({
     [allPlayable]
   );
   const queue = useMemo(
-    () =>
-      mode === "mix" ? allPlayable : allPlayable.filter((chunk) => chunk.source_type === mode),
-    [allPlayable, mode]
+    () => {
+      if (mode === "mic") {
+        return allPlayable.filter((chunk) => chunk.source_type === "mic");
+      }
+      if (mode === "system") return systemPlayable;
+      return orderedChunks([
+        ...allPlayable.filter((chunk) => chunk.source_type === "mic"),
+        ...systemPlayable,
+      ]);
+    },
+    [allPlayable, mode, systemPlayable]
   );
   const intervalFailures = useMemo(() => {
     const seen = new Set<string>();
@@ -221,8 +279,9 @@ export default function ContinuousSessionPlayer({
           setWarning(`已跳过 ${skipped} 段不可用音频。时间线中的缺口仍会保留。`);
           continue;
         }
-        const copy = new Uint8Array(bytes.byteLength);
-        copy.set(bytes);
+        const normalized = normalizeWavForPlayback(bytes, chunk.source_type);
+        const copy = new Uint8Array(normalized.bytes.byteLength);
+        copy.set(normalized.bytes);
         const url = URL.createObjectURL(new Blob([copy], { type: "audio/wav" }));
         if (generation !== generationRef.current) {
           URL.revokeObjectURL(url);
@@ -416,9 +475,10 @@ export default function ContinuousSessionPlayer({
             {playing ? "停止播放" : "连续播放"}
           </button>
         </div>
-        <p className="mt-2 text-xs text-muted-foreground">
-          点击任意一条转写，从该句起点播放，并在该句结束时间自动停止。
-        </p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            点击任意一条转写，从该句起点播放，并在该句结束时间自动停止。播放时会自动统一响度，
+            原始录音不会被修改。
+          </p>
       </div>
 
       {!allPlayable.length && (

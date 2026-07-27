@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const {
   DAILY_DIGEST_TOOL,
   DailyDigestSchemaError,
+  salvageCandidateDailyDigest,
   validateCandidateDailyDigest,
 } = require("./DailyDigestSchema");
 const { compileRedactionTerms } = require("./AnalysisInputBuilder");
@@ -415,20 +416,26 @@ function extractCandidate(body) {
   }
   const choice = body.choices[0];
   const message = choice?.message;
-  if (!isPlainObject(message) || Object.prototype.hasOwnProperty.call(message, "function_call")) {
+  if (!isPlainObject(message)) throw clientError("invalid_structure");
+  const hasFinishReason = Object.prototype.hasOwnProperty.call(choice, "finish_reason");
+  const legacyCall = message.function_call;
+  const toolCalls = message.tool_calls;
+  if (toolCalls !== undefined && !Array.isArray(toolCalls)) {
     throw clientError("invalid_structure");
   }
-  const hasFinishReason = Object.prototype.hasOwnProperty.call(choice, "finish_reason");
-  const toolCalls = message.tool_calls;
-  if (toolCalls !== undefined && (!Array.isArray(toolCalls) || toolCalls.length > 0)) {
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
     if (hasFinishReason && choice.finish_reason !== "tool_calls") {
       throw clientError("invalid_structure");
     }
     if (!Array.isArray(toolCalls) || toolCalls.length !== 1) {
       throw clientError("invalid_structure");
     }
+    if (legacyCall !== undefined && legacyCall !== null) {
+      throw clientError("invalid_structure");
+    }
     const call = toolCalls[0];
     if (
+      (call?.type !== undefined && call.type !== "function") ||
       call?.function?.name !== "submit_jarvis_daily_digest" ||
       typeof call?.function?.arguments !== "string"
     ) {
@@ -437,6 +444,22 @@ function extractCandidate(body) {
     // MiniMax M2.7 can include reasoning content beside a valid tool call.
     // Only the validated tool arguments are eligible for persistence.
     return parseJsonObject(call.function.arguments);
+  }
+  if (legacyCall !== undefined && legacyCall !== null) {
+    if (
+      hasFinishReason &&
+      !new Set(["stop", "function_call"]).has(choice.finish_reason)
+    ) {
+      throw clientError("invalid_structure");
+    }
+    if (
+      !isPlainObject(legacyCall) ||
+      legacyCall.name !== "submit_jarvis_daily_digest" ||
+      typeof legacyCall.arguments !== "string"
+    ) {
+      throw clientError("invalid_structure");
+    }
+    return parseJsonObject(legacyCall.arguments);
   }
   if (hasFinishReason && choice.finish_reason !== "stop") {
     throw clientError("invalid_structure");
@@ -676,7 +699,12 @@ class MiniMaxDailyDigestClient {
         const parsed = extractCandidate(envelopeBody);
         let result;
         try {
-          result = validateCandidateDailyDigest(parsed, normalized.validationContext);
+          try {
+            result = validateCandidateDailyDigest(parsed, normalized.validationContext);
+          } catch (error) {
+            if (!(error instanceof DailyDigestSchemaError)) throw error;
+            result = salvageCandidateDailyDigest(parsed, normalized.validationContext);
+          }
         } catch (error) {
           if (error instanceof DailyDigestSchemaError) {
             throw clientError("invalid_structure", false, error.issueCode);

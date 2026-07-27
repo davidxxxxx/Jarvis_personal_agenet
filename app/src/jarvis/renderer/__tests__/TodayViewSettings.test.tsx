@@ -21,6 +21,7 @@ describe("TodayView settings drawer", () => {
   it("keeps the right column concise and opens all advanced settings on demand", () => {
     render(
       <TodayView
+        onViewAllTodos={() => {}}
         recording={
           {
             session: { id: null },

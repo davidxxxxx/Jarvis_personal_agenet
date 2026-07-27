@@ -249,6 +249,8 @@ test("uses only the official HTTPS endpoint and privacy-preserving fetch options
   assert.equal(captured.body.reasoning_split, true);
   assert.equal(captured.body.temperature, 0.1);
   assert.equal(captured.body.max_completion_tokens, 8192);
+  assert.match(captured.body.messages[0].content, /evidence clusters, not verified people/);
+  assert.match(captured.body.messages[0].content, /Never infer participant count/);
   assert.equal(captured.body.messages[1].content, analysisInput().cloudPayloadJson);
   assert.equal("allowedSegmentIds" in captured.body, false);
 

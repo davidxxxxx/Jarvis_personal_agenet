@@ -106,7 +106,7 @@ class JarvisTranscriptionWorker {
       throw codedError("AUDIO_UNAVAILABLE");
     }
 
-    const initialPrompt = this.repository.getTranscriptPrompt(chunk.session_id);
+    const initialPrompt = this.repository.getTranscriptPrompt(chunk.session_id, chunk.track_id);
     let transcriptionStarted = false;
     let rawResult;
     try {

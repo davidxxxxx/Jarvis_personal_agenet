@@ -204,6 +204,28 @@ test("promotes only a verified immutable runtime and resolves it through current
   assert.equal(manager.isVerified({ gpuUuid: "GPU-test" }), true);
 });
 
+test("reuses a verified runtime fingerprint instead of rehashing large CUDA files on every status poll", async (t) => {
+  const { root, manager } = makeManager(t);
+  await manager.installPinnedCudaRuntime({ consent: true });
+  let hashCalls = 0;
+  const fresh = new WhisperCudaManager({
+    platform: "win32",
+    componentRoot: root,
+    manifest: manager.manifest,
+    sha256FileSync: (filePath) => {
+      hashCalls += 1;
+      return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+    },
+  });
+
+  assert.equal(fresh.getStatus({ gpuUuid: "GPU-test" }).verified, true);
+  const firstStatusHashCalls = hashCalls;
+  assert.ok(firstStatusHashCalls >= 3);
+  assert.equal(fresh.getStatus({ gpuUuid: "GPU-test" }).verified, true);
+  assert.equal(fresh.getVerifiedStartOptions({ enabled: true }).useCuda, true);
+  assert.equal(hashCalls, firstStatusHashCalls);
+});
+
 test("rejects malformed or escaping pointers", (t) => {
   const { root, manager } = makeManager(t);
   fs.writeFileSync(

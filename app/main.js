@@ -306,9 +306,7 @@ const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService
 const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
 const VoiceSpeechDurationMeasurer = require("./src/jarvis/main/VoiceSpeechDurationMeasurer");
 const VoiceEmbeddingCipher = require("./src/jarvis/main/VoiceEmbeddingCipher");
-const HistoricalSelfVoiceRecoveryService = require(
-  "./src/jarvis/main/HistoricalSelfVoiceRecoveryService"
-);
+const HistoricalSelfVoiceRecoveryService = require("./src/jarvis/main/HistoricalSelfVoiceRecoveryService");
 const secretCrypto = require("./src/helpers/secretCrypto");
 const {
   DataRootConfig,
@@ -336,17 +334,13 @@ const {
   RendererShutdownHandshake,
 } = require("./src/jarvis/main/GracefulShutdownCoordinator");
 const { createJarvisProcessingRuntime } = require("./src/jarvis/main/JarvisProcessingRuntime");
-const {
-  installBundledAiModelPackIfPresent,
-} = require("./src/jarvis/main/AiModelPackInstaller");
+const { installBundledAiModelPackIfPresent } = require("./src/jarvis/main/AiModelPackInstaller");
 const { resolveJarvisWhisperModel } = require("./src/jarvis/main/JarvisWhisperModel");
 const { createJarvisOwnedPidsProvider } = require("./src/jarvis/main/JarvisProcessOwnership");
 const { createWindowsForegroundActivityProvider } = require("./src/jarvis/main/ResourceGovernor");
 const { resolveFullscreenYieldActive } = require("./src/jarvis/main/FullscreenYieldPolicy");
 const ApplicationAudioCapturePool = require("./src/jarvis/main/ApplicationAudioCapturePool");
-const ApplicationAudioLifecycleCoordinator = require(
-  "./src/jarvis/main/ApplicationAudioLifecycleCoordinator"
-);
+const ApplicationAudioLifecycleCoordinator = require("./src/jarvis/main/ApplicationAudioLifecycleCoordinator");
 const {
   JarvisProcessingLifecycle,
   createJarvisRuntimeMigrationParticipant,
@@ -445,10 +439,16 @@ function buildJarvisProcessingRuntime() {
         now,
         log: (entry) => debugLogger?.info("Jarvis agent cloud", entry, "jarvis"),
       }),
-    log: ({ phase, sessionId, error }) =>
+    log: ({ phase, sessionId, jobId, jobType, error }) =>
       debugLogger?.warn(
         "Jarvis background processing failed",
-        { phase, sessionId: sessionId ?? null, error: error?.message ?? String(error) },
+        {
+          phase,
+          sessionId: sessionId ?? null,
+          jobId: jobId ?? null,
+          jobType: jobType ?? null,
+          error: error?.message ?? String(error),
+        },
         "jarvis"
       ),
   });
@@ -742,10 +742,7 @@ async function initializeCoreManagers() {
   voiceProfileStore.importLegacySelfProfileSafely((details) =>
     debugLogger.warn("Jarvis skipped an invalid legacy voice profile", details, "jarvis")
   );
-  const {
-    SpeakerEmbeddings,
-    SPEAKER_MODEL_KEYS,
-  } = require("./src/helpers/speakerEmbeddings");
+  const { SpeakerEmbeddings, SPEAKER_MODEL_KEYS } = require("./src/helpers/speakerEmbeddings");
   const primarySpeakerEmbeddings = new SpeakerEmbeddings({
     modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
   });
@@ -765,12 +762,8 @@ async function initializeCoreManagers() {
     argument.startsWith("--recover-self-turn-groups=")
   );
   if (historicalRecoveryArgument) {
-    const serializedGroups = historicalRecoveryArgument.slice(
-      "--recover-self-turn-groups=".length
-    );
-    const turnGroups = serializedGroups
-      .split("|")
-      .map((group) => group.split("+").filter(Boolean));
+    const serializedGroups = historicalRecoveryArgument.slice("--recover-self-turn-groups=".length);
+    const turnGroups = serializedGroups.split("|").map((group) => group.split("+").filter(Boolean));
     const recoveryService = new HistoricalSelfVoiceRecoveryService({
       repository: jarvisRepository,
       audioEvidenceReader: jarvisService.audioEvidenceReader,
@@ -798,13 +791,6 @@ async function initializeCoreManagers() {
       );
     }
   }
-  const historicalSpeakerReadiness =
-    jarvisRepository.reconcileHistoricalSpeakerReadiness(Date.now());
-  debugLogger.info(
-    "Jarvis historical speaker readiness reconciliation",
-    historicalSpeakerReadiness,
-    "jarvis"
-  );
   environmentManager = new EnvironmentManager();
   jarvisAnalysisScheduler = {
     analyzeSession(sessionId, kind, options) {
@@ -909,15 +895,12 @@ async function initializeCoreManagers() {
     service: jarvisService,
     processingLifecycle: jarvisProcessingLifecycle,
     releaseWhisper: async () => whisperManager?.stopServer(),
-    suspendUpstream: (captureState) =>
-      applicationAudioLifecycleCoordinator.suspend(captureState),
+    suspendUpstream: (captureState) => applicationAudioLifecycleCoordinator.suspend(captureState),
     resumeDevices: (token) => rendererPowerResumeHandshake.request("enumerate", token),
-    resumeUpstream: (resumeToken) =>
-      applicationAudioLifecycleCoordinator.resume(resumeToken),
+    resumeUpstream: (resumeToken) => applicationAudioLifecycleCoordinator.resume(resumeToken),
     rebindPcmSession: (previousSessionId, nextSessionId, phase) =>
       ipcHandlers.rebindJarvisSession(previousSessionId, nextSessionId, phase),
-    rotateUpstream: (rotation) =>
-      applicationAudioLifecycleCoordinator.rotate(rotation),
+    rotateUpstream: (rotation) => applicationAudioLifecycleCoordinator.rotate(rotation),
     ensureGpuReady: async () => {
       await new Promise((resolve) => setTimeout(resolve, WHISPER_WAKE_REWARM_DELAY_MS));
       await whisperManager?.onWakeFromSleep();
@@ -969,17 +952,16 @@ async function initializeCoreManagers() {
         const settings = environmentManager.getApplicationAudioSettings();
         return {
           ...settings,
-          runtime:
-            applicationAudioCapturePool?.getStatus?.() ?? {
-              running: false,
-              configuredLimit: settings.trackLimit,
-              effectiveLimit: jarvisFullscreenYieldActive
-                ? Math.min(settings.trackLimit, 2)
-                : settings.trackLimit,
-              fullscreen: jarvisFullscreenYieldActive,
-              activeTracks: [],
-              fallbacks: [],
-            },
+          runtime: applicationAudioCapturePool?.getStatus?.() ?? {
+            running: false,
+            configuredLimit: settings.trackLimit,
+            effectiveLimit: jarvisFullscreenYieldActive
+              ? Math.min(settings.trackLimit, 2)
+              : settings.trackLimit,
+            fullscreen: jarvisFullscreenYieldActive,
+            activeTracks: [],
+            fallbacks: [],
+          },
         };
       },
       setPolicy: async (input) => {
@@ -1006,17 +988,16 @@ async function initializeCoreManagers() {
         }
         return {
           ...saved,
-          runtime:
-            pool?.getStatus?.() ?? {
-              running: false,
-              configuredLimit: saved.trackLimit,
-              effectiveLimit: jarvisFullscreenYieldActive
-                ? Math.min(saved.trackLimit, 2)
-                : saved.trackLimit,
-              fullscreen: jarvisFullscreenYieldActive,
-              activeTracks: [],
-              fallbacks: [],
-            },
+          runtime: pool?.getStatus?.() ?? {
+            running: false,
+            configuredLimit: saved.trackLimit,
+            effectiveLimit: jarvisFullscreenYieldActive
+              ? Math.min(saved.trackLimit, 2)
+              : saved.trackLimit,
+            fullscreen: jarvisFullscreenYieldActive,
+            activeTracks: [],
+            fallbacks: [],
+          },
         };
       },
     },
@@ -1561,7 +1542,16 @@ async function startApp() {
       "jarvis"
     );
   }
-  startJarvisProcessingRuntime();
+  const processingRuntime = startJarvisProcessingRuntime();
+  const historicalSpeakerReadiness = jarvisRepository.reconcileHistoricalSpeakerReadiness(
+    Date.now(),
+    { diarizationPolicy: processingRuntime.diarizationPolicy }
+  );
+  debugLogger.info(
+    "Jarvis historical speaker readiness reconciliation",
+    historicalSpeakerReadiness,
+    "jarvis"
+  );
   registerSidecars();
   startAuthBridgeServer();
 

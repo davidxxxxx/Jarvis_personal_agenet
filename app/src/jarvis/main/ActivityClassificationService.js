@@ -91,10 +91,15 @@ class ActivityClassificationService {
     if (!Array.isArray(activities) || activities.length === 0) {
       throw new TypeError("activities must be a non-empty array");
     }
-    const local = activities.map((activity) => ({
-      activityId: activity.activityId,
-      ...this.localClassifier.classify(localInput(activity)),
-    }));
+    const local = activities.map((activity) => {
+      const classification = {
+        activityId: activity.activityId,
+        ...this.localClassifier.classify(localInput(activity)),
+      };
+      return typeof this.repository.applyPersonalizationRule === "function"
+        ? this.repository.applyPersonalizationRule(activity, classification)
+        : classification;
+    });
     this.repository.saveBatch({
       sessionId,
       activities,

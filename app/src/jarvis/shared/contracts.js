@@ -7,6 +7,11 @@ const CHANNELS = Object.freeze({
   syncSegments: "jarvis:segments:sync",
   listSegments: "jarvis:segments:list",
   listActivityClassifications: "jarvis:activity:list-session",
+  correctActivityClassification: "jarvis:activity:correct",
+  getPersonalizationSettings: "jarvis:personalization:get",
+  decidePersonalizationRule: "jarvis:personalization:rule-decision",
+  resetPersonalizationRules: "jarvis:personalization:reset",
+  setNotificationPreferences: "jarvis:notification-preferences:set",
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
   listSessionSpeakerClusters: "jarvis:speaker:list-session",
@@ -36,6 +41,7 @@ const CHANNELS = Object.freeze({
   decideKnowledgeSuggestion: "jarvis:memory:v2-suggestion-decision",
   resolveKnowledgeConflict: "jarvis:memory:v2-conflict-resolve",
   completeKnowledgeTodo: "jarvis:memory:v2-todo-complete",
+  decideKnowledgeTodo: "jarvis:memory:v2-todo-decision",
   getEvidenceContext: "jarvis:evidence:get-context",
   analyzeSession: "jarvis:analysis:run",
   regenerateDailyDigest: "jarvis:analysis:daily-digest:regenerate",
@@ -207,6 +213,87 @@ function normalizeMemoryConflictResolutionInput(input) {
 function normalizeKnowledgeTodoCompletionInput(input) {
   exactPlainObject(input, ["todoId"], "knowledge todo completion input");
   return { todoId: assertId(input.todoId, "todoId") };
+}
+
+function normalizeKnowledgeTodoDecisionInput(input) {
+  exactPlainObject(input, ["todoId", "action"], "knowledge todo decision input");
+  if (!["confirm", "dismiss", "reopen"].includes(input.action)) {
+    throw new TypeError("knowledge todo decision action is invalid");
+  }
+  return {
+    todoId: assertId(input.todoId, "todoId"),
+    action: input.action,
+  };
+}
+
+const ACTIVITY_CATEGORIES = new Set([
+  "work_meeting",
+  "learning",
+  "social_call",
+  "in_person_conversation",
+  "entertainment",
+  "gaming",
+  "other",
+  "unknown",
+]);
+
+function normalizeActivityCorrectionInput(input) {
+  exactPlainObject(input, ["classificationId", "category"], "activity correction input");
+  if (!ACTIVITY_CATEGORIES.has(input.category)) {
+    throw new TypeError("activity correction category is invalid");
+  }
+  return {
+    classificationId: assertId(input.classificationId, "classificationId"),
+    category: input.category,
+  };
+}
+
+function normalizePersonalizationRuleDecisionInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("personalization rule decision input must be an object");
+  }
+  const action = input.action;
+  if (!["enable", "disable", "delete", "edit"].includes(action)) {
+    throw new TypeError("personalization rule action is invalid");
+  }
+  const expectedKeys = action === "edit" ? ["ruleId", "action", "label"] : ["ruleId", "action"];
+  exactPlainObject(input, expectedKeys, "personalization rule decision input");
+  const normalized = {
+    ruleId: assertId(input.ruleId, "ruleId"),
+    action,
+  };
+  if (action === "edit") {
+    if (typeof input.label !== "string" || !input.label.trim()) {
+      throw new TypeError("personalization rule label must be a non-empty string");
+    }
+    const label = input.label.trim().replace(/\s+/gu, " ");
+    if (Array.from(label).length > 500) {
+      throw new RangeError("personalization rule label is too long");
+    }
+    normalized.label = label;
+  }
+  return normalized;
+}
+
+function normalizeNotificationPreferencesInput(input) {
+  exactPlainObject(
+    input,
+    ["focusMode", "mutedUntil"],
+    "notification preferences input"
+  );
+  if (typeof input.focusMode !== "boolean") {
+    throw new TypeError("notification focusMode must be a boolean");
+  }
+  if (
+    input.mutedUntil !== null &&
+    (!Number.isSafeInteger(input.mutedUntil) || input.mutedUntil < 0)
+  ) {
+    throw new TypeError("notification mutedUntil must be null or a non-negative integer");
+  }
+  return {
+    focusMode: input.focusMode,
+    mutedUntil: input.mutedUntil,
+  };
 }
 
 const EVIDENCE_OWNER_TYPES = new Set([
@@ -590,6 +677,10 @@ module.exports = {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
+  normalizeActivityCorrectionInput,
+  normalizePersonalizationRuleDecisionInput,
+  normalizeNotificationPreferencesInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,

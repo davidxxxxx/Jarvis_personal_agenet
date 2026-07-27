@@ -9,6 +9,19 @@ const BROWSER_OR_LEARNING_PATTERN =
   /^(?:chrome|edge|firefox|brave|opera|vivaldi|obsidian|notion|coursera|udemy)$/i;
 const GAME_OR_MEDIA_PATTERN =
   /^(?:dota2|steam|epic-games|battle-net|spotify|vlc|potplayer|foobar2000)$/i;
+const VIRTUAL_AUDIO_APPLICATION_KEYS = new Set(["audiodg", "audiodgexe", "steelseriessonar"]);
+
+function isVirtualAudioInfrastructure(candidate) {
+  const normalizedKey = String(candidate?.applicationKey ?? "")
+    .replace(/[^a-z0-9]/giu, "")
+    .toLocaleLowerCase();
+  if (VIRTUAL_AUDIO_APPLICATION_KEYS.has(normalizedKey)) return true;
+  const displayName = String(candidate?.applicationDisplayName ?? "").toLocaleLowerCase();
+  return (
+    displayName.includes("windows audio device graph isolation") ||
+    (displayName.includes("steelseries sonar") && displayName.includes("virtual audio"))
+  );
+}
 
 function boundedInteger(value, fallback) {
   if (!Number.isFinite(value)) return fallback;
@@ -49,7 +62,8 @@ class ApplicationAudioPolicy {
           Number.isSafeInteger(candidate.pid) &&
           candidate.pid > 0 &&
           typeof candidate.applicationKey === "string" &&
-          candidate.applicationKey.length > 0
+          candidate.applicationKey.length > 0 &&
+          !isVirtualAudioInfrastructure(candidate)
       )
       .sort((left, right) => {
         const scoreDifference = this.score(right) - this.score(left);
@@ -69,5 +83,6 @@ ApplicationAudioPolicy.DEFAULT_LIMIT = DEFAULT_LIMIT;
 ApplicationAudioPolicy.MIN_LIMIT = MIN_LIMIT;
 ApplicationAudioPolicy.MAX_LIMIT = MAX_LIMIT;
 ApplicationAudioPolicy.FULLSCREEN_LIMIT = FULLSCREEN_LIMIT;
+ApplicationAudioPolicy.isVirtualAudioInfrastructure = isVirtualAudioInfrastructure;
 
 module.exports = ApplicationAudioPolicy;

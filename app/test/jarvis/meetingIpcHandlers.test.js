@@ -1051,10 +1051,16 @@ test("managed system audio emitted during start is committed only after the star
 
 test("managed system failure during start falls back before reporting the source available", async (t) => {
   const interruptions = [];
+  const applicationPoolCalls = [];
   const fixture = createFixture({
     managedStartError: new Error("system producer failed during startup"),
     sourceInterrupted: (...args) => interruptions.push(args),
     systemAvailable: true,
+    applicationAudioCapturePool: {
+      start: async (options) => applicationPoolCalls.push(["start", options]),
+      setFullscreen: async () => {},
+      stop: async () => applicationPoolCalls.push(["stop"]),
+    },
   });
   t.after(fixture.cleanup);
   const start = fixture.handles.get("meeting-transcription-start");
@@ -1068,6 +1074,14 @@ test("managed system failure during start falls back before reporting the source
   assert.equal(result.systemAudioStrategy, "loopback");
   assert.deepEqual(fixture.managerStops, ["stop"]);
   assert.deepEqual(interruptions, []);
+  assert.deepEqual(applicationPoolCalls[0], [
+    "start",
+    {
+      sessionId: "jarvis-startup-system-failure",
+      configuredLimit: 4,
+      fullscreen: false,
+    },
+  ]);
   assert.equal(
     fixture.sent.filter(([channel]) => channel === "meeting-transcription-source-state").length,
     0

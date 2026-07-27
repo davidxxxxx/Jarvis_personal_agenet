@@ -15,9 +15,7 @@ const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
-const {
-  HYBRID_DIARIZATION_POLICY,
-} = require("../../src/jarvis/main/HybridDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
@@ -581,6 +579,38 @@ test("startup repairs a bounded historical analysis batch before starting the cl
   assert.equal(calls.indexOf("recover_analysis:25") < calls.indexOf("cloud_start"), true);
 });
 
+test("periodically recovers sessions that become ready after startup processing", async () => {
+  let now = 1_000;
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: ({ limit }) => calls.push(`recover:${limit}:${now}`),
+      analyzeSession() {},
+    },
+    now: () => now,
+    analysisRecoveryIntervalMs: 30_000,
+  });
+
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 10_000;
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 20_000;
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls, ["recover:1:1000", "recover:1:31000"]);
+});
+
 test("failed budget recovery prevents direct activity recovery until the cloud gate can retry", async () => {
   const calls = [];
   const runtime = new JarvisProcessingRuntime({
@@ -613,6 +643,49 @@ test("failed budget recovery prevents direct activity recovery until the cloud g
   await runtime.stop();
   assert.equal(calls.includes("unsafe_activity_recovery"), false);
   assert.deepEqual(calls, ["analysis_budget_recovery", "cloud_retry"]);
+});
+
+test("slow cloud startup recovery does not block the local processing queue", async () => {
+  const calls = [];
+  const cloudRecovery = deferred();
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => calls.push("recover_leases"),
+      runOnce: async (_at, { priorityBefore } = {}) => {
+        if (priorityBefore === 20) return 0;
+        calls.push("local_drain");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: () => calls.push("recover_analysis"),
+      analyzeSession() {},
+    },
+    cloudDispatcher: {
+      recoverStartup: () => cloudRecovery.promise,
+      start: () => calls.push("cloud_start"),
+      drainOnce() {},
+      stop() {},
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  const startup = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["recover_leases", "local_drain"]);
+
+  cloudRecovery.resolve();
+  await startup;
+  await runtime.stop();
+  assert.deepEqual(calls, ["recover_leases", "local_drain", "recover_analysis", "cloud_start"]);
 });
 
 test("ready notification failures are isolated so analysis and digest both get a chance", async () => {
@@ -1072,7 +1145,9 @@ test("offline model pack selects v2 CUDA diarization and is disposed on shutdown
   insertSession(repository);
   insertTrack(repository);
   const revision = "d".repeat(64);
-  repository.db.prepare(`
+  repository.db
+    .prepare(
+      `
     INSERT INTO processing_jobs (
       id, session_id, track_id, chunk_id, job_type, state, priority,
       input_hash, input_version, model_version, created_at
@@ -1080,15 +1155,17 @@ test("offline model pack selects v2 CUDA diarization and is disposed on shutdown
       'hybrid-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
       ?, 2, ?, 100
     )
-  `).run(
-    buildDiarizationJobKey({
-      sessionId: "s1",
-      trackId: "track-mic",
-      evidenceRevision: revision,
-      policyId: HYBRID_DIARIZATION_POLICY.policyId,
-    }),
-    HYBRID_DIARIZATION_POLICY.policyId
-  );
+  `
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "s1",
+        trackId: "track-mic",
+        evidenceRevision: revision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      HYBRID_DIARIZATION_POLICY.policyId
+    );
   let disposed = 0;
   const capabilities = [];
   const runtime = createJarvisProcessingRuntime({
@@ -1131,12 +1208,11 @@ test("offline model pack selects v2 CUDA diarization and is disposed on shutdown
 
   assert.equal(runtime.diarizationPolicy, HYBRID_DIARIZATION_POLICY);
   assert.equal(await runtime.drainOnce(), 1);
-  assert.deepEqual(capabilities, [
-    { kind: "speaker", capability: { executionDevice: "cuda" } },
-  ]);
+  assert.deepEqual(capabilities, [{ kind: "speaker", capability: { executionDevice: "cuda" } }]);
   assert.equal(
-    repository.db.prepare("SELECT execution_device FROM processing_jobs WHERE id = 'hybrid-job'").get()
-      .execution_device,
+    repository.db
+      .prepare("SELECT execution_device FROM processing_jobs WHERE id = 'hybrid-job'")
+      .get().execution_device,
     "cuda"
   );
   await runtime.stop();

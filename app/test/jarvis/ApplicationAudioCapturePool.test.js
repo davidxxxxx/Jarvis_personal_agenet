@@ -52,6 +52,7 @@ function createHarness(options = {}) {
     silenceReleaseMs: options.silenceReleaseMs,
     retryDelayMs: options.retryDelayMs,
     selectionDebounceMs: options.selectionDebounceMs,
+    sessionInactiveGraceMs: options.sessionInactiveGraceMs,
   });
   return {
     pool,
@@ -94,6 +95,27 @@ test("policy clamps settings to 1-8 and ranks calls, foreground, browsers, then 
   assert.deepEqual(
     selected.map((entry) => entry.applicationKey),
     ["zoom", "notepad", "chrome", "dota2"]
+  );
+});
+
+test("policy excludes virtual-audio infrastructure from application tracks", () => {
+  const policy = new ApplicationAudioPolicy();
+  const selected = policy.select(
+    [
+      active("SteelSeriesSonar", 201, {
+        applicationDisplayName: "SteelSeries Sonar Virtual Audio Device",
+      }),
+      active("audiodg", 202, {
+        applicationDisplayName: "Windows Audio Device Graph Isolation",
+      }),
+      active("zoom", 203),
+    ],
+    { configuredLimit: 4 }
+  );
+
+  assert.deepEqual(
+    selected.map((entry) => entry.applicationKey),
+    ["zoom"]
   );
 });
 
@@ -186,6 +208,34 @@ test("an active application keeps its current PID while that PID remains present
       .filter((event) => event.type === "started" && event.applicationKey === "chrome")
       .map((event) => event.pid),
     [301]
+  );
+});
+
+test("a transient inactive watcher event keeps the same application capture generation", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    sessionInactiveGraceMs: 5_000,
+    silenceReleaseMs: 60_000,
+  });
+  await harness.pool.start();
+  await harness.emit(active("kook", 320));
+  at += 1_000;
+  await harness.emit({ ...active("kook", 320), state: "inactive", peak: 0 });
+  at += 1_000;
+  await harness.emit(active("kook", 320));
+  await harness.pool.waitForIdle();
+
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "ended" && event.applicationKey === "kook"
+    ),
+    false
   );
 });
 

@@ -14,6 +14,10 @@ test("builds a bounded Chinese-English context prompt without asking for transla
 
   assert.match(prompt, /中文和英文混合/);
   assert.match(prompt, /不要翻译/);
+  assert.match(prompt, /完整保留原话/);
+  assert.match(prompt, /粗口\/脏话/);
+  assert.match(prompt, /不美化/);
+  assert.match(prompt, /不替换成谐音/);
   assert.match(prompt, /\[听不清\]/);
   assert.match(prompt, /API latency/);
   assert.ok(Array.from(prompt).length <= 1_100);
@@ -33,6 +37,25 @@ test("flags isolated third-language filler while allowing natural Chinese-Englis
     reasons: ["unexpected_language"],
   });
   assert.deepEqual(classifyTranscriptQuality("我们 review 一下 API budget"), {
+    suspicious: false,
+    reasons: [],
+  });
+});
+
+test("flags unexpected writing systems inside otherwise Chinese-English output", () => {
+  assert.deepEqual(classifyTranscriptQuality("我们 review 一下 этот API budget"), {
+    suspicious: true,
+    reasons: ["unexpected_script"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("我们 review カタカナ API budget"), {
+    suspicious: true,
+    reasons: ["unexpected_script"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("我们 review 한글 API budget"), {
+    suspicious: true,
+    reasons: ["unexpected_script"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("这是中文 mixed with English terms"), {
     suspicious: false,
     reasons: [],
   });

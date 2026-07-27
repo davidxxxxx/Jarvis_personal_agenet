@@ -154,6 +154,41 @@ export interface JarvisActivityClassification {
   updatedAt: number;
 }
 
+export interface JarvisPersonalizationRule {
+  id: string;
+  domain: "activity_classification" | "suggestion" | "todo" | "person";
+  targetValue: string;
+  label: string;
+  supportCount: number;
+  state: "proposed" | "enabled" | "disabled" | "deleted";
+  conditions: {
+    applicationKeys: string[];
+    selfParticipated: boolean;
+    speakerCountBucket: "none" | "one" | "multiple";
+    timeBucket: "night" | "morning" | "afternoon" | "evening" | "unknown";
+  };
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface JarvisNotificationPreferences {
+  focusMode: boolean;
+  mutedUntil: number | null;
+  updatedAt: number;
+  effectiveMuted: boolean;
+}
+
+export interface JarvisPersonalizationSettings {
+  rules: JarvisPersonalizationRule[];
+  notifications: JarvisNotificationPreferences;
+}
+
+export interface JarvisActivityCorrectionResult {
+  classification: JarvisActivityClassification;
+  proposedRule: JarvisPersonalizationRule | null;
+  supportCount: number;
+}
+
 export type JarvisEvidenceOwnerType =
   | "memory_value"
   | "topic_revision"
@@ -623,6 +658,7 @@ export interface JarvisSessionSpeakerProcessing {
   latestRuns: JarvisDiarizationRunView[];
   history: JarvisDiarizationRunView[];
   speakers: JarvisSpeakerClusterView[];
+  fragmentedEvidenceCount: number;
   summaryRefresh: {
     basis_policy_id: string | null;
     latest_policy_id: string;
@@ -798,7 +834,16 @@ export interface JarvisKnowledgeOverview {
     status: "open" | "completed" | "dismissed";
     completedAt: number | null;
     dismissedAt: number | null;
-    verificationState: "confirmed" | "pending_confirmation";
+    verificationState: "confirmed" | "pending_confirmation" | "dismissed";
+    verificationReason?:
+      | "strict_self_commitment"
+      | "assigned_and_accepted"
+      | "user_confirmed"
+      | "user_dismissed"
+      | null;
+    verificationActor?: "system" | "user" | null;
+    provenance?: "evidence_linked" | "legacy_unverified" | "suggestion" | "source_deleted";
+    sourceSuggestionId?: string | null;
     createdAt: number;
     updatedAt: number;
     revisions: Array<{
@@ -821,6 +866,8 @@ export interface JarvisKnowledgeOverview {
       id: string;
       fromStatus: string | null;
       toStatus: "open" | "completed" | "dismissed";
+      reason?: string;
+      actor?: "system" | "user";
       occurredAt: number;
     }>;
   }>;
@@ -862,6 +909,7 @@ export interface JarvisSuggestionDecisionResult {
   status: "accepted" | "already_accepted" | "dismissed" | "already_dismissed";
   suggestionId: string;
   decidedAt: number;
+  todoId?: string | null;
 }
 
 export interface JarvisMemoryConflictResolutionResult {
@@ -874,6 +922,18 @@ export interface JarvisKnowledgeTodoCompletionResult {
   status: "completed" | "already_completed";
   todoId: string;
   completedAt: number;
+}
+
+export interface JarvisKnowledgeTodoDecisionResult {
+  status:
+    | "confirmed"
+    | "already_confirmed"
+    | "dismissed"
+    | "already_dismissed"
+    | "reopened"
+    | "already_open";
+  todoId: string;
+  decidedAt: number;
 }
 
 export interface JarvisAnalysisStatus {

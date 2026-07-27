@@ -15,6 +15,11 @@ import type {
   JarvisSessionQuery,
   JarvisSessionStatus,
   JarvisActivityClassification,
+  JarvisActivityCategory,
+  JarvisActivityCorrectionResult,
+  JarvisPersonalizationRule,
+  JarvisPersonalizationSettings,
+  JarvisNotificationPreferences,
   JarvisSourceInterruptionInput,
   JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
@@ -50,6 +55,7 @@ import type {
   JarvisSuggestionDecisionResult,
   JarvisMemoryConflictResolutionResult,
   JarvisKnowledgeTodoCompletionResult,
+  JarvisKnowledgeTodoDecisionResult,
   JarvisEvidenceHandle,
   JarvisEvidenceContext,
   JarvisTodo,
@@ -599,6 +605,21 @@ declare global {
         ) => Promise<JarvisTranscriptSegment[]>;
         listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
         listActivityClassifications: (sessionId: string) => Promise<JarvisActivityClassification[]>;
+        correctActivityClassification: (
+          classificationId: string,
+          category: JarvisActivityCategory
+        ) => Promise<JarvisActivityCorrectionResult>;
+        getPersonalizationSettings: () => Promise<JarvisPersonalizationSettings>;
+        decidePersonalizationRule: (
+          ruleId: string,
+          action: "enable" | "disable" | "delete" | "edit",
+          label?: string
+        ) => Promise<JarvisPersonalizationRule>;
+        resetPersonalizationRules: () => Promise<{ resetCount: number; resetAt: number }>;
+        setNotificationPreferences: (
+          focusMode: boolean,
+          mutedUntil: number | null
+        ) => Promise<JarvisNotificationPreferences>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listSessionSpeakerClusters: (sessionId: string) => Promise<JarvisSpeakerClusterView[]>;
@@ -649,6 +670,10 @@ declare global {
           selectedMemoryItemId: string
         ) => Promise<JarvisMemoryConflictResolutionResult>;
         completeKnowledgeTodo: (todoId: string) => Promise<JarvisKnowledgeTodoCompletionResult>;
+        decideKnowledgeTodo: (
+          todoId: string,
+          action: "confirm" | "dismiss" | "reopen"
+        ) => Promise<JarvisKnowledgeTodoDecisionResult>;
         getEvidenceContext: (handle: JarvisEvidenceHandle) => Promise<JarvisEvidenceContext | null>;
         analyzeSession: (
           sessionId: string,

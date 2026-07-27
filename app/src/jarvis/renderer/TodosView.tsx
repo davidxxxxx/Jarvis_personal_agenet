@@ -60,6 +60,43 @@ export default function TodosView() {
     }
   };
 
+  const decide = async (todo: Todo, action: "confirm" | "dismiss" | "reopen") => {
+    if (busyId) return;
+    setBusyId(todo.id);
+    try {
+      const result = await window.electronAPI.jarvis.decideKnowledgeTodo(todo.id, action);
+      setTodos((current) =>
+        current.map((item) => {
+          if (item.id !== todo.id) return item;
+          if (action === "confirm") {
+            return {
+              ...item,
+              verificationState: "confirmed",
+              verificationReason: "user_confirmed",
+              verificationActor: "user",
+            };
+          }
+          if (action === "dismiss") {
+            return {
+              ...item,
+              status: "dismissed",
+              dismissedAt: result.decidedAt,
+              verificationState: "dismissed",
+              verificationReason: "user_dismissed",
+              verificationActor: "user",
+            };
+          }
+          return { ...item, status: "open", completedAt: null };
+        })
+      );
+      setError(false);
+    } catch {
+      setError(true);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const counts = useMemo(
     () => ({
       actionable: todos.filter(
@@ -201,7 +238,9 @@ export default function TodosView() {
                     </p>
                     <p className="mt-1 text-xs text-muted-foreground">
                       {todo.verificationState === "pending_confirmation"
-                        ? "旧版分析 · 尚未确认归属"
+                        ? todo.verificationReason === "assigned_and_accepted"
+                          ? "他人分配且 SELF 已接受 · 待你确认"
+                          : "自动分析 · 尚未确认归属"
                         : (todo.ownerLabel ?? "负责人未填写")}
                       {latest?.dueText ? ` · ${latest.dueText}` : " · 未设置日期"}
                     </p>
@@ -221,10 +260,47 @@ export default function TodosView() {
                 <h2 className="mt-1 text-xl font-semibold">{selected.title}</h2>
                 {selected.verificationState === "pending_confirmation" && (
                   <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900">
-                    这条内容来自旧版自动分析，尚无可靠 SELF 承诺或用户确认。它已从正式待办中隔离，
-                    不会触发提醒；原始记录仍完整保留。
+                    {selected.verificationReason === "assigned_and_accepted"
+                      ? "检测到他人把任务交给 SELF，且 SELF 表示接受。请确认后再加入正式待办。"
+                      : "这条内容来自自动分析，但归属证据还不足。它不会触发提醒；原始记录仍完整保留。"}
                   </p>
                 )}
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {selected.status === "open" &&
+                    selected.verificationState === "pending_confirmation" && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={busyId !== null}
+                          onClick={() => void decide(selected, "confirm")}
+                          className="rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground disabled:opacity-50"
+                          aria-label={`Confirm / 确认 ${selected.title}`}
+                        >
+                          确认成为正式待办
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busyId !== null}
+                          onClick={() => void decide(selected, "dismiss")}
+                          className="rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50"
+                          aria-label={`Dismiss / 忽略 ${selected.title}`}
+                        >
+                          忽略
+                        </button>
+                      </>
+                    )}
+                  {selected.status === "completed" && (
+                    <button
+                      type="button"
+                      disabled={busyId !== null}
+                      onClick={() => void decide(selected, "reopen")}
+                      className="rounded-lg border border-border px-3 py-2 text-sm disabled:opacity-50"
+                      aria-label={`Reopen / 撤销完成 ${selected.title}`}
+                    >
+                      撤销完成
+                    </button>
+                  )}
+                </div>
                 <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2">
                   <div className="rounded-lg bg-muted/30 p-3">
                     <dt className="text-xs text-muted-foreground">负责人</dt>

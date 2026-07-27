@@ -90,7 +90,7 @@ describe("JarvisShell", () => {
   it("enables every memory navigation destination", () => {
     render(<JarvisShell />);
 
-    for (const name of [/人物/, /主题/, /待办/, /记忆/]) {
+    for (const name of [/^人物$/, /^主题$/, /^待办$/, /^记忆库$/]) {
       expect(screen.getByRole("button", { name })).toBeEnabled();
     }
     expect(screen.queryByText("完成首次分析后启用")).not.toBeInTheDocument();

@@ -366,6 +366,135 @@ function validateCandidateDailyDigest(payload, context) {
   };
 }
 
+// MiniMax occasionally returns a sound digest with one optional item pointing
+// at an omitted segment/subject, or echoes a processing state that differs from
+// the immutable input. Preserve only locally verifiable items and derive all
+// processing metadata from the trusted context. The strict validator remains
+// the final trust boundary.
+function salvageCandidateDailyDigest(payload, context) {
+  const normalizedContext = normalizeContext(context);
+  const input = exactObject(
+    payload,
+    ["schemaVersion", "sections", "processing"],
+    "schema.top_level_type"
+  );
+  if (input.schemaVersion !== DAILY_DIGEST_SCHEMA_VERSION) fail("schema.version");
+  const rawSections = exactObject(input.sections, [
+    "today",
+    "interactions",
+    "topicsAndDecisions",
+    "commitmentsAndTodos",
+    "worthRemembering",
+    "tomorrowSuggestions",
+  ]);
+  exactObject(input.processing, ["completeness", "missingStages", "transcriptCoverage"]);
+
+  const cleanEvidence = (value, allowed = normalizedContext.allowedSegmentIds) => {
+    if (!Array.isArray(value)) return [];
+    const result = [];
+    for (const id of value) {
+      if (
+        typeof id === "string" &&
+        id.length > 0 &&
+        id === id.trim() &&
+        allowed.has(id) &&
+        !result.includes(id)
+      ) {
+        result.push(id);
+      }
+      if (result.length >= MAX_EVIDENCE_ITEMS) break;
+    }
+    return result;
+  };
+  const keepValid = (value, field, repair) =>
+    collection(value, field).flatMap((raw) => {
+      try {
+        const repaired = repair(raw);
+        return repaired === null ? [] : [repaired];
+      } catch (error) {
+        if (error instanceof DailyDigestSchemaError) return [];
+        throw error;
+      }
+    });
+  const repairFactual = (value, field) =>
+    keepValid(value, field, (raw) => {
+      const item = exactObject(raw, ["text", "evidenceSegmentIds"]);
+      const evidence = cleanEvidence(item.evidenceSegmentIds);
+      return evidence.length === 0
+        ? null
+        : {
+            text: boundedString(item.text, 4_000),
+            evidenceSegmentIds: evidence,
+          };
+    });
+
+  const repaired = {
+    schemaVersion: DAILY_DIGEST_SCHEMA_VERSION,
+    sections: {
+      today: repairFactual(rawSections.today, "today"),
+      interactions: keepValid(rawSections.interactions, "interactions", (raw) => {
+        const item = exactObject(raw, ["subjectRef", "text", "evidenceSegmentIds"]);
+        if (
+          typeof item.subjectRef !== "string" ||
+          !normalizedContext.allowedSubjectRefs.has(item.subjectRef)
+        ) {
+          return null;
+        }
+        const evidence = cleanEvidence(
+          item.evidenceSegmentIds,
+          normalizedContext.subjectEvidenceByRef.get(item.subjectRef)
+        );
+        return evidence.length === 0
+          ? null
+          : {
+              subjectRef: item.subjectRef,
+              text: boundedString(item.text, 4_000),
+              evidenceSegmentIds: evidence,
+            };
+      }),
+      topicsAndDecisions: repairFactual(
+        rawSections.topicsAndDecisions,
+        "topicsAndDecisions"
+      ),
+      commitmentsAndTodos: repairFactual(
+        rawSections.commitmentsAndTodos,
+        "commitmentsAndTodos"
+      ),
+      worthRemembering: repairFactual(rawSections.worthRemembering, "worthRemembering"),
+      tomorrowSuggestions: keepValid(
+        rawSections.tomorrowSuggestions,
+        "tomorrowSuggestions",
+        (raw) => {
+          const item = exactObject(raw, [
+            "text",
+            "rationale",
+            "evidenceSegmentIds",
+            "allowedActions",
+          ]);
+          if (!Array.isArray(item.allowedActions)) return null;
+          const allowedActions = [
+            ...new Set(item.allowedActions.filter((action) => ALLOWED_ACTION_SET.has(action))),
+          ];
+          if (allowedActions.length === 0) return null;
+          return {
+            text: boundedString(item.text, 500),
+            rationale: boundedString(item.rationale, 4_000),
+            evidenceSegmentIds: cleanEvidence(item.evidenceSegmentIds),
+            allowedActions,
+          };
+        }
+      ),
+    },
+    processing: {
+      completeness: normalizedContext.completeness,
+      missingStages:
+        normalizedContext.completeness === "final" ? [] : ["upstream_processing"],
+      transcriptCoverage: { ...normalizedContext.transcriptCoverage },
+    },
+  };
+  return validateCandidateDailyDigest(repaired, context);
+}
+
 const evidenceArraySchema = (minItems) => ({
   type: "array",
   minItems,
@@ -492,5 +621,6 @@ module.exports = {
   DAILY_DIGEST_TOOL,
   DailyDigestSchemaError,
   DAILY_DIGEST_SCHEMA_VERSION,
+  salvageCandidateDailyDigest,
   validateCandidateDailyDigest,
 };

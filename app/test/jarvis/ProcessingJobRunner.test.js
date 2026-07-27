@@ -374,7 +374,10 @@ test("permit draining preserves durable retry and resource deferral transitions"
 test("a running CUDA job yields durably when resources become busy", async (t) => {
   let admissions = 0;
   const governor = {
-    sample: async () => ({ state: admissions === 0 ? "available" : "busy", selectedGpuUuid: "GPU-1" }),
+    sample: async () => ({
+      state: admissions === 0 ? "available" : "busy",
+      selectedGpuUuid: "GPU-1",
+    }),
     admit: () => {
       admissions += 1;
       return admissions === 1
@@ -392,11 +395,15 @@ test("a running CUDA job yields durably when resources become busy", async (t) =
 
   assert.equal(await runner.runOnce(), 1);
   assert.deepEqual(
-    db.prepare(`
+    db
+      .prepare(
+        `
       SELECT state, attempt_count, next_retry_at, error_code, blocked_reason,
              lease_owner, lease_expires_at
       FROM processing_jobs WHERE id = 'j1'
-    `).get(),
+    `
+      )
+      .get(),
     {
       state: "retry",
       attempt_count: 0,
@@ -408,6 +415,57 @@ test("a running CUDA job yields durably when resources become busy", async (t) =
     }
   );
 });
+
+for (const transientReason of [
+  "cpu_load_high",
+  "external_gpu_busy",
+  "gpu_utilization_high",
+  "insufficient_vram",
+  "recovery_hysteresis",
+  "telemetry_unavailable",
+]) {
+  test(`an active CUDA diarization job survives ${transientReason}`, async (t) => {
+    let admissions = 0;
+    const governor = {
+      sample: async () => ({
+        state: admissions === 0 ? "available" : "constrained",
+        selectedGpuUuid: "GPU-1",
+      }),
+      admit: () => {
+        admissions += 1;
+        return admissions === 1
+          ? { action: "run_cuda", reason: "resources_available" }
+          : { action: "defer", reason: transientReason };
+      },
+    };
+    const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+    seedJob(db, { jobType: "diarize_track", priority: 35 });
+    runner.register("diarize_track", async (_job, context) => {
+      assert.equal(context.device, "cuda");
+      assert.equal(await context.checkResources(), true);
+      return { executionDevice: "cuda" };
+    });
+
+    assert.equal(await runner.runOnce(), 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `
+        SELECT state, attempt_count, error_code, blocked_reason, execution_device
+        FROM processing_jobs WHERE id = 'j1'
+      `
+        )
+        .get(),
+      {
+        state: "completed",
+        attempt_count: 1,
+        error_code: null,
+        blocked_reason: null,
+        execution_device: "cuda",
+      }
+    );
+  });
+}
 
 test("local runner leaves unknown and cloud work unclaimed instead of classifying maintenance", async (t) => {
   const { db, runner } = fixture(t);
@@ -458,15 +516,24 @@ test("local runner leaves unknown and cloud work unclaimed instead of classifyin
 });
 
 test("records handler failure with backoff without losing durable input metadata", async (t) => {
-  const { db, runner } = fixture(t);
+  const failures = [];
+  const { db, runner } = fixture(t, { log: (entry) => failures.push(entry) });
   seedJob(db);
+  const failure = new Error("temporary outage");
+  failure.code = "TRANSIENT";
   runner.register("transcribe_chunk", async () => {
-    const error = new Error("temporary outage");
-    error.code = "TRANSIENT";
-    throw error;
+    throw failure;
   });
 
   assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(failures, [
+    {
+      phase: "processing_job_failed",
+      jobId: "j1",
+      jobType: "transcribe_chunk",
+      error: failure,
+    },
+  ]);
   assert.deepEqual(
     db
       .prepare(
@@ -525,6 +592,38 @@ test("blocks deterministic database constraints after one attempt instead of ret
     }
   );
   assert.equal(await runner.runOnce(), 0);
+});
+
+test("blocks deterministic diarization validation failures after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v2",
+  });
+  runner.register("diarize_track", async () => {
+    throw new TypeError("run.speakerCount.maximum must be between 0 and 64 or null");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_VALIDATION_FAILED",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
 });
 
 test("blocks a transcription lineage mismatch instead of retrying obsolete work", async (t) => {

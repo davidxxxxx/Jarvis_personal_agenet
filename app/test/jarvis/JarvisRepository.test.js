@@ -838,6 +838,7 @@ test("retired provenance is private across repository audio views", (t) => {
     assert.equal(Object.hasOwn(chunk, "retired_format"), false);
     assert.equal(Object.hasOwn(chunk, "retired_file_sha256"), false);
   }
+  assert.deepEqual(repo.getSessionDetail("s1", { includeAudioChunks: false }).audioChunks, []);
 });
 
 test("schema initialization is idempotent and file databases use WAL", () => {

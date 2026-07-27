@@ -16,6 +16,8 @@ const THIRD_LANGUAGE_FILLERS = new Set([
   "grazie",
   "prego",
 ]);
+const UNEXPECTED_SCRIPT =
+  /[\p{Script=Cyrillic}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Devanagari}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
 function normalizeText(value) {
   return typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "";
@@ -29,7 +31,7 @@ function takeCodePointTail(value, limit) {
 function buildBilingualPrompt(previousText = "") {
   const context = takeCodePointTail(normalizeText(previousText), CONTEXT_CODE_POINT_LIMIT);
   const instruction =
-    "这是中文和英文混合的真实对话。中文写中文，英文术语保持英文；不要翻译。结合上一段上下文，不确定时写[听不清]，不要猜造人名或专有名词。";
+    "这是中文和英文混合的真实对话。中文写中文，英文术语保持英文；不要翻译。完整保留原话中的口语、语气词和粗口/脏话，不美化、不消音、不替换成谐音。结合上一段上下文，不确定时写[听不清]，不要猜造人名或专有名词。";
   return context ? `${instruction}\n上一段：${context}` : instruction;
 }
 
@@ -80,6 +82,7 @@ function classifyTranscriptQuality(value) {
 
   const thirdLanguageCount = words.filter((word) => THIRD_LANGUAGE_FILLERS.has(word)).length;
   const hasCjk = /\p{Script=Han}/u.test(text);
+  if (UNEXPECTED_SCRIPT.test(text)) reasons.push("unexpected_script");
   if (!hasCjk && words.length >= 3 && thirdLanguageCount / words.length >= 0.6) {
     reasons.push("unexpected_language");
   }

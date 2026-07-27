@@ -122,6 +122,7 @@ class WhisperCudaManager {
     inspectArchive: inspectArchiveImpl = inspectZipArchive,
     extractArchive: extractImpl = extractArchive,
     verifyRuntime = null,
+    sha256FileSync: sha256FileSyncImpl = sha256FileSync,
     now = Date.now,
     extractedSizeEstimate = null,
     diskSafetyMargin = DISK_SAFETY_MARGIN,
@@ -139,6 +140,7 @@ class WhisperCudaManager {
     this.inspectArchiveImpl = inspectArchiveImpl;
     this.extractArchiveImpl = extractImpl;
     this.verifyRuntime = verifyRuntime;
+    this.sha256FileSyncImpl = sha256FileSyncImpl;
     this.now = now;
     this.extractedSizeEstimate =
       extractedSizeEstimate == null ? this.manifest.size * 2 : extractedSizeEstimate;
@@ -149,6 +151,7 @@ class WhisperCudaManager {
     this._quiesced = false;
     this._bootFailures = 0;
     this._lastIntegrityReason = null;
+    this._pointerIntegrityCache = new Map();
   }
 
   isSupportedPlatform() {
@@ -178,12 +181,26 @@ class WhisperCudaManager {
     this._binDir = null;
     this._configuredRoot = null;
     this._lastIntegrityReason = null;
+    this._pointerIntegrityCache.clear();
   }
 
   _readPointer(pointerFile = POINTER_FILE) {
+    let pointerPath = null;
     try {
       const root = this.getCudaBinaryDir();
-      const pointer = JSON.parse(fs.readFileSync(path.join(root, pointerFile), "utf8"));
+      pointerPath = path.join(root, pointerFile);
+      const pointerText = fs.readFileSync(pointerPath, "utf8");
+      const pointerSignature = crypto.createHash("sha256").update(pointerText).digest("hex");
+      const cached = this._pointerIntegrityCache.get(pointerPath);
+      if (
+        cached?.pointerSignature === pointerSignature &&
+        cached.runtimeFingerprint === this._runtimeFingerprint(cached.value.runtimeDir)
+      ) {
+        this._lastIntegrityReason = null;
+        return { ...cached.value };
+      }
+
+      const pointer = JSON.parse(pointerText);
       if (!isSafeName(pointer.version) || !/^[a-f0-9]{64}$/.test(pointer.sha256 || "")) return null;
       const approved = this.approvedManifests.some(
         (candidate) =>
@@ -211,12 +228,31 @@ class WhisperCudaManager {
       if (!runtimeStat.isDirectory() || runtimeStat.isSymbolicLink() || binaryStat.isSymbolicLink())
         return null;
       if (!this._validatePointerIntegrity(pointer, runtimeDir)) return null;
+      const value = { ...pointer, runtimeDir, binaryPath };
+      this._pointerIntegrityCache.set(pointerPath, {
+        pointerSignature,
+        runtimeFingerprint: this._runtimeFingerprint(runtimeDir),
+        value,
+      });
       this._lastIntegrityReason = null;
-      return { ...pointer, runtimeDir, binaryPath };
+      return { ...value };
     } catch (error) {
+      if (pointerPath) this._pointerIntegrityCache.delete(pointerPath);
       if (error?.code?.startsWith("CUDA_INTEGRITY")) this._lastIntegrityReason = error.code;
       return null;
     }
+  }
+
+  _runtimeFingerprint(runtimeDir) {
+    return JSON.stringify(
+      this._listRuntimeFiles(runtimeDir).map((relativePath) => {
+        const stat = fs.lstatSync(path.join(runtimeDir, relativePath));
+        if (!stat.isFile() || stat.isSymbolicLink()) {
+          throw cudaError("CUDA_INTEGRITY_FILE_SET_MISMATCH", "CUDA runtime file set changed");
+        }
+        return [relativePath, stat.size, stat.mtimeMs, stat.ctimeMs];
+      })
+    );
   }
 
   _validatePointerIntegrity(pointer, runtimeDir) {
@@ -264,7 +300,7 @@ class WhisperCudaManager {
     }
     for (const file of pointer.files) {
       const candidate = path.join(runtimeDir, file.path);
-      const digest = sha256FileSync(candidate);
+      const digest = this.sha256FileSyncImpl(candidate);
       if (digest !== file.sha256)
         throw cudaError("CUDA_INTEGRITY_HASH_MISMATCH", "CUDA runtime file hash changed");
     }

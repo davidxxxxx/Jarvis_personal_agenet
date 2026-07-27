@@ -177,6 +177,62 @@ test("accepts documented MiniMax reasoning content beside a valid digest tool ca
   assert.equal(result.result.schemaVersion, "jarvis-daily-digest-v1");
 });
 
+test("accepts MiniMax digest tool-call compatibility fields and legacy function calls", async () => {
+  const messages = [
+    {
+      content: [{ type: "text", text: "reasoning metadata" }],
+      function_call: null,
+      tool_calls: responseEnvelope().choices[0].message.tool_calls,
+    },
+    {
+      content: null,
+      tool_calls: [],
+      function_call: {
+        name: "submit_jarvis_daily_digest",
+        arguments: JSON.stringify(digestCandidate()),
+      },
+    },
+  ];
+  let index = 0;
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () =>
+      jsonResponse({
+        choices: [{ message: messages[index++] }],
+        usage: { prompt_tokens: 321, completion_tokens: 123 },
+      }),
+  });
+
+  for (const _message of messages) {
+    const result = await client.generate(clientInput());
+    assert.deepEqual(result.result, digestCandidate());
+  }
+});
+
+test("salvages grounded digest sections while dropping invalid refs and deriving processing state", async () => {
+  const candidate = digestCandidate();
+  candidate.sections.today.push({
+    text: "Invented unsupported item.",
+    evidenceSegmentIds: ["outside-input"],
+  });
+  candidate.sections.interactions.push({
+    subjectRef: "subject-ffffffffffffffff",
+    text: "Unknown person.",
+    evidenceSegmentIds: ["segment-1"],
+  });
+  candidate.processing.missingStages = ["upstream_processing"];
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(responseEnvelope(candidate)),
+  });
+
+  const result = await client.generate(clientInput());
+
+  assert.deepEqual(result.result.sections.today, digestCandidate().sections.today);
+  assert.deepEqual(result.result.sections.interactions, digestCandidate().sections.interactions);
+  assert.deepEqual(result.result.processing, digestCandidate().processing);
+});
+
 function expectClientError(code, retryable = false) {
   return (error) =>
     error instanceof DailyDigestClientError &&
@@ -435,7 +491,7 @@ test("accepts only the exact persisted digest cloud payload contract", async () 
   }
 });
 
-test("binds interaction evidence to the subject mapping in persisted input", async () => {
+test("drops an interaction whose evidence belongs to another persisted subject", async () => {
   const payload = cloudPayload();
   payload.sections.sessions[0].segments.push({
     segmentId: "segment-2",
@@ -464,12 +520,9 @@ test("binds interaction evidence to the subject mapping in persisted input", asy
     fetchImpl: async () => jsonResponse(responseEnvelope(output)),
   });
 
-  await assert.rejects(
-    () => client.generate(clientInput(payload)),
-    (error) =>
-      expectClientError("invalid_structure")(error) &&
-      error.issueCode === "schema.interaction_evidence_out_of_scope"
-  );
+  const result = await client.generate(clientInput(payload));
+  assert.deepEqual(result.result.sections.interactions, []);
+  assert.deepEqual(result.result.processing.transcriptCoverage, payload.sections.transcriptCoverage);
 });
 
 test("rejects secret and absolute-path text before reading credentials or sending", async () => {

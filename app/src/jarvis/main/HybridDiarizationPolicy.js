@@ -1,7 +1,7 @@
 const { MODEL_PACK_VERSION } = require("./AiModelPackVersion");
 
 const HYBRID_DIARIZATION_POLICY = Object.freeze({
-  policyId: "jarvis-hybrid-diarization-v2",
+  policyId: "jarvis-hybrid-diarization-v3",
   diarizerModelId: "pyannote-community-1+sherpa-campplus-verifier+mossformer2-ss-16k",
   embeddingModelId: "3dspeaker-campplus-voxceleb-16k-v1",
   embeddingDimension: 512,

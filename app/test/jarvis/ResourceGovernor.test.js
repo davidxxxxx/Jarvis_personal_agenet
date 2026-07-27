@@ -484,6 +484,35 @@ test("production sampling interval reuses a snapshot until 15000 ms has elapsed"
   assert.equal(calls, 2);
 });
 
+test("GPU pressure backs resource probes off to one sample per minute", async () => {
+  let at = 1_000;
+  let calls = 0;
+  const governor = new ResourceGovernor({
+    now: () => at,
+    telemetryProvider: async () => {
+      calls += 1;
+      return healthyTelemetry({
+        gpus: [{ ...healthyTelemetry().gpus[0], utilizationPct: 50 }],
+        processes: [{ pid: 88, gpuUuid: "GPU-a", usedVramMb: 256 }],
+        externalGpuBusy: true,
+      });
+    },
+    cudaProvider: async () => cudaReady(),
+    cpuProvider: async () => ({ loadPct: 20 }),
+    powerProvider: async () => ({ onAcPower: true, batteryLevelPct: 100, batterySaver: false }),
+  });
+
+  const first = await governor.sample();
+  assert.equal(first.state, "busy");
+  assert.equal(first.reason, "external_gpu_busy");
+  at += 59_999;
+  assert.equal(await governor.sample(), first);
+  assert.equal(calls, 1);
+  at += 1;
+  assert.notEqual(await governor.sample(), first);
+  assert.equal(calls, 2);
+});
+
 test("requires peak plus 1024 MiB and the configured healthy duration before recovery", async () => {
   let freeVramMb = 5_119;
   let at = 10_000;
@@ -741,7 +770,7 @@ test("Windows power sampling coalesces concurrent calls and caches beyond govern
   const [first, concurrent] = await Promise.all([provider(), provider()]);
   assert.equal(first, concurrent);
   assert.equal(calls, 1);
-  at += 59_999;
+  at += 5 * 60_000 - 1;
   assert.equal(await provider(), first);
   assert.equal(calls, 1);
   at += 1;

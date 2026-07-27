@@ -3,6 +3,7 @@ const crypto = require("node:crypto");
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
 const REDACTION_VERSION = "jarvis-redaction-v1";
 const DEFAULT_MAX_PAYLOAD_BYTES = 96 * 1024;
+const HIERARCHICAL_WINDOW_MS = 20 * 60_000;
 const LABEL_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
 
 function sha256(value) {
@@ -201,6 +202,46 @@ function payloadFor(segments, selected) {
   };
 }
 
+function timelineCoverageOrder(length) {
+  if (length === 0) return [];
+  if (length === 1) return [0];
+  const order = [0, length - 1];
+  const queued = [[1, length - 2]];
+  while (queued.length > 0) {
+    const [start, end] = queued.shift();
+    if (start > end) continue;
+    const middle = Math.floor((start + end) / 2);
+    order.push(middle);
+    queued.push([start, middle - 1], [middle + 1, end]);
+  }
+  return order;
+}
+
+function hierarchicalCoverageOrder(segments, windowMs = HIERARCHICAL_WINDOW_MS) {
+  if (segments.length === 0) return [];
+  const origin = segments[0].startedAt;
+  const windows = new Map();
+  for (let index = 0; index < segments.length; index += 1) {
+    const windowIndex = Math.floor(Math.max(0, segments[index].startedAt - origin) / windowMs);
+    const indices = windows.get(windowIndex) ?? [];
+    indices.push(index);
+    windows.set(windowIndex, indices);
+  }
+  const perWindow = [...windows.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, indices]) => timelineCoverageOrder(indices.length).map((index) => indices[index]));
+  const order = [];
+  for (let depth = 0; ; depth += 1) {
+    let appended = false;
+    for (const window of perWindow) {
+      if (depth >= window.length) continue;
+      order.push(window[depth]);
+      appended = true;
+    }
+    if (!appended) return order;
+  }
+}
+
 class AnalysisInputBuilder {
   constructor({ maxPayloadBytes = DEFAULT_MAX_PAYLOAD_BYTES } = {}) {
     if (!Number.isSafeInteger(maxPayloadBytes) || maxPayloadBytes < 64) {
@@ -209,29 +250,51 @@ class AnalysisInputBuilder {
     this.maxPayloadBytes = maxPayloadBytes;
   }
 
-  build(preparedSnapshot, { cursor = 0 } = {}) {
+  build(preparedSnapshot, { cursor = 0, strategy = "sequential" } = {}) {
     const prepared = plainObject(preparedSnapshot, "preparedSnapshot");
     const segments = normalizeSegments(prepared);
     if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > segments.length) {
       throw new TypeError("cursor is invalid");
     }
+    if (!new Set(["sequential", "timeline", "hierarchical"]).has(strategy)) {
+      throw new TypeError("strategy is invalid");
+    }
+    if (strategy !== "sequential" && cursor !== 0) {
+      throw new TypeError(`${strategy} strategy does not accept a cursor`);
+    }
 
     const selected = [];
     let nextCursor = cursor;
-    for (let index = cursor; index < segments.length; index += 1) {
-      const candidate = payloadFor(segments, [...selected, segments[index]]);
+    const selectionOrder =
+      strategy === "timeline"
+        ? timelineCoverageOrder(segments.length)
+        : strategy === "hierarchical"
+          ? hierarchicalCoverageOrder(segments)
+          : Array.from({ length: segments.length - cursor }, (_value, index) => cursor + index);
+    for (const index of selectionOrder) {
+      const nextSelected =
+        strategy !== "sequential"
+          ? [...selected, segments[index]].sort(
+              (left, right) =>
+                left.startedAt - right.startedAt ||
+                left.endedAt - right.endedAt ||
+                left.segmentId.localeCompare(right.segmentId)
+            )
+          : [...selected, segments[index]];
+      const candidate = payloadFor(segments, nextSelected);
       const candidateBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
       if (candidateBytes > this.maxPayloadBytes) {
-        if (selected.length > 0) {
+        if (strategy === "sequential" && selected.length > 0) {
           nextCursor = index;
           break;
         }
-        nextCursor = index + 1;
+        if (strategy === "sequential") nextCursor = index + 1;
         continue;
       }
-      selected.push(segments[index]);
-      nextCursor = index + 1;
+      selected.splice(0, selected.length, ...nextSelected);
+      if (strategy === "sequential") nextCursor = index + 1;
     }
+    if (strategy !== "sequential") nextCursor = segments.length;
 
     const cloudPayload = payloadFor(segments, selected);
     const cloudPayloadJson = JSON.stringify(cloudPayload);
@@ -252,7 +315,10 @@ class AnalysisInputBuilder {
         allowedOwnerLabels: selectedOwnerLabels,
         pseudonymBindings: localBindings,
         nextCursor,
-        complete: nextCursor >= segments.length,
+        complete:
+          strategy !== "sequential"
+            ? selected.length === segments.length
+            : nextCursor >= segments.length,
         inputBytes: Buffer.byteLength(cloudPayloadJson, "utf8"),
         payloadHash: sha256(cloudPayloadJson),
       },

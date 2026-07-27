@@ -2521,20 +2521,30 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       candidate: validCandidate({ memories: [], topics: [], todos: [] }),
     });
     const accepted = db.prepare("SELECT id FROM suggestions_v2").get();
-    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 }), {
-      status: "accepted",
-      suggestionId: accepted.id,
-      decidedAt: 7000,
-    });
+    const acceptedResult = repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 });
+    assert.equal(acceptedResult.status, "accepted");
+    assert.equal(acceptedResult.suggestionId, accepted.id);
+    assert.equal(acceptedResult.decidedAt, 7000);
+    assert.match(acceptedResult.todoId, /^todo-/u);
     assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7001 }), {
       status: "already_accepted",
       suggestionId: accepted.id,
       decidedAt: 7000,
+      todoId: acceptedResult.todoId,
     });
     assert.throws(() => repository.dismissSuggestion({ suggestionId: accepted.id, at: 7000 }), {
       code: "MEMORY_SUGGESTION_ALREADY_DECIDED",
     });
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT state, reason, actor
+           FROM todo_verification_decisions WHERE todo_instance_id = ?`
+        )
+        .get(acceptedResult.todoId),
+      { state: "confirmed", reason: "user_confirmed", actor: "user" }
+    );
 
     const nextInput = createAlternativeInput(repository, "second suggestion input");
     repository.applyCandidateAnalysis({
@@ -2602,13 +2612,13 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       db.prepare("SELECT count(*) AS count FROM suggestion_occurrences").get().count,
       terminalOccurrenceCount
     );
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
   } finally {
     db.close();
   }
 });
 
-test("completeTodo records one forward-only user transition and is idempotent", () => {
+test("todo decisions require confirmation, complete idempotently, and allow one user reopen", () => {
   const db = createFixture();
   try {
     const { repository, input } = createStoredInput(db);
@@ -2622,6 +2632,10 @@ test("completeTodo records one forward-only user transition and is idempotent", 
       .prepare("SELECT count(*) AS count FROM todo_state_transitions WHERE todo_instance_id = ?")
       .get(todo.id).count;
 
+    assert.throws(() => repository.completeTodo({ todoId: todo.id }), {
+      code: "MEMORY_TODO_CONFIRMATION_REQUIRED",
+    });
+    assert.equal(repository.decideTodo({ todoId: todo.id, action: "confirm" }).status, "confirmed");
     const first = repository.completeTodo({ todoId: todo.id });
     assert.equal(first.status, "completed");
     assert.equal(first.todoId, todo.id);
@@ -2652,6 +2666,13 @@ test("completeTodo records one forward-only user transition and is idempotent", 
         actor: "user",
         occurred_at: first.completedAt,
       }
+    );
+    const reopened = repository.decideTodo({ todoId: todo.id, action: "reopen" });
+    assert.equal(reopened.status, "reopened");
+    assert.equal(db.prepare("SELECT status FROM todos_v2 WHERE id = ?").get(todo.id).status, "open");
+    assert.equal(
+      repository.decideTodo({ todoId: todo.id, action: "reopen" }).status,
+      "already_open"
     );
     assert.throws(() => repository.completeTodo({ todoId: "missing" }), {
       code: "MEMORY_TODO_NOT_FOUND",
@@ -5251,6 +5272,164 @@ test("analysis input skips unattributed segments without blocking attributable e
   }
 });
 
+test("analysis input excludes short fragmented anonymous speakers from cloud summaries", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-fragment', 'session-1', 'fragment.wav', 5100, 5200, 100,
+        '${"d".repeat(64)}', 9500, 'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-fragment', 'session-1', 5100, 5200, NULL, 'fragment',
+        'one accidental fragment', 0.7, 1, 'pending', 'track-1',
+        'chunk-fragment', 'mic',
+        'final', 1, 'whisper-v1', 5200
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, speech_ms, window_count,
+        quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-fragment', 'session-1', 'track-1', 'fragment', 'speaker-v1',
+        1000, 1, 0.9, NULL, 'unknown', 5100, 5200
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-fragment', 'segment-fragment');
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-fragment"] })
+    );
+
+    assert.deepEqual(prepared.segmentIds, ["segment-1"]);
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [{ label: "SELF", subjectId: "person-self" }]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input merges durable anonymous speakers across tracks by local dual-model reference", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-anonymous-peer', 'session-1', 'anonymous-peer.wav', 5200, 5400, 200,
+        '${"e".repeat(64)}', 9500, 'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 12000,
+          window_count = 3, quality_score = 0.9
+      WHERE id = 'cluster-other';
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-anonymous-peer', 'session-1', 5200, 5400, NULL, 'speaker_app',
+        'same durable anonymous speaker', 0.9, 1, 'pending', 'track-1',
+        'chunk-anonymous-peer', 'mic',
+        'final', 1, 'whisper-v1', 5400
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-anonymous-peer', 'session-1', 'track-1',
+        'speaker_app', 'speaker-v1',
+        NULL, 14000, 4, 0.91, NULL, 'unknown', 5200, 5400
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-anonymous-peer', 'segment-anonymous-peer');
+      INSERT INTO speaker_diarization_runs (
+        id, session_id, track_id, transcript_revision, policy_id, diarizer_model_id,
+        embedding_model_id, model_artifact_sha256, embedding_dimension, sample_rate,
+        input_version, execution_device, commit_sequence, created_at, completed_at
+      ) VALUES
+        ('run-anon-other', 'session-1', 'track-omitted', '${HASH_A}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_B}',
+         512, 16000, 1, 'cpu', 1, 5500, 5500),
+        ('run-anon-peer', 'session-1', 'track-1', '${HASH_B}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_C}',
+         512, 16000, 1, 'cpu', 2, 5500, 5500);
+      INSERT INTO speaker_diarization_run_clusters (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      ) VALUES
+        ('run-anon-other', 'cluster-other', 'P1', zeroblob(2048), 12000, 3, 0.9, 5000),
+        ('run-anon-peer', 'cluster-anonymous-peer', 'speaker_app',
+         zeroblob(2048), 14000, 4, 0.91, 5200);
+      INSERT INTO speaker_identity_resolution_runs (
+        id, session_id, diarization_revision, profile_revision, policy_id,
+        commit_sequence, expected_cluster_count, created_at, completed_at
+      ) VALUES (
+        'resolution-anonymous-group', 'session-1', '${HASH_A}', '${HASH_B}',
+        'jarvis-speaker-identity-v1', 1, 2, 5600, 5600
+      );
+      INSERT INTO speaker_identity_resolutions (
+        id, resolution_run_id, session_id, evidence_run_id, cluster_id,
+        diarization_revision, profile_revision, policy_id, candidate_person_id,
+        candidate_person_ref, resolution_state, match_score, match_margin, reason,
+        actor, correction_id, projection_applied, created_at
+      ) VALUES
+        ('resolution-anon-other', 'resolution-anonymous-group', 'session-1',
+         'run-anon-other', 'cluster-other', '${HASH_A}', '${HASH_B}',
+         'jarvis-speaker-identity-v1', NULL, 'anonymous-speaker-shared',
+         'unknown', 0.95, 0.1, 'dual_model_anonymous_group', 'system', NULL, 1, 5600),
+        ('resolution-anon-peer', 'resolution-anonymous-group', 'session-1',
+         'run-anon-peer', 'cluster-anonymous-peer', '${HASH_A}', '${HASH_B}',
+         'jarvis-speaker-identity-v1', NULL, 'anonymous-speaker-shared',
+         'unknown', 0.95, 0.1, 'dual_model_anonymous_group', 'system', NULL, 1, 5600);
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({
+        segmentIds: ["segment-1", "segment-omitted", "segment-anonymous-peer"],
+      })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ segmentId, speakerBindingLabel }) => ({
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+        { segmentId: "segment-anonymous-peer", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectKind, subjectId }) => ({
+        label,
+        subjectKind,
+        subjectId,
+      })),
+      [
+        { label: "SELF", subjectKind: "person", subjectId: "person-self" },
+        { label: "P1", subjectKind: "speaker_cluster", subjectId: "cluster-other" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("analysis input remains blocked when every segment is unattributed", () => {
   const db = createFixture();
   try {
@@ -5316,6 +5495,50 @@ test("cloud payload partitions every manifest segment into selected or fully omi
       );
     }
     assert.equal(db.prepare("SELECT count(*) AS count FROM analysis_inputs").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("cloud payload accepts canonical omitted ranges that overlap a selected application track", () => {
+  const db = createFixture();
+  try {
+    db.prepare(
+      `UPDATE audio_tracks
+       SET started_at = 2000, ended_at = 3000
+       WHERE id = 'track-omitted'`
+    ).run();
+    db.prepare(
+      `UPDATE audio_chunks
+       SET started_at = 2000, ended_at = 3000, duration_ms = 1000
+       WHERE id = 'chunk-omitted'`
+    ).run();
+    db.prepare(
+      `UPDATE transcript_segments
+       SET started_at = 2000, ended_at = 3000
+       WHERE id = 'segment-omitted'`
+    ).run();
+    const repository = createRepository(db);
+    const request = validInput({ segmentIds: ["segment-1", "segment-omitted"] });
+    const prepared = repository.prepareAnalysisInput(request);
+    const cloudPayloadJson = JSON.stringify(
+      validCloudPayload({ omittedRanges: [{ startedAt: 2000, endedAt: 3000 }] })
+    );
+
+    const input = repository.createAnalysisInput({
+      ...request,
+      prepareToken: prepared.prepareToken,
+      inputContractVersion: "jarvis-analysis-input-v2",
+      redactionVersion: "jarvis-redaction-v1",
+      cloudPayloadJson,
+    });
+
+    assert.deepEqual(repository.getAnalysisInputForCloud(input.analysisInputId), {
+      inputHash: input.inputHash,
+      cloudPayloadJson,
+      allowedSegmentIds: ["segment-1"],
+      allowedOwnerLabels: ["SELF"],
+    });
   } finally {
     db.close();
   }
@@ -6783,6 +7006,7 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     const fresh = repository.readPublicSnapshot();
     assert.equal(fresh.memories[0].title, "Deployment choice");
     assert.equal(fresh.memories[0].occurrences[0].evidence.length, 1);
+    repository.decideTodo({ todoId: snapshot.todos[0].id, action: "confirm" });
     repository.completeTodo({ todoId: snapshot.todos[0].id });
     assert.equal(repository.readPublicSnapshot().todos[0].verificationState, "confirmed");
   } finally {

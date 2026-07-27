@@ -11,6 +11,20 @@ const KNOWN_APPLICATIONS = Object.freeze({
   "ms-teams": { applicationKey: "teams", applicationDisplayName: "Microsoft Teams" },
   zoom: { applicationKey: "zoom", applicationDisplayName: "Zoom" },
   "zoom.us": { applicationKey: "zoom", applicationDisplayName: "Zoom" },
+  wemeetapp: {
+    applicationKey: "tencent_meeting",
+    applicationDisplayName: "腾讯会议",
+  },
+  wemeet: {
+    applicationKey: "tencent_meeting",
+    applicationDisplayName: "腾讯会议",
+  },
+  tencentmeeting: {
+    applicationKey: "tencent_meeting",
+    applicationDisplayName: "腾讯会议",
+  },
+  weixin: { applicationKey: "wechat", applicationDisplayName: "微信" },
+  wechat: { applicationKey: "wechat", applicationDisplayName: "微信" },
   dota2: { applicationKey: "dota2", applicationDisplayName: "DOTA 2" },
   steam: { applicationKey: "steam", applicationDisplayName: "Steam" },
   vlc: { applicationKey: "vlc", applicationDisplayName: "VLC" },

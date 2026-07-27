@@ -52,7 +52,7 @@ export default function JarvisShell() {
     ) : selectedView === "storage" ? (
       <JarvisStorageSettings captureActive={captureActive} />
     ) : (
-      <TodayView recording={recording} />
+      <TodayView recording={recording} onViewAllTodos={() => setSelectedView("todos")} />
     );
 
   return (

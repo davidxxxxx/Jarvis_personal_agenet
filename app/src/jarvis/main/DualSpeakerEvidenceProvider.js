@@ -200,6 +200,7 @@ class DualSpeakerEvidenceProvider {
       return {
         eligible: true,
         reason: null,
+        sourceKind: source.trackKind,
         attributionState: source.attributionState,
         overlapDetected: false,
         echoDetected: false,

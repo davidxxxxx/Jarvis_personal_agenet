@@ -1781,7 +1781,7 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 1_000 });
-    assert.equal(TARGET_VERSION, 37);
+    assert.equal(TARGET_VERSION, 42);
 
     const explain = (sql, ...params) =>
       db
@@ -1826,6 +1826,41 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
       assert.doesNotMatch(plan, /SCAN (suggestion_occurrences|todo_state_transitions)/);
       assert.doesNotMatch(plan, /USE TEMP B-TREE FOR ORDER BY/);
     }
+  } finally {
+    db.close();
+  }
+});
+
+test("v38 indexes per-chunk runtime status lookups instead of scanning every processing job", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      DROP INDEX idx_processing_jobs_chunk_type_order;
+      PRAGMA user_version = 37;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 37,
+      toVersion: TARGET_VERSION,
+    });
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT id
+         FROM processing_jobs
+         WHERE chunk_id = ?
+           AND job_type = 'transcribe_chunk'
+           AND state NOT IN ('completed','superseded','audio_expired_before_processing')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`
+      )
+      .all("chunk-1")
+      .map((row) => row.detail)
+      .join(" ");
+
+    assert.match(plan, /idx_processing_jobs_chunk_type_order/);
+    assert.doesNotMatch(plan, /SCAN processing_jobs/);
   } finally {
     db.close();
   }

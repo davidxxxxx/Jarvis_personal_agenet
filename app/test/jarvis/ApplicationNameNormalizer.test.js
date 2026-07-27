@@ -14,6 +14,14 @@ test("normalizes known multi-process applications into one stable identity", () 
     applicationKey: "chrome",
     applicationDisplayName: "Chrome",
   });
+  assert.deepEqual(normalizeApplicationIdentity("wemeetapp.exe"), {
+    applicationKey: "tencent_meeting",
+    applicationDisplayName: "腾讯会议",
+  });
+  assert.deepEqual(normalizeApplicationIdentity("Weixin.exe"), {
+    applicationKey: "wechat",
+    applicationDisplayName: "微信",
+  });
   assert.deepEqual(
     normalizeProcessApplications([
       { pid: 11, name: "chrome.exe" },

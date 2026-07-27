@@ -51,11 +51,9 @@ async function maybeOfferCudaWhisper({
   try {
     if (!manager?.isSupportedPlatform?.())
       return { offered: false, reason: "platform_unsupported" };
-    if (manager.isDownloaded() || manager.hasDeclinedFirstRun()) {
-      return {
-        offered: false,
-        reason: manager.isDownloaded() ? "already_installed" : "previously_declined",
-      };
+    const runtimeInstalled = manager.isDownloaded();
+    if (!runtimeInstalled && manager.hasDeclinedFirstRun()) {
+      return { offered: false, reason: "previously_declined" };
     }
     const installedModel = await resolveInstalledWhisperModel({
       whisperManager,
@@ -64,6 +62,21 @@ async function maybeOfferCudaWhisper({
     });
     if (!installedModel) return { offered: false, reason: "model_missing" };
     const { modelName: resolvedModelName, modelPath } = installedModel;
+    if (runtimeInstalled) {
+      const startOptions = manager.getVerifiedStartOptions?.({
+        enabled: true,
+        gpuUuid: selectedGpuUuid,
+      });
+      if (startOptions?.useCuda !== true || !startOptions.gpuUuid) {
+        return { offered: false, enabled: false, reason: "already_installed_unverified" };
+      }
+      await activateCuda({
+        modelName: resolvedModelName,
+        gpuUuid: startOptions.gpuUuid,
+      });
+      await persistEnabled(true);
+      return { offered: false, enabled: true, reason: "already_verified" };
+    }
     const [gpuInfo, gpuList] = await Promise.all([detectGpu(), listGpus()]);
     if (!gpuInfo?.hasNvidiaGpu) return { offered: false, reason: "nvidia_gpu_missing" };
     const gpuUuid = selectedGpuUuid || gpuList.find((gpu) => gpu.uuid)?.uuid || null;

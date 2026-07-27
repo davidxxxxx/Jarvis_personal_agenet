@@ -137,8 +137,8 @@ function harness({ sendable = true, jobState = "pending", activityClassification
     repository,
     memoryRepository,
     inputBuilder: {
-      build() {
-        events.push(["build"]);
+      build(_prepared, options) {
+        events.push(["build", options]);
         if (!sendable) return { sendable: false, reason: "analysis_input_invalid" };
         return {
           sendable: true,
@@ -237,6 +237,9 @@ test("checkpoint and stop triggers only enqueue an exact redacted durable cloud 
     events.map(([name]) => name),
     ["prepare", "build", "create", "set_head", "enqueue"]
   );
+  assert.deepEqual(events.find(([name]) => name === "build")[1], {
+    strategy: "hierarchical",
+  });
   const created = events.find(([name]) => name === "create")[1];
   assert.doesNotMatch(created.cloudPayloadJson, /real name|secret|notes\.txt/u);
   const enqueued = events.find(([name]) => name === "enqueue")[1];

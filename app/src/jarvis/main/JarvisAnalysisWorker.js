@@ -201,7 +201,7 @@ class JarvisAnalysisWorker {
       head.analysisInputHash === job.input_hash &&
       head.desiredVectorHash === job.desired_head_hash &&
       head.modelVersion === this.model &&
-      head.promptVersion === "jarvis-analysis-v2" &&
+      head.promptVersion === "jarvis-analysis-hierarchical-v3" &&
       head.responseSchemaVersion === "jarvis-analysis-v2"
     );
   }

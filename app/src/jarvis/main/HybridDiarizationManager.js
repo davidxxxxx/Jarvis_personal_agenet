@@ -11,6 +11,14 @@ const {
 } = require("./AiModelPackManifest");
 
 const SAFE_SPEAKER = /^[A-Za-z0-9_.-]{1,128}$/;
+const MAX_BOUNDARY_DRIFT_MS = 2;
+const RECOVERABLE_VERIFIER_ERRORS = new Set([
+  "DIARIZATION_BINARY_UNAVAILABLE",
+  "DIARIZATION_MODEL_UNAVAILABLE",
+  "DIARIZATION_SIDECAR_EXIT_NONZERO",
+  "DIARIZATION_SIDECAR_SPAWN_FAILED",
+  "DIARIZATION_SIDECAR_TIMEOUT",
+]);
 
 function codedError(code, message) {
   const error = new Error(message);
@@ -18,18 +26,76 @@ function codedError(code, message) {
   return error;
 }
 
-function normalizeTurn(turn) {
+function normalizeTurn(turn, durationMs = null) {
   const speaker = turn?.speaker ?? turn?.label;
-  const startMs = Math.round(turn?.startMs ?? turn?.start * 1_000);
-  const endMs = Math.round(turn?.endMs ?? turn?.end * 1_000);
+  const rawStartMs = turn?.startMs ?? turn?.start * 1_000;
+  const rawEndMs = turn?.endMs ?? turn?.end * 1_000;
+  let startMs = Math.round(rawStartMs);
+  let endMs = Math.round(rawEndMs);
+  const boundedDurationMs =
+    Number.isSafeInteger(durationMs) && durationMs > 0 ? durationMs : null;
   if (
     typeof speaker !== "string" ||
     !SAFE_SPEAKER.test(speaker) ||
+    !Number.isFinite(rawStartMs) ||
+    !Number.isFinite(rawEndMs) ||
     !Number.isSafeInteger(startMs) ||
-    !Number.isSafeInteger(endMs) ||
-    startMs < 0 ||
-    endMs <= startMs
+    !Number.isSafeInteger(endMs)
   ) {
+    throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+  }
+  if (startMs < 0) {
+    if (startMs < -MAX_BOUNDARY_DRIFT_MS) {
+      throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+    }
+    startMs = 0;
+  }
+  if (boundedDurationMs !== null) {
+    if (startMs > boundedDurationMs) {
+      const tailDriftMs = startMs - boundedDurationMs;
+      if (tailDriftMs <= MAX_BOUNDARY_DRIFT_MS) {
+        startMs = boundedDurationMs;
+      } else {
+        // A model may emit a padding-only tail that begins after the
+        // authoritative WAV duration. It contains no audio evidence, so omit
+        // only that turn rather than rejecting every valid turn from the
+        // recording.
+        if (endMs <= boundedDurationMs) return null;
+        throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+      }
+    }
+    if (endMs > boundedDurationMs) {
+      if (endMs - boundedDurationMs > MAX_BOUNDARY_DRIFT_MS) {
+        throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+      }
+      endMs = boundedDurationMs;
+    }
+  }
+  if (endMs < startMs) {
+    if (startMs - endMs > MAX_BOUNDARY_DRIFT_MS) {
+      throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+    }
+    const boundaryMs = Math.min(startMs, endMs);
+    startMs = Math.max(0, boundaryMs);
+    endMs = startMs + 1;
+  }
+  // Pyannote may emit a positive sub-millisecond segment whose independently
+  // rounded boundaries collapse onto the same millisecond. Preserve the
+  // evidence as a minimal 1 ms turn instead of discarding the entire long
+  // recording. At the audio tail, move the start back so the correction stays
+  // within the reported duration.
+  if (endMs === startMs) {
+    if (boundedDurationMs !== null && startMs >= boundedDurationMs) {
+      endMs = boundedDurationMs;
+      startMs = Math.max(0, endMs - 1);
+    } else {
+      endMs = startMs + 1;
+    }
+  }
+  if (boundedDurationMs !== null && endMs > boundedDurationMs) {
+    endMs = boundedDurationMs;
+  }
+  if (endMs <= startMs) {
     throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
   }
   return Object.freeze({ speaker, startMs, endMs });
@@ -65,6 +131,8 @@ class HybridDiarizationManager {
       throw new TypeError("verifierDiarizer.diarizeStrict must be a function");
     }
     this.verifierDiarizer = verifierDiarizer;
+    this.verifierCircuitOpen = false;
+    this.verifierFailureCode = null;
     this.verifiedPack = null;
     this.modelRuntime =
       runtime ??
@@ -139,20 +207,41 @@ class HybridDiarizationManager {
     if (!result || typeof result !== "object" || !Array.isArray(result.turns)) {
       throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar result is incomplete");
     }
-    const turns = result.turns.map(normalizeTurn);
+    const turns = result.turns
+      .map((turn) => normalizeTurn(turn, result.durationMs))
+      .filter((turn) => turn !== null);
     const primaryCount = new Set(turns.map((turn) => turn.speaker)).size;
     let verifierCount = result.verifierCount ?? null;
-    if (verifierCount === null && this.verifierDiarizer !== null) {
-      const verifierTurns = await this.verifierDiarizer.diarizeStrict(wavPath);
-      if (!Array.isArray(verifierTurns)) {
-        throw codedError(
-          "DIARIZATION_VERIFIER_INVALID_RESULT",
-          "speaker count verifier returned no turns"
-        );
+    let verifierState = verifierCount === null ? "not_run" : "completed";
+    if (
+      verifierCount === null &&
+      this.verifierDiarizer !== null &&
+      !this.verifierCircuitOpen
+    ) {
+      try {
+        const verifierTurns = await this.verifierDiarizer.diarizeStrict(wavPath);
+        if (!Array.isArray(verifierTurns)) {
+          throw codedError(
+            "DIARIZATION_VERIFIER_INVALID_RESULT",
+            "speaker count verifier returned no turns"
+          );
+        }
+        verifierCount = new Set(
+          verifierTurns.map((turn) => turn?.speaker ?? turn?.label ?? turn?.rawLabel).filter(Boolean)
+        ).size;
+        verifierState = "completed";
+      } catch (error) {
+        if (!RECOVERABLE_VERIFIER_ERRORS.has(error?.code)) throw error;
+        this.verifierCircuitOpen = true;
+        this.verifierFailureCode = error.code;
+        verifierState = "unavailable";
+        this.log({
+          phase: "diarization_verifier_degraded",
+          error,
+        });
       }
-      verifierCount = new Set(
-        verifierTurns.map((turn) => turn?.speaker ?? turn?.label ?? turn?.rawLabel).filter(Boolean)
-      ).size;
+    } else if (verifierCount === null && this.verifierCircuitOpen) {
+      verifierState = "unavailable";
     }
     const consensus = buildSpeakerCountConsensus({
       primaryCount,
@@ -170,6 +259,7 @@ class HybridDiarizationManager {
       pipeline: this.policy.policyId,
       executionDevice: "cuda",
       speakerCount: consensus,
+      verifierState,
       overlapWindows,
       overlapSeparation: result.overlapSeparation ?? {
         state: overlapWindows.length === 0 ? "not_needed" : "pending",
@@ -196,6 +286,8 @@ class HybridDiarizationManager {
       available: this.isAvailable(),
       packRoot: this.packRoot,
       policyId: this.policy.policyId,
+      verifierCircuitOpen: this.verifierCircuitOpen,
+      verifierFailureCode: this.verifierFailureCode,
       ...this.modelRuntime.status(),
     });
   }
@@ -204,8 +296,13 @@ class HybridDiarizationManager {
     return this.modelRuntime.ownedPids?.() ?? [];
   }
 
-  dispose() {
-    return this.modelRuntime.dispose();
+  async dispose() {
+    try {
+      return await this.modelRuntime.dispose();
+    } finally {
+      this.verifierCircuitOpen = false;
+      this.verifierFailureCode = null;
+    }
   }
 }
 

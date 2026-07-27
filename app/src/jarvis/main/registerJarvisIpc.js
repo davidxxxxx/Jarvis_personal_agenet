@@ -11,6 +11,10 @@ const {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
+  normalizeActivityCorrectionInput,
+  normalizePersonalizationRuleDecisionInput,
+  normalizeNotificationPreferencesInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
@@ -149,6 +153,36 @@ function toPublicActivityClassification(entry) {
     evidenceSegmentIds,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
+  };
+}
+
+function toPublicPersonalizationRule(entry) {
+  return {
+    id: assertId(entry?.id, "personalizationRuleId"),
+    domain: entry?.domain,
+    targetValue: entry?.targetValue,
+    label: entry?.label,
+    supportCount: entry?.supportCount,
+    state: entry?.state,
+    conditions: {
+      applicationKeys: Array.isArray(entry?.rule?.features?.applicationKeys)
+        ? entry.rule.features.applicationKeys.slice(0, 8)
+        : [],
+      selfParticipated: entry?.rule?.features?.selfParticipated === true,
+      speakerCountBucket: entry?.rule?.features?.speakerCountBucket ?? "none",
+      timeBucket: entry?.rule?.features?.timeBucket ?? "unknown",
+    },
+    createdAt: entry?.createdAt,
+    updatedAt: entry?.updatedAt,
+  };
+}
+
+function toPublicNotificationPreferences(entry) {
+  return {
+    focusMode: entry?.focusMode === true,
+    mutedUntil: Number.isSafeInteger(entry?.mutedUntil) ? entry.mutedUntil : null,
+    updatedAt: Number.isSafeInteger(entry?.updatedAt) ? entry.updatedAt : 0,
+    effectiveMuted: entry?.effectiveMuted === true,
   };
 }
 
@@ -354,6 +388,12 @@ function toPublicDailyDigestStatus(status) {
 const KNOWLEDGE_LIST_LIMIT = 100;
 const KNOWLEDGE_HISTORY_LIMIT = 20;
 const KNOWLEDGE_EVIDENCE_LIMIT = 8;
+const PUBLIC_TODO_PROVENANCE = new Set([
+  "evidence_linked",
+  "legacy_unverified",
+  "suggestion",
+  "source_deleted",
+]);
 
 function limited(items, limit) {
   return (Array.isArray(items) ? items : []).slice(0, limit);
@@ -423,6 +463,12 @@ function toPublicKnowledgeOverview(snapshot) {
     completedAt: item.completedAt,
     dismissedAt: item.dismissedAt,
     verificationState: item.verificationState,
+    verificationReason: item.verificationReason,
+    verificationActor: item.verificationActor,
+    provenance: PUBLIC_TODO_PROVENANCE.has(item.provenance)
+      ? item.provenance
+      : "legacy_unverified",
+    sourceSuggestionId: item.sourceSuggestionId,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({
@@ -445,6 +491,8 @@ function toPublicKnowledgeOverview(snapshot) {
       id: transition.id,
       fromStatus: transition.fromStatus,
       toStatus: transition.toStatus,
+      reason: transition.reason,
+      actor: transition.actor,
       occurredAt: transition.occurredAt,
     })),
   }));
@@ -729,6 +777,56 @@ function registerJarvisIpc({
       .listSessionActivityClassifications(assertId(args[0], "sessionId"))
       .map(toPublicActivityClassification);
   });
+  if (
+    typeof repository.correctActivityClassification === "function" &&
+    typeof repository.listPersonalizationRules === "function" &&
+    typeof repository.decidePersonalizationRule === "function" &&
+    typeof repository.resetPersonalizationRules === "function" &&
+    typeof repository.getNotificationPreferences === "function" &&
+    typeof repository.setNotificationPreferences === "function"
+  ) {
+    ipcMain.handle(CHANNELS.correctActivityClassification, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("activity correction requires one argument");
+      const input = normalizeActivityCorrectionInput(args[0]);
+      const result = repository.correctActivityClassification({ ...input, correctedAt: now() });
+      return {
+        classification: toPublicActivityClassification(result.classification),
+        proposedRule: result.proposedRule
+          ? toPublicPersonalizationRule(result.proposedRule)
+          : null,
+        supportCount: result.supportCount,
+      };
+    });
+    ipcMain.handle(CHANNELS.getPersonalizationSettings, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("personalization settings take no arguments");
+      return {
+        rules: repository.listPersonalizationRules().map(toPublicPersonalizationRule),
+        notifications: toPublicNotificationPreferences(
+          repository.getNotificationPreferences()
+        ),
+      };
+    });
+    ipcMain.handle(CHANNELS.decidePersonalizationRule, (_event, ...args) => {
+      if (args.length !== 1)
+        throw new TypeError("personalization rule decision requires one argument");
+      const input = normalizePersonalizationRuleDecisionInput(args[0]);
+      return toPublicPersonalizationRule(
+        repository.decidePersonalizationRule({ ...input, at: now() })
+      );
+    });
+    ipcMain.handle(CHANNELS.resetPersonalizationRules, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("personalization reset takes no arguments");
+      return repository.resetPersonalizationRules({ at: now() });
+    });
+    ipcMain.handle(CHANNELS.setNotificationPreferences, (_event, ...args) => {
+      if (args.length !== 1)
+        throw new TypeError("notification preferences require one argument");
+      const input = normalizeNotificationPreferencesInput(args[0]);
+      return toPublicNotificationPreferences(
+        repository.setNotificationPreferences({ ...input, at: now() })
+      );
+    });
+  }
   ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
   ipcMain.handle(CHANNELS.listSessionSpeakerClusters, (_event, sessionId) =>
@@ -780,7 +878,13 @@ function registerJarvisIpc({
     }
   });
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
-    toPublicSessionDetail(repository.getSessionDetail(assertId(sessionId, "sessionId")))
+    toPublicSessionDetail(
+      repository.getSessionDetail(assertId(sessionId, "sessionId"), {
+        // Memory playback uses the paged timeline as its single audio-chunk source.
+        // Avoid serializing the same potentially thousands-long chunk list twice.
+        includeAudioChunks: false,
+      })
+    )
   );
   ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId, page) => {
     const timeline = repository.getSessionTimeline(
@@ -931,6 +1035,7 @@ function registerJarvisIpc({
         "dismissSuggestion",
         "resolveMemoryConflict",
         "completeTodo",
+        "decideTodo",
         "getEvidenceContext",
       ]) {
         if (!memoryRepository || typeof memoryRepository[method] !== "function") {
@@ -941,18 +1046,57 @@ function registerJarvisIpc({
     };
     ipcMain.handle(CHANNELS.getKnowledgeOverview, (_event, ...args) => {
       if (args.length !== 0) throw new TypeError("knowledge overview takes no arguments");
-      return toPublicKnowledgeOverview(currentKnowledgeRepository().readPublicSnapshot());
+      const overview = toPublicKnowledgeOverview(
+        currentKnowledgeRepository().readPublicSnapshot()
+      );
+      if (typeof repository.getSuggestionPersonalizationPenalty === "function") {
+        overview.suggestions.sort(
+          (left, right) =>
+            repository.getSuggestionPersonalizationPenalty(left.title) -
+              repository.getSuggestionPersonalizationPenalty(right.title) ||
+            right.createdAt - left.createdAt ||
+            left.id.localeCompare(right.id)
+        );
+      }
+      return overview;
     });
     ipcMain.handle(CHANNELS.decideKnowledgeSuggestion, (_event, ...args) => {
       if (args.length !== 1) throw new TypeError("suggestion decision requires one argument");
       const input = normalizeSuggestionDecisionInput(args[0]);
+      const suggestion =
+        input.action === "dismiss"
+          ? currentKnowledgeRepository()
+              .readPublicSnapshot()
+              .suggestions?.find((entry) => entry.id === input.suggestionId)
+          : null;
       const result = currentKnowledgeRepository()[
         input.action === "accept" ? "acceptSuggestion" : "dismissSuggestion"
       ]({ suggestionId: input.suggestionId, at: now() });
+      if (
+        input.action === "dismiss" &&
+        result.status === "dismissed" &&
+        suggestion &&
+        typeof repository.recordSuggestionDismissalFeedback === "function"
+      ) {
+        try {
+          repository.recordSuggestionDismissalFeedback({
+            suggestionId: input.suggestionId,
+            summary:
+              suggestion.title ??
+              suggestion.summary ??
+              suggestion.text ??
+              input.suggestionId,
+            occurredAt: now(),
+          });
+        } catch {
+          // Local learning is best-effort and must never block the user's dismissal.
+        }
+      }
       return {
         status: result.status,
         suggestionId: result.suggestionId,
         decidedAt: result.decidedAt,
+        todoId: result.todoId,
       };
     });
     ipcMain.handle(CHANNELS.resolveKnowledgeConflict, (_event, ...args) => {
@@ -974,6 +1118,11 @@ function registerJarvisIpc({
         todoId: result.todoId,
         completedAt: result.completedAt,
       };
+    });
+    ipcMain.handle(CHANNELS.decideKnowledgeTodo, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("todo decision requires one argument");
+      const input = normalizeKnowledgeTodoDecisionInput(args[0]);
+      return currentKnowledgeRepository().decideTodo(input);
     });
     ipcMain.handle(CHANNELS.getEvidenceContext, (_event, ...args) => {
       if (args.length !== 1) throw new TypeError("evidence context requires one argument");

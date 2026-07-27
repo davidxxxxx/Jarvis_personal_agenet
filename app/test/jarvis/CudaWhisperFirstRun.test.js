@@ -59,6 +59,32 @@ test("acceptance invokes the pinned consent path and enables only verified CUDA"
   ]);
 });
 
+test("an already verified runtime restores CUDA activation without prompting again", async () => {
+  const { calls, input } = dependencies({
+    manager: {
+      isSupportedPlatform: () => true,
+      isDownloaded: () => true,
+      hasDeclinedFirstRun: () => false,
+      getVerifiedStartOptions: ({ enabled }) => ({
+        useCuda: enabled === true,
+        gpuUuid: "GPU-a",
+      }),
+    },
+  });
+
+  const result = await maybeOfferCudaWhisper(input);
+
+  assert.deepEqual(result, {
+    offered: false,
+    enabled: true,
+    reason: "already_verified",
+  });
+  assert.deepEqual(calls, [
+    ["activate", "large-v3-turbo"],
+    ["enabled", true],
+  ]);
+});
+
 test("does not prompt without an installed local model", async () => {
   const { calls, input } = dependencies({ fileExists: () => false });
   const result = await maybeOfferCudaWhisper(input);

@@ -16,6 +16,8 @@ import sys
 import traceback
 from typing import Any
 
+MAX_BOUNDARY_DRIFT_MS = 2
+
 
 def _lower_windows_priority() -> None:
     if os.name != "nt":
@@ -80,6 +82,39 @@ def _overlap_windows(turns: list[dict[str, Any]], padding_ms: int, duration_ms: 
         else:
             merged.append(dict(window))
     return merged
+
+
+def _normalize_annotation_turn(segment: Any, speaker: Any, duration_ms: int) -> dict[str, Any] | None:
+    if segment.end <= segment.start or duration_ms <= 0:
+        return None
+    start_ms = max(0, round(segment.start * 1000))
+    end_ms = min(duration_ms, round(segment.end * 1000))
+    if start_ms > duration_ms:
+        if start_ms - duration_ms > MAX_BOUNDARY_DRIFT_MS:
+            return None
+        start_ms = duration_ms
+    if end_ms < start_ms:
+        if start_ms - end_ms > MAX_BOUNDARY_DRIFT_MS:
+            return None
+        boundary_ms = min(start_ms, end_ms)
+        start_ms = max(0, boundary_ms)
+        end_ms = min(duration_ms, start_ms + 1)
+    # Positive sub-millisecond segments can collapse after independent
+    # rounding. Keep a minimal 1 ms interval so one harmless boundary does not
+    # invalidate a multi-hour diarization result.
+    if end_ms <= start_ms:
+        if start_ms >= duration_ms:
+            end_ms = duration_ms
+            start_ms = max(0, end_ms - 1)
+        else:
+            end_ms = min(duration_ms, start_ms + 1)
+    if end_ms <= start_ms:
+        return None
+    return {
+        "speaker": str(speaker),
+        "startMs": start_ms,
+        "endMs": end_ms,
+    }
 
 
 class SeparatorWorker:
@@ -240,13 +275,9 @@ class OfflineModels:
         )
         annotation = output.speaker_diarization
         turns = [
-            {
-                "speaker": str(speaker),
-                "startMs": max(0, round(segment.start * 1000)),
-                "endMs": min(duration_ms, round(segment.end * 1000)),
-            }
+            turn
             for segment, _, speaker in annotation.itertracks(yield_label=True)
-            if segment.end > segment.start
+            if (turn := _normalize_annotation_turn(segment, speaker, duration_ms)) is not None
         ]
         turns.sort(key=lambda turn: (turn["startMs"], turn["endMs"], turn["speaker"]))
         padding_ms = max(0, min(5000, int(request.get("overlapPaddingMs", 250))))

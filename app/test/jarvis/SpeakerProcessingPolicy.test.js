@@ -149,6 +149,20 @@ test("accepts exact terminal audio plus final/no-speech transcripts and returns 
   );
 });
 
+test("accepts up to two milliseconds of capture-boundary overlap but rejects larger overlap", () => {
+  for (const overlapMs of [1, 2]) {
+    const input = finalEvidence();
+    input.chunks[1].audioChunk.started_at -= overlapMs;
+    input.chunks[1].audioChunk.duration_ms += overlapMs;
+    assert.equal(policy().evaluate(input).eligible, true);
+  }
+
+  const invalid = finalEvidence();
+  invalid.chunks[1].audioChunk.started_at -= 3;
+  invalid.chunks[1].audioChunk.duration_ms += 3;
+  assert.equal(policy().evaluate(invalid).reason, "final_audio_incomplete");
+});
+
 test("uses the documented stable reason order for terminal and audio failures", () => {
   const cases = [
     ["session_not_terminal", (input) => (input.session = null)],

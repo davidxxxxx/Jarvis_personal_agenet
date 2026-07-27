@@ -231,7 +231,7 @@ export default function MemoryView() {
     let cancelled = false;
     let requestInFlight = false;
     let timer: number | null = null;
-    const delay = () => (document.hidden || !document.hasFocus() ? 2_000 : 1_000);
+    const delay = () => (document.hidden || !document.hasFocus() ? 15_000 : 5_000);
     const schedule = () => {
       if (cancelled || requestInFlight || timer !== null) return;
       timer = window.setTimeout(() => {
@@ -559,241 +559,255 @@ export default function MemoryView() {
         {error && (
           <p className="mt-4 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>
         )}
-        <section className="mt-5 rounded-2xl border border-border/60 bg-card p-4 shadow-sm sm:p-5">
-          <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
-            <div>
-              <h2 className="text-lg font-semibold">录音与转写</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                播放控制已放到每条转写上，点击文字或左侧按钮即可播放该句。
-              </p>
-            </div>
-            <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
-              {timeline?.segments.length ?? detail.segments.length} 条转写
-            </span>
-          </div>
-          {timeline ? (
-            <ContinuousSessionPlayer
-              timeline={timeline}
-              readChunk={window.electronAPI.jarvis.readAudioChunk}
-              seekRequest={seekRequest}
-              onSeekResult={acknowledgeEvidencePlayback}
-              focusSegmentId={evidenceContext?.transcriptSegmentId}
-              focusRequestId={focusRequestId}
-              onTrackPageChange={(offset) => void loadTrackPage(offset)}
-            />
-          ) : (
-            <p className="rounded-xl bg-muted/30 p-4 text-sm text-muted-foreground">
-              正在读取音频时间线…
-            </p>
-          )}
-        </section>
-        {evidenceNavigation.phase === "transcript_only" && evidenceContext && (
-          <p role="status" className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800">
-            {evidenceNavigation.reason === "audio_expired"
-              ? "Audio was removed by the retention policy. "
-              : evidenceNavigation.reason === "audio_missing"
-                ? "Audio is unavailable. "
-                : "Audio became unavailable. "}
-            {evidenceContext.transcriptState === "available"
-              ? "Transcript evidence remains."
-              : "Transcript evidence is unavailable."}
-          </p>
-        )}
-        <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <span className="rounded-lg bg-primary/10 p-2 text-primary">
-                <Users className="size-5" aria-hidden="true" />
-              </span>
+        <div className="flex flex-col">
+          <section className="order-5 mt-5 rounded-2xl border border-border/60 bg-card p-4 shadow-sm sm:p-5">
+            <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
               <div>
-                <h2 className="font-semibold">说话人与声纹</h2>
+                <h2 className="text-lg font-semibold">录音与转写</h2>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  {headlineSpeakerRun?.speakerCount
-                    ? `本次识别到 ${speakerCountLabel(
-                        headlineSpeakerRun.speakerCount.minimum,
-                        headlineSpeakerRun.speakerCount.maximum
-                      )}`
-                    : timeline?.processing_state === "ready"
-                      ? "本次没有可用的说话人结果"
-                      : "正在后台复核人数和声纹"}
+                  播放控制已放到每条转写上，点击文字或左侧按钮即可播放该句。
                 </p>
               </div>
-            </div>
-            {headlineSpeakerRun && (
               <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
-                {headlineSpeakerRun.inputVersion === 2
-                  ? headlineSpeakerRun.speakerCount?.state === "models_agree"
-                    ? "双模型一致"
-                    : "高精度复核"
-                  : "基础识别"}
+                {timeline?.segments.length ?? detail.segments.length} 条转写
               </span>
+            </div>
+            {timeline ? (
+              <ContinuousSessionPlayer
+                timeline={timeline}
+                readChunk={window.electronAPI.jarvis.readAudioChunk}
+                seekRequest={seekRequest}
+                onSeekResult={acknowledgeEvidencePlayback}
+                focusSegmentId={evidenceContext?.transcriptSegmentId}
+                focusRequestId={focusRequestId}
+                onTrackPageChange={(offset) => void loadTrackPage(offset)}
+              />
+            ) : (
+              <p className="rounded-xl bg-muted/30 p-4 text-sm text-muted-foreground">
+                正在读取音频时间线…
+              </p>
             )}
-          </div>
-          {visibleSpeakers.length > 0 ? (
-            <div className="mt-4 grid gap-2 sm:grid-cols-2">
-              {visibleSpeakers.map((cluster) => (
-                <div
-                  key={cluster.id}
-                  className="flex items-center justify-between gap-3 rounded-lg bg-muted/30 px-3 py-2.5"
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-medium text-muted-foreground">
-                        {cluster.localLabel}
-                      </span>
-                      <SpeakerChip cluster={cluster} localLabel={cluster.localLabel} />
-                    </div>
-                    <p className="mt-1 truncate text-xs text-muted-foreground">
-                      {cluster.person?.isSelf
-                        ? "本人声纹已确认"
-                        : cluster.linkState === "confirmed"
-                          ? "已加入长期人物档案"
-                          : cluster.suggestedPerson
-                            ? `可能是 ${cluster.suggestedPerson.displayName}`
-                            : "点击标签可指定姓名并选择是否长期学习"}
-                    </p>
-                  </div>
-                  {typeof cluster.score === "number" && (
-                    <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                      {Math.round(cluster.score * 100)}%
-                    </span>
-                  )}
+          </section>
+          {evidenceNavigation.phase === "transcript_only" && evidenceContext && (
+            <p
+              role="status"
+              className="order-6 mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-800"
+            >
+              {evidenceNavigation.reason === "audio_expired"
+                ? "Audio was removed by the retention policy. "
+                : evidenceNavigation.reason === "audio_missing"
+                  ? "Audio is unavailable. "
+                  : "Audio became unavailable. "}
+              {evidenceContext.transcriptState === "available"
+                ? "Transcript evidence remains."
+                : "Transcript evidence is unavailable."}
+            </p>
+          )}
+          <section className="order-2 mt-6 rounded-xl border border-border/50 bg-card p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <span className="rounded-lg bg-primary/10 p-2 text-primary">
+                  <Users className="size-5" aria-hidden="true" />
+                </span>
+                <div>
+                  <h2 className="font-semibold">说话人与声纹</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {headlineSpeakerRun?.speakerCount
+                      ? `本次识别到 ${speakerCountLabel(
+                          headlineSpeakerRun.speakerCount.minimum,
+                          headlineSpeakerRun.speakerCount.maximum
+                        )}`
+                      : timeline?.processing_state === "ready"
+                        ? "本次没有可用的说话人结果"
+                        : "正在后台复核人数和声纹"}
+                  </p>
                 </div>
-              ))}
+              </div>
+              {headlineSpeakerRun && (
+                <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+                  {headlineSpeakerRun.inputVersion === 2
+                    ? headlineSpeakerRun.speakerCount?.state === "models_agree"
+                      ? "双模型一致"
+                      : "高精度复核"
+                    : "基础识别"}
+                </span>
+              )}
             </div>
-          ) : (
-            <p className="mt-4 rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
-              {timeline?.processing_state === "ready"
-                ? "没有提取到可命名的声纹。纯系统音频或重叠不清的片段不会强行建立人物档案。"
-                : "录音已安全保存；GPU 空闲后会自动补齐说话人分离和跨会话关联。"}
-            </p>
-          )}
-        </section>
-        <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="font-semibold">完整总结</h2>
-            {speakerProcessing?.summaryRefresh?.recommended === 1 && (
-              <button
-                type="button"
-                onClick={() => void analyze()}
-                disabled={loading}
-                className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-800 disabled:opacity-50 dark:text-amber-200"
-              >
-                {loading ? "正在刷新…" : "付费刷新总结"}
-              </button>
-            )}
-          </div>
-          {speakerProcessing?.summaryRefresh?.recommended === 1 && (
-            <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-              高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax
-              重新总结。
-            </p>
-          )}
-          <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
-            {detail.summary?.summary ??
-              (summaryInputReady
-                ? "尚未生成总结。录音和转写已安全保存。"
-                : "正在完成最终转写和说话人识别，完成后会自动生成总结。")}
-          </p>
-          {decisions.length > 0 && (
-            <div className="mt-4">
-              <h3 className="text-sm font-medium">关键决定</h3>
-              <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
-                {decisions.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {suggestions.length > 0 && (
-            <div className="mt-4">
-              <h3 className="text-sm font-medium">AI 建议</h3>
-              <ul className="mt-2 space-y-2 text-sm text-muted-foreground">
-                {suggestions.map((item) => (
-                  <li key={item.content}>
-                    <span className="text-foreground">{item.content}</span> — {item.reason}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </section>
-        <div className="mt-4 grid gap-4 md:grid-cols-2">
-          <section className="rounded-xl border border-border/50 bg-card p-5">
-            <h2 className="font-semibold">主题</h2>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {detail.topics.length ? (
-                detail.topics.map((topic) => (
-                  <span
-                    key={topic.id}
-                    className="rounded-full bg-primary/10 px-3 py-1 text-xs text-primary"
+            {visibleSpeakers.length > 0 ? (
+              <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                {visibleSpeakers.map((cluster) => (
+                  <div
+                    key={cluster.id}
+                    className="flex items-center justify-between gap-3 rounded-lg bg-muted/30 px-3 py-2.5"
                   >
-                    {topic.canonical_title}
-                  </span>
-                ))
-              ) : (
-                <p className="text-sm text-muted-foreground">暂无主题</p>
-              )}
-            </div>
-          </section>
-          <section className="rounded-xl border border-border/50 bg-card p-5">
-            <h2 className="font-semibold">待办</h2>
-            <ul className="mt-3 space-y-2 text-sm">
-              {detail.todos.length ? (
-                detail.todos.map((todo) => (
-                  <li key={todo.id} className="flex gap-2">
-                    <span>{todo.status === "completed" ? "✓" : "○"}</span>
-                    <span>{todo.content}</span>
-                  </li>
-                ))
-              ) : (
-                <li className="text-muted-foreground">暂无待办</li>
-              )}
-            </ul>
-          </section>
-        </div>
-        {timeline && (
-          <details className="mt-4 rounded-xl border border-border/50 bg-card">
-            <summary className="cursor-pointer px-5 py-4 text-sm font-semibold">
-              处理详情与后台进度
-            </summary>
-            <div className="border-t border-border/50 p-4">
-              {latestSpeakerRuns.length > 0 && (
-                <div className="mb-4 rounded-lg border border-border/50 bg-muted/20 p-3">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <Cpu className="size-4" aria-hidden="true" />
-                    说话人处理
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-medium text-muted-foreground">
+                          {cluster.localLabel}
+                        </span>
+                        <SpeakerChip cluster={cluster} localLabel={cluster.localLabel} />
+                      </div>
+                      <p className="mt-1 truncate text-xs text-muted-foreground">
+                        {cluster.person?.isSelf
+                          ? "本人声纹已确认"
+                          : cluster.linkState === "confirmed"
+                            ? "已加入长期人物档案"
+                            : cluster.suggestedPerson
+                              ? `可能是 ${cluster.suggestedPerson.displayName}`
+                              : "点击标签可指定姓名并选择是否长期学习"}
+                      </p>
+                    </div>
+                    {typeof cluster.score === "number" && (
+                      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                        {Math.round(cluster.score * 100)}%
+                      </span>
+                    )}
                   </div>
-                  <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
-                    {latestSpeakerRuns.map((run) => {
-                      const track = timeline.tracks.find((item) => item.id === run.trackId);
-                      const source =
-                        track?.application_display_name ||
-                        (track?.source_type === "mic" ? "麦克风" : "系统音频");
-                      return (
-                        <li key={run.id} className="flex flex-wrap gap-x-2 gap-y-1">
-                          <span className="font-medium text-foreground">{source}</span>
-                          <span>{run.executionDevice.toUpperCase()}</span>
-                          <span>
-                            {run.speakerCount
-                              ? speakerCountLabel(
-                                  run.speakerCount.minimum,
-                                  run.speakerCount.maximum
-                                )
-                              : "人数未知"}
-                          </span>
-                          <span>重叠分离：{run.overlapSeparationState}</span>
-                          {run.modelPackVersion && <span>{run.modelPackVersion}</span>}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-4 rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
+                {timeline?.processing_state === "ready"
+                  ? "没有提取到可命名的声纹。纯系统音频或重叠不清的片段不会强行建立人物档案。"
+                  : "录音已安全保存；GPU 空闲后会自动补齐说话人分离和跨会话关联。"}
+                </p>
               )}
-              <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
+            {(speakerProcessing?.fragmentedEvidenceCount ?? 0) > 0 && (
+              <p className="mt-3 text-xs leading-5 text-muted-foreground">
+                已隐藏 {speakerProcessing?.fragmentedEvidenceCount} 个过短或重复的声纹碎片；它们只是算法证据，
+                不计作真实人物。
+              </p>
+            )}
+          </section>
+          <section className="order-1 mt-6 rounded-xl border border-border/50 bg-card p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="font-semibold">完整总结</h2>
+              {speakerProcessing?.summaryRefresh?.recommended === 1 && (
+                <button
+                  type="button"
+                  onClick={() => void analyze()}
+                  disabled={loading}
+                  className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-800 disabled:opacity-50 dark:text-amber-200"
+                >
+                  {loading ? "正在刷新…" : "付费刷新总结"}
+                </button>
+              )}
             </div>
-          </details>
-        )}
+            {speakerProcessing?.summaryRefresh?.recommended === 1 && (
+              <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
+                高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax
+                重新总结。
+              </p>
+            )}
+            <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
+              {detail.summary?.summary ??
+                (summaryInputReady
+                  ? "尚未生成总结。录音和转写已安全保存。"
+                  : "正在完成最终转写和说话人识别，完成后会自动生成总结。")}
+            </p>
+            {decisions.length > 0 && (
+              <div className="mt-4">
+                <h3 className="text-sm font-medium">关键决定</h3>
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                  {decisions.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {suggestions.length > 0 && (
+              <div className="mt-4">
+                <h3 className="text-sm font-medium">AI 建议</h3>
+                <ul className="mt-2 space-y-2 text-sm text-muted-foreground">
+                  {suggestions.map((item) => (
+                    <li key={item.content}>
+                      <span className="text-foreground">{item.content}</span> — {item.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
+          <div className="order-3 mt-4 grid gap-4 md:grid-cols-2">
+            <section className="rounded-xl border border-border/50 bg-card p-5">
+              <h2 className="font-semibold">主题</h2>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {detail.topics.length ? (
+                  detail.topics.map((topic) => (
+                    <span
+                      key={topic.id}
+                      className="rounded-full bg-primary/10 px-3 py-1 text-xs text-primary"
+                    >
+                      {topic.canonical_title}
+                    </span>
+                  ))
+                ) : (
+                  <p className="text-sm text-muted-foreground">暂无主题</p>
+                )}
+              </div>
+            </section>
+            <section className="rounded-xl border border-border/50 bg-card p-5">
+              <h2 className="font-semibold">待办</h2>
+              <ul className="mt-3 space-y-2 text-sm">
+                {detail.todos.length ? (
+                  detail.todos.map((todo) => (
+                    <li key={todo.id} className="flex gap-2">
+                      <span>{todo.status === "completed" ? "✓" : "○"}</span>
+                      <span>{todo.content}</span>
+                    </li>
+                  ))
+                ) : (
+                  <li className="text-muted-foreground">暂无待办</li>
+                )}
+              </ul>
+            </section>
+          </div>
+          {timeline && (
+            <details
+              className="order-4 mt-4 rounded-xl border border-border/50 bg-card"
+              open={timeline.processing_state !== "ready"}
+            >
+              <summary className="cursor-pointer px-5 py-4 text-sm font-semibold">
+                处理详情与后台进度
+              </summary>
+              <div className="border-t border-border/50 p-4">
+                {latestSpeakerRuns.length > 0 && (
+                  <div className="mb-4 rounded-lg border border-border/50 bg-muted/20 p-3">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <Cpu className="size-4" aria-hidden="true" />
+                      说话人处理
+                    </div>
+                    <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
+                      {latestSpeakerRuns.map((run) => {
+                        const track = timeline.tracks.find((item) => item.id === run.trackId);
+                        const source =
+                          track?.application_display_name ||
+                          (track?.source_type === "mic" ? "麦克风" : "系统音频·安全兜底");
+                        return (
+                          <li key={run.id} className="flex flex-wrap gap-x-2 gap-y-1">
+                            <span className="font-medium text-foreground">{source}</span>
+                            <span>{run.executionDevice.toUpperCase()}</span>
+                            <span>
+                              {run.speakerCount
+                                ? speakerCountLabel(
+                                    run.speakerCount.minimum,
+                                    run.speakerCount.maximum
+                                  )
+                                : "人数未知"}
+                            </span>
+                            <span>重叠分离：{run.overlapSeparationState}</span>
+                            {run.modelPackVersion && <span>{run.modelPackVersion}</span>}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                )}
+                <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
+              </div>
+            </details>
+          )}
+        </div>
       </main>
     );
   }

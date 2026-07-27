@@ -89,6 +89,7 @@ for (const format of ["wav", "flac"]) {
         endedAt: 2_000,
         personId: null,
         speakerLabel: "mic",
+        sourceType: "system",
         text: "明天 review 产品 roadmap",
         confidence: 0.8,
         isStable: true,
@@ -142,6 +143,124 @@ for (const format of ["wav", "flac"]) {
     assert.equal(repository.getAudioChunk("chunk-1").transcription_status, "completed");
   });
 }
+
+test("excludes unsupported scripts and repeated hallucinations from the rolling prompt", async (t) => {
+  const repository = seedChunk(t);
+  repository.upsertTranscriptSegments("session-1", [
+    {
+      id: "valid-context",
+      startedAt: 1_100,
+      endedAt: 2_000,
+      personId: null,
+      speakerLabel: "mic",
+      sourceType: "system",
+      text: "明天 review 产品 roadmap",
+      confidence: 0.8,
+      isStable: true,
+    },
+    {
+      id: "unsupported-script",
+      startedAt: 2_100,
+      endedAt: 3_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "保留这段中文 Игорь שלום カタカナ 한글",
+      confidence: 0.4,
+      isStable: true,
+    },
+    {
+      id: "repeated-hallucination",
+      startedAt: 3_100,
+      endedAt: 4_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "alpha beta gamma alpha beta gamma alpha beta gamma",
+      confidence: 0.2,
+      isStable: true,
+    },
+  ]);
+  let transcriptionInput;
+  const { worker } = workerFixture(repository, async (input) => {
+    transcriptionInput = input;
+    return { text: "新的正常结果", confidence: 0.9 };
+  });
+
+  await worker.handle(transcriptionJob());
+
+  assert.match(transcriptionInput.initialPrompt, /review 产品 roadmap/u);
+  assert.match(transcriptionInput.initialPrompt, /保留这段中文/u);
+  assert.doesNotMatch(transcriptionInput.initialPrompt, /Игорь|שלום|カタカナ|한글/u);
+  assert.doesNotMatch(transcriptionInput.initialPrompt, /alpha beta gamma/u);
+});
+
+test("keeps the rolling prompt isolated to the current audio track", async (t) => {
+  const repository = seedChunk(t);
+  repository.createTrack({
+    id: "track-2",
+    sessionId: "session-1",
+    sourceType: "system",
+    deviceId: null,
+    deviceLabel: "DOTA 2",
+    applicationKey: "dota2",
+    applicationDisplayName: "DOTA 2",
+    captureGeneration: 1,
+    strategy: "include-process-tree",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  repository.commitChunk({
+    id: "other-track-chunk",
+    sessionId: "session-1",
+    trackId: "track-2",
+    sourceType: "system",
+    sequenceNumber: 0,
+    path: "other-track-chunk.wav",
+    startedAt: 2_000,
+    endedAt: 9_000,
+    durationMs: 7_000,
+    sha256: "b".repeat(64),
+    expiresAt: 600_000,
+  });
+  const otherTrackChunk = repository.getAudioChunk("other-track-chunk");
+  repository.commitChunkTranscript({
+    chunk: otherTrackChunk,
+    result: {
+      text: "DOTA Roshan buyback barracks 游戏解说上下文",
+      confidence: 0.91,
+    },
+    modelVersion: MODEL_VERSION,
+    completedAt: COMPLETED_AT - 1_000,
+  });
+  repository.upsertTranscriptSegments("session-1", [
+    {
+      id: "same-track-context",
+      startedAt: 1_100,
+      endedAt: 2_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "麦克风所在音轨的产品 roadmap",
+      confidence: 0.8,
+      isStable: true,
+    },
+  ]);
+  let transcriptionInput;
+  const { worker } = workerFixture(repository, async (input) => {
+    transcriptionInput = input;
+    return { text: "新的正常结果", confidence: 0.9 };
+  });
+
+  await worker.handle(transcriptionJob());
+
+  assert.match(transcriptionInput.initialPrompt, /麦克风所在音轨的产品 roadmap/u);
+  assert.doesNotMatch(
+    transcriptionInput.initialPrompt,
+    /DOTA|Roshan|buyback|barracks|游戏解说上下文/u
+  );
+});
 
 test("keeps MIC lineage and replaying the same input and model is idempotent", async (t) => {
   const repository = seedChunk(t, { sourceType: "mic" });
@@ -372,6 +491,65 @@ test("the IPC adapter keeps verified WAV bytes local and uses auto language", as
       },
     },
   ]);
+});
+
+test("the IPC adapter locally retries suspicious scripts with Chinese as the primary language", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return options.language === "zh"
+          ? { success: true, text: "我们讨论 API 预算", executionDevice: "cuda" }
+          : { success: true, text: "我们讨论 этот API budget", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => Buffer.from("verified-local-wav"),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      initialPrompt: "中英 context",
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "我们讨论 API 预算", executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].language, null);
+  assert.equal(calls[1].language, "zh");
+  assert.match(calls[1].initialPrompt, /主要语言是中文/);
+  assert.equal(calls[1].requireCuda, true);
 });
 
 test("the IPC adapter maps CPU admission to explicit bounded Whisper options", async () => {

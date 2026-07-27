@@ -28,6 +28,8 @@ const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
 const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
 const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
 const MAX_DAILY_DIGEST_CANDIDATE_BYTES = 512 * 1024;
+const MIN_CLOUD_ANONYMOUS_SPEECH_MS = 5_000;
+const MIN_CLOUD_ANONYMOUS_WINDOWS = 3;
 const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
 const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
 const PUBLIC_SNAPSHOT_LIST_LIMIT = 101;
@@ -292,6 +294,7 @@ class MemoryRepository {
     this.now = now;
     this.validateRedactedCloudPayload = validateRedactedCloudPayload;
     this.memoryMerger = memoryMerger ?? new MemoryMerger();
+    this.actionVerificationByCandidate = new WeakMap();
   }
 
   _normalizeInputRequest(input) {
@@ -372,10 +375,16 @@ class MemoryRepository {
         if (person.is_self !== 1) {
           const confirmed = this.db
             .prepare(
-              `SELECT 1 FROM speaker_clusters
-               WHERE session_id = ? AND person_id = ? AND link_state = 'confirmed' LIMIT 1`
+              `SELECT 1
+               FROM speaker_cluster_segments AS link
+               JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+               WHERE link.transcript_segment_id = ?
+                 AND cluster.session_id = ?
+                 AND cluster.person_id = ?
+                 AND cluster.link_state = 'confirmed'
+               LIMIT 1`
             )
-            .get(sessionId, person.id);
+            .get(segment.id, sessionId, person.id);
           if (!confirmed) return [];
         }
         subject = {
@@ -388,16 +397,56 @@ class MemoryRepository {
       } else {
         const cluster = this.db
           .prepare(
-            `SELECT cluster.id, cluster.local_label
+            `SELECT cluster.id, cluster.local_label,
+                    CASE
+                      WHEN resolution.resolution_state = 'unknown'
+                       AND resolution.reason IN (
+                         'dual_model_anonymous_group',
+                         'dual_model_anonymous_profile'
+                       )
+                      THEN resolution.candidate_person_ref
+                      ELSE NULL
+                    END AS anonymous_person_ref
              FROM speaker_cluster_segments AS link
              JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+             LEFT JOIN speaker_identity_resolutions AS resolution
+               ON resolution.id = (
+                 SELECT candidate.id
+                 FROM speaker_identity_resolutions AS candidate
+                 JOIN speaker_identity_resolution_runs AS run
+                   ON run.id = candidate.resolution_run_id
+                 WHERE candidate.cluster_id = cluster.id
+                   AND candidate.actor = 'system'
+                 ORDER BY run.commit_sequence DESC, candidate.rowid DESC
+                 LIMIT 1
+               )
              WHERE link.transcript_segment_id = ? AND cluster.session_id = ?
-             ORDER BY cluster.id LIMIT 1`
+               AND (
+                 cluster.link_state = 'confirmed'
+                 OR (
+                   cluster.speech_ms >= ?
+                   AND cluster.window_count >= ?
+                 )
+               )
+             ORDER BY
+               CASE cluster.link_state WHEN 'confirmed' THEN 0 ELSE 1 END,
+               cluster.speech_ms DESC,
+               cluster.window_count DESC,
+               COALESCE(cluster.quality_score, 0) DESC,
+               cluster.id
+             LIMIT 1`
           )
-          .get(segment.id, sessionId);
+          .get(
+            segment.id,
+            sessionId,
+            MIN_CLOUD_ANONYMOUS_SPEECH_MS,
+            MIN_CLOUD_ANONYMOUS_WINDOWS
+          );
         if (!cluster?.local_label?.trim()) return [];
         subject = {
-          key: `speaker_cluster:${cluster.id}`,
+          key: cluster.anonymous_person_ref
+            ? `anonymous_speaker:${cluster.anonymous_person_ref}`
+            : `speaker_cluster:${cluster.id}`,
           subjectKind: "speaker_cluster",
           subjectId: cluster.id,
           subjectDisplayNameSnapshot: cluster.local_label,
@@ -582,14 +631,11 @@ class MemoryRepository {
     ) {
       throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
     }
-    for (const manifest of prepared.segments.filter((segment) => selected.has(segment.segmentId))) {
-      const overlappingOmission = canonicalOmittedRanges.some(
-        (range) => range.startedAt < manifest.endedAt && manifest.startedAt < range.endedAt
-      );
-      if (overlappingOmission) {
-        throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
-      }
-    }
+    // Omitted ranges describe omitted segment time spans, not gaps in one
+    // continuous timeline. Independent microphone and application tracks can
+    // legitimately overlap a selected segment. Exact canonical-range matching
+    // above still proves that every omitted range came from the prepared
+    // manifest without rejecting valid multi-track captures.
     const selectedOwnerLabels = prepared.speakerBindings
       .map((binding) => binding.label)
       .filter((label) => payload.segments.some((segment) => segment.speakerLabel === label));
@@ -2906,7 +2952,7 @@ class MemoryRepository {
         classification.source_attribution
       );
     };
-    const evidenceAllowed = (segmentIds, permission) =>
+    const evidenceAllowed = (segmentIds, permission, minimumConfidence) =>
       segmentIds.length > 0 &&
       segmentIds.every((segmentId) => {
         const segment = context.manifestById.get(segmentId);
@@ -2922,7 +2968,7 @@ class MemoryRepository {
           matching.every(
             (classification) =>
               classification.decision === "adopted" &&
-              classification.confidence >= 0.8 &&
+              classification.confidence >= minimumConfidence &&
               classification.source_attribution !== "mixed_unknown" &&
               actionCategories.has(classification.category) &&
               classification.evidence?.[permission] === true
@@ -2933,7 +2979,7 @@ class MemoryRepository {
       context.manifestById.get(segmentId)?.speaker_binding_label === "SELF";
     const selfCommitmentEvidence = new Set(
       candidate.memories
-        .filter((memory) => memory.kind === "commitment")
+        .filter((memory) => memory.kind === "commitment" && memory.confidence >= 0.9)
         .flatMap((memory) => memory.evidenceSegmentIds)
         .filter(isSelfEvidence)
     );
@@ -2943,17 +2989,37 @@ class MemoryRepository {
         todo.ownerLabel === "SELF" &&
         todo.evidenceSegmentIds.some(isSelfEvidence) &&
         todo.evidenceSegmentIds.some((segmentId) => selfCommitmentEvidence.has(segmentId)) &&
-        evidenceAllowed(todo.evidenceSegmentIds, "allowTodos")
+        evidenceAllowed(todo.evidenceSegmentIds, "allowTodos", 0.9)
     );
     const suggestions = candidate.suggestions.filter(
       (suggestion) =>
         suggestion.basedOnEvidenceSegmentIds.some(isSelfEvidence) &&
-        evidenceAllowed(suggestion.basedOnEvidenceSegmentIds, "allowSuggestions")
+        evidenceAllowed(suggestion.basedOnEvidenceSegmentIds, "allowSuggestions", 0.8)
     );
-    if (todos.length === candidate.todos.length && suggestions.length === candidate.suggestions.length) {
-      return candidate;
-    }
-    return { ...candidate, todos, suggestions };
+    const projection = { ...candidate, todos, suggestions };
+    this.actionVerificationByCandidate.set(
+      projection,
+      new Map(
+        todos.map((todo) => [
+          canonicalTupleHash([
+            "todo_verification",
+            canonicalizeText(todo.title),
+            todo.dueText,
+            [...todo.evidenceSegmentIds].sort(),
+          ]),
+          todo.evidenceSegmentIds.every(isSelfEvidence)
+            ? {
+                state: "confirmed",
+                reason: "strict_self_commitment",
+              }
+            : {
+                state: "pending_confirmation",
+                reason: "assigned_and_accepted",
+              },
+        ])
+      )
+    );
+    return projection;
   }
 
   applyCandidateAnalysis(input) {
@@ -2963,6 +3029,8 @@ class MemoryRepository {
     const analysisInputId = assertId(input.analysisInputId, "analysisInputId");
     const inputHash = assertHash(input.inputHash, "inputHash");
     const candidate = input.candidate;
+    const projectedTodoVerification =
+      this.actionVerificationByCandidate.get(candidate) ?? new Map();
     const rawCandidateHash = sha256(canonicalJson(candidate));
     if (
       Object.prototype.hasOwnProperty.call(input, "claimedCandidateHash") &&
@@ -3410,6 +3478,38 @@ class MemoryRepository {
             appliedAt
           );
         insertEvidence("todo_occurrence", occurrenceId, todo.evidenceSegmentIds);
+
+        const desiredVerification = projectedTodoVerification.get(
+          canonicalTupleHash([
+            "todo_verification",
+            canonicalizeText(todo.title),
+            todo.dueText,
+            [...todo.evidenceSegmentIds].sort(),
+          ])
+        );
+        const latestVerification = this._latestTodoVerification(todoRow.id);
+        if (
+          desiredVerification &&
+          latestVerification?.actor !== "user" &&
+          latestVerification?.state !== "confirmed" &&
+          latestVerification?.state !== desiredVerification.state
+        ) {
+          this.db
+            .prepare(
+              `INSERT INTO todo_verification_decisions (
+                 id, todo_instance_id, state, reason, actor,
+                 source_analysis_input_id, occurred_at
+               ) VALUES (?, ?, ?, ?, 'system', ?, ?)`
+            )
+            .run(
+              this._nextId("todo_verification"),
+              todoRow.id,
+              desiredVerification.state,
+              desiredVerification.reason,
+              analysisInputId,
+              appliedAt
+            );
+        }
       };
 
       const applySuggestionInsert = (suggestion) => {
@@ -4765,14 +4865,67 @@ class MemoryRepository {
     const at = assertTimestamp(input.at, "at");
     const transaction = this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT state, decided_at FROM suggestions_v2 WHERE id = ?")
+        .prepare("SELECT id, title, state, decided_at FROM suggestions_v2 WHERE id = ?")
         .get(suggestionId);
       if (!row) throw codedError("MEMORY_SUGGESTION_NOT_FOUND");
+      const ensureAcceptedTodo = (acceptedAt) => {
+        const existing = this.db
+          .prepare(
+            `SELECT todo_instance_id
+             FROM suggestion_acceptances WHERE suggestion_id = ?`
+          )
+          .get(suggestionId);
+        if (existing) return existing.todo_instance_id;
+
+        const todoId = this._nextId("todo");
+        const canonicalBaseKey = canonicalTupleHash([
+          "todo",
+          canonicalizeText(row.title),
+          null,
+        ]);
+        const instanceKey = canonicalTupleHash(["suggestion_acceptance", suggestionId]);
+        this.db
+          .prepare(
+            `INSERT INTO todos_v2 (
+               id, canonical_base_key, instance_key, title, owner_subject_kind,
+               owner_subject_id, owner_display_name_snapshot, status,
+               source_analysis_input_id, provenance, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'open', NULL, 'suggestion', ?, ?)`
+          )
+          .run(todoId, canonicalBaseKey, instanceKey, row.title, acceptedAt, acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO todo_revisions (
+               id, todo_instance_id, revision, previous_revision_id, title, due_text,
+               source_analysis_input_id, provenance, created_at
+             ) VALUES (?, ?, 1, NULL, ?, NULL, NULL, 'suggestion', ?)`
+          )
+          .run(this._nextId("todo_revision"), todoId, row.title, acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO suggestion_acceptances (
+               suggestion_id, todo_instance_id, user_action_id, actor, accepted_at
+             ) VALUES (?, ?, ?, 'user', ?)`
+          )
+          .run(suggestionId, todoId, this._nextId("user_action"), acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at
+             ) VALUES (?, ?, 'confirmed', 'user_confirmed', 'user', NULL, ?)`
+          )
+          .run(this._nextId("todo_verification"), todoId, acceptedAt);
+        return todoId;
+      };
       if (row.state === terminalState) {
         return {
           status: `already_${terminalState}`,
           suggestionId,
           decidedAt: row.decided_at,
+          ...(terminalState === "accepted"
+            ? { todoId: ensureAcceptedTodo(row.decided_at) }
+            : {}),
         };
       }
       if (row.state !== "proposed") throw codedError("MEMORY_SUGGESTION_ALREADY_DECIDED");
@@ -4784,7 +4937,12 @@ class MemoryRepository {
         )
         .run(terminalState, at, at, suggestionId);
       if (updated.changes !== 1) throw codedError("MEMORY_SUGGESTION_STALE_TRANSITION");
-      return { status: terminalState, suggestionId, decidedAt: at };
+      return {
+        status: terminalState,
+        suggestionId,
+        decidedAt: at,
+        ...(terminalState === "accepted" ? { todoId: ensureAcceptedTodo(at) } : {}),
+      };
     });
     return transaction.immediate();
   }
@@ -4795,6 +4953,96 @@ class MemoryRepository {
 
   dismissSuggestion(input) {
     return this._transitionSuggestion(input, "dismissed");
+  }
+
+  _latestTodoVerification(todoId) {
+    return this.db
+      .prepare(
+        `SELECT state, reason, actor, occurred_at
+         FROM todo_verification_decisions
+         WHERE todo_instance_id = ?
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT 1`
+      )
+      .get(todoId);
+  }
+
+  decideTodo(input) {
+    if (!hasExactKeys(input, ["todoId", "action"])) {
+      throw new TypeError("todo decision must contain todoId and action");
+    }
+    const todoId = assertId(input.todoId, "todoId");
+    const action = input.action;
+    if (!["confirm", "dismiss", "reopen"].includes(action)) {
+      throw new TypeError("todo decision action is invalid");
+    }
+    const transaction = this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT status, completed_at, dismissed_at FROM todos_v2 WHERE id = ?")
+        .get(todoId);
+      if (!row) throw codedError("MEMORY_TODO_NOT_FOUND");
+      const latest = this._latestTodoVerification(todoId);
+      const at = assertTimestamp(this.now(), "decidedAt");
+
+      if (action === "confirm") {
+        if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+        if (latest?.state === "confirmed") {
+          return { status: "already_confirmed", todoId, decidedAt: latest.occurred_at };
+        }
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at
+             ) VALUES (?, ?, 'confirmed', 'user_confirmed', 'user', NULL, ?)`
+          )
+          .run(this._nextId("todo_verification"), todoId, at);
+        return { status: "confirmed", todoId, decidedAt: at };
+      }
+
+      if (action === "dismiss") {
+        if (row.status === "dismissed" || latest?.state === "dismissed") {
+          return {
+            status: "already_dismissed",
+            todoId,
+            decidedAt: latest?.occurred_at ?? row.dismissed_at,
+          };
+        }
+        if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at
+             ) VALUES (?, ?, 'dismissed', 'user_dismissed', 'user', NULL, ?)`
+          )
+          .run(this._nextId("todo_verification"), todoId, at);
+        this.db
+          .prepare(
+            `INSERT INTO todo_state_transitions (
+               id, todo_instance_id, from_status, to_status, reason,
+               source_analysis_input_id, actor, occurred_at
+             ) VALUES (?, ?, 'open', 'dismissed', 'user_action', NULL, 'user', ?)`
+          )
+          .run(this._nextId("todo_transition"), todoId, at);
+        return { status: "dismissed", todoId, decidedAt: at };
+      }
+
+      if (row.status === "open") {
+        return { status: "already_open", todoId, decidedAt: latest?.occurred_at ?? at };
+      }
+      if (row.status !== "completed") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+      this.db
+        .prepare(
+          `INSERT INTO todo_state_transitions (
+             id, todo_instance_id, from_status, to_status, reason,
+             source_analysis_input_id, actor, occurred_at
+           ) VALUES (?, ?, 'completed', 'open', 'user_action', NULL, 'user', ?)`
+        )
+        .run(this._nextId("todo_transition"), todoId, at);
+      return { status: "reopened", todoId, decidedAt: at };
+    });
+    return transaction.immediate();
   }
 
   completeTodo(input) {
@@ -4811,6 +5059,21 @@ class MemoryRepository {
         return { status: "already_completed", todoId, completedAt: row.completed_at };
       }
       if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+      const latest = this._latestTodoVerification(todoId);
+      if (latest?.state !== "confirmed") {
+        const systemGenerated = this.db
+          .prepare(
+            `SELECT source_analysis_input_id, provenance
+             FROM todos_v2 WHERE id = ?`
+          )
+          .get(todoId);
+        if (
+          systemGenerated?.source_analysis_input_id !== null ||
+          systemGenerated?.provenance === "legacy_unverified"
+        ) {
+          throw codedError("MEMORY_TODO_CONFIRMATION_REQUIRED");
+        }
+      }
       const completedAt = assertTimestamp(this.now(), "completedAt");
       this.db
         .prepare(
@@ -5455,12 +5718,24 @@ class MemoryRepository {
          ORDER BY occurred_at DESC, id DESC
          LIMIT ?`
       );
+      const todoVerification = this.db.prepare(
+        `SELECT state, reason, actor, occurred_at
+         FROM todo_verification_decisions
+         WHERE todo_instance_id = ?
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT 1`
+      );
       const todos = this.db
         .prepare(
           `SELECT todo.id, todo.title, todo.status, todo.completed_at, todo.dismissed_at,
                   todo.source_analysis_input_id, todo.provenance,
                   todo.created_at, todo.updated_at,
                   todo.owner_display_name_snapshot AS owner_label,
+                  (
+                    SELECT acceptance.suggestion_id
+                    FROM suggestion_acceptances AS acceptance
+                    WHERE acceptance.todo_instance_id = todo.id
+                  ) AS source_suggestion_id,
                   EXISTS(
                     SELECT 1 FROM todo_occurrences AS occurrence
                     WHERE occurrence.todo_instance_id = todo.id
@@ -5489,11 +5764,13 @@ class MemoryRepository {
             transitions.some((transition) =>
               ["analysis_created", "recurrence"].includes(transition.reason)
             );
+          const verification = todoVerification.get(row.id);
           const verificationState =
-            userConfirmed ||
+            verification?.state ??
+            (userConfirmed ||
             (row.provenance !== "legacy_unverified" && !systemGenerated)
               ? "confirmed"
-              : "pending_confirmation";
+              : "pending_confirmation");
           return {
             id: row.id,
             title: row.title,
@@ -5503,6 +5780,9 @@ class MemoryRepository {
             dismissedAt: row.dismissed_at,
             provenance: row.provenance,
             verificationState,
+            verificationReason: verification?.reason ?? null,
+            verificationActor: verification?.actor ?? null,
+            sourceSuggestionId: row.source_suggestion_id,
             createdAt: row.created_at,
             updatedAt: row.updated_at,
             revisions: todoRevisions

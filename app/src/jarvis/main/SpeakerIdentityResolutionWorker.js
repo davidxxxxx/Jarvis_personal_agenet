@@ -6,6 +6,7 @@ const {
   parseIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
 const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
+const { clusterAnonymousSpeakers } = require("./AnonymousSpeakerClusterer");
 
 function codedError(code) {
   const error = new Error(code);
@@ -149,71 +150,112 @@ class SpeakerIdentityResolutionWorker {
     const rejectedByCluster = new Map();
     const clusters = [...snapshot.clusters].sort(compareClusters);
     const results = [];
-    for (let index = 0; index < clusters.length; index += 1) {
-      const cluster = clusters[index];
-      const rejectedPersonIds = this.repository.listRejectedSpeakerPersonIds(
-        cluster.clusterId,
-        revision
-      );
-      rejectedByCluster.set(cluster.clusterId, rejectedPersonIds);
-      let result;
-      if (this.dualEvidenceProvider === null) {
-        result = this.resolver.resolveCluster({
-          cluster,
-          samples: snapshot.samples,
-          rejectedPersonIds,
-        });
-      } else {
-        const evidence = await this.dualEvidenceProvider.buildClusterEvidence({
-          sessionId: identity.sessionId,
-          evidenceRunId: cluster.evidenceRunId,
-          clusterId: cluster.clusterId,
-          createdAt: this.clock(),
-        });
-        if (!evidence.eligible) {
-          result = {
-            candidatePersonId: null,
-            state: "unknown",
-            score: null,
-            margin: null,
-            reason: evidence.reason,
-          };
+    const anonymousEvidence = [];
+    try {
+      for (let index = 0; index < clusters.length; index += 1) {
+        const cluster = clusters[index];
+        const rejectedPersonIds = this.repository.listRejectedSpeakerPersonIds(
+          cluster.clusterId,
+          revision
+        );
+        rejectedByCluster.set(cluster.clusterId, rejectedPersonIds);
+        let result;
+        if (this.dualEvidenceProvider === null) {
+          result = this.resolver.resolveCluster({
+            cluster,
+            samples: snapshot.samples,
+            rejectedPersonIds,
+          });
         } else {
-          try {
-            result = this.dualResolver.resolveCluster({
-              cluster: {
-                ...cluster,
-                attributionState: evidence.attributionState,
-                overlapDetected: evidence.overlapDetected,
-                echoDetected: evidence.echoDetected,
-                speechMs: evidence.speechMs,
-                windowCount: evidence.windowCount,
-                qualityScore: evidence.qualityScore,
-                models: evidence.models,
-              },
-              samples: snapshot.samples,
-              rejectedPersonIds,
-            });
-          } finally {
-            for (const model of Object.values(evidence.models ?? {})) {
-              model?.embedding?.fill?.(0);
+          const evidence = await this.dualEvidenceProvider.buildClusterEvidence({
+            sessionId: identity.sessionId,
+            evidenceRunId: cluster.evidenceRunId,
+            clusterId: cluster.clusterId,
+            createdAt: this.clock(),
+          });
+          if (!evidence.eligible) {
+            result = {
+              candidatePersonId: null,
+              state: "unknown",
+              score: null,
+              margin: null,
+              reason: evidence.reason,
+            };
+          } else {
+            try {
+              result = this.dualResolver.resolveCluster({
+                cluster: {
+                  ...cluster,
+                  sourceKind: evidence.sourceKind,
+                  attributionState: evidence.attributionState,
+                  overlapDetected: evidence.overlapDetected,
+                  echoDetected: evidence.echoDetected,
+                  speechMs: evidence.speechMs,
+                  windowCount: evidence.windowCount,
+                  qualityScore: evidence.qualityScore,
+                  models: evidence.models,
+                },
+                samples: snapshot.samples,
+                rejectedPersonIds,
+              });
+              if (result.state === "unknown" && !result.candidatePersonRef) {
+                anonymousEvidence.push({
+                  clusterId: cluster.clusterId,
+                  trackId: cluster.trackId,
+                  speechMs: evidence.speechMs,
+                  windowCount: evidence.windowCount,
+                  qualityScore: evidence.qualityScore,
+                  models: {
+                    primary: Float32Array.from(evidence.models.primary.embedding),
+                    review: Float32Array.from(evidence.models.review.embedding),
+                  },
+                });
+              }
+            } finally {
+              for (const model of Object.values(evidence.models ?? {})) {
+                model?.embedding?.fill?.(0);
+              }
             }
           }
         }
+        results.push({
+          evidenceRunId: cluster.evidenceRunId,
+          clusterId: cluster.clusterId,
+          candidatePersonId: result.candidatePersonId,
+          ...(result.candidatePersonRef
+            ? { candidatePersonRef: result.candidatePersonRef }
+            : {}),
+          state: result.state,
+          score: result.score,
+          margin: result.margin,
+          reason: result.reason,
+          ...(result.models ? { models: result.models } : {}),
+        });
+        await renewLease();
+        if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
+          await this.yieldToEventLoop();
+        }
       }
-      results.push({
-        evidenceRunId: cluster.evidenceRunId,
-        clusterId: cluster.clusterId,
-        candidatePersonId: result.candidatePersonId,
-        state: result.state,
-        score: result.score,
-        margin: result.margin,
-        reason: result.reason,
-        ...(result.models ? { models: result.models } : {}),
-      });
-      await renewLease();
-      if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
-        await this.yieldToEventLoop();
+
+      const anonymousAssignments = clusterAnonymousSpeakers(anonymousEvidence);
+      for (const result of results) {
+        const assignment = anonymousAssignments.get(result.clusterId);
+        if (
+          !assignment ||
+          result.state !== "unknown" ||
+          result.candidatePersonRef
+        ) {
+          continue;
+        }
+        result.candidatePersonRef = assignment.candidatePersonRef;
+        result.score = assignment.score;
+        result.margin = assignment.margin;
+        result.reason = "dual_model_anonymous_group";
+      }
+    } finally {
+      for (const evidence of anonymousEvidence) {
+        evidence.models.primary.fill(0);
+        evidence.models.review.fill(0);
       }
     }
     await renewLease();

@@ -145,3 +145,111 @@ test("resolution worker persists unknown when safe dual evidence cannot be built
     reason: "overlapping_speech",
   });
 });
+
+test("resolution worker assigns one local anonymous reference to the same speaker across tracks", async () => {
+  const identity = {
+    sessionId: "session-cross-track",
+    diarizationRevision: "c".repeat(64),
+    profileRevision: "d".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+  };
+  const clusters = [
+    {
+      evidenceRunId: "run-mic",
+      clusterId: "cluster-mic",
+      trackId: "track-mic",
+      speechMs: 20_000,
+      windowCount: 4,
+      qualityScore: 0.95,
+    },
+    {
+      evidenceRunId: "run-app",
+      clusterId: "cluster-app",
+      trackId: "track-app",
+      speechMs: 18_000,
+      windowCount: 4,
+      qualityScore: 0.94,
+    },
+  ];
+  const commits = [];
+  const privateVectors = [];
+  const worker = new SpeakerIdentityResolutionWorker({
+    repository: {
+      getSpeakerIdentityResolutionSnapshot: () => ({
+        eligible: true,
+        ...identity,
+        evidenceRunIds: ["run-mic", "run-app"],
+        clusters,
+        samples: [],
+      }),
+      listRejectedSpeakerPersonIds: () => [],
+      applySystemSpeakerResolutions(input) {
+        commits.push(input);
+        return input.results;
+      },
+    },
+    dualEvidenceProvider: {
+      async buildClusterEvidence({ clusterId }) {
+        const primary = new Float32Array([1, clusterId === "cluster-mic" ? 0 : 0.01]);
+        const review = new Float32Array([0.01, 1]);
+        privateVectors.push(primary, review);
+        return {
+          eligible: true,
+          attributionState: "exact",
+          overlapDetected: false,
+          echoDetected: false,
+          speechMs: 16_000,
+          windowCount: 4,
+          qualityScore: 0.94,
+          models: {
+            primary: {
+              modelId: "primary",
+              artifactVersion: "primary-v1",
+              embeddingSpace: "primary-space",
+              embedding: primary,
+            },
+            review: {
+              modelId: "review",
+              artifactVersion: "review-v1",
+              embeddingSpace: "review-space",
+              embedding: review,
+            },
+          },
+        };
+      },
+    },
+    dualResolver: {
+      resolveCluster() {
+        return {
+          candidatePersonId: null,
+          state: "unknown",
+          score: null,
+          margin: null,
+          reason: "no_dual_candidate",
+        };
+      },
+    },
+    clock: () => 30_000,
+    yieldToEventLoop: async () => {},
+  });
+  const job = {
+    job_type: "resolve_identities",
+    session_id: identity.sessionId,
+    track_id: null,
+    chunk_id: null,
+    input_hash: buildIdentityResolutionJobKey(identity),
+    input_version: 1,
+    model_version: identity.policyId,
+  };
+
+  await worker.run(job);
+
+  const refs = commits[0].results.map((result) => result.candidatePersonRef);
+  assert.match(refs[0], /^anonymous-speaker-[0-9a-f]{32}$/u);
+  assert.deepEqual(refs, [refs[0], refs[0]]);
+  assert.deepEqual(
+    commits[0].results.map((result) => result.reason),
+    ["dual_model_anonymous_group", "dual_model_anonymous_group"]
+  );
+  assert.equal(privateVectors.every((vector) => vector.every((value) => value === 0)), true);
+});

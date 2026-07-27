@@ -3,6 +3,7 @@ const { SPEAKER_IDENTITY_MODEL_POLICY } = require("./SessionDiarizationPolicy");
 
 const TERMINAL_SESSION_STATES = new Set(["completed", "recovered", "failed"]);
 const TERMINAL_TRACK_STATES = new Set(["ended", "recovered", "failed"]);
+const MAX_CHUNK_BOUNDARY_OVERLAP_MS = 2;
 
 function sha256(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -90,7 +91,7 @@ function completeAudio(session, track, entries) {
       chunk.sample_rate <= 0 ||
       !safeInteger(chunk.channels) ||
       chunk.channels <= 0 ||
-      (previous && chunk.started_at < previous.ended_at)
+      (previous && previous.ended_at - chunk.started_at > MAX_CHUNK_BOUNDARY_OVERLAP_MS)
     ) {
       return false;
     }

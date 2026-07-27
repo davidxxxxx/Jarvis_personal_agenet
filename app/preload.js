@@ -7,6 +7,10 @@ const {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
+  normalizeActivityCorrectionInput,
+  normalizePersonalizationRuleDecisionInput,
+  normalizeNotificationPreferencesInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
@@ -272,6 +276,25 @@ contextBridge.exposeInMainWorld("electronAPI", {
     listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
     listActivityClassifications: (sessionId) =>
       ipcRenderer.invoke("jarvis:activity:list-session", assertJarvisId(sessionId, "sessionId")),
+    correctActivityClassification: (classificationId, category) =>
+      ipcRenderer.invoke(
+        "jarvis:activity:correct",
+        normalizeActivityCorrectionInput({ classificationId, category })
+      ),
+    getPersonalizationSettings: () => ipcRenderer.invoke("jarvis:personalization:get"),
+    decidePersonalizationRule: (ruleId, action, label) =>
+      ipcRenderer.invoke(
+        "jarvis:personalization:rule-decision",
+        normalizePersonalizationRuleDecisionInput(
+          action === "edit" ? { ruleId, action, label } : { ruleId, action }
+        )
+      ),
+    resetPersonalizationRules: () => ipcRenderer.invoke("jarvis:personalization:reset"),
+    setNotificationPreferences: (focusMode, mutedUntil) =>
+      ipcRenderer.invoke(
+        "jarvis:notification-preferences:set",
+        normalizeNotificationPreferencesInput({ focusMode, mutedUntil })
+      ),
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
     listSessionSpeakerClusters: (sessionId) =>
@@ -337,6 +360,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke(
         "jarvis:memory:v2-todo-complete",
         normalizeKnowledgeTodoCompletionInput({ todoId })
+      ),
+    decideKnowledgeTodo: (todoId, action) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-todo-decision",
+        normalizeKnowledgeTodoDecisionInput({ todoId, action })
       ),
     getEvidenceContext: (input) => invokeEvidenceContext(input),
     analyzeSession: (sessionId, kind) =>

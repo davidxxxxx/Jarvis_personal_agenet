@@ -1,5 +1,8 @@
 const ECHO_SCORE_THRESHOLD = 0.8;
 const TEXT_SIMILARITY_THRESHOLD = 0.85;
+const EXACT_APPLICATION_COVERAGE_THRESHOLD = 0.8;
+const COMPETING_APPLICATION_COVERAGE_LIMIT = 0.2;
+const DOMINANT_APPLICATION_COVERAGE_MARGIN = 0.5;
 const MAX_LCS_CODE_POINTS = 4096;
 
 function normalizeTranscriptText(value) {
@@ -51,6 +54,80 @@ function overlapDuration(left, right) {
   return Math.max(0, Math.min(left.ended_at, right.ended_at) - Math.max(left.started_at, right.started_at));
 }
 
+function coveredOverlap(target, segments) {
+  const ranges = segments
+    .map((segment) => [
+      Math.max(target.started_at, segment.started_at),
+      Math.min(target.ended_at, segment.ended_at),
+    ])
+    .filter(([start, end]) => end > start)
+    .sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  let total = 0;
+  let start = null;
+  let end = null;
+  for (const range of ranges) {
+    if (start === null) {
+      [start, end] = range;
+      continue;
+    }
+    if (range[0] > end) {
+      total += end - start;
+      [start, end] = range;
+    } else {
+      end = Math.max(end, range[1]);
+    }
+  }
+  return start === null ? 0 : total + end - start;
+}
+
+function exactApplicationCoverageWinner(mixed, applications) {
+  const duration = mixed.ended_at - mixed.started_at;
+  if (duration <= 0) return null;
+  const groups = new Map();
+  for (const segment of applications) {
+    if (
+      segment.attribution_state !== "exact" ||
+      !strictlyOverlaps(mixed, segment)
+    ) {
+      continue;
+    }
+    const key = segment.application_key || segment.track_id;
+    const current = groups.get(key) ?? [];
+    current.push(segment);
+    groups.set(key, current);
+  }
+  const ranked = [...groups.values()]
+    .map((segments) => ({
+      segments,
+      coverage: coveredOverlap(mixed, segments) / duration,
+    }))
+    .sort(
+      (left, right) =>
+        right.coverage - left.coverage ||
+        String(left.segments[0]?.application_key ?? left.segments[0]?.track_id).localeCompare(
+          String(right.segments[0]?.application_key ?? right.segments[0]?.track_id)
+        )
+    );
+  if (
+    !ranked[0] ||
+    ranked[0].coverage < EXACT_APPLICATION_COVERAGE_THRESHOLD ||
+    (
+      (ranked[1]?.coverage ?? 0) > COMPETING_APPLICATION_COVERAGE_LIMIT &&
+      ranked[0].coverage - ranked[1].coverage < DOMINANT_APPLICATION_COVERAGE_MARGIN
+    )
+  ) {
+    return null;
+  }
+  const winner = ranked[0].segments
+    .map((segment) => ({
+      segment,
+      similarity: normalizedSimilarity(mixed.text, segment.text),
+      overlap: overlapDuration(mixed, segment),
+    }))
+    .sort(compareWinner)[0];
+  return winner ?? null;
+}
+
 function compareWinner(left, right) {
   if (left.similarity !== right.similarity) return right.similarity - left.similarity;
   const leftApplication = left.segment.track_kind === "application" ? 1 : 0;
@@ -90,7 +167,7 @@ class DualTrackTranscriptDeduper {
       const applicationSegments = systems.filter((row) => row.track_kind === "application");
       const assignments = [];
       for (const mixed of systems.filter((row) => row.track_kind === "system_mix")) {
-        const winner = applicationSegments
+        const textWinner = applicationSegments
           .filter((application) => strictlyOverlaps(mixed, application))
           .map((application) => ({
             segment: application,
@@ -99,6 +176,9 @@ class DualTrackTranscriptDeduper {
           }))
           .filter((candidate) => candidate.similarity >= TEXT_SIMILARITY_THRESHOLD)
           .sort(compareWinner)[0];
+        const winner =
+          textWinner ??
+          exactApplicationCoverageWinner(mixed, applicationSegments);
         if (winner) {
           assignments.push({ duplicateId: mixed.id, masterId: winner.segment.id });
         }

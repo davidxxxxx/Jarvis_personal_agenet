@@ -248,6 +248,106 @@ test("uses UTF-8 bytes and complete segments when selecting a window", () => {
   assert.equal(result.local.complete, false);
 });
 
+test("timeline coverage samples the beginning middle and end of a long recording", () => {
+  const template = prepared().segments[0];
+  const segments = Array.from({ length: 21 }, (_value, index) => ({
+    ...template,
+    ordinal: index,
+    segmentId: `segment-${String(index).padStart(2, "0")}`,
+    textHash: String(index % 10).repeat(64),
+    textSnapshot: `timeline evidence ${index} ${"x".repeat(120)}`,
+    startedAt: index * 1_000,
+    endedAt: index * 1_000 + 900,
+    speakerBindingLabel: "SELF",
+  }));
+  const source = prepared({
+    segments,
+    speakerBindings: [prepared().speakerBindings[0]],
+    redactionTerms: {
+      participants: [prepared().redactionTerms.participants[0]],
+      otherPeople: [],
+      deviceLabels: [],
+    },
+  });
+  const result = new AnalysisInputBuilder({ maxPayloadBytes: 1_400 }).build(source, {
+    strategy: "timeline",
+  });
+  const selectedIds = result.cloudPayload.segments.map((segment) => segment.segmentId);
+
+  assert.equal(result.sendable, true);
+  assert.equal(selectedIds.includes("segment-00"), true);
+  assert.equal(selectedIds.includes("segment-10"), true);
+  assert.equal(selectedIds.includes("segment-20"), true);
+  assert.equal(selectedIds.length < segments.length, true);
+  assert.equal(result.local.complete, false);
+  assert.equal(result.local.nextCursor, segments.length);
+  assert.equal(
+    new AnalysisInputBuilder({ maxPayloadBytes: 1_400 }).verifyRedactedCloudPayload({
+      cloudPayload: result.cloudPayload,
+      preparedSnapshot: source,
+    }),
+    true
+  );
+});
+
+test("hierarchical coverage gives every occupied time window evidence before adding detail", () => {
+  const template = prepared().segments[0];
+  const denseOpening = Array.from({ length: 30 }, (_value, index) => ({
+    ...template,
+    ordinal: index,
+    segmentId: `opening-${String(index).padStart(2, "0")}`,
+    textHash: String(index % 10).repeat(64),
+    textSnapshot: `opening evidence ${index} ${"x".repeat(80)}`,
+    startedAt: index * 1_000,
+    endedAt: index * 1_000 + 1_000,
+    speakerBindingLabel: "SELF",
+  }));
+  const sparseLaterWindows = [
+    {
+      ...template,
+      ordinal: 30,
+      segmentId: "middle-window",
+      textHash: "a".repeat(64),
+      textSnapshot: `middle window evidence ${"y".repeat(80)}`,
+      startedAt: 20 * 60_000,
+      endedAt: 20 * 60_000 + 900,
+      speakerBindingLabel: "SELF",
+    },
+    {
+      ...template,
+      ordinal: 31,
+      segmentId: "late-window",
+      textHash: "b".repeat(64),
+      textSnapshot: `late window evidence ${"z".repeat(80)}`,
+      startedAt: 40 * 60_000,
+      endedAt: 40 * 60_000 + 900,
+      speakerBindingLabel: "SELF",
+    },
+  ];
+  const source = prepared({
+    segments: [...denseOpening, ...sparseLaterWindows],
+    speakerBindings: [prepared().speakerBindings[0]],
+    redactionTerms: {
+      participants: [prepared().redactionTerms.participants[0]],
+      otherPeople: [],
+      deviceLabels: [],
+    },
+  });
+
+  const result = new AnalysisInputBuilder({ maxPayloadBytes: 1_350 }).build(source, {
+    strategy: "hierarchical",
+  });
+  const selectedIds = result.cloudPayload.segments.map((segment) => segment.segmentId);
+
+  assert.equal(result.sendable, true);
+  assert.equal(selectedIds.some((id) => id.startsWith("opening-")), true);
+  assert.equal(selectedIds.includes("middle-window"), true);
+  assert.equal(selectedIds.includes("late-window"), true);
+  assert.equal(selectedIds.length < source.segments.length, true);
+  assert.equal(result.local.complete, false);
+  assert.equal(result.local.nextCursor, source.segments.length);
+});
+
 test("skips a single oversized segment and advances the cursor to a later complete segment", () => {
   const source = prepared({
     segments: [

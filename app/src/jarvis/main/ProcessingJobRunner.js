@@ -14,9 +14,20 @@ const TERMINAL_DATABASE_ERRORS = new Set([
   "SQLITE_CONSTRAINT_UNIQUE",
   "SQLITE_CONSTRAINT_PRIMARYKEY",
 ]);
+const TERMINAL_DIARIZATION_ERRORS = new Set(["DIARIZATION_VALIDATION_FAILED"]);
+const DIARIZATION_SPEAKER_COUNT_VALIDATION =
+  /^run\.speakerCount\.maximum must be between 0 and 64 or null$/;
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
+]);
+const NON_PREEMPTIVE_ACTIVE_CUDA_DIARIZATION_REASONS = new Set([
+  "cpu_load_high",
+  "external_gpu_busy",
+  "gpu_utilization_high",
+  "insufficient_vram",
+  "recovery_hysteresis",
+  "telemetry_unavailable",
 ]);
 const LOCAL_PROCESSING_JOB_TYPES = new Set([
   "transcribe_chunk",
@@ -35,6 +46,22 @@ function normalizeErrorCode(error) {
     return "JOB_FAILED";
   }
   return typeof code === "string" && ERROR_CODE_PATTERN.test(code) ? code : "JOB_FAILED";
+}
+
+function normalizeJobErrorCode(error, job) {
+  const explicitCode = normalizeErrorCode(error);
+  if (explicitCode !== "JOB_FAILED" || job?.job_type !== "diarize_track") {
+    return explicitCode;
+  }
+  let message;
+  try {
+    message = error?.message;
+  } catch {
+    return explicitCode;
+  }
+  return typeof message === "string" && DIARIZATION_SPEAKER_COUNT_VALIDATION.test(message)
+    ? "DIARIZATION_VALIDATION_FAILED"
+    : explicitCode;
 }
 
 function codedError(code) {
@@ -70,6 +97,15 @@ function defaultJobCapability(job) {
     : undefined;
 }
 
+function canContinueActiveCudaDiarization(job, context, admission) {
+  return (
+    job.job_type === "diarize_track" &&
+    context.device === "cuda" &&
+    admission.action === "defer" &&
+    NON_PREEMPTIVE_ACTIVE_CUDA_DIARIZATION_REASONS.has(admission.reason)
+  );
+}
+
 class ProcessingJobRunner {
   constructor({
     store,
@@ -85,6 +121,7 @@ class ProcessingJobRunner {
     classifyCapability = defaultJobCapability,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
+    log = () => {},
   } = {}) {
     const requiredMethods = [
       "claimJobs",
@@ -132,6 +169,7 @@ class ProcessingJobRunner {
     if (typeof setIntervalImpl !== "function" || typeof clearIntervalImpl !== "function") {
       throw new TypeError("interval functions are required");
     }
+    if (typeof log !== "function") throw new TypeError("log must be a function");
 
     this.store = store;
     this.owner = owner;
@@ -146,6 +184,7 @@ class ProcessingJobRunner {
     this.classifyCapability = classifyCapability;
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
+    this.log = log;
     this.handlers = new Map();
   }
 
@@ -244,6 +283,7 @@ class ProcessingJobRunner {
         } catch {
           admission = { action: "defer", reason: "telemetry_unavailable" };
         }
+        if (canContinueActiveCudaDiarization(job, context, admission)) return true;
         const nextDevice = admission.action === "run_cuda" ? "cuda" : "cpu";
         if (
           ["defer", "pause_preview"].includes(admission.action) ||
@@ -301,9 +341,21 @@ class ProcessingJobRunner {
       });
       if (!completed) throw codedError("JOB_LEASE_LOST");
     } catch (error) {
-      if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
-      const errorCode = normalizeErrorCode(error);
+      const errorCode = normalizeJobErrorCode(error, job);
+      if (errorCode === "JOB_LEASE_LOST") throw error;
       const failedAt = this.now();
+      if (errorCode !== "JOB_RESOURCE_YIELD") {
+        try {
+          this.log({
+            phase: "processing_job_failed",
+            jobId: job.id,
+            jobType: job.job_type,
+            error,
+          });
+        } catch {
+          // Diagnostic logging must never alter the durable job transition.
+        }
+      }
       if (errorCode === "JOB_RESOURCE_YIELD") {
         const deferred = this.store.deferJob(job.id, {
           owner: this.owner,
@@ -322,7 +374,11 @@ class ProcessingJobRunner {
         (job.job_type === "transcribe_chunk" && errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
         (["diarize_track", "resolve_identities"].includes(job.job_type) &&
           TERMINAL_OBSOLETE_ERRORS.has(errorCode));
-      if (terminalObsoleteJob || TERMINAL_DATABASE_ERRORS.has(errorCode)) {
+      if (
+        terminalObsoleteJob ||
+        TERMINAL_DATABASE_ERRORS.has(errorCode) ||
+        (job.job_type === "diarize_track" && TERMINAL_DIARIZATION_ERRORS.has(errorCode))
+      ) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,
           at: failedAt,

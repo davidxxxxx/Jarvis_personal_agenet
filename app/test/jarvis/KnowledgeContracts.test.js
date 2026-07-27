@@ -5,6 +5,7 @@ const {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
 } = require("../../src/jarvis/shared/contracts");
 
 test("knowledge channels are narrow and versioned", () => {
@@ -12,6 +13,7 @@ test("knowledge channels are narrow and versioned", () => {
   assert.equal(CHANNELS.decideKnowledgeSuggestion, "jarvis:memory:v2-suggestion-decision");
   assert.equal(CHANNELS.resolveKnowledgeConflict, "jarvis:memory:v2-conflict-resolve");
   assert.equal(CHANNELS.completeKnowledgeTodo, "jarvis:memory:v2-todo-complete");
+  assert.equal(CHANNELS.decideKnowledgeTodo, "jarvis:memory:v2-todo-decision");
 });
 
 test("suggestion decisions accept exact ids and a closed action", () => {
@@ -54,4 +56,13 @@ test("conflict resolution and todo completion reject renderer-owned state", () =
     })
   );
   assert.throws(() => normalizeKnowledgeTodoCompletionInput({ todoId: "todo_1", status: "open" }));
+  for (const action of ["confirm", "dismiss", "reopen"]) {
+    assert.deepEqual(normalizeKnowledgeTodoDecisionInput({ todoId: "todo_1", action }), {
+      todoId: "todo_1",
+      action,
+    });
+  }
+  assert.throws(() =>
+    normalizeKnowledgeTodoDecisionInput({ todoId: "todo_1", action: "complete" })
+  );
 });

@@ -11,12 +11,16 @@ import ResourceGovernanceSettingsCard from "./ResourceGovernanceSettingsCard";
 import SessionSummaryPanel from "./SessionSummaryPanel";
 import TranscriptionQualityCard from "./TranscriptionQualityCard";
 import VoiceEnrollment from "./VoiceEnrollment";
+import ActionCenter from "./ActionCenter";
+import ActivityClassificationPanel from "./ActivityClassificationPanel";
+import PersonalizationSettingsCard from "./PersonalizationSettingsCard";
 
 interface TodayViewProps {
   recording: UseJarvisRecordingResult;
+  onViewAllTodos: () => void;
 }
 
-export default function TodayView({ recording }: TodayViewProps) {
+export default function TodayView({ recording, onViewAllTodos }: TodayViewProps) {
   const { t } = useTranslation();
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -53,6 +57,15 @@ export default function TodayView({ recording }: TodayViewProps) {
           <SessionSummaryPanel
             sessionId={recording.session.id}
             sessionStatus={recording.session.status}
+          />
+          <ActivityClassificationPanel
+            sessionId={recording.session.id}
+            sessionStatus={recording.session.status}
+          />
+          <ActionCenter
+            sessionId={recording.session.id}
+            sessionStatus={recording.session.status}
+            onViewAll={onViewAllTodos}
           />
           <DailyReviewView />
           <div className="rounded-xl border border-border/50 bg-card/70 p-4 shadow-sm">
@@ -117,6 +130,7 @@ export default function TodayView({ recording }: TodayViewProps) {
             </div>
             <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
               <ResourceGovernanceSettingsCard />
+              <PersonalizationSettingsCard />
               <MiniMaxAgentSettingsCard />
               <TranscriptionQualityCard />
               <VoiceEnrollment />

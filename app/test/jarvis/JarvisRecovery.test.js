@@ -91,17 +91,25 @@ test("startup backfills legacy evidence before constructing retention cleanup", 
   assert.ok(retentionIndex > backfillIndex);
 });
 
-test("startup reconciles historical speaker readiness after loading the durable SELF profile", () => {
+test("startup reconciles historical speaker readiness with the selected runtime policy", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
   const profileIndex = mainSource.indexOf("const voiceProfileStore = new VoiceProfileStore");
-  const reconciliationIndex = mainSource.indexOf(
-    "jarvisRepository.reconcileHistoricalSpeakerReadiness"
+  const runtimeIndex = mainSource.indexOf(
+    "const processingRuntime = startJarvisProcessingRuntime();",
+    profileIndex
   );
-  const runtimeIndex = mainSource.indexOf("startJarvisProcessingRuntime();", reconciliationIndex);
+  const reconciliationIndex = mainSource.indexOf(
+    "jarvisRepository.reconcileHistoricalSpeakerReadiness",
+    runtimeIndex
+  );
 
   assert.ok(profileIndex >= 0);
-  assert.ok(reconciliationIndex > profileIndex);
-  assert.ok(runtimeIndex > reconciliationIndex);
+  assert.ok(runtimeIndex > profileIndex);
+  assert.ok(reconciliationIndex > runtimeIndex);
+  assert.match(
+    mainSource.slice(reconciliationIndex, reconciliationIndex + 300),
+    /diarizationPolicy:\s*processingRuntime\.diarizationPolicy/u
+  );
 });
 
 test("model download wiring reports VAD recovery only after verified initialization", () => {

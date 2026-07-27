@@ -184,7 +184,7 @@ function desiredHead(overrides = {}) {
     analysisInputHash: INPUT_HASH,
     transcriptRevision: TRANSCRIPT_HASH,
     identityRevision: IDENTITY_HASH,
-    promptVersion: "jarvis-analysis-v2",
+    promptVersion: "jarvis-analysis-hierarchical-v3",
     responseSchemaVersion: "jarvis-analysis-v2",
     pseudonymBindingRevision: 1,
     modelVersion: "MiniMax-M2.7",

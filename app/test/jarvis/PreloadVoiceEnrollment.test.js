@@ -149,6 +149,7 @@ test("preload exposes narrow v2 knowledge reads and actions", async () => {
   await api.decideKnowledgeSuggestion("suggestion_1", "accept");
   await api.resolveKnowledgeConflict("conflict_1", "memory_1");
   await api.completeKnowledgeTodo("todo_1");
+  await api.decideKnowledgeTodo("todo_1", "confirm");
 
   assert.deepEqual(invokes, [
     ["jarvis:memory:v2-overview"],
@@ -158,10 +159,12 @@ test("preload exposes narrow v2 knowledge reads and actions", async () => {
       { conflictGroupId: "conflict_1", selectedMemoryItemId: "memory_1" },
     ],
     ["jarvis:memory:v2-todo-complete", { todoId: "todo_1" }],
+    ["jarvis:memory:v2-todo-decision", { todoId: "todo_1", action: "confirm" }],
   ]);
   assert.throws(() => api.decideKnowledgeSuggestion("suggestion_1", "convert"));
   assert.throws(() => api.completeKnowledgeTodo("../todo"));
-  assert.equal(invokes.length, 4);
+  assert.throws(() => api.decideKnowledgeTodo("todo_1", "complete"));
+  assert.equal(invokes.length, 5);
 });
 
 test("preload exposes control readiness and coordinated shutdown acknowledgements", () => {
