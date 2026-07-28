@@ -1368,6 +1368,7 @@ test("v2 worker persists CUDA count consensus and overlap separation metadata", 
   const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
   const snapshot = immutableWorkerSnapshot();
   let committed;
+  const releaseHighMemoryFlags = [];
   const worker = new SessionDiarizationWorker({
     policy: HYBRID_DIARIZATION_POLICY,
     speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
@@ -1383,8 +1384,9 @@ test("v2 worker persists CUDA count consensus and overlap separation metadata", 
     audioEvidenceReader: {
       withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
     },
-    diarizeAudio: async ({ chunk, executionContext }) => {
+    diarizeAudio: async ({ chunk, executionContext, releaseHighMemoryResources }) => {
       assert.equal(executionContext.device, "cuda");
+      releaseHighMemoryFlags.push(releaseHighMemoryResources);
       const turns = [{ start: 0, end: 1.6, speaker: `raw_${chunk.id}` }];
       Object.defineProperty(turns, "metadata", {
         value: {
@@ -1433,6 +1435,7 @@ test("v2 worker persists CUDA count consensus and overlap separation metadata", 
   assert.equal(committed.run.overlapMs, 1000);
   assert.equal(committed.run.overlapSeparationState, "completed");
   assert.equal(committed.run.pipelineMetadata.chunks.length, 2);
+  assert.deepEqual(releaseHighMemoryFlags, [false, true]);
   const legacyClusterId = `speaker_cluster_${crypto
     .createHash("sha256")
     .update(["session-worker", "track-worker", "speaker_1"].join("\0"))
@@ -1624,6 +1627,13 @@ test("v2 worker reports only durable long-session speakers instead of overlap an
     brief: 1,
     overlapOnly: 2,
   });
+  assert.equal(committed.clusters.length, 1);
+  assert.equal(committed.clusters[0].windowCount, 3);
+  assert.equal(committed.turns.length, 3);
+  assert.ok(committed.turns.every((turn) => turn.clusterId === committed.clusters[0].id));
+  assert.ok(
+    committed.segmentLinks.every((link) => link.clusterId === committed.clusters[0].id)
+  );
 });
 
 test("v2 worker bounds long-session pipeline metadata without dropping speaker evidence", async () => {

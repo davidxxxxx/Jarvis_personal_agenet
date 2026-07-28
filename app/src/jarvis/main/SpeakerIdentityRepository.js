@@ -419,14 +419,26 @@ class SpeakerIdentityRepository {
           AND source_kind = 'user_confirmed'
         LIMIT 1
       `),
-      syncClusterTranscriptProjection: db.prepare(`
+      syncClusterTranscriptPersonProjection: db.prepare(`
         UPDATE transcript_segments
-        SET person_id = @personId,
-            speaker_label = COALESCE(@displayName, speaker_label)
+        SET person_id = @personId
         WHERE id IN (
           SELECT transcript_segment_id FROM speaker_cluster_segments
           WHERE cluster_id = @clusterId
         )
+      `),
+      syncClusterTranscriptLabelProjection: db.prepare(`
+        UPDATE transcript_segments
+        SET speaker_label = @displayName
+        WHERE @displayName IS NOT NULL
+          AND id IN (
+            SELECT transcript_segment_id FROM speaker_cluster_segments
+            WHERE cluster_id = @clusterId
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_input_segments
+            WHERE segment_id = transcript_segments.id
+          )
       `),
       listModelEmbeddings: db.prepare(`
         SELECT embedding FROM speaker_clusters
@@ -781,6 +793,7 @@ class SpeakerIdentityRepository {
               matchMargin: result.margin,
               updatedAt: input.at,
             });
+            this._syncSystemTranscriptProjection(result);
           }
         }
         return this.statements.listResolutionRunResults.all(existing.id);
@@ -863,6 +876,7 @@ class SpeakerIdentityRepository {
             matchMargin: result.margin,
             updatedAt: input.at,
           });
+          this._syncSystemTranscriptProjection(result);
         }
         rows.push(this.statements.getResolution.get(id));
       }
@@ -1389,11 +1403,19 @@ class SpeakerIdentityRepository {
   }
 
   _syncTranscriptProjection(clusterId, personId, displayName) {
-    this.statements.syncClusterTranscriptProjection.run({
+    this.statements.syncClusterTranscriptPersonProjection.run({
       clusterId,
       personId,
-      displayName,
     });
+    this.statements.syncClusterTranscriptLabelProjection.run({ clusterId, displayName });
+  }
+
+  _syncSystemTranscriptProjection(result) {
+    const person =
+      result.state === "confirmed" && result.candidatePersonId !== null
+        ? this._requirePerson(result.candidatePersonId)
+        : null;
+    this._syncTranscriptProjection(result.clusterId, person?.id ?? null, person?.display_name ?? null);
   }
 
   _wakeResolvedSessionsForClusterModels(cluster) {

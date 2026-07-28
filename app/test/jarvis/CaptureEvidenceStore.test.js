@@ -1422,10 +1422,99 @@ test("commits a chunk and one transcription job atomically", (t) => {
       chunk_id: "c1",
       job_type: "transcribe_chunk",
       state: "pending",
-      priority: 30,
+      priority: 24,
       input_hash: "abc",
       created_at: 100,
     }
+  );
+});
+
+test("prioritizes microphone and system safety tracks ahead of application audio", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  createTrack(store, {
+    id: "t-app",
+    applicationKey: "kook",
+    applicationDisplayName: "KOOK",
+    captureGeneration: 1,
+    strategy: "include-process-tree",
+  });
+  createTrack(store, {
+    id: "t-mic",
+    sourceType: "mic",
+    deviceId: "physical-mic",
+    deviceLabel: "Desk microphone",
+    strategy: "media-recorder",
+  });
+
+  store.commitChunk(chunk({ modelVersion: "model-v1" }));
+  store.commitChunk(
+    chunk({
+      id: "c-app",
+      trackId: "t-app",
+      path: "c-app.wav",
+      sha256: "app",
+      modelVersion: "model-v1",
+    })
+  );
+  store.commitChunk(
+    chunk({
+      id: "c-mic",
+      trackId: "t-mic",
+      sourceType: "mic",
+      path: "c-mic.wav",
+      sha256: "mic",
+      modelVersion: "model-v1",
+    })
+  );
+
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT track.track_kind, job.priority
+         FROM processing_jobs AS job
+         JOIN audio_tracks AS track ON track.id = job.track_id
+         WHERE job.job_type = 'transcribe_chunk'
+         ORDER BY job.priority`
+      )
+      .all(),
+    [
+      { track_kind: "mic", priority: 20 },
+      { track_kind: "system_mix", priority: 24 },
+      { track_kind: "application", priority: 30 },
+    ]
+  );
+
+  db.prepare(
+    `UPDATE processing_jobs SET priority = 30
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  const current = db
+    .prepare(
+      `SELECT input_version, model_version FROM processing_jobs
+       WHERE job_type = 'transcribe_chunk' LIMIT 1`
+    )
+    .get();
+  store.enqueueCurrentModelTranscriptionJobs({
+    inputVersion: current.input_version,
+    modelVersion: current.model_version,
+    at: 101,
+  });
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT track.track_kind, job.priority
+         FROM processing_jobs AS job
+         JOIN audio_tracks AS track ON track.id = job.track_id
+         WHERE job.job_type = 'transcribe_chunk'
+         ORDER BY job.priority`
+      )
+      .all(),
+    [
+      { track_kind: "mic", priority: 20 },
+      { track_kind: "system_mix", priority: 24 },
+      { track_kind: "application", priority: 30 },
+    ]
   );
 });
 
@@ -2236,10 +2325,10 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
   assert.deepEqual(
     db.prepare("SELECT chunk_id, state, priority FROM processing_jobs ORDER BY chunk_id").all(),
     [
-      { chunk_id: "c0", state: "pending", priority: 30 },
+      { chunk_id: "c0", state: "pending", priority: 24 },
       { chunk_id: "c1", state: "retention_urgent", priority: 0 },
-      { chunk_id: "c2", state: "completed", priority: 30 },
-      { chunk_id: "c3", state: "pending", priority: 30 },
+      { chunk_id: "c2", state: "completed", priority: 24 },
+      { chunk_id: "c3", state: "pending", priority: 24 },
     ]
   );
 });
@@ -2463,7 +2552,7 @@ test("records idempotent signed storage growth and deletion telemetry in evidenc
       .all(),
     [
       { job_type: "compress_chunk", priority: 60 },
-      { job_type: "transcribe_chunk", priority: 30 },
+      { job_type: "transcribe_chunk", priority: 24 },
     ]
   );
 
@@ -2761,7 +2850,7 @@ test("claims the newest session first among equal-priority diarization jobs", (t
   );
 });
 
-test("application diarization cannot claim while a primary-track diarization is incomplete", (t) => {
+test("application diarization waits for mic but does not wait for system mix", (t) => {
   const { db, store } = fixture(t);
   createTrack(store, {
     id: "mic-primary",
@@ -2776,12 +2865,13 @@ test("application diarization cannot claim while a primary-track diarization is 
     applicationDisplayName: "Chrome",
     captureGeneration: 1,
   });
+  createTrack(store, { id: "system-fallback" });
   seedProcessingJob(db, {
     id: "mic-diarize",
     trackId: "mic-primary",
     jobType: "diarize_track",
     state: "retry",
-    priority: 35,
+    priority: 18,
     nextRetryAt: 900,
     inputHash: "mic-diarize-input",
   });
@@ -2789,8 +2879,15 @@ test("application diarization cannot claim while a primary-track diarization is 
     id: "app-diarize",
     trackId: "app-secondary",
     jobType: "diarize_track",
-    priority: 40,
+    priority: 26,
     inputHash: "app-diarize-input",
+  });
+  seedProcessingJob(db, {
+    id: "system-diarize",
+    trackId: "system-fallback",
+    jobType: "diarize_track",
+    priority: 28,
+    inputHash: "system-diarize-input",
   });
 
   assert.deepEqual(store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 2 }), []);
@@ -2802,6 +2899,16 @@ test("application diarization cannot claim while a primary-track diarization is 
   assert.equal(
     store.claimJobs({ owner: "worker-a", at: 600, leaseMs: 100, limit: 1 })[0].id,
     "app-diarize"
+  );
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 650,
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE id = 'app-diarize'`
+  ).run();
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 700, leaseMs: 100, limit: 1 })[0].id,
+    "system-diarize"
   );
 });
 

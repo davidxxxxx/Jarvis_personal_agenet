@@ -10,6 +10,7 @@ const DEFAULT_SELECTION_DEBOUNCE_MS = 2_000;
 const DEFAULT_SESSION_INACTIVE_GRACE_MS = 15_000;
 const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
+const WATCHER_AUDIBLE_PEAK_THRESHOLD = 0.001;
 const MAX_CANDIDATE_COUNT = 256;
 
 function safeReason(error, fallback = "application_capture_unavailable") {
@@ -201,11 +202,15 @@ class ApplicationAudioCapturePool {
           blockedUntil: 0,
           firstSeenAt: at,
           inactiveSinceAt: null,
+          requiresAudibleRearm: false,
         };
         this.candidates.set(event.applicationKey, candidate);
       }
       candidate.applicationDisplayName = event.applicationDisplayName;
       if (event.state === "active") {
+        if (event.peak >= WATCHER_AUDIBLE_PEAK_THRESHOLD) {
+          candidate.requiresAudibleRearm = false;
+        }
         candidate.inactiveSinceAt = null;
         candidate.pids.set(event.pid, {
           pid: event.pid,
@@ -250,7 +255,10 @@ class ApplicationAudioCapturePool {
       for (const [applicationKey, track] of [...this.activeTracks]) {
         if (at - track.lastSoundAt < this.silenceReleaseMs) continue;
         const candidate = this.candidates.get(applicationKey);
-        if (candidate) candidate.blockedUntil = at + this.retryDelayMs;
+        if (candidate) {
+          candidate.blockedUntil = at + this.retryDelayMs;
+          candidate.requiresAudibleRearm = true;
+        }
         this._setFallback(track, "confirmed_silence", at + this.retryDelayMs);
         await this._stopTrack(applicationKey, "confirmed_silence", at);
       }
@@ -299,6 +307,7 @@ class ApplicationAudioCapturePool {
     const result = [];
     for (const candidate of this.candidates.values()) {
       if (candidate.blockedUntil > at) continue;
+      if (candidate.requiresAudibleRearm === true) continue;
       const activePid = this.activeTracks.get(candidate.applicationKey)?.pid;
       let processes = [...candidate.pids.values()];
       if (

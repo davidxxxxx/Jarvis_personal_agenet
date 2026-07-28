@@ -10,6 +10,37 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.28 - 2026-07-28
+
+- Verify SQLite integrity before any startup write, use full WAL durability for Jarvis data, and
+  migrate safely to schema v46 after repairing the live recording database.
+- Stop immutable Daily Review snapshots from multiplying as individual background jobs finish;
+  prune 767 obsolete, unpaid snapshots and compact the live database by about 660 MB.
+- Keep application tracks released after confirmed silence until Windows reports audible output
+  again, preventing repeated 60-second KOOK, DOTA 2, and browser track restarts.
+- Project only the latest durable speaker run into memory, preserve verified SELF identity, and
+  collapse unresolved per-application track churn without inventing cross-session people.
+- Exclude virtual audio infrastructure such as audiodg and SteelSeries Sonar from semantic
+  application evidence while retaining the mixed system track as the safety fallback.
+- Cover a typical multi-hour transcript completely in one grounded MiniMax analysis input and
+  offer an explicit paid refresh when an older summary used only partial timeline evidence.
+- Preserve grounded MiniMax summaries when optional collections are malformed or oversized, and
+  persist a safe schema-specific reason when a paid response still cannot be accepted.
+- Ship AI model pack 2026.07.4 and release the high-memory overlap separator after every completed
+  job so an idle Jarvis does not keep its model allocation indefinitely.
+
+## 0.2.0-alpha.27 - 2026-07-27
+
+- Process the physical microphone first, then exact application tracks, and use the mixed system
+  track only as a safety fallback for speaker analysis.
+- Retire a mixed-system diarization job when exact application audio covers at least 80 percent of
+  it, preventing Tencent Meeting or KOOK speech from being counted again as hundreds of people.
+- Persist only durable long-session speaker clusters and reject internally inconsistent runs,
+  while allowing completed short application evidence to join a later identity revision without
+  blocking the primary microphone and meeting tracks.
+- Wake speaker jobs deferred only by GPU, fullscreen, or recovery resource gates after upgrade,
+  while leaving deterministic validation and database failures terminal.
+
 ## 0.2.0-alpha.26 - 2026-07-27
 
 - Keep short and one-window speaker fragments out of MiniMax summaries unless the exact segment is

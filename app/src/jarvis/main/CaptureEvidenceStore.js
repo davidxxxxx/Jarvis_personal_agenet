@@ -197,7 +197,15 @@ class CaptureEvidenceStore {
           priority, input_hash, input_version, model_version, created_at
         ) VALUES (
           @id, @sessionId, @trackId, @chunkId,
-          'transcribe_chunk', 'pending', 30, @inputHash, @inputVersion, @modelVersion, @createdAt
+          'transcribe_chunk', 'pending',
+          CASE (
+            SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = @trackId
+          )
+            WHEN 'mic' THEN 20
+            WHEN 'system_mix' THEN 24
+            ELSE 30
+          END,
+          @inputHash, @inputVersion, @modelVersion, @createdAt
         )
       `),
       getTranscriptionJobByInput: db.prepare(`
@@ -282,6 +290,16 @@ class CaptureEvidenceStore {
       reactivateSupersededTranscriptionJob: db.prepare(`
         UPDATE processing_jobs
         SET state = CASE WHEN attempt_count > 0 THEN 'retry' ELSE 'pending' END,
+            priority = CASE (
+              SELECT track.track_kind
+              FROM audio_chunks AS chunk
+              JOIN audio_tracks AS track ON track.id = chunk.track_id
+              WHERE chunk.id = @chunkId
+            )
+              WHEN 'mic' THEN 20
+              WHEN 'system_mix' THEN 24
+              ELSE 30
+            END,
             completed_at = NULL,
             next_retry_at = CASE WHEN attempt_count > 0 THEN @at ELSE NULL END,
             lease_owner = NULL,
@@ -295,6 +313,20 @@ class CaptureEvidenceStore {
           AND input_version = @inputVersion
           AND model_version = @modelVersion
           AND state = 'superseded'
+      `),
+      reprioritizeActiveTranscriptionJobs: db.prepare(`
+        UPDATE processing_jobs AS job
+        SET priority = CASE (
+          SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+        )
+          WHEN 'mic' THEN 20
+          WHEN 'system_mix' THEN 24
+          ELSE 30
+        END
+        WHERE job.job_type = 'transcribe_chunk'
+          AND job.state IN ('pending', 'retry')
+          AND job.completed_at IS NULL
+          AND job.priority <> 0
       `),
       insertCompressionJob: db.prepare(`
         INSERT INTO processing_jobs (
@@ -570,7 +602,25 @@ class CaptureEvidenceStore {
                 AND primary_job.session_id = job.session_id
                 AND primary_job.completed_at IS NULL
                 AND primary_job.state NOT IN ('completed', 'superseded')
-                AND primary_track.track_kind IN ('mic', 'system_mix')
+                AND primary_track.track_kind = 'mic'
+            )
+          )
+          AND NOT (
+            job.job_type = 'diarize_track'
+            AND EXISTS (
+              SELECT 1 FROM audio_tracks AS system_track
+              WHERE system_track.id = job.track_id
+                AND system_track.track_kind = 'system_mix'
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM processing_jobs AS preferred_job
+              JOIN audio_tracks AS preferred_track ON preferred_track.id = preferred_job.track_id
+              WHERE preferred_job.job_type = 'diarize_track'
+                AND preferred_job.session_id = job.session_id
+                AND preferred_job.completed_at IS NULL
+                AND preferred_job.state NOT IN ('completed', 'superseded')
+                AND preferred_track.track_kind IN ('mic', 'application')
             )
           )
         ORDER BY job.priority ASC,
@@ -619,7 +669,25 @@ class CaptureEvidenceStore {
                 AND primary_job.session_id = job.session_id
                 AND primary_job.completed_at IS NULL
                 AND primary_job.state NOT IN ('completed', 'superseded')
-                AND primary_track.track_kind IN ('mic', 'system_mix')
+                AND primary_track.track_kind = 'mic'
+            )
+          )
+          AND NOT (
+            job.job_type = 'diarize_track'
+            AND EXISTS (
+              SELECT 1 FROM audio_tracks AS system_track
+              WHERE system_track.id = job.track_id
+                AND system_track.track_kind = 'system_mix'
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM processing_jobs AS preferred_job
+              JOIN audio_tracks AS preferred_track ON preferred_track.id = preferred_job.track_id
+              WHERE preferred_job.job_type = 'diarize_track'
+                AND preferred_job.session_id = job.session_id
+                AND preferred_job.completed_at IS NULL
+                AND preferred_job.state NOT IN ('completed', 'superseded')
+                AND preferred_track.track_kind IN ('mic', 'application')
             )
           )
       `),
@@ -1250,7 +1318,7 @@ class CaptureEvidenceStore {
             lease_owner = NULL,
             lease_expires_at = NULL,
             error_code = @errorCode,
-            blocked_reason = NULL,
+            blocked_reason = @blockedReason,
             execution_device = NULL
         WHERE id = @id
           AND state = 'running'
@@ -1465,6 +1533,7 @@ class CaptureEvidenceStore {
     this.enqueueCurrentModelTranscriptionJobsTransaction = db.transaction(
       ({ inputVersion, modelVersion, at, limit }) => {
         this.statements.recoverExpiredTranscriptionJobLeases.run({ at });
+        this.statements.reprioritizeActiveTranscriptionJobs.run();
         const chunks = this.statements.listChunksMissingCurrentTranscription.all({
           inputVersion,
           modelVersion,
@@ -2542,10 +2611,11 @@ class CaptureEvidenceStore {
     );
   }
 
-  blockJob(id, { owner, at, errorCode }) {
+  blockJob(id, { owner, at, errorCode, blockedReason = null }) {
     const input = this._assertJobLeaseTransition(id, { owner, at });
     this._assertIdentifier(errorCode, "errorCode");
-    return this.statements.blockLeasedJob.run({ ...input, errorCode }).changes === 1;
+    if (blockedReason !== null) this._assertIdentifier(blockedReason, "blockedReason");
+    return this.statements.blockLeasedJob.run({ ...input, errorCode, blockedReason }).changes === 1;
   }
 
   enqueueChunkTranscription(chunk) {

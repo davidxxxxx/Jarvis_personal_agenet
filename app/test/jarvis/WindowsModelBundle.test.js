@@ -9,12 +9,12 @@ const {
 } = require("../../scripts/build-windows-model-bundle");
 
 test("model bundle keeps the model outside NSIS while preserving one setup entry", () => {
-  const names = modelArtifactNames("jarvis-ai-model-pack-2026.07.2");
+  const names = modelArtifactNames("jarvis-ai-model-pack-2026.07.4");
 
   assert.deepEqual(names, {
-    archiveName: "Jarvis AI Model Pack 2026.07.2.7z",
-    checksumName: "Jarvis AI Model Pack 2026.07.2.7z.sha512",
-    descriptorName: "Jarvis AI Model Pack 2026.07.2.release.json",
+    archiveName: "Jarvis AI Model Pack 2026.07.4.7z",
+    checksumName: "Jarvis AI Model Pack 2026.07.4.7z.sha512",
+    descriptorName: "Jarvis AI Model Pack 2026.07.4.release.json",
   });
 });
 
@@ -52,11 +52,11 @@ test("7-Zip invocation archives the top-level model directory without shell inte
 
 test("generated NSIS include pins the external archive digest and rejects injection", () => {
   const rendered = renderNsisInclude({
-    archiveName: "Jarvis AI Model Pack 2026.07.2.7z",
+    archiveName: "Jarvis AI Model Pack 2026.07.4.7z",
     sha512: "a".repeat(128),
   });
 
-  assert.match(rendered, /JARVIS_MODEL_ARCHIVE_NAME "Jarvis AI Model Pack 2026\.07\.2\.7z"/u);
+  assert.match(rendered, /JARVIS_MODEL_ARCHIVE_NAME "Jarvis AI Model Pack 2026\.07\.4\.7z"/u);
   assert.match(rendered, new RegExp(`JARVIS_MODEL_ARCHIVE_SHA512 "${"A".repeat(128)}"`, "u"));
   assert.throws(
     () => renderNsisInclude({ archiveName: 'models.7z"\n!include evil', sha512: "a".repeat(128) }),

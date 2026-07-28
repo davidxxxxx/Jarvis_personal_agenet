@@ -981,7 +981,7 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
     {
       job_type: "diarize_track",
       state: "pending",
-      priority: 35,
+      priority: 18,
       input_hash: expectedKey,
       input_version: 1,
       model_version: "jarvis-session-diarization-v1",
@@ -989,6 +989,113 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
       track_id: "track-cas",
       chunk_id: null,
     }
+  );
+});
+
+test("exact application coverage suppresses redundant system-mix diarization", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE sessions SET ended_at = 121000, finalized_at = 121000 WHERE id = 'session-cas';
+    UPDATE audio_tracks
+    SET source_type = 'system', ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', started_at = 1000, ended_at = 121000,
+        duration_ms = 120000, expires_at = 300000
+    WHERE id = 'chunk-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', started_at = 1000, ended_at = 121000
+    WHERE id = 'segment-cas';
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state,
+      failure_code
+    ) VALUES (
+      'track-app', 'session-cas', 'system', 'tencent_meeting', '腾讯会议',
+      1, 24000, 1, 1000, 121000, 'ended', NULL
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-app', 'session-cas', 'track-app', 'system', 0, 'app.wav',
+      1000, 121000, 120000,
+      '${"c".repeat(64)}', 300000,
+      'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, created_at, completed_at
+    ) VALUES (
+      'job-app-transcript', 'session-cas', 'track-app', 'chunk-app',
+      'transcribe_chunk', 'completed', 30,
+      '${"c".repeat(64)}', 1, 'whisper-v1', 1, 2000, 121100
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-app', 'session-cas', 1000, 121000, 'system', 'meeting', 0.9,
+      1, 'track-app', 'chunk-app', 'system', 'final', 1, 'whisper-v1', 121100
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-system-mix-diarization', 'session-cas', 'track-cas',
+      'diarize_track', 'retry', 36,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 121200
+    );
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 122000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 1);
+  assert.deepEqual(result.skipped, [
+    {
+      trackId: "track-cas",
+      reason: "covered_by_exact_application",
+      coverage: 1,
+    },
+  ]);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT track_id, state, priority, error_code
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track'
+         ORDER BY track_id, created_at`
+      )
+      .all(),
+    [
+      {
+        track_id: "track-app",
+        state: "pending",
+        priority: 26,
+        error_code: null,
+      },
+      {
+        track_id: "track-cas",
+        state: "superseded",
+        priority: 28,
+        error_code: "SYSTEM_MIX_COVERED_BY_EXACT_APPLICATION",
+      },
+    ]
+  );
+  assert.deepEqual(
+    repo.getSpeakerIdentityResolutionSnapshot({
+      sessionId: "session-cas",
+      at: 122000,
+      diarizationPolicy: SESSION_DIARIZATION_POLICY,
+    }),
+    { eligible: false, reason: "diarization_incomplete" }
   );
 });
 
@@ -1035,6 +1142,102 @@ test("short application tracks do not fan out diarization jobs", (t) => {
       error_code: "SPEAKER_AUDIO_TOO_SHORT",
       completed_at: 80000,
     }
+  );
+});
+
+test("fragmented application tracks schedule only the longest track per application", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE sessions SET ended_at = 181000, finalized_at = 181000 WHERE id = 'session-cas';
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'kook',
+        application_display_name = 'KOOK', capture_generation = 1,
+        ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', started_at = 1000, ended_at = 121000,
+        duration_ms = 120000, expires_at = 300000
+    WHERE id = 'chunk-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', started_at = 1000, ended_at = 121000
+    WHERE id = 'segment-cas';
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-shorter-app-diarization', 'session-cas', 'track-cas',
+      'diarize_track', 'retry', 26,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 121200
+    );
+
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state,
+      failure_code
+    ) VALUES (
+      'track-app-long', 'session-cas', 'system', 'kook', 'KOOK',
+      2, 24000, 1, 1000, 181000, 'ended', NULL
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-app-long', 'session-cas', 'track-app-long', 'system', 0, 'app-long.wav',
+      1000, 181000, 180000,
+      '${"e".repeat(64)}', 300000,
+      'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, created_at, completed_at
+    ) VALUES (
+      'job-app-long-transcript', 'session-cas', 'track-app-long', 'chunk-app-long',
+      'transcribe_chunk', 'completed', 30,
+      '${"e".repeat(64)}', 1, 'whisper-v1', 1, 2000, 181100
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-app-long', 'session-cas', 1000, 181000, 'system', 'long call', 0.9,
+      1, 'track-app-long', 'chunk-app-long', 'system', 'final', 1, 'whisper-v1', 181100
+    );
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 182000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 1);
+  assert.deepEqual(result.skipped, [
+    { trackId: "track-cas", reason: "application_track_not_primary" },
+  ]);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT track_id, state, error_code
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track'
+         ORDER BY track_id, created_at`
+      )
+      .all(),
+    [
+      {
+        track_id: "track-app-long",
+        state: "pending",
+        error_code: null,
+      },
+      {
+        track_id: "track-cas",
+        state: "superseded",
+        error_code: "APPLICATION_TRACK_NOT_PRIMARY",
+      },
+    ]
   );
 });
 

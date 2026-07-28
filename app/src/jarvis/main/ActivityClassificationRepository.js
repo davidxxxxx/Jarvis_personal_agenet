@@ -97,6 +97,22 @@ function evidenceFeatures(entry) {
   };
 }
 
+function classificationEvidenceBasis(entry) {
+  const evidence = entry?.evidence ?? {};
+  return JSON.stringify({
+    applicationKeys: [...new Set(evidence.applicationKeys ?? [])].sort(),
+    microphoneParticipated: evidence.microphoneParticipated === true,
+    selfDetected: evidence.selfDetected === true,
+    speakerCount: Number.isSafeInteger(evidence.speakerCount) ? evidence.speakerCount : 0,
+    timeBucket: typeof evidence.timeBucket === "string" ? evidence.timeBucket : null,
+    personalizationRuleId:
+      typeof evidence.personalizationRuleId === "string"
+        ? evidence.personalizationRuleId
+        : null,
+    sourceAttribution: entry?.sourceAttribution ?? null,
+  });
+}
+
 function featurePatternKey(features) {
   return sha256(JSON.stringify(features));
 }
@@ -339,21 +355,41 @@ class ActivityClassificationRepository {
   listSessionEffective(sessionId) {
     const history = this.listSessionHistory(sessionId);
     const priority = { local: 1, minimax: 2, user: 3 };
-    const effective = new Map();
+    const byActivityWindow = new Map();
     for (const entry of history) {
       const key = `${entry.startedAt}\0${entry.endedAt}`;
-      const current = effective.get(key);
-      if (
-        !current ||
-        priority[entry.source] > priority[current.source] ||
-        (priority[entry.source] === priority[current.source] &&
-          (entry.updatedAt > current.updatedAt ||
-            (entry.updatedAt === current.updatedAt && entry.id > current.id)))
-      ) {
-        effective.set(key, entry);
-      }
+      const entries = byActivityWindow.get(key) ?? [];
+      entries.push(entry);
+      byActivityWindow.set(key, entries);
     }
-    return [...effective.values()].sort(
+    const newer = (left, right) =>
+      left.updatedAt > right.updatedAt ||
+      (left.updatedAt === right.updatedAt && left.id > right.id);
+    const select = (entries) => {
+      const userEntries = entries.filter((entry) => entry.source === "user");
+      if (userEntries.length > 0) {
+        return userEntries.reduce((current, entry) => (newer(entry, current) ? entry : current));
+      }
+      const localEntries = entries.filter((entry) => entry.source === "local");
+      const candidates =
+        localEntries.length === 0
+          ? entries
+          : (() => {
+              const latestLocal = localEntries.reduce((current, entry) =>
+                newer(entry, current) ? entry : current
+              );
+              const basis = classificationEvidenceBasis(latestLocal);
+              return entries.filter((entry) => classificationEvidenceBasis(entry) === basis);
+            })();
+      return candidates.reduce((current, entry) => {
+        if (priority[entry.source] > priority[current.source]) return entry;
+        if (priority[entry.source] === priority[current.source] && newer(entry, current)) {
+          return entry;
+        }
+        return current;
+      });
+    };
+    return [...byActivityWindow.values()].map(select).sort(
       (left, right) =>
         left.startedAt - right.startedAt ||
         left.endedAt - right.endedAt ||

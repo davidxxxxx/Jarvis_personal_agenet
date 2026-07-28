@@ -253,6 +253,14 @@ class OfflineModels:
         self.separator.close()
 
     def diarize(self, request: dict[str, Any]) -> dict[str, Any]:
+        release_separator = request.get("releaseOverlapSeparatorAfterRequest") is True
+        try:
+            return self._diarize(request)
+        finally:
+            if release_separator:
+                self.separator.close()
+
+    def _diarize(self, request: dict[str, Any]) -> dict[str, Any]:
         import soundfile as sf
 
         audio_path = Path(str(request.get("audioPath", ""))).resolve()
@@ -282,7 +290,18 @@ class OfflineModels:
         turns.sort(key=lambda turn: (turn["startMs"], turn["endMs"], turn["speaker"]))
         padding_ms = max(0, min(5000, int(request.get("overlapPaddingMs", 250))))
         windows = _overlap_windows(turns, padding_ms, duration_ms)
-        separation = self._separate_overlap_windows(audio_path, windows)
+        enable_overlap_separation = request.get("enableOverlapSeparation") is not False
+        separation = (
+            self._separate_overlap_windows(audio_path, windows)
+            if enable_overlap_separation
+            else {
+                "state": "not_needed",
+                "processed": 0,
+                "total": len(windows),
+                "stemCounts": [],
+                "reason": "policy_disabled",
+            }
+        )
         return {
             "durationMs": duration_ms,
             "turns": turns,

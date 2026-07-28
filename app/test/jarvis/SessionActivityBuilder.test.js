@@ -1,5 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const Database = require("better-sqlite3");
 
 const SessionActivityBuilder = require("../../src/jarvis/main/SessionActivityBuilder");
 
@@ -111,4 +112,77 @@ test("mixed system audio never claims an application even if a key is present", 
   const [activity] = new SessionActivityBuilder(db).build("session-mix").activities;
   assert.equal(activity.sourceAttribution, "mixed_unknown");
   assert.deepEqual(activity.applications, []);
+});
+
+test("builder derives activity fields from the current audio_tracks schema", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE audio_tracks (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      application_key TEXT,
+      application_display_name TEXT,
+      device_label TEXT,
+      strategy TEXT,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER
+    );
+    CREATE TABLE people (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      is_self INTEGER NOT NULL
+    );
+    CREATE TABLE transcript_segments (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      track_id TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER NOT NULL,
+      person_id TEXT,
+      speaker_label TEXT,
+      text TEXT NOT NULL,
+      result_kind TEXT NOT NULL,
+      is_stable INTEGER NOT NULL,
+      superseded_by TEXT,
+      duplicate_of TEXT
+    );
+  `);
+  db.prepare(`
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      device_label, strategy, started_at, ended_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "track-kook",
+    "session-current",
+    "system",
+    "kook",
+    "KOOK",
+    null,
+    "wasapi-application-loopback",
+    1_000,
+    4_000
+  );
+  db.prepare(`
+    INSERT INTO transcript_segments (
+      id, session_id, track_id, started_at, ended_at, person_id,
+      speaker_label, text, result_kind, is_stable, superseded_by, duplicate_of
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'final', 1, NULL, NULL)
+  `).run(
+    "segment-kook",
+    "session-current",
+    "track-kook",
+    1_000,
+    4_000,
+    null,
+    "speaker_1",
+    "今晚一起玩"
+  );
+
+  const [activity] = new SessionActivityBuilder(db).build("session-current").activities;
+
+  assert.equal(activity.sourceAttribution, "application");
+  assert.deepEqual(activity.applications, ["kook"]);
+  db.close();
 });

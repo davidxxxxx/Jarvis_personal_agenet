@@ -24,10 +24,24 @@ class SessionActivityBuilder {
     }
     this.db = db;
     this.listTracks = db.prepare(`
-      SELECT * FROM audio_tracks
+      SELECT
+        audio_tracks.*,
+        CASE
+          WHEN source_type = 'mic' THEN 'mic'
+          WHEN application_key IS NOT NULL THEN 'application'
+          ELSE 'system_mix'
+        END AS track_kind,
+        CASE
+          WHEN source_type = 'system' AND application_key IS NULL THEN 'mixed_unknown'
+          ELSE 'exact'
+        END AS attribution_state
+      FROM audio_tracks
       WHERE session_id = ?
-      ORDER BY CASE track_kind
-        WHEN 'application' THEN 0 WHEN 'system_mix' THEN 1 ELSE 2 END,
+      ORDER BY CASE
+        WHEN application_key IS NOT NULL THEN 0
+        WHEN source_type = 'system' THEN 1
+        ELSE 2
+      END,
         started_at, id
     `);
     this.listSegments = db.prepare(`

@@ -966,7 +966,12 @@ test("invalid response structure with authoritative usage reconciles then blocks
     calls.some(([name]) => name === "persist"),
     false
   );
-  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_invalid_response");
+  assert.deepEqual(calls.find(([name]) => name === "block")[2], {
+    owner: "cloud-worker",
+    at: 200,
+    errorCode: "analysis_invalid_response",
+    blockedReason: "analysis_validation_schema_missing_field",
+  });
 });
 
 test("a paid validated response blocks durably when local candidate application fails", async () => {

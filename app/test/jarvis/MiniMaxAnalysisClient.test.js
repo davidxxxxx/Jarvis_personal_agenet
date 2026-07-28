@@ -6,6 +6,7 @@ const { AnalysisClientError } = MiniMaxAnalysisClient;
 
 test("allows long MiniMax reasoning responses while keeping a finite timeout", () => {
   assert.equal(MiniMaxAnalysisClient.DEFAULT_TIMEOUT_MS, 240_000);
+  assert.ok(MiniMaxAnalysisClient.DEFAULT_MAX_REQUEST_BYTES >= 512 * 1024);
 });
 
 function candidate(overrides = {}) {
@@ -186,14 +187,25 @@ test("strict schema failures make one request and never upload a repair", async 
   const client = new MiniMaxAnalysisClient({
     fetchImpl: async (_url, options) => {
       requests.push(JSON.parse(options.body));
-      return response(envelope(toolMessage(candidate({ todos: { items: [] } }))));
+      return response(
+        envelope(
+          toolMessage(
+            candidate({
+              sessionSummary: {
+                ...candidate().sessionSummary,
+                evidenceSegmentIds: [],
+              },
+            })
+          )
+        )
+      );
     },
     getApiKey: () => "unit-test-key",
   });
 
   await assert.rejects(
     client.analyze(analysisInput()),
-    expectClientError("invalid_structure", false, "schema.collection_type.todos")
+    expectClientError("invalid_structure", false, "schema.evidence_empty")
   );
   assert.equal(requests.length, 1);
   assert.doesNotMatch(JSON.stringify(requests), /repair|invalidAnalysis/i);
@@ -202,12 +214,23 @@ test("strict schema failures make one request and never upload a repair", async 
 test("preserves authoritative usage when MiniMax returns an invalid candidate", async () => {
   const client = new MiniMaxAnalysisClient({
     fetchImpl: async () =>
-      response(envelope(toolMessage(candidate({ todos: { items: [] } })))),
+      response(
+        envelope(
+          toolMessage(
+            candidate({
+              sessionSummary: {
+                ...candidate().sessionSummary,
+                evidenceSegmentIds: [],
+              },
+            })
+          )
+        )
+      ),
     getApiKey: () => "unit-test-key",
   });
 
   await assert.rejects(client.analyze(analysisInput()), (error) => {
-    assert.ok(expectClientError("invalid_structure", false, "schema.collection_type.todos")(error));
+    assert.ok(expectClientError("invalid_structure", false, "schema.evidence_empty")(error));
     assert.deepEqual(error.authoritativeUsage, { inputTokens: 10, outputTokens: 20 });
     return true;
   });
@@ -450,7 +473,17 @@ test("logs only the exact privacy allowlist on success and validation failure", 
     fetchImpl: async () =>
       response(
         envelope(
-          toolMessage(valid ? candidate() : candidate({ todos: { poison: forbidden.person } }))
+          toolMessage(
+            valid
+              ? candidate()
+              : candidate({
+                  sessionSummary: {
+                    ...candidate().sessionSummary,
+                    evidenceSegmentIds: [],
+                    poison: forbidden.person,
+                  },
+                })
+          )
         )
       ),
     getApiKey: () => forbidden.key,
@@ -493,7 +526,7 @@ test("logs only the exact privacy allowlist on success and validation failure", 
     outputTokens: 20,
   });
   assert.equal(logs[1].errorCode, "invalid_structure");
-  assert.equal(logs[1].validatorIssueCode, "schema.collection_type.todos");
+  assert.equal(logs[1].validatorIssueCode, "schema.unknown_field");
   const serializedLogs = JSON.stringify(logs);
   for (const value of Object.values(forbidden)) assert.equal(serializedLogs.includes(value), false);
   assert.equal(serializedLogs.includes(analysisInput().cloudPayloadJson), false);

@@ -174,7 +174,14 @@ class HybridDiarizationManager {
     return this.verifiedPack.manifestSha256;
   }
 
-  async diarizeStrict(wavPath, { executionContext = null } = {}) {
+  async diarizeStrict(
+    wavPath,
+    {
+      executionContext = null,
+      enableOverlapSeparation = true,
+      releaseHighMemoryResources = false,
+    } = {}
+  ) {
     if (typeof wavPath !== "string" || !path.isAbsolute(wavPath)) {
       throw new TypeError("wavPath must be absolute");
     }
@@ -200,6 +207,8 @@ class HybridDiarizationManager {
           maximumSpeakers: this.policy.maximumSpeakers,
           verifierMaximumSpeakers: this.policy.verifierMaximumSpeakers,
           overlapPaddingMs: this.policy.overlapPaddingMs,
+          enableOverlapSeparation: enableOverlapSeparation !== false,
+          releaseOverlapSeparatorAfterRequest: releaseHighMemoryResources === true,
           selectedGpuUuid,
         }),
       { selectedGpuUuid }

@@ -1,7 +1,7 @@
 {
   "name": "jarvis-memory-assistant",
   "productName": "Jarvis Memory",
-  "version": "0.2.0-alpha.26",
+  "version": "0.2.0-alpha.28",
   "description": "Local-first Windows conversation memory assistant",
   "main": "main.js",
   "private": true,

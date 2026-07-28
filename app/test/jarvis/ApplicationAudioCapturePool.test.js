@@ -239,6 +239,53 @@ test("a transient inactive watcher event keeps the same application capture gene
   );
 });
 
+test("confirmed silence waits for a new audible watcher event before reopening the app track", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    silenceReleaseMs: 60_000,
+    retryDelayMs: 5_000,
+  });
+  await harness.pool.start();
+  await harness.emit(active("kook", 321, { peak: 0.8 }));
+  await harness.pool.waitForIdle();
+
+  at += 60_001;
+  await harness.pool.sweep();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+  assert.equal(
+    harness.events.some(
+      (event) =>
+        event.type === "ended" &&
+        event.applicationKey === "kook" &&
+        event.reason === "confirmed_silence"
+    ),
+    true
+  );
+
+  at += 6_000;
+  await harness.pool.sweep();
+  await harness.emit(active("kook", 321, { peak: 0 }));
+  await harness.pool.waitForIdle();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+
+  await harness.emit(active("kook", 321, { peak: 0.4 }));
+  await harness.pool.waitForIdle();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    2
+  );
+});
+
 test("evidence registration failures retain the original bounded error code", async () => {
   const error = new Error("invalid application interval");
   error.code = "SQLITE_CONSTRAINT_TRIGGER";

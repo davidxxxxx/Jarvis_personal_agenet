@@ -1781,7 +1781,7 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 1_000 });
-    assert.equal(TARGET_VERSION, 42);
+    assert.equal(TARGET_VERSION, 46);
 
     const explain = (sql, ...params) =>
       db
@@ -1896,6 +1896,82 @@ test("v29 fails closed without dropping an extra constrained processing_jobs col
       schemaBefore
     );
     assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
+  } finally {
+    db.close();
+  }
+});
+
+test("v45 prunes only unreferenced superseded daily-digest snapshots", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    const insertInput = db.prepare(
+      `INSERT INTO daily_digest_inputs (
+         id, local_date, timezone, source_hash, contract_version, completeness,
+         input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+       ) VALUES (?, '2026-07-28', 'Asia/Shanghai', ?,
+         'jarvis-daily-digest-input-v1', 'partial', '{}', '{}', 2, 'MiniMax-M2.7', ?)`
+    );
+    const insertJob = db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, chunk_id, job_type, state, priority,
+         input_hash, input_version, model_version, attempt_count, next_retry_at,
+         lease_owner, lease_expires_at, error_code, blocked_reason, execution_device,
+         created_at, completed_at, lane, analysis_input_id, desired_head_hash, digest_input_id
+       ) VALUES (?, NULL, NULL, NULL, 'generate_daily_digest', ?, 80,
+         ?, 1, 'MiniMax-M2.7', 0, NULL, NULL, NULL, ?, NULL, NULL,
+         ?, ?, 'cloud', NULL, NULL, ?)`
+    );
+    const obsoleteHash = "a".repeat(64);
+    const activeHash = "b".repeat(64);
+    insertInput.run("digest-input-obsolete", obsoleteHash, 2_000);
+    insertInput.run("digest-input-active", activeHash, 2_001);
+    insertJob.run(
+      "digest-job-obsolete",
+      "superseded",
+      obsoleteHash,
+      "DAILY_DIGEST_SUPERSEDED",
+      2_000,
+      2_100,
+      "digest-input-obsolete"
+    );
+    insertJob.run(
+      "digest-job-active",
+      "pending",
+      activeHash,
+      null,
+      2_001,
+      null,
+      "digest-input-active"
+    );
+    db.pragma("user_version = 44");
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 3_000 }), {
+      fromVersion: 44,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(
+      db.prepare("SELECT id FROM daily_digest_inputs ORDER BY id").all(),
+      [{ id: "digest-input-active" }]
+    );
+    assert.deepEqual(
+      db
+        .prepare(
+          "SELECT id, state, digest_input_id FROM processing_jobs WHERE job_type = 'generate_daily_digest'"
+        )
+        .all(),
+      [
+        {
+          id: "digest-job-active",
+          state: "pending",
+          digest_input_id: "digest-input-active",
+        },
+      ]
+    );
+    assert.throws(
+      () => db.prepare("DELETE FROM daily_digest_inputs WHERE id = ?").run("digest-input-active"),
+      /daily digest input is immutable/
+    );
   } finally {
     db.close();
   }

@@ -167,6 +167,35 @@ test("salvages valid grounded output while dropping malformed optional items", (
   assert.deepEqual(result.suggestions[0].basedOnEvidenceSegmentIds, ["seg-2"]);
 });
 
+test("salvage keeps the grounded summary when an optional collection has the wrong type", () => {
+  const result = salvageCandidateAnalysis(
+    candidate({
+      todos: { title: "model emitted an object instead of an array" },
+    }),
+    context
+  );
+
+  assert.equal(result.sessionSummary.title, "Delivery discussion");
+  assert.deepEqual(result.todos, []);
+  assert.equal(result.memories.length, 1);
+  assert.equal(result.topics.length, 1);
+});
+
+test("salvage bounds oversized optional collections before strict validation", () => {
+  const result = salvageCandidateAnalysis(
+    candidate({
+      topics: Array.from({ length: 120 }, (_, index) => ({
+        ...candidate().topics[0],
+        name: `Delivery ${index}`,
+      })),
+    }),
+    context
+  );
+
+  assert.equal(result.topics.length, 100);
+  assert.equal(result.topics[99].name, "Delivery 99");
+});
+
 test("rejects invalid memory kinds confidence owner labels and due text", () => {
   expectIssue(
     candidate({ memories: [{ ...candidate().memories[0], kind: "opinion" }] }),

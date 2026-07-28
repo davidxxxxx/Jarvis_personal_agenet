@@ -44,12 +44,13 @@ const TRANSCRIPT_PROMPT_UNEXPECTED_SCRIPT =
 const STABLE_CLUSTER_REUSE_THRESHOLD = 0.82;
 const STABLE_CLUSTER_REUSE_MARGIN = 0.05;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
+const EXACT_APPLICATION_SYSTEM_MIX_COVERAGE_THRESHOLD = 0.8;
 const PUBLIC_SPEAKER_MIN_SPEECH_MS = 5_000;
 const PUBLIC_SPEAKER_MIN_WINDOWS = 3;
 const DIARIZATION_PRIORITY = Object.freeze({
-  mic: 35,
-  system_mix: 36,
-  application: 40,
+  mic: 18,
+  application: 26,
+  system_mix: 28,
 });
 const LEGACY_TRACK_STATE_BY_SESSION_STATUS = Object.freeze({
   recording: "active",
@@ -75,6 +76,117 @@ function isPublicSpeakerCluster(cluster) {
         (cluster.speechMs >= PUBLIC_SPEAKER_MIN_SPEECH_MS &&
           cluster.windowCount >= PUBLIC_SPEAKER_MIN_WINDOWS))
   );
+}
+
+function mergeAudioRanges(chunks) {
+  const ranges = chunks
+    .map((chunk) => [chunk.started_at, chunk.ended_at])
+    .filter(
+      ([startedAt, endedAt]) =>
+        Number.isSafeInteger(startedAt) &&
+        Number.isSafeInteger(endedAt) &&
+        endedAt > startedAt
+    )
+    .sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const merged = [];
+  for (const range of ranges) {
+    const previous = merged[merged.length - 1];
+    if (!previous || range[0] > previous[1]) {
+      merged.push([...range]);
+    } else {
+      previous[1] = Math.max(previous[1], range[1]);
+    }
+  }
+  return merged;
+}
+
+function coveredAudioRatio(targetChunks, coveringChunks) {
+  const targets = mergeAudioRanges(targetChunks);
+  const coverings = mergeAudioRanges(coveringChunks);
+  const targetMs = targets.reduce((total, range) => total + range[1] - range[0], 0);
+  if (targetMs <= 0 || coverings.length === 0) return 0;
+  let coveredMs = 0;
+  let coveringIndex = 0;
+  for (const target of targets) {
+    while (
+      coveringIndex < coverings.length &&
+      coverings[coveringIndex][1] <= target[0]
+    ) {
+      coveringIndex += 1;
+    }
+    for (let index = coveringIndex; index < coverings.length; index += 1) {
+      const covering = coverings[index];
+      if (covering[0] >= target[1]) break;
+      coveredMs += Math.max(
+        0,
+        Math.min(target[1], covering[1]) - Math.max(target[0], covering[0])
+      );
+    }
+  }
+  return Math.min(1, coveredMs / targetMs);
+}
+
+function preferredSpeakerEvidenceTracks(
+  tracks,
+  chunks,
+  { completedApplicationTrackIds = new Set() } = {}
+) {
+  const audioMsByTrack = new Map();
+  for (const chunk of chunks) {
+    audioMsByTrack.set(
+      chunk.track_id,
+      (audioMsByTrack.get(chunk.track_id) ?? 0) + Math.max(0, chunk.duration_ms ?? 0)
+    );
+  }
+  const preferredApplicationByKey = new Map();
+  const applicationTracks = tracks
+    .filter(
+      (track) =>
+        track.track_kind === "application" &&
+        track.attribution_state === "exact" &&
+        !ApplicationAudioPolicy.isVirtualAudioInfrastructure({
+          applicationKey: track.application_key,
+          applicationDisplayName: track.application_display_name,
+        }) &&
+        ((audioMsByTrack.get(track.id) ?? 0) >= MIN_APPLICATION_DIARIZATION_AUDIO_MS ||
+          completedApplicationTrackIds.has(track.id))
+    )
+    .sort(
+      (left, right) =>
+        (audioMsByTrack.get(right.id) ?? 0) - (audioMsByTrack.get(left.id) ?? 0) ||
+        (left.started_at ?? 0) - (right.started_at ?? 0) ||
+        left.id.localeCompare(right.id)
+    );
+  for (const track of applicationTracks) {
+    if (!preferredApplicationByKey.has(track.application_key)) {
+      preferredApplicationByKey.set(track.application_key, track);
+    }
+  }
+  const qualifiedApplicationTrackIds = new Set(
+    [...preferredApplicationByKey.values()].map((track) => track.id)
+  );
+  const exactApplicationChunks = chunks.filter((chunk) =>
+    qualifiedApplicationTrackIds.has(chunk.track_id)
+  );
+  const coverageBySystemTrack = new Map();
+  const preferred = tracks.filter((track) => {
+    if (track.track_kind === "application") {
+      return qualifiedApplicationTrackIds.has(track.id);
+    }
+    if (track.track_kind !== "system_mix") return true;
+    const ratio = coveredAudioRatio(
+      chunks.filter((chunk) => chunk.track_id === track.id),
+      exactApplicationChunks
+    );
+    coverageBySystemTrack.set(track.id, ratio);
+    return ratio < EXACT_APPLICATION_SYSTEM_MIX_COVERAGE_THRESHOLD;
+  });
+  return {
+    preferred,
+    coverageBySystemTrack,
+    qualifiedApplicationTrackIds,
+    audioMsByTrack,
+  };
 }
 
 function runtimeJobStage({ job_type: jobType, state, priority }) {
@@ -546,6 +658,16 @@ class JarvisRepository {
       this.db.pragma("foreign_keys = ON");
       if (dbPath !== ":memory:") {
         this.db.pragma("journal_mode = WAL");
+        this.db.pragma("synchronous = FULL");
+        this.db.pragma("busy_timeout = 5000");
+        this.db.pragma("wal_autocheckpoint = 1000");
+        const health = this.db.pragma("quick_check");
+        if (
+          health.length !== 1 ||
+          health[0]?.quick_check !== "ok"
+        ) {
+          throw codedError("JARVIS_DATABASE_INTEGRITY_FAILED");
+        }
       }
       // Evidence migrations are independently transactional and may need to suspend
       // FK enforcement before their transaction for SQLite's documented table-rebuild
@@ -1114,6 +1236,53 @@ class JarvisRepository {
           AND state IN ('pending','retry','blocked')
           AND completed_at IS NULL
       `),
+      supersedeCoveredSystemMixDiarizationJobs: this.db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'SYSTEM_MIX_COVERED_BY_EXACT_APPLICATION',
+            blocked_reason = NULL,
+            execution_device = NULL,
+            completed_at = @at
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND state IN ('pending','retry','blocked')
+          AND completed_at IS NULL
+      `),
+      supersedeNonPrimaryApplicationDiarizationJobs: this.db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'APPLICATION_TRACK_NOT_PRIMARY',
+            blocked_reason = NULL,
+            execution_device = NULL,
+            completed_at = @at
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND state IN ('pending','retry','blocked')
+          AND completed_at IS NULL
+      `),
+      reprioritizeDiarizationJobs: this.db.prepare(`
+        UPDATE processing_jobs AS job
+        SET priority = CASE (
+          SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+        )
+          WHEN 'mic' THEN 18
+          WHEN 'application' THEN 26
+          WHEN 'system_mix' THEN 28
+          ELSE priority
+        END
+        WHERE job.job_type = 'diarize_track'
+          AND job.session_id = @sessionId
+          AND job.state IN ('pending','retry','blocked')
+          AND job.completed_at IS NULL
+      `),
       insertDiarizationStableCluster: this.db.prepare(`
         INSERT INTO speaker_clusters (
           id, session_id, track_id, local_label, model_id, embedding,
@@ -1265,7 +1434,7 @@ class JarvisRepository {
           id, session_id, track_id, chunk_id, job_type, state, priority,
           input_hash, input_version, model_version, created_at
         ) VALUES (
-          @id, @sessionId, NULL, NULL, 'resolve_identities', 'pending', 37,
+          @id, @sessionId, NULL, NULL, 'resolve_identities', 'pending', 29,
           @inputHash, 1, @policyId, @createdAt
         )
       `),
@@ -3041,10 +3210,30 @@ class JarvisRepository {
     const speakers = this.speakerIdentityRepository
       .listSessionClusterViews(safeSessionId)
       .filter((cluster) => publicClusterIds.has(cluster.id));
-    const summaryRefresh =
+    const persistedSummaryRefresh =
       this.db
         .prepare("SELECT * FROM session_summary_refresh_state WHERE session_id = ?")
         .get(safeSessionId) ?? null;
+    const latestSummary = this.db
+      .prepare(
+        `SELECT completeness, created_at
+         FROM session_summary_revisions
+         WHERE session_id = ? AND lifecycle = 'active'
+         ORDER BY revision DESC LIMIT 1`
+      )
+      .get(safeSessionId);
+    const summaryRefresh =
+      latestSummary?.completeness === "incremental" &&
+      persistedSummaryRefresh?.recommended !== 1
+        ? {
+            basis_policy_id: persistedSummaryRefresh?.basis_policy_id ?? null,
+            latest_policy_id:
+              latestRuns.at(-1)?.policy_id ?? SESSION_DIARIZATION_POLICY.policyId,
+            recommended: 1,
+            reason: "summary_incomplete",
+            updated_at: latestSummary.created_at,
+          }
+        : persistedSummaryRefresh;
     const reprocessing = this.statements.getSessionReprocessingState.get(safeSessionId) ?? null;
     return {
       preferredInputVersion,
@@ -3148,11 +3337,68 @@ class JarvisRepository {
       throw new TypeError("speakerProcessingPolicy.evaluate is required");
     }
     const tracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
+    const chunks = this.statements.listSessionReadinessChunks.all(safeSessionId);
+    const { preferred: preferredTracks, coverageBySystemTrack, audioMsByTrack } =
+      preferredSpeakerEvidenceTracks(tracks, chunks);
+    const preferredTrackIds = new Set(preferredTracks.map((track) => track.id));
     const jobs = [];
     const skipped = [];
     let enqueued = 0;
     const enqueue = this.db.transaction(() => {
+      this.statements.reprioritizeDiarizationJobs.run({ sessionId: safeSessionId });
       for (const track of tracks) {
+        if (
+          track.track_kind === "application" &&
+          ApplicationAudioPolicy.isVirtualAudioInfrastructure({
+            applicationKey: track.application_key,
+            applicationDisplayName: track.application_display_name,
+          })
+        ) {
+          this.statements.supersedeShortApplicationDiarizationJobs.run({
+            sessionId: safeSessionId,
+            trackId: track.id,
+            at: safeAt,
+          });
+          skipped.push({ trackId: track.id, reason: "virtual_audio_infrastructure" });
+          continue;
+        }
+        if (
+          track.track_kind === "application" &&
+          (audioMsByTrack.get(track.id) ?? 0) < MIN_APPLICATION_DIARIZATION_AUDIO_MS
+        ) {
+          this.statements.supersedeShortApplicationDiarizationJobs.run({
+            sessionId: safeSessionId,
+            trackId: track.id,
+            at: safeAt,
+          });
+          skipped.push({ trackId: track.id, reason: "speaker_audio_too_short" });
+          continue;
+        }
+        if (!preferredTrackIds.has(track.id)) {
+          if (track.track_kind === "application") {
+            this.statements.supersedeNonPrimaryApplicationDiarizationJobs.run({
+              sessionId: safeSessionId,
+              trackId: track.id,
+              at: safeAt,
+            });
+            skipped.push({
+              trackId: track.id,
+              reason: "application_track_not_primary",
+            });
+            continue;
+          }
+          this.statements.supersedeCoveredSystemMixDiarizationJobs.run({
+            sessionId: safeSessionId,
+            trackId: track.id,
+            at: safeAt,
+          });
+          skipped.push({
+            trackId: track.id,
+            reason: "covered_by_exact_application",
+            coverage: coverageBySystemTrack.get(track.id) ?? 0,
+          });
+          continue;
+        }
         const snapshot = this.getDiarizationEvidenceSnapshot({
           sessionId: safeSessionId,
           trackId: track.id,
@@ -3301,12 +3547,32 @@ class JarvisRepository {
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
       return { eligible: false, reason: "session_not_terminal" };
     }
-    const tracks = this.statements.listSessionIdentityResolutionTracks.all(safeSessionId);
+    const candidateTracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
+    const chunks = this.statements.listSessionReadinessChunks.all(safeSessionId);
+    const completedApplicationTrackIds = new Set(
+      this.statements.listSessionIdentityResolutionTracks
+        .all(safeSessionId)
+        .filter((track) => track.track_kind === "application")
+        .map((track) => track.id)
+    );
+    const { preferred, qualifiedApplicationTrackIds } = preferredSpeakerEvidenceTracks(
+      candidateTracks,
+      chunks,
+      { completedApplicationTrackIds }
+    );
+    const tracks = preferred.filter(
+      (track) =>
+        track.track_kind !== "application" ||
+        qualifiedApplicationTrackIds.has(track.id) ||
+        completedApplicationTrackIds.has(track.id)
+    );
     if (tracks.length === 0) return { eligible: false, reason: "no_tracks" };
     const evidenceRuns = [];
     const clusters = [];
     for (const track of tracks) {
-      const primaryTrack = track.track_kind === "mic" || track.track_kind === "system_mix";
+      const primaryTrack = new Set(["mic", "application", "system_mix"]).has(
+        track.track_kind
+      );
       const run = this.statements.getLatestIdentityDiarizationRun.get({
         sessionId: safeSessionId,
         trackId: track.id,
@@ -3605,6 +3871,12 @@ class JarvisRepository {
     }
     if (!Array.isArray(input.clusters) || !Array.isArray(input.turns)) {
       throw new TypeError("diarization clusters and turns must be arrays");
+    }
+    if (
+      normalizedRun.speakerCountMax !== null &&
+      input.clusters.length > normalizedRun.speakerCountMax
+    ) {
+      throw new TypeError("diarization cluster count exceeds the validated speaker count");
     }
     if (input.clusters.length === 0 && input.turns.length > 0) {
       throw new TypeError("diarization turns require clusters");

@@ -68,6 +68,40 @@ test("flags blank markers, punctuation-only output, and repeated three-word hall
     classifyTranscriptQuality("thank you for thank you for thank you for watching").suspicious,
     true
   );
+  assert.equal(
+    classifyTranscriptQuality("卧槽,这把我 我 我 我 我 我 我 我 我 我 出暗面分身").suspicious,
+    false
+  );
+});
+
+test("flags common Whisper boilerplate and invalid replacement characters without censoring speech", () => {
+  assert.deepEqual(classifyTranscriptQuality("Thank you."), {
+    suspicious: true,
+    reasons: ["common_hallucination"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("请不吝点赞、订阅、转发、打赏支持明镜与点点栏目"), {
+    suspicious: true,
+    reasons: ["common_hallucination"],
+  });
+  assert.deepEqual(
+    classifyTranscriptQuality("优优独播剧场——YoYo Television Series Exclusive"),
+    {
+      suspicious: true,
+      reasons: ["common_hallucination"],
+    }
+  );
+  assert.deepEqual(classifyTranscriptQuality("字幕志愿者 杨茜茜"), {
+    suspicious: true,
+    reasons: ["common_hallucination"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("我们继续讨论�这个方案"), {
+    suspicious: true,
+    reasons: ["invalid_character"],
+  });
+  assert.deepEqual(classifyTranscriptQuality("这他妈就是原话，不要给我美化"), {
+    suspicious: false,
+    reasons: [],
+  });
 });
 
 test("exports the approved Jarvis stable and overlap windows", () => {

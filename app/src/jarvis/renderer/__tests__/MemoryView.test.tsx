@@ -6,9 +6,10 @@ import type {
   JarvisSessionDetail,
   JarvisRuntimeStatus,
   JarvisSessionTimeline,
+  JarvisSpeakerClusterView,
   JarvisTranscriptSegment,
 } from "../../types";
-import MemoryView from "../MemoryView";
+import MemoryView, { groupConfirmedSpeakerPeople } from "../MemoryView";
 import { useJarvisStore } from "../jarvisStore";
 
 const session = {
@@ -136,6 +137,60 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+describe("MemoryView speaker people projection", () => {
+  it("shows one person row for multiple confirmed clusters linked to the same person", () => {
+    const base: JarvisSpeakerClusterView = {
+      id: "cluster-self-1",
+      sessionId: session.id,
+      trackId: "mic-track",
+      localLabel: "说话人 1",
+      linkState: "confirmed",
+      person: { id: "self", displayName: "我", isSelf: true },
+      suggestedPerson: null,
+      lastRejectedPerson: null,
+      score: null,
+      margin: null,
+      reason: "user_confirmed",
+      policyId: "hybrid-v2",
+      diarizationRevision: "a".repeat(64),
+      profileRevision: "b".repeat(64),
+      evidenceSegmentIds: ["segment-1"],
+      canUndo: true,
+      updatedAt: 4_000,
+    };
+
+    const groups = groupConfirmedSpeakerPeople([
+      base,
+      {
+        ...base,
+        id: "cluster-self-2",
+        localLabel: "说话人 2",
+        evidenceSegmentIds: ["segment-2"],
+        updatedAt: 5_000,
+      },
+      {
+        ...base,
+        id: "cluster-unknown",
+        localLabel: "说话人 3",
+        linkState: "unknown",
+        person: null,
+      },
+    ]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups[0]).toMatchObject({
+      key: "person:self",
+      clusterCount: 2,
+      localLabels: ["说话人 1", "说话人 2"],
+    });
+    expect(groups[1]).toMatchObject({
+      key: "cluster:cluster-unknown",
+      clusterCount: 1,
+      localLabels: ["说话人 3"],
+    });
+  });
+});
 
 describe("MemoryView processing timeline", () => {
   let poll: (() => void) | null;

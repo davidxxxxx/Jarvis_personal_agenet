@@ -18,6 +18,12 @@ const THIRD_LANGUAGE_FILLERS = new Set([
 ]);
 const UNEXPECTED_SCRIPT =
   /[\p{Script=Cyrillic}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Devanagari}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const INVALID_TRANSCRIPT_CHARACTER = /[\u0000\uFFFD]/u;
+const SHORT_ENGLISH_HALLUCINATION =
+  /^(?:thank\s+you(?:\s+(?:very\s+much|for\s+watching))?|thanks\s+for\s+watching)[\p{P}\p{S}\s]*$/iu;
+const COMMON_MEDIA_HALLUCINATION =
+  /^(?:优优独播剧场(?:[—\-:：\s]*YoYo Television Series Exclusive)?|字幕志愿者(?:\s+\S+){0,4}|明镜需要您的支持(?:\s+欢迎收看订阅明镜)?)[\p{P}\p{S}\s]*$/iu;
+const MEDIA_PROMOTION_TERMS = [/点赞/u, /订阅/u, /转发/u, /打赏/u, /关注/u, /支持.{0,8}栏目/u];
 
 function normalizeText(value) {
   return typeof value === "string" ? value.replace(/\s+/gu, " ").trim() : "";
@@ -59,7 +65,12 @@ function hasRepeatedThreeWordPhrase(words) {
   if (words.length < 9) return false;
   const seen = new Map();
   for (let index = 0; index <= words.length - 3; index += 1) {
-    const phrase = words.slice(index, index + 3).join(" ");
+    const phraseWords = words.slice(index, index + 3);
+    const isSingleCharacterDisfluency =
+      phraseWords.every((word) => word === phraseWords[0]) &&
+      Array.from(phraseWords[0]).length === 1;
+    if (isSingleCharacterDisfluency) continue;
+    const phrase = phraseWords.join(" ");
     const count = (seen.get(phrase) || 0) + 1;
     if (count >= 3) return true;
     seen.set(phrase, count);
@@ -67,11 +78,20 @@ function hasRepeatedThreeWordPhrase(words) {
   return false;
 }
 
+function isCommonHallucination(text) {
+  if (SHORT_ENGLISH_HALLUCINATION.test(text)) return true;
+  if (COMMON_MEDIA_HALLUCINATION.test(text)) return true;
+  if (Array.from(text).length > 100) return false;
+  return MEDIA_PROMOTION_TERMS.filter((pattern) => pattern.test(text)).length >= 3;
+}
+
 function classifyTranscriptQuality(value) {
   const text = normalizeText(value);
   const reasons = [];
   if (!text || BLANK_MARKER.test(text)) reasons.push("blank_marker");
   if (text && !/[\p{L}\p{N}]/u.test(text)) reasons.push("no_lexical_content");
+  if (INVALID_TRANSCRIPT_CHARACTER.test(text)) reasons.push("invalid_character");
+  if (isCommonHallucination(text)) reasons.push("common_hallucination");
 
   const words = text
     .toLocaleLowerCase()

@@ -20,6 +20,7 @@ const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
   createCommittedAudioPreviewExecutor,
+  shouldEnableOverlapSeparation,
 } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 
 function deferred() {
@@ -45,6 +46,23 @@ function configurableService(service) {
     },
   });
 }
+
+test("high-memory overlap separation is limited to microphone and communication tracks", () => {
+  assert.equal(shouldEnableOverlapSeparation({ source_type: "mic" }), true);
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "kook" }),
+    true
+  );
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "tencent_meeting" }),
+    true
+  );
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "dota2" }),
+    false
+  );
+  assert.equal(shouldEnableOverlapSeparation({ source_type: "system", application_key: null }), false);
+});
 
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
   const componentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-runtime-cuda-"));

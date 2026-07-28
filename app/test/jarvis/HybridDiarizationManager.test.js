@@ -85,6 +85,48 @@ test("hybrid manager exposes consensus and sends only final work through CUDA", 
   assert.equal(manager.status().unloadDelayMs, 300_000);
 });
 
+test("hybrid manager can disable the high-memory overlap separator per track", async () => {
+  let requestPayload = null;
+  const manager = new HybridDiarizationManager({
+    packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+    runtime: {
+      async run(operation) {
+        return operation({
+          request: async (_command, payload) => {
+            requestPayload = payload;
+            return {
+              durationMs: 10_000,
+              turns: [{ speaker: "S1", startMs: 0, endMs: 10_000 }],
+              verifierCount: 1,
+              overlapSeparation: {
+                state: "not_needed",
+                processed: 0,
+                total: 0,
+                reason: "policy_disabled",
+              },
+            };
+          },
+        });
+      },
+      status() {
+        return { loaded: true, loading: false, active: 0, unloadScheduled: true };
+      },
+      async dispose() {},
+    },
+    fsImpl: { existsSync: () => true },
+  });
+
+  const turns = await manager.diarizeStrict("G:\\recording.wav", {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+    enableOverlapSeparation: false,
+    releaseHighMemoryResources: true,
+  });
+
+  assert.equal(requestPayload.enableOverlapSeparation, false);
+  assert.equal(requestPayload.releaseOverlapSeparatorAfterRequest, true);
+  assert.equal(turns.metadata.overlapSeparation.reason, "policy_disabled");
+});
+
 test("hybrid manager rejects malformed sidecar turns before persistence", async () => {
   const manager = new HybridDiarizationManager({
     packRoot: "G:\\JarvisData\\models\\ai-model-pack",

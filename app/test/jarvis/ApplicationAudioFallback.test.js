@@ -103,6 +103,15 @@ test("silent application capture is released and later probed without growing ti
 
   now += 600;
   await pool.sweep();
+  assert.equal(pool.getStatus().activeTracks.length, 0);
+  await watcherCallbacks.onSession({
+    state: "active",
+    pid: 601,
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    peak: 0.25,
+  });
+  await pool.waitForIdle();
   assert.equal(pool.getStatus().activeTracks[0].captureGeneration, 2);
   assert.equal(intervalCount, 1);
   await pool.stop();

@@ -76,6 +76,36 @@ test("persists the selected capture mode on session creation", (t) => {
   assert.equal(repo.getSession("dual-session").capture_mode, "dual");
 });
 
+test("incomplete active summaries expose an explicit paid refresh recommendation", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "incremental-summary-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "mic",
+  });
+  repo.db
+    .prepare(
+      `INSERT INTO session_summary_revisions (
+         id, session_id, revision, previous_revision_id, completeness, lifecycle,
+         content_json, source_analysis_input_id, provenance, created_at
+       ) VALUES (
+         'summary-incremental', 'incremental-summary-session', 1, NULL,
+         'incremental', 'active', ?, NULL, 'evidence_linked', 2_000
+       )`
+    )
+    .run(JSON.stringify({ title: "Partial", summary: "Only part of the session was covered." }));
+
+  assert.deepEqual(repo.getSessionSpeakerProcessing("incremental-summary-session").summaryRefresh, {
+    basis_policy_id: null,
+    latest_policy_id: "jarvis-session-diarization-v1",
+    recommended: 1,
+    reason: "summary_incomplete",
+    updated_at: 2_000,
+  });
+});
+
 test("session timeline returns deterministic source evidence, visible text, and job counts", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -853,6 +883,9 @@ test("schema initialization is idempotent and file databases use WAL", () => {
     const second = new JarvisRepository(dbPath);
     assert.equal(second.getSession("s1").language, "zh");
     assert.equal(second.db.pragma("journal_mode", { simple: true }), "wal");
+    assert.equal(second.db.pragma("synchronous", { simple: true }), 2);
+    assert.equal(second.db.pragma("busy_timeout", { simple: true }), 5_000);
+    assert.equal(second.db.pragma("wal_autocheckpoint", { simple: true }), 1_000);
     assert.equal(second.db.pragma("foreign_keys", { simple: true }), 1);
     second.close();
   } finally {

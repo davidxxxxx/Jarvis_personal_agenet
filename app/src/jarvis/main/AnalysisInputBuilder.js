@@ -2,7 +2,11 @@ const crypto = require("node:crypto");
 
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
 const REDACTION_VERSION = "jarvis-redaction-v1";
-const DEFAULT_MAX_PAYLOAD_BYTES = 96 * 1024;
+// MiniMax M2.7 supports a 204,800-token combined context. A 384 KiB UTF-8
+// transcript envelope leaves ample room for the system prompt, tool schema,
+// reasoning, and response while allowing typical multi-hour sessions to carry
+// every attributable segment instead of degrading to timeline sampling.
+const DEFAULT_MAX_PAYLOAD_BYTES = 384 * 1024;
 const HIERARCHICAL_WINDOW_MS = 20 * 60_000;
 const LABEL_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
 

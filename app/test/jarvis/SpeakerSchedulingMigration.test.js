@@ -70,9 +70,9 @@ test("v37 retires short application diarization and prioritizes continuous track
       )
       .all(),
     [
-      { id: "long-job-v37", state: "pending", priority: 40, error_code: null, completed_at: null },
-      { id: "mic-job-v37", state: "pending", priority: 35, error_code: null, completed_at: null },
-      { id: "mix-job-v37", state: "pending", priority: 36, error_code: null, completed_at: null },
+      { id: "long-job-v37", state: "pending", priority: 35, error_code: null, completed_at: null },
+      { id: "mic-job-v37", state: "pending", priority: 34, error_code: null, completed_at: null },
+      { id: "mix-job-v37", state: "pending", priority: 45, error_code: null, completed_at: null },
       {
         id: "short-job-v37",
         state: "superseded",
@@ -166,7 +166,7 @@ test("v39 retires medium application fragments and wakes primary speaker work", 
       {
         id: "mic-job-v39",
         state: "pending",
-        priority: 35,
+        priority: 34,
         next_retry_at: null,
         error_code: null,
         blocked_reason: null,
@@ -175,7 +175,7 @@ test("v39 retires medium application fragments and wakes primary speaker work", 
       {
         id: "mix-job-v39",
         state: "pending",
-        priority: 36,
+        priority: 45,
         next_retry_at: null,
         error_code: null,
         blocked_reason: null,
@@ -255,7 +255,7 @@ test("v40 retires sub-minute application fragments and prioritizes identity comp
       {
         id: "long-job-v40",
         state: "pending",
-        priority: 40,
+        priority: 35,
         error_code: null,
         lease_owner: null,
         execution_device: null,
@@ -264,7 +264,7 @@ test("v40 retires sub-minute application fragments and prioritizes identity comp
       {
         id: "mix-job-v40",
         state: "pending",
-        priority: 36,
+        priority: 45,
         error_code: null,
         lease_owner: null,
         execution_device: null,
@@ -278,6 +278,80 @@ test("v40 retires sub-minute application fragments and prioritizes identity comp
         lease_owner: null,
         execution_device: null,
         completed_at: 34_567,
+      },
+    ]
+  );
+});
+
+test("v44 wakes only recoverable speaker work and preserves deterministic failures", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const db = repository.db;
+  db.exec(`
+    INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+    VALUES ('session-v44', 1000, 70000, 'completed', 1000);
+
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state
+    ) VALUES
+      ('app-v44', 'session-v44', 'system', 'tencent-meeting', '腾讯会议',
+       1, 24000, 1, 1000, 70000, 'ended'),
+      ('mix-v44', 'session-v44', 'system', NULL, NULL,
+       0, 24000, 1, 1000, 70000, 'ended'),
+      ('bad-v44', 'session-v44', 'system', 'chrome', 'Chrome',
+       1, 24000, 1, 1000, 70000, 'ended');
+
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at, next_retry_at,
+      error_code, blocked_reason
+    ) VALUES
+      ('app-job-v44', 'session-v44', 'app-v44', 'diarize_track', 'retry', 40,
+       '${"d".repeat(64)}', 3, 'hybrid', 9000, 99999, NULL, 'recovery_hysteresis'),
+      ('mix-job-v44', 'session-v44', 'mix-v44', 'diarize_track', 'blocked', 36,
+       '${"e".repeat(64)}', 3, 'hybrid', 9000, NULL, 'CUDA_UNAVAILABLE', 'cuda_unavailable'),
+      ('bad-job-v44', 'session-v44', 'bad-v44', 'diarize_track', 'blocked', 40,
+       '${"f".repeat(64)}', 3, 'hybrid', 9000, NULL,
+       'DIARIZATION_VALIDATION_FAILED', 'deterministic_failure');
+  `);
+  db.pragma("user_version = 43");
+
+  assert.deepEqual(applyJarvisMigrations(db, { now: () => 45_678 }), {
+    fromVersion: 43,
+    toVersion: TARGET_VERSION,
+  });
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT id, state, priority, next_retry_at, error_code, blocked_reason
+         FROM processing_jobs WHERE job_type = 'diarize_track' ORDER BY id`
+      )
+      .all(),
+    [
+      {
+        id: "app-job-v44",
+        state: "pending",
+        priority: 35,
+        next_retry_at: null,
+        error_code: null,
+        blocked_reason: null,
+      },
+      {
+        id: "bad-job-v44",
+        state: "blocked",
+        priority: 35,
+        next_retry_at: null,
+        error_code: "DIARIZATION_VALIDATION_FAILED",
+        blocked_reason: "deterministic_failure",
+      },
+      {
+        id: "mix-job-v44",
+        state: "pending",
+        priority: 45,
+        next_retry_at: null,
+        error_code: null,
+        blocked_reason: null,
       },
     ]
   );

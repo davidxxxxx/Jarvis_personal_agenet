@@ -28,7 +28,7 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1_000;
 // Windows antivirus and concurrent test workers can make that legitimate I/O exceed
 // the old 20-second unit-scale deadline without indicating a deadlock.
 const OPERATION_TIMEOUT_MS = 60_000;
-const TEST_TIMEOUT_MS = 180_000;
+const TEST_TIMEOUT_MS = 240_000;
 
 const pcmCache = new Map();
 

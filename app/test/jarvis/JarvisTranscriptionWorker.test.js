@@ -9,6 +9,24 @@ const MODEL_VERSION = "large-v3-turbo";
 const INPUT_VERSION = 1;
 const COMPLETED_AT = 500_000;
 
+function silentPcm16Wav({ sampleRate = 16_000, sampleCount = 1_600 } = {}) {
+  const wav = Buffer.alloc(44 + sampleCount * 2);
+  wav.write("RIFF", 0, "ascii");
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write("WAVE", 8, "ascii");
+  wav.write("fmt ", 12, "ascii");
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36, "ascii");
+  wav.writeUInt32LE(sampleCount * 2, 40);
+  return wav;
+}
+
 function transcriptionJob(chunkId = "chunk-1", overrides = {}) {
   return {
     chunk_id: chunkId,
@@ -488,6 +506,7 @@ test("the IPC adapter keeps verified WAV bytes local and uses auto language", as
         model: MODEL_VERSION,
         language: null,
         initialPrompt: "中英 context",
+        vadEnabled: true,
       },
     },
   ]);
@@ -552,6 +571,161 @@ test("the IPC adapter locally retries suspicious scripts with Chinese as the pri
   assert.equal(calls[1].requireCuda, true);
 });
 
+test("the IPC adapter retries common Whisper boilerplate instead of accepting it as speech", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return options.language === "zh"
+          ? { success: true, text: "我们继续讨论这个方案", executionDevice: "cuda" }
+          : { success: true, text: "Thank you.", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => Buffer.from("verified-local-wav"),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      initialPrompt: "中英 context",
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "我们继续讨论这个方案", executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].language, "zh");
+});
+
+test("the IPC adapter does not persist identical boilerplate from effectively silent audio", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return { success: true, text: "Thank you.", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => silentPcm16Wav(),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "", noSpeech: true, executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].vadEnabled, true);
+  assert.equal(calls[1].vadEnabled, true);
+});
+
+test("the IPC adapter records punctuation-only Whisper output as no speech", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper() {
+        return { success: true, text: "... ...", executionDevice: "cpu" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => silentPcm16Wav(),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      executionContext: { action: "run_cpu", device: "cpu" },
+    }),
+    { success: true, text: "", noSpeech: true, executionDevice: "cpu" }
+  );
+});
+
 test("the IPC adapter maps CPU admission to explicit bounded Whisper options", async () => {
   const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
   const originalLoad = Module._load;
@@ -612,6 +786,7 @@ test("the IPC adapter maps CPU admission to explicit bounded Whisper options", a
       gpuUuid: null,
       threads: 4,
       lowPriority: true,
+      vadEnabled: true,
     },
   ]);
 });

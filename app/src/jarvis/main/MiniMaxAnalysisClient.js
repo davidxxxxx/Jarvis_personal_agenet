@@ -8,7 +8,7 @@ const {
 
 const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
-const DEFAULT_MAX_REQUEST_BYTES = 128 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = 512 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
 const DEFAULT_TIMEOUT_MS = 240_000;
 const OFFICIAL_HOSTS = new Set(["api.minimaxi.com", "api.minimax.io"]);

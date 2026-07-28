@@ -5318,6 +5318,63 @@ test("analysis input excludes short fragmented anonymous speakers from cloud sum
   }
 });
 
+test("analysis input ignores clusters that are absent from the latest diarization run", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 30000,
+          window_count = 10, quality_score = 0.99
+      WHERE id = 'cluster-other';
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-current', 'session-1', 'track-omitted', 'speaker_current',
+        'speaker-v2', NULL, 18000, 6, 0.94, NULL, 'unknown', 5600, 5600
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-current', 'segment-omitted');
+      INSERT INTO speaker_diarization_runs (
+        id, session_id, track_id, transcript_revision, policy_id, diarizer_model_id,
+        embedding_model_id, model_artifact_sha256, embedding_dimension, sample_rate,
+        input_version, execution_device, commit_sequence, created_at, completed_at
+      ) VALUES
+        ('run-stale', 'session-1', 'track-omitted', '${HASH_A}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_B}',
+         512, 16000, 1, 'cpu', 1, 5500, 5500),
+        ('run-current', 'session-1', 'track-omitted', '${HASH_B}',
+         'jarvis-session-diarization-v2', 'diarizer', 'speaker-v2', '${HASH_C}',
+         512, 16000, 2, 'cuda', 2, 5600, 5600);
+      INSERT INTO speaker_diarization_run_clusters (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      ) VALUES
+        ('run-stale', 'cluster-other', 'P1', zeroblob(2048), 30000, 10, 0.99, 5000),
+        ('run-current', 'cluster-current', 'speaker_current',
+         zeroblob(2048), 18000, 6, 0.94, 5000);
+    `);
+
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-omitted"] })
+    );
+
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [
+        { label: "SELF", subjectId: "person-self" },
+        { label: "P1", subjectId: "cluster-current" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("analysis input merges durable anonymous speakers across tracks by local dual-model reference", () => {
   const db = createFixture();
   try {
@@ -5424,6 +5481,118 @@ test("analysis input merges durable anonymous speakers across tracks by local du
         { label: "SELF", subjectKind: "person", subjectId: "person-self" },
         { label: "P1", subjectKind: "speaker_cluster", subjectId: "cluster-other" },
       ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input collapses exact application track churn by application and local speaker", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE audio_tracks
+      SET application_key = 'kook', application_display_name = 'KOOK'
+      WHERE id = 'track-omitted';
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET local_label = 'speaker_1', person_id = NULL, link_state = 'unknown',
+          speech_ms = 12000, window_count = 4, quality_score = 0.9
+      WHERE id = 'cluster-other';
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, ended_at, state,
+        application_key, application_display_name, capture_generation
+      ) VALUES (
+        'track-kook-peer', 'session-1', 'system', 24000, 1, 5200, 5400, 'stopped',
+        'kook', 'KOOK', 1
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-kook-peer', 'session-1', 'kook-peer.wav', 5200, 5400, 200,
+        '${"f".repeat(64)}', 9500, 'completed', 'track-kook-peer', 'system', 0, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-kook-peer', 'session-1', 5200, 5400, NULL, 'speaker_1',
+        'same application speaker after track restart', 0.9, 1, 'pending',
+        'track-kook-peer', 'chunk-kook-peer', 'system', 'final', 1, 'whisper-v1', 5400
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-kook-peer', 'session-1', 'track-kook-peer', 'speaker_1',
+        'speaker-v1', NULL, 14000, 5, 0.91, NULL, 'unknown', 5200, 5400
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-kook-peer', 'segment-kook-peer');
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({
+        segmentIds: ["segment-1", "segment-omitted", "segment-kook-peer"],
+      })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ segmentId, speakerBindingLabel }) => ({
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+        { segmentId: "segment-kook-peer", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectKind, subjectId }) => ({
+        label,
+        subjectKind,
+        subjectId,
+      })),
+      [
+        { label: "SELF", subjectKind: "person", subjectId: "person-self" },
+        { label: "P1", subjectKind: "speaker_cluster", subjectId: "cluster-other" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input excludes virtual audio infrastructure duplicates", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE audio_tracks
+      SET application_key = 'audiodg',
+          application_display_name = 'Windows Audio Device Graph Isolation'
+      WHERE id = 'track-omitted';
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 12000,
+          window_count = 4, quality_score = 0.9
+      WHERE id = 'cluster-other';
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-omitted"] })
+    );
+
+    assert.deepEqual(prepared.segmentIds, ["segment-1"]);
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [{ label: "SELF", subjectId: "person-self" }]
     );
   } finally {
     db.close();
@@ -6088,6 +6257,73 @@ test("daily digest candidate CAS failure rolls back revision evidence and prior 
         .get().count,
       1
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest watermark stays stable while same-type upstream jobs drain", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "stable-pending-watermark");
+    appendDailyDigestSegment(db, context, "stable-pending-watermark-extra");
+    const insertJob = db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, chunk_id, job_type, state, priority,
+         input_hash, input_version, model_version, attempt_count, lane, created_at
+       ) VALUES (?, ?, ?, ?, 'compress_chunk', 'pending', 60, ?, 1,
+         'ffmpeg-flac-v1', 0, 'local', ?)`
+    );
+    insertJob.run(
+      "digest-pending-job-one",
+      context.sessionId,
+      context.trackId,
+      context.chunkId,
+      HASH_A,
+      8_000
+    );
+    insertJob.run(
+      "digest-pending-job-two",
+      context.sessionId,
+      context.trackId,
+      "digest-chunk-stable-pending-watermark-extra",
+      HASH_B,
+      8_001
+    );
+
+    const first = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(first.completeness, "partial");
+    assert.equal(first.inputWatermark.schemaVersion, "jarvis-daily-digest-watermark-v2");
+    assert.deepEqual(first.inputWatermark.pendingUpstreamJobs, [
+      {
+        sessionRef: first.inputWatermark.sessionStates[0].sessionRef,
+        jobType: "compress_chunk",
+      },
+    ]);
+
+    db.prepare("DELETE FROM processing_jobs WHERE id = ?").run("digest-pending-job-one");
+    const whileDraining = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(whileDraining.status, "existing");
+    assert.equal(whileDraining.digestInputId, first.digestInputId);
+
+    db.prepare("DELETE FROM processing_jobs WHERE id = ?").run("digest-pending-job-two");
+    const drained = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(drained.status, "created");
+    assert.notEqual(drained.digestInputId, first.digestInputId);
+    assert.equal(drained.completeness, "final");
+    assert.deepEqual(drained.inputWatermark.pendingUpstreamJobs, []);
   } finally {
     db.close();
   }

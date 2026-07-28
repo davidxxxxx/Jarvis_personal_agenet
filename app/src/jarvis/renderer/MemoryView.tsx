@@ -6,6 +6,7 @@ import type {
   JarvisSession,
   JarvisSessionDetail,
   JarvisSessionTimeline,
+  JarvisSpeakerClusterView,
 } from "../types";
 import { useJarvisStore } from "./jarvisStore";
 import ContinuousSessionPlayer from "./ContinuousSessionPlayer";
@@ -30,6 +31,50 @@ function dateLabel(at: number): string {
 
 function speakerCountLabel(minimum: number, maximum: number): string {
   return minimum === maximum ? `${minimum} 人` : `${minimum}–${maximum} 人`;
+}
+
+export interface JarvisVisibleSpeakerGroup {
+  key: string;
+  representative: JarvisSpeakerClusterView;
+  clusterCount: number;
+  localLabels: string[];
+}
+
+export function groupConfirmedSpeakerPeople(
+  clusters: JarvisSpeakerClusterView[]
+): JarvisVisibleSpeakerGroup[] {
+  const groups: JarvisVisibleSpeakerGroup[] = [];
+  const groupIndexByKey = new Map<string, number>();
+
+  for (const cluster of clusters) {
+    const personId =
+      cluster.linkState === "confirmed" && cluster.person?.id ? cluster.person.id : null;
+    const key = personId ? `person:${personId}` : `cluster:${cluster.id}`;
+    const existingIndex = groupIndexByKey.get(key);
+    if (existingIndex === undefined) {
+      groupIndexByKey.set(key, groups.length);
+      groups.push({
+        key,
+        representative: cluster,
+        clusterCount: 1,
+        localLabels: [cluster.localLabel],
+      });
+      continue;
+    }
+
+    const existing = groups[existingIndex];
+    groups[existingIndex] = {
+      ...existing,
+      representative:
+        cluster.updatedAt > existing.representative.updatedAt
+          ? cluster
+          : existing.representative,
+      clusterCount: existing.clusterCount + 1,
+      localLabels: [...existing.localLabels, cluster.localLabel],
+    };
+  }
+
+  return groups;
 }
 
 function safeStringArray(value: string | null | undefined): string[] {
@@ -491,6 +536,7 @@ export default function MemoryView() {
     const visibleSpeakers = (speakerProcessing?.speakers ?? []).map(
       (cluster) => storedClusterUpdates.get(cluster.id) ?? cluster
     );
+    const visibleSpeakerGroups = groupConfirmedSpeakerPeople(visibleSpeakers);
     const sessionStatusLabel =
       detail.session.status === "completed" && !summaryInputReady
         ? "录音已完成 · 后台处理中"
@@ -633,25 +679,33 @@ export default function MemoryView() {
                 </span>
               )}
             </div>
-            {visibleSpeakers.length > 0 ? (
+            {visibleSpeakerGroups.length > 0 ? (
               <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                {visibleSpeakers.map((cluster) => (
+                {visibleSpeakerGroups.map((group) => {
+                  const cluster = group.representative;
+                  return (
                   <div
-                    key={cluster.id}
+                    key={group.key}
                     className="flex items-center justify-between gap-3 rounded-lg bg-muted/30 px-3 py-2.5"
                   >
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="text-xs font-medium text-muted-foreground">
-                          {cluster.localLabel}
+                          {group.clusterCount > 1
+                            ? `${group.localLabels.slice(0, 2).join(" · ")} · ${group.clusterCount} 个声纹簇`
+                            : cluster.localLabel}
                         </span>
                         <SpeakerChip cluster={cluster} localLabel={cluster.localLabel} />
                       </div>
                       <p className="mt-1 truncate text-xs text-muted-foreground">
                         {cluster.person?.isSelf
-                          ? "本人声纹已确认"
+                          ? group.clusterCount > 1
+                            ? `本人声纹已确认 · 已合并 ${group.clusterCount} 个声纹簇`
+                            : "本人声纹已确认"
                           : cluster.linkState === "confirmed"
-                            ? "已加入长期人物档案"
+                            ? group.clusterCount > 1
+                              ? `已加入长期人物档案 · 已合并 ${group.clusterCount} 个声纹簇`
+                              : "已加入长期人物档案"
                             : cluster.suggestedPerson
                               ? `可能是 ${cluster.suggestedPerson.displayName}`
                               : "点击标签可指定姓名并选择是否长期学习"}
@@ -663,7 +717,8 @@ export default function MemoryView() {
                       </span>
                     )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <p className="mt-4 rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground">
@@ -695,8 +750,9 @@ export default function MemoryView() {
             </div>
             {speakerProcessing?.summaryRefresh?.recommended === 1 && (
               <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-                高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax
-                重新总结。
+                {speakerProcessing.summaryRefresh.reason === "summary_incomplete"
+                  ? "本次长录音的旧总结只覆盖了部分转写。原总结已保留；只有点击上方按钮才会按完整多窗口转写调用 MiniMax 重新总结。"
+                  : "高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax 重新总结。"}
               </p>
             )}
             <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">

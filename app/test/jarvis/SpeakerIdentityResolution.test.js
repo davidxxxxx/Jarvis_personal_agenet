@@ -451,6 +451,39 @@ test("v22 persists revisioned identity resolution history", (t) => {
   );
 });
 
+test("v46 repairs confirmed speaker projections created before system resolution synced transcripts", (t) => {
+  const repository = fixture(t);
+  assert.equal(TARGET_VERSION, 46);
+  repository.renamePerson({ personId: "person-a", displayName: "Person A" });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version
+    ) VALUES (
+      'segment-v45', 'session-resolution', 1000, 4000, 'speaker_1',
+      'legacy projection evidence', 0.9, 1, 'track-resolution', 'mic',
+      'provisional', 1
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-v45');
+    UPDATE speaker_clusters
+    SET person_id = 'person-a', link_state = 'confirmed'
+    WHERE id = 'cluster-resolution';
+    PRAGMA user_version = 45;
+  `);
+
+  assert.deepEqual(applyJarvisMigrations(repository.db), {
+    fromVersion: 45,
+    toVersion: TARGET_VERSION,
+  });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-v45"),
+    { person_id: "person-a", speaker_label: "Person A" }
+  );
+});
+
 test("v21 upgrades in place to the v22 identity resolution schema", () => {
   const db = new Database(":memory:");
   try {
@@ -725,6 +758,18 @@ test("resolution provenance and projection survive repository restart", (t) => {
 test("system resolution persists provenance without learning and protects user corrections", (t) => {
   const repository = fixture(t);
   addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version, model_version, completed_at
+    ) VALUES (
+      'segment-resolution', 'session-resolution', 1000, 4000, 'speaker_1',
+      'identity projection evidence', 0.9, 1, 'track-resolution', 'mic',
+      'provisional', 1, NULL, NULL
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-resolution');
+  `);
   const revisions = {
     diarizationRevision: "a".repeat(64),
     profileRevision: "b".repeat(64),
@@ -752,6 +797,12 @@ test("system resolution persists provenance without learning and protects user c
       .get(),
     { person_id: "person-a", link_state: "confirmed", match_score: 0.9, match_margin: 0.2 }
   );
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-resolution"),
+    { person_id: "person-a", speaker_label: "person-a" }
+  );
   assert.equal(
     repository.db.prepare("SELECT count(*) AS count FROM voice_profile_samples").get().count,
     beforeSamples
@@ -778,6 +829,49 @@ test("system resolution persists provenance without learning and protects user c
   assert.equal(protectedResult.projectionApplied, false);
   assert.equal(protectedResult.reason, "no_candidate");
   assert.equal(repository.getSpeakerCluster("cluster-resolution").linkState, "confirmed");
+});
+
+test("system suggestions remain candidate-only and do not project a person into transcripts", (t) => {
+  const repository = fixture(t);
+  addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version
+    ) VALUES (
+      'segment-suggested', 'session-resolution', 1000, 4000, 'speaker_1',
+      'suggestion evidence', 0.9, 1, 'track-resolution', 'mic', 'provisional', 1
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-suggested');
+  `);
+
+  repository.applySystemSpeakerResolution({
+    evidenceRunId: "run-resolution",
+    clusterId: "cluster-resolution",
+    candidatePersonId: "person-a",
+    state: "suggested",
+    score: 0.78,
+    margin: 0.1,
+    reason: "suggested",
+    diarizationRevision: "e".repeat(64),
+    profileRevision: "f".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    at: 20_000,
+  });
+
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, link_state FROM speaker_clusters WHERE id = ?")
+      .get("cluster-resolution"),
+    { person_id: "person-a", link_state: "suggested" }
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-suggested"),
+    { person_id: null, speaker_label: "speaker_1" }
+  );
 });
 
 test("same-revision user rejection is durable and exact-revision scoped", (t) => {
@@ -1813,7 +1907,7 @@ test("ready snapshot uses per-run evidence and enqueue identity is strict and id
   const repeated = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 });
   assert.equal(queued.enqueued, 1);
   assert.equal(repeated.enqueued, 0);
-  assert.equal(queued.job.priority, 37);
+  assert.equal(queued.job.priority, 29);
   assert.equal(
     queued.job.input_hash,
     buildIdentityResolutionJobKey({
@@ -2164,6 +2258,31 @@ test("session phase always attempts resolution enqueue after diarization schedul
     `resolve:${HYBRID_DIARIZATION_POLICY.policyId}`,
     `refresh:${HYBRID_DIARIZATION_POLICY.policyId}`,
   ]);
+});
+
+test("session phase schedules completed-track diarization before every track transcript is ready", async () => {
+  const { JarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
+  const calls = [];
+  const repository = {
+    listProcessingSessions: () => [],
+    isSessionReadyForPostProcessing: () => false,
+    markSessionProcessing: () => calls.push("mark"),
+    enqueueDiarizationJobs: () => calls.push("diarize"),
+    enqueueSpeakerIdentityResolutionJob: () => calls.push("resolve"),
+    refreshSessionReadiness: () => calls.push("refresh"),
+  };
+  const runtime = new JarvisProcessingRuntime({
+    runner: { runOnce: async () => 0, recoverExpiredLeases: () => 0 },
+    repository,
+    reconciler: { reconcileSession: async () => calls.push("reconcile") },
+    deduper: { dedupe: async () => calls.push("dedupe") },
+    now: () => 100,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+
+  await runtime._runSessionPhase([{ id: "session-partial", ended_at: 100 }], 0, 1, new Set());
+
+  assert.deepEqual(calls, ["mark", "diarize"]);
 });
 
 test("identity resolution can enqueue from the selected hybrid diarization policy", (t) => {

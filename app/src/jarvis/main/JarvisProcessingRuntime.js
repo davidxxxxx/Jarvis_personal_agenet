@@ -30,6 +30,26 @@ const DEFAULT_ANALYSIS_RECOVERY_LIMIT = 25;
 const DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS = 30_000;
 const PREVIEW_CONTEXT_ROW_LIMIT = 16;
 const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
+const OVERLAP_SEPARATION_APPLICATION_KEYS = new Set([
+  "discord",
+  "kook",
+  "qq",
+  "skype",
+  "teams",
+  "telegram",
+  "tencent_meeting",
+  "wechat",
+  "wecom",
+  "zoom",
+]);
+
+function shouldEnableOverlapSeparation(track) {
+  if (track?.source_type === "mic") return true;
+  return (
+    typeof track?.application_key === "string" &&
+    OVERLAP_SEPARATION_APPLICATION_KEYS.has(track.application_key)
+  );
+}
 
 function positiveSafeInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) {
@@ -567,6 +587,11 @@ class JarvisProcessingRuntime {
       try {
         if (!this.repository.isSessionReadyForPostProcessing(session.id)) {
           this.repository.markSessionProcessing?.(session.id);
+          this.repository.enqueueDiarizationJobs?.(session.id, {
+            at: this.now(),
+            policy: this.diarizationPolicy,
+            speakerProcessingPolicy: this.speakerProcessingPolicy,
+          });
           continue;
         }
         this.repository.markSessionProcessing?.(session.id);
@@ -885,8 +910,17 @@ function createJarvisProcessingRuntime({
       ? new SessionDiarizationWorker({
           repository,
           audioEvidenceReader: service.audioEvidenceReader,
-          diarizeAudio: ({ wavPath, executionContext }) =>
-            diarizationManager.diarizeStrict(wavPath, { executionContext }),
+          diarizeAudio: ({
+            wavPath,
+            executionContext,
+            track,
+            releaseHighMemoryResources,
+          }) =>
+            diarizationManager.diarizeStrict(wavPath, {
+              executionContext,
+              enableOverlapSeparation: shouldEnableOverlapSeparation(track),
+              releaseHighMemoryResources,
+            }),
           embedWindow: ({ wavPath, turn }) =>
             speakerEmbeddingHelper.extractEmbedding(
               wavPath,
@@ -1142,4 +1176,5 @@ module.exports = {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
   createCommittedAudioPreviewExecutor,
+  shouldEnableOverlapSeparation,
 };

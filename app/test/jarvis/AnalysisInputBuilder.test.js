@@ -96,6 +96,48 @@ test("builds a deterministic chronological payload with local-only bindings", ()
   assert.equal(first.local.nextCursor, 2);
 });
 
+test("default hierarchical budget keeps a representative multi-hour session complete", () => {
+  const segments = Array.from({ length: 581 }, (_value, index) => ({
+    ordinal: index,
+    segmentId: `seg-${String(index).padStart(4, "0")}`,
+    segmentVersion: 1,
+    textHash: "d".repeat(64),
+    textSnapshot: `window ${index} 中英 mixed transcript ${"context ".repeat(18)}`,
+    resultKind: "final",
+    isStable: true,
+    isCurrent: true,
+    supersededBy: null,
+    duplicateOf: null,
+    startedAt: index * 10_000,
+    endedAt: index * 10_000 + 5_000,
+    speakerBindingLabel: "SELF",
+  }));
+  const result = new AnalysisInputBuilder().build(
+    prepared({
+      segments,
+      speakerBindings: [
+        {
+          label: "SELF",
+          subjectKind: "person",
+          subjectId: "person-private-self",
+          subjectDisplayNameSnapshot: "Local Self",
+        },
+      ],
+      redactionTerms: {
+        participants: [{ label: "SELF", names: ["Local Self"] }],
+        otherPeople: [],
+        deviceLabels: [],
+      },
+    }),
+    { strategy: "hierarchical" }
+  );
+
+  assert.ok(result.local.inputBytes > 96 * 1024);
+  assert.equal(result.local.complete, true);
+  assert.equal(result.local.selectedSegmentIds.length, segments.length);
+  assert.deepEqual(result.cloudPayload.omittedRanges, []);
+});
+
 test("redacts local names devices credentials and absolute paths in the outbound copy", () => {
   const subscriptionShape = ["sk", "cp", "unitsecretvalue123"].join("-");
   const jwt = ["headerheader", "payloadpayload", "signaturesignature"].join(".");

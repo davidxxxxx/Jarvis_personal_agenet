@@ -507,7 +507,7 @@ class SessionDiarizationWorker {
           }
         : entry
     );
-    for (const chunk of admittedChunks) {
+    for (const [chunkIndex, chunk] of admittedChunks.entries()) {
       await renewLease();
       await checkResources();
       if (
@@ -522,12 +522,14 @@ class SessionDiarizationWorker {
         chunk,
         async (wavPath) => {
           await renewLease();
-          const rawTurns = await this.diarizeAudio({
-            wavPath,
-            chunk,
-            policy: this.policy,
-            executionContext: context,
-          });
+           const rawTurns = await this.diarizeAudio({
+             wavPath,
+             chunk,
+             track: snapshot.track,
+             policy: this.policy,
+             executionContext: context,
+             releaseHighMemoryResources: chunkIndex === admittedChunks.length - 1,
+           });
           await renewLease();
           await checkResources();
           if (!Array.isArray(rawTurns)) throw codedError("DIARIZATION_INVALID_TURN");
@@ -705,9 +707,26 @@ class SessionDiarizationWorker {
     );
     const filterLongSessionFragments =
       this.policy.inputVersion === 2 && trackEvidenceMs >= LONG_SESSION_SPEAKER_EVIDENCE_MS;
-    const finalSpeakerCount = filterLongSessionFragments
-      ? speakerCandidates.durable
-      : clusters.length;
+    const durableClusterIds = new Set(
+      clusters
+        .filter(
+          (cluster) =>
+            cluster.centroid instanceof Float32Array &&
+            cluster.speechMs >= DURABLE_SPEAKER_MIN_SPEECH_MS &&
+            cluster.windowCount >= DURABLE_SPEAKER_MIN_WINDOWS
+        )
+        .map((cluster) => cluster.id)
+    );
+    const committedClusters = filterLongSessionFragments
+      ? clusters.filter((cluster) => durableClusterIds.has(cluster.id))
+      : clusters;
+    const committedTurns = filterLongSessionFragments
+      ? turns.filter((turn) => durableClusterIds.has(turn.clusterId))
+      : turns;
+    const committedSegmentLinks = filterLongSessionFragments
+      ? [...segmentLinks.values()].filter((link) => durableClusterIds.has(link.clusterId))
+      : [...segmentLinks.values()];
+    const finalSpeakerCount = committedClusters.length;
     const countEvidence = chunkPipelineMetadata
       .map((metadata) => metadata.speakerCount)
       .filter(
@@ -805,7 +824,7 @@ class SessionDiarizationWorker {
         createdAt: completedAt,
         completedAt,
       },
-      clusters: clusters.map((cluster) => {
+      clusters: committedClusters.map((cluster) => {
         const qualityScore =
           cluster.windowCount > 0
             ? Math.max(
@@ -828,8 +847,8 @@ class SessionDiarizationWorker {
           firstAppearanceAt: cluster.firstAppearanceAt,
         };
       }),
-      turns,
-      segmentLinks: [...segmentLinks.values()],
+      turns: committedTurns,
+      segmentLinks: committedSegmentLinks,
     });
     return {
       executionDevice,

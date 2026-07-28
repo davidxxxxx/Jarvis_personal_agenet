@@ -18,6 +18,7 @@ const {
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
 } = require("../shared/contracts");
+const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
 
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
@@ -25,13 +26,13 @@ const REDACTION_VERSION = "jarvis-redaction-v1";
 const CANONICAL_INPUT_VERSION = "jarvis-analysis-input-canonical-v2";
 const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
 const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
-const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
+const MAX_CLOUD_PAYLOAD_BYTES = 384 * 1024;
 const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
 const MAX_DAILY_DIGEST_CANDIDATE_BYTES = 512 * 1024;
 const MIN_CLOUD_ANONYMOUS_SPEECH_MS = 5_000;
 const MIN_CLOUD_ANONYMOUS_WINDOWS = 3;
 const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
-const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
+const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v2";
 const PUBLIC_SNAPSHOT_LIST_LIMIT = 101;
 const PUBLIC_SNAPSHOT_HISTORY_LIMIT = 20;
 const PUBLIC_SNAPSHOT_EVIDENCE_LIMIT = 8;
@@ -331,7 +332,8 @@ class MemoryRepository {
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
                   segment.version, segment.text, segment.person_id, segment.result_kind,
                   segment.is_stable, segment.superseded_by, segment.duplicate_of,
-                  track.device_label
+                  track.device_label, track.track_kind, track.application_key,
+                  track.application_display_name, track.attribution_state
            FROM transcript_segments AS segment
            LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
            WHERE segment.id = ?`
@@ -365,6 +367,15 @@ class MemoryRepository {
         throw codedError("MEMORY_INPUT_STALE");
       }
       if (segment.device_label?.trim()) deviceLabels.add(segment.device_label);
+      if (
+        segment.track_kind === "application" &&
+        ApplicationAudioPolicy.isVirtualAudioInfrastructure({
+          applicationKey: segment.application_key,
+          applicationDisplayName: segment.application_display_name,
+        })
+      ) {
+        return [];
+      }
 
       let subject;
       if (segment.person_id) {
@@ -397,7 +408,8 @@ class MemoryRepository {
       } else {
         const cluster = this.db
           .prepare(
-            `SELECT cluster.id, cluster.local_label,
+            `SELECT cluster.id, cluster.local_label, cluster_track.track_kind,
+                    cluster_track.application_key, cluster_track.attribution_state,
                     CASE
                       WHEN resolution.resolution_state = 'unknown'
                        AND resolution.reason IN (
@@ -409,6 +421,7 @@ class MemoryRepository {
                     END AS anonymous_person_ref
              FROM speaker_cluster_segments AS link
              JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+             JOIN audio_tracks AS cluster_track ON cluster_track.id = cluster.track_id
              LEFT JOIN speaker_identity_resolutions AS resolution
                ON resolution.id = (
                  SELECT candidate.id
@@ -419,8 +432,31 @@ class MemoryRepository {
                    AND candidate.actor = 'system'
                  ORDER BY run.commit_sequence DESC, candidate.rowid DESC
                  LIMIT 1
-               )
+             )
              WHERE link.transcript_segment_id = ? AND cluster.session_id = ?
+               AND (
+                 NOT EXISTS (
+                   SELECT 1
+                   FROM speaker_diarization_runs AS any_run
+                   WHERE any_run.session_id = cluster.session_id
+                     AND any_run.track_id = cluster.track_id
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                   FROM speaker_diarization_run_clusters AS membership
+                   JOIN speaker_diarization_runs AS current_run
+                     ON current_run.id = membership.run_id
+                   WHERE membership.cluster_id = cluster.id
+                     AND current_run.id = (
+                       SELECT latest_run.id
+                       FROM speaker_diarization_runs AS latest_run
+                       WHERE latest_run.session_id = cluster.session_id
+                         AND latest_run.track_id = cluster.track_id
+                       ORDER BY latest_run.commit_sequence DESC, latest_run.id DESC
+                       LIMIT 1
+                     )
+                 )
+               )
                AND (
                  cluster.link_state = 'confirmed'
                  OR (
@@ -443,10 +479,18 @@ class MemoryRepository {
             MIN_CLOUD_ANONYMOUS_WINDOWS
           );
         if (!cluster?.local_label?.trim()) return [];
+        const applicationSpeakerKey =
+          cluster.track_kind === "application" &&
+          cluster.attribution_state === "exact" &&
+          cluster.application_key?.trim()
+            ? `application_speaker:${cluster.application_key
+                .trim()
+                .toLocaleLowerCase()}:${cluster.local_label.trim().toLocaleLowerCase()}`
+            : null;
         subject = {
           key: cluster.anonymous_person_ref
             ? `anonymous_speaker:${cluster.anonymous_person_ref}`
-            : `speaker_cluster:${cluster.id}`,
+            : (applicationSpeakerKey ?? `speaker_cluster:${cluster.id}`),
           subjectKind: "speaker_cluster",
           subjectId: cluster.id,
           subjectDisplayNameSnapshot: cluster.local_label,
@@ -1083,15 +1127,16 @@ class MemoryRepository {
       const placeholders = rawSessionIds.map(() => "?").join(",");
       const pendingUpstreamRows = this.db
         .prepare(
-          `SELECT session_id, job_type, input_hash, input_version, model_version
+          `SELECT session_id, job_type
            FROM processing_jobs
            WHERE session_id IN (${placeholders})
-             AND job_type <> 'generate_daily_digest'
-             AND completed_at IS NULL
-             AND state NOT IN (
-               'completed','failed','cancelled','superseded','audio_expired_before_processing'
-             )
-           ORDER BY session_id, job_type, input_hash, input_version, model_version`
+              AND job_type <> 'generate_daily_digest'
+              AND completed_at IS NULL
+              AND state NOT IN (
+                'completed','failed','cancelled','superseded','audio_expired_before_processing'
+              )
+           GROUP BY session_id, job_type
+           ORDER BY session_id, job_type`
         )
         .all(...rawSessionIds);
       const incompleteSegmentCount = this.db
@@ -1154,9 +1199,6 @@ class MemoryRepository {
         pendingUpstreamJobs: pendingUpstreamRows.map((job) => ({
           sessionRef: pseudonymousRef("session", job.session_id),
           jobType: job.job_type,
-          inputHash: job.input_hash,
-          inputVersion: job.input_version,
-          modelVersion: job.model_version,
         })),
       };
       const cloudPayload = {

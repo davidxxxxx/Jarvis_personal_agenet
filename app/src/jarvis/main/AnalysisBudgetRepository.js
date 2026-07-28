@@ -782,7 +782,11 @@ function openAnalysisBudgetRepository(databasePath, { busyTimeoutMs = 250 } = {}
   try {
     db.pragma("foreign_keys = ON");
     db.pragma(`busy_timeout = ${busyTimeoutMs}`);
-    if (databasePath !== ":memory:") db.pragma("journal_mode = WAL");
+    if (databasePath !== ":memory:") {
+      db.pragma("journal_mode = WAL");
+      db.pragma("synchronous = FULL");
+      db.pragma("wal_autocheckpoint = 1000");
+    }
     applyJarvisMigrations(db);
     return new AnalysisBudgetRepository(db, { ownsDatabase: true });
   } catch (error) {

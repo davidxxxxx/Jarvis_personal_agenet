@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 42;
+const TARGET_VERSION = 46;
 const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
@@ -6907,6 +6907,211 @@ function upgradePersonalizationV42(db, migratedAt) {
   `);
 }
 
+function upgradePreferredSpeakerSchedulingV43(db) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 34
+      WHEN 'application' THEN 35
+      WHEN 'system_mix' THEN 45
+      ELSE priority
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL
+    WHERE job_type = 'resolve_identities'
+      AND state IN ('retry','blocked')
+      AND completed_at IS NULL;
+  `);
+}
+
+function upgradeRecoverableSpeakerWorkV44(db) {
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 34
+      WHEN 'application' THEN 35
+      WHEN 'system_mix' THEN 45
+      ELSE priority
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state IN ('retry','blocked')
+      AND completed_at IS NULL
+      AND blocked_reason IN (
+        'cpu_load_high',
+        'cuda_unavailable',
+        'cuda_unavailable_cpu_backend',
+        'external_gpu_busy',
+        'fullscreen_game',
+        'gpu_utilization_high',
+        'insufficient_vram',
+        'recovery_hysteresis',
+        'resources_changed',
+        'telemetry_unavailable'
+      );
+  `);
+}
+
+function upgradeDailyDigestSnapshotRetentionV45(db) {
+  if (
+    !tableExists(db, "daily_digest_inputs") ||
+    !tableExists(db, "processing_jobs") ||
+    !tableExists(db, "daily_digest_response_candidates") ||
+    !tableExists(db, "daily_digests")
+  ) {
+    return;
+  }
+  db.exec(`
+    DELETE FROM processing_jobs
+    WHERE id IN (
+      SELECT job.id
+      FROM processing_jobs AS job
+      JOIN daily_digest_inputs AS input ON input.id = job.digest_input_id
+      WHERE job.job_type = 'generate_daily_digest'
+        AND job.state = 'superseded'
+        AND NOT EXISTS (
+          SELECT 1 FROM analysis_budget_attempts AS attempt
+          WHERE attempt.job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_digest_response_candidates AS candidate
+          WHERE candidate.job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_digests AS digest
+          WHERE digest.source_hash = input.source_hash
+        )
+    );
+
+    DROP TRIGGER IF EXISTS daily_digest_inputs_immutable_delete;
+    DELETE FROM daily_digest_inputs AS input
+    WHERE NOT EXISTS (
+      SELECT 1 FROM processing_jobs AS job
+      WHERE job.digest_input_id = input.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM daily_digest_response_candidates AS candidate
+        WHERE candidate.digest_input_id = input.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM daily_digests AS digest
+        WHERE digest.source_hash = input.source_hash
+      );
+    CREATE TRIGGER daily_digest_inputs_immutable_delete
+    BEFORE DELETE ON daily_digest_inputs
+    BEGIN
+      SELECT RAISE(ABORT, 'daily digest input is immutable');
+    END;
+  `);
+}
+
+function upgradeSpeakerTranscriptProjectionV46(db) {
+  if (
+    !tableExists(db, "transcript_segments") ||
+    !tableExists(db, "speaker_cluster_segments") ||
+    !tableExists(db, "speaker_clusters") ||
+    !tableExists(db, "people") ||
+    !tableExists(db, "analysis_input_segments")
+  ) {
+    return;
+  }
+  const transcriptColumns = columns(db, "transcript_segments");
+  const clusterColumns = columns(db, "speaker_clusters");
+  const peopleColumns = columns(db, "people");
+  if (
+    !transcriptColumns.has("person_id") ||
+    !transcriptColumns.has("speaker_label") ||
+    !clusterColumns.has("person_id") ||
+    !clusterColumns.has("link_state") ||
+    !clusterColumns.has("updated_at") ||
+    !peopleColumns.has("display_name")
+  ) {
+    return;
+  }
+  db.exec(`
+    UPDATE transcript_segments AS segment
+    SET person_id = (
+      SELECT CASE
+        WHEN cluster.link_state = 'confirmed' THEN cluster.person_id
+        ELSE NULL
+      END
+      FROM speaker_cluster_segments AS link
+      JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+      WHERE link.transcript_segment_id = segment.id
+      ORDER BY cluster.updated_at DESC, cluster.id DESC
+      LIMIT 1
+    )
+    WHERE EXISTS (
+      SELECT 1
+      FROM speaker_cluster_segments AS link
+      WHERE link.transcript_segment_id = segment.id
+    );
+
+    UPDATE transcript_segments AS segment
+    SET speaker_label = (
+      SELECT person.display_name
+      FROM speaker_cluster_segments AS link
+      JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+      JOIN people AS person ON person.id = cluster.person_id
+      WHERE link.transcript_segment_id = segment.id
+        AND cluster.link_state = 'confirmed'
+      ORDER BY cluster.updated_at DESC, cluster.id DESC
+      LIMIT 1
+    )
+    WHERE NOT EXISTS (
+      SELECT 1 FROM analysis_input_segments AS input
+      WHERE input.segment_id = segment.id
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN people AS person ON person.id = cluster.person_id
+        WHERE link.transcript_segment_id = segment.id
+          AND cluster.link_state = 'confirmed'
+      );
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -7231,6 +7436,18 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 42) {
         upgradePersonalizationV42(db, migratedAt);
       }
+      if (fromVersion < 43) {
+        upgradePreferredSpeakerSchedulingV43(db);
+      }
+      if (fromVersion < 44) {
+        upgradeRecoverableSpeakerWorkV44(db);
+      }
+      if (fromVersion < 45) {
+        upgradeDailyDigestSnapshotRetentionV45(db);
+      }
+      if (fromVersion < 46) {
+        upgradeSpeakerTranscriptProjectionV46(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -7271,6 +7488,10 @@ module.exports = {
   upgradeSpeakerCompletionSchedulingV40,
   upgradeTodoActionsV41,
   upgradePersonalizationV42,
+  upgradePreferredSpeakerSchedulingV43,
+  upgradeRecoverableSpeakerWorkV44,
+  upgradeDailyDigestSnapshotRetentionV45,
+  upgradeSpeakerTranscriptProjectionV46,
   upgradeRuntimeStatusIndexesV38,
   upgradeHybridDiarizationV36,
 };

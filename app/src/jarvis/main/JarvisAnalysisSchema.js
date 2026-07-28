@@ -234,8 +234,8 @@ function salvageCandidateAnalysis(payload, context) {
     }
     return result;
   };
-  const keepValid = (value, field, repair) =>
-    collection(value, field).flatMap((raw) => {
+  const keepValid = (value, repair) =>
+    (Array.isArray(value) ? value.slice(0, MAX_COLLECTION_ITEMS) : []).flatMap((raw) => {
       try {
         const repaired = repair(raw);
         return repaired === null ? [] : [repaired];
@@ -255,7 +255,7 @@ function salvageCandidateAnalysis(payload, context) {
       summary: boundedString(rawSummary.summary, 4_000),
       evidenceSegmentIds: summaryEvidence,
     },
-    memories: keepValid(input.memories, "memories", (raw) => {
+    memories: keepValid(input.memories, (raw) => {
       const item = exactObject(raw, ["kind", "title", "body", "confidence", "evidenceSegmentIds"]);
       if (!MEMORY_KIND_SET.has(item.kind)) fail("schema.memory_kind");
       if (
@@ -277,7 +277,7 @@ function salvageCandidateAnalysis(payload, context) {
             evidenceSegmentIds: evidence,
           };
     }),
-    topics: keepValid(input.topics, "topics", (raw) => {
+    topics: keepValid(input.topics, (raw) => {
       const item = exactObject(raw, ["name", "summary", "evidenceSegmentIds"]);
       const evidence = cleanEvidence(item.evidenceSegmentIds);
       return evidence.length === 0
@@ -288,7 +288,7 @@ function salvageCandidateAnalysis(payload, context) {
             evidenceSegmentIds: evidence,
           };
     }),
-    todos: keepValid(input.todos, "todos", (raw) => {
+    todos: keepValid(input.todos, (raw) => {
       const item = exactObject(raw, ["title", "ownerLabel", "dueText", "evidenceSegmentIds"]);
       if (
         item.ownerLabel !== null &&
@@ -313,7 +313,7 @@ function salvageCandidateAnalysis(payload, context) {
             evidenceSegmentIds: evidence,
           };
     }),
-    suggestions: keepValid(input.suggestions, "suggestions", (raw) => {
+    suggestions: keepValid(input.suggestions, (raw) => {
       const item = exactObject(raw, ["title", "rationale", "basedOnEvidenceSegmentIds"]);
       return {
         title: boundedString(item.title, 500),

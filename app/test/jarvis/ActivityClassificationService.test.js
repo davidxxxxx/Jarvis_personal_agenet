@@ -121,6 +121,41 @@ test("local classification is durable and MiniMax review supersedes it under one
   assert.deepEqual(events.slice(1).map((entry) => entry[0]), ["started", "reconciled"]);
 });
 
+test("new local evidence supersedes a stale MiniMax result until that evidence is reviewed", async (t) => {
+  const { service } = fixture(t);
+  await service.classifySession({
+    sessionId: "session-activity",
+    jobId: "analysis-job-before-self",
+    activities: [activity()],
+  });
+
+  const withConfirmedSelf = {
+    ...activity(),
+    sourceAttribution: "application_and_microphone",
+    speakerLabels: ["SELF", "P1"],
+    statistics: {
+      ...activity().statistics,
+      microphoneParticipated: true,
+      selfDetected: true,
+      speakerCount: 2,
+      turnCount: 4,
+      turnTakingScore: 0.75,
+    },
+  };
+  const refreshed = await service.classifySession({
+    sessionId: "session-activity",
+    jobId: "analysis-job-after-self",
+    activities: [withConfirmedSelf],
+    cloudReview: false,
+  });
+
+  assert.equal(refreshed.cloudStatus, "not_configured");
+  assert.equal(refreshed.classifications.length, 1);
+  assert.equal(refreshed.classifications[0].source, "local");
+  assert.equal(refreshed.classifications[0].evidence.selfDetected, true);
+  assert.equal(refreshed.classifications[0].sourceAttribution, "application_and_microphone");
+});
+
 test("MiniMax failure keeps the conservative local result and closes budget as unknown", async (t) => {
   const error = Object.assign(new Error("network"), {
     code: "network",

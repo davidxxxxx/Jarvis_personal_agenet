@@ -88,6 +88,7 @@ const MEETING_STREAM_SAMPLE_RATE = 24000;
 const MEETING_SYSTEM_RECOVERY_BUFFER_MAX_BYTES = 512 * 1024;
 const JARVIS_MIDNIGHT_REBIND_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
 const JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT = 1_024;
+const EFFECTIVE_DIGITAL_SILENCE_RMS = 0.00001;
 const MEETING_AUDIO_LEVEL_PUBLISH_INTERVAL_MS = 80;
 
 function calculatePcm16Rms(pcmBuffer) {
@@ -104,6 +105,39 @@ function calculatePcm16Rms(pcmBuffer) {
   return sampled > 0 ? Math.min(1, Math.sqrt(sumSquares / sampled)) : 0;
 }
 
+function calculateWavPcm16Rms(wavBuffer) {
+  if (
+    !Buffer.isBuffer(wavBuffer) ||
+    wavBuffer.byteLength < 44 ||
+    wavBuffer.toString("ascii", 0, 4) !== "RIFF" ||
+    wavBuffer.toString("ascii", 8, 12) !== "WAVE"
+  ) {
+    return null;
+  }
+  let offset = 12;
+  while (offset + 8 <= wavBuffer.byteLength) {
+    const chunkId = wavBuffer.toString("ascii", offset, offset + 4);
+    const declaredBytes = wavBuffer.readUInt32LE(offset + 4);
+    const dataOffset = offset + 8;
+    const availableBytes = Math.min(declaredBytes, wavBuffer.byteLength - dataOffset);
+    if (chunkId === "data") {
+      const sampleCount = Math.floor(availableBytes / 2);
+      if (sampleCount === 0) return 0;
+      const stride = Math.max(1, Math.floor(sampleCount / 8_192));
+      let sumSquares = 0;
+      let sampled = 0;
+      for (let sample = 0; sample < sampleCount; sample += stride) {
+        const normalized = wavBuffer.readInt16LE(dataOffset + sample * 2) / 32_768;
+        sumSquares += normalized * normalized;
+        sampled += 1;
+      }
+      return sampled > 0 ? Math.sqrt(sumSquares / sampled) : 0;
+    }
+    offset = dataOffset + declaredBytes + (declaredBytes % 2);
+  }
+  return null;
+}
+
 function createJarvisTranscribeWavAdapter({
   whisperManager,
   model,
@@ -117,10 +151,17 @@ function createJarvisTranscribeWavAdapter({
   }
   if (typeof readFile !== "function") throw new TypeError("readFile must be a function");
   const configuredModel = model.trim();
-  const retryReasons = new Set(["unexpected_script", "unexpected_language", "repeated_phrase"]);
+  const retryReasons = new Set([
+    "unexpected_script",
+    "unexpected_language",
+    "repeated_phrase",
+    "common_hallucination",
+    "invalid_character",
+  ]);
   const qualityPenalty = (quality) =>
     quality.reasons.reduce((total, reason) => {
       if (reason === "blank_marker" || reason === "no_lexical_content") return total + 8;
+      if (reason === "invalid_character" || reason === "common_hallucination") return total + 7;
       if (reason === "unexpected_script") return total + 5;
       if (reason === "repeated_phrase") return total + 4;
       if (reason === "unexpected_language") return total + 3;
@@ -140,6 +181,7 @@ function createJarvisTranscribeWavAdapter({
       .slice(-JARVIS_TRANSCRIPTION_PROMPT_CODE_POINT_LIMIT)
       .join("");
     const wav = await readFile(verifiedWavPath);
+    const wavRms = calculateWavPcm16Rms(wav);
     const resourceOptions = executionContext
       ? {
           useCuda: executionContext.device === "cuda",
@@ -154,6 +196,7 @@ function createJarvisTranscribeWavAdapter({
       model: configuredModel,
       language: null,
       initialPrompt: boundedPrompt || null,
+      vadEnabled: true,
       ...resourceOptions,
     };
     const automatic = await whisperManager.transcribeLocalWhisper(wav, options);
@@ -165,6 +208,12 @@ function createJarvisTranscribeWavAdapter({
       return automatic;
     }
     const automaticQuality = classifyTranscriptQuality(automatic.text);
+    if (
+      automaticQuality.reasons.includes("blank_marker") ||
+      automaticQuality.reasons.includes("no_lexical_content")
+    ) {
+      return { ...automatic, success: true, text: "", noSpeech: true };
+    }
     if (!automaticQuality.reasons.some((reason) => retryReasons.has(reason))) {
       return automatic;
     }
@@ -190,9 +239,25 @@ function createJarvisTranscribeWavAdapter({
       return automatic;
     }
     const retryQuality = classifyTranscriptQuality(chinesePrimary.text);
-    return qualityPenalty(retryQuality) < qualityPenalty(automaticQuality)
+    if (
+      retryQuality.reasons.includes("blank_marker") ||
+      retryQuality.reasons.includes("no_lexical_content")
+    ) {
+      return { ...chinesePrimary, success: true, text: "", noSpeech: true };
+    }
+    const selected =
+      qualityPenalty(retryQuality) < qualityPenalty(automaticQuality)
       ? chinesePrimary
       : automatic;
+    if (
+      wavRms !== null &&
+      wavRms <= EFFECTIVE_DIGITAL_SILENCE_RMS &&
+      automaticQuality.reasons.includes("common_hallucination") &&
+      retryQuality.reasons.includes("common_hallucination")
+    ) {
+      return { ...selected, success: true, text: "", noSpeech: true };
+    }
+    return selected;
   };
 }
 
