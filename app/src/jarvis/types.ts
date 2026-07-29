@@ -321,6 +321,10 @@ export interface JarvisSpeakerClusterView {
   lastRejectedPerson: JarvisSpeakerPersonSummary | null;
   score: number | null;
   margin: number | null;
+  candidatePersonRef: string | null;
+  speechMs: number;
+  windowCount: number;
+  qualityScore: number | null;
   reason: string;
   policyId: string;
   diarizationRevision: string;
@@ -653,11 +657,80 @@ export interface JarvisDiarizationRunView {
   completedAt: number;
 }
 
+export type JarvisSessionParticipantKind =
+  | "self"
+  | "known"
+  | "anonymous"
+  | "reviewed"
+  | "temporary"
+  | "media";
+
+export interface JarvisParticipantEvidenceSegment {
+  clusterId: string;
+  id: string;
+  started_at: number;
+  ended_at: number;
+  text: string;
+  confidence: number | null;
+  track_id: string | null;
+  source_type: "mic" | "system";
+  result_kind: string;
+  duplicate_of: string | null;
+  sourceName: string;
+  pinned?: boolean;
+}
+
+export interface JarvisSessionParticipant {
+  id: string;
+  kind: JarvisSessionParticipantKind;
+  displayName: string;
+  person: JarvisSpeakerPersonSummary | null;
+  candidatePersonRef: string | null;
+  reviewState: "confirmed" | "needs_review" | "media";
+  durable: boolean;
+  speechMs: number;
+  segmentCount: number;
+  clusterCount: number;
+  clusterIds: string[];
+  segmentIds: string[];
+  sourceNames: string[];
+  minimumCount: number;
+  maximumCount: number;
+  score: number | null;
+  representativeSegments: JarvisParticipantEvidenceSegment[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisSessionParticipantProjection {
+  projectorVersion?: string;
+  count: {
+    minimum: number;
+    maximum: number;
+    confirmed: number;
+    needsReview: number;
+    selfIncluded: boolean;
+  };
+  participants: JarvisSessionParticipant[];
+  mediaVoices: JarvisSessionParticipant[];
+  excluded: {
+    fragmented: number;
+    shadowedSystemMix: number;
+    anomaly: boolean;
+  };
+}
+
 export interface JarvisSessionSpeakerProcessing {
   preferredInputVersion: 1 | 2;
   latestRuns: JarvisDiarizationRunView[];
   history: JarvisDiarizationRunView[];
   speakers: JarvisSpeakerClusterView[];
+  participants: JarvisSessionParticipantProjection;
+  participantSnapshot: {
+    id: string;
+    revision: number;
+    sourceHash: string;
+    createdAt: number;
+  } | null;
   fragmentedEvidenceCount: number;
   summaryRefresh: {
     basis_policy_id: string | null;
@@ -679,6 +752,91 @@ export interface JarvisPersonOverview extends JarvisPerson {
   session_count: number;
   open_todo_count: number;
   last_interaction_at: number | null;
+}
+
+export interface JarvisAnonymousPersonOverview {
+  id: string;
+  displayName: string;
+  sessionCount: number;
+  clusterCount: number;
+  speechMs: number;
+  lastSeenAt: number;
+  sourceNames: string[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisPendingParticipantOverview {
+  id: string;
+  sessionId: string;
+  sessionStartedAt: number;
+  minimumCount: number;
+  maximumCount: number;
+  clusterCount: number;
+  speechMs: number;
+  sourceNames: string[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisPeopleReviewOverview {
+  anonymous: JarvisAnonymousPersonOverview[];
+  needsReview: JarvisPendingParticipantOverview[];
+}
+
+export type JarvisParticipantReviewAction =
+  | "split"
+  | "merge"
+  | "mark_media"
+  | "restore_social"
+  | "forget_identity"
+  | "pin_evidence"
+  | "unpin_evidence";
+
+export interface JarvisParticipantReviewInput {
+  sessionId: string;
+  action: JarvisParticipantReviewAction;
+  clusterIds?: string[];
+  segmentIds?: string[];
+  personId?: string;
+  label?: string;
+}
+
+export interface JarvisParticipantReviewPreview {
+  sessionId: string;
+  action: JarvisParticipantReviewAction;
+  clusterIds: string[];
+  segmentIds: string[];
+  affectedClusterCount: number;
+  affectedSegmentCount: number;
+  affectedPersonIds: string[];
+  affectedSessionIds: string[];
+  historyImpact?: {
+    sessionCount: number;
+    clusterCount: number;
+    segmentCount: number;
+    sessionIds: string[];
+  };
+  canUndo: boolean;
+}
+
+export interface JarvisParticipantReviewEvent {
+  id: string;
+  sessionId: string;
+  action: JarvisParticipantReviewAction | "undo";
+  createdAt: number;
+  canUndo: boolean;
+}
+
+export interface JarvisParticipantReviewHistoryEvent extends JarvisParticipantReviewEvent {
+  subjectRef: string;
+  payload: Record<string, unknown>;
+  revertsEventId: string | null;
+  actor: "user" | "system";
+}
+
+export interface JarvisParticipantReviewResult {
+  event: JarvisParticipantReviewEvent;
+  preview?: JarvisParticipantReviewPreview;
+  speakerProcessing: JarvisSessionSpeakerProcessing;
 }
 
 export interface JarvisPersonDetail {

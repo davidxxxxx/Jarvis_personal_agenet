@@ -4,7 +4,12 @@ import i18n from "../../../i18n";
 import type {
   JarvisSession,
   JarvisSessionDetail,
+  JarvisParticipantReviewEvent,
+  JarvisParticipantReviewInput,
   JarvisRuntimeStatus,
+  JarvisSessionParticipant,
+  JarvisSessionParticipantProjection,
+  JarvisSessionSpeakerProcessing,
   JarvisSessionTimeline,
   JarvisSpeakerClusterView,
   JarvisTranscriptSegment,
@@ -128,6 +133,179 @@ function detailFor(value: JarvisSession): JarvisSessionDetail {
   };
 }
 
+function reviewCluster(
+  id: string,
+  localLabel: string,
+  options: Partial<JarvisSpeakerClusterView> = {}
+): JarvisSpeakerClusterView {
+  return {
+    id,
+    sessionId: session.id,
+    trackId: "mic-track",
+    localLabel,
+    linkState: "unknown",
+    person: null,
+    suggestedPerson: null,
+    lastRejectedPerson: null,
+    score: null,
+    margin: null,
+    candidatePersonRef: null,
+    speechMs: 12_000,
+    windowCount: 4,
+    qualityScore: 0.86,
+    reason: "no_candidate",
+    policyId: "hybrid-v2",
+    diarizationRevision: "a".repeat(64),
+    profileRevision: "b".repeat(64),
+    evidenceSegmentIds: [],
+    canUndo: false,
+    updatedAt: 4_000,
+    ...options,
+  };
+}
+
+function reviewParticipant(
+  cluster: JarvisSpeakerClusterView,
+  displayName: string,
+  options: Partial<JarvisSessionParticipant> = {}
+): JarvisSessionParticipant {
+  return {
+    id: `temporary:${cluster.id}`,
+    kind: "temporary",
+    displayName,
+    person: null,
+    candidatePersonRef: null,
+    reviewState: "needs_review",
+    durable: false,
+    speechMs: cluster.speechMs,
+    segmentCount: cluster.evidenceSegmentIds.length,
+    clusterCount: 1,
+    clusterIds: [cluster.id],
+    segmentIds: [...cluster.evidenceSegmentIds],
+    sourceNames: ["麦克风"],
+    minimumCount: 1,
+    maximumCount: 1,
+    score: cluster.score,
+    representativeSegments: cluster.evidenceSegmentIds.map((segmentId, index) => ({
+      clusterId: cluster.id,
+      id: segmentId,
+      started_at: 1_200 + index * 500,
+      ended_at: 1_500 + index * 500,
+      text: `${displayName} 的代表片段 ${index + 1}`,
+      confidence: 0.92,
+      track_id: cluster.trackId,
+      source_type: "mic",
+      result_kind: "final",
+      duplicate_of: null,
+      sourceName: "麦克风",
+    })),
+    representativeCluster: cluster,
+    ...options,
+  };
+}
+
+function reviewProjection(
+  participants: JarvisSessionParticipant[],
+  mediaVoices: JarvisSessionParticipant[] = []
+): JarvisSessionParticipantProjection {
+  return {
+    count: {
+      minimum: participants.reduce((sum, participant) => sum + participant.minimumCount, 0),
+      maximum: participants.reduce((sum, participant) => sum + participant.maximumCount, 0),
+      confirmed: participants.filter((participant) => participant.reviewState === "confirmed")
+        .length,
+      needsReview: participants.filter((participant) => participant.reviewState === "needs_review")
+        .length,
+      selfIncluded: participants.some((participant) => participant.kind === "self"),
+    },
+    participants,
+    mediaVoices,
+    excluded: {
+      fragmented: 0,
+      shadowedSystemMix: 0,
+      anomaly: false,
+    },
+  };
+}
+
+function reviewSpeakerProcessing(
+  participants: JarvisSessionParticipant[],
+  mediaVoices: JarvisSessionParticipant[] = []
+): JarvisSessionSpeakerProcessing {
+  const speakers = [...participants, ...mediaVoices].flatMap((participant) =>
+    participant.clusterIds.includes(participant.representativeCluster.id)
+      ? [participant.representativeCluster]
+      : []
+  );
+  return {
+    preferredInputVersion: 2,
+    latestRuns: [],
+    history: [],
+    speakers,
+    participants: reviewProjection(participants, mediaVoices),
+    participantSnapshot: null,
+    fragmentedEvidenceCount: 0,
+    summaryRefresh: null,
+    reprocessing: null,
+  };
+}
+
+function participantReviewEvent(
+  id: string,
+  action:
+    | JarvisParticipantReviewEvent["action"]
+    | "split"
+    | "forget_identity"
+    | "pin_evidence"
+    | "unpin_evidence"
+): JarvisParticipantReviewEvent {
+  return {
+    id,
+    sessionId: session.id,
+    action: action as JarvisParticipantReviewEvent["action"],
+    createdAt: 5_000,
+    canUndo: action !== "undo",
+  };
+}
+
+function installParticipantReviewApi(
+  speakerProcessing: JarvisSessionSpeakerProcessing,
+  overrides: Record<string, unknown> = {}
+) {
+  const api = {
+    getSessionDetail: vi.fn(async () => ({
+      ...detailFor(session),
+      summary: {
+        session_id: session.id,
+        summary: "人物复核测试总结",
+        decisions_json: "[]",
+        suggestions_json: "[]",
+        updated_at: 4_000,
+        is_final: 1,
+      },
+      segments: [visibleSegment],
+      speakerProcessing,
+    })),
+    getSessionTimeline: vi.fn(async () => ({
+      ...timeline,
+      processing_state: "ready" as const,
+      ready_at: 4_000,
+      segments: [visibleSegment],
+    })),
+    listSessionSpeakerClusters: vi.fn(async () => speakerProcessing.speakers),
+    previewParticipantReview: vi.fn(),
+    applyParticipantReview: vi.fn(),
+    undoParticipantReview: vi.fn(),
+    listParticipantReviewHistory: vi.fn(async () => []),
+    readAudioChunk: vi.fn(),
+    searchMemory: vi.fn(),
+    analyzeSession: vi.fn(),
+    ...overrides,
+  };
+  Object.assign(window, { electronAPI: { jarvis: api } });
+  return api;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -151,6 +329,10 @@ describe("MemoryView speaker people projection", () => {
       lastRejectedPerson: null,
       score: null,
       margin: null,
+      candidatePersonRef: null,
+      speechMs: 8_000,
+      windowCount: 3,
+      qualityScore: 0.9,
       reason: "user_confirmed",
       policyId: "hybrid-v2",
       diarizationRevision: "a".repeat(64),
@@ -906,7 +1088,7 @@ describe("MemoryView processing timeline", () => {
   });
 
   it("shows final speaker count, SELF status, local naming entry, and opt-in paid refresh", async () => {
-    const speakers = [
+    const speakers: JarvisSpeakerClusterView[] = [
       {
         id: "cluster-self",
         sessionId: session.id,
@@ -918,6 +1100,10 @@ describe("MemoryView processing timeline", () => {
         lastRejectedPerson: null,
         score: 0.97,
         margin: 0.25,
+        candidatePersonRef: null,
+        speechMs: 30_000,
+        windowCount: 12,
+        qualityScore: 0.94,
         reason: "dual_model_match",
         policyId: "hybrid-v2",
         diarizationRevision: "a".repeat(64),
@@ -937,6 +1123,10 @@ describe("MemoryView processing timeline", () => {
         lastRejectedPerson: null,
         score: null,
         margin: null,
+        candidatePersonRef: null,
+        speechMs: 8_000,
+        windowCount: 3,
+        qualityScore: 0.76,
         reason: "no_candidate",
         policyId: "hybrid-v2",
         diarizationRevision: "c".repeat(64),
@@ -975,7 +1165,65 @@ describe("MemoryView processing timeline", () => {
         ],
         history: [],
         speakers,
-        fragmentedEvidenceCount: 140,
+        participants: {
+          count: {
+            minimum: 2,
+            maximum: 2,
+            confirmed: 1,
+            needsReview: 1,
+            selfIncluded: true,
+          },
+          participants: [
+            {
+              id: "self",
+              kind: "self",
+              displayName: "我",
+              person: speakers[0].person,
+              candidatePersonRef: null,
+              reviewState: "confirmed",
+              durable: true,
+              speechMs: 30_000,
+              segmentCount: 1,
+              clusterCount: 1,
+              clusterIds: [speakers[0].id],
+              segmentIds: [visibleSegment.id],
+              sourceNames: ["麦克风"],
+              minimumCount: 1,
+              maximumCount: 1,
+              score: 0.97,
+              representativeSegments: [],
+              representativeCluster: speakers[0],
+            },
+            {
+              id: "temporary:cluster-unknown",
+              kind: "temporary",
+              displayName: "人物 B",
+              person: null,
+              candidatePersonRef: null,
+              reviewState: "needs_review",
+              durable: false,
+              speechMs: 8_000,
+              segmentCount: 0,
+              clusterCount: 1,
+              clusterIds: [speakers[1].id],
+              segmentIds: [],
+              sourceNames: ["麦克风"],
+              minimumCount: 1,
+              maximumCount: 1,
+              score: null,
+              representativeSegments: [],
+              representativeCluster: speakers[1],
+            },
+          ],
+          mediaVoices: [],
+          excluded: {
+            fragmented: 0,
+            shadowedSystemMix: 0,
+            anomaly: false,
+          },
+        },
+        participantSnapshot: null,
+        fragmentedEvidenceCount: 229,
         summaryRefresh: {
           basis_policy_id: "legacy-v1",
           latest_policy_id: "hybrid-v2",
@@ -1031,14 +1279,473 @@ describe("MemoryView processing timeline", () => {
     render(<MemoryView />);
     fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
 
-    expect(await screen.findByText("本次识别到 2–3 人")).toBeInTheDocument();
-    expect(screen.getByText("本人声纹已确认")).toBeInTheDocument();
-    expect(screen.getByText("说话人 2")).toBeInTheDocument();
-    expect(screen.getByText(/已隐藏 140 个过短或重复的声纹碎片/)).toBeInTheDocument();
+    expect(await screen.findByText("预计 2 人；我 + 1 位其他参与者")).toBeInTheDocument();
+    expect(screen.getByText("已确认 1")).toBeInTheDocument();
+    expect(screen.getByText("待复核 1")).toBeInTheDocument();
+    expect(screen.getByText(/本人声纹已确认/)).toBeInTheDocument();
+    expect(screen.getByText("人物 B")).toBeInTheDocument();
+    expect(screen.getByText(/已隐藏 229 个过短或重复的声纹碎片/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "未知说话人" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "付费刷新总结" })).toBeInTheDocument();
     fireEvent.click(screen.getByText("处理详情与后台进度"));
     expect(screen.getByText("CUDA")).toBeInTheDocument();
     expect(screen.getByText("重叠分离：completed")).toBeInTheDocument();
+  });
+
+  it("shows a review warning instead of an implausible range for anomalous legacy clusters", async () => {
+    const cluster = reviewCluster("cluster-anomalous", "说话人 1");
+    const participant = reviewParticipant(cluster, "人物 A", {
+      maximumCount: 46,
+    });
+    const processing = reviewSpeakerProcessing([participant]);
+    processing.participants.excluded.anomaly = true;
+    const completedTimeline: JarvisSessionTimeline = {
+      ...timeline,
+      processing_state: "ready",
+      ready_at: 4_000,
+      processing_counts: {
+        pending: 0,
+        leased: 0,
+        retry: 0,
+        blocked: 0,
+        completed: 1,
+        total: 1,
+      },
+    };
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail: vi.fn(async () => ({
+            ...detailFor(session),
+            speakerProcessing: processing,
+          })),
+          getSessionTimeline: vi.fn(async () => completedTimeline),
+          listSessionSpeakerClusters: vi.fn(async () => [cluster]),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+
+    expect(
+      await screen.findByText("历史声纹异常，人数需重新复核")
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/预计 1–46 人/)).not.toBeInTheDocument();
+  });
+});
+
+describe("MemoryView participant review actions", () => {
+  beforeEach(() => {
+    useJarvisStore.setState({
+      sessions: [session],
+      clustersBySession: {},
+      selectedSessionId: null,
+      evidenceNavigation: { phase: "idle", requestId: 0 },
+    });
+  });
+
+  it("previews, applies, and undoes a merge while replacing the visible participant projection", async () => {
+    const firstCluster = reviewCluster("cluster-a", "说话人 1", {
+      evidenceSegmentIds: ["evidence-a"],
+    });
+    const secondCluster = reviewCluster("cluster-b", "说话人 2", {
+      evidenceSegmentIds: ["evidence-b"],
+    });
+    const firstParticipant = reviewParticipant(firstCluster, "人物 A");
+    const secondParticipant = reviewParticipant(secondCluster, "人物 B");
+    const initialProcessing = reviewSpeakerProcessing([firstParticipant, secondParticipant]);
+    const mergedCluster = reviewCluster("cluster-a", "人物 3", {
+      evidenceSegmentIds: ["evidence-a", "evidence-b"],
+      speechMs: 24_000,
+      windowCount: 8,
+    });
+    const mergedParticipant = reviewParticipant(mergedCluster, "人物 3", {
+      id: "anonymous:person-3",
+      kind: "anonymous",
+      reviewState: "confirmed",
+      durable: true,
+      speechMs: 24_000,
+      segmentCount: 2,
+      clusterCount: 2,
+      clusterIds: [firstCluster.id, secondCluster.id],
+      representativeSegments: [
+        ...firstParticipant.representativeSegments,
+        ...secondParticipant.representativeSegments,
+      ],
+    });
+    const mergedProcessing = reviewSpeakerProcessing([mergedParticipant]);
+    const input: JarvisParticipantReviewInput = {
+      sessionId: session.id,
+      action: "merge",
+      clusterIds: [firstCluster.id, secondCluster.id],
+    };
+    const previewParticipantReview = vi.fn(async () => ({
+      sessionId: session.id,
+      action: "merge" as const,
+      clusterIds: input.clusterIds,
+      affectedClusterCount: 2,
+      affectedSegmentCount: 2,
+      affectedPersonIds: [],
+      canUndo: true,
+    }));
+    const applyParticipantReview = vi.fn(async () => ({
+      event: participantReviewEvent("review-merge", "merge"),
+      speakerProcessing: mergedProcessing,
+    }));
+    const undoParticipantReview = vi.fn(async () => ({
+      event: participantReviewEvent("review-merge-undo", "undo"),
+      speakerProcessing: initialProcessing,
+    }));
+    installParticipantReviewApi(initialProcessing, {
+      previewParticipantReview,
+      applyParticipantReview,
+      undoParticipantReview,
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("人物 A")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择合并 人物 A" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择合并 人物 B" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认是同一人" }));
+
+    await waitFor(() => expect(previewParticipantReview).toHaveBeenCalledWith(input));
+    expect(await screen.findByText("确认人物修正")).toBeInTheDocument();
+    expect(screen.getByText(/影响 2 个声纹簇和 2 条转写证据/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+
+    await waitFor(() => expect(applyParticipantReview).toHaveBeenCalledWith(input));
+    expect(await screen.findByText("人物 3")).toBeInTheDocument();
+    expect(screen.queryByText("人物 B")).not.toBeInTheDocument();
+    expect(screen.getByText("人物修正已保存；会话人数和媒体排除已重新计算。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+
+    await waitFor(() => expect(undoParticipantReview).toHaveBeenCalledWith("review-merge"));
+    expect(await screen.findByText("人物 B")).toBeInTheDocument();
+    expect(
+      screen.queryByText("人物修正已保存；会话人数和媒体排除已重新计算。")
+    ).not.toBeInTheDocument();
+  });
+
+  it("marks a participant as media and can restore it to the social participant list", async () => {
+    const cluster = reviewCluster("cluster-media", "说话人 1", {
+      evidenceSegmentIds: ["evidence-media"],
+    });
+    const socialParticipant = reviewParticipant(cluster, "人物 A");
+    const mediaParticipant = reviewParticipant(cluster, "媒体声音 1", {
+      id: `media:${cluster.id}`,
+      kind: "media",
+      reviewState: "media",
+    });
+    const initialProcessing = reviewSpeakerProcessing([socialParticipant]);
+    const mediaProcessing = reviewSpeakerProcessing([], [mediaParticipant]);
+    const previewParticipantReview = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sessionId: session.id,
+        action: "mark_media",
+        clusterIds: [cluster.id],
+        affectedClusterCount: 1,
+        affectedSegmentCount: 1,
+        affectedPersonIds: [],
+        canUndo: true,
+      })
+      .mockResolvedValueOnce({
+        sessionId: session.id,
+        action: "restore_social",
+        clusterIds: [cluster.id],
+        affectedClusterCount: 1,
+        affectedSegmentCount: 1,
+        affectedPersonIds: [],
+        canUndo: true,
+      });
+    const applyParticipantReview = vi
+      .fn()
+      .mockResolvedValueOnce({
+        event: participantReviewEvent("review-media", "mark_media"),
+        speakerProcessing: mediaProcessing,
+      })
+      .mockResolvedValueOnce({
+        event: participantReviewEvent("review-restore", "restore_social"),
+        speakerProcessing: initialProcessing,
+      });
+    installParticipantReviewApi(initialProcessing, {
+      previewParticipantReview,
+      applyParticipantReview,
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("人物 A")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "标记为媒体声音" }));
+    await waitFor(() =>
+      expect(previewParticipantReview).toHaveBeenNthCalledWith(1, {
+        sessionId: session.id,
+        action: "mark_media",
+        clusterIds: [cluster.id],
+      })
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "确认并保存" }));
+
+    await waitFor(() =>
+      expect(applyParticipantReview).toHaveBeenNthCalledWith(1, {
+        sessionId: session.id,
+        action: "mark_media",
+        clusterIds: [cluster.id],
+      })
+    );
+    expect(await screen.findByText("已排除 1 组媒体声音")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("查看已排除的媒体声音（1）"));
+    fireEvent.click(screen.getByRole("button", { name: "改为互动人物" }));
+
+    await waitFor(() =>
+      expect(previewParticipantReview).toHaveBeenNthCalledWith(2, {
+        sessionId: session.id,
+        action: "restore_social",
+        clusterIds: [cluster.id],
+      })
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "确认并保存" }));
+
+    await waitFor(() =>
+      expect(applyParticipantReview).toHaveBeenNthCalledWith(2, {
+        sessionId: session.id,
+        action: "restore_social",
+        clusterIds: [cluster.id],
+      })
+    );
+    expect(await screen.findByText("人物 A")).toBeInTheDocument();
+    expect(screen.queryByText("已排除 1 组媒体声音")).not.toBeInTheDocument();
+  });
+
+  it("splits a selected transcript segment into a new participant after impact confirmation", async () => {
+    const cluster = reviewCluster("cluster-split", "说话人 1", {
+      evidenceSegmentIds: ["evidence-split"],
+    });
+    const participant = reviewParticipant(cluster, "人物 A");
+    const initialProcessing = reviewSpeakerProcessing([participant]);
+    const splitCluster = reviewCluster("cluster-split-new", "人物 B", {
+      evidenceSegmentIds: ["evidence-split"],
+    });
+    const splitParticipant = reviewParticipant(splitCluster, "人物 B");
+    const splitProcessing = reviewSpeakerProcessing([
+      reviewParticipant(cluster, "人物 A", {
+        representativeSegments: [],
+        segmentCount: 0,
+      }),
+      splitParticipant,
+    ]);
+    const input = {
+      sessionId: session.id,
+      action: "split",
+      clusterIds: [cluster.id],
+      segmentIds: ["evidence-split"],
+    } as unknown as JarvisParticipantReviewInput;
+    const previewParticipantReview = vi.fn(async () => ({
+      sessionId: session.id,
+      action: "split",
+      clusterIds: [cluster.id],
+      segmentIds: ["evidence-split"],
+      affectedClusterCount: 1,
+      affectedSegmentCount: 1,
+      affectedPersonIds: [],
+      canUndo: true,
+    }));
+    const applyParticipantReview = vi.fn(async () => ({
+      event: participantReviewEvent("review-split", "split"),
+      speakerProcessing: splitProcessing,
+    }));
+    installParticipantReviewApi(initialProcessing, {
+      previewParticipantReview,
+      applyParticipantReview,
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByRole("button", { name: "播放 人物 A 证据 1" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "拆分为新人物" }));
+    await waitFor(() => expect(previewParticipantReview).toHaveBeenCalledWith(input));
+    expect(screen.getByText(/影响 1 个声纹簇和 1 条转写证据/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+
+    await waitFor(() => expect(applyParticipantReview).toHaveBeenCalledWith(input));
+    expect(await screen.findByText("人物 B")).toBeInTheDocument();
+    expect(screen.getByText("预计 2 人；未检测到本人发言")).toBeInTheDocument();
+  });
+
+  it("forgets a confirmed identity without deleting the session participant evidence", async () => {
+    const cluster = reviewCluster("cluster-known", "说话人 1", {
+      linkState: "confirmed",
+      person: { id: "person-alice", displayName: "张三", isSelf: false },
+      evidenceSegmentIds: ["evidence-known"],
+    });
+    const knownParticipant = reviewParticipant(cluster, "张三", {
+      id: "known:person-alice",
+      kind: "known",
+      person: cluster.person,
+      reviewState: "confirmed",
+      durable: true,
+    });
+    const forgottenParticipant = reviewParticipant(
+      reviewCluster("cluster-known", "说话人 1", {
+        evidenceSegmentIds: ["evidence-known"],
+      }),
+      "未命名人物"
+    );
+    const initialProcessing = reviewSpeakerProcessing([knownParticipant]);
+    const forgottenProcessing = reviewSpeakerProcessing([forgottenParticipant]);
+    const input = {
+      sessionId: session.id,
+      action: "forget_identity",
+      clusterIds: [cluster.id],
+      personId: "person-alice",
+    } as unknown as JarvisParticipantReviewInput;
+    const previewParticipantReview = vi.fn(async () => ({
+      sessionId: session.id,
+      action: "forget_identity",
+      clusterIds: [cluster.id],
+      affectedClusterCount: 1,
+      affectedSegmentCount: 1,
+      affectedPersonIds: ["person-alice"],
+      canUndo: true,
+    }));
+    const applyParticipantReview = vi.fn(async () => ({
+      event: participantReviewEvent("review-forget", "forget_identity"),
+      speakerProcessing: forgottenProcessing,
+    }));
+    installParticipantReviewApi(initialProcessing, {
+      previewParticipantReview,
+      applyParticipantReview,
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("张三")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "忘记此身份" }));
+    await waitFor(() => expect(previewParticipantReview).toHaveBeenCalledWith(input));
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+
+    await waitFor(() => expect(applyParticipantReview).toHaveBeenCalledWith(input));
+    expect(await screen.findByText("未命名人物")).toBeInTheDocument();
+    expect(screen.queryByText("张三")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "播放 未命名人物 证据 1" })).toBeInTheDocument();
+  });
+
+  it("pins and unpins representative evidence through explicit retention-impact confirmation", async () => {
+    const cluster = reviewCluster("cluster-pin", "说话人 1", {
+      evidenceSegmentIds: ["evidence-pin"],
+    });
+    const participant = reviewParticipant(cluster, "人物 A");
+    const withPinnedState = (
+      value: JarvisSessionParticipant,
+      pinned: boolean
+    ): JarvisSessionParticipant => ({
+      ...value,
+      representativeSegments: value.representativeSegments.map((segment) => ({
+        ...segment,
+        pinned,
+      })),
+    });
+    const unpinnedProcessing = reviewSpeakerProcessing([withPinnedState(participant, false)]);
+    const pinnedProcessing = reviewSpeakerProcessing([withPinnedState(participant, true)]);
+    const pinInput = {
+      sessionId: session.id,
+      action: "pin_evidence",
+      clusterIds: [cluster.id],
+      segmentIds: ["evidence-pin"],
+    } as unknown as JarvisParticipantReviewInput;
+    const unpinInput = {
+      sessionId: session.id,
+      action: "unpin_evidence",
+      clusterIds: [cluster.id],
+      segmentIds: ["evidence-pin"],
+    } as unknown as JarvisParticipantReviewInput;
+    const previewParticipantReview = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sessionId: session.id,
+        action: "pin_evidence",
+        clusterIds: [cluster.id],
+        segmentIds: ["evidence-pin"],
+        affectedClusterCount: 1,
+        affectedSegmentCount: 1,
+        affectedPersonIds: [],
+        canUndo: true,
+      })
+      .mockResolvedValueOnce({
+        sessionId: session.id,
+        action: "unpin_evidence",
+        clusterIds: [cluster.id],
+        segmentIds: ["evidence-pin"],
+        affectedClusterCount: 1,
+        affectedSegmentCount: 1,
+        affectedPersonIds: [],
+        canUndo: true,
+      });
+    const applyParticipantReview = vi
+      .fn()
+      .mockResolvedValueOnce({
+        event: participantReviewEvent("review-pin", "pin_evidence"),
+        speakerProcessing: pinnedProcessing,
+      })
+      .mockResolvedValueOnce({
+        event: participantReviewEvent("review-unpin", "unpin_evidence"),
+        speakerProcessing: unpinnedProcessing,
+      });
+    installParticipantReviewApi(unpinnedProcessing, {
+      previewParticipantReview,
+      applyParticipantReview,
+    });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "固定证据" }));
+
+    await waitFor(() => expect(previewParticipantReview).toHaveBeenCalledWith(pinInput));
+    expect(screen.getByText(/固定后将不再按 7 天规则自动删除/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+    await waitFor(() => expect(applyParticipantReview).toHaveBeenCalledWith(pinInput));
+
+    fireEvent.click(await screen.findByRole("button", { name: "取消固定" }));
+    await waitFor(() => expect(previewParticipantReview).toHaveBeenCalledWith(unpinInput));
+    fireEvent.click(screen.getByRole("button", { name: "确认并保存" }));
+    await waitFor(() => expect(applyParticipantReview).toHaveBeenCalledWith(unpinInput));
+    expect(await screen.findByRole("button", { name: "固定证据" })).toBeInTheDocument();
+  });
+
+  it("loads an understandable immutable review history for the current session", async () => {
+    const cluster = reviewCluster("cluster-history", "说话人 1");
+    const processing = reviewSpeakerProcessing([reviewParticipant(cluster, "人物 A")]);
+    const listParticipantReviewHistory = vi.fn(async () => [
+      participantReviewEvent("review-history-2", "undo"),
+      {
+        ...participantReviewEvent("review-history-1", "merge"),
+        canUndo: false,
+      },
+    ]);
+    installParticipantReviewApi(processing, { listParticipantReviewHistory });
+
+    render(<MemoryView />);
+    fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
+    expect(await screen.findByText("人物 A")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "复核历史" }));
+
+    await waitFor(() =>
+      expect(listParticipantReviewHistory).toHaveBeenCalledWith(session.id)
+    );
+    expect(await screen.findByText("合并人物")).toBeInTheDocument();
+    expect(screen.getByText("撤销人物修正")).toBeInTheDocument();
+    expect(screen.queryByText("speaker_1")).not.toBeInTheDocument();
   });
 });

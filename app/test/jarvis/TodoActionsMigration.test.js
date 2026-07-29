@@ -13,7 +13,7 @@ test("v41 persists todo verification and permits only user completed-to-open und
       fromVersion: 0,
       toVersion: TARGET_VERSION,
     });
-    assert.equal(TARGET_VERSION, 46);
+    assert.equal(TARGET_VERSION, 47);
     db.prepare(
       `INSERT INTO todos_v2 (
          id, canonical_base_key, instance_key, title, status, provenance,

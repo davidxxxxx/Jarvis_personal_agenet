@@ -10,6 +10,20 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 - Evidence-gated Todos, suggestions, and local personalization.
 - Progressive Finish & Summarize session page and a compact home Action Center.
 
+## 0.2.0-alpha.29 - 2026-07-30
+
+- Replace raw diarization cluster counts with a session participant projection that identifies
+  verified SELF, known people, durable anonymous people, temporary candidates, and media voices
+  without presenting algorithm fragments as real people.
+- Add evidence-based participant review in Memory: playable clips, segment splits, reversible
+  merges, media marking, identity forgetting, pinned evidence, impact previews, and audit history.
+- Reorganize People into understandable SELF, known, anonymous, and review sections while keeping
+  game, video, duplicate capture, and anomalous legacy speaker evidence out of social profiles.
+- Migrate locally to schema v47 with immutable participant review events and idempotent participant
+  snapshots; trickle bounded historical snapshot backfill only while recording is idle.
+- Show conservative participant ranges until review is complete, preserve raw technical evidence
+  behind details, and report the larger of projector and legacy fragmented-evidence counts.
+
 ## 0.2.0-alpha.28 - 2026-07-28
 
 - Verify SQLite integrity before any startup write, use full WAL durability for Jarvis data, and

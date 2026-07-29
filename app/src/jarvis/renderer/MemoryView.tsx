@@ -1,10 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowLeft, BrainCircuit, Clock3, Cpu, History, Search, Users } from "lucide-react";
+import {
+  ArrowLeft,
+  AudioLines,
+  BrainCircuit,
+  Clock3,
+  Cpu,
+  History,
+  Play,
+  Search,
+  Users,
+} from "lucide-react";
 import type {
   JarvisRuntimeStatus,
+  JarvisParticipantReviewEvent,
+  JarvisParticipantReviewHistoryEvent,
+  JarvisParticipantReviewInput,
+  JarvisParticipantReviewPreview,
   JarvisSession,
   JarvisSessionDetail,
+  JarvisSessionParticipant,
+  JarvisSessionParticipantProjection,
   JarvisSessionTimeline,
   JarvisSpeakerClusterView,
 } from "../types";
@@ -31,6 +47,53 @@ function dateLabel(at: number): string {
 
 function speakerCountLabel(minimum: number, maximum: number): string {
   return minimum === maximum ? `${minimum} 人` : `${minimum}–${maximum} 人`;
+}
+
+function participantCountSummary(projection: JarvisSessionParticipantProjection): string {
+  if (projection.excluded.anomaly) {
+    return "历史声纹异常，人数需重新复核";
+  }
+  const { count } = projection;
+  const minimumOthers = Math.max(0, count.minimum - (count.selfIncluded ? 1 : 0));
+  const maximumOthers = Math.max(0, count.maximum - (count.selfIncluded ? 1 : 0));
+  const people = speakerCountLabel(count.minimum, count.maximum);
+  if (!count.selfIncluded) {
+    return `预计 ${people}；未检测到本人发言`;
+  }
+  return `预计 ${people}；我 + ${speakerCountLabel(minimumOthers, maximumOthers).replace(" 人", "")} 位其他参与者`;
+}
+
+function speechDurationLabel(speechMs: number): string {
+  const seconds = Math.max(0, Math.round(speechMs / 1_000));
+  if (seconds < 60) return `${seconds} 秒有效语音`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = seconds % 60;
+  return remaining > 0 ? `${minutes} 分 ${remaining} 秒有效语音` : `${minutes} 分钟有效语音`;
+}
+
+function participantStateLabel(participant: JarvisSessionParticipant): string {
+  if (participant.kind === "self") return "本人声纹已确认";
+  if (participant.kind === "known") return "已命名人物";
+  if (participant.kind === "anonymous") {
+    return participant.durable ? "匿名人物已跨会话关联" : "未命名人物";
+  }
+  return "待复核，人数可能调整";
+}
+
+function participantReviewActionLabel(
+  action: JarvisParticipantReviewEvent["action"]
+): string {
+  const labels: Record<JarvisParticipantReviewEvent["action"], string> = {
+    split: "拆分人物片段",
+    merge: "合并人物",
+    mark_media: "标记为媒体声音",
+    restore_social: "恢复为互动人物",
+    forget_identity: "忘记人物身份",
+    pin_evidence: "固定证据",
+    unpin_evidence: "取消固定证据",
+    undo: "撤销人物修正",
+  };
+  return labels[action];
 }
 
 export interface JarvisVisibleSpeakerGroup {
@@ -150,6 +213,7 @@ export default function MemoryView() {
   const clearEvidenceNavigation = useJarvisStore((state) => state.clearEvidenceNavigation);
   const clustersBySession = useJarvisStore((state) => state.clustersBySession);
   const loadSessionClusters = useJarvisStore((state) => state.loadSessionClusters);
+  const openEvidence = useJarvisStore((state) => state.openEvidence);
   const [sessions, setSessions] = useState(storedSessions);
   const [query, setQuery] = useState("");
   const [detail, setDetail] = useState<JarvisSessionDetail | null>(null);
@@ -159,6 +223,22 @@ export default function MemoryView() {
   const [loading, setLoading] = useState(false);
   const [sourcePageLoading, setSourcePageLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [participantReviewPreview, setParticipantReviewPreview] = useState<{
+    input: JarvisParticipantReviewInput;
+    preview: JarvisParticipantReviewPreview;
+  } | null>(null);
+  const [participantReviewBusy, setParticipantReviewBusy] = useState(false);
+  const [lastParticipantReview, setLastParticipantReview] =
+    useState<JarvisParticipantReviewEvent | null>(null);
+  const [participantReviewHistory, setParticipantReviewHistory] = useState<
+    JarvisParticipantReviewHistoryEvent[] | null
+  >(null);
+  const [participantReviewHistoryOpen, setParticipantReviewHistoryOpen] = useState(false);
+  const [participantReviewHistoryLoading, setParticipantReviewHistoryLoading] =
+    useState(false);
+  const [selectedParticipantIds, setSelectedParticipantIds] = useState<Set<string>>(
+    () => new Set()
+  );
   const detailRequestGeneration = useRef(0);
   const sourcePageRequestGeneration = useRef(0);
   const timelineRef = useRef<JarvisSessionTimeline | null>(null);
@@ -382,6 +462,9 @@ export default function MemoryView() {
       setSourcePageLoading(false);
       setLoading(true);
       setError(null);
+      setParticipantReviewPreview(null);
+      setLastParticipantReview(null);
+      setSelectedParticipantIds(new Set());
       try {
         const runtimeRequest =
           typeof window.electronAPI?.jarvis?.getRuntimeStatus === "function"
@@ -514,6 +597,82 @@ export default function MemoryView() {
     }
   };
 
+  const previewParticipantReview = async (input: JarvisParticipantReviewInput) => {
+    setParticipantReviewBusy(true);
+    setError(null);
+    try {
+      const preview = await window.electronAPI.jarvis.previewParticipantReview(input);
+      setParticipantReviewPreview({ input, preview });
+    } catch {
+      setError("无法预览这次人物修正，请稍后重试。");
+    } finally {
+      setParticipantReviewBusy(false);
+    }
+  };
+
+  const toggleParticipantReviewHistory = async () => {
+    if (!detail) return;
+    if (participantReviewHistoryOpen) {
+      setParticipantReviewHistoryOpen(false);
+      return;
+    }
+    setParticipantReviewHistoryOpen(true);
+    if (participantReviewHistory !== null) return;
+    setParticipantReviewHistoryLoading(true);
+    try {
+      setParticipantReviewHistory(
+        await window.electronAPI.jarvis.listParticipantReviewHistory(detail.session.id)
+      );
+    } catch {
+      setParticipantReviewHistoryOpen(false);
+      setError("人物复核历史暂时无法读取，请稍后重试。");
+    } finally {
+      setParticipantReviewHistoryLoading(false);
+    }
+  };
+
+  const applyParticipantReview = async () => {
+    if (!detail || !participantReviewPreview) return;
+    setParticipantReviewBusy(true);
+    setError(null);
+    try {
+      const result = await window.electronAPI.jarvis.applyParticipantReview(
+        participantReviewPreview.input
+      );
+      setDetail((current) =>
+        current ? { ...current, speakerProcessing: result.speakerProcessing } : current
+      );
+      setParticipantReviewPreview(null);
+      setSelectedParticipantIds(new Set());
+      setLastParticipantReview(result.event);
+      setParticipantReviewHistory(null);
+    } catch {
+      setError("人物修正未能保存，原有识别结果没有改变。");
+    } finally {
+      setParticipantReviewBusy(false);
+    }
+  };
+
+  const undoParticipantReview = async () => {
+    if (!lastParticipantReview) return;
+    setParticipantReviewBusy(true);
+    setError(null);
+    try {
+      const result = await window.electronAPI.jarvis.undoParticipantReview(
+        lastParticipantReview.id
+      );
+      setDetail((current) =>
+        current ? { ...current, speakerProcessing: result.speakerProcessing } : current
+      );
+      setLastParticipantReview(null);
+      setParticipantReviewHistory(null);
+    } catch {
+      setError("无法撤销这次人物修正。");
+    } finally {
+      setParticipantReviewBusy(false);
+    }
+  };
+
   if (detail) {
     const decisions = safeStringArray(detail.summary?.decisions_json);
     const suggestions = safeLegacySuggestions(detail.summary?.suggestions_json);
@@ -536,7 +695,24 @@ export default function MemoryView() {
     const visibleSpeakers = (speakerProcessing?.speakers ?? []).map(
       (cluster) => storedClusterUpdates.get(cluster.id) ?? cluster
     );
-    const visibleSpeakerGroups = groupConfirmedSpeakerPeople(visibleSpeakers);
+    const participantProjection = speakerProcessing?.participants ?? null;
+    const projectedParticipants = (participantProjection?.participants ?? []).map((participant) => {
+      const stored = storedClusterUpdates.get(participant.representativeCluster.id);
+      const storedMatchesProjection =
+        stored &&
+        (participant.person?.id
+          ? stored.person?.id === participant.person.id
+          : stored.linkState !== "confirmed");
+      return {
+        ...participant,
+        representativeCluster: storedMatchesProjection
+          ? stored
+          : participant.representativeCluster,
+      };
+    });
+    const selectedClusterIds = projectedParticipants
+      .filter((participant) => selectedParticipantIds.has(participant.id))
+      .flatMap((participant) => participant.clusterIds);
     const sessionStatusLabel =
       detail.session.status === "completed" && !summaryInputReady
         ? "录音已完成 · 后台处理中"
@@ -570,6 +746,11 @@ export default function MemoryView() {
             setDetail(null);
             setTimeline(null);
             setRuntimeStatus(null);
+            setParticipantReviewPreview(null);
+            setLastParticipantReview(null);
+            setParticipantReviewHistory(null);
+            setParticipantReviewHistoryOpen(false);
+            setSelectedParticipantIds(new Set());
           }}
           className="mb-5 flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
         >
@@ -658,63 +839,293 @@ export default function MemoryView() {
                 <div>
                   <h2 className="font-semibold">说话人与声纹</h2>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    {headlineSpeakerRun?.speakerCount
-                      ? `本次识别到 ${speakerCountLabel(
-                          headlineSpeakerRun.speakerCount.minimum,
-                          headlineSpeakerRun.speakerCount.maximum
-                        )}`
+                    {participantProjection
+                      ? participantCountSummary(participantProjection)
                       : timeline?.processing_state === "ready"
                         ? "本次没有可用的说话人结果"
                         : "正在后台复核人数和声纹"}
                   </p>
                 </div>
               </div>
-              {headlineSpeakerRun && (
-                <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
-                  {headlineSpeakerRun.inputVersion === 2
-                    ? headlineSpeakerRun.speakerCount?.state === "models_agree"
-                      ? "双模型一致"
-                      : "高精度复核"
-                    : "基础识别"}
-                </span>
-              )}
+              <div className="flex flex-wrap justify-end gap-2">
+                {participantProjection && (
+                  <>
+                    <span className="rounded-full bg-emerald-500/10 px-3 py-1 text-xs text-emerald-700 dark:text-emerald-300">
+                      已确认 {participantProjection.count.confirmed}
+                    </span>
+                    {participantProjection.count.needsReview > 0 && (
+                      <span className="rounded-full bg-amber-500/10 px-3 py-1 text-xs text-amber-700 dark:text-amber-300">
+                        待复核 {participantProjection.count.needsReview}
+                      </span>
+                    )}
+                    {participantProjection.mediaVoices.length > 0 && (
+                      <span className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+                        已排除 {participantProjection.mediaVoices.length} 组媒体声音
+                      </span>
+                    )}
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void toggleParticipantReviewHistory()}
+                  disabled={participantReviewHistoryLoading}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-border/60 px-3 py-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+                >
+                  <History className="size-3.5" aria-hidden="true" />
+                  复核历史
+                </button>
+              </div>
             </div>
-            {visibleSpeakerGroups.length > 0 ? (
-              <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                {visibleSpeakerGroups.map((group) => {
-                  const cluster = group.representative;
+            {participantReviewPreview && (
+              <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
+                <p className="text-sm font-medium">确认人物修正</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  这次操作会影响 {participantReviewPreview.preview.affectedClusterCount}{" "}
+                  个声纹簇和 {participantReviewPreview.preview.affectedSegmentCount} 条转写证据。
+                  原结果会保留在本地历史中，可以立即撤销。
+                </p>
+                {participantReviewPreview.input.action === "pin_evidence" && (
+                  <p className="mt-1 text-xs leading-5 text-amber-800 dark:text-amber-200">
+                    固定后将不再按 7 天规则自动删除；取消固定后会重新遵循音频保留期。
+                  </p>
+                )}
+                <div className="mt-3 flex gap-2">
+                  <button
+                    type="button"
+                    disabled={participantReviewBusy}
+                    onClick={() => setParticipantReviewPreview(null)}
+                    className="rounded-lg border border-border px-3 py-1.5 text-xs"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    disabled={participantReviewBusy}
+                    onClick={() => void applyParticipantReview()}
+                    className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+                  >
+                    {participantReviewBusy ? "正在保存…" : "确认并保存"}
+                  </button>
+                </div>
+              </div>
+            )}
+            {lastParticipantReview && (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-200">
+                <span>人物修正已保存；会话人数和媒体排除已重新计算。</span>
+                <button
+                  type="button"
+                  disabled={participantReviewBusy}
+                  onClick={() => void undoParticipantReview()}
+                  className="font-medium underline underline-offset-2 disabled:opacity-50"
+                >
+                  撤销
+                </button>
+              </div>
+            )}
+            {participantReviewHistoryOpen && (
+              <div className="mt-4 rounded-xl border border-border/50 bg-muted/20 p-3">
+                <p className="text-sm font-medium">复核历史</p>
+                {participantReviewHistoryLoading ? (
+                  <p className="mt-2 text-xs text-muted-foreground">正在读取…</p>
+                ) : (participantReviewHistory?.length ?? 0) > 0 ? (
+                  <ol className="mt-2 space-y-2">
+                    {participantReviewHistory?.map((event) => (
+                      <li
+                        key={event.id}
+                        className="flex items-center justify-between gap-3 rounded-lg bg-background/70 px-3 py-2 text-xs"
+                      >
+                        <span>{participantReviewActionLabel(event.action)}</span>
+                        <span className="text-muted-foreground">
+                          {new Date(event.createdAt).toLocaleString("zh-CN")}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="mt-2 text-xs text-muted-foreground">还没有人工复核记录。</p>
+                )}
+              </div>
+            )}
+            {selectedClusterIds.length >= 2 && (
+              <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-border/50 bg-muted/20 px-3 py-2">
+                <span className="text-xs text-muted-foreground">
+                  已选择 {selectedParticipantIds.size} 位候选人物
+                </span>
+                <button
+                  type="button"
+                  disabled={participantReviewBusy}
+                  onClick={() =>
+                    void previewParticipantReview({
+                      sessionId: detail.session.id,
+                      action: "merge",
+                      clusterIds: selectedClusterIds,
+                    })
+                  }
+                  className="rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary"
+                >
+                  确认是同一人
+                </button>
+              </div>
+            )}
+            {projectedParticipants.length > 0 ? (
+              <div className="mt-4 grid gap-3 xl:grid-cols-2">
+                {projectedParticipants.map((participant) => {
+                  const cluster = participant.representativeCluster;
                   return (
                   <div
-                    key={group.key}
-                    className="flex items-center justify-between gap-3 rounded-lg bg-muted/30 px-3 py-2.5"
+                    key={participant.id}
+                    className="min-w-0 rounded-xl border border-border/50 bg-muted/20 p-3"
                   >
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-xs font-medium text-muted-foreground">
-                          {group.clusterCount > 1
-                            ? `${group.localLabels.slice(0, 2).join(" · ")} · ${group.clusterCount} 个声纹簇`
-                            : cluster.localLabel}
-                        </span>
-                        <SpeakerChip cluster={cluster} localLabel={cluster.localLabel} />
+                    <div className="flex min-w-0 items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {!(cluster.linkState === "confirmed" && cluster.person) && (
+                            <span className="font-medium">{participant.displayName}</span>
+                          )}
+                          <SpeakerChip cluster={cluster} localLabel={participant.displayName} />
+                        </div>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {participantStateLabel(participant)}
+                          {participant.sourceNames.length > 0
+                            ? ` · ${participant.sourceNames.join("、")}`
+                            : ""}
+                        </p>
                       </div>
-                      <p className="mt-1 truncate text-xs text-muted-foreground">
-                        {cluster.person?.isSelf
-                          ? group.clusterCount > 1
-                            ? `本人声纹已确认 · 已合并 ${group.clusterCount} 个声纹簇`
-                            : "本人声纹已确认"
-                          : cluster.linkState === "confirmed"
-                            ? group.clusterCount > 1
-                              ? `已加入长期人物档案 · 已合并 ${group.clusterCount} 个声纹簇`
-                              : "已加入长期人物档案"
-                            : cluster.suggestedPerson
-                              ? `可能是 ${cluster.suggestedPerson.displayName}`
-                              : "点击标签可指定姓名并选择是否长期学习"}
-                      </p>
-                    </div>
-                    {typeof cluster.score === "number" && (
                       <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                        {Math.round(cluster.score * 100)}%
+                        {speechDurationLabel(participant.speechMs)}
                       </span>
+                    </div>
+                    {participant.kind !== "self" && (
+                      <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border/40 pt-2.5 text-xs">
+                        <label className="flex cursor-pointer items-center gap-1.5 text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            aria-label={`选择合并 ${participant.displayName}`}
+                            checked={selectedParticipantIds.has(participant.id)}
+                            onChange={(event) =>
+                              setSelectedParticipantIds((current) => {
+                                const next = new Set(current);
+                                if (event.target.checked) next.add(participant.id);
+                                else next.delete(participant.id);
+                                return next;
+                              })
+                            }
+                            className="size-3.5 accent-primary"
+                          />
+                          选择合并
+                        </label>
+                        <button
+                          type="button"
+                          disabled={participantReviewBusy}
+                          onClick={() =>
+                            void previewParticipantReview({
+                              sessionId: detail.session.id,
+                              action: "mark_media",
+                              clusterIds: participant.clusterIds,
+                            })
+                          }
+                          className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                        >
+                          标记为媒体声音
+                        </button>
+                        {participant.kind === "known" && participant.person && (
+                          <button
+                            type="button"
+                            disabled={participantReviewBusy}
+                            onClick={() =>
+                              void previewParticipantReview({
+                                sessionId: detail.session.id,
+                                action: "forget_identity",
+                                clusterIds: participant.clusterIds,
+                                personId: participant.person?.id,
+                              })
+                            }
+                            className="text-destructive underline-offset-2 hover:underline"
+                          >
+                            忘记此身份
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    {participant.representativeSegments.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        {participant.representativeSegments.map((segment, index) => (
+                          <div
+                            key={segment.id}
+                            className="rounded-lg border border-border/40 bg-background/60 p-2"
+                          >
+                            <button
+                              type="button"
+                              aria-label={`播放 ${participant.displayName} 证据 ${index + 1}`}
+                              onClick={() =>
+                                void openEvidence({
+                                  ownerType: "speaker_cluster",
+                                  ownerId: segment.clusterId,
+                                  evidenceId: segment.id,
+                                })
+                              }
+                              className="group flex w-full min-w-0 items-center gap-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                            >
+                              <span className="grid size-7 shrink-0 place-items-center rounded-full bg-primary/10 text-primary">
+                                <Play className="size-3.5 fill-current" aria-hidden="true" />
+                              </span>
+                              <AudioLines
+                                className="size-4 shrink-0 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate text-xs text-foreground/80">
+                                  {segment.text || "无可用转写"}
+                                </span>
+                                <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                                  {segment.sourceName} ·{" "}
+                                  {new Date(segment.started_at).toLocaleTimeString("zh-CN", {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                    second: "2-digit",
+                                  })}
+                                </span>
+                              </span>
+                            </button>
+                            <div className="mt-2 flex flex-wrap gap-3 border-t border-border/30 pt-2 text-[11px]">
+                              {participant.kind !== "self" && (
+                                <button
+                                  type="button"
+                                  disabled={participantReviewBusy}
+                                  onClick={() =>
+                                    void previewParticipantReview({
+                                      sessionId: detail.session.id,
+                                      action: "split",
+                                      clusterIds: [segment.clusterId],
+                                      segmentIds: [segment.id],
+                                    })
+                                  }
+                                  className="text-muted-foreground hover:text-foreground"
+                                >
+                                  拆分为新人物
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                disabled={participantReviewBusy}
+                                onClick={() =>
+                                  void previewParticipantReview({
+                                    sessionId: detail.session.id,
+                                    action: segment.pinned
+                                      ? "unpin_evidence"
+                                      : "pin_evidence",
+                                    clusterIds: [segment.clusterId],
+                                    segmentIds: [segment.id],
+                                  })
+                                }
+                                className="text-primary"
+                              >
+                                {segment.pinned ? "取消固定" : "固定证据"}
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                     )}
                   </div>
                   );
@@ -727,11 +1138,53 @@ export default function MemoryView() {
                   : "录音已安全保存；GPU 空闲后会自动补齐说话人分离和跨会话关联。"}
                 </p>
               )}
-            {(speakerProcessing?.fragmentedEvidenceCount ?? 0) > 0 && (
+            {Math.max(
+              participantProjection?.excluded.fragmented ?? 0,
+              speakerProcessing?.fragmentedEvidenceCount ?? 0
+            ) > 0 && (
               <p className="mt-3 text-xs leading-5 text-muted-foreground">
-                已隐藏 {speakerProcessing?.fragmentedEvidenceCount} 个过短或重复的声纹碎片；它们只是算法证据，
+                已隐藏{" "}
+                {Math.max(
+                  participantProjection?.excluded.fragmented ?? 0,
+                  speakerProcessing?.fragmentedEvidenceCount ?? 0
+                )}{" "}
+                个过短或重复的声纹碎片；它们只是算法证据，
                 不计作真实人物。
               </p>
+            )}
+            {(participantProjection?.mediaVoices.length ?? 0) > 0 && (
+              <details className="mt-3 rounded-lg border border-border/50 bg-muted/20">
+                <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground">
+                  查看已排除的媒体声音（{participantProjection?.mediaVoices.length}）
+                </summary>
+                <div className="space-y-2 border-t border-border/40 p-3">
+                  {participantProjection?.mediaVoices.map((voice) => (
+                    <div
+                      key={voice.id}
+                      className="flex flex-wrap items-center justify-between gap-2 text-xs"
+                    >
+                      <span>
+                        {voice.displayName} · {voice.sourceNames.join("、")} ·{" "}
+                        {speechDurationLabel(voice.speechMs)}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={participantReviewBusy}
+                        onClick={() =>
+                          void previewParticipantReview({
+                            sessionId: detail.session.id,
+                            action: "restore_social",
+                            clusterIds: voice.clusterIds,
+                          })
+                        }
+                        className="text-primary underline-offset-2 hover:underline"
+                      >
+                        改为互动人物
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </details>
             )}
           </section>
           <section className="order-1 mt-6 rounded-xl border border-border/50 bg-card p-5">
@@ -858,6 +1311,23 @@ export default function MemoryView() {
                       })}
                     </ul>
                   </div>
+                )}
+                {visibleSpeakers.length > 0 && (
+                  <details className="mb-4 rounded-lg border border-border/50 bg-muted/20">
+                    <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground">
+                      技术详情：{visibleSpeakers.length} 个原始声纹簇
+                    </summary>
+                    <ul className="max-h-48 space-y-1 overflow-y-auto border-t border-border/40 p-3 text-[11px] text-muted-foreground">
+                      {visibleSpeakers.map((cluster) => (
+                        <li key={cluster.id} className="flex flex-wrap gap-x-2">
+                          <span>技术标签：{cluster.localLabel}</span>
+                          <span>{cluster.linkState}</span>
+                          <span>{speechDurationLabel(cluster.speechMs)}</span>
+                          {cluster.candidatePersonRef && <span>匿名人物关联</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 )}
                 <ProcessingStatus timeline={timeline} runtimeStatus={runtimeStatus} />
               </div>

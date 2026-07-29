@@ -16,7 +16,7 @@ const V34_TABLES = [
 test("v34 adds encrypted dual-speaker evidence and activity classification history", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 46);
+    assert.equal(TARGET_VERSION, 47);
     applyJarvisMigrations(db);
     for (const table of V34_TABLES) {
       assert.ok(

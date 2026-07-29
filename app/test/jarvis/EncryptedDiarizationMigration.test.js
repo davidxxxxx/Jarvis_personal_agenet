@@ -125,7 +125,7 @@ test("v35 admits encrypted diarization evidence, repairs app-track generations, 
       fromVersion: 34,
       toVersion: TARGET_VERSION,
     });
-    assert.equal(TARGET_VERSION, 46);
+    assert.equal(TARGET_VERSION, 47);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     assert.deepEqual(
       db

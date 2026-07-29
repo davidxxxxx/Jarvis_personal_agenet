@@ -330,6 +330,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     getRuntimeStatus: () => ipcRenderer.invoke("jarvis:runtime:status"),
     searchMemory: (query, limit) => ipcRenderer.invoke("jarvis:memory:search", query, limit),
     listPeopleOverview: () => ipcRenderer.invoke("jarvis:memory:people"),
+    listPeopleReviewOverview: () => ipcRenderer.invoke("jarvis:memory:people-review"),
+    previewParticipantReview: (input) =>
+      ipcRenderer.invoke("jarvis:participant-review:preview", input),
+    applyParticipantReview: (input) =>
+      ipcRenderer.invoke("jarvis:participant-review:apply", input),
+    undoParticipantReview: (eventId) =>
+      ipcRenderer.invoke("jarvis:participant-review:undo", eventId),
+    listParticipantReviewHistory: (sessionId) =>
+      ipcRenderer.invoke("jarvis:participant-review:history", sessionId),
     getPersonDetail: (personId) => ipcRenderer.invoke("jarvis:memory:person-detail", personId),
     listTopics: () => ipcRenderer.invoke("jarvis:memory:topics"),
     getTopicDetail: (topicId) => ipcRenderer.invoke("jarvis:memory:topic-detail", topicId),

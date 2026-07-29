@@ -38,12 +38,22 @@ function pairEvidence(left, right, thresholds) {
   };
 }
 
+function sourceCompatible(left, right) {
+  const leftGroup =
+    typeof left.sourceGroup === "string" && left.sourceGroup ? left.sourceGroup : null;
+  const rightGroup =
+    typeof right.sourceGroup === "string" && right.sourceGroup ? right.sourceGroup : null;
+  if (leftGroup === null && rightGroup === null) return true;
+  return leftGroup !== null && leftGroup === rightGroup;
+}
+
 function bestPeer(candidate, candidates, thresholds) {
   const ranked = candidates
     .filter(
       (other) =>
         other.clusterId !== candidate.clusterId &&
-        other.trackId !== candidate.trackId
+        other.trackId !== candidate.trackId &&
+        sourceCompatible(candidate, other)
     )
     .map((other) => ({
       candidate: other,
@@ -143,7 +153,11 @@ function clusterAnonymousSpeakers(
         return {
           members,
           passed:
-            members.some((member) => member.trackId !== candidate.trackId) &&
+            members.some(
+              (member) =>
+                member.trackId !== candidate.trackId &&
+                sourceCompatible(candidate, member)
+            ) &&
             evidence.every((item) => item.passed),
           score: Math.min(...evidence.map((item) => item.score)),
         };
@@ -181,4 +195,5 @@ function clusterAnonymousSpeakers(
 
 module.exports = {
   clusterAnonymousSpeakers,
+  sourceCompatible,
 };

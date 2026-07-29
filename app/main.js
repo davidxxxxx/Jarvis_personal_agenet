@@ -307,6 +307,7 @@ const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
 const VoiceSpeechDurationMeasurer = require("./src/jarvis/main/VoiceSpeechDurationMeasurer");
 const VoiceEmbeddingCipher = require("./src/jarvis/main/VoiceEmbeddingCipher");
 const HistoricalSelfVoiceRecoveryService = require("./src/jarvis/main/HistoricalSelfVoiceRecoveryService");
+const ParticipantReviewBackfillService = require("./src/jarvis/main/ParticipantReviewBackfillService");
 const secretCrypto = require("./src/helpers/secretCrypto");
 const {
   DataRootConfig,
@@ -392,6 +393,8 @@ let rendererShutdownHandshake = null;
 let jarvisPowerLifecycle = null;
 let rendererPowerResumeHandshake = null;
 let jarvisLocalDateTimer = null;
+let participantReviewBackfillService = null;
+let participantReviewBackfillTimer = null;
 let applicationAudioLifecycleCoordinator = null;
 const foregroundActivityProvider = createWindowsForegroundActivityProvider();
 const jarvisOwnedPidsProvider = createJarvisOwnedPidsProvider({
@@ -406,6 +409,46 @@ function resolveConfiguredJarvisWhisperModel() {
     env: process.env,
     whisperManager,
   });
+}
+
+const PARTICIPANT_REVIEW_BACKFILL_LIMIT = 4;
+const PARTICIPANT_REVIEW_BACKFILL_RETRY_MS = 60_000;
+
+function scheduleParticipantReviewBackfill(
+  scope = "recent_audio",
+  delayMs = 15_000
+) {
+  if (participantReviewBackfillTimer || !participantReviewBackfillService) return;
+  participantReviewBackfillTimer = setTimeout(() => {
+    participantReviewBackfillTimer = null;
+    const state = jarvisService?.getState?.();
+    if (state?.status && state.status !== "idle") {
+      scheduleParticipantReviewBackfill(scope, PARTICIPANT_REVIEW_BACKFILL_RETRY_MS);
+      return;
+    }
+    void participantReviewBackfillService
+      .runOnce({ scope })
+      .then((result) => {
+        debugLogger?.info("Jarvis participant review backfill", result, "jarvis");
+        if (result.state !== "completed") return;
+        if (result.inspected >= PARTICIPANT_REVIEW_BACKFILL_LIMIT) {
+          scheduleParticipantReviewBackfill(scope, PARTICIPANT_REVIEW_BACKFILL_RETRY_MS);
+        } else if (scope === "recent_audio") {
+          scheduleParticipantReviewBackfill(
+            "metadata_cleanup",
+            PARTICIPANT_REVIEW_BACKFILL_RETRY_MS
+          );
+        }
+      })
+      .catch((error) => {
+        debugLogger?.warn(
+          "Jarvis participant review backfill failed",
+          { error: error?.message ?? String(error) },
+          "jarvis"
+        );
+      });
+  }, delayMs);
+  participantReviewBackfillTimer.unref?.();
 }
 
 function buildJarvisProcessingRuntime() {
@@ -596,6 +639,21 @@ async function initializeCoreManagers() {
     validateRedactedCloudPayload: (input) =>
       jarvisAnalysisInputBuilder.verifyRedactedCloudPayload(input),
     embeddingCipher: voiceEmbeddingCipher,
+  });
+  participantReviewBackfillService = new ParticipantReviewBackfillService({
+    repository: jarvisRepository,
+    limit: PARTICIPANT_REVIEW_BACKFILL_LIMIT,
+    log: ({ phase, batchId, sessionId, error }) =>
+      debugLogger?.warn(
+        "Jarvis participant review backfill session failed",
+        {
+          phase,
+          batchId,
+          sessionId,
+          error: error?.message ?? String(error),
+        },
+        "jarvis"
+      ),
   });
   const speakerCorrectionService = new SpeakerCorrectionService({
     repository: jarvisRepository,
@@ -1630,6 +1688,10 @@ async function startApp() {
     await windowManager.createControlPanelWindow();
   }
 
+  // Historical participant snapshots are local-only and deliberately trickled
+  // after the first visible window. Active recording always takes priority.
+  scheduleParticipantReviewBackfill();
+
   // Retention can touch hundreds of files; begin only after the first user-visible windows exist.
   retentionCleaner.start();
   void retentionCleaner.clean(Date.now()).catch(() => {
@@ -2472,10 +2534,17 @@ function performGracefulTeardown() {
       () => {
         if (jarvisLocalDateTimer) clearInterval(jarvisLocalDateTimer);
         jarvisLocalDateTimer = null;
+        if (participantReviewBackfillTimer) clearTimeout(participantReviewBackfillTimer);
+        participantReviewBackfillTimer = null;
         jarvisPowerLifecycle = null;
         applicationAudioLifecycleCoordinator = null;
         rendererPowerResumeHandshake?.markUnavailable("application shutting down");
         rendererPowerResumeHandshake = null;
+      },
+      async () => {
+        const service = participantReviewBackfillService;
+        participantReviewBackfillService = null;
+        await service?.stop();
       },
       closeAuthBridge,
       () => {

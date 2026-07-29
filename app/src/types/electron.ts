@@ -40,6 +40,11 @@ import type {
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
   JarvisPersonOverview,
+  JarvisPeopleReviewOverview,
+  JarvisParticipantReviewInput,
+  JarvisParticipantReviewHistoryEvent,
+  JarvisParticipantReviewPreview,
+  JarvisParticipantReviewResult,
   JarvisConfirmSpeakerInput,
   JarvisSpeakerClusterView,
   JarvisSpeakerConfirmationResult,
@@ -651,6 +656,17 @@ declare global {
         getRuntimeStatus: () => Promise<JarvisRuntimeStatus>;
         searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
         listPeopleOverview: () => Promise<JarvisPersonOverview[]>;
+        listPeopleReviewOverview: () => Promise<JarvisPeopleReviewOverview>;
+        previewParticipantReview: (
+          input: JarvisParticipantReviewInput
+        ) => Promise<JarvisParticipantReviewPreview>;
+        applyParticipantReview: (
+          input: JarvisParticipantReviewInput
+        ) => Promise<JarvisParticipantReviewResult>;
+        undoParticipantReview: (eventId: string) => Promise<JarvisParticipantReviewResult>;
+        listParticipantReviewHistory: (
+          sessionId: string
+        ) => Promise<JarvisParticipantReviewHistoryEvent[]>;
         getPersonDetail: (personId: string) => Promise<JarvisPersonDetail | null>;
         listTopics: () => Promise<JarvisTopic[]>;
         getTopicDetail: (topicId: string) => Promise<JarvisTopicDetail | null>;

@@ -453,7 +453,7 @@ test("v22 persists revisioned identity resolution history", (t) => {
 
 test("v46 repairs confirmed speaker projections created before system resolution synced transcripts", (t) => {
   const repository = fixture(t);
-  assert.equal(TARGET_VERSION, 46);
+  assert.equal(TARGET_VERSION, 47);
   repository.renamePerson({ personId: "person-a", displayName: "Person A" });
   repository.db.exec(`
     INSERT INTO transcript_segments (

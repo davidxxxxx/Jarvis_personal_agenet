@@ -255,6 +255,11 @@ class SpeakerIdentityRepository {
         WHERE session_id = ?
         ORDER BY track_id, local_label, id
       `),
+      listConfirmedSessionClusterIds: db.prepare(`
+        SELECT id FROM speaker_clusters
+        WHERE session_id = ? AND link_state = 'confirmed'
+        ORDER BY id
+      `),
       listClusterSegments: db.prepare(`
         SELECT transcript_segment_id FROM speaker_cluster_segments
         WHERE cluster_id = ? ORDER BY transcript_segment_id
@@ -294,8 +299,11 @@ class SpeakerIdentityRepository {
         ORDER BY correction.created_at DESC, correction.rowid DESC
       `),
       listProfiles: db.prepare(`
-        SELECT * FROM voice_profile_samples
-        WHERE model_id = ? ORDER BY person_id, created_at, id
+        SELECT sample.* FROM voice_profile_samples AS sample
+        LEFT JOIN speaker_identity_review_overrides AS forgotten
+          ON forgotten.person_id = sample.person_id AND forgotten.state = 'forgotten'
+        WHERE sample.model_id = ? AND forgotten.person_id IS NULL
+        ORDER BY sample.person_id, sample.created_at, sample.id
       `),
       deleteClusterModelEmbeddings: db.prepare(`
         DELETE FROM speaker_cluster_model_embeddings WHERE cluster_id = ?
@@ -1336,6 +1344,10 @@ class SpeakerIdentityRepository {
       lastRejectedPerson: this._mapPersonSummary(rejectedPerson),
       score: row.match_score,
       margin: row.match_margin,
+      candidatePersonRef: resolution?.candidate_person_ref ?? null,
+      speechMs: row.speech_ms,
+      windowCount: row.window_count,
+      qualityScore: row.quality_score,
       reason: this._correctionReason(correction, resolution),
       policyId: resolution?.policy_id ?? "unresolved",
       diarizationRevision: resolution?.diarization_revision ?? "",
@@ -1588,6 +1600,12 @@ class SpeakerIdentityRepository {
     return this.statements.listSessionClusters
       .all(assertId(sessionId, "sessionId"))
       .map((row) => this._mapCluster(row));
+  }
+
+  listConfirmedSessionClusterIds(sessionId) {
+    return this.statements.listConfirmedSessionClusterIds
+      .all(assertId(sessionId, "sessionId"))
+      .map((row) => row.id);
   }
 
   getClusterView(clusterId) {

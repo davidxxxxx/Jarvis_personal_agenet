@@ -41,6 +41,24 @@ function compareClusters(left, right) {
   );
 }
 
+function anonymousSourceGroup(cluster) {
+  if (typeof cluster?.applicationKey === "string" && cluster.applicationKey.trim()) {
+    return `application:${cluster.applicationKey.trim().toLocaleLowerCase()}`;
+  }
+  if (cluster?.trackKind === "mic") return "microphone";
+  if (cluster?.trackKind === "system_mix") return "system_mix";
+  return null;
+}
+
+function canReplaceWeakCandidate(result) {
+  return new Set([
+    "primary_gate_failed",
+    "review_gate_failed",
+    "models_disagree",
+    "no_dual_candidate",
+  ]).has(result?.reason);
+}
+
 class SpeakerIdentityResolutionWorker {
   constructor({
     repository,
@@ -198,10 +216,14 @@ class SpeakerIdentityResolutionWorker {
                 samples: snapshot.samples,
                 rejectedPersonIds,
               });
-              if (result.state === "unknown" && !result.candidatePersonRef) {
+              if (
+                result.state === "unknown" &&
+                (!result.candidatePersonRef || canReplaceWeakCandidate(result))
+              ) {
                 anonymousEvidence.push({
                   clusterId: cluster.clusterId,
                   trackId: cluster.trackId,
+                  sourceGroup: anonymousSourceGroup(cluster),
                   speechMs: evidence.speechMs,
                   windowCount: evidence.windowCount,
                   qualityScore: evidence.qualityScore,
@@ -243,10 +265,11 @@ class SpeakerIdentityResolutionWorker {
         if (
           !assignment ||
           result.state !== "unknown" ||
-          result.candidatePersonRef
+          (result.candidatePersonRef && !canReplaceWeakCandidate(result))
         ) {
           continue;
         }
+        result.candidatePersonId = null;
         result.candidatePersonRef = assignment.candidatePersonRef;
         result.score = assignment.score;
         result.margin = assignment.margin;

@@ -1007,6 +1007,21 @@ function registerJarvisIpc({
     return sessions.map(toRendererSession);
   });
   ipcMain.handle(CHANNELS.listPeopleOverview, () => repository.listPeopleOverview());
+  ipcMain.handle(CHANNELS.listPeopleReviewOverview, () =>
+    repository.listPeopleReviewOverview()
+  );
+  ipcMain.handle(CHANNELS.previewParticipantReview, (_event, input) =>
+    repository.previewParticipantReview(input)
+  );
+  ipcMain.handle(CHANNELS.applyParticipantReview, (_event, input) =>
+    repository.applyParticipantReview(input)
+  );
+  ipcMain.handle(CHANNELS.undoParticipantReview, (_event, eventId) =>
+    repository.undoParticipantReview(assertId(eventId, "participantReviewEventId"))
+  );
+  ipcMain.handle(CHANNELS.listParticipantReviewHistory, (_event, sessionId) =>
+    repository.listParticipantReviewHistory(assertId(sessionId, "sessionId"))
+  );
   ipcMain.handle(CHANNELS.getPersonDetail, (_event, personId) =>
     repository.getPersonDetail(assertId(personId, "personId"))
   );

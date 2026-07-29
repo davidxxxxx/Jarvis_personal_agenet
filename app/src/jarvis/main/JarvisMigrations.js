@@ -1,6 +1,6 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 
-const TARGET_VERSION = 46;
+const TARGET_VERSION = 47;
 const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
@@ -7112,6 +7112,199 @@ function upgradeSpeakerTranscriptProjectionV46(db) {
   `);
 }
 
+function upgradeParticipantReviewV47(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_participant_snapshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+      projector_version TEXT NOT NULL CHECK(length(trim(projector_version)) BETWEEN 1 AND 128),
+      source_hash TEXT NOT NULL CHECK(
+        length(source_hash) = 64 AND source_hash NOT GLOB '*[^0-9a-f]*'
+      ),
+      payload_json TEXT NOT NULL CHECK(
+        json_valid(payload_json) AND json_type(payload_json) = 'object'
+      ),
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      UNIQUE(session_id, revision),
+      UNIQUE(session_id, source_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS session_participant_snapshot_clusters (
+      snapshot_id TEXT NOT NULL
+        REFERENCES session_participant_snapshots(id) ON DELETE CASCADE,
+      participant_ref TEXT NOT NULL CHECK(length(trim(participant_ref)) BETWEEN 1 AND 200),
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      membership_kind TEXT NOT NULL
+        CHECK(membership_kind IN ('self','known','anonymous','reviewed','temporary','media')),
+      PRIMARY KEY(snapshot_id, participant_ref, cluster_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS participant_review_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      action TEXT NOT NULL CHECK(action IN (
+        'confirm','split','merge','mark_media','restore_social',
+        'forget_identity','pin_evidence','unpin_evidence','undo'
+      )),
+      subject_ref TEXT NOT NULL CHECK(length(trim(subject_ref)) BETWEEN 1 AND 256),
+      payload_json TEXT NOT NULL CHECK(
+        json_valid(payload_json) AND json_type(payload_json) = 'object'
+      ),
+      previous_state_json TEXT NOT NULL CHECK(
+        json_valid(previous_state_json) AND json_type(previous_state_json) = 'object'
+      ),
+      next_state_json TEXT NOT NULL CHECK(
+        json_valid(next_state_json) AND json_type(next_state_json) = 'object'
+      ),
+      reverts_event_id TEXT UNIQUE REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      CHECK(
+        (action = 'undo' AND reverts_event_id IS NOT NULL)
+        OR (action <> 'undo' AND reverts_event_id IS NULL)
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_cluster_review_overrides (
+      cluster_id TEXT PRIMARY KEY REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      group_ref TEXT CHECK(
+        group_ref IS NULL OR length(trim(group_ref)) BETWEEN 1 AND 200
+      ),
+      disposition TEXT NOT NULL CHECK(disposition IN ('social','media','unknown')),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_segment_review_overrides (
+      transcript_segment_id TEXT PRIMARY KEY
+        REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      group_ref TEXT NOT NULL CHECK(length(trim(group_ref)) BETWEEN 1 AND 200),
+      disposition TEXT NOT NULL CHECK(disposition IN ('social','media','unknown')),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_identity_review_overrides (
+      person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+      state TEXT NOT NULL CHECK(state = 'forgotten'),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS participant_review_backfill_batches (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL CHECK(scope IN ('recent_audio','all_retained_audio','metadata_cleanup')),
+      state TEXT NOT NULL CHECK(state IN ('queued','running','completed','failed','cancelled')),
+      session_count INTEGER NOT NULL DEFAULT 0 CHECK(session_count >= 0),
+      processed_count INTEGER NOT NULL DEFAULT 0 CHECK(
+        processed_count >= 0 AND processed_count <= session_count
+      ),
+      changed_count INTEGER NOT NULL DEFAULT 0 CHECK(
+        changed_count >= 0 AND changed_count <= processed_count
+      ),
+      error_code TEXT,
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      started_at INTEGER,
+      completed_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS pinned_speaker_evidence (
+      transcript_segment_id TEXT PRIMARY KEY
+        REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      label TEXT CHECK(label IS NULL OR length(trim(label)) BETWEEN 1 AND 200),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      pinned_at INTEGER NOT NULL CHECK(typeof(pinned_at) = 'integer' AND pinned_at >= 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_participant_snapshots_session_created
+      ON session_participant_snapshots(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_participant_review_events_session_created
+      ON participant_review_events(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cluster_review_overrides_session
+      ON speaker_cluster_review_overrides(session_id, disposition, group_ref);
+    CREATE INDEX IF NOT EXISTS idx_segment_review_overrides_session
+      ON speaker_segment_review_overrides(session_id, disposition, group_ref);
+    CREATE INDEX IF NOT EXISTS idx_identity_review_overrides_state
+      ON speaker_identity_review_overrides(state, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_participant_backfill_state_created
+      ON participant_review_backfill_batches(state, created_at);
+
+    CREATE TRIGGER IF NOT EXISTS participant_review_events_immutable_update
+    BEFORE UPDATE ON participant_review_events
+    BEGIN
+      SELECT RAISE(ABORT, 'participant review event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS participant_review_events_immutable_delete
+    BEFORE DELETE ON participant_review_events
+    BEGIN
+      SELECT RAISE(ABORT, 'participant review event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_cluster_review_override_insert
+    BEFORE INSERT ON speaker_cluster_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker cluster review session mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM speaker_clusters AS cluster
+        WHERE cluster.id = NEW.cluster_id AND cluster.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_cluster_review_override_update
+    BEFORE UPDATE OF cluster_id, session_id ON speaker_cluster_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker cluster review session mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM speaker_clusters AS cluster
+        WHERE cluster.id = NEW.cluster_id AND cluster.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_segment_review_override_insert
+    BEFORE INSERT ON speaker_segment_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker segment review lineage mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN transcript_segments AS segment ON segment.id = link.transcript_segment_id
+        WHERE link.cluster_id = NEW.cluster_id
+          AND link.transcript_segment_id = NEW.transcript_segment_id
+          AND cluster.session_id = NEW.session_id
+          AND segment.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_pinned_speaker_evidence_insert
+    BEFORE INSERT ON pinned_speaker_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'pinned speaker evidence lineage mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN transcript_segments AS segment ON segment.id = link.transcript_segment_id
+        WHERE link.cluster_id = NEW.cluster_id
+          AND link.transcript_segment_id = NEW.transcript_segment_id
+          AND cluster.session_id = NEW.session_id
+          AND segment.session_id = NEW.session_id
+      );
+    END;
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -7447,6 +7640,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       }
       if (fromVersion < 46) {
         upgradeSpeakerTranscriptProjectionV46(db);
+      }
+      if (fromVersion < 47) {
+        upgradeParticipantReviewV47(db);
       }
 
       const violations = db.pragma("foreign_key_check");

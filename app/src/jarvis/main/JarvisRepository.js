@@ -29,6 +29,10 @@ const {
 const { SPEAKER_MODEL_KEYS, getSpeakerModelManifest } = require("./SpeakerModelManifest");
 const { buildBilingualPrompt, classifyTranscriptQuality } = require("./transcriptionQuality");
 const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
+const {
+  PROJECTOR_VERSION,
+  projectSessionParticipants,
+} = require("./SessionParticipantProjector");
 
 const TERMINAL_SESSION_STATUSES = new Set(["completed", "recovered", "failed"]);
 const SEGMENT_SESSION_MISMATCH_MESSAGE = "segment belongs to a different session";
@@ -497,6 +501,19 @@ function projectSessionSummaryRevision(row, sessionId) {
 function derivedId(prefix, ...parts) {
   const digest = crypto.createHash("sha256").update(parts.join("\0")).digest("hex").slice(0, 24);
   return `${prefix}_${digest}`;
+}
+
+function canonicalJson(value) {
+  const normalize = (entry) => {
+    if (Array.isArray(entry)) return entry.map(normalize);
+    if (!entry || typeof entry !== "object") return entry;
+    return Object.fromEntries(
+      Object.keys(entry)
+        .sort()
+        .map((key) => [key, normalize(entry[key])])
+    );
+  };
+  return JSON.stringify(normalize(value));
 }
 
 function takeCodePointTail(value, limit) {
@@ -1097,6 +1114,25 @@ class JarvisRepository {
         WHERE session_id = ?
         ORDER BY commit_sequence
       `),
+      listSessionSpeakerEvidenceSegments: this.db.prepare(`
+        SELECT
+          link.cluster_id,
+          segment.id,
+          segment.started_at,
+          segment.ended_at,
+          segment.text,
+          segment.confidence,
+          segment.track_id,
+          segment.source_type,
+          segment.result_kind,
+          segment.duplicate_of
+        FROM speaker_cluster_segments AS link
+        JOIN transcript_segments AS segment
+          ON segment.id = link.transcript_segment_id
+        WHERE segment.session_id = ?
+          AND segment.superseded_by IS NULL
+        ORDER BY segment.started_at, segment.ended_at, segment.id
+      `),
       listDiarizationEchoCandidates: this.db.prepare(`
         SELECT turn.*
         FROM speaker_turns AS turn
@@ -1374,13 +1410,18 @@ class JarvisRepository {
         SELECT sample.*, person.is_self
         FROM voice_profile_samples AS sample
         JOIN people AS person ON person.id = sample.person_id
-        WHERE sample.model_id = ?
+        LEFT JOIN speaker_identity_review_overrides AS forgotten
+          ON forgotten.person_id = sample.person_id AND forgotten.state = 'forgotten'
+        WHERE sample.model_id = ? AND forgotten.person_id IS NULL
         ORDER BY sample.person_id, sample.id
       `),
       listIdentityResolutionProfilesAll: this.db.prepare(`
         SELECT sample.*, person.is_self
         FROM voice_profile_samples AS sample
         JOIN people AS person ON person.id = sample.person_id
+        LEFT JOIN speaker_identity_review_overrides AS forgotten
+          ON forgotten.person_id = sample.person_id AND forgotten.state = 'forgotten'
+        WHERE forgotten.person_id IS NULL
         ORDER BY sample.model_id, sample.person_id, sample.id
       `),
       listAnonymousIdentityResolutionProfiles: this.db.prepare(`
@@ -1981,9 +2022,25 @@ class JarvisRepository {
         ORDER BY chunk.id ASC, started_at ASC, ended_at ASC
       `),
       listExpiredAudioChunks: this.db.prepare(`
-        SELECT * FROM audio_chunks
-        WHERE expires_at <= ? AND deleted_at IS NULL
-        ORDER BY expires_at ASC, id ASC
+        SELECT chunk.* FROM audio_chunks AS chunk
+        WHERE chunk.expires_at <= ? AND chunk.deleted_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM pinned_speaker_evidence AS pinned
+            JOIN transcript_segments AS segment
+              ON segment.id = pinned.transcript_segment_id
+            WHERE segment.session_id = chunk.session_id
+              AND segment.started_at < chunk.ended_at
+              AND chunk.started_at < segment.ended_at
+              AND (
+                segment.track_id = chunk.track_id
+                OR (
+                  segment.track_id IS NULL
+                  AND segment.source_type = chunk.source_type
+                )
+              )
+          )
+        ORDER BY chunk.expires_at ASC, chunk.id ASC
       `),
       getSessionSourceTrack: this.db.prepare(`
         SELECT * FROM audio_tracks
@@ -3189,27 +3246,172 @@ class JarvisRepository {
     const latestRuns = [...latestByTrack.values()].sort(
       (left, right) => left.commit_sequence - right.commit_sequence
     );
-    const clusterIds = new Set(
-      latestRuns.flatMap((run) =>
-        this.statements.listIdentityResolutionRunClusters
-          .all(run.id)
-          .map((cluster) => cluster.cluster_id)
-      )
+    const latestRunClusters = latestRuns.flatMap((run) =>
+      this.statements.listIdentityResolutionRunClusters.all(run.id)
     );
-    const clusterEvidence = new Map(
-      this.speakerIdentityRepository
-        .listSessionClusters(safeSessionId)
-        .map((cluster) => [cluster.id, cluster])
+    const clusterIds = new Set(latestRunClusters.map((cluster) => cluster.cluster_id));
+    const confirmedClusterIds = new Set(
+      this.speakerIdentityRepository.listConfirmedSessionClusterIds(safeSessionId)
     );
     const publicClusterIds = new Set(
-      [...clusterIds].filter((clusterId) => {
-        const cluster = clusterEvidence.get(clusterId);
-        return isPublicSpeakerCluster(cluster);
-      })
+      latestRunClusters
+        .filter(
+          (cluster) =>
+            confirmedClusterIds.has(cluster.cluster_id) ||
+            (cluster.speech_ms >= PUBLIC_SPEAKER_MIN_SPEECH_MS &&
+              cluster.window_count >= PUBLIC_SPEAKER_MIN_WINDOWS)
+        )
+        .map((cluster) => cluster.cluster_id)
     );
-    const speakers = this.speakerIdentityRepository
-      .listSessionClusterViews(safeSessionId)
-      .filter((cluster) => publicClusterIds.has(cluster.id));
+    for (const clusterId of confirmedClusterIds) {
+      publicClusterIds.add(clusterId);
+    }
+    const speakerEvidence = new Map();
+    const clusterReviewOverrides = new Map(
+      this.db
+        .prepare(
+          `SELECT cluster_id, group_ref, disposition, source_event_id, updated_at
+           FROM speaker_cluster_review_overrides WHERE session_id = ?`
+        )
+        .all(safeSessionId)
+        .map((row) => [
+          row.cluster_id,
+          {
+            groupRef: row.group_ref,
+            disposition: row.disposition,
+            sourceEventId: row.source_event_id,
+            updatedAt: row.updated_at,
+          },
+        ])
+    );
+    const segmentReviewOverrides = new Map(
+      this.db
+        .prepare(
+          `SELECT transcript_segment_id, cluster_id, group_ref, disposition,
+            source_event_id, updated_at
+           FROM speaker_segment_review_overrides WHERE session_id = ?`
+        )
+        .all(safeSessionId)
+        .map((row) => [
+          row.transcript_segment_id,
+          {
+            clusterId: row.cluster_id,
+            groupRef: row.group_ref,
+            disposition: row.disposition,
+            sourceEventId: row.source_event_id,
+            updatedAt: row.updated_at,
+          },
+        ])
+    );
+    const pinnedSegmentIds = new Set(
+      this.db
+        .prepare(
+          "SELECT transcript_segment_id FROM pinned_speaker_evidence WHERE session_id = ?"
+        )
+        .all(safeSessionId)
+        .map((row) => row.transcript_segment_id)
+    );
+    for (const clusterId of clusterReviewOverrides.keys()) publicClusterIds.add(clusterId);
+    for (const override of segmentReviewOverrides.values()) {
+      publicClusterIds.add(override.clusterId);
+    }
+    const speakers = [...publicClusterIds]
+      .sort()
+      .map((clusterId) => {
+        const cluster = this.speakerIdentityRepository.getCluster(clusterId);
+        const view = this.speakerIdentityRepository.getClusterView(clusterId);
+        if (cluster && view) speakerEvidence.set(clusterId, cluster);
+        return view;
+      })
+      .filter(Boolean);
+    const evidenceSegmentsByCluster = new Map();
+    for (const segment of this.statements.listSessionSpeakerEvidenceSegments.all(safeSessionId)) {
+      if (!publicClusterIds.has(segment.cluster_id)) continue;
+      const entries = evidenceSegmentsByCluster.get(segment.cluster_id) ?? [];
+      entries.push({
+        id: segment.id,
+        started_at: segment.started_at,
+        ended_at: segment.ended_at,
+        text: segment.text,
+        confidence: segment.confidence,
+        track_id: segment.track_id,
+        source_type: segment.source_type,
+        result_kind: segment.result_kind,
+        duplicate_of: segment.duplicate_of,
+        pinned: pinnedSegmentIds.has(segment.id),
+      });
+      evidenceSegmentsByCluster.set(segment.cluster_id, entries);
+    }
+    const projectionClusters = speakers.flatMap((speaker) => {
+      const evidenceSegments = evidenceSegmentsByCluster.get(speaker.id) ?? [];
+      const reviewedGroups = new Map();
+      const baseSegments = [];
+      for (const segment of evidenceSegments) {
+        const override = segmentReviewOverrides.get(segment.id);
+        if (!override || override.clusterId !== speaker.id) {
+          baseSegments.push(segment);
+          continue;
+        }
+        const entry = reviewedGroups.get(override.groupRef) ?? {
+          override,
+          segments: [],
+        };
+        entry.segments.push(segment);
+        reviewedGroups.set(override.groupRef, entry);
+      }
+      const clusterBase = {
+        ...speaker,
+        _embedding: speakerEvidence.get(speaker.id)?.embedding ?? null,
+        baseClusterId: speaker.id,
+      };
+      if (reviewedGroups.size === 0) {
+        return [
+          {
+            ...clusterBase,
+            evidenceSegments,
+            reviewOverride: clusterReviewOverrides.get(speaker.id) ?? null,
+          },
+        ];
+      }
+      const expanded = [];
+      if (baseSegments.length > 0) {
+        expanded.push({
+          ...clusterBase,
+          projectionRef: `${speaker.id}:base`,
+          evidenceSegments: baseSegments,
+          reviewOverride: clusterReviewOverrides.get(speaker.id) ?? null,
+        });
+      }
+      for (const [groupRef, entry] of reviewedGroups) {
+        expanded.push({
+          ...clusterBase,
+          projectionRef: `${speaker.id}:segment:${groupRef}`,
+          linkState: "unknown",
+          person: null,
+          candidatePersonRef: null,
+          reason: "user_segment_review",
+          speechMs: entry.segments.reduce(
+            (total, segment) => total + Math.max(0, segment.ended_at - segment.started_at),
+            0
+          ),
+          windowCount: entry.segments.length,
+          evidenceSegments: entry.segments,
+          reviewOverride: {
+            groupRef,
+            disposition: entry.override.disposition,
+            sourceEventId: entry.override.sourceEventId,
+            updatedAt: entry.override.updatedAt,
+          },
+        });
+      }
+      return expanded;
+    });
+    const participantProjection = projectSessionParticipants({
+      clusters: projectionClusters,
+      tracks: this.statements.listSessionReadinessTracks.all(safeSessionId),
+      activityClassifications:
+        this.activityClassificationRepository.listSessionEffective(safeSessionId),
+    });
     const persistedSummaryRefresh =
       this.db
         .prepare("SELECT * FROM session_summary_refresh_state WHERE session_id = ?")
@@ -3240,10 +3442,373 @@ class JarvisRepository {
       latestRuns: latestRuns.map(projectDiarizationRun),
       history: allRuns.map(projectDiarizationRun),
       speakers,
+      participants: participantProjection,
+      participantSnapshot: (() => {
+        const snapshot = this.getLatestParticipantSnapshot(safeSessionId);
+        return snapshot
+          ? {
+              id: snapshot.id,
+              revision: snapshot.revision,
+              sourceHash: snapshot.sourceHash,
+              createdAt: snapshot.createdAt,
+            }
+          : null;
+      })(),
       fragmentedEvidenceCount: Math.max(0, clusterIds.size - publicClusterIds.size),
       summaryRefresh,
       reprocessing,
     };
+  }
+
+  getLatestParticipantSnapshot(sessionId) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const row = this.db
+      .prepare(
+        `SELECT id, session_id, revision, projector_version, source_hash,
+          payload_json, created_at
+         FROM session_participant_snapshots
+         WHERE session_id = ? ORDER BY revision DESC LIMIT 1`
+      )
+      .get(safeSessionId);
+    if (!row) return null;
+    let projection;
+    try {
+      projection = JSON.parse(row.payload_json);
+    } catch {
+      throw codedError("PARTICIPANT_SNAPSHOT_INVALID");
+    }
+    const memberships = this.db
+      .prepare(
+        `SELECT participant_ref, cluster_id, membership_kind
+         FROM session_participant_snapshot_clusters
+         WHERE snapshot_id = ?
+         ORDER BY participant_ref, cluster_id`
+      )
+      .all(row.id)
+      .map((membership) => ({
+        participantRef: membership.participant_ref,
+        clusterId: membership.cluster_id,
+        membershipKind: membership.membership_kind,
+      }));
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      revision: row.revision,
+      projectorVersion: row.projector_version,
+      sourceHash: row.source_hash,
+      payload: projection,
+      projection,
+      memberships,
+      createdAt: row.created_at,
+    };
+  }
+
+  refreshSessionParticipantSnapshot(
+    sessionId,
+    { at = this.memoryDependencies.now() } = {}
+  ) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeAt = assertNonNegativeInteger(at, "participantSnapshotAt");
+    const processing = this.getSessionSpeakerProcessing(safeSessionId);
+    const activities = this.activityClassificationRepository
+      .listSessionEffective(safeSessionId)
+      .map((activity) => ({
+        id: activity.id,
+        category: activity.category,
+        confidence: activity.confidence,
+        startedAt: activity.started_at ?? activity.startedAt,
+        endedAt: activity.ended_at ?? activity.endedAt,
+        updatedAt: activity.updated_at ?? activity.updatedAt ?? null,
+      }))
+      .sort(
+        (left, right) =>
+          (left.startedAt ?? 0) - (right.startedAt ?? 0) ||
+          String(left.id).localeCompare(String(right.id))
+      );
+    const reviewHead =
+      this.db
+        .prepare(
+          `SELECT id, action, created_at
+           FROM participant_review_events
+           WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`
+        )
+        .get(safeSessionId) ?? null;
+    const causalState = {
+      projectorVersion: PROJECTOR_VERSION,
+      latestRuns: processing.latestRuns.map((run) => ({
+        id: run.id,
+        commitSequence: run.commitSequence,
+        policyId: run.policyId,
+      })),
+      speakers: processing.speakers
+        .map((speaker) => ({
+          id: speaker.id,
+          personId: speaker.person?.id ?? null,
+          personName: speaker.person?.displayName ?? null,
+          isSelf: speaker.person?.isSelf ?? false,
+          linkState: speaker.linkState,
+          reason: speaker.reason,
+          updatedAt: speaker.updatedAt,
+        }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+      activities,
+      reviewHead,
+      projection: processing.participants,
+    };
+    const sourceHash = crypto
+      .createHash("sha256")
+      .update(canonicalJson(causalState))
+      .digest("hex");
+    const existing = this.db
+      .prepare(
+        `SELECT id FROM session_participant_snapshots
+         WHERE session_id = ? AND source_hash = ?`
+      )
+      .get(safeSessionId, sourceHash);
+    if (existing) return this.getLatestParticipantSnapshot(safeSessionId);
+
+    const snapshotId = derivedId(
+      "participant-snapshot",
+      safeSessionId,
+      sourceHash
+    );
+    const projection = processing.participants;
+    const persist = this.db.transaction(() => {
+      const revision = this.db
+        .prepare(
+          `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
+           FROM session_participant_snapshots WHERE session_id = ?`
+        )
+        .get(safeSessionId).revision;
+      this.db
+        .prepare(
+          `INSERT INTO session_participant_snapshots (
+            id, session_id, revision, projector_version, source_hash,
+            payload_json, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          snapshotId,
+          safeSessionId,
+          revision,
+          PROJECTOR_VERSION,
+          sourceHash,
+          canonicalJson(projection),
+          safeAt
+        );
+      const insertMembership = this.db.prepare(
+        `INSERT INTO session_participant_snapshot_clusters (
+          snapshot_id, participant_ref, cluster_id, membership_kind
+        ) VALUES (?, ?, ?, ?)`
+      );
+      for (const participant of [
+        ...projection.participants,
+        ...projection.mediaVoices,
+      ]) {
+        const participantRef = `participant:${participant.kind}:${crypto
+          .createHash("sha256")
+          .update(
+            canonicalJson({
+              id: participant.id,
+              clusterIds: [...participant.clusterIds].sort(),
+              segmentIds: [...(participant.segmentIds ?? [])].sort(),
+            })
+          )
+          .digest("hex")
+          .slice(0, 40)}`;
+        for (const clusterId of [...new Set(participant.clusterIds)].sort()) {
+          insertMembership.run(
+            snapshotId,
+            participantRef,
+            clusterId,
+            participant.kind
+          );
+        }
+      }
+      return revision;
+    });
+    persist.immediate();
+    return this.getLatestParticipantSnapshot(safeSessionId);
+  }
+
+  beginParticipantReviewBackfillBatch({
+    scope = "recent_audio",
+    limit = 4,
+    at = this.memoryDependencies.now(),
+  } = {}) {
+    const validScopes = new Set([
+      "recent_audio",
+      "all_retained_audio",
+      "metadata_cleanup",
+    ]);
+    if (!validScopes.has(scope)) {
+      throw new RangeError("participant review backfill scope is invalid");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError("participant review backfill limit must be between 1 and 100");
+    }
+    const safeAt = assertNonNegativeInteger(at, "participantReviewBackfillAt");
+    const audioPredicate =
+      scope === "metadata_cleanup"
+        ? `NOT EXISTS (
+            SELECT 1 FROM audio_chunks AS chunk
+            WHERE chunk.session_id = session.id
+              AND chunk.write_state = 'committed'
+              AND chunk.deleted_at IS NULL
+              AND chunk.expires_at > @at
+          )`
+        : `EXISTS (
+            SELECT 1 FROM audio_chunks AS chunk
+            WHERE chunk.session_id = session.id
+              AND chunk.write_state = 'committed'
+              AND chunk.deleted_at IS NULL
+              AND chunk.expires_at > @at
+          )`;
+    const sessionIds = this.db
+      .prepare(
+        `SELECT session.id
+         FROM sessions AS session
+         WHERE session.status IN ('completed','recovered','failed')
+           AND session.ended_at IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM session_participant_snapshots AS snapshot
+             WHERE snapshot.session_id = session.id
+           )
+           AND ${audioPredicate}
+         ORDER BY COALESCE(session.finalized_at, session.ended_at) DESC, session.id DESC
+         LIMIT @limit`
+      )
+      .all({ at: safeAt, limit })
+      .map((row) => row.id);
+    const batchId = this.memoryDependencies.createId("participant-backfill");
+    const state = sessionIds.length === 0 ? "completed" : "running";
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE participant_review_backfill_batches
+           SET state = 'cancelled', error_code = 'startup_interrupted',
+               completed_at = @at
+           WHERE state IN ('queued','running')`
+        )
+        .run({ at: safeAt });
+      this.db
+        .prepare(
+          `INSERT INTO participant_review_backfill_batches (
+             id, scope, state, session_count, processed_count, changed_count,
+             error_code, created_at, started_at, completed_at
+           ) VALUES (?, ?, ?, ?, 0, 0, NULL, ?, ?, ?)`
+        )
+        .run(
+          batchId,
+          scope,
+          state,
+          sessionIds.length,
+          safeAt,
+          sessionIds.length > 0 ? safeAt : null,
+          sessionIds.length > 0 ? null : safeAt
+        );
+    });
+    create.immediate();
+    return {
+      ...this.getParticipantReviewBackfillBatch(batchId),
+      sessionIds,
+    };
+  }
+
+  getParticipantReviewBackfillBatch(batchId) {
+    const safeBatchId = assertId(batchId, "participantReviewBackfillBatchId");
+    const row = this.db
+      .prepare("SELECT * FROM participant_review_backfill_batches WHERE id = ?")
+      .get(safeBatchId);
+    if (!row) return null;
+    return {
+      id: row.id,
+      scope: row.scope,
+      state: row.state,
+      sessionCount: row.session_count,
+      processedCount: row.processed_count,
+      changedCount: row.changed_count,
+      errorCode: row.error_code,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+    };
+  }
+
+  recordParticipantReviewBackfillProgress(
+    batchId,
+    { changed = false, errorCode = null } = {}
+  ) {
+    const safeBatchId = assertId(batchId, "participantReviewBackfillBatchId");
+    if (typeof changed !== "boolean") {
+      throw new TypeError("participant review backfill changed must be a boolean");
+    }
+    if (
+      errorCode !== null &&
+      (typeof errorCode !== "string" || errorCode.length === 0 || errorCode.length > 200)
+    ) {
+      throw new TypeError("participant review backfill errorCode is invalid");
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE participant_review_backfill_batches
+         SET processed_count = processed_count + 1,
+             changed_count = changed_count + @changed,
+             error_code = COALESCE(error_code, @errorCode)
+         WHERE id = @id
+           AND state = 'running'
+           AND processed_count < session_count`
+      )
+      .run({
+        id: safeBatchId,
+        changed: changed ? 1 : 0,
+        errorCode,
+      });
+    if (result.changes !== 1) {
+      throw codedError("PARTICIPANT_BACKFILL_BATCH_NOT_RUNNING");
+    }
+    return this.getParticipantReviewBackfillBatch(safeBatchId);
+  }
+
+  finishParticipantReviewBackfillBatch(
+    batchId,
+    { state = "completed", errorCode = null, at = this.memoryDependencies.now() } = {}
+  ) {
+    const safeBatchId = assertId(batchId, "participantReviewBackfillBatchId");
+    if (!new Set(["completed", "failed", "cancelled"]).has(state)) {
+      throw new RangeError("participant review backfill terminal state is invalid");
+    }
+    if (
+      errorCode !== null &&
+      (typeof errorCode !== "string" || errorCode.length === 0 || errorCode.length > 200)
+    ) {
+      throw new TypeError("participant review backfill errorCode is invalid");
+    }
+    const safeAt = assertNonNegativeInteger(at, "participantReviewBackfillCompletedAt");
+    const result = this.db
+      .prepare(
+        `UPDATE participant_review_backfill_batches
+         SET state = @state,
+             error_code = COALESCE(@errorCode, error_code),
+             completed_at = @at
+         WHERE id = @id
+           AND state = 'running'
+           AND (@state <> 'completed' OR processed_count = session_count)`
+      )
+      .run({
+        id: safeBatchId,
+        state,
+        errorCode,
+        at: safeAt,
+      });
+    if (result.changes !== 1) {
+      const current = this.getParticipantReviewBackfillBatch(safeBatchId);
+      if (current?.state === "completed" && current.sessionCount === 0 && state === "completed") {
+        return current;
+      }
+      throw codedError("PARTICIPANT_BACKFILL_BATCH_NOT_RUNNING");
+    }
+    return this.getParticipantReviewBackfillBatch(safeBatchId);
   }
 
   listDiarizationEchoCandidates({ sessionId, excludeTrackId, policyId } = {}) {
@@ -3646,6 +4211,15 @@ class JarvisRepository {
           evidenceRunId: run.id,
           clusterId: cluster.cluster_id,
           trackId: track.id,
+          trackKind:
+            track.source_type === "mic"
+              ? "mic"
+              : track.application_key
+                ? "application"
+                : "system_mix",
+          applicationKey: track.application_key ?? null,
+          applicationDisplayName: track.application_display_name ?? null,
+          captureGeneration: track.capture_generation ?? 0,
           modelId: run.embedding_model_id,
           embedding,
           speechMs: cluster.speech_ms,
@@ -4533,6 +5107,9 @@ class JarvisRepository {
       FROM people p
       LEFT JOIN transcript_segments ts ON ts.person_id = p.id
       LEFT JOIN todos td ON td.owner_person_id = p.id
+      LEFT JOIN speaker_identity_review_overrides forgotten
+        ON forgotten.person_id = p.id AND forgotten.state = 'forgotten'
+      WHERE forgotten.person_id IS NULL
       GROUP BY p.id
       ORDER BY p.is_self DESC, COALESCE(last_interaction_at, p.last_seen_at) DESC, p.display_name
     `
@@ -4540,9 +5117,878 @@ class JarvisRepository {
       .all();
   }
 
+  listPeopleReviewOverview() {
+    const rows = this.db
+      .prepare(
+        `
+      WITH ranked_resolution AS (
+        SELECT resolution.cluster_id, resolution.candidate_person_ref, resolution.reason,
+          ROW_NUMBER() OVER (
+            PARTITION BY resolution.cluster_id
+            ORDER BY run.commit_sequence DESC, resolution.rowid DESC
+          ) AS rank
+        FROM speaker_identity_resolutions AS resolution
+        JOIN speaker_identity_resolution_runs AS run
+          ON run.id = resolution.resolution_run_id
+        WHERE resolution.actor = 'system'
+          AND resolution.projection_applied = 1
+      )
+      SELECT sc.id, sc.session_id, sc.track_id, sc.speech_ms, sc.window_count,
+        sc.quality_score, sc.updated_at, s.started_at AS session_started_at,
+        track.source_type, track.application_key, track.application_display_name,
+        resolution.candidate_person_ref, resolution.reason
+      FROM speaker_clusters sc
+      JOIN sessions s ON s.id = sc.session_id
+      LEFT JOIN audio_tracks track ON track.id = sc.track_id
+      LEFT JOIN ranked_resolution AS resolution
+        ON resolution.cluster_id = sc.id AND resolution.rank = 1
+      WHERE sc.person_id IS NULL
+        AND sc.link_state = 'unknown'
+        AND (sc.speech_ms >= 5000 OR sc.window_count >= 3)
+      ORDER BY sc.updated_at DESC, sc.id
+      LIMIT 500
+    `
+      )
+      .all();
+    const applicationPolicy = new ApplicationAudioPolicy();
+    const candidates = rows
+      .map((row) => {
+        const applicationClass = applicationPolicy.classify(row.application_key);
+        const socialSource =
+          row.source_type === "mic" || applicationClass === "communication";
+        if (!socialSource) return null;
+        return {
+          row,
+          sourceName:
+            row.application_display_name ||
+            (row.source_type === "mic" ? "麦克风" : "系统音频·应用未知"),
+        };
+      })
+      .filter(Boolean);
+
+    const candidateByClusterId = new Map(
+      candidates.map((candidate) => [candidate.row.id, candidate])
+    );
+    const sessionIds = [
+      ...new Set(candidates.map((candidate) => candidate.row.session_id)),
+    ];
+    const anonymousGroups = new Map();
+    const needsReview = [];
+    for (const sessionId of sessionIds) {
+      let projection;
+      try {
+        projection = this.getSessionSpeakerProcessing(sessionId).participants;
+      } catch {
+        continue;
+      }
+      if (projection.excluded.anomaly) continue;
+      for (const participant of projection.participants) {
+        const members = participant.clusterIds
+          .map((clusterId) => candidateByClusterId.get(clusterId))
+          .filter(Boolean);
+        if (members.length === 0) continue;
+        const lastSeenAt = Math.max(...members.map((member) => member.row.updated_at));
+        const sourceNames = [...new Set(members.map((member) => member.sourceName))];
+        if (participant.kind === "anonymous" || participant.kind === "reviewed") {
+          const group = anonymousGroups.get(participant.id) ?? [];
+          group.push({
+            participant,
+            sessionId,
+            sessionStartedAt: members[0].row.session_started_at,
+            lastSeenAt,
+            sourceNames,
+          });
+          anonymousGroups.set(participant.id, group);
+          continue;
+        }
+        if (participant.kind !== "temporary") continue;
+        needsReview.push({
+          id: derivedId("session-review", sessionId, participant.id),
+          sessionId,
+          sessionStartedAt: members[0].row.session_started_at,
+          minimumCount: participant.minimumCount,
+          maximumCount: participant.maximumCount,
+          clusterCount: participant.clusterCount,
+          speechMs: participant.speechMs,
+          sourceNames,
+          representativeCluster: participant.representativeCluster,
+        });
+      }
+    }
+
+    const anonymous = [...anonymousGroups.entries()]
+      .map(([id, members]) => {
+        const representative = [...members].sort(
+          (left, right) =>
+            right.participant.speechMs - left.participant.speechMs ||
+            right.lastSeenAt - left.lastSeenAt
+        )[0];
+        return {
+          id,
+          displayName: "",
+          sessionCount: new Set(members.map((member) => member.sessionId)).size,
+          clusterCount: members.reduce(
+            (total, member) => total + member.participant.clusterCount,
+            0
+          ),
+          speechMs: members.reduce(
+            (total, member) => total + member.participant.speechMs,
+            0
+          ),
+          lastSeenAt: Math.max(...members.map((member) => member.lastSeenAt)),
+          sourceNames: [
+            ...new Set(members.flatMap((member) => member.sourceNames)),
+          ],
+          representativeCluster: representative.participant.representativeCluster,
+        };
+      })
+      .sort(
+        (left, right) =>
+          right.lastSeenAt - left.lastSeenAt || left.id.localeCompare(right.id)
+      )
+      .map((entry, index) => ({
+        ...entry,
+        displayName: `未命名人物 ${index + 1}`,
+      }));
+
+    needsReview.sort(
+      (left, right) =>
+        right.sessionStartedAt - left.sessionStartedAt ||
+        left.id.localeCompare(right.id)
+    );
+
+    return { anonymous, needsReview: needsReview.slice(0, 50) };
+  }
+
+  previewParticipantReview(input) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      throw new TypeError("participant review input is required");
+    }
+    const sessionId = assertId(input.sessionId, "sessionId");
+    const action = input.action;
+    if (
+      !new Set([
+        "split",
+        "merge",
+        "mark_media",
+        "restore_social",
+        "forget_identity",
+        "pin_evidence",
+        "unpin_evidence",
+      ]).has(action)
+    ) {
+      throw new TypeError("unsupported participant review action");
+    }
+    const clusterIds = Array.isArray(input.clusterIds)
+      ? [...new Set(input.clusterIds.map((id) => assertId(id, "clusterId")))]
+      : [];
+    const segmentIds = Array.isArray(input.segmentIds)
+      ? [
+          ...new Set(
+            input.segmentIds.map((id) => assertId(id, "transcriptSegmentId"))
+          ),
+        ]
+      : [];
+    if (clusterIds.length > 64) throw new RangeError("participant review affects too many clusters");
+    if (segmentIds.length > 64) throw new RangeError("participant review affects too many segments");
+    if (action === "merge" && (clusterIds.length < 2 || segmentIds.length > 0)) {
+      throw new TypeError("merge requires at least two clusters");
+    }
+    if (action === "split" && (clusterIds.length !== 1 || segmentIds.length === 0)) {
+      throw new TypeError("split requires one cluster and selected segments");
+    }
+    if (
+      new Set(["mark_media", "restore_social"]).has(action) &&
+      clusterIds.length === 0
+    ) {
+      throw new TypeError(`${action} requires selected clusters`);
+    }
+    if (
+      new Set(["pin_evidence", "unpin_evidence"]).has(action) &&
+      segmentIds.length !== 1
+    ) {
+      throw new TypeError(`${action} requires one evidence segment`);
+    }
+    if (
+      action === "pin_evidence" &&
+      input.label !== undefined &&
+      (typeof input.label !== "string" ||
+        !input.label.trim() ||
+        Array.from(input.label.trim()).length > 200)
+    ) {
+      throw new TypeError("evidence label must contain 1 to 200 characters");
+    }
+
+    if (action === "forget_identity") {
+      const personId = assertId(input.personId, "personId");
+      const person = this.db
+        .prepare("SELECT id, is_self FROM people WHERE id = ?")
+        .get(personId);
+      if (!person) throw new Error("participant identity does not exist");
+      if (person.is_self === 1) throw new Error("SELF identity cannot be forgotten");
+      const impactedClusters = this.db
+        .prepare(
+          `SELECT id, session_id FROM speaker_clusters
+           WHERE person_id = ? ORDER BY session_id, id`
+        )
+        .all(personId);
+      const impactedSegments = this.db
+        .prepare(
+          `SELECT id, session_id FROM transcript_segments
+           WHERE person_id = ? ORDER BY session_id, id`
+        )
+        .all(personId);
+      const affectedSessionIds = [
+        ...new Set([
+          ...impactedClusters.map((row) => row.session_id),
+          ...impactedSegments.map((row) => row.session_id),
+        ]),
+      ].sort();
+      return {
+        sessionId,
+        action,
+        clusterIds: impactedClusters.map((row) => row.id),
+        segmentIds: impactedSegments.map((row) => row.id),
+        affectedClusterCount: impactedClusters.length,
+        affectedSegmentCount: impactedSegments.length,
+        affectedPersonIds: [personId],
+        affectedSessionIds,
+        historyImpact: {
+          sessionCount: affectedSessionIds.length,
+          clusterCount: impactedClusters.length,
+          segmentCount: impactedSegments.length,
+          sessionIds: affectedSessionIds,
+        },
+        canUndo: true,
+      };
+    }
+
+    const clusterPlaceholders = clusterIds.map(() => "?").join(",");
+    const clusters =
+      clusterIds.length === 0
+        ? []
+        : this.db
+            .prepare(
+              `SELECT id, session_id, person_id, link_state, speech_ms, window_count
+               FROM speaker_clusters
+               WHERE id IN (${clusterPlaceholders}) ORDER BY id`
+            )
+            .all(...clusterIds);
+    if (
+      clusters.length !== clusterIds.length ||
+      clusters.some((cluster) => cluster.session_id !== sessionId)
+    ) {
+      throw new Error("participant review clusters must belong to the selected session");
+    }
+    const segmentPlaceholders = segmentIds.map(() => "?").join(",");
+    const segmentLinks =
+      segmentIds.length === 0
+        ? []
+        : this.db
+            .prepare(
+              `SELECT segment.id, segment.session_id, link.cluster_id
+               FROM transcript_segments AS segment
+               JOIN speaker_cluster_segments AS link
+                 ON link.transcript_segment_id = segment.id
+               WHERE segment.id IN (${segmentPlaceholders})
+               ORDER BY segment.id, link.cluster_id`
+            )
+            .all(...segmentIds);
+    for (const segmentId of segmentIds) {
+      const links = segmentLinks.filter((row) => row.id === segmentId);
+      if (
+        links.length === 0 ||
+        links.some((row) => row.session_id !== sessionId) ||
+        (clusterIds.length > 0 &&
+          !links.some((row) => clusterIds.includes(row.cluster_id)))
+      ) {
+        throw new Error("participant review segments must belong to selected clusters");
+      }
+    }
+    const resolvedClusterIds =
+      clusterIds.length > 0
+        ? clusterIds
+        : [...new Set(segmentLinks.map((row) => row.cluster_id))];
+    const resolvedClusters =
+      clusters.length > 0
+        ? clusters
+        : this.db
+            .prepare(
+              `SELECT id, session_id, person_id, link_state, speech_ms, window_count
+               FROM speaker_clusters
+               WHERE id IN (${resolvedClusterIds.map(() => "?").join(",")})
+               ORDER BY id`
+            )
+            .all(...resolvedClusterIds);
+    const segmentCount =
+      segmentIds.length > 0
+        ? segmentIds.length
+        : this.db
+            .prepare(
+              `SELECT count(DISTINCT transcript_segment_id) AS count
+               FROM speaker_cluster_segments
+               WHERE cluster_id IN (${clusterPlaceholders})`
+            )
+            .get(...clusterIds).count;
+    return {
+      sessionId,
+      action,
+      clusterIds: resolvedClusterIds,
+      segmentIds,
+      affectedClusterCount: resolvedClusters.length,
+      affectedSegmentCount: segmentCount,
+      affectedPersonIds: [
+        ...new Set(resolvedClusters.map((cluster) => cluster.person_id).filter(Boolean)),
+      ],
+      affectedSessionIds: [sessionId],
+      canUndo: true,
+    };
+  }
+
+  applyParticipantReview(input) {
+    const preview = this.previewParticipantReview(input);
+    const at = assertNonNegativeInteger(
+      input.at ?? this.memoryDependencies.now(),
+      "participantReviewAt"
+    );
+    const eventId = this.memoryDependencies.createId("participant-review");
+    const clusterPlaceholders = preview.clusterIds.map(() => "?").join(",");
+    const segmentPlaceholders = preview.segmentIds.map(() => "?").join(",");
+    const groupRef = new Set(["merge", "split"]).has(preview.action)
+      ? `manual-group-${crypto
+          .createHash("sha256")
+          .update(`${eventId}\0${preview.clusterIds.join("\0")}\0${preview.segmentIds.join("\0")}`)
+          .digest("hex")
+          .slice(0, 32)}`
+      : null;
+    let previousState;
+    let nextState;
+    if (new Set(["merge", "mark_media", "restore_social"]).has(preview.action)) {
+      const previousRows = this.db
+        .prepare(
+          `SELECT cluster_id, group_ref, disposition
+           FROM speaker_cluster_review_overrides
+           WHERE cluster_id IN (${clusterPlaceholders}) ORDER BY cluster_id`
+        )
+        .all(...preview.clusterIds);
+      const nextRows = preview.clusterIds.map((clusterId) => ({
+        clusterId,
+        groupRef,
+        disposition: preview.action === "mark_media" ? "media" : "social",
+      }));
+      previousState = {
+        overrides: previousRows.map((row) => ({
+          clusterId: row.cluster_id,
+          groupRef: row.group_ref,
+          disposition: row.disposition,
+        })),
+      };
+      nextState = { overrides: nextRows };
+    } else if (preview.action === "split") {
+      const previousRows = this.db
+        .prepare(
+          `SELECT transcript_segment_id, cluster_id, group_ref, disposition
+           FROM speaker_segment_review_overrides
+           WHERE transcript_segment_id IN (${segmentPlaceholders})
+           ORDER BY transcript_segment_id`
+        )
+        .all(...preview.segmentIds);
+      previousState = {
+        segmentOverrides: previousRows.map((row) => ({
+          segmentId: row.transcript_segment_id,
+          clusterId: row.cluster_id,
+          groupRef: row.group_ref,
+          disposition: row.disposition,
+        })),
+      };
+      nextState = {
+        segmentOverrides: preview.segmentIds.map((segmentId) => ({
+          segmentId,
+          clusterId: preview.clusterIds[0],
+          groupRef,
+          disposition: "social",
+        })),
+      };
+    } else if (new Set(["pin_evidence", "unpin_evidence"]).has(preview.action)) {
+      const previousRows = this.db
+        .prepare(
+          `SELECT transcript_segment_id, cluster_id, session_id, label
+           FROM pinned_speaker_evidence
+           WHERE transcript_segment_id IN (${segmentPlaceholders})
+           ORDER BY transcript_segment_id`
+        )
+        .all(...preview.segmentIds);
+      previousState = {
+        pinnedEvidence: previousRows.map((row) => ({
+          segmentId: row.transcript_segment_id,
+          clusterId: row.cluster_id,
+          sessionId: row.session_id,
+          label: row.label,
+        })),
+      };
+      nextState = {
+        pinnedEvidence:
+          preview.action === "pin_evidence"
+            ? [
+                {
+                  segmentId: preview.segmentIds[0],
+                  clusterId: preview.clusterIds[0],
+                  sessionId: preview.sessionId,
+                  label:
+                    typeof input.label === "string" ? input.label.trim() : null,
+                },
+              ]
+            : [],
+      };
+    } else {
+      const personId = assertId(input.personId, "personId");
+      const identityOverride =
+        this.db
+          .prepare(
+            `SELECT person_id, state FROM speaker_identity_review_overrides
+             WHERE person_id = ?`
+          )
+          .get(personId) ?? null;
+      const clusters = this.db
+        .prepare(
+          `SELECT id, session_id, person_id, link_state
+           FROM speaker_clusters WHERE person_id = ? ORDER BY session_id, id`
+        )
+        .all(personId);
+      const segments = this.db
+        .prepare(
+          `SELECT id, session_id, person_id, speaker_label
+           FROM transcript_segments WHERE person_id = ? ORDER BY session_id, id`
+        )
+        .all(personId);
+      previousState = {
+        identityOverride: identityOverride
+          ? { personId: identityOverride.person_id, state: identityOverride.state }
+          : null,
+        clusters: clusters.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          personId: row.person_id,
+          linkState: row.link_state,
+        })),
+        segments: segments.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          personId: row.person_id,
+          speakerLabel: row.speaker_label,
+        })),
+      };
+      nextState = {
+        identityOverride: { personId, state: "forgotten" },
+        clusters: clusters.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          personId: null,
+          linkState: "unknown",
+        })),
+        segments: segments.map((row) => ({
+          id: row.id,
+          sessionId: row.session_id,
+          personId: null,
+          speakerLabel: row.speaker_label,
+        })),
+      };
+    }
+    const subjectRef =
+      input.personId ??
+      preview.segmentIds[0] ??
+      (preview.clusterIds.join(",").length <= 256
+        ? preview.clusterIds.join(",")
+        : derivedId("participant-review-subject", ...preview.clusterIds));
+    const event = {
+      id: eventId,
+      sessionId: preview.sessionId,
+      action: preview.action,
+      subjectRef,
+      payloadJson: JSON.stringify({
+        clusterIds: preview.clusterIds,
+        segmentIds: preview.segmentIds,
+        personId: input.personId ?? null,
+        groupRef,
+      }),
+      previousStateJson: JSON.stringify(previousState),
+      nextStateJson: JSON.stringify(nextState),
+      actor: "user",
+      createdAt: at,
+    };
+    const apply = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO participant_review_events (
+            id, session_id, action, subject_ref, payload_json,
+            previous_state_json, next_state_json, reverts_event_id, actor, created_at
+          ) VALUES (
+            @id, @sessionId, @action, @subjectRef, @payloadJson,
+            @previousStateJson, @nextStateJson, NULL, @actor, @createdAt
+          )`
+        )
+        .run(event);
+      if (Array.isArray(nextState.overrides)) {
+        const upsert = this.db.prepare(
+          `INSERT INTO speaker_cluster_review_overrides (
+            cluster_id, session_id, group_ref, disposition, source_event_id, updated_at
+          ) VALUES (@clusterId, @sessionId, @groupRef, @disposition, @eventId, @updatedAt)
+          ON CONFLICT(cluster_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            group_ref = excluded.group_ref,
+            disposition = excluded.disposition,
+            source_event_id = excluded.source_event_id,
+            updated_at = excluded.updated_at`
+        );
+        for (const row of nextState.overrides) {
+          upsert.run({
+            ...row,
+            sessionId: preview.sessionId,
+            eventId,
+            updatedAt: at,
+          });
+        }
+      } else if (Array.isArray(nextState.segmentOverrides)) {
+        const upsert = this.db.prepare(
+          `INSERT INTO speaker_segment_review_overrides (
+            transcript_segment_id, cluster_id, session_id, group_ref,
+            disposition, source_event_id, updated_at
+          ) VALUES (
+            @segmentId, @clusterId, @sessionId, @groupRef,
+            @disposition, @eventId, @updatedAt
+          )
+          ON CONFLICT(transcript_segment_id) DO UPDATE SET
+            cluster_id = excluded.cluster_id,
+            session_id = excluded.session_id,
+            group_ref = excluded.group_ref,
+            disposition = excluded.disposition,
+            source_event_id = excluded.source_event_id,
+            updated_at = excluded.updated_at`
+        );
+        for (const row of nextState.segmentOverrides) {
+          upsert.run({
+            ...row,
+            sessionId: preview.sessionId,
+            eventId,
+            updatedAt: at,
+          });
+        }
+      } else if (Array.isArray(nextState.pinnedEvidence)) {
+        if (preview.segmentIds.length > 0) {
+          this.db
+            .prepare(
+              `DELETE FROM pinned_speaker_evidence
+               WHERE transcript_segment_id IN (${segmentPlaceholders})`
+            )
+            .run(...preview.segmentIds);
+        }
+        const insert = this.db.prepare(
+          `INSERT INTO pinned_speaker_evidence (
+            transcript_segment_id, cluster_id, session_id, label,
+            source_event_id, pinned_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (const row of nextState.pinnedEvidence) {
+          insert.run(
+            row.segmentId,
+            row.clusterId,
+            row.sessionId,
+            row.label,
+            eventId,
+            at
+          );
+        }
+      } else if (nextState.identityOverride) {
+        const personId = nextState.identityOverride.personId;
+        this.db
+          .prepare(
+            `INSERT INTO speaker_identity_review_overrides (
+              person_id, state, source_event_id, updated_at
+            ) VALUES (?, 'forgotten', ?, ?)
+            ON CONFLICT(person_id) DO UPDATE SET
+              state = 'forgotten',
+              source_event_id = excluded.source_event_id,
+              updated_at = excluded.updated_at`
+          )
+          .run(personId, eventId, at);
+        this.db
+          .prepare(
+            `UPDATE speaker_clusters
+             SET person_id = NULL, link_state = 'unknown', updated_at = ?
+             WHERE person_id = ?`
+          )
+          .run(at, personId);
+        this.db
+          .prepare(
+            `UPDATE transcript_segments
+             SET person_id = NULL
+             WHERE person_id = ?`
+          )
+          .run(personId);
+      }
+      return event;
+    });
+    const applied = apply.immediate();
+    for (const affectedSessionId of preview.affectedSessionIds) {
+      try {
+        this.refreshSessionParticipantSnapshot(affectedSessionId, { at });
+      } catch {
+        // The durable review event remains authoritative. A later reconciliation can rematerialize.
+      }
+    }
+    return {
+      event: {
+        id: applied.id,
+        sessionId: applied.sessionId,
+        action: applied.action,
+        createdAt: applied.createdAt,
+        canUndo: true,
+      },
+      preview,
+      speakerProcessing: this.getSessionSpeakerProcessing(preview.sessionId),
+    };
+  }
+
+  undoParticipantReview(eventId, at = this.memoryDependencies.now()) {
+    const safeEventId = assertId(eventId, "participantReviewEventId");
+    const safeAt = assertNonNegativeInteger(at, "participantReviewUndoAt");
+    const original = this.db
+      .prepare("SELECT * FROM participant_review_events WHERE id = ?")
+      .get(safeEventId);
+    if (!original || original.action === "undo") {
+      throw new Error("participant review event is not undoable");
+    }
+    const existingUndo = this.db
+      .prepare("SELECT id FROM participant_review_events WHERE reverts_event_id = ?")
+      .get(safeEventId);
+    if (existingUndo) throw new Error("participant review event was already undone");
+    let previousState;
+    let nextState;
+    try {
+      previousState = JSON.parse(original.previous_state_json);
+      nextState = JSON.parse(original.next_state_json);
+    } catch {
+      throw new Error("participant review event state is invalid");
+    }
+    const undoId = this.memoryDependencies.createId("participant-review-undo");
+    const undo = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO participant_review_events (
+            id, session_id, action, subject_ref, payload_json,
+            previous_state_json, next_state_json, reverts_event_id, actor, created_at
+          ) VALUES (?, ?, 'undo', ?, ?, ?, ?, ?, 'user', ?)`
+        )
+        .run(
+          undoId,
+          original.session_id,
+          original.subject_ref,
+          JSON.stringify({ revertedEventId: safeEventId }),
+          JSON.stringify(nextState),
+          JSON.stringify(previousState),
+          safeEventId,
+          safeAt
+        );
+      if (Array.isArray(nextState?.overrides)) {
+        const clusterIds = nextState.overrides.map((row) =>
+          assertId(row.clusterId, "clusterId")
+        );
+        const placeholders = clusterIds.map(() => "?").join(",");
+        this.db
+          .prepare(
+            `DELETE FROM speaker_cluster_review_overrides
+             WHERE cluster_id IN (${placeholders})`
+          )
+          .run(...clusterIds);
+        const restore = this.db.prepare(
+          `INSERT INTO speaker_cluster_review_overrides (
+            cluster_id, session_id, group_ref, disposition, source_event_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (const row of previousState.overrides ?? []) {
+          restore.run(
+            assertId(row.clusterId, "clusterId"),
+            original.session_id,
+            row.groupRef ?? null,
+            row.disposition,
+            undoId,
+            safeAt
+          );
+        }
+      } else if (Array.isArray(nextState?.segmentOverrides)) {
+        const segmentIds = nextState.segmentOverrides.map((row) =>
+          assertId(row.segmentId, "transcriptSegmentId")
+        );
+        if (segmentIds.length > 0) {
+          this.db
+            .prepare(
+              `DELETE FROM speaker_segment_review_overrides
+               WHERE transcript_segment_id IN (${segmentIds.map(() => "?").join(",")})`
+            )
+            .run(...segmentIds);
+        }
+        const restore = this.db.prepare(
+          `INSERT INTO speaker_segment_review_overrides (
+            transcript_segment_id, cluster_id, session_id, group_ref,
+            disposition, source_event_id, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        );
+        for (const row of previousState.segmentOverrides ?? []) {
+          restore.run(
+            row.segmentId,
+            row.clusterId,
+            original.session_id,
+            row.groupRef,
+            row.disposition,
+            undoId,
+            safeAt
+          );
+        }
+      } else if (Array.isArray(nextState?.pinnedEvidence)) {
+        const segmentIds = new Set([
+          ...(nextState.pinnedEvidence ?? []).map((row) => row.segmentId),
+          ...(previousState.pinnedEvidence ?? []).map((row) => row.segmentId),
+        ]);
+        if (segmentIds.size > 0) {
+          this.db
+            .prepare(
+              `DELETE FROM pinned_speaker_evidence
+               WHERE transcript_segment_id IN (${[...segmentIds].map(() => "?").join(",")})`
+            )
+            .run(...segmentIds);
+        }
+        const restore = this.db.prepare(
+          `INSERT INTO pinned_speaker_evidence (
+            transcript_segment_id, cluster_id, session_id, label,
+            source_event_id, pinned_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        );
+        for (const row of previousState.pinnedEvidence ?? []) {
+          restore.run(
+            row.segmentId,
+            row.clusterId,
+            row.sessionId,
+            row.label,
+            undoId,
+            safeAt
+          );
+        }
+      } else if (nextState?.identityOverride) {
+        const personId = assertId(nextState.identityOverride.personId, "personId");
+        this.db
+          .prepare("DELETE FROM speaker_identity_review_overrides WHERE person_id = ?")
+          .run(personId);
+        if (previousState.identityOverride) {
+          this.db
+            .prepare(
+              `INSERT INTO speaker_identity_review_overrides (
+                person_id, state, source_event_id, updated_at
+              ) VALUES (?, ?, ?, ?)`
+            )
+            .run(
+              personId,
+              previousState.identityOverride.state,
+              undoId,
+              safeAt
+            );
+        }
+        const restoreCluster = this.db.prepare(
+          `UPDATE speaker_clusters
+           SET person_id = ?, link_state = ?, updated_at = ?
+           WHERE id = ?`
+        );
+        for (const row of previousState.clusters ?? []) {
+          restoreCluster.run(row.personId, row.linkState, safeAt, row.id);
+        }
+        const restoreSegment = this.db.prepare(
+          `UPDATE transcript_segments
+           SET person_id = ?, speaker_label = ?
+           WHERE id = ?`
+        );
+        for (const row of previousState.segments ?? []) {
+          restoreSegment.run(row.personId, row.speakerLabel, row.id);
+        }
+      }
+      return {
+        id: undoId,
+        sessionId: original.session_id,
+        action: "undo",
+        createdAt: safeAt,
+        canUndo: false,
+      };
+    });
+    const affectedSessionIds = [
+      ...new Set(
+        original.action === "forget_identity"
+          ? [
+              ...(previousState.clusters ?? []).map((row) => row.sessionId),
+              ...(previousState.segments ?? []).map((row) => row.sessionId),
+            ]
+          : [original.session_id]
+      ),
+    ];
+    const event = undo.immediate();
+    for (const affectedSessionId of affectedSessionIds) {
+      try {
+        this.refreshSessionParticipantSnapshot(affectedSessionId, { at: safeAt });
+      } catch {
+        // Keep undo durable even when a derived snapshot needs later reconciliation.
+      }
+    }
+    return {
+      event,
+      speakerProcessing: this.getSessionSpeakerProcessing(original.session_id),
+    };
+  }
+
+  listParticipantReviewHistory(sessionId) {
+    return this.db
+      .prepare(
+        `SELECT id, session_id, action, subject_ref, payload_json,
+          reverts_event_id, actor, created_at
+         FROM participant_review_events
+         WHERE session_id = ? ORDER BY created_at DESC, rowid DESC`
+      )
+      .all(assertId(sessionId, "sessionId"))
+      .map((row) => {
+        const state = this.db
+          .prepare(
+            `SELECT previous_state_json, next_state_json
+             FROM participant_review_events WHERE id = ?`
+          )
+          .get(row.id);
+        return {
+          id: row.id,
+          sessionId: row.session_id,
+          action: row.action,
+          subjectRef: row.subject_ref,
+          payload: JSON.parse(row.payload_json),
+          previousState: JSON.parse(state.previous_state_json),
+          nextState: JSON.parse(state.next_state_json),
+          revertsEventId: row.reverts_event_id,
+          actor: row.actor,
+          createdAt: row.created_at,
+          canUndo:
+            row.action !== "undo" &&
+            !this.db
+              .prepare(
+                "SELECT 1 FROM participant_review_events WHERE reverts_event_id = ? LIMIT 1"
+              )
+              .get(row.id),
+        };
+      });
+  }
+
   getPersonDetail(id) {
     const personId = assertId(id, "personId");
-    const person = this.db.prepare("SELECT * FROM people WHERE id = ?").get(personId);
+    const person = this.db
+      .prepare(
+        `SELECT person.* FROM people AS person
+         LEFT JOIN speaker_identity_review_overrides AS forgotten
+           ON forgotten.person_id = person.id AND forgotten.state = 'forgotten'
+         WHERE person.id = ? AND forgotten.person_id IS NULL`
+      )
+      .get(personId);
     if (!person) return null;
     return {
       person,
@@ -5294,11 +6740,25 @@ class JarvisRepository {
   }
 
   confirmSpeakerLink(input) {
-    return this.speakerIdentityRepository.confirmLink(input);
+    const result = this.speakerIdentityRepository.confirmLink(input);
+    const cluster = this.speakerIdentityRepository.getCluster(input?.clusterId);
+    if (cluster?.sessionId) {
+      try {
+        this.refreshSessionParticipantSnapshot(cluster.sessionId);
+      } catch {}
+    }
+    return result;
   }
 
   confirmSpeakerLinkWithOutcome(input) {
-    return this.speakerIdentityRepository.confirmLinkWithOutcome(input);
+    const result = this.speakerIdentityRepository.confirmLinkWithOutcome(input);
+    const cluster = this.speakerIdentityRepository.getCluster(input?.clusterId);
+    if (cluster?.sessionId) {
+      try {
+        this.refreshSessionParticipantSnapshot(cluster.sessionId);
+      } catch {}
+    }
+    return result;
   }
 
   runSpeakerCorrectionTransaction(work) {
@@ -5316,7 +6776,11 @@ class JarvisRepository {
   }
 
   applySystemSpeakerResolutions(input) {
-    return this.speakerIdentityRepository.applySystemResolutions(input);
+    const result = this.speakerIdentityRepository.applySystemResolutions(input);
+    try {
+      this.refreshSessionParticipantSnapshot(input.sessionId, { at: input.at });
+    } catch {}
+    return result;
   }
 
   listRejectedSpeakerPersonIds(clusterId, revision) {
@@ -5332,7 +6796,13 @@ class JarvisRepository {
   }
 
   saveActivityClassificationBatch(input) {
-    return this.activityClassificationRepository.saveBatch(input);
+    const result = this.activityClassificationRepository.saveBatch(input);
+    try {
+      this.refreshSessionParticipantSnapshot(input.sessionId, {
+        at: input.createdAt,
+      });
+    } catch {}
+    return result;
   }
 
   listSessionActivityClassificationHistory(sessionId) {
@@ -5344,7 +6814,13 @@ class JarvisRepository {
   }
 
   correctActivityClassification(input) {
-    return this.activityClassificationRepository.recordUserCorrection(input);
+    const result = this.activityClassificationRepository.recordUserCorrection(input);
+    try {
+      this.refreshSessionParticipantSnapshot(result.sessionId, {
+        at: input.correctedAt,
+      });
+    } catch {}
+    return result;
   }
 
   recordSuggestionDismissalFeedback(input) {
@@ -5376,7 +6852,14 @@ class JarvisRepository {
   }
 
   undoSpeakerCorrection(clusterId) {
-    return this.speakerIdentityRepository.undoLastCorrection(clusterId);
+    const result = this.speakerIdentityRepository.undoLastCorrection(clusterId);
+    const cluster = this.speakerIdentityRepository.getCluster(clusterId);
+    if (cluster?.sessionId) {
+      try {
+        this.refreshSessionParticipantSnapshot(cluster.sessionId);
+      } catch {}
+    }
+    return result;
   }
 
   mergeSpeakerPeople(input) {
