@@ -3,12 +3,13 @@
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
 Current verified prerelease: `0.2.0-alpha.29` with database schema target `v47`.
-Current hardened source and packaged candidate: `0.2.0-rc.1` at
-`293bb057fa28b2667516c5c5e445783ea1874659` with database schema target `v58`.
-Its automated regression, static, virtual-endurance, Windows package, native-ABI, offline, and
-restart gates passed on 2026-08-03. It becomes the fully verified Phase 4 candidate only after the
-external legacy fixture and recorded physical microphone, real CUDA, private CAM++, and live
-MiniMax acceptance gates are complete.
+Current hardened source and packaged candidate: `0.2.0-rc.2` at
+`e0303215f8cf9a25430e851a6e1bb53e034e2776` with database schema target `v58`.
+Its candidate-specific main/renderer regression, static, Windows package, native-ABI, offline,
+restart, real v48 migration, and visible KOOK/system-mix deduplication checks passed on 2026-08-04.
+Three-hour endurance was not rerun for this candidate. It becomes the fully verified Phase 4
+candidate only after the remaining recorded physical microphone, real CUDA inference, private
+CAM++, live MiniMax, and migration-interruption acceptance gates are complete.
 
 ## Version line
 
@@ -18,7 +19,7 @@ MiniMax acceptance gates are complete.
 | Phase 1 complete       | `0.2.0-alpha.1` | `jarvis-v0.2.0-alpha.1` | Application-source and capture foundation |
 | Phase 2 complete       | `0.2.0-alpha.2` | `jarvis-v0.2.0-alpha.2` | Identity and activity classification      |
 | Phase 3 complete       | `0.2.0-beta.1`  | `jarvis-v0.2.0-beta.1`  | Actions and personalization               |
-| Phase 4 acceptance     | `0.2.0-rc.1`    | `jarvis-v0.2.0-rc.1`    | Packaged release candidate                |
+| Phase 4 acceptance     | `0.2.0-rc.2`    | `jarvis-v0.2.0-rc.2`    | Packaged release candidate                |
 | Final verified release | `0.2.0`         | `jarvis-v0.2.0`         | User-facing stable release                |
 
 Database versions and app versions are deliberately separate. For example, schema `v33` is an
@@ -39,9 +40,10 @@ internal migration target and does not imply app version `33`.
 
 ## GitHub tracking
 
-The current checkout has only the upstream `openwhispr` remote. Jarvis changes must never be pushed
-there. Before the first phase tag, add a user-owned GitHub repository as `origin`, push the current
-branch, and use a draft pull request as the durable change log.
+The user-owned `origin` is
+`https://github.com/davidxxxxx/Jarvis_personal_agenet.git`; the upstream OpenWhispr remote must not
+receive Jarvis branches or tags. Draft PR #1 is the durable prerelease change log and must be updated
+instead of creating duplicate pull requests.
 
 Each GitHub prerelease should contain:
 
