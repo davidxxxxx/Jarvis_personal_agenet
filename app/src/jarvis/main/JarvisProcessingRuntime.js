@@ -29,6 +29,8 @@ const DEFAULT_MAX_DRAIN_MS = 5_000;
 const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
 const DEFAULT_ANALYSIS_RECOVERY_LIMIT = 25;
 const DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS = 30_000;
+const DEFAULT_ACOUSTIC_DEDUPE_RETRY_MS = 60_000;
+const ACOUSTIC_DEDUPE_RESOURCE_DEFERRED = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
 const RESOURCE_DEFER_WAKE_REASONS = new Set(["external_gpu_busy", "gpu_utilization_high"]);
 const PREVIEW_CONTEXT_ROW_LIMIT = 16;
 const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
@@ -187,6 +189,7 @@ class JarvisProcessingRuntime {
     maxDrainMs = DEFAULT_MAX_DRAIN_MS,
     maxSessionsPerDrain = DEFAULT_MAX_SESSIONS_PER_DRAIN,
     analysisRecoveryIntervalMs = DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS,
+    acousticDedupeRetryMs = DEFAULT_ACOUSTIC_DEDUPE_RETRY_MS,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
     log = () => {},
@@ -332,6 +335,10 @@ class JarvisProcessingRuntime {
       analysisRecoveryIntervalMs,
       "analysisRecoveryIntervalMs"
     );
+    this.acousticDedupeRetryMs = positiveSafeInteger(
+      acousticDedupeRetryMs,
+      "acousticDedupeRetryMs"
+    );
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
     this.log = log;
@@ -367,6 +374,7 @@ class JarvisProcessingRuntime {
     this.running = true;
     this.sessionCursor = null;
     this.sessionPhaseFirst = false;
+    this.acousticDedupeRetryAtBySession = new Map();
   }
 
   start() {
@@ -588,6 +596,11 @@ class JarvisProcessingRuntime {
       if (!session?.id || visited.has(session.id)) continue;
       visited.add(session.id);
       try {
+        const acousticRetryAt = this.acousticDedupeRetryAtBySession.get(session.id);
+        if (acousticRetryAt !== undefined) {
+          if (this.now() < acousticRetryAt) continue;
+          this.acousticDedupeRetryAtBySession.delete(session.id);
+        }
         if (!this.repository.isSessionReadyForPostProcessing(session.id)) {
           this.repository.markSessionProcessing?.(session.id);
           this.repository.enqueueDiarizationJobs?.(session.id, {
@@ -654,7 +667,17 @@ class JarvisProcessingRuntime {
           }
         }
       } catch (error) {
-        this.log({ phase: "post_process", sessionId: session.id, error });
+        if (error?.code === ACOUSTIC_DEDUPE_RESOURCE_DEFERRED) {
+          const retryAt = safeTimestampAdd(
+            this.now(),
+            this.acousticDedupeRetryMs,
+            "acoustic dedupe retry"
+          );
+          this.acousticDedupeRetryAtBySession.set(session.id, retryAt);
+          this.log({ phase: "post_process", sessionId: session.id, retryAt, error });
+        } else {
+          this.log({ phase: "post_process", sessionId: session.id, error });
+        }
       } finally {
         this.sessionCursor = this._sessionCursorFor(session);
         inspected += 1;
@@ -665,6 +688,9 @@ class JarvisProcessingRuntime {
 
   async _drain() {
     const startedAt = this.now();
+    for (const [sessionId, retryAt] of this.acousticDedupeRetryAtBySession) {
+      if (retryAt <= startedAt) this.acousticDedupeRetryAtBySession.delete(sessionId);
+    }
     const resourceSnapshot = await this._releaseIdleWhisperUnderPressure();
     if (this.stopping || !this.running) return 0;
     try {
@@ -673,6 +699,20 @@ class JarvisProcessingRuntime {
       this.log({ phase: "resource_snapshot", error });
     }
     if (this.stopping || !this.running) return 0;
+    if (
+      resourceSnapshot &&
+      this.acousticDedupeRetryAtBySession.size > 0 &&
+      typeof this.governor?.admit === "function"
+    ) {
+      try {
+        const decision = this.governor.admit("maintenance", resourceSnapshot);
+        if (decision?.action === "run_cpu") {
+          this.acousticDedupeRetryAtBySession.clear();
+        }
+      } catch (error) {
+        this.log({ phase: "application_mix_acoustic_recovery", error });
+      }
+    }
     if (RESOURCE_DEFER_WAKE_REASONS.has(resourceSnapshot?.reason)) {
       this.resourceDeferredWakePending = true;
     }

@@ -541,6 +541,170 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
   ]);
 });
 
+test("coded acoustic deferral cools down only that session until retry expiry", async () => {
+  let now = 1_000;
+  let jobPhaseCalls = 0;
+  let deferredAttempts = 0;
+  const activeSessions = new Set(["deferred", "healthy"]);
+  const events = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        jobPhaseCalls += 1;
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () =>
+        [...activeSessions].map((id) => ({ id, finalized_at: id === "deferred" ? 1 : 2 })),
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: (id) => events.push(`processing:${id}`),
+      enqueueDiarizationJobs: (id) => events.push(`diarize:${id}`),
+      refreshSessionReadiness: (id) => {
+        events.push(`ready:${id}`);
+        activeSessions.delete(id);
+        return { processing_state: "ready" };
+      },
+    },
+    reconciler: {
+      reconcileSession: (id) => events.push(`reconcile:${id}`),
+    },
+    deduper: {
+      dedupe: (id) => {
+        events.push(`dedupe:${id}`);
+        if (id === "deferred" && deferredAttempts++ === 0) {
+          const error = new Error("acoustic dedupe deferred");
+          error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+          throw error;
+        }
+      },
+    },
+    now: () => now,
+    acousticDedupeRetryMs: 60_000,
+    log: (entry) => events.push(`error:${entry.sessionId}`),
+  });
+
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 1);
+  assert.equal(activeSessions.has("healthy"), false);
+  assert.deepEqual(events.slice(0, 9), [
+    "processing:deferred",
+    "reconcile:deferred",
+    "dedupe:deferred",
+    "error:deferred",
+    "processing:healthy",
+    "reconcile:healthy",
+    "dedupe:healthy",
+    "diarize:healthy",
+    "ready:healthy",
+  ]);
+
+  const jobsAfterFirstDrain = jobPhaseCalls;
+  now = 60_999;
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 1);
+  assert.equal(events.filter((event) => event === "reconcile:deferred").length, 1);
+  assert.ok(jobPhaseCalls > jobsAfterFirstDrain);
+
+  now = 61_000;
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 2);
+  assert.equal(events.filter((event) => event === "reconcile:deferred").length, 2);
+  assert.equal(activeSessions.has("deferred"), false);
+});
+
+test("expired acoustic cooldown is swept after its session leaves the processing list", async () => {
+  let now = 1_000;
+  let listed = true;
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => (listed ? [{ id: "orphaned" }] : []),
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "processing" }),
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: {
+      dedupe() {
+        const error = new Error("acoustic dedupe deferred");
+        error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+        throw error;
+      },
+    },
+    now: () => now,
+    acousticDedupeRetryMs: 60_000,
+  });
+
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 1);
+  listed = false;
+
+  now = 60_999;
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 1);
+
+  now = 61_000;
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 0);
+});
+
+test("recovered maintenance admission releases acoustic cooldown before expiry", async () => {
+  let now = 1_000;
+  let available = false;
+  let attempts = 0;
+  const activeSessions = new Set(["deferred"]);
+  const governor = {
+    async sample() {
+      return available
+        ? { state: "available", reason: "resources_available" }
+        : { state: "constrained", reason: "recovery_hysteresis" };
+    },
+    admit(kind) {
+      assert.equal(kind, "maintenance");
+      return available
+        ? { action: "run_cpu", reason: "resources_available" }
+        : { action: "defer", reason: "recovery_hysteresis" };
+    },
+  };
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [...activeSessions].map((id) => ({ id })),
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: (id) => {
+        activeSessions.delete(id);
+        return { processing_state: "ready" };
+      },
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: {
+      dedupe() {
+        attempts += 1;
+        if (attempts === 1) {
+          const error = new Error("acoustic dedupe deferred");
+          error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+          throw error;
+        }
+      },
+    },
+    now: () => now,
+    governor,
+    acousticDedupeRetryMs: 60_000,
+  });
+
+  await runtime.drainOnce();
+  now = 6_000;
+  await runtime.drainOnce();
+  assert.equal(attempts, 1);
+
+  available = true;
+  now = 11_000;
+  await runtime.drainOnce();
+  assert.equal(attempts, 2);
+  assert.equal(activeSessions.size, 0);
+});
+
 test("start recovers expired leases immediately and owns an unref polling timer", async () => {
   const calls = [];
   const timer = { unref: () => calls.push("unref") };
