@@ -43,8 +43,9 @@ function loadPreloadApi({ responder, rejection = null } = {}) {
 const config = {
   keyConfigured: true,
   model: "MiniMax-M2.7",
-  key: "sk-cp-private",
-  path: "C:\\private\\key",
+  modelStatus: "ready",
+  fallbackUsed: false,
+  checkedAt: 1_000,
 };
 
 const budget = {
@@ -71,6 +72,7 @@ const resourceSettings = {
 const applicationAudioStatus = {
   enabled: true,
   trackLimit: 4,
+  fallbackPolicy: "conservative",
   runtime: {
     running: true,
     configuredLimit: 4,
@@ -99,6 +101,49 @@ const applicationAudioStatus = {
   privatePath: "C:\\private\\application-audio.json",
 };
 
+test("preload exposes only explicit safe todo reminder inputs", async () => {
+  const { api, invokes } = loadPreloadApi();
+  await api.getTodoReminder("todo_1");
+  await api.setTodoReminder("todo_1", 9_000);
+  await api.setTodoReminder("todo_1", null);
+  assert.deepEqual(invokes, [
+    ["jarvis:todo-reminder:get", "todo_1"],
+    ["jarvis:todo-reminder:set", { todoId: "todo_1", reminderAt: 9_000 }],
+    ["jarvis:todo-reminder:set", { todoId: "todo_1", reminderAt: null }],
+  ]);
+  assert.throws(() => api.getTodoReminder("../private"));
+  assert.throws(() => api.setTodoReminder("todo_1", -1));
+});
+
+test("preload exposes the lightweight action center watermark channel", async () => {
+  const { api, invokes } = loadPreloadApi();
+  await api.getActionCenterWatermark();
+  await api.getActionCenterDelta();
+  await api.markActionCenterRead(7);
+  assert.deepEqual(invokes, [
+    ["jarvis:memory:v2-action-watermark"],
+    ["jarvis:memory:v2-action-delta"],
+    ["jarvis:memory:v2-action-read", { throughSequence: 7 }],
+  ]);
+  assert.throws(() => api.markActionCenterRead(-1));
+});
+
+test("preload validates the four rollout flags returned by the main process", async () => {
+  const rolloutFlags = {
+    applicationAudioV1: true,
+    dualSpeakerVerificationV1: false,
+    activityClassificationV1: true,
+    actionCenterV1: false,
+  };
+  const { api, invokes } = loadPreloadApi({ responder: () => rolloutFlags });
+
+  assert.deepEqual(await api.getRolloutFlags(), rolloutFlags);
+  assert.deepEqual(invokes, [["jarvis:rollout-flags:get"]]);
+
+  const invalid = loadPreloadApi({ responder: () => ({ ...rolloutFlags, privatePath: "x" }) });
+  await assert.rejects(() => invalid.api.getRolloutFlags(), /exact keys/u);
+});
+
 test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe responses", async () => {
   const { api, invokes } = loadPreloadApi({
     responder(channel) {
@@ -109,10 +154,16 @@ test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe r
   assert.deepEqual(await api.setMiniMaxKey(" sk-cp-user-key "), {
     keyConfigured: true,
     model: "MiniMax-M2.7",
+    modelStatus: "ready",
+    fallbackUsed: false,
+    checkedAt: 1_000,
   });
   assert.deepEqual(await api.clearMiniMaxKey(), {
     keyConfigured: true,
     model: "MiniMax-M2.7",
+    modelStatus: "ready",
+    fallbackUsed: false,
+    checkedAt: 1_000,
   });
   assert.deepEqual(
     await api.setAnalysisBudget({
@@ -121,15 +172,15 @@ test("preload sends exact MiniMax and analysis-budget inputs and rebuilds safe r
       timezone: "UTC",
     }),
     {
-    mode: "capped",
-    monthKey: "2026-07",
-    timezone: "Asia/Shanghai",
-    currency: "USD",
-    monthlyLimitMicrousd: 5_000_000,
-    spentMicrousd: 1_000_000,
-    reservedMicrousd: 500_000,
-    remainingMicrousd: 3_500_000,
-    blockedReason: null,
+      mode: "capped",
+      monthKey: "2026-07",
+      timezone: "Asia/Shanghai",
+      currency: "USD",
+      monthlyLimitMicrousd: 5_000_000,
+      spentMicrousd: 1_000_000,
+      reservedMicrousd: 500_000,
+      remainingMicrousd: 3_500_000,
+      blockedReason: null,
     }
   );
   assert.deepEqual(invokes, [
@@ -207,6 +258,7 @@ test("preload validates application audio settings and strips process identity f
   const expected = {
     enabled: true,
     trackLimit: 4,
+    fallbackPolicy: "conservative",
     runtime: {
       running: true,
       configuredLimit: 4,
@@ -233,19 +285,27 @@ test("preload validates application audio settings and strips process identity f
   };
   assert.deepEqual(await api.getApplicationAudioSettings(), expected);
   assert.deepEqual(
-    await api.setApplicationAudioSettings({ enabled: false, trackLimit: 8 }),
+    await api.setApplicationAudioSettings({
+      enabled: false,
+      trackLimit: 8,
+      fallbackPolicy: "transcript_only",
+    }),
     expected
   );
   assert.deepEqual(invokes, [
     ["jarvis:application-audio:get"],
-    ["jarvis:application-audio:set", { enabled: false, trackLimit: 8 }],
+    [
+      "jarvis:application-audio:set",
+      { enabled: false, trackLimit: 8, fallbackPolicy: "transcript_only" },
+    ],
   ]);
 
   for (const input of [
-    { enabled: "yes", trackLimit: 4 },
-    { enabled: true, trackLimit: 0 },
-    { enabled: true, trackLimit: 9 },
-    { enabled: true, trackLimit: 4, extra: true },
+    { enabled: "yes", trackLimit: 4, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 0, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 9, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 4, fallbackPolicy: "unsafe" },
+    { enabled: true, trackLimit: 4, fallbackPolicy: "conservative", extra: true },
   ]) {
     assert.throws(() => api.setApplicationAudioSettings(input));
   }
@@ -294,7 +354,12 @@ test("preload strips private analysis status fields and masks raw IPC failures",
         recoveryWaitMs: 60_000,
       }),
     () => failed.api.getApplicationAudioSettings(),
-    () => failed.api.setApplicationAudioSettings({ enabled: true, trackLimit: 4 }),
+    () =>
+      failed.api.setApplicationAudioSettings({
+        enabled: true,
+        trackLimit: 4,
+        fallbackPolicy: "conservative",
+      }),
     () => failed.api.getAnalysisStatus("session-1"),
     () => failed.api.analyzeSession("session-1", "final"),
   ]) {

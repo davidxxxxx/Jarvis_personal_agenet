@@ -9,6 +9,54 @@ const { MODEL_PACK_VERSION, verifyAiModelPack } = require("../src/jarvis/main/Ai
 const APP_ROOT = path.resolve(__dirname, "..");
 const DEFAULT_DIST_ROOT = path.join(APP_ROOT, "dist");
 
+function parseCliArgs(argv) {
+  let publishOnly = false;
+  let publishToDist = false;
+  let distRoot;
+  const setDistRoot = (value) => {
+    if (distRoot !== undefined) throw new Error("--dist-root may only be provided once");
+    if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+      throw new Error("--dist-root requires a value");
+    }
+    if (!path.isAbsolute(value)) throw new TypeError("--dist-root must be absolute");
+    const resolved = path.resolve(value);
+    if (resolved === path.parse(resolved).root) {
+      throw new Error("--dist-root must not be a volume root");
+    }
+    distRoot = resolved;
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--publish-only") {
+      publishOnly = true;
+      continue;
+    }
+    if (argument === "--publish-to-dist") {
+      publishToDist = true;
+      continue;
+    }
+    if (argument === "--dist-root") {
+      setDistRoot(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+    const rootMatch = /^--dist-root=(.*)$/u.exec(argument);
+    if (rootMatch) {
+      setDistRoot(rootMatch[1]);
+      continue;
+    }
+    throw new Error(`unsupported model bundle argument: ${argument}`);
+  }
+  if (publishOnly && publishToDist) {
+    throw new Error("model bundle publication mode is ambiguous");
+  }
+  if (distRoot !== undefined && !publishOnly && !publishToDist) {
+    throw new Error("--dist-root requires publication");
+  }
+  return { publishOnly, publishToDist, distRoot };
+}
+
 function modelArtifactNames(packVersion) {
   if (
     typeof packVersion !== "string" ||
@@ -294,12 +342,12 @@ async function loadCachedWindowsModelBundle({
 }
 
 async function main() {
-  const publishOnly = process.argv.includes("--publish-only");
+  const { publishOnly, publishToDist, distRoot } = parseCliArgs(process.argv.slice(2));
   const bundle = publishOnly
     ? await loadCachedWindowsModelBundle()
     : await buildWindowsModelBundle();
-  if (publishOnly || process.argv.includes("--publish-to-dist")) {
-    await publishWindowsModelBundle({ bundle });
+  if (publishOnly || publishToDist) {
+    await publishWindowsModelBundle({ bundle, ...(distRoot === undefined ? {} : { distRoot }) });
   }
   process.stdout.write(
     `[jarvis-model-pack] ${bundle.reused ? "reused" : "built"} ${bundle.archiveName} (${bundle.bytes} bytes)\n`
@@ -319,6 +367,7 @@ module.exports = {
   hashFile,
   loadCachedWindowsModelBundle,
   modelArtifactNames,
+  parseCliArgs,
   publishWindowsModelBundle,
   renderNsisInclude,
 };

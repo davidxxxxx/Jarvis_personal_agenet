@@ -47,8 +47,8 @@ test("watcher normalizes active PIDs, merges processes by app, and omits private
     "data",
     Buffer.from(
       '{"type":"session","state":"active","pid":101,"peak":0.2}\n' +
-        '{"type":"session","state":"active","pid":102,"peak":0.4}\n' +
-        '{"type":"session","state":"active","pid":103,"peak":0.3}\n'
+        '{"type":"session","state":"active","pid":102,"peak":0.4,"audible":true}\n' +
+        '{"type":"session","state":"active","pid":103,"peak":0,"audible":false}\n'
     )
   );
   await new Promise((resolve) => setImmediate(resolve));
@@ -62,6 +62,7 @@ test("watcher normalizes active PIDs, merges processes by app, and omits private
       applicationKey: event.applicationKey,
       applicationDisplayName: event.applicationDisplayName,
       peak: event.peak,
+      audible: event.audible,
     })),
     [
       {
@@ -70,6 +71,7 @@ test("watcher normalizes active PIDs, merges processes by app, and omits private
         applicationKey: "chrome",
         applicationDisplayName: "Chrome",
         peak: 0.2,
+        audible: true,
       },
       {
         state: "active",
@@ -77,19 +79,52 @@ test("watcher normalizes active PIDs, merges processes by app, and omits private
         applicationKey: "chrome",
         applicationDisplayName: "Chrome",
         peak: 0.4,
+        audible: true,
       },
       {
         state: "active",
         pid: 103,
         applicationKey: "kook",
         applicationDisplayName: "KOOK",
-        peak: 0.3,
+        peak: 0,
+        audible: false,
       },
     ]
   );
   assert.equal(JSON.stringify(events).includes("private"), false);
   assert.equal(JSON.stringify(events).includes("cmd"), false);
   await watcher.stop();
+});
+
+test("watcher stop is idempotent and closes one native helper handle", async () => {
+  const child = fakeChild();
+  let stdinEnds = 0;
+  child.stdin.end = () => {
+    stdinEnds += 1;
+    setImmediate(() => child.emit("exit", 0, null));
+  };
+  const watcher = new WindowsAudioSessionWatcher({
+    platform: "win32",
+    processId: 99,
+    resolveBinary: () => "G:\\Jarvis\\windows-system-audio-helper.exe",
+    capabilityProvider: async () => ({
+      available: true,
+      supportsApplicationCapture: true,
+      supportsSessionWatch: true,
+      windowsBuild: 22631,
+      minimumWindowsBuild: 20348,
+    }),
+    spawnImpl: () => child,
+  });
+
+  const started = watcher.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  child.stdout.emit("data", Buffer.from('{"type":"ready","windowsBuild":22631}\n'));
+  await started;
+  await Promise.all([watcher.stop(), watcher.stop()]);
+
+  assert.equal(stdinEnds, 1);
+  assert.equal(watcher.process, null);
 });
 
 test("watcher fails closed on unsupported builds and does not enter a restart loop", async () => {

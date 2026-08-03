@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, BrainCircuit, Lightbulb } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { JarvisKnowledgeOverview } from "../types";
+import type { JarvisKnowledgeDismissReason, JarvisKnowledgeOverview } from "../types";
 import EvidenceLink from "./EvidenceLink";
+import {
+  createKnowledgeActionId,
+  IgnoreReasonDialog,
+  TodoComposerDialog,
+} from "./KnowledgeActionDialogs";
+
+type Suggestion = JarvisKnowledgeOverview["suggestions"][number];
 
 export default function KnowledgeMemoryPanel() {
   const { t } = useTranslation();
@@ -11,6 +18,15 @@ export default function KnowledgeMemoryPanel() {
   const [showAll, setShowAll] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  const [suggestionComposer, setSuggestionComposer] = useState<{
+    suggestion: Suggestion;
+    commandId: string;
+    todoId: string;
+  } | null>(null);
+  const [ignoreTarget, setIgnoreTarget] = useState<{
+    suggestion: Suggestion;
+    commandId: string;
+  } | null>(null);
   const generation = useRef(0);
 
   const load = useCallback(async () => {
@@ -34,33 +50,60 @@ export default function KnowledgeMemoryPanel() {
     };
   }, [load]);
 
-  const decide = async (suggestionId: string, action: "accept" | "dismiss") => {
+  const startSuggestionDecision = (suggestion: Suggestion, action: "accept" | "dismiss") => {
     if (busyId) return;
-    setBusyId(suggestionId);
+    if (action === "accept") {
+      setSuggestionComposer({
+        suggestion,
+        commandId: createKnowledgeActionId("command"),
+        todoId: createKnowledgeActionId("todo"),
+      });
+      return;
+    }
+    setIgnoreTarget({
+      suggestion,
+      commandId: createKnowledgeActionId("command"),
+    });
+  };
+
+  const acceptSuggestion = async (value: { title: string; dueText: string | null }) => {
+    if (!suggestionComposer || busyId) return;
+    setBusyId(suggestionComposer.suggestion.id);
     try {
-      const result = await window.electronAPI.jarvis.decideKnowledgeSuggestion(
-        suggestionId,
-        action
-      );
-      setOverview((current) =>
-        current
-          ? {
-              ...current,
-              suggestions: current.suggestions.map((item) =>
-                item.id === suggestionId
-                  ? {
-                      ...item,
-                      state: action === "accept" ? "accepted" : "dismissed",
-                      decidedAt: result.decidedAt,
-                    }
-                  : item
-              ),
-            }
-          : current
-      );
+      await window.electronAPI.jarvis.applyKnowledgeAction({
+        commandId: suggestionComposer.commandId,
+        type: "suggestion_accept",
+        suggestionId: suggestionComposer.suggestion.id,
+        todoId: suggestionComposer.todoId,
+        ...value,
+      });
+      setSuggestionComposer(null);
+      await load();
       setError(false);
-    } catch {
+    } catch (caught) {
       setError(true);
+      throw caught;
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const dismissSuggestion = async (reasonCode: JarvisKnowledgeDismissReason) => {
+    if (!ignoreTarget || busyId) return;
+    setBusyId(ignoreTarget.suggestion.id);
+    try {
+      await window.electronAPI.jarvis.applyKnowledgeAction({
+        commandId: ignoreTarget.commandId,
+        type: "suggestion_dismiss",
+        suggestionId: ignoreTarget.suggestion.id,
+        reasonCode,
+      });
+      setIgnoreTarget(null);
+      await load();
+      setError(false);
+    } catch (caught) {
+      setError(true);
+      throw caught;
     } finally {
       setBusyId(null);
     }
@@ -102,16 +145,18 @@ export default function KnowledgeMemoryPanel() {
     }
   };
 
-  const proposedSuggestions = overview?.suggestions.filter((item) => item.state === "proposed") ?? [];
+  const proposedSuggestions =
+    overview?.suggestions.filter((item) => item.state === "proposed") ?? [];
   const openConflicts = overview?.conflicts.filter((item) => item.state === "open") ?? [];
   const selectedMemory =
     overview?.memories.find((memory) => memory.id === selectedMemoryId) ?? null;
   const selectedEvidence = useMemo(
-    () =>
-      selectedMemory?.occurrences.flatMap((occurrence) => occurrence.evidence) ?? [],
+    () => selectedMemory?.occurrences.flatMap((occurrence) => occurrence.evidence) ?? [],
     [selectedMemory]
   );
-  const visibleMemories = showAll ? overview?.memories ?? [] : overview?.memories.slice(0, 6) ?? [];
+  const visibleMemories = showAll
+    ? (overview?.memories ?? [])
+    : (overview?.memories.slice(0, 6) ?? []);
 
   if (!overview && !error) {
     return <p className="text-sm text-muted-foreground">正在读取长期记忆…</p>;
@@ -250,7 +295,7 @@ export default function KnowledgeMemoryPanel() {
                   <button
                     type="button"
                     disabled={busyId !== null}
-                    onClick={() => void decide(suggestion.id, "accept")}
+                    onClick={() => startSuggestionDecision(suggestion, "accept")}
                     className="rounded-lg bg-primary px-3 py-1.5 text-primary-foreground disabled:opacity-50"
                   >
                     Accept / 接受
@@ -258,7 +303,7 @@ export default function KnowledgeMemoryPanel() {
                   <button
                     type="button"
                     disabled={busyId !== null}
-                    onClick={() => void decide(suggestion.id, "dismiss")}
+                    onClick={() => startSuggestionDecision(suggestion, "dismiss")}
                     className="rounded-lg border border-border px-3 py-1.5 disabled:opacity-50"
                   >
                     Dismiss / 忽略
@@ -297,6 +342,24 @@ export default function KnowledgeMemoryPanel() {
             ))}
           </div>
         </details>
+      )}
+      {suggestionComposer && (
+        <TodoComposerDialog
+          heading="接受候选建议"
+          description="确认标题和日期后，建议才会通过统一行动生命周期转为正式待办。"
+          confirmLabel="创建待办"
+          initialTitle={suggestionComposer.suggestion.title}
+          onCancel={() => setSuggestionComposer(null)}
+          onConfirm={acceptSuggestion}
+        />
+      )}
+      {ignoreTarget && (
+        <IgnoreReasonDialog
+          entityTitle={ignoreTarget.suggestion.title}
+          allowLocalNote={false}
+          onCancel={() => setIgnoreTarget(null)}
+          onConfirm={(reasonCode) => dismissSuggestion(reasonCode)}
+        />
       )}
     </section>
   );

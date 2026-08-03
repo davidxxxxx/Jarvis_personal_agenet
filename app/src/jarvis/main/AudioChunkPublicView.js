@@ -35,6 +35,7 @@ const RENDERER_AUDIO_CHUNK_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "duration_ms",
+  "transcription_status",
   "track_id",
   "source_type",
   "sequence_number",

@@ -2,6 +2,8 @@
 
 const crypto = require("node:crypto");
 const { ACTIVITY_CATEGORIES } = require("./LocalActivityClassifier");
+const { ActivityOutputPolicy } = require("./ActivityOutputPolicy");
+const PersonalizationFeedbackRepository = require("./PersonalizationFeedbackRepository");
 
 const CATEGORY_SET = new Set(ACTIVITY_CATEGORIES);
 const DECISIONS = new Set(["adopted", "tentative", "unknown"]);
@@ -13,6 +15,9 @@ const SOURCE_ATTRIBUTIONS = new Set([
   "application_and_microphone",
   "mixed_unknown",
 ]);
+const SPEAKER_COUNT_BUCKETS = new Set(["none", "one", "multiple"]);
+const TIME_BUCKETS = new Set(["night", "morning", "afternoon", "evening"]);
+const activityOutputPolicy = new ActivityOutputPolicy();
 
 function text(value, name) {
   if (typeof value !== "string" || !value.trim()) {
@@ -90,8 +95,7 @@ function evidenceFeatures(entry) {
       .filter((value) => typeof value === "string" && value.trim())
       .map((value) => value.trim().toLowerCase())
       .sort(),
-    selfParticipated:
-      evidence.selfDetected === true || evidence.microphoneParticipated === true,
+    selfParticipated: evidence.selfDetected === true || evidence.microphoneParticipated === true,
     speakerCountBucket: speakerCountBucket(evidence.speakerCount),
     timeBucket: timeBucket(entry?.startedAt ?? 0),
   };
@@ -106,15 +110,63 @@ function classificationEvidenceBasis(entry) {
     speakerCount: Number.isSafeInteger(evidence.speakerCount) ? evidence.speakerCount : 0,
     timeBucket: typeof evidence.timeBucket === "string" ? evidence.timeBucket : null,
     personalizationRuleId:
-      typeof evidence.personalizationRuleId === "string"
-        ? evidence.personalizationRuleId
-        : null,
+      typeof evidence.personalizationRuleId === "string" ? evidence.personalizationRuleId : null,
     sourceAttribution: entry?.sourceAttribution ?? null,
   });
 }
 
 function featurePatternKey(features) {
   return sha256(JSON.stringify(features));
+}
+
+function normalizedRuleEdit({ label, targetValue, conditions }) {
+  const nextLabel = text(label, "label").replace(/\s+/gu, " ");
+  if (Array.from(nextLabel).length > 500) throw new RangeError("label is too long");
+  if (!CATEGORY_SET.has(targetValue)) {
+    throw new TypeError("personalization rule target category is invalid");
+  }
+  if (
+    !conditions ||
+    typeof conditions !== "object" ||
+    Array.isArray(conditions) ||
+    Object.getPrototypeOf(conditions) !== Object.prototype ||
+    Object.keys(conditions).sort().join("\0") !==
+      ["applicationKeys", "selfParticipated", "speakerCountBucket", "timeBucket"].sort().join("\0")
+  ) {
+    throw new TypeError("personalization rule conditions are invalid");
+  }
+  if (
+    !Array.isArray(conditions.applicationKeys) ||
+    conditions.applicationKeys.length > 8 ||
+    conditions.applicationKeys.some(
+      (entry) => typeof entry !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(entry)
+    )
+  ) {
+    throw new TypeError("personalization rule application keys are invalid");
+  }
+  const applicationKeys = [...new Set(conditions.applicationKeys)].sort();
+  if (applicationKeys.length !== conditions.applicationKeys.length) {
+    throw new TypeError("personalization rule application keys must be unique");
+  }
+  if (typeof conditions.selfParticipated !== "boolean") {
+    throw new TypeError("personalization rule SELF condition is invalid");
+  }
+  if (!SPEAKER_COUNT_BUCKETS.has(conditions.speakerCountBucket)) {
+    throw new TypeError("personalization rule speaker count condition is invalid");
+  }
+  if (!TIME_BUCKETS.has(conditions.timeBucket)) {
+    throw new TypeError("personalization rule time condition is invalid");
+  }
+  return {
+    label: nextLabel,
+    targetValue,
+    conditions: {
+      applicationKeys,
+      selfParticipated: conditions.selfParticipated,
+      speakerCountBucket: conditions.speakerCountBucket,
+      timeBucket: conditions.timeBucket,
+    },
+  };
 }
 
 function mapRule(row) {
@@ -162,6 +214,7 @@ class ActivityClassificationRepository {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     this.db = db;
     this.now = now;
+    this.personalizationFeedbackRepository = new PersonalizationFeedbackRepository(db);
     this.insert = db.prepare(`
       INSERT OR IGNORE INTO activity_classifications (
         id, session_id, started_at, ended_at, category, confidence, decision,
@@ -244,11 +297,6 @@ class ActivityClassificationRepository {
       UPDATE jarvis_notification_preferences
       SET focus_mode = @focusMode, muted_until = @mutedUntil, updated_at = @updatedAt
       WHERE singleton = 1
-    `);
-    this.suggestionFeedbackCount = db.prepare(`
-      SELECT COUNT(*) AS count
-      FROM personalization_feedback
-      WHERE domain = 'suggestion' AND pattern_key = ?
     `);
     this._saveBatch = db.transaction((rows) => {
       const persisted = [];
@@ -389,12 +437,14 @@ class ActivityClassificationRepository {
         return current;
       });
     };
-    return [...byActivityWindow.values()].map(select).sort(
-      (left, right) =>
-        left.startedAt - right.startedAt ||
-        left.endedAt - right.endedAt ||
-        left.id.localeCompare(right.id)
-    );
+    return [...byActivityWindow.values()]
+      .map(select)
+      .sort(
+        (left, right) =>
+          left.startedAt - right.startedAt ||
+          left.endedAt - right.endedAt ||
+          left.id.localeCompare(right.id)
+      );
   }
 
   applyPersonalizationRule(activity, classification) {
@@ -402,23 +452,26 @@ class ActivityClassificationRepository {
     const rule = mapRule(this.findEnabledActivityRule.get(featurePatternKey(features)));
     if (!rule) return classification;
     const exactAttribution = activity?.sourceAttribution !== "mixed_unknown";
+    const confidence = exactAttribution ? Math.max(classification.confidence ?? 0, 0.9) : 0.79;
+    const decision = exactAttribution ? "adopted" : "tentative";
+    const permissions = activityOutputPolicy.evaluate({
+      category: rule.targetValue,
+      confidence,
+      decision,
+      sourceAttribution: activity?.sourceAttribution ?? "mixed_unknown",
+      selfParticipated: features.selfParticipated,
+    });
     return {
       ...classification,
       category: rule.targetValue,
-      confidence: exactAttribution ? Math.max(classification.confidence ?? 0, 0.9) : 0.79,
-      decision: exactAttribution ? "adopted" : "tentative",
+      confidence,
+      decision,
       source: "local",
       reason: `enabled_personalization_rule:${rule.id}`,
       personalizationRuleId: rule.id,
-      allowSummary: true,
-      allowSuggestions:
-        exactAttribution &&
-        ["work_meeting", "learning", "social_call", "in_person_conversation"].includes(
-          rule.targetValue
-        ),
-      allowTodos:
-        exactAttribution &&
-        ["work_meeting", "social_call", "in_person_conversation"].includes(rule.targetValue),
+      allowSummary: permissions.allowSummary,
+      allowSuggestions: permissions.allowSuggestions,
+      allowTodos: permissions.allowTodos,
     };
   }
 
@@ -429,14 +482,6 @@ class ActivityClassificationRepository {
     const at = timestamp(correctedAt, "correctedAt");
     const features = evidenceFeatures(source);
     const patternKey = featurePatternKey(features);
-    const evidence = {
-      ...source.evidence,
-      personalizationFeedback: {
-        originalCategory: source.category,
-        correctedCategory: category,
-        patternKey,
-      },
-    };
     const identity = {
       sessionId: source.sessionId,
       startedAt: source.startedAt,
@@ -446,6 +491,26 @@ class ActivityClassificationRepository {
       correctedAt: at,
     };
     const mixedUnknown = source.sourceAttribution === "mixed_unknown";
+    const correctedConfidence = mixedUnknown ? 0.79 : 1;
+    const correctedDecision = mixedUnknown ? "tentative" : "adopted";
+    const permissions = activityOutputPolicy.evaluate({
+      category,
+      confidence: correctedConfidence,
+      decision: correctedDecision,
+      sourceAttribution: source.sourceAttribution,
+      selfParticipated: features.selfParticipated,
+    });
+    const evidence = {
+      ...source.evidence,
+      allowSummary: permissions.allowSummary,
+      allowSuggestions: permissions.allowSuggestions,
+      allowTodos: permissions.allowTodos,
+      personalizationFeedback: {
+        originalCategory: source.category,
+        correctedCategory: category,
+        patternKey,
+      },
+    };
     const row = {
       id: deterministicId(identity),
       sessionId: source.sessionId,
@@ -454,8 +519,8 @@ class ActivityClassificationRepository {
       category,
       // A manual category correction does not make an unknown audio source exact.
       // Preserve the attribution gate required by the database and by Todo policy.
-      confidence: mixedUnknown ? 0.79 : 1,
-      decision: mixedUnknown ? "tentative" : "adopted",
+      confidence: correctedConfidence,
+      decision: correctedDecision,
       source: "user",
       reason: "user_activity_correction",
       sourceAttribution: source.sourceAttribution,
@@ -482,16 +547,10 @@ class ActivityClassificationRepository {
         patternKey,
         category
       ).count;
-      let proposedRule = this.getRuleByPattern.get(
-        "activity_classification",
-        patternKey,
-        category
-      );
+      let proposedRule = this.getRuleByPattern.get("activity_classification", patternKey, category);
       if (supportCount >= 3) {
         const applicationLabel =
-          features.applicationKeys.length > 0
-            ? features.applicationKeys.join("、")
-            : "未知应用";
+          features.applicationKeys.length > 0 ? features.applicationKeys.join("、") : "未知应用";
         const ruleId = `rule_${sha256(`activity\0${patternKey}\0${category}`).slice(0, 32)}`;
         const inserted = this.insertRule.run({
           id: ruleId,
@@ -533,40 +592,33 @@ class ActivityClassificationRepository {
   }
 
   recordSuggestionDismissal({ suggestionId, summary, occurredAt = this.now() } = {}) {
-    const safeId = text(suggestionId, "suggestionId");
-    const normalized = text(summary, "suggestion summary").toLowerCase().replace(/\s+/gu, " ");
-    const features = { contentFingerprint: sha256(normalized) };
-    const patternKey = featurePatternKey(features);
-    const at = timestamp(occurredAt, "occurredAt");
-    this.insertFeedback.run({
-      id: `feedback_${sha256(`suggestion\0${safeId}`).slice(0, 32)}`,
-      domain: "suggestion",
-      sourceEntityId: safeId,
-      originalValue: "visible",
-      correctedValue: "lower_priority",
-      patternKey,
-      featureJson: JSON.stringify(features),
-      occurredAt: at,
+    const result = this.personalizationFeedbackRepository.recordSuggestionDismissal({
+      suggestionId: text(suggestionId, "suggestionId"),
+      summary: text(summary, "suggestion summary"),
+      occurredAt: timestamp(occurredAt, "occurredAt"),
     });
     return {
-      patternKey,
-      dismissalCount: this.suggestionFeedbackCount.get(patternKey).count,
+      patternKey: result.patternKey,
+      dismissalCount: this.personalizationFeedbackRepository.suggestionFeedbackScore(summary),
     };
   }
 
   suggestionPenalty(summary) {
-    if (typeof summary !== "string" || !summary.trim()) return 0;
-    const normalized = summary.trim().toLowerCase().replace(/\s+/gu, " ");
-    const patternKey = featurePatternKey({ contentFingerprint: sha256(normalized) });
-    const count = this.suggestionFeedbackCount.get(patternKey).count;
-    return Math.min(0.45, count * 0.15);
+    return this.personalizationFeedbackRepository.suggestionPenalty(summary);
   }
 
   listPersonalizationRules() {
     return this.listRulesStatement.all().map(mapRule);
   }
 
-  decidePersonalizationRule({ ruleId, action, label, at = this.now() } = {}) {
+  decidePersonalizationRule({
+    ruleId,
+    action,
+    label,
+    targetValue,
+    conditions,
+    at = this.now(),
+  } = {}) {
     const safeRuleId = text(ruleId, "ruleId");
     const rule = this.getRule.get(safeRuleId);
     if (!rule) throw new Error("personalization rule does not exist");
@@ -585,50 +637,93 @@ class ActivityClassificationRepository {
             : rule.state;
     if (!RULE_STATES.has(nextState)) throw new TypeError("personalization rule state is invalid");
     let nextLabel = rule.label;
+    let nextTargetValue = rule.target_value;
+    let nextPatternKey = rule.pattern_key;
+    let nextRuleJson = rule.rule_json;
+    let editDetail = {};
     if (action === "edit") {
-      nextLabel = text(label, "label");
-      if (Array.from(nextLabel).length > 500) throw new RangeError("label is too long");
+      if (rule.domain !== "activity_classification") {
+        throw new TypeError("only activity classification rules can be edited");
+      }
+      const edit = normalizedRuleEdit({ label, targetValue, conditions });
+      nextLabel = edit.label;
+      nextTargetValue = edit.targetValue;
+      nextPatternKey = featurePatternKey(edit.conditions);
+      nextRuleJson = JSON.stringify({ features: edit.conditions, category: edit.targetValue });
+      const previousRule = JSON.parse(rule.rule_json);
+      editDetail = {
+        previous: {
+          label: rule.label,
+          targetValue: rule.target_value,
+          conditions: previousRule.features,
+        },
+        next: {
+          label: nextLabel,
+          targetValue: nextTargetValue,
+          conditions: edit.conditions,
+        },
+      };
     }
-    this.db.transaction(() => {
-      this.db
-        .prepare(
-          `UPDATE personalization_rules
-           SET state = ?, label = ?, updated_at = ?
+    this.db
+      .transaction(() => {
+        this.db
+          .prepare(
+            `UPDATE personalization_rules
+           SET state = ?, label = ?, target_value = ?, pattern_key = ?,
+               rule_json = ?, updated_at = ?
            WHERE id = ?`
-        )
-        .run(nextState, nextLabel, occurredAt, safeRuleId);
-      this._appendRuleEvent({
-        ruleId: safeRuleId,
-        action: action === "enable" ? "enabled" : action === "disable" ? "disabled" : action === "delete" ? "deleted" : "edited",
-        previousState: rule.state,
-        nextState,
-        detail: action === "edit" ? { previousLabel: rule.label, nextLabel } : {},
-        at: occurredAt,
-      });
-    }).immediate();
+          )
+          .run(
+            nextState,
+            nextLabel,
+            nextTargetValue,
+            nextPatternKey,
+            nextRuleJson,
+            occurredAt,
+            safeRuleId
+          );
+        this._appendRuleEvent({
+          ruleId: safeRuleId,
+          action:
+            action === "enable"
+              ? "enabled"
+              : action === "disable"
+                ? "disabled"
+                : action === "delete"
+                  ? "deleted"
+                  : "edited",
+          previousState: rule.state,
+          nextState,
+          detail: action === "edit" ? editDetail : {},
+          at: occurredAt,
+        });
+      })
+      .immediate();
     return mapRule(this.getRule.get(safeRuleId));
   }
 
   resetPersonalizationRules({ at = this.now() } = {}) {
     const occurredAt = timestamp(at, "at");
-    const result = this.db.transaction(() => {
-      const changed = this.db
-        .prepare(
-          `UPDATE personalization_rules
+    const result = this.db
+      .transaction(() => {
+        const changed = this.db
+          .prepare(
+            `UPDATE personalization_rules
            SET state = 'deleted', updated_at = ?
            WHERE state <> 'deleted'`
-        )
-        .run(occurredAt).changes;
-      this._appendRuleEvent({
-        ruleId: null,
-        action: "reset",
-        previousState: null,
-        nextState: null,
-        detail: { changed },
-        at: occurredAt,
-      });
-      return changed;
-    }).immediate();
+          )
+          .run(occurredAt).changes;
+        this._appendRuleEvent({
+          ruleId: null,
+          action: "reset",
+          previousState: null,
+          nextState: null,
+          detail: { changed },
+          at: occurredAt,
+        });
+        return changed;
+      })
+      .immediate();
     return { resetCount: result, resetAt: occurredAt };
   }
 
@@ -644,10 +739,7 @@ class ActivityClassificationRepository {
 
   setNotificationPreferences({ focusMode, mutedUntil, at = this.now() } = {}) {
     if (typeof focusMode !== "boolean") throw new TypeError("focusMode must be a boolean");
-    if (
-      mutedUntil !== null &&
-      (!Number.isSafeInteger(mutedUntil) || mutedUntil < 0)
-    ) {
+    if (mutedUntil !== null && (!Number.isSafeInteger(mutedUntil) || mutedUntil < 0)) {
       throw new TypeError("mutedUntil must be null or a non-negative safe integer");
     }
     const occurredAt = timestamp(at, "at");

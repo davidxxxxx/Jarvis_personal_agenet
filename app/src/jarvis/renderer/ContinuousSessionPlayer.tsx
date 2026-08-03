@@ -11,6 +11,7 @@ import type {
 import SpeakerChip from "./SpeakerChip";
 import { useJarvisStore } from "./jarvisStore";
 import { normalizeWavForPlayback } from "./playbackLoudness";
+import TranscriptTodoButton from "./TranscriptTodoButton";
 
 type PlaybackMode = "mix" | "mic" | "system";
 
@@ -46,8 +47,7 @@ function orderedChunks(chunks: JarvisAudioChunk[]): JarvisAudioChunk[] {
 function overlapMs(left: JarvisAudioChunk, right: JarvisAudioChunk): number {
   return Math.max(
     0,
-    Math.min(left.ended_at, right.ended_at) -
-      Math.max(left.started_at, right.started_at)
+    Math.min(left.ended_at, right.ended_at) - Math.max(left.started_at, right.started_at)
   );
 }
 
@@ -67,10 +67,13 @@ export function preferredSystemChunks(
     const duration = Math.max(1, chunk.ended_at - chunk.started_at);
     const covered = applicationChunks
       .filter((candidate) => overlapMs(chunk, candidate) > 0)
-      .map((candidate) => [
-        Math.max(chunk.started_at, candidate.started_at),
-        Math.min(chunk.ended_at, candidate.ended_at),
-      ] as const)
+      .map(
+        (candidate) =>
+          [
+            Math.max(chunk.started_at, candidate.started_at),
+            Math.min(chunk.ended_at, candidate.ended_at),
+          ] as const
+      )
       .sort((left, right) => left[0] - right[0] || left[1] - right[1])
       .reduce(
         (state, range) => {
@@ -83,7 +86,8 @@ export function preferredSystemChunks(
           return state;
         },
         { ranges: [] as Array<[number, number]> }
-      ).ranges.reduce((total, range) => total + range[1] - range[0], 0);
+      )
+      .ranges.reduce((total, range) => total + range[1] - range[0], 0);
     return covered / duration < 0.8;
   });
 }
@@ -216,19 +220,16 @@ export default function ContinuousSessionPlayer({
     () => new Map(allPlayable.map((chunk) => [chunk.id, chunk])),
     [allPlayable]
   );
-  const queue = useMemo(
-    () => {
-      if (mode === "mic") {
-        return allPlayable.filter((chunk) => chunk.source_type === "mic");
-      }
-      if (mode === "system") return systemPlayable;
-      return orderedChunks([
-        ...allPlayable.filter((chunk) => chunk.source_type === "mic"),
-        ...systemPlayable,
-      ]);
-    },
-    [allPlayable, mode, systemPlayable]
-  );
+  const queue = useMemo(() => {
+    if (mode === "mic") {
+      return allPlayable.filter((chunk) => chunk.source_type === "mic");
+    }
+    if (mode === "system") return systemPlayable;
+    return orderedChunks([
+      ...allPlayable.filter((chunk) => chunk.source_type === "mic"),
+      ...systemPlayable,
+    ]);
+  }, [allPlayable, mode, systemPlayable]);
   const intervalFailures = useMemo(() => {
     const seen = new Set<string>();
     return timeline.application_audio_intervals.filter((interval) => {
@@ -475,10 +476,10 @@ export default function ContinuousSessionPlayer({
             {playing ? "停止播放" : "连续播放"}
           </button>
         </div>
-          <p className="mt-2 text-xs text-muted-foreground">
-            点击任意一条转写，从该句起点播放，并在该句结束时间自动停止。播放时会自动统一响度，
-            原始录音不会被修改。
-          </p>
+        <p className="mt-2 text-xs text-muted-foreground">
+          点击任意一条转写，从该句起点播放，并在该句结束时间自动停止。播放时会自动统一响度，
+          原始录音不会被修改。
+        </p>
       </div>
 
       {!allPlayable.length && (
@@ -708,6 +709,9 @@ export default function ContinuousSessionPlayer({
                       >
                         {segment.text}
                       </button>
+                      <div className="mt-2 flex justify-end">
+                        <TranscriptTodoButton sessionId={timeline.session_id} segment={segment} />
+                      </div>
                     </div>
                   </div>
                   {isActive && (

@@ -28,6 +28,7 @@ const DEFAULT_MAX_DRAIN_MS = 5_000;
 const DEFAULT_MAX_SESSIONS_PER_DRAIN = 5;
 const DEFAULT_ANALYSIS_RECOVERY_LIMIT = 25;
 const DEFAULT_ANALYSIS_RECOVERY_INTERVAL_MS = 30_000;
+const RESOURCE_DEFER_WAKE_REASONS = new Set(["external_gpu_busy", "gpu_utilization_high"]);
 const PREVIEW_CONTEXT_ROW_LIMIT = 16;
 const PREVIEW_PROMPT_CODE_POINT_LIMIT = 1_024;
 const OVERLAP_SEPARATION_APPLICATION_KEYS = new Set([
@@ -349,6 +350,7 @@ class JarvisProcessingRuntime {
     this.dualSpeakerVerifier = dualSpeakerVerifier;
     this.prepareTranscriptionJobs = prepareTranscriptionJobs;
     this.restrictiveReleaseLatched = false;
+    this.resourceDeferredWakePending = true;
     this.fullscreenYieldActive = false;
     this.timer = null;
     this.inFlight = null;
@@ -624,7 +626,30 @@ class JarvisProcessingRuntime {
               this.log({ phase: "daily_digest_ready", sessionId: session.id, error });
             }
           } else {
-            this.repository.completeHistoricalLocalOnlyReprocessing?.(session.id, this.now());
+            const started = this.repository.startHistoricalLocalOnlyReprocessing?.(
+              session.id,
+              this.now()
+            );
+            if (started?.state !== "processing") {
+              throw new Error("historical local-only reprocessing did not enter processing");
+            }
+            if (typeof this.analysisScheduler?.classifySessionLocally !== "function") {
+              throw new Error("local activity classification is unavailable");
+            }
+            await Promise.resolve(
+              this.analysisScheduler.classifySessionLocally(session.id, { force: true })
+            );
+            if (typeof this.repository.refreshSessionParticipantSnapshot !== "function") {
+              throw new Error("participant snapshot refresh is unavailable");
+            }
+            await Promise.resolve(this.repository.refreshSessionParticipantSnapshot(session.id));
+            const completed = this.repository.finalizeHistoricalLocalOnlyReprocessing?.(
+              session.id,
+              this.now()
+            );
+            if (completed?.state !== "completed") {
+              throw new Error("historical local-only reprocessing did not finalize");
+            }
           }
         }
       } catch (error) {
@@ -647,6 +672,17 @@ class JarvisProcessingRuntime {
       this.log({ phase: "resource_snapshot", error });
     }
     if (this.stopping || !this.running) return 0;
+    if (RESOURCE_DEFER_WAKE_REASONS.has(resourceSnapshot?.reason)) {
+      this.resourceDeferredWakePending = true;
+    }
+    if (resourceSnapshot?.state === "available" && this.resourceDeferredWakePending) {
+      try {
+        this.runner.wakeResourceDeferredJobs?.(this.now());
+        this.resourceDeferredWakePending = false;
+      } catch (error) {
+        this.log({ phase: "resource_deferred_wake", error });
+      }
+    }
     this.fullscreenYieldActive = resolveFullscreenYieldActive(
       resourceSnapshot,
       this.fullscreenYieldActive
@@ -796,6 +832,7 @@ function createJarvisProcessingRuntime({
   primarySpeakerEmbeddingHelper = null,
   reviewSpeakerEmbeddingHelper = null,
   dualSpeakerVerifier = null,
+  dualSpeakerVerificationEnabled = true,
   speakerIdentityReleaseEvidence = null,
   cloudCompositionFactory = null,
   ...runtimeOptions
@@ -832,6 +869,9 @@ function createJarvisProcessingRuntime({
   }
   if (cloudCompositionFactory !== null && typeof cloudCompositionFactory !== "function") {
     throw new TypeError("cloudCompositionFactory must be a function or null");
+  }
+  if (typeof dualSpeakerVerificationEnabled !== "boolean") {
+    throw new TypeError("dualSpeakerVerificationEnabled must be a boolean");
   }
   if (ownedPidsProvider !== null && typeof ownedPidsProvider !== "function") {
     throw new TypeError("ownedPidsProvider must be a function or null");
@@ -910,12 +950,7 @@ function createJarvisProcessingRuntime({
       ? new SessionDiarizationWorker({
           repository,
           audioEvidenceReader: service.audioEvidenceReader,
-          diarizeAudio: ({
-            wavPath,
-            executionContext,
-            track,
-            releaseHighMemoryResources,
-          }) =>
+          diarizeAudio: ({ wavPath, executionContext, track, releaseHighMemoryResources }) =>
             diarizationManager.diarizeStrict(wavPath, {
               executionContext,
               enableOverlapSeparation: shouldEnableOverlapSeparation(track),
@@ -1001,25 +1036,30 @@ function createJarvisProcessingRuntime({
       },
     });
   const effectiveGate = heavyGate ?? new HeavyJobGate();
-  const effectivePrimarySpeakerEmbeddingHelper =
-    primarySpeakerEmbeddingHelper ??
-    new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.PRIMARY });
-  const effectiveReviewSpeakerEmbeddingHelper =
-    reviewSpeakerEmbeddingHelper ?? new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.REVIEW });
-  const effectiveDualSpeakerVerifier =
-    dualSpeakerVerifier ??
-    new DualSpeakerVerifier({
-      primaryEmbeddings: effectivePrimarySpeakerEmbeddingHelper,
-      reviewEmbeddings: effectiveReviewSpeakerEmbeddingHelper,
-      resourceGovernor: effectiveGovernor,
-      releaseEvidence: speakerIdentityReleaseEvidence,
-    });
+  const effectivePrimarySpeakerEmbeddingHelper = dualSpeakerVerificationEnabled
+    ? (primarySpeakerEmbeddingHelper ??
+      new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.PRIMARY }))
+    : null;
+  const effectiveReviewSpeakerEmbeddingHelper = dualSpeakerVerificationEnabled
+    ? (reviewSpeakerEmbeddingHelper ??
+      new SpeakerEmbeddings({ modelKey: SPEAKER_MODEL_KEYS.REVIEW }))
+    : null;
+  const effectiveDualSpeakerVerifier = dualSpeakerVerificationEnabled
+    ? (dualSpeakerVerifier ??
+      new DualSpeakerVerifier({
+        primaryEmbeddings: effectivePrimarySpeakerEmbeddingHelper,
+        reviewEmbeddings: effectiveReviewSpeakerEmbeddingHelper,
+        resourceGovernor: effectiveGovernor,
+        releaseEvidence: speakerIdentityReleaseEvidence,
+      }))
+    : null;
   const canBuildDualIdentityResolutionWorker =
+    dualSpeakerVerificationEnabled &&
     canBuildIdentityResolutionWorker &&
     typeof repository.listSpeakerIdentityAudioWindows === "function" &&
     typeof repository.replaceSpeakerClusterModelEmbeddings === "function" &&
-    typeof effectivePrimarySpeakerEmbeddingHelper.extractEmbedding === "function" &&
-    typeof effectiveReviewSpeakerEmbeddingHelper.extractEmbedding === "function";
+    typeof effectivePrimarySpeakerEmbeddingHelper?.extractEmbedding === "function" &&
+    typeof effectiveReviewSpeakerEmbeddingHelper?.extractEmbedding === "function";
   const effectiveIdentityResolutionWorker =
     speakerIdentityResolutionWorker ??
     (canBuildIdentityResolutionWorker

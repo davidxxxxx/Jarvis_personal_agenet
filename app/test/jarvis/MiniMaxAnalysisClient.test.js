@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+const AnalysisInputBuilder = require("../../src/jarvis/main/AnalysisInputBuilder");
 const MiniMaxAnalysisClient = require("../../src/jarvis/main/MiniMaxAnalysisClient");
 const { AnalysisClientError } = MiniMaxAnalysisClient;
 
@@ -11,7 +12,7 @@ test("allows long MiniMax reasoning responses while keeping a finite timeout", (
 
 function candidate(overrides = {}) {
   return {
-    schemaVersion: "jarvis-analysis-v2",
+    schemaVersion: "jarvis-analysis-v3",
     sessionSummary: {
       title: "Delivery",
       summary: "Delivery scope was agreed.",
@@ -37,7 +38,106 @@ function analysisInput(overrides = {}) {
     inputHash: "a".repeat(64),
     allowedSegmentIds: ["seg-1"],
     allowedOwnerLabels: ["SELF"],
+    allowedLearningGoalIds: [],
     ...overrides,
+  };
+}
+
+function v3Segment(overrides = {}) {
+  return {
+    segmentId: "seg-1",
+    startedAt: 1,
+    endedAt: 2,
+    speakerLabel: "SELF",
+    applicationKey: null,
+    sourceAttribution: "microphone",
+    activityCategory: "work_meeting",
+    activityConfidence: 0.94,
+    activityDecision: "adopted",
+    selfParticipated: true,
+    memoryMode: "full",
+    allowedSuggestionBases: ["work_context"],
+    todoCandidateAllowed: true,
+    text: "交付",
+    ...overrides,
+  };
+}
+
+function v3AnalysisInput(payloadOverrides = {}, inputOverrides = {}) {
+  const payload = {
+    inputVersion: "jarvis-analysis-input-v3",
+    segments: [v3Segment()],
+    omittedRanges: [],
+    ...payloadOverrides,
+  };
+  return {
+    cloudPayloadJson: JSON.stringify(payload),
+    inputHash: "b".repeat(64),
+    allowedSegmentIds: payload.segments.map((segment) => segment.segmentId),
+    allowedOwnerLabels: [...new Set(payload.segments.map((segment) => segment.speakerLabel))],
+    allowedLearningGoalIds: (payload.learningGoals ?? []).map((goal) => goal.goalId),
+    ...inputOverrides,
+  };
+}
+
+function builtV3AnalysisInput() {
+  const privateValues = {
+    windowTitle: "Private Quarterly Title",
+    realName: "Alice Example",
+    voiceprint: "VOICEPRINT_SECRET",
+    audioPath: "G:\\private-audio.wav",
+  };
+  const built = new AnalysisInputBuilder().build({
+    prepareToken: "local-only-token",
+    speakerBindings: [
+      {
+        label: "SELF",
+        subjectKind: "self",
+        subjectId: "person-private",
+        subjectDisplayNameSnapshot: privateValues.realName,
+      },
+    ],
+    redactionTerms: {
+      participants: [{ label: "SELF", names: [privateValues.realName] }],
+      otherPeople: ["Bob Example"],
+      deviceLabels: ["Private microphone"],
+    },
+    segments: [
+      {
+        ordinal: 0,
+        segmentId: "seg-1",
+        segmentVersion: 1,
+        textHash: "c".repeat(64),
+        textSnapshot:
+          "Alice Example agreed with Bob Example to review C:\\Users\\Alice\\plan.txt using Private microphone",
+        resultKind: "final",
+        isStable: true,
+        isCurrent: true,
+        supersededBy: null,
+        duplicateOf: null,
+        startedAt: 1,
+        endedAt: 2,
+        speakerBindingLabel: "SELF",
+        applicationKey: "teams",
+        sourceAttribution: "application_and_microphone",
+        activityCategory: "work_meeting",
+        activityConfidence: 0.93456,
+        activityDecision: "adopted",
+        selfParticipated: true,
+        ...privateValues,
+      },
+    ],
+  });
+  return {
+    built,
+    privateValues,
+    input: {
+      cloudPayloadJson: built.cloudPayloadJson,
+      inputHash: "d".repeat(64),
+      allowedSegmentIds: built.local.selectedSegmentIds,
+      allowedOwnerLabels: built.local.allowedOwnerLabels,
+      allowedLearningGoalIds: [],
+    },
   };
 }
 
@@ -134,10 +234,7 @@ test("accepts MiniMax tool-call compatibility fields, direct object, or JSON fen
 test("rejects ambiguous envelopes arrays primitives prose and malformed tool content", async () => {
   const invalidBodies = [
     [JSON.stringify({ choices: [] }), "envelope.choices_count"],
-    [
-      JSON.stringify({ choices: [{ message: {} }, { message: {} }] }),
-      "envelope.choices_count",
-    ],
+    [JSON.stringify({ choices: [{ message: {} }, { message: {} }] }), "envelope.choices_count"],
     [
       envelope({
         ...toolMessage(),
@@ -166,7 +263,10 @@ test("rejects ambiguous envelopes arrays primitives prose and malformed tool con
     [envelope({ content: "```json\n{}\n```\n```json\n{}\n```" }), "envelope.content_fence"],
     [envelope({ content: "[]" }), "envelope.content.shape"],
     [envelope({ content: "1" }), "envelope.content.shape"],
-    [envelope({ content: null, function_call: { name: "other", arguments: "{}" } }), "envelope.legacy_function_call_shape"],
+    [
+      envelope({ content: null, function_call: { name: "other", arguments: "{}" } }),
+      "envelope.legacy_function_call_shape",
+    ],
   ];
   let calls = 0;
   const client = new MiniMaxAnalysisClient({
@@ -274,6 +374,8 @@ test("uses only the official HTTPS endpoint and privacy-preserving fetch options
   assert.equal(captured.body.max_completion_tokens, 8192);
   assert.match(captured.body.messages[0].content, /evidence clusters, not verified people/);
   assert.match(captured.body.messages[0].content, /Never infer participant count/);
+  assert.match(captured.body.messages[0].content, /copy learningGoalId character-for-character/);
+  assert.match(captured.body.messages[0].content, /Never invent a goal ID/);
   assert.equal(captured.body.messages[1].content, analysisInput().cloudPayloadJson);
   assert.equal("allowedSegmentIds" in captured.body, false);
 
@@ -291,6 +393,250 @@ test("uses only the official HTTPS endpoint and privacy-preserving fetch options
       expectClientError("configuration", false)
     );
   }
+});
+
+test("accepts the exact v3 builder contract and uploads only its privacy allowlist", async () => {
+  const { built, privateValues, input } = builtV3AnalysisInput();
+  let requestBody;
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return response(envelope(toolMessage()));
+    },
+    getApiKey: () => "unit-test-key",
+  });
+
+  assert.deepEqual((await client.analyze(input)).result, candidate());
+  assert.equal(requestBody.messages[1].content, built.cloudPayloadJson);
+  const uploaded = JSON.parse(requestBody.messages[1].content);
+  assert.equal(uploaded.inputVersion, "jarvis-analysis-input-v3");
+  assert.deepEqual(uploaded.segments[0], {
+    segmentId: "seg-1",
+    startedAt: 1,
+    endedAt: 2,
+    speakerLabel: "SELF",
+    applicationKey: "teams",
+    sourceAttribution: "application_and_microphone",
+    activityCategory: "work_meeting",
+    activityConfidence: 0.9346,
+    activityDecision: "adopted",
+    selfParticipated: true,
+    memoryMode: "full",
+    allowedSuggestionBases: ["work_context"],
+    todoCandidateAllowed: true,
+    text: built.cloudPayload.segments[0].text,
+  });
+  assert.match(uploaded.segments[0].text, /SELF agreed with \[PERSON\]/u);
+  assert.match(uploaded.segments[0].text, /\[PATH\]/u);
+  const serializedUpload = JSON.stringify(uploaded);
+  for (const sensitive of Object.values(privateValues)) {
+    assert.equal(serializedUpload.includes(sensitive), false);
+  }
+  for (const forbiddenField of ["windowTitle", "realName", "voiceprint", "audioPath"]) {
+    assert.equal(serializedUpload.includes(forbiddenField), false);
+  }
+  assert.equal("allowedSegmentIds" in requestBody, false);
+  assert.equal("allowedOwnerLabels" in requestBody, false);
+});
+
+test("rejects unsupported v3 fields and inconsistent policy before any request", async () => {
+  let fetches = 0;
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () => {
+      fetches += 1;
+      return response(envelope(toolMessage()));
+    },
+    getApiKey: () => "unit-test-key",
+  });
+  const inputs = [
+    v3AnalysisInput({ windowTitle: "Private title" }),
+    v3AnalysisInput({ segments: [{ ...v3Segment(), voiceprint: [0.1, 0.2] }] }),
+    v3AnalysisInput({
+      omittedRanges: [{ startedAt: 3, endedAt: 4, audioPath: "G:\\private.wav" }],
+    }),
+    v3AnalysisInput({
+      segments: [
+        v3Segment({
+          activityCategory: "entertainment",
+          memoryMode: "full",
+          allowedSuggestionBases: ["work_context"],
+          todoCandidateAllowed: true,
+        }),
+      ],
+    }),
+    v3AnalysisInput({
+      segments: [
+        v3Segment({
+          applicationKey: "teams",
+          sourceAttribution: "mixed_unknown",
+          memoryMode: "summary_only",
+          allowedSuggestionBases: [],
+          todoCandidateAllowed: false,
+        }),
+      ],
+    }),
+    v3AnalysisInput({}, { localAudio: "raw-bytes" }),
+  ];
+
+  for (const input of inputs) {
+    await assert.rejects(client.analyze(input), expectClientError("invalid_structure", false));
+  }
+  assert.equal(fetches, 0);
+});
+
+test("rejects raw paths secrets and non-anonymous speakers before any request", async () => {
+  let fetches = 0;
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () => {
+      fetches += 1;
+      return response(envelope(toolMessage()));
+    },
+    getApiKey: () => "unit-test-key",
+  });
+  const inputs = [
+    v3AnalysisInput({
+      segments: [v3Segment({ text: "Open C:\\Users\\Alice\\private-audio.wav" })],
+    }),
+    v3AnalysisInput({
+      segments: [
+        v3Segment({
+          applicationKey: "C:\\Program Files\\Meeting.exe",
+          sourceAttribution: "application",
+        }),
+      ],
+    }),
+    v3AnalysisInput({ segments: [v3Segment({ speakerLabel: "Alice Example" })] }),
+    v3AnalysisInput({
+      learningGoals: [{ goalId: "goal-private", title: "Bearer private-token-value" }],
+    }),
+    v3AnalysisInput({
+      segments: [v3Segment({ segmentId: "G:\\recordings\\voiceprint.wav" })],
+    }),
+  ];
+
+  for (const input of inputs) {
+    await assert.rejects(client.analyze(input), expectClientError("invalid_structure", false));
+  }
+  assert.equal(fetches, 0);
+});
+
+test("keeps historical v2 inputs readable without requiring v3 context fields", async () => {
+  let uploaded;
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async (_url, options) => {
+      uploaded = JSON.parse(options.body).messages[1].content;
+      return response(envelope(toolMessage()));
+    },
+    getApiKey: () => "unit-test-key",
+  });
+  const legacyInput = analysisInput();
+  delete legacyInput.allowedLearningGoalIds;
+
+  assert.deepEqual((await client.analyze(legacyInput)).result, candidate());
+  assert.equal(JSON.parse(uploaded).inputVersion, "jarvis-analysis-input-v2");
+  assert.deepEqual(Object.keys(JSON.parse(uploaded).segments[0]).sort(), [
+    "endedAt",
+    "segmentId",
+    "speakerLabel",
+    "startedAt",
+    "text",
+  ]);
+});
+
+test("keeps speakers anonymous and removes invented evidence identifiers", async () => {
+  const input = v3AnalysisInput({
+    segments: [
+      v3Segment(),
+      v3Segment({
+        segmentId: "seg-2",
+        startedAt: 3,
+        endedAt: 4,
+        speakerLabel: "P1",
+        activityCategory: "social_call",
+        selfParticipated: false,
+        memoryMode: "summary_only",
+        allowedSuggestionBases: [],
+        todoCandidateAllowed: false,
+        text: "收到",
+      }),
+    ],
+  });
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () =>
+      response(
+        envelope(
+          toolMessage(
+            candidate({
+              sessionSummary: {
+                ...candidate().sessionSummary,
+                evidenceSegmentIds: ["seg-1", "invented-segment"],
+              },
+              memories: [
+                {
+                  kind: "fact",
+                  title: "Invented evidence",
+                  body: "This item must not survive validation.",
+                  confidence: 0.9,
+                  evidenceSegmentIds: ["invented-segment"],
+                },
+              ],
+            })
+          )
+        )
+      ),
+    getApiKey: () => "unit-test-key",
+  });
+
+  const result = (await client.analyze(input)).result;
+  assert.deepEqual(result.sessionSummary.evidenceSegmentIds, ["seg-1"]);
+  assert.deepEqual(result.memories, []);
+  assert.deepEqual(
+    JSON.parse(input.cloudPayloadJson).segments.map((segment) => segment.speakerLabel),
+    ["SELF", "P1"]
+  );
+});
+
+test("allows only payload learning goal ids and validates suggestion goal binding", async () => {
+  const payload = {
+    inputVersion: "jarvis-analysis-input-v2",
+    learningGoals: [{ goalId: "goal-english", title: "Improve spoken English" }],
+    segments: [
+      { segmentId: "seg-1", startedAt: 1, endedAt: 2, speakerLabel: "SELF", text: "练习口语" },
+    ],
+    omittedRanges: [],
+  };
+  const client = new MiniMaxAnalysisClient({
+    fetchImpl: async () =>
+      response(
+        envelope(
+          toolMessage(
+            candidate({
+              suggestions: [
+                {
+                  title: "Practice a short dialogue",
+                  rationale: "This advances the confirmed speaking goal.",
+                  basis: "learning_goal",
+                  learningGoalId: "goal-english",
+                  basedOnEvidenceSegmentIds: ["seg-1"],
+                },
+              ],
+            })
+          )
+        )
+      ),
+    getApiKey: () => "unit-test-key",
+  });
+  const input = analysisInput({
+    cloudPayloadJson: JSON.stringify(payload),
+    allowedLearningGoalIds: ["goal-english"],
+  });
+  const result = await client.analyze(input);
+  assert.equal(result.result.suggestions[0].learningGoalId, "goal-english");
+
+  await assert.rejects(
+    client.analyze({ ...input, allowedLearningGoalIds: ["goal-invented"] }),
+    expectClientError("invalid_structure", false)
+  );
 });
 
 test("rejects an oversized serialized request before reading the key or fetching", async () => {

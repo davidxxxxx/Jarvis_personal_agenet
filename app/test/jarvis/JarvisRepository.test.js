@@ -106,6 +106,60 @@ test("incomplete active summaries expose an explicit paid refresh recommendation
   });
 });
 
+test("activity classification corrections idempotently recommend a paid summary refresh", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "classification-refresh-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "mic",
+  });
+  repo.db
+    .prepare(
+      `INSERT INTO session_summary_revisions (
+         id, session_id, revision, previous_revision_id, completeness, lifecycle,
+         content_json, source_analysis_input_id, provenance, created_at
+       ) VALUES (
+         'summary-classification-refresh', 'classification-refresh-session', 1, NULL,
+         'final', 'active', ?, NULL, 'evidence_linked', 2_000
+       )`
+    )
+    .run(JSON.stringify({ title: "Paid summary", summary: "Keep this local result." }));
+
+  const first = repo.markSessionSummaryRefreshRecommended(
+    "classification-refresh-session",
+    "activity_classification_changed",
+    3_000
+  );
+  const repeated = repo.markSessionSummaryRefreshRecommended(
+    "classification-refresh-session",
+    "activity_classification_changed",
+    3_000
+  );
+
+  assert.deepEqual(repeated, first);
+  assert.deepEqual(first, {
+    session_id: "classification-refresh-session",
+    basis_policy_id: null,
+    latest_policy_id: "jarvis-session-diarization-v1",
+    recommended: 1,
+    reason: "activity_classification_changed",
+    updated_at: 3_000,
+  });
+  assert.equal(
+    repo.db
+      .prepare("SELECT count(*) AS count FROM session_summary_refresh_state WHERE session_id = ?")
+      .get("classification-refresh-session").count,
+    1
+  );
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
+  );
+});
+
 test("session timeline returns deterministic source evidence, visible text, and job counts", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -1423,6 +1477,17 @@ test("derived memory analysis is idempotent and queryable from every Jarvis view
   assert.equal(detail.topics.length, 1);
   assert.equal(detail.todos.length, 1);
   assert.equal(repo.listTopics().length, 1);
+  const changesBeforeTopicRead = repo.db.prepare("SELECT total_changes() AS count").get().count;
+  const topicDetail = repo.getTopicDetail(repo.listTopics()[0].id);
+  const changesAfterTopicRead = repo.db.prepare("SELECT total_changes() AS count").get().count;
+  assert.equal(changesAfterTopicRead, changesBeforeTopicRead);
+  assert.equal(topicDetail.people[0].id, "person-2");
+  assert.deepEqual(topicDetail.decisions, [
+    { sessionId: "history-1", content: "采用厂商提供的 SDK" },
+  ]);
+  assert.equal(topicDetail.sessions[0].id, "history-1");
+  assert.equal(topicDetail.todos[0].owner_name, "说话人 2");
+  assert.equal(topicDetail.memories[0].person_name, "说话人 2");
   assert.equal(repo.listTodos().length, 1);
   assert.equal(repo.listMemories().length, 1);
   const people = repo.listPeopleOverview();

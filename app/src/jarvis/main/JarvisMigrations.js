@@ -1,6 +1,7 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
+const { computeSessionSemanticHashes } = require("./SessionReprocessingSemantics");
 
-const TARGET_VERSION = 47;
+const TARGET_VERSION = 58;
 const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
@@ -1086,7 +1087,7 @@ const HYBRID_DIARIZATION_HISTORY_SCHEMA = `
     recommended INTEGER NOT NULL DEFAULT 0 CHECK(recommended IN (0,1)),
     reason TEXT CHECK(reason IS NULL OR reason IN (
       'speaker_count_changed','speaker_identity_changed','application_source_changed',
-      'transcript_changed','manual_request'
+      'transcript_changed','activity_classification_changed','manual_request'
     )),
     updated_at INTEGER NOT NULL,
     CHECK(recommended = 1 OR reason IS NULL)
@@ -1101,6 +1102,18 @@ const HYBRID_DIARIZATION_HISTORY_SCHEMA = `
     state TEXT NOT NULL CHECK(state IN ('queued','processing','completed')),
     started_at INTEGER NOT NULL,
     completed_at INTEGER,
+    baseline_content_sha256 TEXT NOT NULL CHECK(
+      length(baseline_content_sha256) = 64 AND
+      baseline_content_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    baseline_identity_sha256 TEXT NOT NULL CHECK(
+      length(baseline_identity_sha256) = 64 AND
+      baseline_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    baseline_classification_sha256 TEXT NOT NULL CHECK(
+      length(baseline_classification_sha256) = 64 AND
+      baseline_classification_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
     CHECK((state = 'completed') = (completed_at IS NOT NULL))
   );
   CREATE INDEX IF NOT EXISTS idx_session_reprocessing_active
@@ -7305,6 +7318,2124 @@ function upgradeParticipantReviewV47(db) {
   `);
 }
 
+function upgradeRestrainedNotificationsV48(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS todo_reminders (
+      todo_instance_id TEXT PRIMARY KEY REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      reminder_at INTEGER NOT NULL CHECK(
+        typeof(reminder_at) = 'integer' AND reminder_at >= 0
+      ),
+      reminder_source TEXT NOT NULL CHECK(reminder_source = 'user'),
+      generation INTEGER NOT NULL DEFAULT 1 CHECK(
+        typeof(generation) = 'integer' AND generation >= 1
+      ),
+      state TEXT NOT NULL CHECK(state IN ('scheduled','deferred','delivered','cancelled')),
+      deferred_reason TEXT CHECK(
+        deferred_reason IS NULL OR (
+          typeof(deferred_reason) = 'text'
+          AND length(deferred_reason) BETWEEN 1 AND 128
+          AND deferred_reason NOT GLOB '*[^a-z0-9_]*'
+        )
+      ),
+      delivered_at INTEGER CHECK(
+        delivered_at IS NULL OR (typeof(delivered_at) = 'integer' AND delivered_at >= 0)
+      ),
+      cancelled_at INTEGER CHECK(
+        cancelled_at IS NULL OR (typeof(cancelled_at) = 'integer' AND cancelled_at >= 0)
+      ),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      CHECK(
+        (state IN ('scheduled','deferred') AND delivered_at IS NULL AND cancelled_at IS NULL)
+        OR (state = 'delivered' AND delivered_at IS NOT NULL AND cancelled_at IS NULL)
+        OR (state = 'cancelled' AND delivered_at IS NULL AND cancelled_at IS NOT NULL)
+      ),
+      CHECK(state = 'deferred' OR deferred_reason IS NULL)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_todo_reminders_due
+      ON todo_reminders(state, reminder_at, todo_instance_id)
+      WHERE state IN ('scheduled','deferred');
+
+    CREATE TRIGGER IF NOT EXISTS cancel_todo_reminder_on_terminal_state
+    AFTER UPDATE OF status ON todos_v2
+    WHEN NEW.status <> 'open'
+    BEGIN
+      UPDATE todo_reminders
+      SET state = 'cancelled',
+          deferred_reason = NULL,
+          delivered_at = NULL,
+          cancelled_at = MAX(NEW.updated_at, OLD.updated_at),
+          updated_at = MAX(NEW.updated_at, OLD.updated_at)
+      WHERE todo_instance_id = NEW.id
+        AND state IN ('scheduled','deferred');
+    END;
+  `);
+
+  // No reminder is inferred from due_text: only a later explicit user action may create one.
+}
+
+function upgradeActionCenterDeltaV49(db, migratedAt) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS action_center_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      action_kind TEXT NOT NULL CHECK(action_kind IN ('todo','suggestion')),
+      action_id TEXT NOT NULL CHECK(
+        typeof(action_id) = 'text' AND length(trim(action_id)) BETWEEN 1 AND 128
+      ),
+      session_id TEXT NOT NULL CHECK(
+        typeof(session_id) = 'text' AND length(trim(session_id)) BETWEEN 1 AND 128
+      ),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      UNIQUE(action_kind, action_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_action_center_events_session_sequence
+    ON action_center_events(session_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS action_center_read_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      last_seen_sequence INTEGER NOT NULL DEFAULT 0 CHECK(
+        typeof(last_seen_sequence) = 'integer' AND last_seen_sequence >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= 0
+      )
+    );
+  `);
+
+  db.exec(`
+    INSERT OR IGNORE INTO action_center_events (
+      action_kind, action_id, session_id, created_at
+    )
+    SELECT action_kind, action_id, session_id, created_at
+    FROM (
+      SELECT
+        'todo' AS action_kind,
+        todo.id AS action_id,
+        MIN(COALESCE(occurrence.legacy_session_id, input.session_id)) AS session_id,
+        todo.created_at AS created_at
+      FROM todos_v2 AS todo
+      JOIN todo_occurrences AS occurrence
+        ON occurrence.todo_instance_id = todo.id
+       AND occurrence.created_at = todo.created_at
+      LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+      WHERE COALESCE(occurrence.legacy_session_id, input.session_id) IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM todo_occurrences AS earlier
+          WHERE earlier.todo_instance_id = todo.id
+            AND earlier.created_at < occurrence.created_at
+        )
+      GROUP BY todo.id
+      HAVING COUNT(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+
+      UNION ALL
+
+      SELECT
+        'suggestion' AS action_kind,
+        suggestion.id AS action_id,
+        MIN(COALESCE(occurrence.legacy_session_id, input.session_id)) AS session_id,
+        suggestion.created_at AS created_at
+      FROM suggestions_v2 AS suggestion
+      JOIN suggestion_occurrences AS occurrence
+        ON occurrence.suggestion_id = suggestion.id
+       AND occurrence.created_at = suggestion.created_at
+      LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+      WHERE COALESCE(occurrence.legacy_session_id, input.session_id) IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM suggestion_occurrences AS earlier
+          WHERE earlier.suggestion_id = suggestion.id
+            AND earlier.created_at < occurrence.created_at
+        )
+      GROUP BY suggestion.id
+      HAVING COUNT(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+    )
+    ORDER BY created_at, action_kind, action_id;
+  `);
+
+  db.prepare(
+    `INSERT OR IGNORE INTO action_center_read_state (
+       singleton, last_seen_sequence, updated_at
+     ) SELECT 1, COALESCE(MAX(sequence), 0), ? FROM action_center_events`
+  ).run(migratedAt);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS action_center_delta_todo_occurrence_insert
+    AFTER INSERT ON todo_occurrences
+    WHEN NEW.created_at = (
+      SELECT created_at FROM todos_v2 WHERE id = NEW.todo_instance_id
+    )
+      AND COALESCE(
+        NEW.legacy_session_id,
+        (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+      ) IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM todo_occurrences AS earlier
+        WHERE earlier.todo_instance_id = NEW.todo_instance_id
+          AND earlier.created_at < NEW.created_at
+      )
+    BEGIN
+      INSERT OR IGNORE INTO action_center_events (
+        action_kind, action_id, session_id, created_at
+      ) VALUES (
+        'todo',
+        NEW.todo_instance_id,
+        COALESCE(
+          NEW.legacy_session_id,
+          (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+        ),
+        NEW.created_at
+      );
+      DELETE FROM action_center_events
+      WHERE action_kind = 'todo'
+        AND action_id = NEW.todo_instance_id
+        AND EXISTS (
+          SELECT 1
+          FROM todo_occurrences AS peer
+          LEFT JOIN analysis_inputs AS peer_input ON peer_input.id = peer.analysis_input_id
+          WHERE peer.todo_instance_id = NEW.todo_instance_id
+            AND peer.created_at = NEW.created_at
+            AND COALESCE(peer.legacy_session_id, peer_input.session_id) IS NOT COALESCE(
+              NEW.legacy_session_id,
+              (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+            )
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS action_center_delta_suggestion_occurrence_insert
+    AFTER INSERT ON suggestion_occurrences
+    WHEN NEW.created_at = (
+      SELECT created_at FROM suggestions_v2 WHERE id = NEW.suggestion_id
+    )
+      AND COALESCE(
+        NEW.legacy_session_id,
+        (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+      ) IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM suggestion_occurrences AS earlier
+        WHERE earlier.suggestion_id = NEW.suggestion_id
+          AND earlier.created_at < NEW.created_at
+      )
+    BEGIN
+      INSERT OR IGNORE INTO action_center_events (
+        action_kind, action_id, session_id, created_at
+      ) VALUES (
+        'suggestion',
+        NEW.suggestion_id,
+        COALESCE(
+          NEW.legacy_session_id,
+          (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+        ),
+        NEW.created_at
+      );
+      DELETE FROM action_center_events
+      WHERE action_kind = 'suggestion'
+        AND action_id = NEW.suggestion_id
+        AND EXISTS (
+          SELECT 1
+          FROM suggestion_occurrences AS peer
+          LEFT JOIN analysis_inputs AS peer_input ON peer_input.id = peer.analysis_input_id
+          WHERE peer.suggestion_id = NEW.suggestion_id
+            AND peer.created_at = NEW.created_at
+            AND COALESCE(peer.legacy_session_id, peer_input.session_id) IS NOT COALESCE(
+              NEW.legacy_session_id,
+              (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+            )
+        );
+    END;
+  `);
+}
+
+function upgradeSessionReprocessingV50(db) {
+  const hasReprocessing = tableExists(db, "session_reprocessing_state");
+  const hasSummaryRefresh = tableExists(db, "session_summary_refresh_state");
+  const reprocessingColumns = hasReprocessing
+    ? columns(db, "session_reprocessing_state")
+    : new Set();
+  const summarySql = hasSummaryRefresh
+    ? db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+           WHERE type = 'table' AND name = 'session_summary_refresh_state'`
+        )
+        .get()?.sql
+    : null;
+  const rebuildReprocessing =
+    !reprocessingColumns.has("baseline_content_sha256") ||
+    !reprocessingColumns.has("baseline_identity_sha256") ||
+    !reprocessingColumns.has("baseline_classification_sha256");
+  const rebuildSummary =
+    typeof summarySql !== "string" || !summarySql.includes("activity_classification_changed");
+  if (!rebuildReprocessing && !rebuildSummary) return;
+
+  const reprocessingRows =
+    rebuildReprocessing && hasReprocessing
+      ? db.prepare("SELECT * FROM session_reprocessing_state ORDER BY session_id").all()
+      : [];
+  const summaryRows =
+    rebuildSummary && hasSummaryRefresh
+      ? db.prepare("SELECT * FROM session_summary_refresh_state ORDER BY session_id").all()
+      : [];
+  if (rebuildReprocessing && hasReprocessing) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_session_reprocessing_active;
+      ALTER TABLE session_reprocessing_state RENAME TO session_reprocessing_state_v49;
+    `);
+  }
+  if (rebuildSummary && hasSummaryRefresh) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_summary_refresh_recommended;
+      ALTER TABLE session_summary_refresh_state RENAME TO session_summary_refresh_state_v49;
+    `);
+  }
+  db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+
+  if (rebuildSummary) {
+    const insertSummary = db.prepare(`
+      INSERT INTO session_summary_refresh_state (
+        session_id, basis_policy_id, latest_policy_id, recommended, reason, updated_at
+      ) VALUES (
+        @session_id, @basis_policy_id, @latest_policy_id, @recommended, @reason, @updated_at
+      )
+    `);
+    for (const row of summaryRows) insertSummary.run(row);
+    if (hasSummaryRefresh) db.exec("DROP TABLE session_summary_refresh_state_v49");
+  }
+  if (rebuildReprocessing) {
+    const insertReprocessing = db.prepare(`
+      INSERT INTO session_reprocessing_state (
+        session_id, policy_id, mode, state, started_at, completed_at,
+        baseline_content_sha256, baseline_identity_sha256,
+        baseline_classification_sha256
+      ) VALUES (
+        @sessionId, @policyId, @mode, @state, @startedAt, @completedAt,
+        @contentSha256, @identitySha256, @classificationSha256
+      )
+    `);
+    for (const row of reprocessingRows) {
+      insertReprocessing.run({
+        sessionId: row.session_id,
+        policyId: row.policy_id,
+        mode: row.mode,
+        state: row.state,
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        ...computeSessionSemanticHashes(db, row.session_id),
+      });
+    }
+    if (hasReprocessing) db.exec("DROP TABLE session_reprocessing_state_v49");
+  }
+}
+
+function upgradeTodoTrustV51(db) {
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "trust_policy_id TEXT NOT NULL DEFAULT 'legacy-unverified-v1' CHECK(typeof(trust_policy_id) = 'text' AND length(trim(trust_policy_id)) BETWEEN 1 AND 128)"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "trust_snapshot_state TEXT NOT NULL DEFAULT 'legacy_unverified' CHECK(trust_snapshot_state IN ('captured','legacy_unverified','user_override'))"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "application_snapshot_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(application_snapshot_json) AND json_type(application_snapshot_json) = 'array')"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "activity_snapshot_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(activity_snapshot_json) AND json_type(activity_snapshot_json) = 'array')"
+  );
+  for (const column of [
+    "semantic_confidence_snapshot",
+    "voiceprint_confidence_snapshot",
+    "scene_confidence_snapshot",
+    "transcript_context_confidence_snapshot",
+  ]) {
+    addColumn(
+      db,
+      "todo_verification_decisions",
+      `${column} REAL CHECK(${column} IS NULL OR (typeof(${column}) IN ('integer','real') AND ${column} BETWEEN 0 AND 1))`
+    );
+  }
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "automatic_eligible INTEGER NOT NULL DEFAULT 0 CHECK(automatic_eligible IN (0,1))"
+  );
+
+  db.exec(`
+    DROP VIEW IF EXISTS todo_effective_verification;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_strict_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_immutable_update;
+
+    CREATE TRIGGER todo_verification_decisions_trust_shape_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.automatic_eligible = 1 AND NOT (
+      NEW.actor = 'system'
+      AND NEW.state = 'confirmed'
+      AND NEW.reason = 'strict_self_commitment'
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+      AND json_array_length(NEW.application_snapshot_json) > 0
+      AND json_array_length(NEW.activity_snapshot_json) > 0
+      AND NEW.semantic_confidence_snapshot >= 0.9
+      AND NEW.voiceprint_confidence_snapshot >= 0.9
+      AND NEW.scene_confidence_snapshot >= 0.9
+      AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is invalid');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_strict_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.actor = 'system' AND NEW.state = 'confirmed' AND NOT (
+      NEW.reason = 'strict_self_commitment'
+      AND NEW.automatic_eligible = 1
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+      AND json_array_length(NEW.application_snapshot_json) > 0
+      AND json_array_length(NEW.activity_snapshot_json) > 0
+      AND NEW.semantic_confidence_snapshot >= 0.9
+      AND NEW.voiceprint_confidence_snapshot >= 0.9
+      AND NEW.scene_confidence_snapshot >= 0.9
+      AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is required');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_trust_immutable_update
+    BEFORE UPDATE OF
+      trust_policy_id, trust_snapshot_state, application_snapshot_json,
+      activity_snapshot_json, semantic_confidence_snapshot,
+      voiceprint_confidence_snapshot, scene_confidence_snapshot,
+      transcript_context_confidence_snapshot, automatic_eligible
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot is immutable');
+    END;
+
+    CREATE VIEW todo_effective_verification AS
+    SELECT decision.*,
+           CASE
+             WHEN decision.actor = 'user' THEN decision.state
+             WHEN decision.state = 'confirmed'
+              AND decision.reason = 'strict_self_commitment'
+              AND decision.trust_snapshot_state = 'captured'
+              AND decision.automatic_eligible = 1
+              AND decision.semantic_confidence_snapshot >= 0.9
+              AND decision.voiceprint_confidence_snapshot >= 0.9
+              AND decision.scene_confidence_snapshot >= 0.9
+             THEN 'confirmed'
+             WHEN decision.state = 'confirmed' THEN 'pending_confirmation'
+             ELSE decision.state
+           END AS effective_state
+    FROM todo_verification_decisions AS decision
+    WHERE decision.id = (
+      SELECT latest.id
+      FROM todo_verification_decisions AS latest
+      WHERE latest.todo_instance_id = decision.todo_instance_id
+      ORDER BY latest.occurred_at DESC, latest.id DESC
+      LIMIT 1
+    );
+  `);
+}
+
+function upgradeLearningGoalsV52(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS learning_goals (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text' AND length(trim(id)) BETWEEN 1 AND 128
+      ),
+      title TEXT NOT NULL CHECK(
+        typeof(title) = 'text' AND length(trim(title)) BETWEEN 1 AND 500
+      ),
+      normalized_title TEXT NOT NULL CHECK(
+        typeof(normalized_title) = 'text' AND length(trim(normalized_title)) BETWEEN 1 AND 500
+      ),
+      state TEXT NOT NULL CHECK(state IN ('confirmed','archived','deleted')),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      confirmed_at INTEGER NOT NULL CHECK(
+        typeof(confirmed_at) = 'integer' AND confirmed_at >= created_at
+      ),
+      archived_at INTEGER CHECK(
+        archived_at IS NULL OR (typeof(archived_at) = 'integer' AND archived_at >= confirmed_at)
+      ),
+      deleted_at INTEGER CHECK(
+        deleted_at IS NULL OR (typeof(deleted_at) = 'integer' AND deleted_at >= confirmed_at)
+      ),
+      CHECK((state = 'archived') = (archived_at IS NOT NULL)),
+      CHECK((state = 'deleted') = (deleted_at IS NOT NULL))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_goals_active_title
+      ON learning_goals(normalized_title) WHERE state <> 'deleted';
+    CREATE INDEX IF NOT EXISTS idx_learning_goals_state_updated
+      ON learning_goals(state, updated_at DESC, id);
+
+    CREATE TABLE IF NOT EXISTS learning_goal_events (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text' AND length(trim(id)) BETWEEN 1 AND 128
+      ),
+      learning_goal_id TEXT NOT NULL REFERENCES learning_goals(id) ON DELETE RESTRICT,
+      action TEXT NOT NULL CHECK(action IN ('created','edited','archived','restored','deleted')),
+      previous_json TEXT CHECK(
+        previous_json IS NULL OR (json_valid(previous_json) AND json_type(previous_json) = 'object')
+      ),
+      next_json TEXT NOT NULL CHECK(
+        json_valid(next_json) AND json_type(next_json) = 'object'
+      ),
+      actor TEXT NOT NULL CHECK(actor = 'user'),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_learning_goal_events_goal_time
+      ON learning_goal_events(learning_goal_id, occurred_at, id);
+
+    CREATE TRIGGER IF NOT EXISTS learning_goal_events_immutable_update
+    BEFORE UPDATE ON learning_goal_events
+    BEGIN
+      SELECT RAISE(ABORT, 'learning goal events are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS learning_goal_events_immutable_delete
+    BEFORE DELETE ON learning_goal_events
+    BEGIN
+      SELECT RAISE(ABORT, 'learning goal events are immutable');
+    END;
+  `);
+}
+
+function upgradeTodoTrustHardeningV53(db) {
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "speaker_evidence_verified_snapshot INTEGER CHECK(speaker_evidence_verified_snapshot IS NULL OR speaker_evidence_verified_snapshot IN (0,1))"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "overlap_detected_snapshot INTEGER CHECK(overlap_detected_snapshot IS NULL OR overlap_detected_snapshot IN (0,1))"
+  );
+  db.exec(`
+    DROP VIEW IF EXISTS todo_effective_verification;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_strict_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_snapshot_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_immutable_update;
+
+    UPDATE todo_verification_decisions
+    SET trust_policy_id = 'legacy-unverified-v1',
+        trust_snapshot_state = 'legacy_unverified',
+        application_snapshot_json = '[]',
+        activity_snapshot_json = '[]',
+        semantic_confidence_snapshot = NULL,
+        voiceprint_confidence_snapshot = NULL,
+        scene_confidence_snapshot = NULL,
+        transcript_context_confidence_snapshot = NULL,
+        automatic_eligible = 0
+    WHERE trust_snapshot_state = 'captured'
+      AND (
+        speaker_evidence_verified_snapshot IS NULL
+        OR overlap_detected_snapshot IS NULL
+      );
+
+    CREATE TRIGGER todo_verification_decisions_snapshot_shape_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NOT (
+      (
+        NEW.trust_snapshot_state = 'captured'
+        AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+        AND NEW.actor = 'system'
+        AND json_array_length(NEW.application_snapshot_json) BETWEEN 1 AND 100
+        AND json_array_length(NEW.activity_snapshot_json) BETWEEN 1 AND 100
+        AND NEW.semantic_confidence_snapshot >= 0.9
+        AND NEW.voiceprint_confidence_snapshot >= 0.9
+        AND NEW.scene_confidence_snapshot >= 0.9
+        AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+        AND NEW.speaker_evidence_verified_snapshot = 1
+        AND NEW.overlap_detected_snapshot = 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(NEW.application_snapshot_json) AS item
+          WHERE COALESCE(json_type(item.value), 'missing') <> 'object'
+             OR (SELECT COUNT(*) FROM json_each(item.value)) <> 4
+             OR EXISTS (
+               SELECT 1 FROM json_each(item.value) AS field
+               WHERE field.key NOT IN (
+                 'segmentId','applicationKey','sourceAttribution','speakerRelation'
+               )
+             )
+             OR COALESCE(json_type(item.value, '$.segmentId'), 'missing') <> 'text'
+             OR length(json_extract(item.value, '$.segmentId')) NOT BETWEEN 1 AND 128
+             OR json_extract(item.value, '$.segmentId') GLOB '*[^A-Za-z0-9_-]*'
+             OR COALESCE(json_type(item.value, '$.applicationKey'), 'missing')
+                  NOT IN ('null','text')
+             OR (
+               json_type(item.value, '$.applicationKey') = 'text'
+               AND (
+                 length(json_extract(item.value, '$.applicationKey')) NOT BETWEEN 1 AND 64
+                 OR json_extract(item.value, '$.applicationKey') GLOB '*[^a-z0-9._-]*'
+               )
+             )
+             OR COALESCE(json_extract(item.value, '$.sourceAttribution'), '')
+                  NOT IN ('application','microphone','application_and_microphone')
+             OR NOT (
+               json_extract(item.value, '$.speakerRelation') = 'SELF'
+               OR (
+                 substr(json_extract(item.value, '$.speakerRelation'), 1, 1) = 'P'
+                 AND length(json_extract(item.value, '$.speakerRelation')) BETWEEN 2 AND 20
+                 AND substr(json_extract(item.value, '$.speakerRelation'), 2, 1) BETWEEN '1' AND '9'
+                 AND substr(json_extract(item.value, '$.speakerRelation'), 2)
+                       NOT GLOB '*[^0-9]*'
+               )
+             )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(NEW.activity_snapshot_json) AS item
+          WHERE COALESCE(json_type(item.value), 'missing') <> 'object'
+             OR (SELECT COUNT(*) FROM json_each(item.value)) <> 4
+             OR EXISTS (
+               SELECT 1 FROM json_each(item.value) AS field
+               WHERE field.key NOT IN ('segmentId','category','confidence','decision')
+             )
+             OR COALESCE(json_type(item.value, '$.segmentId'), 'missing') <> 'text'
+             OR length(json_extract(item.value, '$.segmentId')) NOT BETWEEN 1 AND 128
+             OR json_extract(item.value, '$.segmentId') GLOB '*[^A-Za-z0-9_-]*'
+             OR COALESCE(json_extract(item.value, '$.category'), '') NOT IN (
+               'work_meeting','learning','social_call','in_person_conversation'
+             )
+             OR COALESCE(json_type(item.value, '$.confidence'), 'missing')
+                  NOT IN ('integer','real')
+             OR json_extract(item.value, '$.confidence') NOT BETWEEN 0.9 AND 1
+             OR COALESCE(json_extract(item.value, '$.decision'), '') <> 'adopted'
+        )
+        AND (
+          SELECT COUNT(*) FROM json_each(NEW.application_snapshot_json)
+        ) = (
+          SELECT COUNT(DISTINCT json_extract(item.value, '$.segmentId'))
+          FROM json_each(NEW.application_snapshot_json) AS item
+        )
+        AND (
+          SELECT COUNT(*) FROM json_each(NEW.activity_snapshot_json)
+        ) = (
+          SELECT COUNT(DISTINCT json_extract(item.value, '$.segmentId'))
+          FROM json_each(NEW.activity_snapshot_json) AS item
+        )
+        AND NOT EXISTS (
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.application_snapshot_json) AS item
+          EXCEPT
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.activity_snapshot_json) AS item
+        )
+        AND NOT EXISTS (
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.activity_snapshot_json) AS item
+          EXCEPT
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.application_snapshot_json) AS item
+        )
+        AND (
+          (
+            NEW.automatic_eligible = 1
+            AND NEW.state = 'confirmed'
+            AND NEW.reason = 'strict_self_commitment'
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') <> 'SELF'
+            )
+          )
+          OR (
+            NEW.automatic_eligible = 0
+            AND NEW.state = 'pending_confirmation'
+            AND NEW.reason = 'assigned_and_accepted'
+            AND EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') = 'SELF'
+            )
+            AND EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') GLOB 'P*'
+            )
+          )
+        )
+      )
+      OR (
+        NEW.trust_snapshot_state IN ('legacy_unverified','user_override')
+        AND json_array_length(NEW.application_snapshot_json) = 0
+        AND json_array_length(NEW.activity_snapshot_json) = 0
+        AND NEW.semantic_confidence_snapshot IS NULL
+        AND NEW.voiceprint_confidence_snapshot IS NULL
+        AND NEW.scene_confidence_snapshot IS NULL
+        AND NEW.transcript_context_confidence_snapshot IS NULL
+        AND NEW.speaker_evidence_verified_snapshot IS NULL
+        AND NEW.overlap_detected_snapshot IS NULL
+        AND NEW.automatic_eligible = 0
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot shape is invalid');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_strict_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.actor = 'system' AND NEW.state = 'confirmed' AND NOT (
+      NEW.reason = 'strict_self_commitment'
+      AND NEW.automatic_eligible = 1
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.speaker_evidence_verified_snapshot = 1
+      AND NEW.overlap_detected_snapshot = 0
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is required');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_trust_immutable_update
+    BEFORE UPDATE OF
+      trust_policy_id, trust_snapshot_state, application_snapshot_json,
+      activity_snapshot_json, semantic_confidence_snapshot,
+      voiceprint_confidence_snapshot, scene_confidence_snapshot,
+      transcript_context_confidence_snapshot, automatic_eligible,
+      speaker_evidence_verified_snapshot, overlap_detected_snapshot
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot is immutable');
+    END;
+
+    CREATE VIEW todo_effective_verification AS
+    SELECT decision.*,
+           CASE
+             WHEN decision.actor = 'user' THEN decision.state
+             WHEN decision.state = 'confirmed'
+              AND decision.reason = 'strict_self_commitment'
+              AND decision.trust_snapshot_state = 'captured'
+              AND decision.automatic_eligible = 1
+              AND decision.semantic_confidence_snapshot >= 0.9
+              AND decision.voiceprint_confidence_snapshot >= 0.9
+              AND decision.scene_confidence_snapshot >= 0.9
+              AND decision.speaker_evidence_verified_snapshot = 1
+              AND decision.overlap_detected_snapshot = 0
+             THEN 'confirmed'
+             WHEN decision.state = 'confirmed' THEN 'pending_confirmation'
+             ELSE decision.state
+           END AS effective_state
+    FROM todo_verification_decisions AS decision
+    WHERE decision.id = (
+      SELECT latest.id
+      FROM todo_verification_decisions AS latest
+      WHERE latest.todo_instance_id = decision.todo_instance_id
+      ORDER BY latest.occurred_at DESC, latest.id DESC
+      LIMIT 1
+    );
+  `);
+}
+
+function upgradeKnowledgeActionLifecycleV54(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge_action_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      command_id TEXT NOT NULL UNIQUE CHECK(
+        typeof(command_id) = 'text'
+        AND length(command_id) BETWEEN 1 AND 192
+        AND substr(command_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND command_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      schema_version INTEGER NOT NULL CHECK(
+        typeof(schema_version) = 'integer' AND schema_version = 1
+      ),
+      command_fingerprint TEXT NOT NULL CHECK(
+        typeof(command_fingerprint) = 'text'
+        AND length(command_fingerprint) = 64
+        AND command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      action_type TEXT NOT NULL CHECK(
+        typeof(action_type) = 'text'
+        AND action_type IN (
+          'manual_create','transcript_create','todo_dismiss','todo_restore',
+          'suggestion_dismiss','suggestion_restore','suggestion_accept',
+          'suggestion_accept_undo','todo_pin','todo_unpin','urgency_set',
+          'title_due_edit'
+        )
+      ),
+      entity_kind TEXT NOT NULL CHECK(
+        typeof(entity_kind) = 'text' AND entity_kind IN ('todo','suggestion')
+      ),
+      entity_id TEXT NOT NULL CHECK(
+        typeof(entity_id) = 'text'
+        AND length(entity_id) BETWEEN 1 AND 192
+        AND substr(entity_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND entity_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      payload_json TEXT NOT NULL CHECK(
+        typeof(payload_json) = 'text'
+        AND length(payload_json) BETWEEN 2 AND 32768
+        AND json_valid(payload_json)
+        AND json_type(payload_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      ),
+      CHECK(
+        (entity_kind = 'suggestion' AND action_type IN (
+          'suggestion_dismiss','suggestion_restore','suggestion_accept',
+          'suggestion_accept_undo'
+        ))
+        OR
+        (entity_kind = 'todo' AND action_type IN (
+          'manual_create','transcript_create','todo_dismiss','todo_restore',
+          'todo_pin','todo_unpin','urgency_set','title_due_edit'
+        ))
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_knowledge_action_events_entity_sequence
+    ON knowledge_action_events(entity_kind, entity_id, sequence DESC);
+
+    CREATE TABLE IF NOT EXISTS todo_action_metadata (
+      todo_instance_id TEXT PRIMARY KEY REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      source_kind TEXT NOT NULL CHECK(
+        typeof(source_kind) = 'text'
+        AND source_kind IN ('existing','manual','transcript','suggestion')
+      ),
+      source_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL CHECK(
+        source_session_id IS NULL OR (
+          typeof(source_session_id) = 'text'
+          AND length(source_session_id) BETWEEN 1 AND 192
+          AND substr(source_session_id, 1, 1) GLOB '[A-Za-z0-9]'
+          AND source_session_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+        )
+      ),
+      pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0,1)),
+      urgency TEXT NOT NULL DEFAULT 'normal' CHECK(urgency IN ('normal','urgent')),
+      user_modified INTEGER NOT NULL DEFAULT 0 CHECK(user_modified IN (0,1)),
+      dismissed_from_verification_state TEXT CHECK(
+        dismissed_from_verification_state IS NULL
+        OR dismissed_from_verification_state IN ('pending_confirmation','confirmed')
+      ),
+      dismiss_reason_code TEXT CHECK(
+        dismiss_reason_code IS NULL OR dismiss_reason_code IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      ),
+      dismiss_local_note TEXT CHECK(
+        dismiss_local_note IS NULL OR (
+          typeof(dismiss_local_note) = 'text'
+          AND length(trim(dismiss_local_note)) BETWEEN 1 AND 500
+          AND instr(dismiss_local_note, char(0)) = 0
+        )
+      ),
+      suppressed INTEGER NOT NULL DEFAULT 0 CHECK(suppressed IN (0,1)),
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0),
+      last_event_sequence INTEGER REFERENCES knowledge_action_events(sequence) ON DELETE RESTRICT,
+      CHECK(source_kind <> 'transcript' OR source_session_id IS NOT NULL),
+      CHECK(source_kind NOT IN ('manual','suggestion') OR source_session_id IS NULL),
+      CHECK(
+        dismiss_reason_code IS NULL OR dismissed_from_verification_state IS NOT NULL
+      ),
+      CHECK(dismiss_local_note IS NULL OR dismiss_reason_code IS NOT NULL)
+    );
+
+    CREATE TABLE IF NOT EXISTS todo_action_segments (
+      todo_instance_id TEXT NOT NULL
+        REFERENCES todo_action_metadata(todo_instance_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL CHECK(typeof(ordinal) = 'integer' AND ordinal BETWEEN 0 AND 511),
+      segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE RESTRICT,
+      PRIMARY KEY(todo_instance_id, ordinal),
+      UNIQUE(todo_instance_id, segment_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS suggestion_action_metadata (
+      suggestion_id TEXT PRIMARY KEY REFERENCES suggestions_v2(id) ON DELETE RESTRICT,
+      effective_state TEXT NOT NULL CHECK(
+        typeof(effective_state) = 'text'
+        AND effective_state IN ('proposed','accepted','dismissed')
+      ),
+      dismiss_reason_code TEXT CHECK(
+        dismiss_reason_code IS NULL OR dismiss_reason_code IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      ),
+      converted_todo_id TEXT REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      acceptance_undone INTEGER NOT NULL DEFAULT 0 CHECK(acceptance_undone IN (0,1)),
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0),
+      last_event_sequence INTEGER REFERENCES knowledge_action_events(sequence) ON DELETE RESTRICT,
+      CHECK(effective_state = 'dismissed' OR dismiss_reason_code IS NULL),
+      CHECK(
+        acceptance_undone = 0
+        OR (effective_state = 'proposed' AND converted_todo_id IS NOT NULL)
+      ),
+      CHECK(
+        last_event_sequence IS NULL
+        OR effective_state <> 'accepted'
+        OR converted_todo_id IS NOT NULL
+      ),
+      CHECK(
+        last_event_sequence IS NULL
+        OR effective_state <> 'dismissed'
+        OR dismiss_reason_code IS NOT NULL
+      )
+    );
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_validate_payload_insert
+    BEFORE INSERT ON knowledge_action_events
+    WHEN NOT (
+      (
+        NEW.action_type = 'manual_create'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('title','dueText')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+      )
+      OR (
+        NEW.action_type = 'transcript_create'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 4
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json)
+          WHERE key NOT IN ('title','dueText','sessionId','segmentIds')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.sessionId'), 'missing') = 'text'
+        AND length(json_extract(NEW.payload_json, '$.sessionId')) BETWEEN 1 AND 192
+        AND substr(json_extract(NEW.payload_json, '$.sessionId'), 1, 1) GLOB '[A-Za-z0-9]'
+        AND json_extract(NEW.payload_json, '$.sessionId') NOT GLOB '*[^A-Za-z0-9._:-]*'
+        AND COALESCE(json_type(NEW.payload_json, '$.segmentIds'), 'missing') = 'array'
+        AND json_array_length(NEW.payload_json, '$.segmentIds') BETWEEN 1 AND 512
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json, '$.segmentIds') AS segment
+          WHERE segment.type <> 'text'
+             OR length(segment.value) NOT BETWEEN 1 AND 192
+             OR substr(segment.value, 1, 1) NOT GLOB '[A-Za-z0-9]'
+             OR segment.value GLOB '*[^A-Za-z0-9._:-]*'
+        )
+        AND json_array_length(NEW.payload_json, '$.segmentIds') = (
+          SELECT count(DISTINCT segment.value)
+          FROM json_each(NEW.payload_json, '$.segmentIds') AS segment
+        )
+      )
+      OR (
+        NEW.action_type = 'todo_dismiss'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('reasonCode','localNote')
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.reasonCode'), '') IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.localNote'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.localNote') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.localNote'))) BETWEEN 1 AND 500
+        )
+      )
+      OR (
+        NEW.action_type IN ('todo_restore','todo_pin','todo_unpin')
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 0
+      )
+      OR (
+        NEW.action_type = 'suggestion_dismiss'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key <> 'reasonCode'
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.reasonCode'), '') IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      )
+      OR (
+        NEW.action_type IN ('suggestion_restore','suggestion_accept_undo')
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 0
+      )
+      OR (
+        NEW.action_type = 'suggestion_accept'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 3
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('todoId','title','dueText')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.todoId'), 'missing') = 'text'
+        AND length(json_extract(NEW.payload_json, '$.todoId')) BETWEEN 1 AND 192
+        AND substr(json_extract(NEW.payload_json, '$.todoId'), 1, 1) GLOB '[A-Za-z0-9]'
+        AND json_extract(NEW.payload_json, '$.todoId') NOT GLOB '*[^A-Za-z0-9._:-]*'
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+      )
+      OR (
+        NEW.action_type = 'urgency_set'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key <> 'urgency'
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.urgency'), '') IN ('normal','urgent')
+      )
+      OR (
+        NEW.action_type = 'title_due_edit'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) BETWEEN 1 AND 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('title','dueText')
+        )
+        AND (
+          json_type(NEW.payload_json, '$.title') IS NULL
+          OR (
+            json_type(NEW.payload_json, '$.title') = 'text'
+            AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+          )
+        )
+        AND (
+          json_type(NEW.payload_json, '$.dueText') IS NULL
+          OR json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR (
+            json_type(NEW.payload_json, '$.dueText') = 'text'
+            AND length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+          )
+        )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event payload is invalid');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_immutable_update
+    BEFORE UPDATE ON knowledge_action_events
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_immutable_delete
+    BEFORE DELETE ON knowledge_action_events
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event is immutable');
+    END;
+  `);
+
+  db.exec(`
+    INSERT OR IGNORE INTO todo_action_metadata (
+      todo_instance_id, source_kind, source_session_id, pinned, urgency,
+      user_modified, dismissed_from_verification_state, dismiss_reason_code,
+      dismiss_local_note, suppressed, updated_at, last_event_sequence
+    )
+    SELECT
+      todo.id,
+      'existing',
+      (
+        SELECT CASE
+          WHEN count(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+          THEN min(COALESCE(occurrence.legacy_session_id, input.session_id))
+          ELSE NULL
+        END
+        FROM todo_occurrences AS occurrence
+        LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+        WHERE occurrence.todo_instance_id = todo.id
+      ),
+      0,
+      'normal',
+      0,
+      NULL,
+      NULL,
+      NULL,
+      CASE WHEN todo.status = 'dismissed' THEN 1 ELSE 0 END,
+      todo.updated_at,
+      NULL
+    FROM todos_v2 AS todo;
+
+    INSERT OR IGNORE INTO suggestion_action_metadata (
+      suggestion_id, effective_state, dismiss_reason_code, converted_todo_id,
+      acceptance_undone, updated_at, last_event_sequence
+    )
+    SELECT
+      suggestion.id,
+      suggestion.state,
+      NULL,
+      acceptance.todo_instance_id,
+      0,
+      suggestion.updated_at,
+      NULL
+    FROM suggestions_v2 AS suggestion
+    LEFT JOIN suggestion_acceptances AS acceptance
+      ON acceptance.suggestion_id = suggestion.id;
+
+    WITH stable_segments AS (
+      SELECT DISTINCT
+        occurrence.todo_instance_id AS todo_instance_id,
+        evidence.transcript_segment_id AS segment_id
+      FROM todo_occurrences AS occurrence
+      JOIN evidence_refs AS evidence
+        ON evidence.entity_type = 'todo_occurrence'
+       AND evidence.entity_id = occurrence.id
+    ), ranked_segments AS (
+      SELECT
+        stable.todo_instance_id,
+        row_number() OVER (
+          PARTITION BY stable.todo_instance_id
+          ORDER BY segment.started_at, segment.ended_at, stable.segment_id
+        ) - 1 AS ordinal,
+        stable.segment_id
+      FROM stable_segments AS stable
+      JOIN transcript_segments AS segment ON segment.id = stable.segment_id
+    )
+    INSERT OR IGNORE INTO todo_action_segments (todo_instance_id, ordinal, segment_id)
+    SELECT todo_instance_id, ordinal, segment_id
+    FROM ranked_segments
+    WHERE ordinal < 512;
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_validate_insert
+    BEFORE INSERT ON todo_action_metadata
+    WHEN NOT (
+      (
+        NEW.source_kind = 'existing'
+        AND NEW.last_event_sequence IS NULL
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM knowledge_action_events AS event
+        WHERE event.sequence = NEW.last_event_sequence
+          AND event.occurred_at = NEW.updated_at
+          AND NOT EXISTS (
+            SELECT 1 FROM knowledge_action_events AS later
+            WHERE later.entity_kind = event.entity_kind
+              AND later.entity_id = event.entity_id
+              AND later.sequence > event.sequence
+          )
+          AND (
+            (
+              NEW.source_kind = 'manual'
+              AND event.action_type = 'manual_create'
+              AND event.entity_kind = 'todo'
+              AND event.entity_id = NEW.todo_instance_id
+              AND NEW.source_session_id IS NULL
+            )
+            OR (
+              NEW.source_kind = 'transcript'
+              AND event.action_type = 'transcript_create'
+              AND event.entity_kind = 'todo'
+              AND event.entity_id = NEW.todo_instance_id
+              AND NEW.source_session_id = json_extract(event.payload_json, '$.sessionId')
+            )
+            OR (
+              NEW.source_kind = 'suggestion'
+              AND event.action_type = 'suggestion_accept'
+              AND event.entity_kind = 'suggestion'
+              AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+              AND NEW.source_session_id IS NULL
+            )
+          )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata source event is invalid');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_immutable_identity
+    BEFORE UPDATE OF todo_instance_id, source_kind, source_session_id ON todo_action_metadata
+    WHEN
+      NEW.todo_instance_id IS NOT OLD.todo_instance_id
+      OR NEW.source_kind IS NOT OLD.source_kind
+      OR (
+        NEW.source_session_id IS NOT OLD.source_session_id
+        AND NOT (
+          OLD.source_session_id IS NOT NULL
+          AND NEW.source_session_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM sessions WHERE id = OLD.source_session_id
+          )
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata source is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_no_delete
+    BEFORE DELETE ON todo_action_metadata
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_validate_insert
+    BEFORE INSERT ON todo_action_segments
+    WHEN EXISTS (
+      SELECT 1
+      FROM todo_action_metadata AS metadata
+      WHERE metadata.todo_instance_id = NEW.todo_instance_id
+        AND metadata.source_kind = 'transcript'
+        AND metadata.last_event_sequence IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM knowledge_action_events AS event
+          WHERE event.sequence = metadata.last_event_sequence
+            AND event.action_type = 'transcript_create'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND json_extract(event.payload_json, '$.segmentIds[' || NEW.ordinal || ']') = NEW.segment_id
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment does not match its creation event');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_immutable_update
+    BEFORE UPDATE ON todo_action_segments
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_immutable_delete
+    BEFORE DELETE ON todo_action_segments
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_validate_insert
+    BEFORE INSERT ON suggestion_action_metadata
+    WHEN NEW.last_event_sequence IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata must begin from projected state');
+    END;
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_no_delete
+    BEFORE DELETE ON suggestion_action_metadata
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata cannot be deleted');
+    END;
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_require_latest_event
+    BEFORE UPDATE OF
+      pinned, urgency, user_modified, dismissed_from_verification_state,
+      dismiss_reason_code, dismiss_local_note, suppressed, updated_at,
+      last_event_sequence
+    ON todo_action_metadata
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM knowledge_action_events AS event
+      WHERE event.sequence = NEW.last_event_sequence
+        AND event.sequence > COALESCE(OLD.last_event_sequence, 0)
+        AND event.occurred_at = NEW.updated_at
+        AND NEW.updated_at >= OLD.updated_at
+        AND event.sequence = (
+          SELECT max(peer.sequence)
+          FROM knowledge_action_events AS peer
+          WHERE (
+            peer.entity_kind = 'todo' AND peer.entity_id = NEW.todo_instance_id
+          ) OR (
+            NEW.source_kind = 'suggestion'
+            AND peer.entity_kind = 'suggestion'
+            AND (
+              json_extract(peer.payload_json, '$.todoId') = NEW.todo_instance_id
+              OR EXISTS (
+                SELECT 1 FROM suggestion_acceptances AS acceptance
+                WHERE acceptance.suggestion_id = peer.entity_id
+                  AND acceptance.todo_instance_id = NEW.todo_instance_id
+              )
+            )
+          )
+        )
+        AND (
+          (
+            event.action_type = 'todo_dismiss'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND OLD.suppressed = 0
+            AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS NOT NULL
+            AND NEW.dismiss_reason_code = json_extract(event.payload_json, '$.reasonCode')
+            AND NEW.dismiss_local_note IS json_extract(event.payload_json, '$.localNote')
+          )
+          OR (
+            event.action_type = 'todo_restore'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND OLD.suppressed = 0
+            AND OLD.dismissed_from_verification_state IS NOT NULL
+            AND OLD.dismiss_reason_code IS NOT NULL
+            AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+          OR (
+            event.action_type = 'todo_pin'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND OLD.pinned = 0 AND NEW.pinned = 1
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'todo_unpin'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND OLD.pinned = 1 AND NEW.pinned = 0
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'urgency_set'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND NEW.urgency = json_extract(event.payload_json, '$.urgency')
+            AND NEW.urgency <> OLD.urgency
+            AND NEW.pinned = OLD.pinned
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'title_due_edit'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'suggestion_accept_undo'
+            AND NEW.source_kind = 'suggestion'
+            AND event.entity_kind = 'suggestion'
+            AND EXISTS (
+              SELECT 1 FROM suggestion_acceptances AS acceptance
+              WHERE acceptance.suggestion_id = event.entity_id
+                AND acceptance.todo_instance_id = NEW.todo_instance_id
+            )
+            AND OLD.suppressed = 0 AND NEW.suppressed = 1
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = OLD.user_modified
+            AND NEW.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+          OR (
+            event.action_type = 'suggestion_accept'
+            AND NEW.source_kind = 'suggestion'
+            AND event.entity_kind = 'suggestion'
+            AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+            AND OLD.suppressed = 1 AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = OLD.user_modified
+            AND OLD.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata update requires the latest valid event');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_require_latest_event
+    BEFORE UPDATE ON suggestion_action_metadata
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM knowledge_action_events AS event
+      WHERE event.sequence = NEW.last_event_sequence
+        AND event.sequence > COALESCE(OLD.last_event_sequence, 0)
+        AND event.entity_kind = 'suggestion'
+        AND event.entity_id = NEW.suggestion_id
+        AND event.occurred_at = NEW.updated_at
+        AND NEW.updated_at >= OLD.updated_at
+        AND event.sequence = (
+          SELECT max(peer.sequence)
+          FROM knowledge_action_events AS peer
+          WHERE peer.entity_kind = 'suggestion' AND peer.entity_id = NEW.suggestion_id
+        )
+        AND OLD.effective_state = (
+          SELECT suggestion.state FROM suggestions_v2 AS suggestion
+          WHERE suggestion.id = NEW.suggestion_id
+        )
+        AND (
+          (
+            event.action_type = 'suggestion_dismiss'
+            AND OLD.effective_state = 'proposed'
+            AND NEW.effective_state = 'dismissed'
+            AND NEW.dismiss_reason_code = json_extract(event.payload_json, '$.reasonCode')
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.acceptance_undone = OLD.acceptance_undone
+          )
+          OR (
+            event.action_type = 'suggestion_restore'
+            AND OLD.effective_state = 'dismissed'
+            AND NEW.effective_state = 'proposed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.acceptance_undone = OLD.acceptance_undone
+          )
+          OR (
+            event.action_type = 'suggestion_accept'
+            AND OLD.effective_state = 'proposed'
+            AND NEW.effective_state = 'accepted'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id = json_extract(event.payload_json, '$.todoId')
+            AND NEW.acceptance_undone = 0
+          )
+          OR (
+            event.action_type = 'suggestion_accept_undo'
+            AND OLD.effective_state = 'accepted'
+            AND NEW.effective_state = 'proposed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.converted_todo_id IS NOT NULL
+            AND NEW.acceptance_undone = 1
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata update requires the latest valid event');
+    END;
+  `);
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS todos_v2_terminal_state;
+    DROP TRIGGER IF EXISTS todos_v2_require_transition;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_insert;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_state;
+    DROP TRIGGER IF EXISTS suggestions_v2_terminal_state;
+
+    CREATE TRIGGER todos_v2_terminal_state
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN OLD.status = 'dismissed'
+      AND (
+        NEW.status IS NOT OLD.status
+        OR NEW.completed_at IS NOT OLD.completed_at
+        OR NEW.dismissed_at IS NOT OLD.dismissed_at
+      )
+      AND NOT (
+        NEW.status = 'open'
+        AND NEW.completed_at IS NULL
+        AND NEW.dismissed_at IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM todo_state_transitions AS transition
+          JOIN todo_action_metadata AS metadata
+            ON metadata.todo_instance_id = OLD.id
+          JOIN knowledge_action_events AS event
+            ON event.sequence = metadata.last_event_sequence
+          WHERE transition.todo_instance_id = OLD.id
+            AND transition.id = (
+              SELECT latest.id
+              FROM todo_state_transitions AS latest
+              WHERE latest.todo_instance_id = OLD.id
+              ORDER BY latest.rowid DESC
+              LIMIT 1
+            )
+            AND transition.from_status = 'dismissed'
+            AND transition.to_status = 'open'
+            AND transition.reason = 'user_action'
+            AND transition.actor = 'user'
+            AND transition.source_analysis_input_id IS NULL
+            AND transition.occurred_at = event.occurred_at
+            AND (
+              (
+                event.action_type = 'todo_restore'
+                AND event.entity_kind = 'todo'
+                AND event.entity_id = OLD.id
+              )
+              OR (
+                metadata.source_kind = 'suggestion'
+                AND event.action_type = 'suggestion_accept'
+                AND event.entity_kind = 'suggestion'
+                AND json_extract(event.payload_json, '$.todoId') = OLD.id
+              )
+            )
+            AND event.sequence = (
+              SELECT max(peer.sequence)
+              FROM knowledge_action_events AS peer
+              WHERE (peer.entity_kind = 'todo' AND peer.entity_id = OLD.id)
+                 OR (
+                   metadata.source_kind = 'suggestion'
+                   AND peer.entity_kind = 'suggestion'
+                   AND (
+                     json_extract(peer.payload_json, '$.todoId') = OLD.id
+                     OR EXISTS (
+                       SELECT 1 FROM suggestion_acceptances AS acceptance
+                       WHERE acceptance.suggestion_id = peer.entity_id
+                         AND acceptance.todo_instance_id = OLD.id
+                     )
+                   )
+                 )
+            )
+            AND metadata.suppressed = 0
+            AND (
+              metadata.dismissed_from_verification_state IS NOT NULL
+              OR event.action_type = 'suggestion_accept'
+            )
+            AND metadata.dismiss_reason_code IS NULL
+            AND metadata.dismiss_local_note IS NULL
+            AND NEW.updated_at = max(OLD.updated_at, event.occurred_at)
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'dismissed todo can only be restored by its latest action event');
+    END;
+
+    CREATE TRIGGER todos_v2_require_transition
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todo_state_transitions AS transition
+      WHERE transition.todo_instance_id = OLD.id
+        AND transition.id = (
+          SELECT latest.id
+          FROM todo_state_transitions AS latest
+          WHERE latest.todo_instance_id = OLD.id
+          ORDER BY latest.rowid DESC
+          LIMIT 1
+        )
+        AND (
+          (
+            transition.from_status IS NULL
+            AND OLD.status = 'open'
+            AND NEW.status = 'open'
+            AND NEW.completed_at IS NULL
+            AND NEW.dismissed_at IS NULL
+          )
+          OR (
+            transition.from_status = OLD.status
+            AND transition.to_status = NEW.status
+            AND (
+              (
+                NEW.status = 'completed'
+                AND NEW.completed_at = transition.occurred_at
+                AND NEW.dismissed_at IS NULL
+              )
+              OR (
+                NEW.status = 'dismissed'
+                AND NEW.dismissed_at = transition.occurred_at
+                AND NEW.completed_at IS NULL
+              )
+              OR (
+                OLD.status IN ('completed','dismissed')
+                AND NEW.status = 'open'
+                AND NEW.completed_at IS NULL
+                AND NEW.dismissed_at IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state change requires transition history');
+    END;
+
+    CREATE TRIGGER todo_state_transitions_validate_insert
+    BEFORE INSERT ON todo_state_transitions
+    WHEN COALESCE(
+      (
+        (
+          NEW.reason IN ('analysis_created','recurrence')
+          AND NEW.actor = 'system'
+          AND NEW.source_analysis_input_id IS NOT NULL
+          AND NEW.from_status IS NULL
+          AND NEW.to_status = 'open'
+        )
+        OR (
+          NEW.reason IN ('user_action','suggestion_acceptance')
+          AND NEW.actor = 'user'
+          AND NEW.source_analysis_input_id IS NULL
+          AND (
+            (NEW.from_status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+            OR (NEW.from_status = 'completed' AND NEW.to_status = 'open')
+            OR (
+              NEW.reason = 'user_action'
+              AND NEW.from_status = 'dismissed'
+              AND NEW.to_status = 'open'
+              AND EXISTS (
+                SELECT 1
+                FROM todo_action_metadata AS metadata
+                JOIN knowledge_action_events AS event
+                  ON event.sequence = metadata.last_event_sequence
+                WHERE metadata.todo_instance_id = NEW.todo_instance_id
+                  AND metadata.suppressed = 0
+                  AND (
+                    (
+                      event.action_type = 'todo_restore'
+                      AND event.entity_kind = 'todo'
+                      AND event.entity_id = NEW.todo_instance_id
+                    )
+                    OR (
+                      metadata.source_kind = 'suggestion'
+                      AND event.action_type = 'suggestion_accept'
+                      AND event.entity_kind = 'suggestion'
+                      AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+                    )
+                  )
+                  AND event.occurred_at = NEW.occurred_at
+                  AND event.sequence = (
+                    SELECT max(peer.sequence)
+                    FROM knowledge_action_events AS peer
+                    WHERE (
+                      peer.entity_kind = 'todo' AND peer.entity_id = NEW.todo_instance_id
+                    ) OR (
+                      metadata.source_kind = 'suggestion'
+                      AND peer.entity_kind = 'suggestion'
+                      AND (
+                        json_extract(peer.payload_json, '$.todoId') = NEW.todo_instance_id
+                        OR EXISTS (
+                          SELECT 1 FROM suggestion_acceptances AS acceptance
+                          WHERE acceptance.suggestion_id = peer.entity_id
+                            AND acceptance.todo_instance_id = NEW.todo_instance_id
+                        )
+                      )
+                    )
+                  )
+              )
+            )
+          )
+        )
+      ),
+      0
+    ) = 0
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition reason contract is invalid');
+    END;
+
+    CREATE TRIGGER todo_state_transitions_validate_state
+    BEFORE INSERT ON todo_state_transitions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todos_v2 AS todo
+      WHERE todo.id = NEW.todo_instance_id
+        AND (
+          (
+            NEW.from_status IS NULL
+            AND NEW.to_status = 'open'
+            AND todo.status = 'open'
+          )
+          OR (
+            NEW.from_status = todo.status
+            AND (
+              (todo.status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+              OR (todo.status IN ('completed','dismissed') AND NEW.to_status = 'open')
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition is invalid');
+    END;
+
+    CREATE TRIGGER suggestions_v2_terminal_state
+    BEFORE UPDATE OF state, decided_at ON suggestions_v2
+    WHEN OLD.state IN ('accepted','dismissed')
+      AND (NEW.state IS NOT OLD.state OR NEW.decided_at IS NOT OLD.decided_at)
+      AND NOT (
+        NEW.state = 'proposed'
+        AND NEW.decided_at IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM suggestion_action_metadata AS metadata
+          JOIN knowledge_action_events AS event
+            ON event.sequence = metadata.last_event_sequence
+          WHERE metadata.suggestion_id = OLD.id
+            AND metadata.effective_state = 'proposed'
+            AND metadata.dismiss_reason_code IS NULL
+            AND event.entity_kind = 'suggestion'
+            AND event.entity_id = OLD.id
+            AND event.action_type = CASE OLD.state
+              WHEN 'dismissed' THEN 'suggestion_restore'
+              WHEN 'accepted' THEN 'suggestion_accept_undo'
+            END
+            AND event.sequence = (
+              SELECT max(peer.sequence)
+              FROM knowledge_action_events AS peer
+              WHERE peer.entity_kind = 'suggestion' AND peer.entity_id = OLD.id
+            )
+            AND metadata.updated_at = event.occurred_at
+            AND NEW.updated_at = event.occurred_at
+            AND (
+              OLD.state <> 'accepted'
+              OR (
+                metadata.acceptance_undone = 1
+                AND metadata.converted_todo_id IS NOT NULL
+              )
+            )
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'terminal suggestion can only be restored by its latest action event');
+    END;
+  `);
+}
+
+function upgradePersonalizationFeedbackEventsV55(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS personalization_feedback_events (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text'
+        AND length(id) BETWEEN 1 AND 192
+        AND substr(id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      source_entity_id TEXT NOT NULL CHECK(
+        typeof(source_entity_id) = 'text'
+        AND length(trim(source_entity_id)) BETWEEN 1 AND 200
+      ),
+      event_state TEXT NOT NULL CHECK(event_state IN ('active','retracted')),
+      original_value TEXT CHECK(
+        original_value IS NULL OR (
+          typeof(original_value) = 'text'
+          AND length(trim(original_value)) BETWEEN 1 AND 200
+        )
+      ),
+      corrected_value TEXT NOT NULL CHECK(
+        typeof(corrected_value) = 'text'
+        AND length(trim(corrected_value)) BETWEEN 1 AND 200
+      ),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text'
+        AND length(pattern_key) = 64
+        AND pattern_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      feature_json TEXT NOT NULL CHECK(
+        typeof(feature_json) = 'text'
+        AND json_valid(feature_json)
+        AND json_type(feature_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_events_effective
+    ON personalization_feedback_events(
+      domain, pattern_key, source_entity_id, occurred_at DESC, id DESC
+    );
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_events_source
+    ON personalization_feedback_events(domain, source_entity_id, occurred_at DESC, id DESC);
+
+    CREATE TRIGGER IF NOT EXISTS personalization_feedback_events_immutable_update
+    BEFORE UPDATE ON personalization_feedback_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS personalization_feedback_events_immutable_delete
+    BEFORE DELETE ON personalization_feedback_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback event is immutable');
+    END;
+  `);
+}
+
+function upgradeKnowledgeActionProjectionBackfillV57(db) {
+  db.exec(`
+    DROP TRIGGER IF EXISTS todo_action_metadata_immutable_identity;
+    DROP TRIGGER IF EXISTS todo_action_metadata_require_latest_event;
+  `);
+  upgradeKnowledgeActionLifecycleV54(db);
+  db.exec(`
+    INSERT OR IGNORE INTO todo_action_metadata (
+      todo_instance_id, source_kind, source_session_id, pinned, urgency,
+      user_modified, dismissed_from_verification_state, dismiss_reason_code,
+      dismiss_local_note, suppressed, updated_at, last_event_sequence
+    )
+    SELECT
+      todo.id,
+      'existing',
+      (
+        SELECT CASE
+          WHEN count(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+          THEN min(COALESCE(occurrence.legacy_session_id, input.session_id))
+          ELSE NULL
+        END
+        FROM todo_occurrences AS occurrence
+        LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+        WHERE occurrence.todo_instance_id = todo.id
+      ),
+      0,
+      'normal',
+      0,
+      NULL,
+      NULL,
+      NULL,
+      CASE WHEN todo.status = 'dismissed' THEN 1 ELSE 0 END,
+      todo.updated_at,
+      NULL
+    FROM todos_v2 AS todo;
+
+    INSERT OR IGNORE INTO suggestion_action_metadata (
+      suggestion_id, effective_state, dismiss_reason_code, converted_todo_id,
+      acceptance_undone, updated_at, last_event_sequence
+    )
+    SELECT
+      suggestion.id,
+      suggestion.state,
+      NULL,
+      acceptance.todo_instance_id,
+      0,
+      suggestion.updated_at,
+      NULL
+    FROM suggestions_v2 AS suggestion
+    LEFT JOIN suggestion_acceptances AS acceptance
+      ON acceptance.suggestion_id = suggestion.id;
+  `);
+
+  const missingProjection = db
+    .prepare(
+      `SELECT
+         (SELECT count(*)
+          FROM todos_v2 AS todo
+          LEFT JOIN todo_action_metadata AS metadata
+            ON metadata.todo_instance_id = todo.id
+          WHERE metadata.todo_instance_id IS NULL) AS todos,
+         (SELECT count(*)
+          FROM suggestions_v2 AS suggestion
+          LEFT JOIN suggestion_action_metadata AS metadata
+            ON metadata.suggestion_id = suggestion.id
+          WHERE metadata.suggestion_id IS NULL) AS suggestions`
+    )
+    .get();
+  if (missingProjection.todos !== 0 || missingProjection.suggestions !== 0) {
+    throw new Error("knowledge action metadata backfill is incomplete");
+  }
+}
+
+function upgradeAnalysisInputV3V58(db) {
+  if (!tableExists(db, "analysis_inputs") || !tableExists(db, "analysis_input_segments")) {
+    throw new Error("analysis input v3 migration requires the v57 lineage schema");
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.pragma("legacy_alter_table = ON");
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS analysis_inputs_immutable_update;
+      DROP TRIGGER IF EXISTS analysis_inputs_candidate_cas;
+      DROP TRIGGER IF EXISTS analysis_inputs_immutable_delete;
+      ALTER TABLE analysis_inputs RENAME TO analysis_inputs_v57;
+
+      CREATE TABLE analysis_inputs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        transcript_revision TEXT NOT NULL CHECK(
+          typeof(transcript_revision) = 'text' AND length(transcript_revision) = 64
+          AND transcript_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        identity_revision TEXT NOT NULL CHECK(
+          typeof(identity_revision) = 'text' AND length(identity_revision) = 64
+          AND identity_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        prompt_version TEXT NOT NULL CHECK(
+          typeof(prompt_version) = 'text' AND length(trim(prompt_version)) BETWEEN 1 AND 128
+        ),
+        input_hash TEXT NOT NULL UNIQUE CHECK(
+          typeof(input_hash) = 'text' AND length(input_hash) = 64
+          AND input_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        input_contract_version TEXT NOT NULL CHECK(
+          typeof(input_contract_version) = 'text'
+          AND input_contract_version IN ('jarvis-analysis-input-v2','jarvis-analysis-input-v3')
+        ),
+        redaction_version TEXT NOT NULL CHECK(
+          typeof(redaction_version) = 'text'
+          AND redaction_version = 'jarvis-redaction-v1'
+        ),
+        cloud_payload_json TEXT NOT NULL CHECK(
+          CASE
+            WHEN typeof(cloud_payload_json) = 'text' AND json_valid(cloud_payload_json)
+            THEN COALESCE(
+              json_type(cloud_payload_json) = 'object'
+              AND json_extract(cloud_payload_json, '$.inputVersion') = input_contract_version,
+              0
+            )
+            ELSE 0
+          END
+        ),
+        cloud_payload_bytes INTEGER NOT NULL CHECK(
+          typeof(cloud_payload_bytes) = 'integer'
+          AND cloud_payload_bytes BETWEEN 2 AND 393216
+          AND length(CAST(cloud_payload_json AS BLOB)) = cloud_payload_bytes
+        ),
+        cloud_payload_sha256 TEXT NOT NULL CHECK(
+          typeof(cloud_payload_sha256) = 'text' AND length(cloud_payload_sha256) = 64
+          AND cloud_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        candidate_hash TEXT CHECK(
+          candidate_hash IS NULL OR (
+            typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
+            AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        applied_at INTEGER CHECK(
+          applied_at IS NULL OR (typeof(applied_at) = 'integer' AND applied_at >= 0)
+        ),
+        created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+        CHECK(
+          (candidate_hash IS NULL AND applied_at IS NULL)
+          OR (candidate_hash IS NOT NULL AND applied_at IS NOT NULL)
+        )
+      );
+
+      INSERT INTO analysis_inputs (
+        id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, candidate_hash, applied_at, created_at
+      )
+      SELECT
+        id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, candidate_hash, applied_at, created_at
+      FROM analysis_inputs_v57;
+
+      DROP TABLE analysis_inputs_v57;
+
+      CREATE INDEX idx_analysis_inputs_session_created
+      ON analysis_inputs(session_id, created_at);
+
+      CREATE TRIGGER analysis_inputs_immutable_update
+      BEFORE UPDATE OF id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, created_at
+      ON analysis_inputs
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input is immutable');
+      END;
+
+      CREATE TRIGGER analysis_inputs_candidate_cas
+      BEFORE UPDATE OF candidate_hash, applied_at ON analysis_inputs
+      WHEN NOT (
+        OLD.candidate_hash IS NULL AND OLD.applied_at IS NULL
+        AND NEW.candidate_hash IS NOT NULL AND NEW.applied_at IS NOT NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input candidate CAS is invalid');
+      END;
+
+      CREATE TRIGGER analysis_inputs_immutable_delete
+      BEFORE DELETE ON analysis_inputs
+      WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input is immutable');
+      END;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `application_key TEXT CHECK(
+      application_key IS NULL OR (
+        typeof(application_key) = 'text'
+        AND length(application_key) BETWEEN 1 AND 64
+        AND substr(application_key, 1, 1) GLOB '[a-z]'
+        AND application_key NOT GLOB '*[^a-z0-9._-]*'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `source_attribution TEXT CHECK(
+      source_attribution IS NULL OR source_attribution IN (
+        'application','microphone','application_and_microphone','mixed_unknown'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_category TEXT CHECK(
+      activity_category IS NULL OR activity_category IN (
+        'work_meeting','learning','social_call','in_person_conversation',
+        'entertainment','gaming','other','unknown'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_confidence REAL CHECK(
+      activity_confidence IS NULL OR (
+        typeof(activity_confidence) IN ('integer','real')
+        AND activity_confidence BETWEEN 0 AND 1
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_decision TEXT CHECK(
+      activity_decision IS NULL OR activity_decision IN ('adopted','tentative','unknown')
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `self_participated INTEGER CHECK(
+      self_participated IS NULL OR (
+        typeof(self_participated) = 'integer' AND self_participated IN (0,1)
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `memory_mode TEXT CHECK(
+      memory_mode IS NULL OR memory_mode IN (
+        'transcript_only','summary_only','interest_only','full'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `allowed_suggestion_bases_json TEXT CHECK(
+      allowed_suggestion_bases_json IS NULL OR (
+        CASE
+          WHEN typeof(allowed_suggestion_bases_json) = 'text'
+            AND json_valid(allowed_suggestion_bases_json)
+          THEN json_type(allowed_suggestion_bases_json) = 'array'
+            AND json_array_length(allowed_suggestion_bases_json) BETWEEN 0 AND 1
+            AND (
+              json_array_length(allowed_suggestion_bases_json) = 0
+              OR (
+                json_type(allowed_suggestion_bases_json, '$[0]') = 'text'
+                AND json_extract(allowed_suggestion_bases_json, '$[0]') IN (
+                  'work_context','learning_goal','explicit_agreement'
+                )
+              )
+            )
+          ELSE 0
+        END
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `todo_candidate_allowed INTEGER CHECK(
+      todo_candidate_allowed IS NULL OR (
+        typeof(todo_candidate_allowed) = 'integer' AND todo_candidate_allowed IN (0,1)
+      )
+    )`
+  );
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS analysis_input_segments_validate_context;
+    CREATE TRIGGER analysis_input_segments_validate_context
+    BEFORE INSERT ON analysis_input_segments
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM analysis_inputs AS input
+      WHERE input.id = NEW.analysis_input_id
+        AND (
+          (
+            input.input_contract_version = 'jarvis-analysis-input-v2'
+            AND NEW.application_key IS NULL
+            AND NEW.source_attribution IS NULL
+            AND NEW.activity_category IS NULL
+            AND NEW.activity_confidence IS NULL
+            AND NEW.activity_decision IS NULL
+            AND NEW.self_participated IS NULL
+            AND NEW.memory_mode IS NULL
+            AND NEW.allowed_suggestion_bases_json IS NULL
+            AND NEW.todo_candidate_allowed IS NULL
+          )
+          OR (
+            input.input_contract_version = 'jarvis-analysis-input-v3'
+            AND NEW.source_attribution IS NOT NULL
+            AND NEW.activity_category IS NOT NULL
+            AND NEW.activity_confidence IS NOT NULL
+            AND NEW.activity_decision IS NOT NULL
+            AND NEW.self_participated IS NOT NULL
+            AND NEW.memory_mode IS NOT NULL
+            AND NEW.allowed_suggestion_bases_json IS NOT NULL
+            AND NEW.todo_candidate_allowed IS NOT NULL
+            AND (
+              (
+                NEW.source_attribution IN ('application','application_and_microphone')
+                AND NEW.application_key IS NOT NULL
+              )
+              OR (
+                NEW.source_attribution IN ('microphone','mixed_unknown')
+                AND NEW.application_key IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'analysis input segment context is invalid');
+    END;
+  `);
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -7335,12 +9466,14 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     tableExists(db, "speaker_diarization_run_clusters") &&
     tableExists(db, "speaker_turns");
   const rebuildsHybridDiarization = fromVersion < 36 && tableExists(db, "speaker_diarization_runs");
+  const rebuildsAnalysisInputV3 = fromVersion < 58;
   const rebuildsReferencedSchema =
     rebuildsTranscriptSegments ||
     rebuildsApplicationAudioTracks ||
     rebuildsAnalysisBudgetPrices ||
     rebuildsEncryptedDiarizationEvidence ||
-    rebuildsHybridDiarization;
+    rebuildsHybridDiarization ||
+    rebuildsAnalysisInputV3;
   const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
   if (rebuildsReferencedSchema && db.inTransaction) {
     throw new Error("referenced schema migration must own the outer transaction");
@@ -7644,6 +9777,36 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 47) {
         upgradeParticipantReviewV47(db);
       }
+      if (fromVersion < 48) {
+        upgradeRestrainedNotificationsV48(db);
+      }
+      if (fromVersion < 49) {
+        upgradeActionCenterDeltaV49(db, migratedAt);
+      }
+      if (fromVersion < 50) {
+        upgradeSessionReprocessingV50(db);
+      }
+      if (fromVersion < 51) {
+        upgradeTodoTrustV51(db);
+      }
+      if (fromVersion < 52) {
+        upgradeLearningGoalsV52(db);
+      }
+      if (fromVersion < 53) {
+        upgradeTodoTrustHardeningV53(db);
+      }
+      if (fromVersion < 54) {
+        upgradeKnowledgeActionLifecycleV54(db);
+      }
+      if (fromVersion < 55) {
+        upgradePersonalizationFeedbackEventsV55(db);
+      }
+      if (fromVersion < 57) {
+        upgradeKnowledgeActionProjectionBackfillV57(db);
+      }
+      if (fromVersion < 58) {
+        upgradeAnalysisInputV3V58(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -7688,6 +9851,14 @@ module.exports = {
   upgradeRecoverableSpeakerWorkV44,
   upgradeDailyDigestSnapshotRetentionV45,
   upgradeSpeakerTranscriptProjectionV46,
+  upgradeRestrainedNotificationsV48,
+  upgradeActionCenterDeltaV49,
+  upgradeTodoTrustV51,
+  upgradeLearningGoalsV52,
+  upgradeTodoTrustHardeningV53,
+  upgradeKnowledgeActionLifecycleV54,
+  upgradePersonalizationFeedbackEventsV55,
+  upgradeKnowledgeActionProjectionBackfillV57,
   upgradeRuntimeStatusIndexesV38,
   upgradeHybridDiarizationV36,
 };

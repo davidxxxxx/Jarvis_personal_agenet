@@ -25,6 +25,12 @@ function prepared(overrides = {}) {
         startedAt: 20,
         endedAt: 30,
         speakerBindingLabel: "P1",
+        applicationKey: "chrome",
+        sourceAttribution: "application",
+        activityCategory: "entertainment",
+        activityConfidence: 0.93,
+        activityDecision: "adopted",
+        selfParticipated: false,
       },
       {
         ordinal: 0,
@@ -40,6 +46,12 @@ function prepared(overrides = {}) {
         startedAt: 10,
         endedAt: 20,
         speakerBindingLabel: "SELF",
+        applicationKey: null,
+        sourceAttribution: "microphone",
+        activityCategory: "work_meeting",
+        activityConfidence: 0.94,
+        activityDecision: "adopted",
+        selfParticipated: true,
       },
     ],
     speakerBindings: [
@@ -85,7 +97,26 @@ test("builds a deterministic chronological payload with local-only bindings", ()
     first.cloudPayload.segments.map((segment) => segment.speakerLabel),
     ["SELF", "P1"]
   );
-  assert.equal(first.cloudPayload.inputVersion, "jarvis-analysis-input-v2");
+  assert.equal(first.cloudPayload.inputVersion, "jarvis-analysis-input-v3");
+  assert.deepEqual(first.cloudPayload.segments[0], {
+    segmentId: "seg-first",
+    startedAt: 10,
+    endedAt: 20,
+    speakerLabel: "SELF",
+    applicationKey: null,
+    sourceAttribution: "microphone",
+    activityCategory: "work_meeting",
+    activityConfidence: 0.94,
+    activityDecision: "adopted",
+    selfParticipated: true,
+    memoryMode: "full",
+    allowedSuggestionBases: ["work_context"],
+    todoCandidateAllowed: true,
+    text: "First text from SELF",
+  });
+  assert.equal(first.cloudPayload.segments[1].memoryMode, "interest_only");
+  assert.deepEqual(first.cloudPayload.segments[1].allowedSuggestionBases, []);
+  assert.equal(first.cloudPayload.segments[1].todoCandidateAllowed, false);
   assert.deepEqual(first.cloudPayload.omittedRanges, []);
   assert.deepEqual(first, second);
   assert.deepEqual(source, before);
@@ -94,6 +125,76 @@ test("builds a deterministic chronological payload with local-only bindings", ()
   assert.equal(JSON.stringify(first.cloudPayload).includes("pseudonymBindings"), false);
   assert.equal(first.local.complete, true);
   assert.equal(first.local.nextCursor, 2);
+});
+
+test("source-unknown and tentative activity context remains transcript or summary only", () => {
+  const source = prepared();
+  source.segments[0] = {
+    ...source.segments[0],
+    applicationKey: null,
+    sourceAttribution: "mixed_unknown",
+    activityCategory: "work_meeting",
+    activityConfidence: 0.99,
+    activityDecision: "adopted",
+    selfParticipated: true,
+  };
+  source.segments[1] = {
+    ...source.segments[1],
+    activityCategory: "learning",
+    activityConfidence: 0.7,
+    activityDecision: "tentative",
+    selfParticipated: true,
+  };
+  const result = new AnalysisInputBuilder().build(source);
+
+  assert.equal(result.cloudPayload.segments[1].memoryMode, "summary_only");
+  for (const segment of result.cloudPayload.segments) {
+    assert.deepEqual(segment.allowedSuggestionBases, []);
+    assert.equal(segment.todoCandidateAllowed, false);
+  }
+});
+
+test("rejects non-normalized application and activity context before cloud serialization", () => {
+  const source = prepared();
+  source.segments[0].applicationKey = "C:\\Private\\chrome.exe";
+  assert.throws(() => new AnalysisInputBuilder().build(source), /prepared segment is invalid/u);
+});
+
+test("includes only confirmed goal ids and redacted goal text needed for learning suggestions", () => {
+  const builder = new AnalysisInputBuilder();
+  const source = prepared({
+    learningGoals: [
+      {
+        goalId: "learning-goal-english",
+        title: "Local Self 要完成 C:\\Private\\English 训练",
+      },
+    ],
+  });
+  const result = builder.build(source);
+
+  assert.deepEqual(result.cloudPayload.learningGoals, [
+    {
+      goalId: "learning-goal-english",
+      title: "SELF 要完成 [PATH]",
+    },
+  ]);
+  assert.equal(
+    builder.verifyRedactedCloudPayload({
+      cloudPayload: result.cloudPayload,
+      preparedSnapshot: source,
+    }),
+    true
+  );
+  assert.equal(
+    builder.verifyRedactedCloudPayload({
+      cloudPayload: {
+        ...result.cloudPayload,
+        learningGoals: [{ goalId: "invented-goal", title: "invented" }],
+      },
+      preparedSnapshot: source,
+    }),
+    false
+  );
 });
 
 test("default hierarchical budget keeps a representative multi-hour session complete", () => {
@@ -219,10 +320,7 @@ test("compiles reusable redaction matchers without changing established output",
 
   assert.equal(redact(text), redactText(text, terms));
   assert.equal(redact(text), redact(text));
-  assert.equal(
-    redact(text),
-    "SELF met P1 and [PERSON] using [DEVICE] with [SECRET] at [PATH]"
-  );
+  assert.equal(redact(text), "SELF met P1 and [PERSON] using [DEVICE] with [SECRET] at [PATH]");
 });
 
 test("fails closed unless every prepared segment is final stable current and non-duplicate", () => {
@@ -311,7 +409,7 @@ test("timeline coverage samples the beginning middle and end of a long recording
       deviceLabels: [],
     },
   });
-  const result = new AnalysisInputBuilder({ maxPayloadBytes: 1_400 }).build(source, {
+  const result = new AnalysisInputBuilder({ maxPayloadBytes: 2_400 }).build(source, {
     strategy: "timeline",
   });
   const selectedIds = result.cloudPayload.segments.map((segment) => segment.segmentId);
@@ -324,7 +422,7 @@ test("timeline coverage samples the beginning middle and end of a long recording
   assert.equal(result.local.complete, false);
   assert.equal(result.local.nextCursor, segments.length);
   assert.equal(
-    new AnalysisInputBuilder({ maxPayloadBytes: 1_400 }).verifyRedactedCloudPayload({
+    new AnalysisInputBuilder({ maxPayloadBytes: 2_400 }).verifyRedactedCloudPayload({
       cloudPayload: result.cloudPayload,
       preparedSnapshot: source,
     }),
@@ -376,13 +474,16 @@ test("hierarchical coverage gives every occupied time window evidence before add
     },
   });
 
-  const result = new AnalysisInputBuilder({ maxPayloadBytes: 1_350 }).build(source, {
+  const result = new AnalysisInputBuilder({ maxPayloadBytes: 2_400 }).build(source, {
     strategy: "hierarchical",
   });
   const selectedIds = result.cloudPayload.segments.map((segment) => segment.segmentId);
 
   assert.equal(result.sendable, true);
-  assert.equal(selectedIds.some((id) => id.startsWith("opening-")), true);
+  assert.equal(
+    selectedIds.some((id) => id.startsWith("opening-")),
+    true
+  );
   assert.equal(selectedIds.includes("middle-window"), true);
   assert.equal(selectedIds.includes("late-window"), true);
   assert.equal(selectedIds.length < source.segments.length, true);
@@ -397,7 +498,7 @@ test("skips a single oversized segment and advances the cursor to a later comple
       { ...prepared().segments[0], textSnapshot: "small" },
     ],
   });
-  const result = new AnalysisInputBuilder({ maxPayloadBytes: 400 }).build(source);
+  const result = new AnalysisInputBuilder({ maxPayloadBytes: 750 }).build(source);
 
   assert.equal(result.sendable, true);
   assert.deepEqual(

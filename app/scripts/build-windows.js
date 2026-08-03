@@ -1,3 +1,4 @@
+const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { assertSafeArtifactTree, assertSafeBuilderConfig } = require("./verify-package-safety");
@@ -15,6 +16,70 @@ const SIGNING_ENVIRONMENT = [
   /^(?:WIN(?:DOWS)?_)?CERTIFICATE_(?:LINK|PASSWORD|NAME|SUBJECT_NAME)$/i,
 ];
 
+function parseCliArgs(argv) {
+  let dirOnly = false;
+  let outputDir;
+  const setOutputDir = (value) => {
+    if (outputDir !== undefined) {
+      throw new Error("--output-dir may only be provided once");
+    }
+    if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
+      throw new Error("--output-dir requires a value");
+    }
+    outputDir = value;
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--dir") {
+      dirOnly = true;
+      continue;
+    }
+    if (argument === "--output-dir") {
+      setOutputDir(argv[index + 1]);
+      index += 1;
+      continue;
+    }
+    const outputMatch = /^--output-dir=(.*)$/u.exec(argument);
+    if (outputMatch) {
+      setOutputDir(outputMatch[1]);
+      continue;
+    }
+    throw new Error(`unsupported Windows build argument: ${argument}`);
+  }
+
+  return { dirOnly, outputDir };
+}
+
+function resolvePackageOutputDirectory(
+  outputDir,
+  { fsImpl = fs, platform = process.platform, systemDrive = process.env.SystemDrive || "C:" } = {}
+) {
+  const pathImpl = platform === "win32" ? path.win32 : path;
+  if (typeof outputDir !== "string" || !pathImpl.isAbsolute(outputDir)) {
+    throw new TypeError("Windows package output directory must be absolute");
+  }
+  const resolved = pathImpl.resolve(outputDir);
+  const parsedRoot = pathImpl.parse(resolved).root;
+  const normalizeRoot = (value) =>
+    String(value || "")
+      .replace(/[\\/]$/u, "")
+      .toLowerCase();
+  if (normalizeRoot(resolved) === normalizeRoot(parsedRoot)) {
+    throw new Error("Windows package output directory must not be a volume root");
+  }
+  if (
+    platform === "win32" &&
+    normalizeRoot(path.win32.parse(resolved).root) === normalizeRoot(systemDrive)
+  ) {
+    throw new Error("Windows package output directory must not use the system drive");
+  }
+  if (fsImpl.existsSync(resolved)) {
+    throw new Error("Windows package output directory must not already exist");
+  }
+  return resolved;
+}
+
 function sanitizeUnsignedEnvironment(environment) {
   const sanitized = {};
   for (const [name, value] of Object.entries(environment ?? {})) {
@@ -30,9 +95,16 @@ function createUnsignedBuilderInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
   dirOnly = false,
+  outputDir = path.join(appRoot, "dist"),
 } = {}) {
   const configPath = path.join(appRoot, "electron-builder.unsigned-win.json");
-  const args = [require.resolve("electron-builder/cli.js"), "--win", "--config", configPath];
+  const args = [
+    require.resolve("electron-builder/cli.js"),
+    "--win",
+    "--config",
+    configPath,
+    `--config.directories.output=${outputDir}`,
+  ];
   if (dirOnly) args.push("--dir");
   return {
     command: process.execPath,
@@ -51,9 +123,14 @@ function createWindowsModelBundleInvocation({
   appRoot = path.resolve(__dirname, ".."),
   env = process.env,
   publishOnly = false,
+  distRoot,
 } = {}) {
+  if (distRoot !== undefined && !publishOnly) {
+    throw new Error("model bundle distribution root requires publish-only mode");
+  }
   const args = [path.join(appRoot, "scripts", "build-windows-model-bundle.js")];
   if (publishOnly) args.push("--publish-only");
+  if (distRoot !== undefined) args.push("--dist-root", distRoot);
   return {
     command: process.execPath,
     args,
@@ -146,8 +223,8 @@ function getSourceNativePaths(appRoot) {
   };
 }
 
-function getPackagedNativePaths(appRoot) {
-  const unpackedRoot = path.join(appRoot, "dist", "win-unpacked");
+function getPackagedNativePaths(appRoot, artifactRoot = path.join(appRoot, "dist")) {
+  const unpackedRoot = path.join(artifactRoot, "win-unpacked");
   const modulePath = path.join(
     unpackedRoot,
     "resources",
@@ -254,12 +331,28 @@ function assertUnsignedWindowsArtifacts({
 
 function buildUnsignedWindows(options = {}) {
   const appRoot = options.appRoot ?? path.resolve(__dirname, "..");
-  const invocation = createUnsignedBuilderInvocation({ ...options, appRoot });
-  const modelBundleInvocation = createWindowsModelBundleInvocation({ ...options, appRoot });
+  const artifactRoot =
+    options.outputDir === undefined
+      ? path.join(appRoot, "dist")
+      : resolvePackageOutputDirectory(options.outputDir, {
+          fsImpl: options.outputFsImpl,
+          platform: options.outputPlatform,
+          systemDrive: options.systemDrive,
+        });
+  const invocation = createUnsignedBuilderInvocation({
+    ...options,
+    appRoot,
+    outputDir: artifactRoot,
+  });
+  const modelBundleInvocation = createWindowsModelBundleInvocation({
+    appRoot,
+    env: options.env,
+  });
   const modelPublishInvocation = createWindowsModelBundleInvocation({
     ...options,
     appRoot,
     publishOnly: true,
+    distRoot: artifactRoot,
   });
   const electronRebuildInvocation = createElectronNativeRebuildInvocation({ ...options, appRoot });
   const nodeRestoreInvocation = createNodeNativeRestoreInvocation({ ...options, appRoot });
@@ -272,7 +365,7 @@ function buildUnsignedWindows(options = {}) {
   const assertUnsignedWindowsArtifactsImpl =
     options.assertUnsignedWindowsArtifactsImpl ?? assertUnsignedWindowsArtifacts;
   const sourceNativePaths = getSourceNativePaths(appRoot);
-  const packagedNativePaths = getPackagedNativePaths(appRoot);
+  const packagedNativePaths = getPackagedNativePaths(appRoot, artifactRoot);
   let result;
   let primaryError;
   let restoreError;
@@ -315,7 +408,6 @@ function buildUnsignedWindows(options = {}) {
         spawnSyncImpl
       );
     }
-    const artifactRoot = path.join(appRoot, "dist");
     assertSafeArtifactTreeImpl(artifactRoot);
     if (!options.dirOnly) {
       assertUnsignedWindowsArtifactsImpl({
@@ -354,7 +446,7 @@ function buildUnsignedWindows(options = {}) {
 }
 
 if (require.main === module) {
-  buildUnsignedWindows({ dirOnly: process.argv.includes("--dir") });
+  buildUnsignedWindows(parseCliArgs(process.argv.slice(2)));
 }
 
 module.exports = {
@@ -364,6 +456,8 @@ module.exports = {
   createNodeNativeRestoreInvocation,
   createUnsignedBuilderInvocation,
   createWindowsModelBundleInvocation,
+  parseCliArgs,
+  resolvePackageOutputDirectory,
   sanitizeUnsignedEnvironment,
   verifyNativeAbi,
 };

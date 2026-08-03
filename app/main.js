@@ -24,6 +24,7 @@ const {
   dialog,
   ipcMain,
   net,
+  Notification,
   session,
   systemPreferences,
 } = require("electron");
@@ -347,6 +348,10 @@ const {
   createJarvisRuntimeMigrationParticipant,
 } = require("./src/jarvis/main/JarvisProcessingLifecycle");
 const JarvisPowerLifecycle = require("./src/jarvis/main/JarvisPowerLifecycle");
+const JarvisNotificationScheduler = require("./src/jarvis/main/JarvisNotificationScheduler");
+const MiniMaxModelDiscovery = require("./src/jarvis/main/MiniMaxModelDiscovery");
+const { DEFAULT_JARVIS_ROLLOUT_FLAGS } = require("./src/jarvis/main/JarvisRolloutFlags");
+const { createElectronNotificationDelivery } = JarvisNotificationScheduler;
 const { RendererPowerResumeHandshake } = JarvisPowerLifecycle;
 
 // Manager instances - initialized after app.whenReady()
@@ -396,6 +401,7 @@ let jarvisLocalDateTimer = null;
 let participantReviewBackfillService = null;
 let participantReviewBackfillTimer = null;
 let applicationAudioLifecycleCoordinator = null;
+let jarvisNotificationScheduler = null;
 const foregroundActivityProvider = createWindowsForegroundActivityProvider();
 const jarvisOwnedPidsProvider = createJarvisOwnedPidsProvider({
   mainPid: process.pid,
@@ -413,11 +419,40 @@ function resolveConfiguredJarvisWhisperModel() {
 
 const PARTICIPANT_REVIEW_BACKFILL_LIMIT = 4;
 const PARTICIPANT_REVIEW_BACKFILL_RETRY_MS = 60_000;
+const SAFE_JARVIS_REPOSITORY_LOG_PHASES = new Set(["activity_correction_participant_refresh"]);
+const SAFE_JARVIS_REPOSITORY_ERROR_CODES = new Set([
+  "PARTICIPANT_SNAPSHOT_REFRESH_FAILED",
+  "SQLITE_BUSY",
+  "SQLITE_CONSTRAINT",
+  "SQLITE_CONSTRAINT_TRIGGER",
+  "SQLITE_CORRUPT",
+  "SQLITE_FULL",
+  "SQLITE_IOERR",
+  "SQLITE_LOCKED",
+  "SQLITE_NOTADB",
+  "SQLITE_READONLY",
+]);
 
-function scheduleParticipantReviewBackfill(
-  scope = "recent_audio",
-  delayMs = 15_000
-) {
+function safeJarvisRepositoryLogToken(value, allowlist, fallback) {
+  return typeof value === "string" && allowlist.has(value) ? value : fallback;
+}
+
+function createSafeJarvisRepositoryLogRecord({ phase, errorCode } = {}) {
+  return {
+    phase: safeJarvisRepositoryLogToken(
+      phase,
+      SAFE_JARVIS_REPOSITORY_LOG_PHASES,
+      "repository_deferred"
+    ),
+    errorCode: safeJarvisRepositoryLogToken(
+      errorCode,
+      SAFE_JARVIS_REPOSITORY_ERROR_CODES,
+      "PARTICIPANT_SNAPSHOT_REFRESH_FAILED"
+    ),
+  };
+}
+
+function scheduleParticipantReviewBackfill(scope = "recent_audio", delayMs = 15_000) {
   if (participantReviewBackfillTimer || !participantReviewBackfillService) return;
   participantReviewBackfillTimer = setTimeout(() => {
     participantReviewBackfillTimer = null;
@@ -453,12 +488,15 @@ function scheduleParticipantReviewBackfill(
 
 function buildJarvisProcessingRuntime() {
   const model = resolveConfiguredJarvisWhisperModel();
+  const rolloutFlags =
+    environmentManager?.getJarvisRolloutFlags?.() ?? DEFAULT_JARVIS_ROLLOUT_FLAGS;
   return createJarvisProcessingRuntime({
     repository: jarvisRepository,
     service: jarvisService,
     ipcHandlers,
     model,
     resourceSettings: environmentManager?.getJarvisResourceSettings?.(),
+    dualSpeakerVerificationEnabled: rolloutFlags.dualSpeakerVerificationV1,
     foregroundActivityProvider,
     ownedPidsProvider: jarvisOwnedPidsProvider,
     onResourceSnapshot: async (snapshot) => {
@@ -468,6 +506,7 @@ function buildJarvisProcessingRuntime() {
       );
       windowManager?.setFullscreenYieldActive(jarvisFullscreenYieldActive);
       await ipcHandlers?.setJarvisFullscreenYield(jarvisFullscreenYieldActive);
+      jarvisNotificationScheduler?.wake();
     },
     cloudCompositionFactory: ({ repository, governor, previewScheduler, owner, now }) =>
       createProductionAgentCloudComposition({
@@ -477,7 +516,10 @@ function buildJarvisProcessingRuntime() {
         fetchImpl: (url, options) => net.fetch(url, options),
         governor,
         previewScheduler,
+        calendarEventsProvider: ({ startedAt, endedAt }) =>
+          databaseManager?.getCalendarEventsOverlapping?.(startedAt, endedAt) ?? [],
         timezoneProvider: () => Intl.DateTimeFormat().resolvedOptions().timeZone,
+        activityClassificationEnabled: rolloutFlags.activityClassificationV1,
         owner,
         now,
         log: (entry) => debugLogger?.info("Jarvis agent cloud", entry, "jarvis"),
@@ -639,6 +681,12 @@ async function initializeCoreManagers() {
     validateRedactedCloudPayload: (input) =>
       jarvisAnalysisInputBuilder.verifyRedactedCloudPayload(input),
     embeddingCipher: voiceEmbeddingCipher,
+    log: (entry) =>
+      debugLogger?.warn(
+        "Jarvis repository deferred maintenance",
+        createSafeJarvisRepositoryLogRecord(entry),
+        "jarvis"
+      ),
   });
   participantReviewBackfillService = new ParticipantReviewBackfillService({
     repository: jarvisRepository,
@@ -740,6 +788,47 @@ async function initializeCoreManagers() {
     temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
+  jarvisNotificationScheduler = new JarvisNotificationScheduler({
+    repository: jarvisRepository,
+    notify: createElectronNotificationDelivery({
+      Notification,
+      onClick: () => {
+        const existing = windowManager?.controlPanelWindow;
+        if (isLiveWindow(existing)) {
+          if (existing.isMinimized()) existing.restore();
+          existing.show();
+          existing.focus();
+          return;
+        }
+        return windowManager?.createControlPanelWindow?.();
+      },
+    }),
+    contextProvider: async () => {
+      const governor = jarvisProcessingLifecycle.runtime?.governor ?? null;
+      let snapshot = governor?.latestSnapshot ?? null;
+      const sampledAt = snapshot?.sampledAt;
+      if (!snapshot || !Number.isSafeInteger(sampledAt) || Date.now() - sampledAt > 60_000) {
+        snapshot = (await governor?.sample?.()) ?? null;
+      }
+      if (!snapshot) {
+        const error = new Error("Notification focus context is unavailable");
+        error.code = "JARVIS_NOTIFICATION_CONTEXT_UNAVAILABLE";
+        throw error;
+      }
+      const foregroundProcess = String(snapshot?.foregroundActivityProcessName ?? "").toLowerCase();
+      const presentationActive =
+        snapshot?.fullscreenActivityActive === true &&
+        /^(powerpnt|keynote|soffice|libreoffice|wps|wpp)$/u.test(foregroundProcess);
+      return {
+        fullscreenGame: jarvisFullscreenYieldActive && !presentationActive,
+        presentationActive,
+        meetingActive:
+          meetingDetectionEngine?.isMeetingModeActive?.() === true ||
+          Boolean(googleCalendarManager?.getActiveMeetingState?.()?.activeMeeting),
+      };
+    },
+    log: (entry) => debugLogger?.warn("Jarvis restrained notification", entry, "jarvis"),
+  });
   const reconfigureStorageHolders = async (root) => {
     const currentLeaseRoot = jarvisDataRootLease ? path.dirname(jarvisDataRootLease.path) : null;
     const nextLease =
@@ -775,12 +864,16 @@ async function initializeCoreManagers() {
       prepareStorageMigration: () => jarvisService.prepareStorageMigration(),
       stopRetention: () => retentionCleaner.stop(),
       quiesceAnalysis: () => jarvisAnalysisScheduler.quiesce(),
-      checkpointAndCloseRepository: () => {
+      checkpointAndCloseRepository: async () => {
+        await jarvisNotificationScheduler?.stop();
         jarvisRepository.checkpointForMigration();
         jarvisRepository.close();
       },
       reconfigureStorageHolders,
-      resumeAnalysis: () => jarvisAnalysisScheduler.resume(),
+      resumeAnalysis: () => {
+        jarvisAnalysisScheduler.resume();
+        jarvisNotificationScheduler?.start();
+      },
       startRetention: () => retentionCleaner.start(),
     })
   );
@@ -1023,11 +1116,14 @@ async function initializeCoreManagers() {
         };
       },
       setPolicy: async (input) => {
+        const previous = environmentManager.getApplicationAudioSettings();
         const saved = await environmentManager.saveApplicationAudioSettings(input);
         const pool = applicationAudioCapturePool;
-        if (pool) {
+        const captureSettingsChanged =
+          previous.enabled !== saved.enabled || previous.trackLimit !== saved.trackLimit;
+        if (pool && captureSettingsChanged) {
           if (!saved.enabled) {
-            await pool.stop();
+            if (previous.enabled) await pool.stop();
           } else {
             await pool.setConfiguredLimit(saved.trackLimit);
             const capture = jarvisService.getState();
@@ -1059,7 +1155,13 @@ async function initializeCoreManagers() {
         };
       },
     },
+    rolloutFlags: environmentManager.getJarvisRolloutFlags(),
+    miniMaxModelDiscovery: new MiniMaxModelDiscovery({
+      fetchImpl: (url, options) => net.fetch(url, options),
+      getApiKey: () => environmentManager.getMiniMaxKey(),
+    }),
     dailyDigestScheduler: jarvisDailyDigestScheduler,
+    notificationScheduler: jarvisNotificationScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
     storageManager: jarvisStorageManager,
     pickStorageDirectory: async () => {
@@ -1070,6 +1172,7 @@ async function initializeCoreManagers() {
       return result.canceled ? null : (result.filePaths[0] ?? null);
     },
     processingLifecycle: jarvisProcessingLifecycle,
+    log: (entry) => debugLogger?.warn("Jarvis IPC deferred work", entry, "jarvis"),
   });
 
   const uiLanguage = environmentManager.getUiLanguage();
@@ -1782,6 +1885,7 @@ async function startApp() {
 
   // Phase 2: Initialize remaining managers after windows are visible
   initializeDeferredManagers();
+  jarvisNotificationScheduler.start();
 
   if (whisperCudaManager && whisperCudaVerifier) {
     const { detectNvidiaGpu, listNvidiaGpus } = require("./src/utils/gpuDetection");
@@ -2530,6 +2634,11 @@ function performGracefulTeardown() {
       () => sidecarRegistry.shutdownAll(),
     ],
     stopRuntime: [
+      async () => {
+        const scheduler = jarvisNotificationScheduler;
+        jarvisNotificationScheduler = null;
+        await scheduler?.stop();
+      },
       stopJarvisProcessingRuntime,
       () => {
         if (jarvisLocalDateTimer) clearInterval(jarvisLocalDateTimer);

@@ -327,6 +327,13 @@ function validationContextFor(activities) {
     sourceAttributionByActivity: Object.fromEntries(
       activities.map((activity) => [activity.activityId, activity.sourceAttribution])
     ),
+    selfParticipationByActivity: Object.fromEntries(
+      activities.map((activity) => [
+        activity.activityId,
+        activity.statistics.selfDetected === true ||
+          activity.statistics.microphoneParticipated === true,
+      ])
+    ),
     segmentIdsByActivity: Object.fromEntries(
       activities.map((activity) => [
         activity.activityId,

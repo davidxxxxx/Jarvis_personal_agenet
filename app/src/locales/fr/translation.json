@@ -234,6 +234,10 @@
       "keyConfigured": "MiniMax key configured",
       "keyNotConfigured": "MiniMax key not configured",
       "model": "Model: {{model}}",
+      "modelReady": "La disponibilité du modèle MiniMax est confirmée.",
+      "modelCheckUnavailable": "La disponibilité du modèle MiniMax n’a pas pu être vérifiée. L’enregistrement local n’est pas affecté.",
+      "modelUnavailable": "{{model}} n’est pas disponible pour cette clé. L’analyse dans le cloud reste en pause.",
+      "modelFallback": "Le modèle configuré n’était pas disponible. Jarvis utilisera {{model}}.",
       "keyLabel": "MiniMax subscription key",
       "saveKey": "Save MiniMax key",
       "removeKey": "Remove MiniMax key",
@@ -277,14 +281,34 @@
       "description": "Choose how quickly Jarvis yields the GPU and resumes background processing.",
       "loading": "Loading resource settings…",
       "profiles": {
-        "game_priority": { "title": "Game priority", "description": "Yield early and resume slowly." },
-        "balanced": { "title": "Balanced", "description": "Ignore light GPU use and share safely." },
-        "processing_priority": { "title": "Processing priority", "description": "Use more idle GPU capacity." }
+        "game_priority": {
+          "title": "Game priority",
+          "description": "Yield early and resume slowly."
+        },
+        "balanced": {
+          "title": "Balanced",
+          "description": "Ignore light GPU use and share safely."
+        },
+        "processing_priority": {
+          "title": "Processing priority",
+          "description": "Use more idle GPU capacity."
+        }
       },
       "applicationAudio": {
         "title": "Séparer le son de l’ordinateur par application",
         "description": "Suivre uniquement les applications qui émettent du son. En cas d’échec, utiliser le mixage système sans deviner la source.",
         "trackLimit": "Nombre maximal de pistes d’application simultanées",
+        "fallbackPolicy": "When an app track falls back to mixed system audio",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "Conservative summary",
+            "description": "Keep mixed audio and the full transcript. Allow only evidence-checkable summaries; block suggestions, todos, and identity learning."
+          },
+          "transcript_only": {
+            "title": "Transcript only",
+            "description": "Keep mixed audio and the full transcript. Block summaries, suggestions, todos, and identity learning."
+          }
+        },
         "runtime": "Enregistrement de {{active}} pistes d’application (limite {{limit}}) · {{fallback}} sources dégradées",
         "idle": "Démarre au prochain enregistrement ; les jeux en plein écran conservent au maximum deux pistes."
       },

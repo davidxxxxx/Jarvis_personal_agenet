@@ -61,7 +61,44 @@ test("high-memory overlap separation is limited to microphone and communication 
     shouldEnableOverlapSeparation({ source_type: "system", application_key: "dota2" }),
     false
   );
-  assert.equal(shouldEnableOverlapSeparation({ source_type: "system", application_key: null }), false);
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: null }),
+    false
+  );
+});
+
+test("dual speaker rollout rollback leaves diarization evidence available without constructing verifier", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const service = configurableService({
+    audioEvidenceReader: { withVerifiedWav: async () => null },
+    flacCompressionWorker: { run: async () => {} },
+    previewAudioRing: { withPreviewWav: async () => null },
+  });
+
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    dualSpeakerVerificationEnabled: false,
+  });
+
+  assert.equal(runtime.dualSpeakerVerifier, null);
+  assert.ok(runtime.speakerProcessingPolicy);
+  assert.throws(
+    () =>
+      createJarvisProcessingRuntime({
+        repository,
+        service,
+        ipcHandlers: { createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }) },
+        model: "large-v3-turbo",
+        dualSpeakerVerificationEnabled: "false",
+      }),
+    /dualSpeakerVerificationEnabled/u
+  );
 });
 
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
@@ -541,13 +578,23 @@ test("historical local-only reprocessing preserves summaries and never queues cl
       isSessionReadyForPostProcessing: () => true,
       refreshSessionReadiness: () => ({ processing_state: "ready" }),
       isHistoricalLocalOnlyReprocessing: () => true,
-      completeHistoricalLocalOnlyReprocessing: (sessionId) =>
-        calls.push(`local_complete:${sessionId}`),
+      startHistoricalLocalOnlyReprocessing: (sessionId) => {
+        calls.push(`local_start:${sessionId}`);
+        return { state: "processing" };
+      },
+      refreshSessionParticipantSnapshot: (sessionId) =>
+        calls.push(`participant_refresh:${sessionId}`),
+      finalizeHistoricalLocalOnlyReprocessing: (sessionId) => {
+        calls.push(`local_finalize:${sessionId}`);
+        return { state: "completed" };
+      },
     },
     reconciler: { reconcileSession: () => calls.push("reconcile") },
     deduper: { dedupe: () => calls.push("dedupe") },
     analysisScheduler: {
       analyzeSession: () => calls.push("unexpected_cloud_analysis"),
+      classifySessionLocally: (sessionId, options) =>
+        calls.push(`local_classify:${sessionId}:${options.force}`),
     },
     dailyDigestScheduler: {
       start() {},
@@ -558,7 +605,69 @@ test("historical local-only reprocessing preserves summaries and never queues cl
   });
 
   await runtime.drainOnce();
-  assert.deepEqual(calls, ["reconcile", "dedupe", "local_complete:historical-session"]);
+  assert.deepEqual(calls, [
+    "reconcile",
+    "dedupe",
+    "local_start:historical-session",
+    "local_classify:historical-session:true",
+    "participant_refresh:historical-session",
+    "local_finalize:historical-session",
+  ]);
+});
+
+test("historical local-only failures remain retryable at every durable finalize step", async (t) => {
+  for (const failureStage of ["classify", "participant", "finalize"]) {
+    await t.test(failureStage, async () => {
+      let shouldFail = true;
+      let finalized = 0;
+      const calls = [];
+      const failOnce = (stage) => {
+        calls.push(stage);
+        if (failureStage === stage && shouldFail) {
+          shouldFail = false;
+          throw new Error(`${stage} failed`);
+        }
+      };
+      const runtime = new JarvisProcessingRuntime({
+        runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+        repository: {
+          listProcessingSessions: () => [{ id: "historical-retry", ended_at: 1 }],
+          isSessionReadyForPostProcessing: () => true,
+          refreshSessionReadiness: () => ({ processing_state: "ready" }),
+          isHistoricalLocalOnlyReprocessing: () => true,
+          startHistoricalLocalOnlyReprocessing: () => {
+            calls.push("start");
+            return { state: "processing" };
+          },
+          refreshSessionParticipantSnapshot: () => failOnce("participant"),
+          finalizeHistoricalLocalOnlyReprocessing: () => {
+            failOnce("finalize");
+            finalized += 1;
+            return { state: "completed" };
+          },
+        },
+        reconciler: { reconcileSession() {} },
+        deduper: { dedupe() {} },
+        analysisScheduler: {
+          analyzeSession() {
+            throw new Error("cloud analysis must stay disabled");
+          },
+          classifySessionLocally() {
+            failOnce("classify");
+          },
+        },
+        now: () => 10,
+        log: ({ phase }) => calls.push(`error:${phase}`),
+      });
+
+      await runtime.drainOnce();
+      assert.equal(finalized, 0);
+      await runtime.drainOnce();
+      assert.equal(finalized, 1);
+      assert.equal(calls.filter((entry) => entry === "start").length, 2);
+      assert.equal(calls.filter((entry) => entry === "error:post_process").length, 1);
+    });
+  }
 });
 
 test("startup repairs a bounded historical analysis batch before starting the cloud dispatcher", async () => {
@@ -2577,6 +2686,61 @@ test("generic recovery runs while fullscreen and its first-exit recovery stay pa
     "resource:recovery_hysteresis",
     "preview:recovery_hysteresis",
   ]);
+});
+
+test("an available resource snapshot wakes parked local jobs before the job phase", async () => {
+  const calls = [];
+  const available = {
+    state: "available",
+    reason: "resources_available",
+    restrictiveForMs: 0,
+    previewEnabled: true,
+  };
+  const snapshots = [
+    available,
+    available,
+    {
+      state: "busy",
+      reason: "external_gpu_busy",
+      restrictiveForMs: 0,
+      previewEnabled: true,
+    },
+    available,
+  ];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases() {},
+      wakeResourceDeferredJobs(at) {
+        calls.push(`wake:${at}`);
+        return 2;
+      },
+      async runOnce() {
+        calls.push("job");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    governor: {
+      sample: async () => snapshots.shift(),
+    },
+    onResourceSnapshot: (snapshot) => calls.push(`resource:${snapshot.reason}`),
+    now: () => 2_000,
+  });
+
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.deepEqual(calls.slice(0, 3), ["resource:resources_available", "wake:2000", "job"]);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 1);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 1);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 2);
 });
 
 test("stop during governor sampling prevents a late preview from escaping the shutdown join", async () => {

@@ -6,14 +6,33 @@ const {
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
   normalizeKnowledgeTodoDecisionInput,
+  normalizeActionCenterReadInput,
 } = require("../../src/jarvis/shared/contracts");
 
 test("knowledge channels are narrow and versioned", () => {
+  assert.equal(CHANNELS.getActionCenterWatermark, "jarvis:memory:v2-action-watermark");
+  assert.equal(CHANNELS.getActionCenterDelta, "jarvis:memory:v2-action-delta");
+  assert.equal(CHANNELS.markActionCenterRead, "jarvis:memory:v2-action-read");
   assert.equal(CHANNELS.getKnowledgeOverview, "jarvis:memory:v2-overview");
   assert.equal(CHANNELS.decideKnowledgeSuggestion, "jarvis:memory:v2-suggestion-decision");
   assert.equal(CHANNELS.resolveKnowledgeConflict, "jarvis:memory:v2-conflict-resolve");
   assert.equal(CHANNELS.completeKnowledgeTodo, "jarvis:memory:v2-todo-complete");
   assert.equal(CHANNELS.decideKnowledgeTodo, "jarvis:memory:v2-todo-decision");
+});
+
+test("action read boundaries accept one exact durable sequence", () => {
+  assert.deepEqual(normalizeActionCenterReadInput({ throughSequence: 42 }), {
+    throughSequence: 42,
+  });
+  for (const input of [
+    null,
+    {},
+    { throughSequence: -1 },
+    { throughSequence: 1.5 },
+    { throughSequence: 1, extra: true },
+  ]) {
+    assert.throws(() => normalizeActionCenterReadInput(input));
+  }
 });
 
 test("suggestion decisions accept exact ids and a closed action", () => {

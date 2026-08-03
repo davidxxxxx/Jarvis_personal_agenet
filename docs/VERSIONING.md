@@ -2,8 +2,10 @@
 
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
-Current verified prerelease: `0.2.0-alpha.2` with database schema target `v34`.
-Current development target: `0.2.0-beta.1`; its database schema target is not assigned yet.
+Current verified prerelease: `0.2.0-alpha.29` with database schema target `v47`.
+Current release-candidate source target: `0.2.0-rc.1` with database schema target `v58`.
+It becomes the verified Phase 4 candidate only after the independent Windows package, packaged
+restart, and recorded hardware/live acceptance gates are complete.
 
 ## Version line
 
@@ -72,11 +74,11 @@ comparison; Jarvis branches and tags go only to `origin`.
 
 ```powershell
 cd G:\Jarvis\.worktrees\jarvis-all-day-runtime\app
-npm run release:check -- --tag jarvis-v0.2.0-alpha.2
+npm run release:check -- --tag jarvis-vX.Y.Z
 cd ..
-git tag -a jarvis-v0.2.0-alpha.2 -m "Jarvis Memory 0.2.0-alpha.2"
+git tag -a jarvis-vX.Y.Z -m "Jarvis Memory X.Y.Z"
 git push origin codex/jarvis-start-budget-ui
-git push origin jarvis-v0.2.0-alpha.2
+git push origin jarvis-vX.Y.Z
 ```
 
 Never move or overwrite a published tag. If a tagged build fails acceptance, increment the

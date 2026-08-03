@@ -143,9 +143,15 @@ test("main registers runtime and production composition providers without option
   assert.match(provider, /jarvisRepository\.checkpointForMigration\(\)/);
   assert.match(provider, /jarvisRepository\.close\(\)/);
   assert.match(provider, /reconfigureStorageHolders/);
-  assert.match(provider, /resumeAnalysis: \(\) => jarvisAnalysisScheduler\.resume\(\)/);
+  assert.match(
+    provider,
+    /resumeAnalysis: \(\) => \{[\s\S]*?jarvisAnalysisScheduler\.resume\(\);[\s\S]*?jarvisNotificationScheduler\?\.start\(\);[\s\S]*?\}/
+  );
   assert.match(provider, /startRetention: \(\) => retentionCleaner\.start\(\)/);
-  assert.doesNotMatch(provider, /quiesce\?\.|resume\?\.|stop\?\.|start\?\./);
+  assert.doesNotMatch(
+    provider,
+    /jarvisAnalysisScheduler\?\.(?:quiesce|resume)|retentionCleaner\?\.(?:stop|start)/
+  );
   assert.match(composition, /whisperCudaManager/);
   assert.match(composition, /whisperManager/);
   assert.match(composition, /parakeetManager/);

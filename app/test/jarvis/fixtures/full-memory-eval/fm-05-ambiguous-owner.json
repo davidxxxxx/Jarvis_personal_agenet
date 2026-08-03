@@ -1,0 +1,120 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-05-ambiguous-owner",
+  "coverage": ["ambiguous-owner"],
+  "sessionId": "session-fm-05",
+  "request": {
+    "inputHash": "2b4bae0007c20bb9e79ee9b30cb6ecfeba4e5543b36cfc417e1f1fffd1a10fd9",
+    "allowedSegmentIds": ["seg-fm-05-1", "seg-fm-05-2"],
+    "allowedOwnerLabels": ["P1", "SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-05-1",
+          "startedAt": 1000,
+          "endedAt": 2500,
+          "speakerLabel": "P1",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.91,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "someone should update the dashboard."
+        },
+        {
+          "segmentId": "seg-fm-05-2",
+          "startedAt": 2700,
+          "endedAt": 4200,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.91,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "we should decide who owns that later."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-05-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Dashboard ownership",
+          "summary": "A dashboard update was proposed, but no owner accepted it.",
+          "evidenceSegmentIds": ["seg-fm-05-1", "seg-fm-05-2"]
+        },
+        "memories": [
+          {
+            "kind": "event",
+            "title": "Unassigned dashboard update",
+            "body": "The dashboard update remains unassigned pending an owner decision.",
+            "confidence": 0.93,
+            "evidenceSegmentIds": ["seg-fm-05-1", "seg-fm-05-2"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Dashboard maintenance",
+            "summary": "The update need was discussed without assigning an owner.",
+            "evidenceSegmentIds": ["seg-fm-05-1", "seg-fm-05-2"]
+          }
+        ],
+        "todos": [],
+        "suggestions": [
+          {
+            "title": "Clarify dashboard ownership",
+            "rationale": "The discussion explicitly deferred the owner decision.",
+            "basis": "work_context",
+            "learningGoalId": null,
+            "basedOnEvidenceSegmentIds": ["seg-fm-05-2"]
+          }
+        ]
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-05",
+      "inputHash": "2b4bae0007c20bb9e79ee9b30cb6ecfeba4e5543b36cfc417e1f1fffd1a10fd9",
+      "requestBytes": 1030,
+      "responseBytes": 650,
+      "durationMs": 9,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 74,
+      "outputTokens": 80
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-05",
+        "sourceSegmentId": "seg-fm-05-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-05",
+        "sourceSegmentId": "seg-fm-05-2"
+      }
+    ],
+    "todos": []
+  }
+}

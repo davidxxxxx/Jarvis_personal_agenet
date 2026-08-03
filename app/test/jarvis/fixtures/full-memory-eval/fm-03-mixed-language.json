@@ -1,0 +1,129 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-03-mixed-language",
+  "coverage": ["mixed-language"],
+  "sessionId": "session-fm-03",
+  "request": {
+    "inputHash": "fef7be8541c98dced520a62de232304a15e61d4272c8af0ace73178b2dce03c0",
+    "allowedSegmentIds": ["seg-fm-03-1", "seg-fm-03-2"],
+    "allowedOwnerLabels": ["SELF", "P1"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-03-1",
+          "startedAt": 1000,
+          "endedAt": 2700,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.93,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "我会 update the onboarding note tomorrow。"
+        },
+        {
+          "segmentId": "seg-fm-03-2",
+          "startedAt": 2900,
+          "endedAt": 4300,
+          "speakerLabel": "P1",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.93,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "好的，please keep the example bilingual。"
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-03-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Onboarding note update",
+          "summary": "SELF committed to updating the onboarding note with a bilingual example tomorrow.",
+          "evidenceSegmentIds": ["seg-fm-03-1", "seg-fm-03-2"]
+        },
+        "memories": [
+          {
+            "kind": "commitment",
+            "title": "更新 onboarding note",
+            "body": "SELF 将在明天更新 onboarding note。",
+            "confidence": 0.97,
+            "evidenceSegmentIds": ["seg-fm-03-1"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Bilingual onboarding",
+            "summary": "The onboarding note should keep a bilingual example.",
+            "evidenceSegmentIds": ["seg-fm-03-1", "seg-fm-03-2"]
+          }
+        ],
+        "todos": [
+          {
+            "title": "Update the onboarding note",
+            "ownerLabel": "SELF",
+            "dueText": "tomorrow",
+            "semanticConfidence": 0.97,
+            "evidenceSegmentIds": ["seg-fm-03-1"],
+            "actionKind": "self_commitment",
+            "assignmentSegmentIds": [],
+            "acceptanceSegmentIds": []
+          }
+        ],
+        "suggestions": []
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-03",
+      "inputHash": "fef7be8541c98dced520a62de232304a15e61d4272c8af0ace73178b2dce03c0",
+      "requestBytes": 1080,
+      "responseBytes": 760,
+      "durationMs": 11,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 82,
+      "outputTokens": 98
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-03",
+        "sourceSegmentId": "seg-fm-03-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-03",
+        "sourceSegmentId": "seg-fm-03-2"
+      }
+    ],
+    "todos": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-03",
+        "sourceSegmentId": "seg-fm-03-1"
+      }
+    ]
+  }
+}

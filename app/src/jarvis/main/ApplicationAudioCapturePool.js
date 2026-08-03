@@ -10,7 +10,7 @@ const DEFAULT_SELECTION_DEBOUNCE_MS = 2_000;
 const DEFAULT_SESSION_INACTIVE_GRACE_MS = 15_000;
 const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
-const WATCHER_AUDIBLE_PEAK_THRESHOLD = 0.001;
+const WATCHER_AUDIBLE_PEAK_THRESHOLD = 0.0005;
 const MAX_CANDIDATE_COUNT = 256;
 
 function safeReason(error, fallback = "application_capture_unavailable") {
@@ -208,13 +208,15 @@ class ApplicationAudioCapturePool {
       }
       candidate.applicationDisplayName = event.applicationDisplayName;
       if (event.state === "active") {
-        if (event.peak >= WATCHER_AUDIBLE_PEAK_THRESHOLD) {
+        const audible = this._isAudibleSessionEvent(event);
+        if (audible) {
           candidate.requiresAudibleRearm = false;
         }
         candidate.inactiveSinceAt = null;
         candidate.pids.set(event.pid, {
           pid: event.pid,
           peak: event.peak,
+          audible,
           isForeground: event.isForeground === true,
           lastSeenAt: at,
         });
@@ -310,6 +312,11 @@ class ApplicationAudioCapturePool {
       if (candidate.requiresAudibleRearm === true) continue;
       const activePid = this.activeTracks.get(candidate.applicationKey)?.pid;
       let processes = [...candidate.pids.values()];
+      if (activePid) {
+        processes = processes.filter((process) => process.audible || process.pid === activePid);
+      } else {
+        processes = processes.filter((process) => process.audible);
+      }
       if (
         processes.length === 0 &&
         activePid &&
@@ -320,6 +327,7 @@ class ApplicationAudioCapturePool {
           {
             pid: activePid,
             peak: 0,
+            audible: false,
             isForeground: false,
             lastSeenAt: candidate.inactiveSinceAt,
           },
@@ -624,7 +632,14 @@ class ApplicationAudioCapturePool {
       typeof event.peak === "number" &&
       Number.isFinite(event.peak) &&
       event.peak >= 0 &&
-      event.peak <= 1
+      event.peak <= 1 &&
+      (event.audible === undefined || typeof event.audible === "boolean")
+    );
+  }
+
+  _isAudibleSessionEvent(event) {
+    return (
+      event.state === "active" && (event.audible ?? event.peak >= WATCHER_AUDIBLE_PEAK_THRESHOLD)
     );
   }
 }

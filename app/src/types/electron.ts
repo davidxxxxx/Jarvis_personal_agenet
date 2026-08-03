@@ -18,8 +18,12 @@ import type {
   JarvisActivityCategory,
   JarvisActivityCorrectionResult,
   JarvisPersonalizationRule,
+  JarvisPersonalizationRuleEdit,
   JarvisPersonalizationSettings,
+  JarvisLearningGoal,
+  JarvisLearningGoalResult,
   JarvisNotificationPreferences,
+  JarvisTodoReminder,
   JarvisSourceInterruptionInput,
   JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
@@ -36,6 +40,7 @@ import type {
   JarvisResourceGovernanceSettings,
   JarvisApplicationAudioSettings,
   JarvisApplicationAudioStatus,
+  JarvisRolloutFlags,
   JarvisMemoryItem,
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
@@ -56,11 +61,16 @@ import type {
   JarvisTodayInsights,
   JarvisDailyDigestReadResult,
   JarvisDailyDigestStatus,
+  JarvisActionCenterWatermark,
+  JarvisActionCenterDelta,
+  JarvisActionCenterReadResult,
   JarvisKnowledgeOverview,
   JarvisSuggestionDecisionResult,
   JarvisMemoryConflictResolutionResult,
   JarvisKnowledgeTodoCompletionResult,
   JarvisKnowledgeTodoDecisionResult,
+  JarvisKnowledgeActionInput,
+  JarvisKnowledgeActionResult,
   JarvisEvidenceHandle,
   JarvisEvidenceContext,
   JarvisTodo,
@@ -618,13 +628,24 @@ declare global {
         decidePersonalizationRule: (
           ruleId: string,
           action: "enable" | "disable" | "delete" | "edit",
-          label?: string
+          edit?: JarvisPersonalizationRuleEdit
         ) => Promise<JarvisPersonalizationRule>;
         resetPersonalizationRules: () => Promise<{ resetCount: number; resetAt: number }>;
+        listLearningGoals: () => Promise<JarvisLearningGoal[]>;
+        createLearningGoal: (title: string) => Promise<JarvisLearningGoalResult>;
+        editLearningGoal: (goalId: string, title: string) => Promise<JarvisLearningGoalResult>;
+        archiveLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
+        restoreLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
+        deleteLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
         setNotificationPreferences: (
           focusMode: boolean,
           mutedUntil: number | null
         ) => Promise<JarvisNotificationPreferences>;
+        getTodoReminder: (todoId: string) => Promise<JarvisTodoReminder | null>;
+        setTodoReminder: (
+          todoId: string,
+          reminderAt: number | null
+        ) => Promise<JarvisTodoReminder | null>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listSessionSpeakerClusters: (sessionId: string) => Promise<JarvisSpeakerClusterView[]>;
@@ -676,6 +697,9 @@ declare global {
         listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
         getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
         getDailyDigest: (localDate: string) => Promise<JarvisDailyDigestReadResult>;
+        getActionCenterWatermark: () => Promise<JarvisActionCenterWatermark>;
+        getActionCenterDelta: () => Promise<JarvisActionCenterDelta>;
+        markActionCenterRead: (throughSequence: number) => Promise<JarvisActionCenterReadResult>;
         getKnowledgeOverview: () => Promise<JarvisKnowledgeOverview>;
         decideKnowledgeSuggestion: (
           suggestionId: string,
@@ -690,6 +714,9 @@ declare global {
           todoId: string,
           action: "confirm" | "dismiss" | "reopen"
         ) => Promise<JarvisKnowledgeTodoDecisionResult>;
+        applyKnowledgeAction: (
+          input: JarvisKnowledgeActionInput
+        ) => Promise<JarvisKnowledgeActionResult>;
         getEvidenceContext: (handle: JarvisEvidenceHandle) => Promise<JarvisEvidenceContext | null>;
         analyzeSession: (
           sessionId: string,
@@ -715,6 +742,7 @@ declare global {
         setApplicationAudioSettings: (
           input: JarvisApplicationAudioSettings
         ) => Promise<JarvisApplicationAudioStatus>;
+        getRolloutFlags: () => Promise<JarvisRolloutFlags>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
         setRetentionMode: (
           id: string,

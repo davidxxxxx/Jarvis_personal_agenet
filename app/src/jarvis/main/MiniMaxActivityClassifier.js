@@ -131,6 +131,13 @@ function deriveValidationContext(payload) {
     sourceAttributionByActivity: Object.fromEntries(
       payload.activities.map((activity) => [activity.activityId, activity.sourceAttribution])
     ),
+    selfParticipationByActivity: Object.fromEntries(
+      payload.activities.map((activity) => [
+        activity.activityId,
+        activity.statistics.selfDetected === true ||
+          activity.statistics.microphoneParticipated === true,
+      ])
+    ),
     segmentIdsByActivity: Object.fromEntries(
       payload.activities.map((activity) => [
         activity.activityId,
@@ -162,23 +169,33 @@ function normalizeInput(input) {
   }
   exactKeys(
     input.validationContext,
-    ["activityIds", "sourceAttributionByActivity", "segmentIdsByActivity"],
+    [
+      "activityIds",
+      "sourceAttributionByActivity",
+      "selfParticipationByActivity",
+      "segmentIdsByActivity",
+    ],
     "input.validation_context"
   );
   const expectedContext = deriveValidationContext(payload);
   const suppliedActivityIds = input.validationContext.activityIds;
   const suppliedSources = input.validationContext.sourceAttributionByActivity;
+  const suppliedSelfParticipation = input.validationContext.selfParticipationByActivity;
   const suppliedSegments = input.validationContext.segmentIdsByActivity;
   if (
     !Array.isArray(suppliedActivityIds) ||
     !isPlainObject(suppliedSources) ||
+    !isPlainObject(suppliedSelfParticipation) ||
     !isPlainObject(suppliedSegments) ||
     JSON.stringify(suppliedActivityIds) !== JSON.stringify(expectedContext.activityIds) ||
     Object.keys(suppliedSources).length !== expectedContext.activityIds.length ||
+    Object.keys(suppliedSelfParticipation).length !== expectedContext.activityIds.length ||
     Object.keys(suppliedSegments).length !== expectedContext.activityIds.length ||
     expectedContext.activityIds.some(
       (activityId) =>
         suppliedSources[activityId] !== expectedContext.sourceAttributionByActivity[activityId] ||
+        suppliedSelfParticipation[activityId] !==
+          expectedContext.selfParticipationByActivity[activityId] ||
         !Array.isArray(suppliedSegments[activityId]) ||
         JSON.stringify(suppliedSegments[activityId]) !==
           JSON.stringify(expectedContext.segmentIdsByActivity[activityId])
@@ -304,6 +321,7 @@ function validateCandidate(candidate, context) {
     returned.add(item.activityId);
     const gate = applyConfidenceGate(item.category, item.confidence, {
       sourceAttribution: context.sourceAttributionByActivity[item.activityId],
+      selfParticipated: context.selfParticipationByActivity?.[item.activityId] === true,
     });
     return {
       activityId: item.activityId,
@@ -374,6 +392,7 @@ function salvageCandidate(candidate, context) {
         activityId: item.activityId,
         ...applyConfidenceGate(item.category, item.confidence, {
           sourceAttribution: context.sourceAttributionByActivity[item.activityId],
+          selfParticipated: context.selfParticipationByActivity?.[item.activityId] === true,
         }),
         source: "minimax",
         reason: Array.from(item.reason.trim()).slice(0, 240).join(""),

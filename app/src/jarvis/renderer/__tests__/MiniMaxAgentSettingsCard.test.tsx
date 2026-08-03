@@ -3,7 +3,19 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../../../i18n";
 import MiniMaxAgentSettingsCard from "../MiniMaxAgentSettingsCard";
 
-const DEFAULT_CONFIG = { keyConfigured: false, model: "MiniMax-M2.7" };
+const DEFAULT_CONFIG = {
+  keyConfigured: false,
+  model: "MiniMax-M2.7" as const,
+  modelStatus: "not_configured" as const,
+  fallbackUsed: false,
+  checkedAt: null,
+};
+const READY_CONFIG = {
+  ...DEFAULT_CONFIG,
+  keyConfigured: true,
+  modelStatus: "ready" as const,
+  checkedAt: 1_000,
+};
 const DEFAULT_BUDGET = {
   mode: "capped" as const,
   monthKey: "2026-07",
@@ -19,7 +31,7 @@ const DEFAULT_BUDGET = {
 function installElectronApi(overrides = {}) {
   const jarvis = {
     getMiniMaxConfig: vi.fn().mockResolvedValue(DEFAULT_CONFIG),
-    setMiniMaxKey: vi.fn().mockResolvedValue({ ...DEFAULT_CONFIG, keyConfigured: true }),
+    setMiniMaxKey: vi.fn().mockResolvedValue(READY_CONFIG),
     clearMiniMaxKey: vi.fn().mockResolvedValue(DEFAULT_CONFIG),
     getAnalysisBudget: vi.fn().mockResolvedValue(DEFAULT_BUDGET),
     setAnalysisBudget: vi.fn().mockImplementation(async (input) => ({
@@ -83,6 +95,27 @@ describe("MiniMaxAgentSettingsCard", () => {
     expect(await screen.findByText("MiniMax key not configured")).toBeVisible();
   });
 
+  it.each([
+    [READY_CONFIG, "MiniMax model availability confirmed."],
+    [
+      { ...READY_CONFIG, modelStatus: "unavailable" as const },
+      "MiniMax model availability could not be checked. Local recording is unaffected.",
+    ],
+    [
+      { ...READY_CONFIG, modelStatus: "model_unavailable" as const },
+      "MiniMax-M2.7 is not available for this key. Cloud analysis remains paused.",
+    ],
+    [
+      { ...READY_CONFIG, fallbackUsed: true },
+      "The configured model was unavailable. Jarvis will use MiniMax-M2.7.",
+    ],
+  ])("reports MiniMax model discovery without exposing provider details", async (next, copy) => {
+    installElectronApi({ getMiniMaxConfig: vi.fn().mockResolvedValue(next) });
+    render(<MiniMaxAgentSettingsCard />);
+
+    expect(await screen.findByText(copy)).toBeVisible();
+  });
+
   it("applies a two-hundred-dollar cap and an explicit no-limit mode", async () => {
     const jarvis = installElectronApi();
     render(<MiniMaxAgentSettingsCard />);
@@ -108,9 +141,7 @@ describe("MiniMaxAgentSettingsCard", () => {
         timezone: "Asia/Shanghai",
       })
     );
-    expect(
-      await screen.findByText(/No limit may create ongoing charges/)
-    ).toBeVisible();
+    expect(await screen.findByText(/No limit may create ongoing charges/)).toBeVisible();
     expect(jarvis.setAnalysisBudget).toHaveBeenCalledTimes(2);
   });
 
@@ -144,7 +175,7 @@ describe("MiniMaxAgentSettingsCard", () => {
       .mockRejectedValueOnce(new Error("budget unavailable"))
       .mockResolvedValue(DEFAULT_BUDGET);
     installElectronApi({
-      getMiniMaxConfig: vi.fn().mockResolvedValue({ ...DEFAULT_CONFIG, keyConfigured: true }),
+      getMiniMaxConfig: vi.fn().mockResolvedValue(READY_CONFIG),
       getAnalysisBudget,
     });
 

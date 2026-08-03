@@ -9,7 +9,59 @@ const {
   assertRetentionMode,
   normalizeResourceGovernanceSettings,
   normalizeApplicationAudioSettings,
+  normalizeJarvisRolloutFlags,
+  normalizePersonalizationRuleDecisionInput,
 } = require("../../src/jarvis/shared/contracts");
+
+test("rollout flags are a closed four-boolean public contract", () => {
+  const flags = {
+    applicationAudioV1: true,
+    dualSpeakerVerificationV1: false,
+    activityClassificationV1: true,
+    actionCenterV1: false,
+  };
+  assert.deepEqual(normalizeJarvisRolloutFlags(flags), flags);
+  assert.throws(() => normalizeJarvisRolloutFlags({ ...flags, extra: true }));
+  assert.throws(() => normalizeJarvisRolloutFlags({ ...flags, actionCenterV1: "true" }));
+});
+
+test("personalization rule edits carry functional target and bounded conditions", () => {
+  assert.deepEqual(
+    normalizePersonalizationRuleDecisionInput({
+      ruleId: "rule-1",
+      action: "edit",
+      label: "  Chrome learning  ",
+      targetValue: "learning",
+      conditions: {
+        applicationKeys: ["chrome"],
+        selfParticipated: true,
+        speakerCountBucket: "one",
+        timeBucket: "evening",
+      },
+    }),
+    {
+      ruleId: "rule-1",
+      action: "edit",
+      label: "Chrome learning",
+      targetValue: "learning",
+      conditions: {
+        applicationKeys: ["chrome"],
+        selfParticipated: true,
+        speakerCountBucket: "one",
+        timeBucket: "evening",
+      },
+    }
+  );
+  assert.throws(
+    () =>
+      normalizePersonalizationRuleDecisionInput({
+        ruleId: "rule-1",
+        action: "edit",
+        label: "looks editable",
+      }),
+    /exact keys/u
+  );
+});
 const registerJarvisIpcImpl = require("../../src/jarvis/main/registerJarvisIpc");
 
 function createSpeakerCorrectionService(overrides = {}) {
@@ -34,6 +86,25 @@ function registerJarvisIpc(options) {
 function createRepository(overrides = {}) {
   return {
     memoryRepository: {
+      getActionCenterWatermark: () => ({
+        revision: "a".repeat(64),
+        todoCount: 0,
+        suggestionCount: 0,
+        updatedAt: null,
+      }),
+      getActionCenterDelta: () => ({
+        throughSequence: 0,
+        lastSeenSequence: 0,
+        confirmedTodoCount: 0,
+        pendingTodoCount: 0,
+        suggestionCount: 0,
+        total: 0,
+        sessions: [],
+      }),
+      markActionCenterRead: ({ throughSequence }) => ({
+        lastSeenSequence: throughSequence,
+        markedAt: 1,
+      }),
       readPublicSnapshot: () => ({
         memories: [],
         topics: [],
@@ -46,6 +117,7 @@ function createRepository(overrides = {}) {
       resolveMemoryConflict: () => ({ status: "resolved" }),
       completeTodo: () => ({ status: "completed" }),
       decideTodo: () => ({ status: "confirmed" }),
+      applyKnowledgeAction: () => ({ status: "applied" }),
       getEvidenceContext: () => null,
     },
     createSession: () => "created",
@@ -71,6 +143,14 @@ function createRepository(overrides = {}) {
     setTodoStatus: () => null,
     listMemories: () => [],
     getTodayInsights: () => null,
+    getTodoReminder: () => null,
+    setTodoReminder: () => null,
+    listLearningGoals: () => [],
+    createLearningGoal: () => null,
+    editLearningGoal: () => null,
+    archiveLearningGoal: () => null,
+    restoreLearningGoal: () => null,
+    deleteLearningGoal: () => null,
     getCloudBudgetStatus: () => ({
       monthUtc: "2026-07",
       enabled: false,
@@ -83,6 +163,45 @@ function createRepository(overrides = {}) {
     setCloudBudgetSettings: () => ({ enabled: 0 }),
     ...overrides,
   };
+}
+
+function correctedActivityResult() {
+  return {
+    classification: {
+      id: "classification-user-correction",
+      sessionId: "session-1",
+      startedAt: 1_000,
+      endedAt: 91_000,
+      category: "work_meeting",
+      confidence: 1,
+      decision: "adopted",
+      source: "user",
+      reason: "user_correction",
+      sourceAttribution: "microphone",
+      evidence: {
+        applicationKeys: ["Chrome"],
+        allowSummary: true,
+        allowSuggestions: true,
+        allowTodos: true,
+        evidenceSegmentIds: ["segment-1"],
+      },
+      createdAt: 2_000,
+      updatedAt: 2_000,
+    },
+    proposedRule: null,
+    supportCount: 1,
+  };
+}
+
+function activityCorrectionRepository(correctActivityClassification) {
+  return createRepository({
+    correctActivityClassification,
+    listPersonalizationRules: () => [],
+    decidePersonalizationRule: () => null,
+    resetPersonalizationRules: () => ({ reset: true }),
+    getNotificationPreferences: () => ({}),
+    setNotificationPreferences: () => ({}),
+  });
 }
 
 test("activity classification IPC exposes only decision evidence and normalized applications", () => {
@@ -164,11 +283,143 @@ test("activity classification IPC exposes only decision evidence and normalized 
   );
 });
 
+test("activity correction persists first and awaits analysis-lineage refresh", async () => {
+  const handlers = new Map();
+  const calls = [];
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: activityCorrectionRepository((input) => {
+      calls.push(["persist", input]);
+      return correctedActivityResult();
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    analysisScheduler: {
+      refreshAfterActivityClassification(sessionId) {
+        calls.push(["refresh", sessionId]);
+        return refreshGate;
+      },
+    },
+    now: () => 2_000,
+  });
+
+  const pending = handlers.get(CHANNELS.correctActivityClassification)(null, {
+    classificationId: "classification-1",
+    category: "work_meeting",
+  });
+  assert.equal(typeof pending?.then, "function");
+  await Promise.resolve();
+  assert.deepEqual(calls, [
+    [
+      "persist",
+      {
+        classificationId: "classification-1",
+        category: "work_meeting",
+        correctedAt: 2_000,
+      },
+    ],
+    ["refresh", "session-1"],
+  ]);
+  let settled = false;
+  pending.finally(() => {
+    settled = true;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  releaseRefresh({ state: "queued" });
+  const result = await pending;
+  assert.equal(settled, true);
+  assert.equal(result.classification.sessionId, "session-1");
+  assert.equal(result.classification.category, "work_meeting");
+  assert.equal(result.supportCount, 1);
+});
+
+test("activity correction remains successful when analysis refresh is deferred", async () => {
+  const handlers = new Map();
+  const logs = [];
+  let persisted = false;
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: activityCorrectionRepository(() => {
+      persisted = true;
+      return correctedActivityResult();
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    analysisScheduler: {
+      async refreshAfterActivityClassification() {
+        const error = new Error("private refresh detail");
+        error.code = "ANALYSIS_REFRESH_OFFLINE";
+        throw error;
+      },
+    },
+    log: (record) => {
+      logs.push(record);
+      throw new Error("logger unavailable");
+    },
+    now: () => 2_000,
+  });
+
+  const result = await handlers.get(CHANNELS.correctActivityClassification)(null, {
+    classificationId: "classification-1",
+    category: "work_meeting",
+  });
+
+  assert.equal(persisted, true);
+  assert.equal(result.classification.id, "classification-user-correction");
+  assert.deepEqual(logs, [
+    {
+      phase: "activity_classification_refresh",
+      state: "deferred",
+      sessionId: "session-1",
+      errorCode: "ANALYSIS_REFRESH_OFFLINE",
+    },
+  ]);
+  assert.equal(JSON.stringify(logs).includes("private refresh detail"), false);
+});
+
 test("v2 knowledge IPC projects bounded safe fields and keeps action ownership in main", async () => {
   const calls = [];
   const handlers = new Map();
   const repository = createRepository({
     memoryRepository: {
+      getActionCenterWatermark: () => ({
+        revision: "b".repeat(64),
+        todoCount: 1,
+        suggestionCount: 0,
+        updatedAt: 2,
+        privatePath: "C:\\private.db",
+      }),
+      getActionCenterDelta: () => ({
+        throughSequence: 4,
+        lastSeenSequence: 1,
+        confirmedTodoCount: 1,
+        pendingTodoCount: 1,
+        suggestionCount: 1,
+        total: 3,
+        sessions: [
+          {
+            sessionId: "session_1",
+            confirmedTodoCount: 1,
+            pendingTodoCount: 1,
+            suggestionCount: 1,
+            total: 3,
+            privatePath: "C:\\private.db",
+          },
+        ],
+        privatePath: "C:\\private.db",
+      }),
+      markActionCenterRead: (input) => (
+        calls.push(["mark-action-read", input]),
+        { lastSeenSequence: input.throughSequence, markedAt: 7_000, privatePath: "C:\\private.db" }
+      ),
       readPublicSnapshot: () => ({
         memories: [
           {
@@ -220,6 +471,57 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
             completedAt: null,
             dismissedAt: null,
             verificationState: "pending_confirmation",
+            trustSnapshot: {
+              policyId: "todo-attribution-v1",
+              state: "captured",
+              applicationEvidence: [
+                {
+                  segmentId: "segment_1",
+                  applicationKey: "kook",
+                  sourceAttribution: "application_and_microphone",
+                  speakerRelation: "SELF",
+                  executablePath: "C:\\private\\kook.exe",
+                },
+                {
+                  segmentId: "segment_2",
+                  applicationKey: "kook",
+                  sourceAttribution: "application",
+                  speakerRelation: "P1",
+                },
+              ],
+              activityEvidence: [
+                {
+                  segmentId: "segment_1",
+                  category: "social_call",
+                  confidence: 0.95,
+                  decision: "adopted",
+                  rawWindowTitle: "private call",
+                },
+                {
+                  segmentId: "segment_2",
+                  category: "social_call",
+                  confidence: 0.95,
+                  decision: "adopted",
+                },
+              ],
+              semanticConfidence: 0.96,
+              voiceprintConfidence: 0.97,
+              sceneConfidence: 0.95,
+              transcriptContextConfidence: 0.91,
+              speakerEvidenceVerified: true,
+              overlapDetected: false,
+              automaticEligible: false,
+              rawModelVector: "private-vector",
+            },
+            cardContext: {
+              sessionId: "session_1",
+              startedAt: 1_000,
+              applicationName: "KOOK",
+              activityCategory: "social_call",
+              activityConfidence: 0.95,
+              sourceAttribution: "application_and_microphone",
+              rawWindowTitle: "sensitive-window-title",
+            },
             provenance: "private-provenance",
             createdAt: 1,
             updatedAt: 2,
@@ -238,6 +540,18 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
       resolveMemoryConflict: (input) => (calls.push(["resolve", input]), { status: "resolved" }),
       completeTodo: (input) => (calls.push(["complete", input]), { status: "completed" }),
       decideTodo: (input) => (calls.push(["decide", input]), { status: "confirmed" }),
+      applyKnowledgeAction: (input) => (
+        calls.push(["knowledge-action", input]),
+        {
+          status: "applied",
+          commandId: input.commandId,
+          type: input.type,
+          entityKind: "todo",
+          entityId: input.todoId,
+          occurredAt: input.at,
+          todoId: input.todoId,
+        }
+      ),
       getEvidenceContext: () => null,
     },
   });
@@ -251,6 +565,33 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
   });
 
   const overview = await handlers.get(CHANNELS.getKnowledgeOverview)(null);
+  assert.deepEqual(await handlers.get(CHANNELS.getActionCenterWatermark)(null), {
+    revision: "b".repeat(64),
+    todoCount: 1,
+    suggestionCount: 0,
+    updatedAt: 2,
+  });
+  assert.deepEqual(await handlers.get(CHANNELS.getActionCenterDelta)(null), {
+    throughSequence: 4,
+    lastSeenSequence: 1,
+    confirmedTodoCount: 1,
+    pendingTodoCount: 1,
+    suggestionCount: 1,
+    total: 3,
+    sessions: [
+      {
+        sessionId: "session_1",
+        confirmedTodoCount: 1,
+        pendingTodoCount: 1,
+        suggestionCount: 1,
+        total: 3,
+      },
+    ],
+  });
+  assert.deepEqual(
+    await handlers.get(CHANNELS.markActionCenterRead)(null, { throughSequence: 4 }),
+    { lastSeenSequence: 4, markedAt: 7_000 }
+  );
   assert.deepEqual(Object.keys(overview).sort(), [
     "conflicts",
     "memories",
@@ -266,6 +607,53 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
     evidenceId: "evidence_1",
   });
   assert.equal(overview.todos[0].verificationState, "pending_confirmation");
+  assert.deepEqual(overview.todos[0].cardContext, {
+    sessionId: "session_1",
+    startedAt: 1_000,
+    applicationName: "KOOK",
+    activityCategory: "social_call",
+    activityConfidence: 0.95,
+    sourceAttribution: "application_and_microphone",
+  });
+  assert.deepEqual(overview.todos[0].trustSnapshot, {
+    policyId: "todo-attribution-v1",
+    state: "captured",
+    applicationEvidence: [
+      {
+        segmentId: "segment_1",
+        applicationKey: "kook",
+        sourceAttribution: "application_and_microphone",
+        speakerRelation: "SELF",
+      },
+      {
+        segmentId: "segment_2",
+        applicationKey: "kook",
+        sourceAttribution: "application",
+        speakerRelation: "P1",
+      },
+    ],
+    activityEvidence: [
+      {
+        segmentId: "segment_1",
+        category: "social_call",
+        confidence: 0.95,
+        decision: "adopted",
+      },
+      {
+        segmentId: "segment_2",
+        category: "social_call",
+        confidence: 0.95,
+        decision: "adopted",
+      },
+    ],
+    semanticConfidence: 0.96,
+    voiceprintConfidence: 0.97,
+    sceneConfidence: 0.95,
+    transcriptContextConfidence: 0.91,
+    speakerEvidenceVerified: true,
+    overlapDetected: false,
+    automaticEligible: false,
+  });
   const serialized = JSON.stringify(overview);
   for (const secret of [
     "private-provenance",
@@ -273,6 +661,9 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
     "C:\\private.wav",
     "private-source",
     "private-prompt",
+    "private-vector",
+    "private call",
+    "sensitive-window-title",
   ]) {
     assert.equal(serialized.includes(secret), false, secret);
   }
@@ -286,13 +677,132 @@ test("v2 knowledge IPC projects bounded safe fields and keeps action ownership i
     selectedMemoryItemId: "memory_1",
   });
   await handlers.get(CHANNELS.completeKnowledgeTodo)(null, { todoId: "todo_1" });
+  const actionReceipt = await handlers.get(CHANNELS.applyKnowledgeAction)(null, {
+    commandId: "command_knowledge_1",
+    type: "todo_dismiss",
+    todoId: "todo_1",
+    reasonCode: "wrong_context",
+    localNote: "local only note",
+  });
+  assert.deepEqual(actionReceipt, {
+    status: "applied",
+    commandId: "command_knowledge_1",
+    type: "todo_dismiss",
+    entityKind: "todo",
+    entityId: "todo_1",
+    occurredAt: 7_000,
+    todoId: "todo_1",
+  });
+  assert.equal(JSON.stringify(actionReceipt).includes("local only note"), false);
   assert.deepEqual(calls, [
+    ["mark-action-read", { throughSequence: 4 }],
     ["accept", { suggestionId: "suggestion_1", at: 7_000 }],
     ["resolve", { conflictGroupId: "conflict_1", selectedMemoryItemId: "memory_1" }],
     ["complete", { todoId: "todo_1" }],
+    [
+      "knowledge-action",
+      {
+        commandId: "command_knowledge_1",
+        type: "todo_dismiss",
+        todoId: "todo_1",
+        reasonCode: "wrong_context",
+        localNote: "local only note",
+        at: 7_000,
+      },
+    ],
   ]);
   assert.throws(() =>
     handlers.get(CHANNELS.completeKnowledgeTodo)(null, { todoId: "todo_1", status: "open" })
+  );
+});
+
+test("knowledge overview fails closed for corrupt system trust snapshots without hiding other data", async () => {
+  const validApplication = Array.from({ length: 33 }, (_value, index) => ({
+    segmentId: `segment_${index + 1}`,
+    applicationKey: null,
+    sourceAttribution: "microphone",
+    speakerRelation: "SELF",
+  }));
+  const validActivity = Array.from({ length: 33 }, (_value, index) => ({
+    segmentId: `segment_${index + 1}`,
+    category: "work_meeting",
+    confidence: 0.95,
+    decision: "adopted",
+  }));
+  const todo = (id, actor, trustSnapshot) => ({
+    id,
+    title: id,
+    ownerLabel: "我",
+    status: "open",
+    completedAt: null,
+    dismissedAt: null,
+    verificationState: "confirmed",
+    verificationReason: actor === "user" ? "user_confirmed" : "strict_self_commitment",
+    verificationActor: actor,
+    trustSnapshot,
+    provenance: "evidence_linked",
+    sourceSuggestionId: null,
+    reminder: null,
+    createdAt: 1,
+    updatedAt: 2,
+    revisions: [],
+    occurrences: [],
+    transitions: [],
+  });
+  const captured = (applicationEvidence, activityEvidence) => ({
+    policyId: "todo-attribution-v1",
+    state: "captured",
+    applicationEvidence,
+    activityEvidence,
+    semanticConfidence: 0.95,
+    voiceprintConfidence: 0.96,
+    sceneConfidence: 0.95,
+    transcriptContextConfidence: 0.9,
+    speakerEvidenceVerified: true,
+    overlapDetected: false,
+    automaticEligible: true,
+  });
+  const handlers = new Map();
+  const repository = createRepository();
+  repository.memoryRepository.readPublicSnapshot = () => ({
+    memories: [],
+    topics: [],
+    suggestions: [],
+    memoryConflicts: [],
+    todos: [
+      todo("todo_null", "system", captured([null], [null])),
+      todo(
+        "todo_late_corruption",
+        "system",
+        captured([...validApplication, null], [...validActivity, null])
+      ),
+      todo("todo_user_authority", "user", captured([null], [null])),
+    ],
+  });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository,
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+  });
+
+  const overview = await handlers.get(CHANNELS.getKnowledgeOverview)(null);
+  assert.deepEqual(
+    overview.todos.map((entry) => ({
+      id: entry.id,
+      verificationState: entry.verificationState,
+      trustSnapshot: entry.trustSnapshot,
+    })),
+    [
+      { id: "todo_null", verificationState: "pending_confirmation", trustSnapshot: null },
+      {
+        id: "todo_late_corruption",
+        verificationState: "pending_confirmation",
+        trustSnapshot: null,
+      },
+      { id: "todo_user_authority", verificationState: "confirmed", trustSnapshot: null },
+    ]
   );
 });
 
@@ -314,6 +824,24 @@ test("evidence context IPC validates ownership and returns only the safe context
       endedAt: 2_500,
       quoteText: "Stored quote",
       audioState: "available",
+      actionAttribution: {
+        basis: "current_local_state",
+        applicationKey: null,
+        applicationName: "Microphone",
+        sourceAttribution: "microphone",
+        speakerRelation: "SELF",
+        semanticConfidence: 0.96,
+        voiceConfidence: 0.94,
+        transcriptConfidence: 0.91,
+        activityClassification: {
+          id: "classification_1",
+          category: "in_person_conversation",
+          confidence: 0.95,
+          decision: "adopted",
+          source: "local",
+          reason: "physical microphone with SELF participation",
+        },
+      },
       path: "C:\\private\\capture.flac",
       sha256: "a".repeat(64),
       device_id: "private-device",
@@ -351,7 +879,10 @@ test("evidence context IPC validates ownership and returns only the safe context
     "endedAt",
     "quoteText",
     "audioState",
+    "transcriptContext",
+    "actionAttribution",
   ]);
+  assert.deepEqual(result.transcriptContext, []);
   assert.equal(JSON.stringify(result).includes("private"), false);
   assert.throws(() =>
     handlers.get(CHANNELS.getEvidenceContext)(null, { ...request, sessionId: "forged" })
@@ -442,6 +973,14 @@ function createIpcHarness(overrides = {}) {
       return input;
     },
   };
+  const miniMaxModelDiscovery = {
+    discover: async () => ({
+      status: "ready",
+      resolvedModel: "MiniMax-M2.7",
+      fallbackUsed: false,
+      checkedAt: 1_000,
+    }),
+  };
   registerJarvisIpc({
     ipcMain,
     repository,
@@ -451,6 +990,7 @@ function createIpcHarness(overrides = {}) {
     analysisScheduler,
     analysisBudgetGuard,
     resourceSettings,
+    miniMaxModelDiscovery,
   });
   return {
     handlers,
@@ -461,6 +1001,7 @@ function createIpcHarness(overrides = {}) {
     analysisScheduler,
     analysisBudgetGuard,
     resourceSettings,
+    miniMaxModelDiscovery,
   };
 }
 
@@ -475,6 +1016,120 @@ test("contract rejects path traversal and unknown states", () => {
   assert.throws(() => assertCaptureMode("auto"), /invalid capture mode/);
   assert.throws(() => assertSourceType("mixed"), /invalid source type/);
   assert.throws(() => assertRetentionMode("adaptive"), /invalid retention mode/);
+});
+
+test("todo reminder IPC accepts only explicit timestamps and wakes the durable scheduler", () => {
+  const calls = [];
+  const handlers = new Map();
+  const reminder = {
+    todoId: "todo_1",
+    title: "private title is not projected",
+    reminderAt: 9_000,
+    reminderSource: "user",
+    generation: 4,
+    state: "scheduled",
+    deferredReason: null,
+    deliveredAt: null,
+    cancelledAt: null,
+    createdAt: 1,
+    updatedAt: 7_000,
+    verificationState: "confirmed",
+  };
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      getTodoReminder: (todoId) => (calls.push(["get", todoId]), reminder),
+      setTodoReminder: (input) => (calls.push(["set", input]), reminder),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    notificationScheduler: { wake: () => calls.push(["wake"]) },
+    now: () => 7_000,
+  });
+
+  assert.deepEqual(handlers.get(CHANNELS.getTodoReminder)(null, "todo_1"), {
+    todoId: "todo_1",
+    reminderAt: 9_000,
+    reminderSource: "user",
+    state: "scheduled",
+    deferredReason: null,
+    deliveredAt: null,
+    updatedAt: 7_000,
+  });
+  assert.deepEqual(
+    handlers.get(CHANNELS.setTodoReminder)(null, {
+      todoId: "todo_1",
+      reminderAt: 9_000,
+    }),
+    {
+      todoId: "todo_1",
+      reminderAt: 9_000,
+      reminderSource: "user",
+      state: "scheduled",
+      deferredReason: null,
+      deliveredAt: null,
+      updatedAt: 7_000,
+    }
+  );
+  assert.deepEqual(calls, [
+    ["get", "todo_1"],
+    ["set", { todoId: "todo_1", reminderAt: 9_000, at: 7_000 }],
+    ["wake"],
+  ]);
+  assert.throws(() =>
+    handlers.get(CHANNELS.setTodoReminder)(null, {
+      todoId: "todo_1",
+      reminderAt: 9_000,
+      reminderSource: "model",
+    })
+  );
+});
+
+test("todo reminder IPC preserves safe business codes and redacts internal failures", () => {
+  const handlers = new Map();
+  const wakes = [];
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      getTodoReminder: () => {
+        throw new Error("SQLITE_ERROR at G:\\JarvisData\\jarvis.db: no such table");
+      },
+      setTodoReminder: () => {
+        const error = new Error("private verification query failed");
+        error.code = "JARVIS_TODO_REMINDER_CONFIRMATION_REQUIRED";
+        throw error;
+      },
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    notificationScheduler: { wake: () => wakes.push("wake") },
+    now: () => 7_000,
+  });
+
+  assert.throws(
+    () => handlers.get(CHANNELS.getTodoReminder)(null, "todo_1"),
+    (error) => {
+      assert.equal(error.code, "JARVIS_TODO_REMINDER_UNAVAILABLE");
+      assert.equal(error.message, "Todo reminder is temporarily unavailable");
+      assert.doesNotMatch(error.message, /sqlite|jarvisdata|\.db/iu);
+      return true;
+    }
+  );
+  assert.throws(
+    () =>
+      handlers.get(CHANNELS.setTodoReminder)(null, {
+        todoId: "todo_1",
+        reminderAt: 9_000,
+      }),
+    (error) => {
+      assert.equal(error.code, "JARVIS_TODO_REMINDER_CONFIRMATION_REQUIRED");
+      assert.equal(error.message, "Confirm this todo before setting a reminder");
+      return true;
+    }
+  );
+  assert.deepEqual(wakes, []);
 });
 
 test("retention mode IPC validates mode and forwards a sanitized session id", () => {
@@ -572,6 +1227,7 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
         session_id: "s1",
         path: "speech.flac",
         format: "flac",
+        transcription_status: "completed",
         retired_path: "private.wav",
         retired_format: "wav",
         retired_file_sha256: "f".repeat(64),
@@ -605,6 +1261,7 @@ test("session timeline IPC is reachable and keeps retired provenance private", (
   const result = handlers.get(CHANNELS.getSessionTimeline)(null, "s1");
   assert.equal(result.session_id, "s1");
   assert.equal(result.chunks[0].format, "flac");
+  assert.equal(result.chunks[0].transcription_status, "completed");
   assert.equal(Object.hasOwn(result.chunks[0], "retired_path"), false);
   assert.equal(Object.hasOwn(result.chunks[0], "retired_format"), false);
   assert.equal(Object.hasOwn(result.chunks[0], "retired_file_sha256"), false);
@@ -1101,6 +1758,96 @@ test("source lifecycle IPC validates metadata and forwards only sanitized inputs
   assert.equal(restored.length, 1);
 });
 
+test("learning goal IPC keeps timestamps in main and exposes only the safe lifecycle view", () => {
+  const handlers = new Map();
+  const calls = [];
+  const goal = (state = "confirmed") => ({
+    id: "learning-goal-1",
+    title: "学习 英语",
+    state,
+    createdAt: 1_000,
+    updatedAt: 2_000,
+    confirmedAt: 1_000,
+    archivedAt: state === "archived" ? 2_000 : null,
+    deletedAt: state === "deleted" ? 2_000 : null,
+    privatePath: "C:\\private\\goal.json",
+    voiceEmbedding: [0.1],
+  });
+  const repository = createRepository({
+    listLearningGoals() {
+      calls.push(["list"]);
+      return [goal()];
+    },
+    createLearningGoal(input) {
+      calls.push(["create", input]);
+      return { status: "created", goal: goal() };
+    },
+    editLearningGoal(input) {
+      calls.push(["edit", input]);
+      return { status: "edited", goal: goal() };
+    },
+    archiveLearningGoal(input) {
+      calls.push(["archive", input]);
+      return { status: "archived", goal: goal("archived") };
+    },
+    restoreLearningGoal(input) {
+      calls.push(["restore", input]);
+      return { status: "restored", goal: goal() };
+    },
+    deleteLearningGoal(input) {
+      calls.push(["delete", input]);
+      return { status: "deleted", goal: goal("deleted") };
+    },
+  });
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository,
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    now: () => 9_000,
+  });
+
+  const listed = handlers.get(CHANNELS.listLearningGoals)(null);
+  const created = handlers.get(CHANNELS.createLearningGoal)(null, { title: "  学习   英语 " });
+  handlers.get(CHANNELS.editLearningGoal)(null, {
+    goalId: "learning-goal-1",
+    title: "学习 英语",
+  });
+  handlers.get(CHANNELS.archiveLearningGoal)(null, { goalId: "learning-goal-1" });
+  handlers.get(CHANNELS.restoreLearningGoal)(null, { goalId: "learning-goal-1" });
+  const deleted = handlers.get(CHANNELS.deleteLearningGoal)(null, {
+    goalId: "learning-goal-1",
+  });
+
+  assert.deepEqual(calls, [
+    ["list"],
+    ["create", { title: "学习 英语", at: 9_000 }],
+    ["edit", { goalId: "learning-goal-1", title: "学习 英语", at: 9_000 }],
+    ["archive", { goalId: "learning-goal-1", at: 9_000 }],
+    ["restore", { goalId: "learning-goal-1", at: 9_000 }],
+    ["delete", { goalId: "learning-goal-1", at: 9_000 }],
+  ]);
+  assert.deepEqual(Object.keys(listed[0]).sort(), [
+    "archivedAt",
+    "confirmedAt",
+    "createdAt",
+    "id",
+    "state",
+    "title",
+    "updatedAt",
+  ]);
+  assert.equal(created.goal.title, "学习 英语");
+  assert.equal(deleted.goal.state, "deleted");
+  assert.equal(JSON.stringify([listed, created, deleted]).includes("private"), false);
+  assert.equal(JSON.stringify([listed, created, deleted]).includes("voiceEmbedding"), false);
+
+  assert.throws(() => handlers.get(CHANNELS.createLearningGoal)(null, { title: "学习", at: 1 }));
+  assert.throws(() => handlers.get(CHANNELS.archiveLearningGoal)(null, { goalId: "../private" }));
+  assert.throws(() => handlers.get(CHANNELS.listLearningGoals)(null, "extra"));
+  assert.equal(calls.length, 6);
+});
+
 test("contract exposes only the named Jarvis channels", () => {
   assert.deepEqual(
     Object.keys(CHANNELS).sort(),
@@ -1121,8 +1868,11 @@ test("contract exposes only the named Jarvis channels", () => {
       "getDailyDigest",
       "getEvidenceContext",
       "getKnowledgeOverview",
+      "getActionCenterDelta",
+      "getActionCenterWatermark",
       "getMiniMaxConfig",
       "getResourceGovernance",
+      "getRolloutFlags",
       "getPersonDetail",
       "getRuntimeStatus",
       "getSession",
@@ -1131,6 +1881,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "getSessionTimelineStatus",
       "getStorageStatus",
       "getTodayInsights",
+      "getTodoReminder",
       "getTopicDetail",
       "getVoiceEnrollmentStatus",
       "analyzeSession",
@@ -1157,6 +1908,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "listSessionSpeakerClusters",
       "listSpeakerCorrections",
       "mergePeople",
+      "markActionCenterRead",
       "rejectSpeaker",
       "undoSpeakerCorrection",
       "undoParticipantReview",
@@ -1170,6 +1922,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "setSessionStatus",
       "setRetentionMode",
       "setTodoStatus",
+      "setTodoReminder",
       "sourceInterrupted",
       "sourceRestored",
       "startCapture",
@@ -1179,9 +1932,16 @@ test("contract exposes only the named Jarvis channels", () => {
       "renameTopic",
       "decideKnowledgeSuggestion",
       "decideKnowledgeTodo",
+      "applyKnowledgeAction",
+      "archiveLearningGoal",
+      "createLearningGoal",
       "decidePersonalizationRule",
+      "deleteLearningGoal",
+      "editLearningGoal",
       "getPersonalizationSettings",
+      "listLearningGoals",
       "resetPersonalizationRules",
+      "restoreLearningGoal",
       "setNotificationPreferences",
       "resolveKnowledgeConflict",
       "upsertSegments",
@@ -1227,6 +1987,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.completeVoiceEnrollment,
       CHANNELS.completeKnowledgeTodo,
       CHANNELS.decideKnowledgeTodo,
+      CHANNELS.applyKnowledgeAction,
       CHANNELS.cancelVoiceEnrollment,
       CHANNELS.getCloudBudget,
       CHANNELS.setCloudBudget,
@@ -1235,6 +1996,9 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.getSessionTimelineStatus,
       CHANNELS.getEvidenceContext,
       CHANNELS.getKnowledgeOverview,
+      CHANNELS.getActionCenterDelta,
+      CHANNELS.getActionCenterWatermark,
+      CHANNELS.markActionCenterRead,
       CHANNELS.getRuntimeStatus,
       CHANNELS.searchMemory,
       CHANNELS.listPeopleOverview,
@@ -1249,12 +2013,21 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.renameTopic,
       CHANNELS.listTodos,
       CHANNELS.setTodoStatus,
+      CHANNELS.getTodoReminder,
+      CHANNELS.setTodoReminder,
+      CHANNELS.listLearningGoals,
+      CHANNELS.createLearningGoal,
+      CHANNELS.editLearningGoal,
+      CHANNELS.archiveLearningGoal,
+      CHANNELS.restoreLearningGoal,
+      CHANNELS.deleteLearningGoal,
       CHANNELS.listMemories,
       CHANNELS.getTodayInsights,
       CHANNELS.analyzeSession,
       CHANNELS.getAnalysisStatus,
       CHANNELS.getAnalysisBudget,
       CHANNELS.getResourceGovernance,
+      CHANNELS.getRolloutFlags,
       CHANNELS.getMiniMaxConfig,
       CHANNELS.clearMiniMaxKey,
       CHANNELS.setMiniMaxKey,
@@ -1266,6 +2039,13 @@ test("IPC registers only request-response repository channels", () => {
   );
   assert.equal(handlers.has(CHANNELS.control), false);
   assert.equal(handlers.has(CHANNELS.stateChanged), false);
+  assert.deepEqual(handlers.get(CHANNELS.getRolloutFlags)(null), {
+    applicationAudioV1: true,
+    dualSpeakerVerificationV1: true,
+    activityClassificationV1: true,
+    actionCenterV1: true,
+  });
+  assert.throws(() => handlers.get(CHANNELS.getRolloutFlags)(null, "extra"));
 });
 
 test("daily digest IPC accepts only localDate and rebuilds a private-safe public view", async () => {
@@ -1574,12 +2354,30 @@ test("IPC exposes MiniMax configured state without returning the secret", async 
   };
   const config = await handlers.get(CHANNELS.getMiniMaxConfig)();
   const expectedModel = "MiniMax-M2.7";
-  assert.deepEqual(config, { keyConfigured: true, model: expectedModel });
+  assert.deepEqual(config, {
+    keyConfigured: true,
+    model: expectedModel,
+    modelStatus: "ready",
+    fallbackUsed: false,
+    checkedAt: 1_000,
+  });
   assert.doesNotMatch(JSON.stringify(config), /sk-cp/);
   const saved = await handlers.get(CHANNELS.setMiniMaxKey)(null, { key: "new-token-plan-key" });
-  assert.deepEqual(saved, { keyConfigured: true, model: expectedModel });
+  assert.deepEqual(saved, {
+    keyConfigured: true,
+    model: expectedModel,
+    modelStatus: "ready",
+    fallbackUsed: false,
+    checkedAt: 1_000,
+  });
   const cleared = await handlers.get(CHANNELS.clearMiniMaxKey)(null);
-  assert.deepEqual(cleared, { keyConfigured: true, model: expectedModel });
+  assert.deepEqual(cleared, {
+    keyConfigured: true,
+    model: expectedModel,
+    modelStatus: "ready",
+    fallbackUsed: false,
+    checkedAt: 1_000,
+  });
   assert.deepEqual(calls, [["save", "new-token-plan-key"], ["clear"]]);
   await assert.rejects(
     handlers.get(CHANNELS.setMiniMaxKey)(null, {
@@ -1756,6 +2554,7 @@ test("application audio IPC exposes bounded runtime state and exact 1-8 track se
     getStatus: () => ({
       enabled: true,
       trackLimit: 4,
+      fallbackPolicy: "conservative",
       runtime: {
         running: true,
         configuredLimit: 4,
@@ -1801,6 +2600,7 @@ test("application audio IPC exposes bounded runtime state and exact 1-8 track se
   assert.deepEqual(status, {
     enabled: true,
     trackLimit: 4,
+    fallbackPolicy: "conservative",
     runtime: {
       running: true,
       configuredLimit: 4,
@@ -1829,16 +2629,18 @@ test("application audio IPC exposes bounded runtime state and exact 1-8 track se
     await handlers.get(CHANNELS.setApplicationAudioSettings)(null, {
       enabled: false,
       trackLimit: 8,
+      fallbackPolicy: "transcript_only",
     }),
-    { ...status, enabled: false, trackLimit: 8 }
+    { ...status, enabled: false, trackLimit: 8, fallbackPolicy: "transcript_only" }
   );
-  assert.deepEqual(calls, [{ enabled: false, trackLimit: 8 }]);
+  assert.deepEqual(calls, [{ enabled: false, trackLimit: 8, fallbackPolicy: "transcript_only" }]);
 
   for (const invalid of [
-    { enabled: "yes", trackLimit: 4 },
-    { enabled: true, trackLimit: 0 },
-    { enabled: true, trackLimit: 9 },
-    { enabled: true, trackLimit: 4, extra: true },
+    { enabled: "yes", trackLimit: 4, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 0, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 9, fallbackPolicy: "conservative" },
+    { enabled: true, trackLimit: 4, fallbackPolicy: "unsafe" },
+    { enabled: true, trackLimit: 4, fallbackPolicy: "conservative", extra: true },
   ]) {
     assert.throws(() => normalizeApplicationAudioSettings(invalid));
     assert.throws(() => handlers.get(CHANNELS.setApplicationAudioSettings)(null, invalid));
@@ -1993,6 +2795,90 @@ test("session list and search IPC remove device and storage-private fields", asy
     ]);
     assert.equal(JSON.stringify(result).includes("private"), false);
   }
+});
+
+test("topic detail IPC exposes bounded relationships without private session fields", async () => {
+  const privateSession = {
+    id: "session-topic",
+    started_at: 1,
+    ended_at: 2,
+    status: "completed",
+    language: "zh",
+    created_at: 1,
+    capture_mode: "mic",
+    mic_device_id: "private-device",
+    storage_root: "C:\\private\\recordings",
+  };
+  const { handlers } = createIpcHarness({
+    getTopicDetail: () => ({
+      topic: {
+        id: "topic-1",
+        canonical_title: "Project Atlas",
+        normalized_title: "project atlas",
+        description: "Launch plan",
+        status: "active",
+        created_at: 1,
+        last_seen_at: 2,
+        private_path: "C:\\private\\topic.json",
+      },
+      people: [
+        {
+          id: "person-1",
+          display_name: "Alice",
+          is_self: 0,
+          voice_profile_id: null,
+          voice_confidence: null,
+          created_at: 1,
+          last_seen_at: 2,
+          raw_embedding: [0.1],
+        },
+      ],
+      sessions: [privateSession],
+      decisions: [{ sessionId: "session-topic", content: "Ship Friday", raw_prompt: "private" }],
+      todos: [
+        {
+          id: "todo-1",
+          content: "Prepare release",
+          owner_person_id: "person-1",
+          owner_name: "Alice",
+          topic_id: "topic-1",
+          topic_title: "Project Atlas",
+          due_at: null,
+          status: "open",
+          updated_at: 2,
+          completed_at: null,
+          source_session_id: "session-topic",
+          source_segment_id: null,
+          private_note: "private",
+        },
+      ],
+      memories: [
+        {
+          id: "memory-1",
+          type: "fact",
+          content: "Local-first",
+          person_id: "person-1",
+          person_name: "Alice",
+          topic_id: "topic-1",
+          topic_title: "Project Atlas",
+          confidence: 0.9,
+          last_seen_at: 2,
+          occurrence_count: 1,
+          needs_confirmation: 0,
+          private_path: "C:\\private\\memory.json",
+        },
+      ],
+    }),
+  });
+
+  const result = await handlers.get(CHANNELS.getTopicDetail)(null, "topic-1");
+
+  assert.equal(result.sessions[0].id, "session-topic");
+  assert.equal(result.people[0].display_name, "Alice");
+  assert.equal(result.decisions[0].content, "Ship Friday");
+  assert.equal(result.todos[0].content, "Prepare release");
+  assert.equal(result.memories[0].content, "Local-first");
+  assert.equal(JSON.stringify(result).includes("private"), false);
 });
 
 test("IPC binds narrow voice enrollment sessions to the requesting renderer", async () => {

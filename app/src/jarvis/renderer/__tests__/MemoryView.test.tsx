@@ -1228,7 +1228,7 @@ describe("MemoryView processing timeline", () => {
           basis_policy_id: "legacy-v1",
           latest_policy_id: "hybrid-v2",
           recommended: 1,
-          reason: "speaker_count_changed",
+          reason: "activity_classification_changed",
           updated_at: 4_000,
         },
         reprocessing: {
@@ -1237,6 +1237,9 @@ describe("MemoryView processing timeline", () => {
           state: "completed",
           started_at: 3_000,
           completed_at: 4_000,
+          baseline_content_sha256: "c".repeat(64),
+          baseline_identity_sha256: "d".repeat(64),
+          baseline_classification_sha256: "e".repeat(64),
         },
       },
     };
@@ -1287,6 +1290,7 @@ describe("MemoryView processing timeline", () => {
     expect(screen.getByText(/已隐藏 229 个过短或重复的声纹碎片/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "未知说话人" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "付费刷新总结" })).toBeInTheDocument();
+    expect(screen.getByText(/本地重处理发现活动分类发生变化/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("处理详情与后台进度"));
     expect(screen.getByText("CUDA")).toBeInTheDocument();
     expect(screen.getByText("重叠分离：completed")).toBeInTheDocument();
@@ -1331,9 +1335,7 @@ describe("MemoryView processing timeline", () => {
     render(<MemoryView />);
     fireEvent.click(screen.getByRole("button", { name: /的录音/ }));
 
-    expect(
-      await screen.findByText("历史声纹异常，人数需重新复核")
-    ).toBeInTheDocument();
+    expect(await screen.findByText("历史声纹异常，人数需重新复核")).toBeInTheDocument();
     expect(screen.queryByText(/预计 1–46 人/)).not.toBeInTheDocument();
   });
 });
@@ -1741,9 +1743,7 @@ describe("MemoryView participant review actions", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "复核历史" }));
 
-    await waitFor(() =>
-      expect(listParticipantReviewHistory).toHaveBeenCalledWith(session.id)
-    );
+    await waitFor(() => expect(listParticipantReviewHistory).toHaveBeenCalledWith(session.id));
     expect(await screen.findByText("合并人物")).toBeInTheDocument();
     expect(screen.getByText("撤销人物修正")).toBeInTheDocument();
     expect(screen.queryByText("speaker_1")).not.toBeInTheDocument();

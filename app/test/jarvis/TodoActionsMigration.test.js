@@ -1,10 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
-const {
-  applyJarvisMigrations,
-  TARGET_VERSION,
-} = require("../../src/jarvis/main/JarvisMigrations");
+const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 
 test("v41 persists todo verification and permits only user completed-to-open undo", () => {
   const db = new Database(":memory:");
@@ -13,7 +10,7 @@ test("v41 persists todo verification and permits only user completed-to-open und
       fromVersion: 0,
       toVersion: TARGET_VERSION,
     });
-    assert.equal(TARGET_VERSION, 47);
+    assert.ok(TARGET_VERSION >= 41);
     db.prepare(
       `INSERT INTO todos_v2 (
          id, canonical_base_key, instance_key, title, status, provenance,
@@ -37,10 +34,11 @@ test("v41 persists todo verification and permits only user completed-to-open und
         'reopen-v41', 'todo-v41', 'completed', 'open', 'user_action', 'user', 4
       );
     `);
-    assert.deepEqual(
-      db.prepare("SELECT status, completed_at, dismissed_at FROM todos_v2").get(),
-      { status: "open", completed_at: null, dismissed_at: null }
-    );
+    assert.deepEqual(db.prepare("SELECT status, completed_at, dismissed_at FROM todos_v2").get(), {
+      status: "open",
+      completed_at: null,
+      dismissed_at: null,
+    });
     assert.throws(
       () =>
         db

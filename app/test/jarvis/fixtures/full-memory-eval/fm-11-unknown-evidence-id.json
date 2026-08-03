@@ -1,0 +1,72 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-11-unknown-evidence-id",
+  "coverage": ["unknown-evidence-id"],
+  "sessionId": "session-fm-11",
+  "request": {
+    "inputHash": "7191292dfd7e3afdb35b80b9432d386db3458f862be083e6e5307b911f4fadd0",
+    "allowedSegmentIds": ["seg-fm-11-1"],
+    "allowedOwnerLabels": ["SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-11-1",
+          "startedAt": 1000,
+          "endedAt": 2500,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.9,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "the evidence boundary must stay local."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-11-1",
+      "expectedDisposition": "rejected",
+      "expectedErrorCode": "invalid_structure",
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Out-of-scope evidence",
+          "summary": "This candidate cites an unknown segment.",
+          "evidenceSegmentIds": ["seg-fm-11-missing"]
+        },
+        "memories": [],
+        "topics": [],
+        "todos": [],
+        "suggestions": []
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-11",
+      "inputHash": "7191292dfd7e3afdb35b80b9432d386db3458f862be083e6e5307b911f4fadd0",
+      "requestBytes": 830,
+      "responseBytes": 340,
+      "durationMs": 7,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 43,
+      "outputTokens": 35,
+      "errorCode": "invalid_structure",
+      "validatorIssueCode": "schema.evidence_empty"
+    }
+  ],
+  "rendered": {
+    "memories": [],
+    "topics": [],
+    "todos": []
+  }
+}

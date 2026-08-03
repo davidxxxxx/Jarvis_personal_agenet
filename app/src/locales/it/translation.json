@@ -234,6 +234,10 @@
       "keyConfigured": "MiniMax key configured",
       "keyNotConfigured": "MiniMax key not configured",
       "model": "Model: {{model}}",
+      "modelReady": "La disponibilità del modello MiniMax è stata confermata.",
+      "modelCheckUnavailable": "Non è stato possibile verificare la disponibilità del modello MiniMax. La registrazione locale non è interessata.",
+      "modelUnavailable": "{{model}} non è disponibile per questa chiave. L'analisi cloud rimane in pausa.",
+      "modelFallback": "Il modello configurato non era disponibile. Jarvis userà {{model}}.",
       "keyLabel": "MiniMax subscription key",
       "saveKey": "Save MiniMax key",
       "removeKey": "Remove MiniMax key",
@@ -277,14 +281,34 @@
       "description": "Choose how quickly Jarvis yields the GPU and resumes background processing.",
       "loading": "Loading resource settings…",
       "profiles": {
-        "game_priority": { "title": "Game priority", "description": "Yield early and resume slowly." },
-        "balanced": { "title": "Balanced", "description": "Ignore light GPU use and share safely." },
-        "processing_priority": { "title": "Processing priority", "description": "Use more idle GPU capacity." }
+        "game_priority": {
+          "title": "Game priority",
+          "description": "Yield early and resume slowly."
+        },
+        "balanced": {
+          "title": "Balanced",
+          "description": "Ignore light GPU use and share safely."
+        },
+        "processing_priority": {
+          "title": "Processing priority",
+          "description": "Use more idle GPU capacity."
+        }
       },
       "applicationAudio": {
         "title": "Separa l’audio del computer per app",
         "description": "Monitora solo le app che producono suoni. In caso di errore usa il mix di sistema senza indovinare la fonte.",
         "trackLimit": "Numero massimo di tracce app simultanee",
+        "fallbackPolicy": "When an app track falls back to mixed system audio",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "Conservative summary",
+            "description": "Keep mixed audio and the full transcript. Allow only evidence-checkable summaries; block suggestions, todos, and identity learning."
+          },
+          "transcript_only": {
+            "title": "Transcript only",
+            "description": "Keep mixed audio and the full transcript. Block summaries, suggestions, todos, and identity learning."
+          }
+        },
         "runtime": "Registrazione di {{active}} tracce app (limite {{limit}}) · {{fallback}} fonti degradate",
         "idle": "Si avvia con la prossima registrazione; i giochi a schermo intero mantengono al massimo due tracce app."
       },

@@ -5,6 +5,7 @@ const test = require("node:test");
 const {
   createArchiveInvocation,
   modelArtifactNames,
+  parseCliArgs,
   renderNsisInclude,
 } = require("../../scripts/build-windows-model-bundle");
 
@@ -65,5 +66,32 @@ test("generated NSIS include pins the external archive digest and rejects inject
   assert.throws(
     () => renderNsisInclude({ archiveName: "models.7z", sha512: "not-a-digest" }),
     /SHA-512/u
+  );
+});
+
+test("model bundle CLI publishes only to one explicit distribution root", () => {
+  const distRoot = path.resolve(String.raw`G:\Jarvis\releases\0.2.0-rc.1`);
+
+  assert.deepEqual(parseCliArgs(["--publish-only", "--dist-root", distRoot]), {
+    publishOnly: true,
+    publishToDist: false,
+    distRoot,
+  });
+  assert.deepEqual(parseCliArgs(["--publish-to-dist", `--dist-root=${distRoot}`]), {
+    publishOnly: false,
+    publishToDist: true,
+    distRoot,
+  });
+  assert.throws(() => parseCliArgs(["--dist-root", distRoot]), /requires publication/i);
+  assert.throws(
+    () => parseCliArgs(["--publish-only", "--dist-root", "relative-output"]),
+    /must be absolute/i
+  );
+  if (process.platform === "win32") {
+    assert.throws(() => parseCliArgs(["--publish-only", "--dist-root", "G:\\"]), /volume root/i);
+  }
+  assert.throws(
+    () => parseCliArgs(["--publish-only", "--dist-root", distRoot, "--unexpected"]),
+    /unsupported model bundle argument/i
   );
 });

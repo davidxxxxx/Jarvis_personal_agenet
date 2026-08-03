@@ -60,7 +60,8 @@ function exactObject(value, requiredKeys, issueCode = "schema.object_type") {
 function isAutomaticActionDirective(value) {
   const sentences = value.split(/[.!?。！？;；]+/u).filter((sentence) => sentence.trim());
   return sentences.some((sentence) => {
-    const englishAction = /\b(?:create|add|write|schedule|send|post|convert|update|delete|remove|complete|mark)\b[^\n]{0,180}\b(?:todos?|tasks?|calendars?|events?|messages?|emails?)\b/iu;
+    const englishAction =
+      /\b(?:create|add|write|schedule|send|post|convert|update|delete|remove|complete|mark)\b[^\n]{0,180}\b(?:todos?|tasks?|calendars?|events?|messages?|emails?)\b/iu;
     const englishMarker =
       /\b(?:auto(?:matically)?|immediately)\b|\bwithout\s+(?:asking|(?:user\s+)?confirmation)\b/iu;
     const englishActionIndex = sentence.search(
@@ -68,8 +69,7 @@ function isAutomaticActionDirective(value) {
     );
     if (englishAction.test(sentence) && englishMarker.test(sentence)) {
       const beforeAction = englishActionIndex < 0 ? "" : sentence.slice(0, englishActionIndex);
-      const negated =
-        /\b(?:do\s+not|don't|never|must\s+not|should\s+not)\b/iu.test(beforeAction);
+      const negated = /\b(?:do\s+not|don't|never|must\s+not|should\s+not)\b/iu.test(beforeAction);
       const descriptive =
         /\b(?:document(?:ed|ing)?|describe(?:d|ing)?|explain(?:ed|ing)?|discuss(?:ed|ing)?|show(?:ed|ing)?|learn(?:ed|ing)?|teach(?:es|ing)?|taught|write|wrote)\b[^\n]{0,100}\bhow\s+to\b/iu.test(
           beforeAction
@@ -77,19 +77,16 @@ function isAutomaticActionDirective(value) {
       if (!negated && !descriptive) return true;
     }
 
-    const chineseAction = /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)[^\n]{0,80}(?:待办|任务|日历|事件|消息|邮件)/u;
+    const chineseAction =
+      /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)[^\n]{0,80}(?:待办|任务|日历|事件|消息|邮件)/u;
     const chineseMarker = /(?:自动|立即|无需(?:用户)?确认|未经(?:用户)?确认|无需询问)/u;
     if (chineseAction.test(sentence) && chineseMarker.test(sentence)) {
       const actionIndex = sentence.search(
         /(?:创建|添加|写入|安排|发送|转换|转为|更新|删除|移除|完成|标记)/u
       );
       const beforeAction = actionIndex < 0 ? "" : sentence.slice(0, actionIndex);
-      const negated = /(?:不会|不应|不能|不该|不可以|不要|不得|切勿|禁止)/u.test(
-        beforeAction
-      );
-      const descriptive = /(?:讨论|记录|描述|解释|说明|记载)[^\n]{0,60}如何/u.test(
-        beforeAction
-      );
+      const negated = /(?:不会|不应|不能|不该|不可以|不要|不得|切勿|禁止)/u.test(beforeAction);
+      const descriptive = /(?:讨论|记录|描述|解释|说明|记载)[^\n]{0,60}如何/u.test(beforeAction);
       if (!negated && !descriptive) return true;
     }
     return false;
@@ -183,7 +180,9 @@ function normalizeContext(context) {
         evidence.size < 1 ||
         [...evidence].some((segmentId) => !input.allowedSegmentIds.has(segmentId))
     ) ||
-    [...input.allowedSubjectRefs].some((subjectRef) => !input.subjectEvidenceByRef.has(subjectRef)) ||
+    [...input.allowedSubjectRefs].some(
+      (subjectRef) => !input.subjectEvidenceByRef.has(subjectRef)
+    ) ||
     !new Set(["partial", "final"]).has(input.completeness)
   ) {
     fail("schema.validation_context");
@@ -225,6 +224,12 @@ function factualItems(value, field, allowedSegmentIds) {
 
 function sameCoverage(left, right) {
   return COVERAGE_KEYS.every((key) => left[key] === right[key]);
+}
+
+function requireMeaningfulSections(sections) {
+  if (!Object.values(sections).some((items) => Array.isArray(items) && items.length > 0)) {
+    fail("schema.empty_digest");
+  }
 }
 
 function validateCandidateDailyDigest(payload, context) {
@@ -291,35 +296,35 @@ function validateCandidateDailyDigest(payload, context) {
       "worthRemembering",
       normalizedContext.allowedSegmentIds
     ),
-    tomorrowSuggestions: collection(
-      rawSections.tomorrowSuggestions,
-      "tomorrowSuggestions"
-    ).map((raw) => {
-      const item = exactObject(raw, [
-        "text",
-        "rationale",
-        "evidenceSegmentIds",
-        "allowedActions",
-      ]);
-      if (!Array.isArray(item.allowedActions)) fail("schema.actions_type");
-      if (item.allowedActions.length === 0) fail("schema.actions_empty");
-      if (new Set(item.allowedActions).size !== item.allowedActions.length) {
-        fail("schema.actions_duplicate");
+    tomorrowSuggestions: collection(rawSections.tomorrowSuggestions, "tomorrowSuggestions").map(
+      (raw) => {
+        const item = exactObject(raw, [
+          "text",
+          "rationale",
+          "evidenceSegmentIds",
+          "allowedActions",
+        ]);
+        if (!Array.isArray(item.allowedActions)) fail("schema.actions_type");
+        if (item.allowedActions.length === 0) fail("schema.actions_empty");
+        if (new Set(item.allowedActions).size !== item.allowedActions.length) {
+          fail("schema.actions_duplicate");
+        }
+        if (item.allowedActions.some((action) => !ALLOWED_ACTION_SET.has(action))) {
+          fail("schema.action_unsupported");
+        }
+        return {
+          text: boundedString(item.text, 500),
+          rationale: boundedString(item.rationale, 4_000),
+          evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
+            required: false,
+            allowedSegmentIds: normalizedContext.allowedSegmentIds,
+          }),
+          allowedActions: [...item.allowedActions],
+        };
       }
-      if (item.allowedActions.some((action) => !ALLOWED_ACTION_SET.has(action))) {
-        fail("schema.action_unsupported");
-      }
-      return {
-        text: boundedString(item.text, 500),
-        rationale: boundedString(item.rationale, 4_000),
-        evidenceSegmentIds: evidenceIds(item.evidenceSegmentIds, {
-          required: false,
-          allowedSegmentIds: normalizedContext.allowedSegmentIds,
-        }),
-        allowedActions: [...item.allowedActions],
-      };
-    }),
+    ),
   };
+  requireMeaningfulSections(sections);
 
   const rawProcessing = exactObject(input.processing, [
     "completeness",
@@ -347,10 +352,7 @@ function validateCandidateDailyDigest(payload, context) {
   ) {
     fail("schema.missing_stages_mismatch");
   }
-  const transcriptCoverage = validateCoverage(
-    rawProcessing.transcriptCoverage,
-    "schema.coverage"
-  );
+  const transcriptCoverage = validateCoverage(rawProcessing.transcriptCoverage, "schema.coverage");
   if (!sameCoverage(transcriptCoverage, normalizedContext.transcriptCoverage)) {
     fail("schema.coverage_mismatch");
   }
@@ -373,21 +375,24 @@ function validateCandidateDailyDigest(payload, context) {
 // the final trust boundary.
 function salvageCandidateDailyDigest(payload, context) {
   const normalizedContext = normalizeContext(context);
-  const input = exactObject(
-    payload,
-    ["schemaVersion", "sections", "processing"],
-    "schema.top_level_type"
-  );
+  const input = plainObject(payload, "schema.top_level_type");
+  const allowedTopLevelKeys = new Set(["schemaVersion", "sections", "processing"]);
+  if (Object.keys(input).some((key) => !allowedTopLevelKeys.has(key))) {
+    fail("schema.unknown_field");
+  }
   if (input.schemaVersion !== DAILY_DIGEST_SCHEMA_VERSION) fail("schema.version");
-  const rawSections = exactObject(input.sections, [
+  const rawSections = plainObject(input.sections, "schema.sections_type");
+  const recognizedSectionKeys = [
     "today",
     "interactions",
     "topicsAndDecisions",
     "commitmentsAndTodos",
     "worthRemembering",
     "tomorrowSuggestions",
-  ]);
-  exactObject(input.processing, ["completeness", "missingStages", "transcriptCoverage"]);
+  ];
+  const missingSectionCount = recognizedSectionKeys.filter(
+    (key) => !Array.isArray(rawSections[key])
+  ).length;
 
   const cleanEvidence = (value, allowed = normalizedContext.allowedSegmentIds) => {
     if (!Array.isArray(value)) return [];
@@ -406,8 +411,10 @@ function salvageCandidateDailyDigest(payload, context) {
     }
     return result;
   };
-  const keepValid = (value, field, repair) =>
-    collection(value, field).flatMap((raw) => {
+  const salvageCollection = (value) =>
+    Array.isArray(value) ? value.slice(0, MAX_COLLECTION_ITEMS) : [];
+  const keepValid = (value, _field, repair) =>
+    salvageCollection(value).flatMap((raw) => {
       try {
         const repaired = repair(raw);
         return repaired === null ? [] : [repaired];
@@ -452,14 +459,8 @@ function salvageCandidateDailyDigest(payload, context) {
               evidenceSegmentIds: evidence,
             };
       }),
-      topicsAndDecisions: repairFactual(
-        rawSections.topicsAndDecisions,
-        "topicsAndDecisions"
-      ),
-      commitmentsAndTodos: repairFactual(
-        rawSections.commitmentsAndTodos,
-        "commitmentsAndTodos"
-      ),
+      topicsAndDecisions: repairFactual(rawSections.topicsAndDecisions, "topicsAndDecisions"),
+      commitmentsAndTodos: repairFactual(rawSections.commitmentsAndTodos, "commitmentsAndTodos"),
       worthRemembering: repairFactual(rawSections.worthRemembering, "worthRemembering"),
       tomorrowSuggestions: keepValid(
         rawSections.tomorrowSuggestions,
@@ -487,11 +488,12 @@ function salvageCandidateDailyDigest(payload, context) {
     },
     processing: {
       completeness: normalizedContext.completeness,
-      missingStages:
-        normalizedContext.completeness === "final" ? [] : ["upstream_processing"],
+      missingStages: normalizedContext.completeness === "final" ? [] : ["upstream_processing"],
       transcriptCoverage: { ...normalizedContext.transcriptCoverage },
     },
   };
+  requireMeaningfulSections(repaired.sections);
+  if (missingSectionCount > 1) fail("schema.sections_incomplete");
   return validateCandidateDailyDigest(repaired, context);
 }
 

@@ -11,7 +11,15 @@ const CHANNELS = Object.freeze({
   getPersonalizationSettings: "jarvis:personalization:get",
   decidePersonalizationRule: "jarvis:personalization:rule-decision",
   resetPersonalizationRules: "jarvis:personalization:reset",
+  listLearningGoals: "jarvis:learning-goals:list",
+  createLearningGoal: "jarvis:learning-goals:create",
+  editLearningGoal: "jarvis:learning-goals:edit",
+  archiveLearningGoal: "jarvis:learning-goals:archive",
+  restoreLearningGoal: "jarvis:learning-goals:restore",
+  deleteLearningGoal: "jarvis:learning-goals:delete",
   setNotificationPreferences: "jarvis:notification-preferences:set",
+  getTodoReminder: "jarvis:todo-reminder:get",
+  setTodoReminder: "jarvis:todo-reminder:set",
   renamePerson: "jarvis:person:rename",
   listPeople: "jarvis:person:list",
   listSessionSpeakerClusters: "jarvis:speaker:list-session",
@@ -42,11 +50,15 @@ const CHANNELS = Object.freeze({
   listMemories: "jarvis:memory:list",
   getTodayInsights: "jarvis:memory:today-insights",
   getDailyDigest: "jarvis:memory:daily-digest",
+  getActionCenterWatermark: "jarvis:memory:v2-action-watermark",
+  getActionCenterDelta: "jarvis:memory:v2-action-delta",
+  markActionCenterRead: "jarvis:memory:v2-action-read",
   getKnowledgeOverview: "jarvis:memory:v2-overview",
   decideKnowledgeSuggestion: "jarvis:memory:v2-suggestion-decision",
   resolveKnowledgeConflict: "jarvis:memory:v2-conflict-resolve",
   completeKnowledgeTodo: "jarvis:memory:v2-todo-complete",
   decideKnowledgeTodo: "jarvis:memory:v2-todo-decision",
+  applyKnowledgeAction: "jarvis:memory:v2-knowledge-action",
   getEvidenceContext: "jarvis:evidence:get-context",
   analyzeSession: "jarvis:analysis:run",
   regenerateDailyDigest: "jarvis:analysis:daily-digest:regenerate",
@@ -57,6 +69,7 @@ const CHANNELS = Object.freeze({
   setResourceGovernance: "jarvis:resource-governance:set",
   getApplicationAudioSettings: "jarvis:application-audio:get",
   setApplicationAudioSettings: "jarvis:application-audio:set",
+  getRolloutFlags: "jarvis:rollout-flags:get",
   getMiniMaxConfig: "jarvis:minimax:get-config",
   setMiniMaxKey: "jarvis:minimax:set-key",
   clearMiniMaxKey: "jarvis:minimax:clear-key",
@@ -192,6 +205,41 @@ function exactPlainObject(input, keys, name) {
   return input;
 }
 
+const LEARNING_GOAL_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
+
+function normalizeLearningGoalTitle(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("learning goal title must be a string");
+  }
+  const normalized = value.normalize("NFKC").trim().replace(/\s+/gu, " ");
+  if (
+    !normalized ||
+    Array.from(normalized).length > 500 ||
+    LEARNING_GOAL_CONTROL_CHARACTERS.test(normalized)
+  ) {
+    throw new TypeError("learning goal title must contain 1 to 500 safe characters");
+  }
+  return normalized;
+}
+
+function normalizeLearningGoalCreateInput(input) {
+  exactPlainObject(input, ["title"], "learning goal create input");
+  return { title: normalizeLearningGoalTitle(input.title) };
+}
+
+function normalizeLearningGoalEditInput(input) {
+  exactPlainObject(input, ["goalId", "title"], "learning goal edit input");
+  return {
+    goalId: assertId(input.goalId, "learningGoalId"),
+    title: normalizeLearningGoalTitle(input.title),
+  };
+}
+
+function normalizeLearningGoalIdInput(input) {
+  exactPlainObject(input, ["goalId"], "learning goal decision input");
+  return { goalId: assertId(input.goalId, "learningGoalId") };
+}
+
 function normalizeSuggestionDecisionInput(input) {
   exactPlainObject(input, ["suggestionId", "action"], "suggestion decision input");
   if (input.action !== "accept" && input.action !== "dismiss") {
@@ -231,6 +279,189 @@ function normalizeKnowledgeTodoDecisionInput(input) {
   };
 }
 
+const KNOWLEDGE_ACTION_TYPES = new Set([
+  "manual_create",
+  "transcript_create",
+  "todo_dismiss",
+  "todo_restore",
+  "suggestion_dismiss",
+  "suggestion_restore",
+  "suggestion_accept",
+  "suggestion_accept_undo",
+  "todo_pin",
+  "todo_unpin",
+  "urgency_set",
+  "title_due_edit",
+]);
+const KNOWLEDGE_DISMISS_REASONS = new Set([
+  "not_relevant",
+  "already_done",
+  "not_mine",
+  "wrong_context",
+  "low_value",
+  "other",
+]);
+
+function boundedKnowledgeText(value, name, maxLength, { nullable = false } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string") throw new TypeError(`${name} is invalid`);
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maxLength) throw new TypeError(`${name} is invalid`);
+  return normalized;
+}
+
+function knowledgeActionShape(input, required, optional = []) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("knowledge action input is invalid");
+  }
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(input);
+  if (
+    required.some((key) => !Object.prototype.hasOwnProperty.call(input, key)) ||
+    keys.some((key) => !allowed.has(key))
+  ) {
+    throw new TypeError("knowledge action input has invalid keys");
+  }
+  return input;
+}
+
+function normalizeKnowledgeActionInput(input) {
+  if (!input || !KNOWLEDGE_ACTION_TYPES.has(input.type)) {
+    throw new TypeError("knowledge action type is invalid");
+  }
+  const common = {
+    commandId: assertId(input.commandId, "commandId"),
+    type: input.type,
+  };
+  switch (input.type) {
+    case "manual_create":
+      knowledgeActionShape(input, ["commandId", "type", "todoId", "title", "dueText"]);
+      return {
+        ...common,
+        todoId: assertId(input.todoId, "todoId"),
+        title: boundedKnowledgeText(input.title, "title", 512),
+        dueText: boundedKnowledgeText(input.dueText, "dueText", 256, { nullable: true }),
+      };
+    case "transcript_create": {
+      knowledgeActionShape(input, [
+        "commandId",
+        "type",
+        "todoId",
+        "title",
+        "dueText",
+        "sessionId",
+        "segmentIds",
+      ]);
+      if (
+        !Array.isArray(input.segmentIds) ||
+        input.segmentIds.length === 0 ||
+        input.segmentIds.length > 512
+      ) {
+        throw new TypeError("segmentIds are invalid");
+      }
+      const segmentIds = input.segmentIds.map((value) => assertId(value, "segmentId"));
+      if (new Set(segmentIds).size !== segmentIds.length) {
+        throw new TypeError("segmentIds must be unique");
+      }
+      return {
+        ...common,
+        todoId: assertId(input.todoId, "todoId"),
+        title: boundedKnowledgeText(input.title, "title", 512),
+        dueText: boundedKnowledgeText(input.dueText, "dueText", 256, { nullable: true }),
+        sessionId: assertId(input.sessionId, "sessionId"),
+        segmentIds,
+      };
+    }
+    case "todo_dismiss":
+      knowledgeActionShape(input, ["commandId", "type", "todoId", "reasonCode"], ["localNote"]);
+      if (!KNOWLEDGE_DISMISS_REASONS.has(input.reasonCode)) {
+        throw new TypeError("knowledge action reason is invalid");
+      }
+      return {
+        ...common,
+        todoId: assertId(input.todoId, "todoId"),
+        reasonCode: input.reasonCode,
+        localNote:
+          input.localNote === undefined || input.localNote === null
+            ? null
+            : boundedKnowledgeText(input.localNote, "localNote", 500),
+      };
+    case "todo_restore":
+    case "todo_pin":
+    case "todo_unpin":
+      knowledgeActionShape(input, ["commandId", "type", "todoId"]);
+      return { ...common, todoId: assertId(input.todoId, "todoId") };
+    case "suggestion_dismiss":
+      knowledgeActionShape(input, ["commandId", "type", "suggestionId", "reasonCode"]);
+      if (!KNOWLEDGE_DISMISS_REASONS.has(input.reasonCode)) {
+        throw new TypeError("knowledge action reason is invalid");
+      }
+      return {
+        ...common,
+        suggestionId: assertId(input.suggestionId, "suggestionId"),
+        reasonCode: input.reasonCode,
+      };
+    case "suggestion_restore":
+    case "suggestion_accept_undo":
+      knowledgeActionShape(input, ["commandId", "type", "suggestionId"]);
+      return { ...common, suggestionId: assertId(input.suggestionId, "suggestionId") };
+    case "suggestion_accept":
+      knowledgeActionShape(input, [
+        "commandId",
+        "type",
+        "suggestionId",
+        "todoId",
+        "title",
+        "dueText",
+      ]);
+      return {
+        ...common,
+        suggestionId: assertId(input.suggestionId, "suggestionId"),
+        todoId: assertId(input.todoId, "todoId"),
+        title: boundedKnowledgeText(input.title, "title", 512),
+        dueText: boundedKnowledgeText(input.dueText, "dueText", 256, { nullable: true }),
+      };
+    case "urgency_set":
+      knowledgeActionShape(input, ["commandId", "type", "todoId", "urgency"]);
+      if (!new Set(["normal", "urgent"]).has(input.urgency)) {
+        throw new TypeError("knowledge action urgency is invalid");
+      }
+      return {
+        ...common,
+        todoId: assertId(input.todoId, "todoId"),
+        urgency: input.urgency,
+      };
+    case "title_due_edit": {
+      knowledgeActionShape(input, ["commandId", "type", "todoId"], ["title", "dueText"]);
+      const hasTitle = Object.prototype.hasOwnProperty.call(input, "title");
+      const hasDueText = Object.prototype.hasOwnProperty.call(input, "dueText");
+      if (!hasTitle && !hasDueText) throw new TypeError("knowledge action edit is empty");
+      return {
+        ...common,
+        todoId: assertId(input.todoId, "todoId"),
+        ...(hasTitle ? { title: boundedKnowledgeText(input.title, "title", 512) } : {}),
+        ...(hasDueText
+          ? {
+              dueText: boundedKnowledgeText(input.dueText, "dueText", 256, {
+                nullable: true,
+              }),
+            }
+          : {}),
+      };
+    }
+    default:
+      throw new TypeError("knowledge action type is invalid");
+  }
+}
+
+function normalizeActionCenterReadInput(input) {
+  exactPlainObject(input, ["throughSequence"], "action center read input");
+  if (!Number.isSafeInteger(input.throughSequence) || input.throughSequence < 0) {
+    throw new TypeError("action center read sequence is invalid");
+  }
+  return { throughSequence: input.throughSequence };
+}
+
 const ACTIVITY_CATEGORIES = new Set([
   "work_meeting",
   "learning",
@@ -261,7 +492,10 @@ function normalizePersonalizationRuleDecisionInput(input) {
   if (!["enable", "disable", "delete", "edit"].includes(action)) {
     throw new TypeError("personalization rule action is invalid");
   }
-  const expectedKeys = action === "edit" ? ["ruleId", "action", "label"] : ["ruleId", "action"];
+  const expectedKeys =
+    action === "edit"
+      ? ["ruleId", "action", "label", "targetValue", "conditions"]
+      : ["ruleId", "action"];
   exactPlainObject(input, expectedKeys, "personalization rule decision input");
   const normalized = {
     ruleId: assertId(input.ruleId, "ruleId"),
@@ -275,17 +509,47 @@ function normalizePersonalizationRuleDecisionInput(input) {
     if (Array.from(label).length > 500) {
       throw new RangeError("personalization rule label is too long");
     }
+    if (!ACTIVITY_CATEGORIES.has(input.targetValue)) {
+      throw new TypeError("personalization rule target category is invalid");
+    }
+    exactPlainObject(
+      input.conditions,
+      ["applicationKeys", "selfParticipated", "speakerCountBucket", "timeBucket"],
+      "personalization rule conditions"
+    );
+    if (
+      !Array.isArray(input.conditions.applicationKeys) ||
+      input.conditions.applicationKeys.length > 8 ||
+      input.conditions.applicationKeys.some(
+        (entry) => typeof entry !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(entry)
+      ) ||
+      new Set(input.conditions.applicationKeys).size !== input.conditions.applicationKeys.length
+    ) {
+      throw new TypeError("personalization rule application keys are invalid");
+    }
+    if (typeof input.conditions.selfParticipated !== "boolean") {
+      throw new TypeError("personalization rule SELF condition is invalid");
+    }
+    if (!new Set(["none", "one", "multiple"]).has(input.conditions.speakerCountBucket)) {
+      throw new TypeError("personalization rule speaker count condition is invalid");
+    }
+    if (!new Set(["night", "morning", "afternoon", "evening"]).has(input.conditions.timeBucket)) {
+      throw new TypeError("personalization rule time condition is invalid");
+    }
     normalized.label = label;
+    normalized.targetValue = input.targetValue;
+    normalized.conditions = {
+      applicationKeys: [...input.conditions.applicationKeys].sort(),
+      selfParticipated: input.conditions.selfParticipated,
+      speakerCountBucket: input.conditions.speakerCountBucket,
+      timeBucket: input.conditions.timeBucket,
+    };
   }
   return normalized;
 }
 
 function normalizeNotificationPreferencesInput(input) {
-  exactPlainObject(
-    input,
-    ["focusMode", "mutedUntil"],
-    "notification preferences input"
-  );
+  exactPlainObject(input, ["focusMode", "mutedUntil"], "notification preferences input");
   if (typeof input.focusMode !== "boolean") {
     throw new TypeError("notification focusMode must be a boolean");
   }
@@ -298,6 +562,20 @@ function normalizeNotificationPreferencesInput(input) {
   return {
     focusMode: input.focusMode,
     mutedUntil: input.mutedUntil,
+  };
+}
+
+function normalizeTodoReminderInput(input) {
+  exactPlainObject(input, ["todoId", "reminderAt"], "todo reminder input");
+  if (
+    input.reminderAt !== null &&
+    (!Number.isSafeInteger(input.reminderAt) || input.reminderAt < 0)
+  ) {
+    throw new TypeError("todo reminderAt must be null or a non-negative safe integer");
+  }
+  return {
+    todoId: assertId(input.todoId, "todoId"),
+    reminderAt: input.reminderAt,
   };
 }
 
@@ -344,6 +622,117 @@ function evidenceResponseTime(value) {
 
 function nullableEvidenceId(value, name) {
   return value === null ? null : assertId(value, name);
+}
+
+function nullableEvidenceConfidence(value) {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  return value;
+}
+
+function normalizeActionEvidenceAttribution(input) {
+  if (input === null || input === undefined) return null;
+  exactEnumerableObject(
+    input,
+    [
+      "basis",
+      "applicationKey",
+      "applicationName",
+      "sourceAttribution",
+      "speakerRelation",
+      "semanticConfidence",
+      "voiceConfidence",
+      "transcriptConfidence",
+      "activityClassification",
+    ],
+    "action evidence attribution"
+  );
+  if (!new Set(["captured_todo_snapshot", "current_local_state"]).has(input.basis)) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  if (
+    input.applicationKey !== null &&
+    (typeof input.applicationKey !== "string" || !/^[a-z0-9._-]{1,64}$/u.test(input.applicationKey))
+  ) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  if (
+    typeof input.applicationName !== "string" ||
+    !input.applicationName.trim() ||
+    Array.from(input.applicationName).length > 80 ||
+    /[\u0000-\u001f\u007f]/u.test(input.applicationName)
+  ) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  if (
+    !new Set(["application", "microphone", "application_and_microphone", "mixed_unknown"]).has(
+      input.sourceAttribution
+    ) ||
+    !/^(?:SELF|P[1-9][0-9]*|UNKNOWN)$/u.test(input.speakerRelation)
+  ) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  let activityClassification = null;
+  if (input.activityClassification !== null) {
+    exactEnumerableObject(
+      input.activityClassification,
+      ["id", "category", "confidence", "decision", "source", "reason"],
+      "action evidence activity classification"
+    );
+    if (
+      !new Set([
+        "work_meeting",
+        "learning",
+        "social_call",
+        "in_person_conversation",
+        "entertainment",
+        "gaming",
+        "other",
+        "unknown",
+      ]).has(input.activityClassification.category) ||
+      !new Set(["adopted", "tentative", "unknown"]).has(input.activityClassification.decision) ||
+      !new Set(["local", "minimax", "user", "captured_snapshot"]).has(
+        input.activityClassification.source
+      ) ||
+      (input.activityClassification.reason !== null &&
+        (typeof input.activityClassification.reason !== "string" ||
+          Array.from(input.activityClassification.reason).length > 512 ||
+          /[\u0000-\u001f\u007f]/u.test(input.activityClassification.reason)))
+    ) {
+      throw new TypeError("evidence context response is invalid");
+    }
+    const capturedClassification = input.basis === "captured_todo_snapshot";
+    if (
+      capturedClassification !== (input.activityClassification.source === "captured_snapshot") ||
+      capturedClassification !== (input.activityClassification.id === null)
+    ) {
+      throw new TypeError("evidence context response is invalid");
+    }
+    activityClassification = {
+      id:
+        input.activityClassification.id === null
+          ? null
+          : assertId(input.activityClassification.id, "activityClassificationId"),
+      category: input.activityClassification.category,
+      confidence: nullableEvidenceConfidence(input.activityClassification.confidence),
+      decision: input.activityClassification.decision,
+      source: input.activityClassification.source,
+      reason: input.activityClassification.reason,
+    };
+  }
+  return {
+    basis: input.basis,
+    applicationKey: input.applicationKey,
+    applicationName: input.applicationName,
+    sourceAttribution: input.sourceAttribution,
+    speakerRelation: input.speakerRelation,
+    semanticConfidence: nullableEvidenceConfidence(input.semanticConfidence),
+    voiceConfidence: nullableEvidenceConfidence(input.voiceConfidence),
+    transcriptConfidence: nullableEvidenceConfidence(input.transcriptConfidence),
+    activityClassification,
+  };
 }
 
 function normalizeEvidenceContextResponse(input) {
@@ -415,6 +804,66 @@ function normalizeEvidenceContextResponse(input) {
   if (!new Set(["available", "expired", "missing"]).has(input.audioState)) {
     throw new TypeError("evidence context response is invalid");
   }
+  const rawTranscriptContext = input.transcriptContext ?? [];
+  if (!Array.isArray(rawTranscriptContext) || rawTranscriptContext.length > 7) {
+    throw new TypeError("evidence context response is invalid");
+  }
+  const seenContextSegments = new Set();
+  const transcriptContext = rawTranscriptContext.map((entry) => {
+    exactEnumerableObject(
+      entry,
+      [
+        "segmentId",
+        "startedAt",
+        "endedAt",
+        "text",
+        "speakerRelation",
+        "applicationName",
+        "isEvidence",
+      ],
+      "evidence transcript context"
+    );
+    const segmentId = assertId(entry.segmentId, "transcriptContextSegmentId");
+    const contextStartedAt = evidenceResponseTime(entry.startedAt);
+    const contextEndedAt = evidenceResponseTime(entry.endedAt);
+    if (
+      seenContextSegments.has(segmentId) ||
+      contextStartedAt < sessionStartedAt ||
+      contextEndedAt <= contextStartedAt ||
+      (sessionEndedAt !== null && contextEndedAt > sessionEndedAt) ||
+      typeof entry.text !== "string" ||
+      !entry.text.trim() ||
+      Array.from(entry.text).length > 2_048 ||
+      !/^(?:SELF|P[1-9][0-9]*|UNKNOWN)$/u.test(entry.speakerRelation) ||
+      (entry.applicationName !== null &&
+        (typeof entry.applicationName !== "string" ||
+          !entry.applicationName.trim() ||
+          Array.from(entry.applicationName).length > 80 ||
+          /[\u0000-\u001f\u007f]/u.test(entry.applicationName))) ||
+      typeof entry.isEvidence !== "boolean"
+    ) {
+      throw new TypeError("evidence context response is invalid");
+    }
+    seenContextSegments.add(segmentId);
+    return {
+      segmentId,
+      startedAt: contextStartedAt,
+      endedAt: contextEndedAt,
+      text: entry.text,
+      speakerRelation: entry.speakerRelation,
+      applicationName: entry.applicationName,
+      isEvidence: entry.isEvidence,
+    };
+  });
+  const focalContext = transcriptContext.filter((entry) => entry.isEvidence);
+  if (
+    (input.transcriptState === "missing" && transcriptContext.length > 0) ||
+    focalContext.length > 1 ||
+    (transcriptContext.length > 0 &&
+      (focalContext.length !== 1 || focalContext[0].segmentId !== transcriptSegmentId))
+  ) {
+    throw new TypeError("evidence context response is invalid");
+  }
   return {
     ownerType: input.ownerType,
     ownerId: assertId(input.ownerId, "ownerId"),
@@ -430,6 +879,8 @@ function normalizeEvidenceContextResponse(input) {
     endedAt,
     quoteText: input.quoteText,
     audioState: input.audioState,
+    transcriptContext,
+    actionAttribution: normalizeActionEvidenceAttribution(input.actionAttribution),
   };
 }
 
@@ -446,17 +897,40 @@ function normalizeMiniMaxKeyInput(input) {
 }
 
 const PUBLIC_MINIMAX_MODELS = new Set(["MiniMax-M2.7"]);
+const PUBLIC_MINIMAX_MODEL_STATUSES = new Set([
+  "not_configured",
+  "ready",
+  "unavailable",
+  "model_unavailable",
+]);
 
 function normalizeMiniMaxConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("MiniMax config response is invalid");
   }
-  if (typeof input.keyConfigured !== "boolean" || !PUBLIC_MINIMAX_MODELS.has(input.model)) {
+  exactEnumerableObject(
+    input,
+    ["keyConfigured", "model", "modelStatus", "fallbackUsed", "checkedAt"],
+    "MiniMax config response"
+  );
+  if (
+    typeof input.keyConfigured !== "boolean" ||
+    !PUBLIC_MINIMAX_MODELS.has(input.model) ||
+    !PUBLIC_MINIMAX_MODEL_STATUSES.has(input.modelStatus) ||
+    typeof input.fallbackUsed !== "boolean" ||
+    (input.checkedAt !== null && (!Number.isSafeInteger(input.checkedAt) || input.checkedAt < 0)) ||
+    (!input.keyConfigured &&
+      (input.modelStatus !== "not_configured" || input.fallbackUsed || input.checkedAt !== null)) ||
+    (input.keyConfigured && input.modelStatus === "not_configured")
+  ) {
     throw new TypeError("MiniMax config response is invalid");
   }
   return {
     keyConfigured: input.keyConfigured,
     model: input.model,
+    modelStatus: input.modelStatus,
+    fallbackUsed: input.fallbackUsed,
+    checkedAt: input.checkedAt,
   };
 }
 
@@ -509,17 +983,41 @@ function normalizeResourceGovernanceSettings(input) {
 }
 
 function normalizeApplicationAudioSettings(input) {
-  exactEnumerableObject(input, ["enabled", "trackLimit"], "application audio settings");
+  exactEnumerableObject(
+    input,
+    ["enabled", "trackLimit", "fallbackPolicy"],
+    "application audio settings"
+  );
   if (typeof input.enabled !== "boolean") {
     throw new TypeError("application audio enabled must be a boolean");
   }
   if (!Number.isSafeInteger(input.trackLimit) || input.trackLimit < 1 || input.trackLimit > 8) {
     throw new RangeError("application audio trackLimit must be between 1 and 8");
   }
+  if (!new Set(["conservative", "transcript_only"]).has(input.fallbackPolicy)) {
+    throw new TypeError("application audio fallbackPolicy is invalid");
+  }
   return {
     enabled: input.enabled,
     trackLimit: input.trackLimit,
+    fallbackPolicy: input.fallbackPolicy,
   };
+}
+
+function normalizeJarvisRolloutFlags(input) {
+  const keys = [
+    "applicationAudioV1",
+    "dualSpeakerVerificationV1",
+    "activityClassificationV1",
+    "actionCenterV1",
+  ];
+  exactEnumerableObject(input, keys, "Jarvis rollout flags");
+  for (const key of keys) {
+    if (typeof input[key] !== "boolean") {
+      throw new TypeError(`Jarvis rollout flag ${key} must be a boolean`);
+    }
+  }
+  return Object.fromEntries(keys.map((key) => [key, input[key]]));
 }
 
 function normalizeAnalysisBudgetInput(input) {
@@ -683,9 +1181,15 @@ module.exports = {
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
   normalizeKnowledgeTodoDecisionInput,
+  normalizeKnowledgeActionInput,
+  normalizeActionCenterReadInput,
   normalizeActivityCorrectionInput,
   normalizePersonalizationRuleDecisionInput,
+  normalizeLearningGoalCreateInput,
+  normalizeLearningGoalEditInput,
+  normalizeLearningGoalIdInput,
   normalizeNotificationPreferencesInput,
+  normalizeTodoReminderInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
@@ -693,6 +1197,7 @@ module.exports = {
   RESOURCE_GOVERNANCE_PRESETS,
   normalizeResourceGovernanceSettings,
   normalizeApplicationAudioSettings,
+  normalizeJarvisRolloutFlags,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,

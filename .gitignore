@@ -1,5 +1,6 @@
 .superpowers/
 .worktrees/
+/.runtime-cache/
 work/
 outputs/
 node_modules/

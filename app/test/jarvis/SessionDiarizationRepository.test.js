@@ -115,6 +115,41 @@ function enqueueFinalDiarization(repo, sessionId, input) {
   });
 }
 
+function saveLocalActivityClassification(repo, category, createdAt) {
+  return repo.saveActivityClassificationBatch({
+    sessionId: "session-cas",
+    activities: [
+      {
+        activityId: "activity-session-cas",
+        startedAt: 1_000,
+        endedAt: 5_000,
+        applications: [],
+        sourceAttribution: "microphone",
+        statistics: {
+          microphoneParticipated: true,
+          selfDetected: false,
+          speakerCount: 1,
+        },
+      },
+    ],
+    classifications: [
+      {
+        activityId: "activity-session-cas",
+        category,
+        confidence: 0.91,
+        decision: "adopted",
+        source: "local",
+        reason: "test_local_classification",
+        allowSummary: true,
+        allowSuggestions: true,
+        allowTodos: false,
+        evidenceSegmentIds: ["segment-cas"],
+      },
+    ],
+    createdAt,
+  });
+}
+
 test("repository exposes raw speaker evidence before final-evidence policy filtering", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -305,6 +340,136 @@ test("historical sessions without legacy speaker results are also eligible for l
   });
   assert.equal(queued.enqueued, 1);
   assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
+  );
+});
+
+test("zero-enqueue historical work stays active and ready sessions remain discoverable", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db
+    .prepare("UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = ?")
+    .run("session-cas");
+
+  const first = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6_000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(first.enqueued, 1);
+  repo.db.exec(`
+    UPDATE processing_jobs
+    SET state = 'completed', completed_at = 6100
+    WHERE job_type = 'diarize_track';
+    UPDATE sessions
+    SET processing_state = 'ready', ready_at = 6100
+    WHERE id = 'session-cas';
+  `);
+
+  const second = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6_200,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(second.enqueued, 0);
+  const state = repo.db
+    .prepare("SELECT * FROM session_reprocessing_state WHERE session_id = ?")
+    .get("session-cas");
+  assert.equal(state.state, "queued");
+  for (const column of [
+    "baseline_content_sha256",
+    "baseline_identity_sha256",
+    "baseline_classification_sha256",
+  ]) {
+    assert.match(state[column], /^[0-9a-f]{64}$/u);
+  }
+  assert.deepEqual(
+    repo.listProcessingSessions().map((session) => session.id),
+    ["session-cas"]
+  );
+});
+
+test("atomic local finalize preserves summaries and recommends only semantic changes", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "semantic_baseline"));
+  repo.db.exec(`
+    INSERT INTO analysis_runs (
+      id, session_id, kind, window_start, window_end, input_hash,
+      model, status, attempt_count, created_at, completed_at
+    ) VALUES (
+      'analysis-semantic', 'session-cas', 'final', 1000, 5000, 'semantic-summary-input',
+      'MiniMax-M2.7', 'completed', 1, 6000, 6000
+    );
+    INSERT INTO session_summaries (
+      session_id, summary, decisions_json, suggestions_json,
+      analysis_run_id, updated_at, is_final
+    ) VALUES (
+      'session-cas', 'keep this paid summary', '[]', '[]',
+      'analysis-semantic', 6000, 1
+    );
+    UPDATE sessions SET processing_state = 'ready', ready_at = 6000
+    WHERE id = 'session-cas';
+  `);
+  const requeue = (at) => {
+    repo.enqueueHistoricalHybridReprocessing("session-cas", {
+      at,
+      policy: HYBRID_DIARIZATION_POLICY,
+      speakerProcessingPolicy: finalSpeakerPolicy(),
+    });
+    repo.startHistoricalLocalOnlyReprocessing("session-cas", at + 1);
+  };
+  const refreshState = () =>
+    repo.db
+      .prepare("SELECT recommended, reason FROM session_summary_refresh_state WHERE session_id = ?")
+      .get("session-cas");
+
+  requeue(6_100);
+  repo.db
+    .prepare(
+      "UPDATE speaker_clusters SET match_score = 0.01, quality_score = 0.02, updated_at = 6110"
+    )
+    .run();
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_120);
+  assert.deepEqual(refreshState(), { recommended: 0, reason: null });
+
+  requeue(6_200);
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('semantic-person', 'Semantic Person', 0, 6200, 6200);
+    UPDATE speaker_clusters
+    SET person_id = 'semantic-person', link_state = 'confirmed', updated_at = 6210;
+  `);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_220);
+  assert.deepEqual(refreshState(), { recommended: 1, reason: "speaker_identity_changed" });
+
+  saveLocalActivityClassification(repo, "work_meeting", 6_300);
+  requeue(6_310);
+  saveLocalActivityClassification(repo, "social_call", 6_320);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_330);
+  assert.deepEqual(refreshState(), {
+    recommended: 1,
+    reason: "activity_classification_changed",
+  });
+
+  requeue(6_400);
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("semantic transcript changed", "segment-cas");
+  repo.db.prepare("UPDATE speaker_clusters SET person_id = NULL, link_state = 'unknown'").run();
+  saveLocalActivityClassification(repo, "entertainment", 6_410);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_420);
+  assert.deepEqual(refreshState(), { recommended: 1, reason: "transcript_changed" });
+  assert.equal(
+    repo.db.prepare("SELECT summary FROM session_summaries WHERE session_id = ?").get("session-cas")
+      .summary,
+    "keep this paid summary"
+  );
   assert.equal(
     repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
       .count,

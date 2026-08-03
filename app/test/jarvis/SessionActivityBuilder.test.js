@@ -148,12 +148,14 @@ test("builder derives activity fields from the current audio_tracks schema", () 
       duplicate_of TEXT
     );
   `);
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO audio_tracks (
       id, session_id, source_type, application_key, application_display_name,
       device_label, strategy, started_at, ended_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+  `
+  ).run(
     "track-kook",
     "session-current",
     "system",
@@ -164,12 +166,14 @@ test("builder derives activity fields from the current audio_tracks schema", () 
     1_000,
     4_000
   );
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO transcript_segments (
       id, session_id, track_id, started_at, ended_at, person_id,
       speaker_label, text, result_kind, is_stable, superseded_by, duplicate_of
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'final', 1, NULL, NULL)
-  `).run(
+  `
+  ).run(
     "segment-kook",
     "session-current",
     "track-kook",
@@ -185,4 +189,94 @@ test("builder derives activity fields from the current audio_tracks schema", () 
   assert.equal(activity.sourceAttribution, "application");
   assert.deepEqual(activity.applications, ["kook"]);
   db.close();
+});
+
+test("builder supplies local topic and calendar features without adding identity data", () => {
+  const tracks = [
+    {
+      id: "track-chrome",
+      track_kind: "application",
+      attribution_state: "exact",
+      application_key: "chrome",
+      device_label: null,
+    },
+  ];
+  const segments = [
+    {
+      id: "segment-course",
+      track_id: "track-chrome",
+      started_at: 1_000,
+      ended_at: 4_000,
+      text: "这节课程讲项目规划和编程教程",
+      person_id: null,
+      speaker_label: "speaker_1",
+      is_self: null,
+    },
+  ];
+  const db = {
+    prepare(sql) {
+      if (sql.includes("FROM audio_tracks")) return { all: () => tracks };
+      if (sql.includes("FROM transcript_segments")) return { all: () => segments };
+      if (sql.includes("FROM people")) return { all: () => [] };
+      throw new Error("unexpected query");
+    },
+  };
+  const ranges = [];
+  const [activity] = new SessionActivityBuilder(db, {
+    calendarEventsProvider(range) {
+      ranges.push(range);
+      return [{ summary: "项目周会", attendees_count: 3 }];
+    },
+  }).build("session-course").activities;
+
+  assert.deepEqual(ranges, [{ sessionId: "session-course", startedAt: 1_000, endedAt: 4_000 }]);
+  assert.deepEqual(activity.topicHints, ["project", "planning", "course", "tutorial", "coding"]);
+  assert.equal(activity.calendarBlockKind, "meeting");
+  assert.equal(JSON.stringify(activity).includes("项目周会"), false);
+});
+
+test("calendar lookup failures conservatively degrade to no calendar context", () => {
+  const db = {
+    prepare(sql) {
+      if (sql.includes("FROM audio_tracks")) {
+        return {
+          all: () => [
+            {
+              id: "track-mic",
+              track_kind: "mic",
+              attribution_state: "exact",
+              application_key: null,
+              device_label: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("FROM transcript_segments")) {
+        return {
+          all: () => [
+            {
+              id: "segment-mic",
+              track_id: "track-mic",
+              started_at: 1_000,
+              ended_at: 2_000,
+              text: "普通对话",
+              person_id: null,
+              speaker_label: "speaker_1",
+              is_self: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("FROM people")) return { all: () => [] };
+      throw new Error("unexpected query");
+    },
+  };
+
+  const [activity] = new SessionActivityBuilder(db, {
+    calendarEventsProvider() {
+      throw new Error("calendar unavailable");
+    },
+  }).build("session-mic").activities;
+
+  assert.equal(activity.calendarBlockKind, "none");
 });

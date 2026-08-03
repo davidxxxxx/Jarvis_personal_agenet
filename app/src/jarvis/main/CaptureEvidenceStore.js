@@ -712,6 +712,16 @@ class CaptureEvidenceStore {
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at <= @at
       `),
+      wakeResourceDeferredJobs: db.prepare(`
+        UPDATE processing_jobs
+        SET next_retry_at = @at
+        WHERE lane = 'local'
+          AND state = 'retry'
+          AND completed_at IS NULL
+          AND blocked_reason IN ('external_gpu_busy', 'gpu_utilization_high')
+          AND next_retry_at IS NOT NULL
+          AND next_retry_at > @at
+      `),
       insertCloudJob: db.prepare(`
         INSERT OR IGNORE INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state, priority,
@@ -2544,6 +2554,11 @@ class CaptureEvidenceStore {
   recoverExpiredLeases(at) {
     this._assertNonNegativeSafeInteger(at, "at");
     return this.statements.recoverExpiredJobLeases.run({ at }).changes;
+  }
+
+  wakeResourceDeferredJobs(at) {
+    this._assertNonNegativeSafeInteger(at, "at");
+    return this.statements.wakeResourceDeferredJobs.run({ at }).changes;
   }
 
   renewJobLease(id, { owner, at, leaseMs }) {

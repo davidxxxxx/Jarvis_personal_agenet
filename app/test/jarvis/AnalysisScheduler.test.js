@@ -3,6 +3,9 @@ const assert = require("node:assert/strict");
 const AnalysisScheduler = require("../../src/jarvis/main/AnalysisScheduler");
 
 const HASH = "a".repeat(64);
+const EMPTY_ACTIVITY_REVISION = "e".repeat(64);
+const LOCAL_ACTIVITY_REVISION = "d".repeat(64);
+const ADOPTED_ACTIVITY_REVISION = "f".repeat(64);
 
 function sessionDetail() {
   return {
@@ -78,17 +81,49 @@ function desiredIdentity(overrides = {}) {
   };
 }
 
-function harness({ sendable = true, jobState = "pending", activityClassification = false } = {}) {
+function harness(options = {}) {
+  const {
+    sendable = true,
+    jobState = "pending",
+    activityClassification = false,
+    activityCloudReviewEnabled = true,
+    cloudTransportEnabled = true,
+  } = options;
   const events = [];
-  let inputCreated = false;
+  const tracksParticipantSnapshot = Object.prototype.hasOwnProperty.call(
+    options,
+    "participantSnapshotRevision"
+  );
+  let participantSnapshotRevision = options.participantSnapshotRevision;
   let identity = desiredIdentity();
+  let activityClassifications = [...(options.activityClassifications ?? [])];
+  let activityClassificationRevision =
+    options.activityClassificationRevision ?? EMPTY_ACTIVITY_REVISION;
+  let enqueueFailures = 0;
+  const inputsByKey = new Map();
+  const inputsById = new Map();
   const headHashes = new Map();
+  let currentHead = null;
   const repository = {
     getSessionDetail: () => sessionDetail(),
     listPeople: () => [{ id: "person-real", display_name: "real name", is_self: 0 }],
+    markSessionSummaryRefreshRecommended(sessionId, reason, at) {
+      events.push(["recommend_summary_refresh", { sessionId, reason, at }]);
+      return {
+        session_id: sessionId,
+        recommended: 1,
+        reason,
+        updated_at: at,
+      };
+    },
+    ...(tracksParticipantSnapshot
+      ? {
+          getLatestParticipantSnapshot: () => participantSnapshotRevision,
+        }
+      : {}),
     ...(activityClassification
       ? {
-          listSessionActivityClassifications: () => [],
+          listSessionActivityClassifications: () => activityClassifications,
         }
       : {}),
   };
@@ -99,13 +134,28 @@ function harness({ sendable = true, jobState = "pending", activityClassification
     },
     createAnalysisInput(request) {
       events.push(["create", request]);
-      const status = inputCreated ? "existing" : "created";
-      inputCreated = true;
+      const key = JSON.stringify({
+        transcriptRevision: request.transcriptRevision,
+        identityRevision: request.identityRevision,
+        promptVersion: request.promptVersion,
+        segmentIds: request.segmentIds,
+        cloudPayloadJson: request.cloudPayloadJson,
+      });
+      let input = inputsByKey.get(key);
+      const status = input ? "existing" : "created";
+      if (!input) {
+        const index = inputsByKey.size + 1;
+        input = {
+          analysisInputId: `input-${index}`,
+          inputHash: index === 1 ? HASH : index.toString(16).repeat(64),
+        };
+        inputsByKey.set(key, input);
+        inputsById.set(input.analysisInputId, input);
+      }
       return {
         status,
         candidateState: "pending",
-        analysisInputId: "input-1",
-        inputHash: HASH,
+        ...input,
       };
     },
     setAnalysisDesiredHead(input) {
@@ -115,17 +165,35 @@ function harness({ sendable = true, jobState = "pending", activityClassification
         const digit = String(headHashes.size + 1);
         headHashes.set(key, digit.repeat(64));
       }
-      return {
+      currentHead = {
         analysisInputId: input.analysisInputId,
-        analysisInputHash: HASH,
+        analysisInputHash: inputsById.get(input.analysisInputId).inputHash,
         desiredVectorHash: headHashes.get(key),
         modelVersion: input.modelVersion,
+        activityClassificationRevision: input.activityClassificationRevision ?? null,
       };
+      return currentHead;
     },
+    ...(activityClassification
+      ? {
+          getActivityActionPolicyRevision() {
+            return activityClassificationRevision;
+          },
+          getAnalysisDesiredHead() {
+            return currentHead;
+          },
+        }
+      : {}),
   };
   const cloudQueue = {
     enqueueCloudJob(input) {
       events.push(["enqueue", input]);
+      if (enqueueFailures > 0) {
+        enqueueFailures -= 1;
+        const error = new Error("durable cloud queue temporarily unavailable");
+        error.code = "analysis_runtime_not_ready";
+        throw error;
+      }
       return { id: `job-${input.desiredHeadHash[0]}`, state: jobState };
     },
     authorizeManualAnalysisRetry(id, options) {
@@ -162,13 +230,40 @@ function harness({ sendable = true, jobState = "pending", activityClassification
     },
     desiredIdentityProvider: () => identity,
     cloudQueue,
-    cloudTransportEnabled: true,
+    cloudTransportEnabled,
+    activityCloudReviewEnabled,
     ...(activityClassification
       ? {
           activityClassificationService: {
-            async classifySession(input) {
-              events.push(["classify_activity", input]);
-              return { classifications: [], cloudStatus: "completed" };
+            classifyLocal(input) {
+              events.push(["classify_activity_local", input]);
+              const result = options.classifyLocalActivity
+                ? options.classifyLocalActivity(input)
+                : {
+                    classifications: [{ id: "classification-local", decision: "adopted" }],
+                    cloudStatus: "local_only",
+                    activityClassificationRevision: LOCAL_ACTIVITY_REVISION,
+                  };
+              if (Array.isArray(result?.classifications)) {
+                activityClassifications = result.classifications;
+              }
+              if (typeof result?.activityClassificationRevision === "string") {
+                activityClassificationRevision = result.activityClassificationRevision;
+              }
+              return result;
+            },
+            async reviewSessionWithCloud(input) {
+              events.push(["classify_activity_cloud", input]);
+              const result = options.classifyActivity
+                ? await options.classifyActivity(input)
+                : { classifications: [], cloudStatus: "completed" };
+              if (Array.isArray(result?.classifications)) {
+                activityClassifications = result.classifications;
+              }
+              if (typeof result?.activityClassificationRevision === "string") {
+                activityClassificationRevision = result.activityClassificationRevision;
+              }
+              return result;
             },
           },
           activityBuilder: {
@@ -204,6 +299,19 @@ function harness({ sendable = true, jobState = "pending", activityClassification
     setIdentity(next) {
       identity = desiredIdentity(next);
     },
+    setParticipantSnapshot(next) {
+      if (!tracksParticipantSnapshot) {
+        throw new Error("participant snapshot tracking was not enabled for this harness");
+      }
+      participantSnapshotRevision = next;
+    },
+    setActivityClassificationState(classifications, revision) {
+      activityClassifications = [...classifications];
+      activityClassificationRevision = revision;
+    },
+    failNextEnqueue() {
+      enqueueFailures += 1;
+    },
   };
 }
 
@@ -225,6 +333,82 @@ test("production-default analysis is blocked before reading a session or cloud s
     updatedAt: 10,
   });
   assert.equal(reads, 0);
+});
+
+test("cloud-disabled analysis still commits local activity classification without touching cloud state", async () => {
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    cloudTransportEnabled: false,
+  });
+
+  const status = await scheduler.analyzeSession("s1", "final");
+
+  assert.equal(status.state, "blocked");
+  assert.equal(status.errorCode, "analysis_runtime_not_ready");
+  assert.equal(status.localClassification, "completed");
+  assert.deepEqual(
+    events.map(([name]) => name),
+    ["classify_activity_local"]
+  );
+});
+
+test("activity rollout rollback keeps local classification and analysis while skipping cloud review", async () => {
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    activityCloudReviewEnabled: false,
+  });
+
+  const status = await scheduler.analyzeSession("s1", "final");
+  await scheduler.quiesce();
+
+  assert.equal(status.state, "queued");
+  assert.equal(events.filter(([name]) => name === "classify_activity_local").length, 1);
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  assert.equal(events.filter(([name]) => name === "classify_activity_cloud").length, 0);
+});
+
+test("forced local classification rebuilds latest activity evidence without touching cloud state", () => {
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    activityClassifications: [{ id: "classification-existing", decision: "adopted" }],
+  });
+  const originalBuild = scheduler.activityBuilder.build.bind(scheduler.activityBuilder);
+  let builds = 0;
+  scheduler.activityBuilder.build = (sessionId) => {
+    builds += 1;
+    assert.equal(sessionId, "s1");
+    return originalBuild(sessionId);
+  };
+
+  assert.equal(scheduler.classifySessionLocally("s1"), null);
+  const prepared = scheduler.classifySessionLocally("s1", { force: true });
+
+  assert.equal(builds, 1);
+  assert.equal(prepared.activities[0].activityId, "activity-1");
+  assert.deepEqual(
+    events.map(([name]) => name),
+    ["classify_activity_local"]
+  );
+  assert.equal(
+    events.some(([name]) => name === "classify_activity_cloud"),
+    false
+  );
+  assert.equal(
+    events.some(([name]) => name === "enqueue"),
+    false
+  );
+});
+
+test("local activity classification is durable before cloud input preparation and enqueue", async () => {
+  const { scheduler, events } = harness({ activityClassification: true });
+
+  await scheduler.analyzeSession("s1", "final");
+  await scheduler.quiesce();
+
+  const names = events.map(([name]) => name);
+  assert.ok(names.indexOf("classify_activity_local") < names.indexOf("prepare"));
+  assert.ok(names.indexOf("classify_activity_local") < names.indexOf("enqueue"));
+  assert.ok(names.indexOf("enqueue") < names.indexOf("classify_activity_cloud"));
 });
 
 test("checkpoint and stop triggers only enqueue an exact redacted durable cloud job", async () => {
@@ -270,11 +454,118 @@ test("ten-minute and final triggers target the same durable identity without dir
   );
 });
 
+test("an adopted classification present before analysis is part of the durable desired head", async () => {
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    activityClassifications: [{ id: "classification-adopted", decision: "adopted" }],
+    activityClassificationRevision: ADOPTED_ACTIVITY_REVISION,
+  });
+
+  await scheduler.analyzeSession("s1", "final");
+
+  assert.equal(events.filter(([name]) => name === "classify_activity_local").length, 0);
+  assert.equal(events.filter(([name]) => name === "classify_activity_cloud").length, 0);
+  assert.equal(
+    events.find(([name]) => name === "set_head")[1].activityClassificationRevision,
+    ADOPTED_ACTIVITY_REVISION
+  );
+});
+
+test("classification completing after analysis recommends a paid refresh without another cloud job", async () => {
+  let releaseClassification;
+  const classification = new Promise((resolve) => {
+    releaseClassification = resolve;
+  });
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    activityClassificationRevision: EMPTY_ACTIVITY_REVISION,
+    classifyActivity: () => classification,
+  });
+
+  const first = await scheduler.analyzeSession("s1", "final");
+  assert.equal(first.state, "queued");
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+    summary: { summary: "keep the paid result" },
+  });
+
+  releaseClassification({
+    classifications: [{ id: "classification-adopted", decision: "adopted" }],
+    activityClassificationRevision: ADOPTED_ACTIVITY_REVISION,
+    cloudStatus: "completed",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  assert.equal(events.filter(([name]) => name === "create").length, 1);
+  assert.equal(events.filter(([name]) => name === "set_head").length, 1);
+  assert.equal(events.filter(([name]) => name === "recommend_summary_refresh").length, 1);
+});
+
+test("an adopted user correction stays local until an explicit paid refresh", async () => {
+  const { scheduler, events, setActivityClassificationState } = harness({
+    activityClassification: true,
+    activityClassifications: [{ id: "classification-original", decision: "adopted" }],
+    activityClassificationRevision: ADOPTED_ACTIVITY_REVISION,
+  });
+  await scheduler.analyzeSession("s1", "final");
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+    summary: { summary: "keep the paid result" },
+  });
+
+  const correctedRevision = "9".repeat(64);
+  setActivityClassificationState(
+    [{ id: "classification-corrected", decision: "adopted" }],
+    correctedRevision
+  );
+  await scheduler.refreshAfterActivityClassification("s1");
+  scheduler.repository.listSessions = () => [
+    { id: "s1", status: "completed", processing_state: "ready" },
+  ];
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "ready",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 1,
+    updatedAt: 9,
+  });
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  const automatic = await scheduler.analyzeSession("s1", "final");
+
+  assert.equal(automatic.summaryRefreshRecommended, true);
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
+  assert.deepEqual(
+    events
+      .filter(([name]) => name === "set_head")
+      .map(([, input]) => input.activityClassificationRevision),
+    [ADOPTED_ACTIVITY_REVISION]
+  );
+  assert.equal(events.filter(([name]) => name === "recommend_summary_refresh").length, 3);
+
+  const paid = await scheduler.analyzeSession("s1", "final", { manual: true });
+
+  assert.equal(paid.state, "queued");
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 2);
+  assert.deepEqual(
+    events
+      .filter(([name]) => name === "set_head")
+      .map(([, input]) => input.activityClassificationRevision),
+    [ADOPTED_ACTIVITY_REVISION, correctedRevision]
+  );
+});
+
 test("only an explicit manual request requeues a blocked analysis job", async () => {
   const { scheduler, events } = harness({ jobState: "blocked" });
 
   assert.equal((await scheduler.analyzeSession("s1", "final")).state, "queued");
-  assert.equal(events.some(([name]) => name === "manual_retry"), false);
+  assert.equal(
+    events.some(([name]) => name === "manual_retry"),
+    false
+  );
 
   const retried = await scheduler.analyzeSession("s1", "final", {
     manual: true,
@@ -298,6 +589,70 @@ test("changed schema or subject identity targets a replacement desired-head job"
   const replacement = await scheduler.analyzeSession("s1", "final");
   assert.notEqual(replacement.desiredVectorHash, first.desiredVectorHash);
   assert.notEqual(replacement.jobId, first.jobId);
+});
+
+test("durable participant snapshot revisions cannot reuse a stale analysis identity", async () => {
+  const { scheduler, events, setParticipantSnapshot } = harness({
+    participantSnapshotRevision: {
+      revision: 1,
+      sourceHash: "9".repeat(64),
+      projectorVersion: "session-participants-v1",
+    },
+  });
+
+  const baseline = await scheduler.analyzeSession("s1", "final");
+  setParticipantSnapshot({
+    revision: 2,
+    sourceHash: "8".repeat(64),
+    projectorVersion: "session-participants-v1",
+  });
+  const sourceChanged = await scheduler.analyzeSession("s1", "final");
+  setParticipantSnapshot({
+    revision: 3,
+    sourceHash: "8".repeat(64),
+    projectorVersion: "session-participants-v2",
+  });
+  const projectorChanged = await scheduler.analyzeSession("s1", "final");
+  setParticipantSnapshot({
+    revision: 4,
+    sourceHash: "8".repeat(64),
+    projectorVersion: "session-participants-v2",
+  });
+  const revisionOnlyChanged = await scheduler.analyzeSession("s1", "final");
+
+  assert.equal(
+    new Set(
+      [baseline, sourceChanged, projectorChanged, revisionOnlyChanged].map((status) => status.jobId)
+    ).size,
+    4
+  );
+  const creates = events.filter(([name]) => name === "create").map(([, input]) => input);
+  assert.equal(new Set(creates.map((input) => input.identityRevision)).size, 4);
+  assert.deepEqual(
+    creates.map((input) => input.participantSnapshotRevision),
+    [
+      {
+        revision: 1,
+        sourceHash: "9".repeat(64),
+        projectorVersion: "session-participants-v1",
+      },
+      {
+        revision: 2,
+        sourceHash: "8".repeat(64),
+        projectorVersion: "session-participants-v1",
+      },
+      {
+        revision: 3,
+        sourceHash: "8".repeat(64),
+        projectorVersion: "session-participants-v2",
+      },
+      {
+        revision: 4,
+        sourceHash: "8".repeat(64),
+        projectorVersion: "session-participants-v2",
+      },
+    ]
+  );
 });
 
 test("an unsendable immutable input is blocked before input, head, or job persistence", async () => {
@@ -445,7 +800,7 @@ test("startup cloud recovery skips active historical local-only reprocessing", a
   assert.equal(events.find(([name]) => name === "enqueue")[1].sessionId, "normal");
 });
 
-test("startup recovery backfills activity classification for an already summarized session", async () => {
+test("startup recovery backfills local classification and only recommends summary refresh", async () => {
   const { scheduler, events } = harness({
     jobState: "completed",
     activityClassification: true,
@@ -472,6 +827,95 @@ test("startup recovery backfills activity classification for an already summariz
 
   assert.equal(await scheduler.recoverReadySessions(), 1);
   await scheduler.quiesce();
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 0);
+  assert.equal(events.filter(([name]) => name === "classify_activity_local").length, 1);
+  assert.equal(events.filter(([name]) => name === "classify_activity_cloud").length, 0);
+  assert.equal(events.filter(([name]) => name === "recommend_summary_refresh").length, 1);
+});
+
+test("startup recovery never replaces a paid head for a newer classification revision", async () => {
+  const { scheduler, events } = harness({
+    jobState: "completed",
+    activityClassification: true,
+    activityClassifications: [{ id: "classification-adopted", decision: "adopted" }],
+    activityClassificationRevision: ADOPTED_ACTIVITY_REVISION,
+  });
+  scheduler.repository.listSessions = () => [
+    { id: "s1", status: "completed", processing_state: "ready" },
+  ];
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+    summary: { summary: "already durable" },
+  });
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "ready",
+    retryable: false,
+    errorCode: null,
+    nextRetryAt: null,
+    attemptCount: 1,
+    updatedAt: 9,
+  });
+  scheduler.memoryRepository.getAnalysisDesiredHead = () => ({
+    activityClassificationRevision: EMPTY_ACTIVITY_REVISION,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 0);
+  assert.equal(events.filter(([name]) => name === "classify_activity_local").length, 0);
+  assert.equal(events.filter(([name]) => name === "classify_activity_cloud").length, 0);
+  assert.equal(events.filter(([name]) => name === "recommend_summary_refresh").length, 1);
+});
+
+test("startup recovery recreates a genuinely missing initial cloud job", async () => {
+  const { scheduler, events, failNextEnqueue } = harness();
+  failNextEnqueue();
+  assert.throws(
+    () => scheduler.analyzeSession("s1", "final"),
+    (error) => error?.code === "analysis_runtime_not_ready"
+  );
+
+  scheduler.repository.listSessions = () => [
+    { id: "s1", status: "completed", processing_state: "ready" },
+  ];
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+  });
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "retry_needed",
+    retryable: true,
+    errorCode: "analysis_runtime_not_ready",
+    nextRetryAt: null,
+    attemptCount: 0,
+    updatedAt: 10,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 1);
+  assert.equal(events.filter(([name]) => name === "enqueue").length, 2);
+});
+
+test("startup missing-job recovery does not re-enqueue a normal rate-limit retry", async () => {
+  const { scheduler, events } = harness({
+    activityClassification: true,
+    activityClassifications: [{ id: "classification-adopted", decision: "adopted" }],
+    activityClassificationRevision: ADOPTED_ACTIVITY_REVISION,
+  });
+  await scheduler.analyzeSession("s1", "final");
+  scheduler.repository.listSessions = () => [
+    { id: "s1", status: "completed", processing_state: "ready" },
+  ];
+  scheduler.repository.getSessionDetail = () => ({
+    ...sessionDetail(),
+    summary: { summary: "already durable" },
+  });
+  scheduler.memoryRepository.getAnalysisWorkState = () => ({
+    state: "retry_needed",
+    retryable: true,
+    errorCode: "rate_limit",
+    nextRetryAt: 100,
+    attemptCount: 1,
+    updatedAt: 10,
+  });
+
+  assert.equal(await scheduler.recoverReadySessions(), 0);
   assert.equal(events.filter(([name]) => name === "enqueue").length, 1);
-  assert.equal(events.filter(([name]) => name === "classify_activity").length, 1);
 });

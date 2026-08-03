@@ -5,6 +5,7 @@ const { normalizeProcessApplications } = require("./applicationNameNormalizer");
 const START_TIMEOUT_MS = 5_000;
 const STOP_TIMEOUT_MS = 3_000;
 const MAX_LINE_BUFFER_BYTES = 64 * 1024;
+const AUDIBLE_PEAK_THRESHOLD = 0.0005;
 
 async function defaultProcessList() {
   const module = await import("ps-list");
@@ -35,6 +36,7 @@ class WindowsAudioSessionWatcher {
     this.onWarning = onWarning;
     this.onError = onError;
     this.process = null;
+    this.stopPromise = null;
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
     this.identityByPid = new Map();
@@ -43,12 +45,17 @@ class WindowsAudioSessionWatcher {
   }
 
   async start() {
+    if (this.stopPromise) await this.stopPromise;
     if (this.process) return;
     if (this.platform !== "win32") {
       throw new Error("Application audio session watch is available only on Windows.");
     }
     const capability = await this.capabilityProvider();
-    if (!capability?.available || !capability.supportsApplicationCapture || !capability.supportsSessionWatch) {
+    if (
+      !capability?.available ||
+      !capability.supportsApplicationCapture ||
+      !capability.supportsSessionWatch
+    ) {
       const minimum = capability?.minimumWindowsBuild ?? 20348;
       throw new Error(`Application audio capture requires Windows build ${minimum} or newer.`);
     }
@@ -125,10 +132,11 @@ class WindowsAudioSessionWatcher {
   }
 
   async stop() {
+    if (this.stopPromise) return this.stopPromise;
     const child = this.process;
     if (!child) return;
     this.stopping = true;
-    await new Promise((resolve) => {
+    const stopPromise = new Promise((resolve) => {
       const timeout = setTimeout(() => {
         try {
           child.kill();
@@ -150,11 +158,15 @@ class WindowsAudioSessionWatcher {
           resolve();
         }
       }
+    }).finally(() => {
+      if (this.process === child) this.process = null;
+      this.stdoutBuffer = "";
+      this.stderrBuffer = "";
+      this.stopping = false;
+      if (this.stopPromise === stopPromise) this.stopPromise = null;
     });
-    if (this.process === child) this.process = null;
-    this.stdoutBuffer = "";
-    this.stderrBuffer = "";
-    this.stopping = false;
+    this.stopPromise = stopPromise;
+    return stopPromise;
   }
 
   async _handleSession(message) {
@@ -169,6 +181,9 @@ class WindowsAudioSessionWatcher {
     ) {
       return;
     }
+    if (message.audible !== undefined && typeof message.audible !== "boolean") return;
+    const measuredAudible = message.state === "active" && message.peak >= AUDIBLE_PEAK_THRESHOLD;
+    if (message.audible !== undefined && message.audible !== measuredAudible) return;
     if (!this.identityByPid.has(message.pid)) await this._refreshProcessMap();
     const identity = this.identityByPid.get(message.pid);
     if (!identity) return;
@@ -178,6 +193,7 @@ class WindowsAudioSessionWatcher {
       applicationKey: identity.applicationKey,
       applicationDisplayName: identity.applicationDisplayName,
       peak: message.peak,
+      audible: measuredAudible,
     });
     if (message.state === "inactive") this.identityByPid.delete(message.pid);
   }

@@ -208,7 +208,7 @@ class JarvisAnalysisWorker {
       head.desiredVectorHash === job.desired_head_hash &&
       head.modelVersion === this.model &&
       head.promptVersion === "jarvis-analysis-hierarchical-v3" &&
-      head.responseSchemaVersion === "jarvis-analysis-v2"
+      head.responseSchemaVersion === "jarvis-analysis-v3"
     );
   }
 
@@ -318,6 +318,7 @@ class JarvisAnalysisWorker {
       const result = this.validateCandidate(response.result, {
         allowedSegmentIds: new Set(analysisInput.allowedSegmentIds),
         allowedOwnerLabels: new Set(analysisInput.allowedOwnerLabels),
+        allowedLearningGoalIds: new Set(analysisInput.allowedLearningGoalIds ?? []),
       });
       return { result, usage: authoritativeUsage };
     } catch (cause) {

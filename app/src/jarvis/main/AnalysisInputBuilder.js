@@ -1,6 +1,7 @@
 const crypto = require("node:crypto");
 
-const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
+const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v3";
+const LEGACY_INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
 const REDACTION_VERSION = "jarvis-redaction-v1";
 // MiniMax M2.7 supports a 204,800-token combined context. A 384 KiB UTF-8
 // transcript envelope leaves ample room for the system prompt, tool schema,
@@ -9,6 +10,25 @@ const REDACTION_VERSION = "jarvis-redaction-v1";
 const DEFAULT_MAX_PAYLOAD_BYTES = 384 * 1024;
 const HIERARCHICAL_WINDOW_MS = 20 * 60_000;
 const LABEL_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
+const LEARNING_GOAL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const APPLICATION_KEY_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/u;
+const SOURCE_ATTRIBUTIONS = new Set([
+  "application",
+  "microphone",
+  "application_and_microphone",
+  "mixed_unknown",
+]);
+const ACTIVITY_CATEGORIES = new Set([
+  "work_meeting",
+  "learning",
+  "social_call",
+  "in_person_conversation",
+  "entertainment",
+  "gaming",
+  "other",
+  "unknown",
+]);
+const ACTIVITY_DECISIONS = new Set(["adopted", "tentative", "unknown"]);
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
@@ -133,6 +153,72 @@ function redactText(text, redactionTerms) {
   return compileRedactionTerms(redactionTerms)(text);
 }
 
+function normalizedSegmentContext(segment) {
+  const applicationKey = segment.applicationKey ?? null;
+  const sourceAttribution = segment.sourceAttribution ?? "mixed_unknown";
+  const activityCategory = segment.activityCategory ?? "unknown";
+  const activityConfidence = segment.activityConfidence ?? 0;
+  const activityDecision = segment.activityDecision ?? "unknown";
+  const selfParticipated = segment.selfParticipated ?? segment.speakerBindingLabel === "SELF";
+  if (
+    (applicationKey !== null &&
+      (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey))) ||
+    !SOURCE_ATTRIBUTIONS.has(sourceAttribution) ||
+    !ACTIVITY_CATEGORIES.has(activityCategory) ||
+    typeof activityConfidence !== "number" ||
+    !Number.isFinite(activityConfidence) ||
+    activityConfidence < 0 ||
+    activityConfidence > 1 ||
+    !ACTIVITY_DECISIONS.has(activityDecision) ||
+    typeof selfParticipated !== "boolean" ||
+    (["application", "application_and_microphone"].includes(sourceAttribution) &&
+      applicationKey === null) ||
+    (["microphone", "mixed_unknown"].includes(sourceAttribution) && applicationKey !== null)
+  ) {
+    throw new TypeError("prepared segment is invalid");
+  }
+
+  let memoryMode = "summary_only";
+  let allowedSuggestionBases = [];
+  let todoCandidateAllowed = false;
+  if (activityCategory === "unknown" || activityDecision === "unknown") {
+    memoryMode = "transcript_only";
+  } else if (sourceAttribution === "mixed_unknown") {
+    memoryMode = "summary_only";
+  } else if (activityCategory === "entertainment" || activityCategory === "gaming") {
+    memoryMode =
+      activityDecision === "adopted" && activityConfidence >= 0.8
+        ? "interest_only"
+        : "summary_only";
+  } else if (activityDecision === "adopted" && activityConfidence >= 0.8 && selfParticipated) {
+    memoryMode = "full";
+    if (activityCategory === "work_meeting") {
+      allowedSuggestionBases = ["work_context"];
+      todoCandidateAllowed = true;
+    } else if (activityCategory === "learning") {
+      allowedSuggestionBases = ["learning_goal"];
+      todoCandidateAllowed = true;
+    } else if (
+      activityCategory === "social_call" ||
+      activityCategory === "in_person_conversation"
+    ) {
+      allowedSuggestionBases = ["explicit_agreement"];
+      todoCandidateAllowed = true;
+    }
+  }
+  return {
+    applicationKey,
+    sourceAttribution,
+    activityCategory,
+    activityConfidence: Number(activityConfidence.toFixed(4)),
+    activityDecision,
+    selfParticipated,
+    memoryMode,
+    allowedSuggestionBases,
+    todoCandidateAllowed,
+  };
+}
+
 function normalizeSegments(preparedSnapshot) {
   if (!Array.isArray(preparedSnapshot.segments)) throw new TypeError("segments must be an array");
   const labels = new Set(
@@ -165,11 +251,13 @@ function normalizeSegments(preparedSnapshot) {
       throw new TypeError("prepared segment is invalid");
     }
     ids.add(segment.segmentId);
+    const context = normalizedSegmentContext(segment);
     return {
       segmentId: segment.segmentId,
       startedAt: segment.startedAt,
       endedAt: segment.endedAt,
       speakerLabel: segment.speakerBindingLabel,
+      ...context,
       text: redact(segment.textSnapshot),
     };
   });
@@ -179,6 +267,33 @@ function normalizeSegments(preparedSnapshot) {
       left.endedAt - right.endedAt ||
       left.segmentId.localeCompare(right.segmentId)
   );
+}
+
+function normalizeLearningGoals(preparedSnapshot) {
+  const goals = preparedSnapshot.learningGoals ?? [];
+  if (!Array.isArray(goals) || goals.length > 32) {
+    throw new TypeError("learningGoals must be an array with at most 32 entries");
+  }
+  const redact = compileRedactionTerms(preparedSnapshot.redactionTerms);
+  const ids = new Set();
+  return goals
+    .map((goal) => {
+      plainObject(goal, "learningGoal");
+      if (
+        !exactKeys(goal, ["goalId", "title"]) ||
+        typeof goal.goalId !== "string" ||
+        !LEARNING_GOAL_ID_PATTERN.test(goal.goalId) ||
+        ids.has(goal.goalId) ||
+        typeof goal.title !== "string" ||
+        !goal.title.trim() ||
+        Array.from(goal.title).length > 500
+      ) {
+        throw new TypeError("prepared learning goal is invalid");
+      }
+      ids.add(goal.goalId);
+      return { goalId: goal.goalId, title: redact(goal.title.trim()) };
+    })
+    .sort((left, right) => left.goalId.localeCompare(right.goalId));
 }
 
 function collapsedOmittedRanges(segments, selectedIds) {
@@ -197,10 +312,13 @@ function collapsedOmittedRanges(segments, selectedIds) {
     }, []);
 }
 
-function payloadFor(segments, selected) {
+function payloadFor(segments, selected, learningGoals = []) {
   const selectedIds = new Set(selected.map((segment) => segment.segmentId));
   return {
     inputVersion: INPUT_CONTRACT_VERSION,
+    ...(learningGoals.length > 0
+      ? { learningGoals: learningGoals.map((goal) => ({ ...goal })) }
+      : {}),
     segments: selected.map((segment) => ({ ...segment })),
     omittedRanges: collapsedOmittedRanges(segments, selectedIds),
   };
@@ -257,6 +375,7 @@ class AnalysisInputBuilder {
   build(preparedSnapshot, { cursor = 0, strategy = "sequential" } = {}) {
     const prepared = plainObject(preparedSnapshot, "preparedSnapshot");
     const segments = normalizeSegments(prepared);
+    const learningGoals = normalizeLearningGoals(prepared);
     if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > segments.length) {
       throw new TypeError("cursor is invalid");
     }
@@ -285,7 +404,7 @@ class AnalysisInputBuilder {
                 left.segmentId.localeCompare(right.segmentId)
             )
           : [...selected, segments[index]];
-      const candidate = payloadFor(segments, nextSelected);
+      const candidate = payloadFor(segments, nextSelected, learningGoals);
       const candidateBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
       if (candidateBytes > this.maxPayloadBytes) {
         if (strategy === "sequential" && selected.length > 0) {
@@ -300,7 +419,7 @@ class AnalysisInputBuilder {
     }
     if (strategy !== "sequential") nextCursor = segments.length;
 
-    const cloudPayload = payloadFor(segments, selected);
+    const cloudPayload = payloadFor(segments, selected, learningGoals);
     const cloudPayloadJson = JSON.stringify(cloudPayload);
     const selectedOwnerLabels = [...new Set(selected.map((segment) => segment.speakerLabel))];
     const localBindings = structuredClone(
@@ -333,9 +452,16 @@ class AnalysisInputBuilder {
     try {
       const payload = plainObject(cloudPayload, "cloudPayload");
       const prepared = plainObject(preparedSnapshot, "preparedSnapshot");
+      const expectedLearningGoals = normalizeLearningGoals(prepared);
+      const expectedPayloadKeys =
+        expectedLearningGoals.length > 0
+          ? ["inputVersion", "learningGoals", "segments", "omittedRanges"]
+          : ["inputVersion", "segments", "omittedRanges"];
       if (
-        !exactKeys(payload, ["inputVersion", "segments", "omittedRanges"]) ||
+        !exactKeys(payload, expectedPayloadKeys) ||
         payload.inputVersion !== INPUT_CONTRACT_VERSION ||
+        (expectedLearningGoals.length > 0 &&
+          JSON.stringify(payload.learningGoals) !== JSON.stringify(expectedLearningGoals)) ||
         !Array.isArray(payload.segments) ||
         payload.segments.length === 0 ||
         !Array.isArray(payload.omittedRanges) ||
@@ -348,7 +474,24 @@ class AnalysisInputBuilder {
       const selectedIds = new Set();
       let previous = null;
       for (const segment of payload.segments) {
-        if (!exactKeys(segment, ["segmentId", "startedAt", "endedAt", "speakerLabel", "text"])) {
+        if (
+          !exactKeys(segment, [
+            "segmentId",
+            "startedAt",
+            "endedAt",
+            "speakerLabel",
+            "applicationKey",
+            "sourceAttribution",
+            "activityCategory",
+            "activityConfidence",
+            "activityDecision",
+            "selfParticipated",
+            "memoryMode",
+            "allowedSuggestionBases",
+            "todoCandidateAllowed",
+            "text",
+          ])
+        ) {
           return false;
         }
         const expectedSegment = expectedById.get(segment.segmentId);
@@ -377,7 +520,9 @@ class AnalysisInputBuilder {
 
 module.exports = AnalysisInputBuilder;
 module.exports.INPUT_CONTRACT_VERSION = INPUT_CONTRACT_VERSION;
+module.exports.LEGACY_INPUT_CONTRACT_VERSION = LEGACY_INPUT_CONTRACT_VERSION;
 module.exports.REDACTION_VERSION = REDACTION_VERSION;
 module.exports.DEFAULT_MAX_PAYLOAD_BYTES = DEFAULT_MAX_PAYLOAD_BYTES;
 module.exports.redactText = redactText;
 module.exports.compileRedactionTerms = compileRedactionTerms;
+module.exports.normalizedSegmentContext = normalizedSegmentContext;

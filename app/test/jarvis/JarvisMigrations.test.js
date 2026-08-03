@@ -1781,7 +1781,7 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 1_000 });
-    assert.equal(TARGET_VERSION, 47);
+    assert.ok(TARGET_VERSION >= 30);
 
     const explain = (sql, ...params) =>
       db
@@ -1950,10 +1950,9 @@ test("v45 prunes only unreferenced superseded daily-digest snapshots", () => {
       fromVersion: 44,
       toVersion: TARGET_VERSION,
     });
-    assert.deepEqual(
-      db.prepare("SELECT id FROM daily_digest_inputs ORDER BY id").all(),
-      [{ id: "digest-input-active" }]
-    );
+    assert.deepEqual(db.prepare("SELECT id FROM daily_digest_inputs ORDER BY id").all(), [
+      { id: "digest-input-active" },
+    ]);
     assert.deepEqual(
       db
         .prepare(
@@ -2209,6 +2208,77 @@ test("v29 preserves legacy session-anchored digest jobs as inert terminal histor
         error_code: "LEGACY_DIGEST_IDENTITY_UNAVAILABLE",
         completed_at: 123,
       }
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v50 upgrades active v49 local reprocessing with semantic SHA-256 baselines", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at, processing_state)
+      VALUES ('v49-reprocessing', 10, 20, 'completed', 10, 'ready');
+      DROP TABLE session_reprocessing_state;
+      DROP TABLE session_summary_refresh_state;
+      CREATE TABLE session_summary_refresh_state (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        basis_policy_id TEXT,
+        latest_policy_id TEXT NOT NULL,
+        recommended INTEGER NOT NULL DEFAULT 0 CHECK(recommended IN (0,1)),
+        reason TEXT CHECK(reason IS NULL OR reason IN (
+          'speaker_count_changed','speaker_identity_changed','application_source_changed',
+          'transcript_changed','manual_request'
+        )),
+        updated_at INTEGER NOT NULL,
+        CHECK(recommended = 1 OR reason IS NULL)
+      );
+      CREATE TABLE session_reprocessing_state (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        policy_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode = 'historical_local_only'),
+        state TEXT NOT NULL CHECK(state IN ('queued','processing','completed')),
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        CHECK((state = 'completed') = (completed_at IS NOT NULL))
+      );
+      INSERT INTO session_reprocessing_state (
+        session_id, policy_id, mode, state, started_at, completed_at
+      ) VALUES (
+        'v49-reprocessing', 'jarvis-hybrid-diarization-v2',
+        'historical_local_only', 'processing', 900, NULL
+      );
+      PRAGMA user_version = 49;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 49,
+      toVersion: TARGET_VERSION,
+    });
+    const row = db
+      .prepare("SELECT * FROM session_reprocessing_state WHERE session_id = ?")
+      .get("v49-reprocessing");
+    assert.equal(row.state, "processing");
+    assert.equal(row.started_at, 900);
+    assert.equal(row.completed_at, null);
+    for (const column of [
+      "baseline_content_sha256",
+      "baseline_identity_sha256",
+      "baseline_classification_sha256",
+    ]) {
+      assert.match(row[column], /^[0-9a-f]{64}$/u);
+    }
+    assert.doesNotThrow(() =>
+      db
+        .prepare(
+          `INSERT INTO session_summary_refresh_state (
+             session_id, latest_policy_id, recommended, reason, updated_at
+           ) VALUES (?, ?, 1, 'activity_classification_changed', ?)`
+        )
+        .run("v49-reprocessing", "jarvis-hybrid-diarization-v2", 2_000)
     );
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {

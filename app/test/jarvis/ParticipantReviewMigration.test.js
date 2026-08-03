@@ -42,8 +42,8 @@ test("v46 databases migrate participant review history and overrides to v47", (t
   initial.close();
 
   migrated = new JarvisRepository(databasePath);
-  assert.equal(TARGET_VERSION, 47);
-  assert.equal(migrated.db.pragma("user_version", { simple: true }), 47);
+  assert.ok(TARGET_VERSION >= 47);
+  assert.equal(migrated.db.pragma("user_version", { simple: true }), TARGET_VERSION);
   const tables = new Set(
     migrated.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")

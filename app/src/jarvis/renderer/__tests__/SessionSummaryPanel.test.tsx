@@ -31,7 +31,17 @@ function detailWithSummary(): JarvisSessionDetail {
     },
     segments: [],
     audioChunks: [],
-    topics: [],
+    topics: [
+      {
+        id: "topic-1",
+        canonical_title: "Project Atlas",
+        normalized_title: "project atlas",
+        description: "Launch scope and delivery timing",
+        status: "active",
+        created_at: 1_000,
+        last_seen_at: 2_000,
+      },
+    ],
     todos: [
       {
         id: "todo-1",
@@ -82,6 +92,31 @@ describe("SessionSummaryPanel", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Ship the MVP on Friday")).toBeInTheDocument();
     expect(screen.getByText(/Prepare the demo/)).toBeInTheDocument();
+    expect(screen.getByText("Project Atlas")).toBeInTheDocument();
+    expect(screen.getByText("Launch scope and delivery timing")).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["blocked", "offline", "Offline"],
+    ["quota_limited", "budget_exceeded", "Quota limited"],
+    ["retry_needed", "rate_limit", "Retry needed"],
+  ] as const)("shows the explicit %s analysis outcome", async (state, errorCode, label) => {
+    getSessionDetail.mockResolvedValue({
+      ...detailWithSummary(),
+      summary: null,
+    });
+    getAnalysisStatus.mockResolvedValue({
+      sessionId: "session-1",
+      state,
+      errorCode,
+      updatedAt: 2_100,
+    });
+
+    render(<SessionSummaryPanel sessionId="session-1" sessionStatus="completed" />);
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry summary" })).toBeInTheDocument();
   });
 
   it("offers an in-place retry when final analysis is blocked", async () => {

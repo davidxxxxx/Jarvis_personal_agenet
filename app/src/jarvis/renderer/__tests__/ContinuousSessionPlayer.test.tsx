@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { JarvisSessionTimeline } from "../../types";
+import type { JarvisKnowledgeActionInput, JarvisSessionTimeline } from "../../types";
 import ContinuousSessionPlayer from "../ContinuousSessionPlayer";
 
 class FakeAudio {
@@ -403,5 +403,72 @@ describe("ContinuousSessionPlayer", () => {
 
     expect(createdAudio[0].pause).toHaveBeenCalled();
     expect(screen.getByRole("button", { name: /播放这条转写/ })).toBeInTheDocument();
+  });
+
+  it("creates a Todo from final transcript references without copying raw evidence", async () => {
+    const applyKnowledgeAction = vi
+      .fn<(input: JarvisKnowledgeActionInput) => Promise<unknown>>()
+      .mockRejectedValueOnce(new Error("temporary failure"))
+      .mockImplementation(async (input) => ({
+        status: "applied" as const,
+        commandId: input.commandId,
+        type: input.type,
+        entityKind: "todo" as const,
+        entityId: "todo-created",
+        occurredAt: Date.now(),
+        todoId: "todo-created",
+      }));
+    window.electronAPI = {
+      jarvis: { applyKnowledgeAction },
+    } as unknown as typeof window.electronAPI;
+
+    const view = render(<ContinuousSessionPlayer timeline={timeline()} readChunk={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "从该转写创建 Todo" }));
+    expect(screen.getByLabelText("待办标题")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "创建待办" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("待办标题"), {
+      target: { value: "整理这段讨论" },
+    });
+    fireEvent.change(screen.getByLabelText("日期或时间（可选）"), {
+      target: { value: "周五" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建待办" }));
+
+    await waitFor(() => expect(applyKnowledgeAction).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("操作没有保存，请稍后重试。")).toBeVisible();
+    const firstInput = applyKnowledgeAction.mock.calls[0][0];
+    fireEvent.click(screen.getByRole("button", { name: "创建待办" }));
+    await waitFor(() => expect(applyKnowledgeAction).toHaveBeenCalledTimes(2));
+    const input = applyKnowledgeAction.mock.calls[1][0];
+    expect(firstInput.type).toBe("transcript_create");
+    expect(input.type).toBe("transcript_create");
+    expect(input.commandId).toBe(firstInput.commandId);
+    if (firstInput.type !== "transcript_create" || input.type !== "transcript_create") {
+      throw new Error("expected transcript_create actions");
+    }
+    expect(input.todoId).toBe(firstInput.todoId);
+    expect(input).toEqual(
+      expect.objectContaining({
+        type: "transcript_create",
+        sessionId: "session-1",
+        segmentIds: ["segment-system"],
+        title: "整理这段讨论",
+        dueText: "周五",
+      })
+    );
+    expect(input).not.toHaveProperty("quote");
+    expect(input).not.toHaveProperty("evidence");
+    expect(input).not.toHaveProperty("text");
+
+    view.unmount();
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          segments: [{ ...timeline().segments[0], result_kind: "provisional" }],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+    expect(screen.queryByRole("button", { name: "从该转写创建 Todo" })).not.toBeInTheDocument();
   });
 });

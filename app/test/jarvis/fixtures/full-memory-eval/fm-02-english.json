@@ -1,0 +1,137 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-02-english",
+  "coverage": ["english"],
+  "sessionId": "session-fm-02",
+  "request": {
+    "inputHash": "cff90c5d023e9b419d4bc17fb410ce0769554894e133c3aa48e78b2e5d597a96",
+    "allowedSegmentIds": ["seg-fm-02-1", "seg-fm-02-2"],
+    "allowedOwnerLabels": ["P1", "SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-02-1",
+          "startedAt": 1000,
+          "endedAt": 2600,
+          "speakerLabel": "P1",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.95,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "please prepare the release checklist by Thursday."
+        },
+        {
+          "segmentId": "seg-fm-02-2",
+          "startedAt": 2800,
+          "endedAt": 4300,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.95,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "yes, i will prepare it by Thursday."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-02-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Release checklist",
+          "summary": "SELF accepted an assignment to prepare the release checklist by Thursday.",
+          "evidenceSegmentIds": ["seg-fm-02-1", "seg-fm-02-2"]
+        },
+        "memories": [
+          {
+            "kind": "commitment",
+            "title": "Checklist commitment",
+            "body": "SELF accepted responsibility for the release checklist.",
+            "confidence": 0.99,
+            "evidenceSegmentIds": ["seg-fm-02-1", "seg-fm-02-2"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Release checklist",
+            "summary": "Preparation of the release checklist and its deadline.",
+            "evidenceSegmentIds": ["seg-fm-02-1", "seg-fm-02-2"]
+          }
+        ],
+        "todos": [
+          {
+            "title": "Prepare the release checklist",
+            "ownerLabel": "SELF",
+            "dueText": "Thursday",
+            "semanticConfidence": 0.99,
+            "evidenceSegmentIds": ["seg-fm-02-1", "seg-fm-02-2"],
+            "actionKind": "assignment_accepted",
+            "assignmentSegmentIds": ["seg-fm-02-1"],
+            "acceptanceSegmentIds": ["seg-fm-02-2"]
+          }
+        ],
+        "suggestions": [
+          {
+            "title": "Start with required checks",
+            "rationale": "The accepted checklist assignment has a stated Thursday deadline.",
+            "basis": "work_context",
+            "learningGoalId": null,
+            "basedOnEvidenceSegmentIds": ["seg-fm-02-2"]
+          }
+        ]
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-02",
+      "inputHash": "cff90c5d023e9b419d4bc17fb410ce0769554894e133c3aa48e78b2e5d597a96",
+      "requestBytes": 1100,
+      "responseBytes": 820,
+      "durationMs": 13,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 85,
+      "outputTokens": 105
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-02",
+        "sourceSegmentId": "seg-fm-02-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-02",
+        "sourceSegmentId": "seg-fm-02-1"
+      }
+    ],
+    "todos": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-02",
+        "sourceSegmentId": "seg-fm-02-2"
+      }
+    ]
+  }
+}

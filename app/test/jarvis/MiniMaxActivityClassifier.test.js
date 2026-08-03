@@ -173,7 +173,8 @@ test("classifies every batched activity exactly once and preserves input order",
     result.classifications.map((classification) => classification.activityId),
     ["activity-1", "activity-2"]
   );
-  assert.equal(result.classifications[1].allowTodos, true);
+  assert.equal(result.classifications[1].allowTodos, false);
+  assert.equal(result.classifications[1].allowSuggestions, false);
 });
 
 test("caps MiniMax confidence for mixed unknown system audio", async () => {

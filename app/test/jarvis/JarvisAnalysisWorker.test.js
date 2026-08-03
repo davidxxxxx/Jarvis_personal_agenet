@@ -138,7 +138,9 @@ test("startup applies a validated candidate and completes it with zero client ca
 
 test("startup blocks a validated candidate whose local application fails", () => {
   const { worker, calls } = workerHarness({
-    applyError: Object.assign(new Error("local merge failed"), { code: "MEMORY_MERGER_INVALID_INPUT" }),
+    applyError: Object.assign(new Error("local merge failed"), {
+      code: "MEMORY_MERGER_INVALID_INPUT",
+    }),
   });
 
   assert.deepEqual(
@@ -151,8 +153,14 @@ test("startup blocks a validated candidate whose local application fails", () =>
     }),
     { status: "blocked", reason: "candidate_apply_failed", jobId: "job-analysis-1" }
   );
-  assert.equal(calls.some(([name]) => name === "complete"), false);
-  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_candidate_apply_failed");
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+  assert.equal(
+    calls.find(([name]) => name === "block")[2].errorCode,
+    "analysis_candidate_apply_failed"
+  );
 });
 
 test("startup supersedes a reconciled superseded candidate with zero network or apply calls", () => {
@@ -185,7 +193,7 @@ function desiredHead(overrides = {}) {
     transcriptRevision: TRANSCRIPT_HASH,
     identityRevision: IDENTITY_HASH,
     promptVersion: "jarvis-analysis-hierarchical-v3",
-    responseSchemaVersion: "jarvis-analysis-v2",
+    responseSchemaVersion: "jarvis-analysis-v3",
     pseudonymBindingRevision: 1,
     modelVersion: "MiniMax-M2.7",
     cloudPayloadHash: PAYLOAD_HASH,
@@ -208,7 +216,7 @@ function desiredHead(overrides = {}) {
 
 function validCandidate() {
   return {
-    schemaVersion: "jarvis-analysis-v2",
+    schemaVersion: "jarvis-analysis-v3",
     sessionSummary: {
       title: "Session title",
       summary: "A durable session summary.",
@@ -235,6 +243,7 @@ function validCandidate() {
         title: "Prepare the release",
         ownerLabel: "SELF",
         dueText: null,
+        semanticConfidence: 0.95,
         evidenceSegmentIds: ["segment-1"],
       },
     ],
@@ -242,6 +251,8 @@ function validCandidate() {
       {
         title: "Review tomorrow",
         rationale: "A later review may catch regressions.",
+        basis: "work_context",
+        learningGoalId: null,
         basedOnEvidenceSegmentIds: [],
       },
     ],
@@ -530,9 +541,18 @@ test("missing MiniMax configuration defers before reserving or starting budget",
     reason: "configuration_required",
     jobId: "job-analysis-1",
   });
-  assert.equal(calls.some(([name]) => name === "reserve"), false);
-  assert.equal(calls.some(([name]) => name === "mark_started"), false);
-  assert.equal(calls.some(([name]) => name === "request"), false);
+  assert.equal(
+    calls.some(([name]) => name === "reserve"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "mark_started"),
+    false
+  );
+  assert.equal(
+    calls.some(([name]) => name === "request"),
+    false
+  );
 });
 
 test("analysis jobs require the fixed input contract version before durable reads", async () => {
@@ -695,11 +715,11 @@ test("manual retry authorization survives resource deferral before transport", a
   );
 
   assert.equal(result.status, "deferred");
-  assert.equal(harness.calls.some(([name]) => name === "request"), false);
   assert.equal(
-    harness.calls.find(([name]) => name === "defer")[2].preserveManualRetry,
-    true
+    harness.calls.some(([name]) => name === "request"),
+    false
   );
+  assert.equal(harness.calls.find(([name]) => name === "defer")[2].preserveManualRetry, true);
 });
 
 test("prior started and usage-unknown attempts always block before reservation", async () => {
@@ -748,14 +768,14 @@ test("an explicit manual retry may replace usage-unknown work only in no-limit m
   };
   const capped = executionHarness({ attempts: [attempt], budgetMode: "capped" });
   assert.equal(
-    (
-      await capped.worker.execute(
-        claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })
-      )
-    ).status,
+    (await capped.worker.execute(claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })))
+      .status,
     "blocked"
   );
-  assert.equal(capped.calls.some(([name]) => name === "request"), false);
+  assert.equal(
+    capped.calls.some(([name]) => name === "request"),
+    false
+  );
 
   const unlimited = executionHarness({
     attempts: [attempt],
@@ -770,11 +790,8 @@ test("an explicit manual retry may replace usage-unknown work only in no-limit m
     },
   });
   assert.equal(
-    (
-      await unlimited.worker.execute(
-        claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })
-      )
-    ).status,
+    (await unlimited.worker.execute(claimedJob({ error_code: "ANALYSIS_MANUAL_RETRY_AUTHORIZED" })))
+      .status,
     "applied"
   );
   assert.equal(unlimited.calls.filter(([name]) => name === "request").length, 1);
@@ -976,7 +993,9 @@ test("invalid response structure with authoritative usage reconciles then blocks
 
 test("a paid validated response blocks durably when local candidate application fails", async () => {
   const { worker, calls } = executionHarness({
-    applyError: Object.assign(new Error("local merge failed"), { code: "MEMORY_MERGER_INVALID_INPUT" }),
+    applyError: Object.assign(new Error("local merge failed"), {
+      code: "MEMORY_MERGER_INVALID_INPUT",
+    }),
   });
 
   assert.deepEqual(await worker.execute(claimedJob()), {
@@ -987,8 +1006,14 @@ test("a paid validated response blocks durably when local candidate application 
   assert.equal(calls.filter(([name]) => name === "request").length, 1);
   assert.equal(calls.filter(([name]) => name === "reconcile").length, 1);
   assert.equal(calls.filter(([name]) => name === "persist").length, 1);
-  assert.equal(calls.some(([name]) => name === "complete"), false);
-  assert.equal(calls.find(([name]) => name === "block")[2].errorCode, "analysis_candidate_apply_failed");
+  assert.equal(
+    calls.some(([name]) => name === "complete"),
+    false
+  );
+  assert.equal(
+    calls.find(([name]) => name === "block")[2].errorCode,
+    "analysis_candidate_apply_failed"
+  );
 });
 
 test("a head change after paid response reconciles cost but CAS causes no visible write", async () => {

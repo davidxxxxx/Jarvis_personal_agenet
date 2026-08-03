@@ -17,7 +17,7 @@ test("desired identity is deterministic and changes with durable identity revisi
   const first = createDesiredIdentity({ prepared });
   assert.deepEqual(createDesiredIdentity({ prepared }), first);
   assert.equal(first.modelVersion, MODEL);
-  assert.equal(first.responseSchemaVersion, "jarvis-analysis-v2");
+  assert.equal(first.responseSchemaVersion, "jarvis-analysis-v3");
   assert.equal(Number.isSafeInteger(first.pseudonymBindingRevision), true);
   assert.equal(Number.isSafeInteger(first.segmentSubjectRevisions[0].subjectRevision), true);
   assert.notDeepEqual(

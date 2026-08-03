@@ -237,6 +237,10 @@
       "keyConfigured": "MiniMax Key 已配置",
       "keyNotConfigured": "MiniMax Key 未配置",
       "model": "模型：{{model}}",
+      "modelReady": "MiniMax 模型可用性已确认。",
+      "modelCheckUnavailable": "暂时无法检查 MiniMax 模型可用性，本地录音不受影响。",
+      "modelUnavailable": "此 Key 无法使用 {{model}}，云端分析将保持暂停。",
+      "modelFallback": "配置的模型不可用，Jarvis 将改用 {{model}}。",
       "keyLabel": "MiniMax 订阅 Key",
       "saveKey": "保存 MiniMax Key",
       "removeKey": "移除 MiniMax Key",
@@ -306,6 +310,17 @@
         "title": "按应用分离电脑声音",
         "description": "只跟踪正在发声的应用；失败时退回系统混音，保证不漏音且不猜来源。",
         "trackLimit": "最多同时保留的独立应用音轨",
+        "fallbackPolicy": "应用音轨降级为来源未知的系统混音时",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "保守摘要",
+            "description": "保留系统混音和完整转写，仅允许可核查摘要；禁止建议、正式待办及人物或声纹学习。"
+          },
+          "transcript_only": {
+            "title": "仅转写",
+            "description": "保留系统混音和完整转写，禁止摘要、建议、正式待办及人物或声纹学习。"
+          }
+        },
         "runtime": "正在记录 {{active}} 个应用音轨（上限 {{limit}}）· {{fallback}} 个来源已降级",
         "idle": "将在下次录音时启动；全屏游戏期间最多保留两个应用音轨。"
       },

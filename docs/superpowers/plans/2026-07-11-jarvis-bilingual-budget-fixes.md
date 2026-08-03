@@ -41,11 +41,13 @@
 ### Task 1: Draggable Jarvis titlebar
 
 **Files:**
+
 - Create: `app/src/jarvis/renderer/JarvisTitleBar.tsx`
 - Modify: `app/src/jarvis/renderer/JarvisShell.tsx`
 - Modify: `app/src/jarvis/renderer/__tests__/JarvisShell.test.tsx`
 
 **Interfaces:**
+
 - Consumes: existing `WindowControls` component.
 - Produces: `JarvisTitleBar(): JSX.Element` and DOM hooks `data-testid="jarvis-drag-region"`, `data-testid="jarvis-window-controls"`.
 
@@ -60,8 +62,12 @@ vi.mock("../../../components/WindowControls", () => ({
 
 it("provides a draggable titlebar without making window controls draggable", () => {
   render(<JarvisShell />);
-  expect(screen.getByTestId("jarvis-drag-region")).toHaveStyle({ WebkitAppRegion: "drag" });
-  expect(screen.getByTestId("jarvis-window-controls").parentElement).toHaveStyle({
+  expect(screen.getByTestId("jarvis-drag-region")).toHaveStyle({
+    WebkitAppRegion: "drag",
+  });
+  expect(
+    screen.getByTestId("jarvis-window-controls").parentElement,
+  ).toHaveStyle({
     WebkitAppRegion: "no-drag",
   });
 });
@@ -80,7 +86,10 @@ Expected: FAIL because `jarvis-drag-region` does not exist.
 ```tsx
 <header data-testid="jarvis-drag-region" style={{ WebkitAppRegion: "drag" }}>
   <span>Jarvis Memory</span>
-  <div data-testid="jarvis-window-controls-slot" style={{ WebkitAppRegion: "no-drag" }}>
+  <div
+    data-testid="jarvis-window-controls-slot"
+    style={{ WebkitAppRegion: "no-drag" }}
+  >
     <WindowControls />
   </div>
 </header>
@@ -104,6 +113,7 @@ git commit -m "fix: make Jarvis window draggable"
 ### Task 2: Persistent self-voice enrollment status
 
 **Files:**
+
 - Modify: `app/src/jarvis/main/VoiceEnrollmentService.js`
 - Modify: `app/src/jarvis/shared/contracts.js`
 - Modify: `app/src/jarvis/main/registerJarvisIpc.js`
@@ -117,6 +127,7 @@ git commit -m "fix: make Jarvis window draggable"
 - Modify: `app/src/jarvis/renderer/__tests__/VoiceEnrollment.test.tsx`
 
 **Interfaces:**
+
 - Produces: `VoiceEnrollmentService.getStatus(): { enrolled: boolean, profileId: number | null, sampleCount: number, updatedAt: string | null }`.
 - Produces: `CHANNELS.getVoiceEnrollmentStatus = "jarvis:voice-enrollment:status"`.
 - Produces: `window.electronAPI.jarvis.getVoiceEnrollmentStatus()` returning metadata only.
@@ -179,6 +190,7 @@ git commit -m "feat: show persistent self voice status"
 ### Task 3: Local bilingual transcription windows and turbo default
 
 **Files:**
+
 - Create: `app/src/jarvis/main/transcriptionQuality.js`
 - Create: `app/test/jarvis/transcriptionQuality.test.js`
 - Modify: `app/src/jarvis/renderer/useJarvisRecording.ts`
@@ -188,6 +200,7 @@ git commit -m "feat: show persistent self voice status"
 - Modify: `app/src/jarvis/renderer/__tests__/meetingPreparation.test.ts`
 
 **Interfaces:**
+
 - Produces: `buildBilingualPrompt(previousText: string): string` capped at 800 Unicode code points.
 - Produces: `classifyTranscriptQuality(text: string): { suspicious: boolean, reasons: string[] }`.
 - Produces: `mergeOverlappingTranscript(previous: string, next: string): string`.
@@ -199,9 +212,15 @@ Cover these exact cases:
 
 ```js
 assert.match(buildBilingualPrompt("我们讨论 API latency"), /中文和英文混合/);
-assert.equal(mergeOverlappingTranscript("我们讨论 API latency", "API latency and budget"), "and budget");
+assert.equal(
+  mergeOverlappingTranscript("我们讨论 API latency", "API latency and budget"),
+  "and budget",
+);
 assert.equal(classifyTranscriptQuality("und der die das").suspicious, true);
-assert.equal(classifyTranscriptQuality("我们 review 一下 API budget").suspicious, false);
+assert.equal(
+  classifyTranscriptQuality("我们 review 一下 API budget").suspicious,
+  false,
+);
 ```
 
 Also test repeated 3-grams, blank markers, punctuation-only results, and a normal Chinese-English sentence.
@@ -221,8 +240,15 @@ Implement deterministic Unicode-aware normalization, suffix/prefix overlap searc
 Extract and export `resolveJarvisWhisperModel(settings)` from `useJarvisRecording.ts`. Assert:
 
 ```ts
-expect(resolveJarvisWhisperModel({ meetingWhisperModel: "", whisperModel: "base" })).toBe("turbo");
-expect(resolveJarvisWhisperModel({ meetingWhisperModel: "small", whisperModel: "base" })).toBe("small");
+expect(
+  resolveJarvisWhisperModel({ meetingWhisperModel: "", whisperModel: "base" }),
+).toBe("turbo");
+expect(
+  resolveJarvisWhisperModel({
+    meetingWhisperModel: "small",
+    whisperModel: "base",
+  }),
+).toBe("small");
 ```
 
 The first assertion makes Jarvis use turbo by default without changing global OpenWhispr defaults.
@@ -274,12 +300,14 @@ git commit -m "feat: improve Jarvis bilingual local transcription"
 ### Task 4: Transactional monthly cloud budget
 
 **Files:**
+
 - Create: `app/src/jarvis/main/CloudBudgetGuard.js`
 - Create: `app/test/jarvis/CloudBudgetGuard.test.js`
 - Modify: `app/src/jarvis/main/JarvisRepository.js`
 - Modify: `app/test/jarvis/JarvisRepository.test.js`
 
 **Interfaces:**
+
 - Produces repository methods `getCloudBudgetSettings()`, `setCloudBudgetSettings(input)`, `getCloudBudgetStatus(at)`, `reserveCloudUsage(input)`, `settleCloudUsage(input)`, and `releaseCloudUsage(input)`.
 - Produces `CloudBudgetGuard.reserve(request)`, `.settle(reservationId, usage)`, `.release(reservationId)`, and `.status(at)`.
 
@@ -315,7 +343,11 @@ const RESERVATION_MICROUSD = 100_000;
 const DEFAULT_LIMIT_MICROUSD = 5_000_000;
 const MIN_LIMIT_MICROUSD = 5_000_000;
 const MAX_LIMIT_MICROUSD = 10_000_000;
-const PRICE = { version: "openai-2026-07-11", inputPerMillion: 2_500_000, outputPerMillion: 10_000_000 };
+const PRICE = {
+  version: "openai-2026-07-11",
+  inputPerMillion: 2_500_000,
+  outputPerMillion: 10_000_000,
+};
 ```
 
 Calculate micro-USD with integer ceiling arithmetic and keep a promise tail so only one reserve/settle operation runs at a time.
@@ -336,6 +368,7 @@ git commit -m "feat: add transactional cloud budget guard"
 ### Task 5: Opt-in OpenAI correction service and versioned renderer updates
 
 **Files:**
+
 - Create: `app/src/jarvis/main/OpenAiCorrectionService.js`
 - Create: `app/test/jarvis/OpenAiCorrectionService.test.js`
 - Modify: `app/src/jarvis/main/JarvisRepository.js`
@@ -347,6 +380,7 @@ git commit -m "feat: add transactional cloud budget guard"
 - Modify: `app/src/jarvis/renderer/__tests__/meetingFinalSegmentShutdown.test.ts`
 
 **Interfaces:**
+
 - Consumes: `CloudBudgetGuard`, `environmentManager.getOpenAIKey()`, Electron `net.fetch`, and `classifyTranscriptQuality()`.
 - Produces: `OpenAiCorrectionService.maybeCorrect(input): Promise<{ status: string, text?: string, confidence?: number }>`.
 - Produces meeting event type `correction` with `{ text, originalText, source, timestamp, confidence }`.
@@ -356,7 +390,16 @@ git commit -m "feat: add transactional cloud budget guard"
 Assert a normal bilingual transcript performs no request; a suspicious transcript with consent and key sends one multipart request containing model `gpt-4o-transcribe`, `include[]=logprobs`, the WAV, and the bilingual prompt. Mock this response:
 
 ```json
-{"text":"我们 review 一下 API budget","usage":{"type":"tokens","input_tokens":120,"output_tokens":18,"total_tokens":138},"logprobs":[]}
+{
+  "text": "我们 review 一下 API budget",
+  "usage": {
+    "type": "tokens",
+    "input_tokens": 120,
+    "output_tokens": 18,
+    "total_tokens": 138
+  },
+  "logprobs": []
+}
 ```
 
 Assert usage settles, while 401/429/500/timeouts release the reservation and return the local fallback. Assert request/log metadata never contains the key or transcript.
@@ -412,6 +455,7 @@ git commit -m "feat: correct low confidence transcripts within budget"
 ### Task 6: Budget and transcription quality UI
 
 **Files:**
+
 - Create: `app/src/jarvis/renderer/TranscriptionQualityCard.tsx`
 - Create: `app/src/jarvis/renderer/__tests__/TranscriptionQualityCard.test.tsx`
 - Modify: `app/src/jarvis/shared/contracts.js`
@@ -425,6 +469,7 @@ git commit -m "feat: correct low confidence transcripts within budget"
 - Modify: `app/test/jarvis/contracts.test.js`
 
 **Interfaces:**
+
 - Produces channels `jarvis:cloud-budget:get` and `jarvis:cloud-budget:set`.
 - Produces `JarvisCloudBudgetStatus` with enabled, keyConfigured, limit/spent/reserved/remaining micro-USD, month UTC, and blocked reason.
 
@@ -466,9 +511,11 @@ git commit -m "feat: add transcription budget controls"
 ### Task 7: Regression, package, and Windows hardware verification
 
 **Files:**
+
 - Modify only files required by failures found in this task.
 
 **Interfaces:**
+
 - Consumes all prior tasks.
 - Produces verified unpacked Windows artifact.
 
@@ -507,7 +554,8 @@ With mock budget near exhaustion, verify no outbound request occurs. With an ind
 
 - [ ] **Step 5: Copy the verified deliverables**
 
-Copy the installer/unpacked launch artifact and updated README/release notes to `C:\Users\xujie\Documents\Codex\2026-07-10\mvp\outputs` without deleting prior user artifacts.
+Copy the installer/unpacked launch artifact and updated README/release notes to
+`G:\Jarvis\releases\mvp\outputs` without deleting prior user artifacts.
 
 - [ ] **Step 6: Confirm the verification tree is clean**
 

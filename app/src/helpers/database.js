@@ -2089,6 +2089,38 @@ class DatabaseManager {
     }
   }
 
+  getCalendarEventsOverlapping(startedAt, endedAt) {
+    if (
+      !Number.isSafeInteger(startedAt) ||
+      !Number.isSafeInteger(endedAt) ||
+      startedAt < 0 ||
+      endedAt <= startedAt
+    ) {
+      throw new TypeError("calendar range must be a positive millisecond interval");
+    }
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      return this.db
+        .prepare(
+          `SELECT summary, attendees_count, hangout_link, conference_data
+           FROM calendar_events
+           WHERE status = 'confirmed'
+             AND is_all_day = 0
+             AND datetime(start_time) < datetime(?)
+             AND datetime(end_time) > datetime(?)
+           ORDER BY start_time ASC, id ASC`
+        )
+        .all(new Date(endedAt).toISOString(), new Date(startedAt).toISOString());
+    } catch (error) {
+      debugLogger.error(
+        "Error getting overlapping calendar events",
+        { error: error.message },
+        "gcal"
+      );
+      throw error;
+    }
+  }
+
   searchNotes(query, limit = 50) {
     try {
       if (!this.db) throw new Error("Database not initialized");

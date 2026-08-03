@@ -32,6 +32,8 @@ function context(overrides = {}) {
     endedAt: 2_500,
     quoteText: "Stored evidence",
     audioState: "available",
+    transcriptContext: [],
+    actionAttribution: null,
     ...overrides,
   };
 }
@@ -100,6 +102,8 @@ test("evidence context responses are reconstructed from an exact privacy allowli
     "endedAt",
     "quoteText",
     "audioState",
+    "transcriptContext",
+    "actionAttribution",
   ]);
   assert.equal(JSON.stringify(normalized).includes("private"), false);
   assert.equal(normalizeEvidenceContextResponse(null), null);
@@ -115,4 +119,106 @@ test("evidence context responses are reconstructed from an exact privacy allowli
   ]) {
     assert.throws(() => normalizeEvidenceContextResponse(invalid), /evidence context response/i);
   }
+});
+
+test("evidence transcript context is bounded, anonymous, and tied to the cited segment", () => {
+  const normalized = normalizeEvidenceContextResponse(
+    context({
+      transcriptContext: [
+        {
+          segmentId: "segment_before",
+          startedAt: 1_100,
+          endedAt: 1_400,
+          text: "Can you take this?",
+          speakerRelation: "P1",
+          applicationName: "KOOK",
+          isEvidence: false,
+        },
+        {
+          segmentId: "segment_1",
+          startedAt: 1_500,
+          endedAt: 2_500,
+          text: "I will handle it.",
+          speakerRelation: "SELF",
+          applicationName: "Microphone",
+          isEvidence: true,
+        },
+      ],
+    })
+  );
+
+  assert.equal(normalized.transcriptContext.length, 2);
+  assert.equal(normalized.transcriptContext[0].speakerRelation, "P1");
+  assert.equal(JSON.stringify(normalized.transcriptContext).includes("path"), false);
+  for (const invalid of [
+    context({
+      transcriptContext: [
+        {
+          segmentId: "wrong_segment",
+          startedAt: 1_500,
+          endedAt: 2_500,
+          text: "Wrong focal segment",
+          speakerRelation: "SELF",
+          applicationName: "Microphone",
+          isEvidence: true,
+        },
+      ],
+    }),
+    context({
+      transcriptContext: [
+        {
+          segmentId: "segment_1",
+          startedAt: 1_500,
+          endedAt: 2_500,
+          text: "Leaked source",
+          speakerRelation: "SELF",
+          applicationName: "KOOK",
+          isEvidence: true,
+          executablePath: "C:\\private\\kook.exe",
+        },
+      ],
+    }),
+  ]) {
+    assert.throws(() => normalizeEvidenceContextResponse(invalid), /evidence/i);
+  }
+});
+
+test("action evidence attribution keeps only normalized applications and anonymous speaker labels", () => {
+  const normalized = normalizeEvidenceContextResponse(
+    context({
+      sourceType: "system",
+      actionAttribution: {
+        basis: "current_local_state",
+        applicationKey: "kook",
+        applicationName: "KOOK",
+        sourceAttribution: "application_and_microphone",
+        speakerRelation: "SELF",
+        semanticConfidence: 0.96,
+        voiceConfidence: 0.94,
+        transcriptConfidence: 0.91,
+        activityClassification: {
+          id: "classification_1",
+          category: "social_call",
+          confidence: 0.93,
+          decision: "adopted",
+          source: "minimax",
+          reason: "active call with SELF participation",
+        },
+      },
+    })
+  );
+
+  assert.equal(normalized.actionAttribution.applicationName, "KOOK");
+  assert.equal(normalized.actionAttribution.speakerRelation, "SELF");
+  assert.equal(normalized.actionAttribution.activityClassification.category, "social_call");
+  assert.throws(() =>
+    normalizeEvidenceContextResponse(
+      context({
+        actionAttribution: {
+          ...normalized.actionAttribution,
+          executablePath: "C:\\private\\kook.exe",
+        },
+      })
+    )
+  );
 });

@@ -98,13 +98,15 @@ function createGovernedSoakRuntime({
     now,
     governor: {
       sample: async () => ({
-        state: "available",
+        state: deferFinalTranscription ? "busy" : "available",
+        reason: deferFinalTranscription ? "external_gpu_busy" : "resources_available",
+        externalGpuBusy: deferFinalTranscription,
         selectedGpuUuid: null,
         restrictiveForMs: 0,
       }),
       admit: (kind) =>
         deferFinalTranscription && kind === "final_transcription"
-          ? { action: "defer", reason: "simulated_external_gpu_busy" }
+          ? { action: "defer", reason: "external_gpu_busy" }
           : { action: "run_cpu", reason: "bounded_soak" },
     },
     heavyGate: new HeavyJobGate(),

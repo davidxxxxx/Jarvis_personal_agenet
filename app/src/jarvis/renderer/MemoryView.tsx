@@ -71,6 +71,26 @@ function speechDurationLabel(speechMs: number): string {
   return remaining > 0 ? `${minutes} 分 ${remaining} 秒有效语音` : `${minutes} 分钟有效语音`;
 }
 
+function summaryRefreshMessage(reason: string | null): string {
+  const suffix = "原总结已保留；只有点击上方按钮才会调用 MiniMax 重新总结。";
+  switch (reason) {
+    case "summary_incomplete":
+      return "本次长录音的旧总结只覆盖了部分转写。原总结已保留；只有点击上方按钮才会按完整多窗口转写调用 MiniMax 重新总结。";
+    case "transcript_changed":
+      return `本地重处理发现转写内容发生变化。${suffix}`;
+    case "speaker_identity_changed":
+      return `本地重处理发现说话人身份归属发生变化。${suffix}`;
+    case "activity_classification_changed":
+      return `本地重处理发现活动分类发生变化。${suffix}`;
+    case "application_source_changed":
+      return `本地重处理发现应用来源发生变化。${suffix}`;
+    case "manual_request":
+      return `你已请求重新生成总结。${suffix}`;
+    default:
+      return `高精度复核发现说话人数发生变化。${suffix}`;
+  }
+}
+
 function participantStateLabel(participant: JarvisSessionParticipant): string {
   if (participant.kind === "self") return "本人声纹已确认";
   if (participant.kind === "known") return "已命名人物";
@@ -80,9 +100,7 @@ function participantStateLabel(participant: JarvisSessionParticipant): string {
   return "待复核，人数可能调整";
 }
 
-function participantReviewActionLabel(
-  action: JarvisParticipantReviewEvent["action"]
-): string {
+function participantReviewActionLabel(action: JarvisParticipantReviewEvent["action"]): string {
   const labels: Record<JarvisParticipantReviewEvent["action"], string> = {
     split: "拆分人物片段",
     merge: "合并人物",
@@ -129,9 +147,7 @@ export function groupConfirmedSpeakerPeople(
     groups[existingIndex] = {
       ...existing,
       representative:
-        cluster.updatedAt > existing.representative.updatedAt
-          ? cluster
-          : existing.representative,
+        cluster.updatedAt > existing.representative.updatedAt ? cluster : existing.representative,
       clusterCount: existing.clusterCount + 1,
       localLabels: [...existing.localLabels, cluster.localLabel],
     };
@@ -234,8 +250,7 @@ export default function MemoryView() {
     JarvisParticipantReviewHistoryEvent[] | null
   >(null);
   const [participantReviewHistoryOpen, setParticipantReviewHistoryOpen] = useState(false);
-  const [participantReviewHistoryLoading, setParticipantReviewHistoryLoading] =
-    useState(false);
+  const [participantReviewHistoryLoading, setParticipantReviewHistoryLoading] = useState(false);
   const [selectedParticipantIds, setSelectedParticipantIds] = useState<Set<string>>(
     () => new Set()
   );
@@ -548,6 +563,18 @@ export default function MemoryView() {
     timeline?.session_id,
   ]);
 
+  useEffect(() => {
+    if (
+      evidenceNavigation.phase !== "idle" ||
+      !selectedSessionId ||
+      detail?.session.id === selectedSessionId
+    ) {
+      return;
+    }
+    setMemoryMode("sessions");
+    void open(selectedSessionId);
+  }, [detail?.session.id, evidenceNavigation.phase, open, selectedSessionId]);
+
   const analyze = async () => {
     if (!detail) return;
     const sessionId = detail.session.id;
@@ -705,9 +732,7 @@ export default function MemoryView() {
           : stored.linkState !== "confirmed");
       return {
         ...participant,
-        representativeCluster: storedMatchesProjection
-          ? stored
-          : participant.representativeCluster,
+        representativeCluster: storedMatchesProjection ? stored : participant.representativeCluster,
       };
     });
     const selectedClusterIds = projectedParticipants
@@ -880,8 +905,8 @@ export default function MemoryView() {
               <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
                 <p className="text-sm font-medium">确认人物修正</p>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  这次操作会影响 {participantReviewPreview.preview.affectedClusterCount}{" "}
-                  个声纹簇和 {participantReviewPreview.preview.affectedSegmentCount} 条转写证据。
+                  这次操作会影响 {participantReviewPreview.preview.affectedClusterCount} 个声纹簇和{" "}
+                  {participantReviewPreview.preview.affectedSegmentCount} 条转写证据。
                   原结果会保留在本地历史中，可以立即撤销。
                 </p>
                 {participantReviewPreview.input.action === "pin_evidence" && (
@@ -972,162 +997,160 @@ export default function MemoryView() {
                 {projectedParticipants.map((participant) => {
                   const cluster = participant.representativeCluster;
                   return (
-                  <div
-                    key={participant.id}
-                    className="min-w-0 rounded-xl border border-border/50 bg-muted/20 p-3"
-                  >
-                    <div className="flex min-w-0 items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {!(cluster.linkState === "confirmed" && cluster.person) && (
-                            <span className="font-medium">{participant.displayName}</span>
-                          )}
-                          <SpeakerChip cluster={cluster} localLabel={participant.displayName} />
+                    <div
+                      key={participant.id}
+                      className="min-w-0 rounded-xl border border-border/50 bg-muted/20 p-3"
+                    >
+                      <div className="flex min-w-0 items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            {!(cluster.linkState === "confirmed" && cluster.person) && (
+                              <span className="font-medium">{participant.displayName}</span>
+                            )}
+                            <SpeakerChip cluster={cluster} localLabel={participant.displayName} />
+                          </div>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {participantStateLabel(participant)}
+                            {participant.sourceNames.length > 0
+                              ? ` · ${participant.sourceNames.join("、")}`
+                              : ""}
+                          </p>
                         </div>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          {participantStateLabel(participant)}
-                          {participant.sourceNames.length > 0
-                            ? ` · ${participant.sourceNames.join("、")}`
-                            : ""}
-                        </p>
+                        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                          {speechDurationLabel(participant.speechMs)}
+                        </span>
                       </div>
-                      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                        {speechDurationLabel(participant.speechMs)}
-                      </span>
-                    </div>
-                    {participant.kind !== "self" && (
-                      <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border/40 pt-2.5 text-xs">
-                        <label className="flex cursor-pointer items-center gap-1.5 text-muted-foreground">
-                          <input
-                            type="checkbox"
-                            aria-label={`选择合并 ${participant.displayName}`}
-                            checked={selectedParticipantIds.has(participant.id)}
-                            onChange={(event) =>
-                              setSelectedParticipantIds((current) => {
-                                const next = new Set(current);
-                                if (event.target.checked) next.add(participant.id);
-                                else next.delete(participant.id);
-                                return next;
-                              })
-                            }
-                            className="size-3.5 accent-primary"
-                          />
-                          选择合并
-                        </label>
-                        <button
-                          type="button"
-                          disabled={participantReviewBusy}
-                          onClick={() =>
-                            void previewParticipantReview({
-                              sessionId: detail.session.id,
-                              action: "mark_media",
-                              clusterIds: participant.clusterIds,
-                            })
-                          }
-                          className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
-                        >
-                          标记为媒体声音
-                        </button>
-                        {participant.kind === "known" && participant.person && (
+                      {participant.kind !== "self" && (
+                        <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border/40 pt-2.5 text-xs">
+                          <label className="flex cursor-pointer items-center gap-1.5 text-muted-foreground">
+                            <input
+                              type="checkbox"
+                              aria-label={`选择合并 ${participant.displayName}`}
+                              checked={selectedParticipantIds.has(participant.id)}
+                              onChange={(event) =>
+                                setSelectedParticipantIds((current) => {
+                                  const next = new Set(current);
+                                  if (event.target.checked) next.add(participant.id);
+                                  else next.delete(participant.id);
+                                  return next;
+                                })
+                              }
+                              className="size-3.5 accent-primary"
+                            />
+                            选择合并
+                          </label>
                           <button
                             type="button"
                             disabled={participantReviewBusy}
                             onClick={() =>
                               void previewParticipantReview({
                                 sessionId: detail.session.id,
-                                action: "forget_identity",
+                                action: "mark_media",
                                 clusterIds: participant.clusterIds,
-                                personId: participant.person?.id,
                               })
                             }
-                            className="text-destructive underline-offset-2 hover:underline"
+                            className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                           >
-                            忘记此身份
+                            标记为媒体声音
                           </button>
-                        )}
-                      </div>
-                    )}
-                    {participant.representativeSegments.length > 0 && (
-                      <div className="mt-3 space-y-2">
-                        {participant.representativeSegments.map((segment, index) => (
-                          <div
-                            key={segment.id}
-                            className="rounded-lg border border-border/40 bg-background/60 p-2"
-                          >
+                          {participant.kind === "known" && participant.person && (
                             <button
                               type="button"
-                              aria-label={`播放 ${participant.displayName} 证据 ${index + 1}`}
+                              disabled={participantReviewBusy}
                               onClick={() =>
-                                void openEvidence({
-                                  ownerType: "speaker_cluster",
-                                  ownerId: segment.clusterId,
-                                  evidenceId: segment.id,
+                                void previewParticipantReview({
+                                  sessionId: detail.session.id,
+                                  action: "forget_identity",
+                                  clusterIds: participant.clusterIds,
+                                  personId: participant.person?.id,
                                 })
                               }
-                              className="group flex w-full min-w-0 items-center gap-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                              className="text-destructive underline-offset-2 hover:underline"
                             >
-                              <span className="grid size-7 shrink-0 place-items-center rounded-full bg-primary/10 text-primary">
-                                <Play className="size-3.5 fill-current" aria-hidden="true" />
-                              </span>
-                              <AudioLines
-                                className="size-4 shrink-0 text-muted-foreground"
-                                aria-hidden="true"
-                              />
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate text-xs text-foreground/80">
-                                  {segment.text || "无可用转写"}
-                                </span>
-                                <span className="mt-0.5 block text-[11px] text-muted-foreground">
-                                  {segment.sourceName} ·{" "}
-                                  {new Date(segment.started_at).toLocaleTimeString("zh-CN", {
-                                    hour: "2-digit",
-                                    minute: "2-digit",
-                                    second: "2-digit",
-                                  })}
-                                </span>
-                              </span>
+                              忘记此身份
                             </button>
-                            <div className="mt-2 flex flex-wrap gap-3 border-t border-border/30 pt-2 text-[11px]">
-                              {participant.kind !== "self" && (
+                          )}
+                        </div>
+                      )}
+                      {participant.representativeSegments.length > 0 && (
+                        <div className="mt-3 space-y-2">
+                          {participant.representativeSegments.map((segment, index) => (
+                            <div
+                              key={segment.id}
+                              className="rounded-lg border border-border/40 bg-background/60 p-2"
+                            >
+                              <button
+                                type="button"
+                                aria-label={`播放 ${participant.displayName} 证据 ${index + 1}`}
+                                onClick={() =>
+                                  void openEvidence({
+                                    ownerType: "speaker_cluster",
+                                    ownerId: segment.clusterId,
+                                    evidenceId: segment.id,
+                                  })
+                                }
+                                className="group flex w-full min-w-0 items-center gap-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                              >
+                                <span className="grid size-7 shrink-0 place-items-center rounded-full bg-primary/10 text-primary">
+                                  <Play className="size-3.5 fill-current" aria-hidden="true" />
+                                </span>
+                                <AudioLines
+                                  className="size-4 shrink-0 text-muted-foreground"
+                                  aria-hidden="true"
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate text-xs text-foreground/80">
+                                    {segment.text || "无可用转写"}
+                                  </span>
+                                  <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                                    {segment.sourceName} ·{" "}
+                                    {new Date(segment.started_at).toLocaleTimeString("zh-CN", {
+                                      hour: "2-digit",
+                                      minute: "2-digit",
+                                      second: "2-digit",
+                                    })}
+                                  </span>
+                                </span>
+                              </button>
+                              <div className="mt-2 flex flex-wrap gap-3 border-t border-border/30 pt-2 text-[11px]">
+                                {participant.kind !== "self" && (
+                                  <button
+                                    type="button"
+                                    disabled={participantReviewBusy}
+                                    onClick={() =>
+                                      void previewParticipantReview({
+                                        sessionId: detail.session.id,
+                                        action: "split",
+                                        clusterIds: [segment.clusterId],
+                                        segmentIds: [segment.id],
+                                      })
+                                    }
+                                    className="text-muted-foreground hover:text-foreground"
+                                  >
+                                    拆分为新人物
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   disabled={participantReviewBusy}
                                   onClick={() =>
                                     void previewParticipantReview({
                                       sessionId: detail.session.id,
-                                      action: "split",
+                                      action: segment.pinned ? "unpin_evidence" : "pin_evidence",
                                       clusterIds: [segment.clusterId],
                                       segmentIds: [segment.id],
                                     })
                                   }
-                                  className="text-muted-foreground hover:text-foreground"
+                                  className="text-primary"
                                 >
-                                  拆分为新人物
+                                  {segment.pinned ? "取消固定" : "固定证据"}
                                 </button>
-                              )}
-                              <button
-                                type="button"
-                                disabled={participantReviewBusy}
-                                onClick={() =>
-                                  void previewParticipantReview({
-                                    sessionId: detail.session.id,
-                                    action: segment.pinned
-                                      ? "unpin_evidence"
-                                      : "pin_evidence",
-                                    clusterIds: [segment.clusterId],
-                                    segmentIds: [segment.id],
-                                  })
-                                }
-                                className="text-primary"
-                              >
-                                {segment.pinned ? "取消固定" : "固定证据"}
-                              </button>
+                              </div>
                             </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   );
                 })}
               </div>
@@ -1136,8 +1159,8 @@ export default function MemoryView() {
                 {timeline?.processing_state === "ready"
                   ? "没有提取到可命名的声纹。纯系统音频或重叠不清的片段不会强行建立人物档案。"
                   : "录音已安全保存；GPU 空闲后会自动补齐说话人分离和跨会话关联。"}
-                </p>
-              )}
+              </p>
+            )}
             {Math.max(
               participantProjection?.excluded.fragmented ?? 0,
               speakerProcessing?.fragmentedEvidenceCount ?? 0
@@ -1148,8 +1171,7 @@ export default function MemoryView() {
                   participantProjection?.excluded.fragmented ?? 0,
                   speakerProcessing?.fragmentedEvidenceCount ?? 0
                 )}{" "}
-                个过短或重复的声纹碎片；它们只是算法证据，
-                不计作真实人物。
+                个过短或重复的声纹碎片；它们只是算法证据， 不计作真实人物。
               </p>
             )}
             {(participantProjection?.mediaVoices.length ?? 0) > 0 && (
@@ -1203,9 +1225,7 @@ export default function MemoryView() {
             </div>
             {speakerProcessing?.summaryRefresh?.recommended === 1 && (
               <p className="mt-3 rounded-lg bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-                {speakerProcessing.summaryRefresh.reason === "summary_incomplete"
-                  ? "本次长录音的旧总结只覆盖了部分转写。原总结已保留；只有点击上方按钮才会按完整多窗口转写调用 MiniMax 重新总结。"
-                  : "高精度复核发现说话人数发生变化。原总结已保留；只有点击上方按钮才会调用 MiniMax 重新总结。"}
+                {summaryRefreshMessage(speakerProcessing.summaryRefresh.reason)}
               </p>
             )}
             <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">

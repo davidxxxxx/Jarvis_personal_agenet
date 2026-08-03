@@ -21,7 +21,7 @@ function privateInput() {
             startedAt: 0,
             endedAt: 10_000,
             speakerLabel: "P1",
-            text: "张三说请联系李四，token=sk-cp-not-a-real-key-123456。麦克风 SteelSeries Sonar，文件在 C:\\Users\\xujie\\secret.txt。",
+            text: "张三说请联系李四，token=sk-cp-not-a-real-key-123456。麦克风 SteelSeries Sonar，文件在 C:\\Users\\ExampleUser\\secret.txt。",
           },
         ],
         statistics: {
@@ -90,7 +90,7 @@ test("cloud payload contains only normalized apps, anonymous speakers, transcrip
     "张三",
     "李四",
     "SteelSeries Sonar",
-    "C:\\Users\\xujie",
+    "C:\\Users\\ExampleUser",
     "secret.txt",
     "sk-cp-not-a-real-key",
   ]) {

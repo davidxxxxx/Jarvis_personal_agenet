@@ -81,8 +81,10 @@ test("activity corrections stay local and only propose a rule after three simila
     action: "enable",
     at: now++,
   });
-  const learned =
-    repository.activityClassificationRepository.applyPersonalizationRule(activity(4), base);
+  const learned = repository.activityClassificationRepository.applyPersonalizationRule(
+    activity(4),
+    base
+  );
   assert.equal(learned.category, "work_meeting");
   assert.equal(learned.decision, "adopted");
   assert.match(learned.reason, /enabled_personalization_rule/u);
@@ -93,6 +95,177 @@ test("activity corrections stay local and only propose a rule after three simila
         .prepare("UPDATE personalization_feedback SET corrected_value = ?")
         .run("gaming"),
     /immutable/u
+  );
+});
+
+test("editing a personalization rule changes its target and matching conditions with audit history", (t) => {
+  let now = new Date(2026, 6, 27, 10, 0, 0).getTime();
+  const repository = new JarvisRepository(":memory:", { now: () => now });
+  t.after(() => repository.close());
+  repository.createSession({
+    id: "editable-rule-session",
+    startedAt: 1,
+    micDeviceId: "physical-mic",
+  });
+
+  let proposedRule;
+  for (let index = 0; index < 3; index += 1) {
+    const [saved] = repository.saveActivityClassificationBatch({
+      sessionId: "editable-rule-session",
+      activities: [activity(index)],
+      classifications: [localClassification(index)],
+      createdAt: now++,
+    });
+    proposedRule = repository.correctActivityClassification({
+      classificationId: saved.id,
+      category: "work_meeting",
+      correctedAt: now++,
+    }).proposedRule;
+  }
+
+  const edited = repository.decidePersonalizationRule({
+    ruleId: proposedRule.id,
+    action: "edit",
+    label: "Chrome 上午的本人学习活动",
+    targetValue: "learning",
+    conditions: {
+      applicationKeys: ["chrome"],
+      selfParticipated: true,
+      speakerCountBucket: "multiple",
+      timeBucket: "morning",
+    },
+    at: now++,
+  });
+
+  assert.equal(edited.label, "Chrome 上午的本人学习活动");
+  assert.equal(edited.targetValue, "learning");
+  assert.deepEqual(edited.rule, {
+    features: {
+      applicationKeys: ["chrome"],
+      selfParticipated: true,
+      speakerCountBucket: "multiple",
+      timeBucket: "morning",
+    },
+    category: "learning",
+  });
+  assert.equal(
+    repository.activityClassificationRepository.applyPersonalizationRule(
+      {
+        ...activity(9),
+        applications: ["chrome"],
+      },
+      localClassification(9)
+    ).category,
+    "social_call"
+  );
+
+  repository.decidePersonalizationRule({
+    ruleId: edited.id,
+    action: "enable",
+    at: now++,
+  });
+  const learned = repository.activityClassificationRepository.applyPersonalizationRule(
+    {
+      ...activity(9),
+      applications: ["chrome"],
+    },
+    localClassification(9)
+  );
+  assert.equal(learned.category, "learning");
+  assert.equal(learned.allowSuggestions, false);
+
+  const audit = repository.db
+    .prepare(
+      `SELECT detail_json FROM personalization_rule_events
+       WHERE rule_id = ? AND action = 'edited' ORDER BY occurred_at DESC LIMIT 1`
+    )
+    .get(edited.id);
+  assert.deepEqual(JSON.parse(audit.detail_json).next, {
+    label: "Chrome 上午的本人学习活动",
+    targetValue: "learning",
+    conditions: {
+      applicationKeys: ["chrome"],
+      selfParticipated: true,
+      speakerCountBucket: "multiple",
+      timeBucket: "morning",
+    },
+  });
+});
+
+test("activity correction refreshes the corrected session participant snapshot", (t) => {
+  const repository = new JarvisRepository(":memory:", { now: () => 1_000 });
+  t.after(() => repository.close());
+  repository.createSession({
+    id: "corrected-session",
+    startedAt: 1,
+    micDeviceId: "physical-mic",
+  });
+  const [saved] = repository.saveActivityClassificationBatch({
+    sessionId: "corrected-session",
+    activities: [activity(0)],
+    classifications: [localClassification(0)],
+    createdAt: 1_000,
+  });
+  const refreshes = [];
+  repository.refreshSessionParticipantSnapshot = (sessionId, options) => {
+    refreshes.push({ sessionId, options });
+  };
+
+  const result = repository.correctActivityClassification({
+    classificationId: saved.id,
+    category: "work_meeting",
+    correctedAt: 1_001,
+  });
+
+  assert.equal(result.classification.sessionId, "corrected-session");
+  assert.deepEqual(refreshes, [{ sessionId: "corrected-session", options: { at: 1_001 } }]);
+});
+
+test("durable activity correction survives participant refresh and diagnostic failures", (t) => {
+  const diagnostics = [];
+  const repository = new JarvisRepository(":memory:", {
+    now: () => 2_000,
+    log(entry) {
+      diagnostics.push(entry);
+      throw new Error("diagnostic sink failed");
+    },
+  });
+  t.after(() => repository.close());
+  repository.createSession({
+    id: "refresh-failure-session",
+    startedAt: 1,
+    micDeviceId: "physical-mic",
+  });
+  const [saved] = repository.saveActivityClassificationBatch({
+    sessionId: "refresh-failure-session",
+    activities: [activity(1)],
+    classifications: [localClassification(1)],
+    createdAt: 2_000,
+  });
+  repository.refreshSessionParticipantSnapshot = () => {
+    const error = new Error("G:\\private\\speaker-name must not reach diagnostics");
+    error.code = "SNAPSHOT_RETRY";
+    throw error;
+  };
+
+  const result = repository.correctActivityClassification({
+    classificationId: saved.id,
+    category: "work_meeting",
+    correctedAt: 2_001,
+  });
+
+  assert.equal(result.classification.category, "work_meeting");
+  assert.deepEqual(diagnostics, [
+    {
+      phase: "activity_correction_participant_refresh",
+      state: "deferred",
+      sessionId: "refresh-failure-session",
+      errorCode: "SNAPSHOT_RETRY",
+    },
+  ]);
+  assert.equal(
+    repository.listSessionActivityClassifications("refresh-failure-session")[0].category,
+    "work_meeting"
   );
 });
 

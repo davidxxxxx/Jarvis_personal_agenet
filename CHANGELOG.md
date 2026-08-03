@@ -5,10 +5,28 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 
 ## Unreleased
 
-### Planned for 0.2.0
+No additional changes yet.
 
-- Evidence-gated Todos, suggestions, and local personalization.
-- Progressive Finish & Summarize session page and a compact home Action Center.
+## 0.2.0-rc.1 - 2026-08-03
+
+- Switch immediately to a progressive session result after Finish & Summarize, with independent
+  audio, final-transcript, participant-review, and MiniMax progress plus durable local fallback
+  and an explicit paid-retry confirmation when cloud summarization fails.
+- Organize the home Action Center into now, confirmation, candidate suggestion, later, and today's
+  completed sections; expose explicit reminder controls only for confirmed Todos.
+- Migrate locally to schema v58 and deliver restrained Windows reminders only at user-selected
+  times, deferring and merging them during games, meetings, presentations, focus, or mute modes.
+- Build MiniMax summaries from durable participant projections instead of fragmented diarization
+  labels, exclude media voices, and invalidate cached analysis whenever participant evidence changes.
+- Recover completed sessions from deterministic speaker failures without hiding the failure detail,
+  and salvage only bounded MiniMax Daily Review defects while rejecting empty or severely incomplete
+  responses.
+- Add a 12-case anonymous Full Memory release gate for bilingual output, evidence scope, privacy,
+  idempotency, safe Todo lifecycle, and navigable source evidence.
+- Verify real-shaped v54, v56, and v57 databases through v58 migration, cold reopen, integrity,
+  idempotency, and deterministic rollback gates.
+- Allow the guarded Windows builder to publish every application, native, and model artifact to one
+  new off-system-drive output directory without overwriting a running installation.
 
 ## 0.2.0-alpha.29 - 2026-07-30
 

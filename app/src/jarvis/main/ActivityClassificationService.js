@@ -81,16 +81,14 @@ class ActivityClassificationService {
     this.now = now;
   }
 
-  async classifySession({
-    sessionId,
-    jobId,
-    activities,
-    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
-    cloudReview = true,
-  } = {}) {
+  _requireActivities(activities) {
     if (!Array.isArray(activities) || activities.length === 0) {
       throw new TypeError("activities must be a non-empty array");
     }
+  }
+
+  classifyLocal({ sessionId, activities } = {}) {
+    this._requireActivities(activities);
     const local = activities.map((activity) => {
       const classification = {
         activityId: activity.activityId,
@@ -106,11 +104,20 @@ class ActivityClassificationService {
       classifications: local,
       createdAt: this.now(),
     });
-    if (
-      cloudReview !== true ||
-      this.cloudClient === null ||
-      this.cloudClient.isConfigured?.() === false
-    ) {
+    return {
+      classifications: this.repository.listSessionEffective(sessionId),
+      cloudStatus: "local_only",
+    };
+  }
+
+  async reviewSessionWithCloud({
+    sessionId,
+    jobId,
+    activities,
+    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
+  } = {}) {
+    this._requireActivities(activities);
+    if (this.cloudClient === null || this.cloudClient.isConfigured?.() === false) {
       return {
         classifications: this.repository.listSessionEffective(sessionId),
         cloudStatus: this.cloudClient === null ? "local_only" : "not_configured",
@@ -196,6 +203,23 @@ class ActivityClassificationService {
         errorCode: typeof error?.code === "string" ? error.code : "classification_failed",
       };
     }
+  }
+
+  async classifySession({
+    sessionId,
+    jobId,
+    activities,
+    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
+    cloudReview = true,
+  } = {}) {
+    this.classifyLocal({ sessionId, activities });
+    if (cloudReview !== true) {
+      return {
+        classifications: this.repository.listSessionEffective(sessionId),
+        cloudStatus: this.cloudClient === null ? "local_only" : "not_configured",
+      };
+    }
+    return this.reviewSessionWithCloud({ sessionId, jobId, activities, redactionTerms });
   }
 }
 

@@ -1,0 +1,165 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-12-duplicate-retry",
+  "coverage": ["duplicate-retry"],
+  "sessionId": "session-fm-12",
+  "request": {
+    "inputHash": "17065b47a421495886b171fc464f6493d2645fe49a58b2b081883438701e384f",
+    "allowedSegmentIds": ["seg-fm-12-1"],
+    "allowedOwnerLabels": ["SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-12-1",
+          "startedAt": 1000,
+          "endedAt": 2700,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.96,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "i will archive the synthetic notes tomorrow."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-12-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Archive notes",
+          "summary": "SELF committed to archiving the synthetic notes tomorrow.",
+          "evidenceSegmentIds": ["seg-fm-12-1"]
+        },
+        "memories": [
+          {
+            "kind": "commitment",
+            "title": "Archive commitment",
+            "body": "SELF will archive the synthetic notes tomorrow.",
+            "confidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-12-1"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Note archiving",
+            "summary": "The synthetic notes are scheduled for archiving.",
+            "evidenceSegmentIds": ["seg-fm-12-1"]
+          }
+        ],
+        "todos": [
+          {
+            "title": "Archive the synthetic notes",
+            "ownerLabel": "SELF",
+            "dueText": "tomorrow",
+            "semanticConfidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-12-1"],
+            "actionKind": "self_commitment",
+            "assignmentSegmentIds": [],
+            "acceptanceSegmentIds": []
+          }
+        ],
+        "suggestions": []
+      }
+    },
+    {
+      "attemptId": "attempt-fm-12-2",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Archive notes",
+          "summary": "SELF committed to archiving the synthetic notes tomorrow.",
+          "evidenceSegmentIds": ["seg-fm-12-1"]
+        },
+        "memories": [
+          {
+            "kind": "commitment",
+            "title": "Archive commitment",
+            "body": "SELF will archive the synthetic notes tomorrow.",
+            "confidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-12-1"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Note archiving",
+            "summary": "The synthetic notes are scheduled for archiving.",
+            "evidenceSegmentIds": ["seg-fm-12-1"]
+          }
+        ],
+        "todos": [
+          {
+            "title": "Archive the synthetic notes",
+            "ownerLabel": "SELF",
+            "dueText": "tomorrow",
+            "semanticConfidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-12-1"],
+            "actionKind": "self_commitment",
+            "assignmentSegmentIds": [],
+            "acceptanceSegmentIds": []
+          }
+        ],
+        "suggestions": []
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-12-1",
+      "inputHash": "17065b47a421495886b171fc464f6493d2645fe49a58b2b081883438701e384f",
+      "requestBytes": 860,
+      "responseBytes": 630,
+      "durationMs": 8,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 52,
+      "outputTokens": 73
+    },
+    {
+      "requestId": "request-fm-12-2",
+      "inputHash": "17065b47a421495886b171fc464f6493d2645fe49a58b2b081883438701e384f",
+      "requestBytes": 860,
+      "responseBytes": 630,
+      "durationMs": 8,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 52,
+      "outputTokens": 73
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-12",
+        "sourceSegmentId": "seg-fm-12-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-12",
+        "sourceSegmentId": "seg-fm-12-1"
+      }
+    ],
+    "todos": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-12",
+        "sourceSegmentId": "seg-fm-12-1"
+      }
+    ]
+  }
+}

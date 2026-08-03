@@ -486,7 +486,7 @@ test("analysis input cloud payload contract validates exact redacted JSON and UT
 
     const oversizedPayload = JSON.stringify({
       inputVersion: INPUT_CONTRACT_VERSION,
-      padding: "x".repeat(98_304),
+      padding: "x".repeat(393_216),
     });
     assert.throws(
       () =>
@@ -1516,12 +1516,12 @@ test("relation guards enforce predecessor, slot, conflict, terminal, and polymor
     assert.throws(
       () =>
         db.prepare("UPDATE suggestions_v2 SET decided_at = 7000 WHERE id = 'suggestion-1'").run(),
-      /suggestion terminal state is immutable/
+      /terminal suggestion can only be restored by its latest action event/
     );
     assert.throws(
       () =>
         db.prepare("UPDATE suggestions_v2 SET state = 'proposed' WHERE id = 'suggestion-1'").run(),
-      /suggestion terminal state is immutable/
+      /terminal suggestion can only be restored by its latest action event/
     );
 
     assert.throws(

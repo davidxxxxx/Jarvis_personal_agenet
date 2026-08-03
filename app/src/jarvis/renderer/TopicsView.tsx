@@ -1,16 +1,39 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { BookOpenText, Search } from "lucide-react";
+import { BookOpenText, LoaderCircle, Pencil, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { JarvisKnowledgeOverview } from "../types";
+import type { JarvisKnowledgeOverview, JarvisTopicDetail } from "../types";
 import EvidenceLink from "./EvidenceLink";
 
-export default function TopicsView() {
+interface TopicsViewProps {
+  onOpenSession?: (sessionId: string) => void;
+}
+
+type DetailState = "idle" | "loading" | "ready" | "error";
+
+function sessionLabel(startedAt: number): string {
+  return new Date(startedAt).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+export default function TopicsView({ onOpenSession = () => undefined }: TopicsViewProps) {
   const { t } = useTranslation();
   const [topics, setTopics] = useState<JarvisKnowledgeOverview["topics"]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [error, setError] = useState(false);
+  const [detail, setDetail] = useState<JarvisTopicDetail | null>(null);
+  const [detailState, setDetailState] = useState<DetailState>("idle");
+  const [detailRefreshKey, setDetailRefreshKey] = useState(0);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
   const generation = useRef(0);
+  const detailGeneration = useRef(0);
 
   useEffect(() => {
     const request = ++generation.current;
@@ -30,6 +53,39 @@ export default function TopicsView() {
     };
   }, []);
 
+  useEffect(() => {
+    const request = ++detailGeneration.current;
+    setRenameOpen(false);
+    setRenameBusy(false);
+    setRenameError(null);
+    if (!selectedId) {
+      setDetail(null);
+      setDetailState("idle");
+      return;
+    }
+
+    setDetail(null);
+    setDetailState("loading");
+    void window.electronAPI.jarvis
+      .getTopicDetail(selectedId)
+      .then((nextDetail) => {
+        if (detailGeneration.current !== request) return;
+        if (!nextDetail) {
+          setDetailState("error");
+          return;
+        }
+        if (selectedId !== nextDetail.topic.id) return;
+        setDetail(nextDetail);
+        setDetailState("ready");
+      })
+      .catch(() => {
+        if (detailGeneration.current === request) setDetailState("error");
+      });
+    return () => {
+      detailGeneration.current += 1;
+    };
+  }, [detailRefreshKey, selectedId]);
+
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     if (!normalized) return topics;
@@ -39,9 +95,66 @@ export default function TopicsView() {
     });
   }, [query, topics]);
   const selected = topics.find((topic) => topic.id === selectedId) ?? null;
+  const selectedName = detail?.topic.canonical_title ?? selected?.name ?? "";
+  const selectedSummary = selected?.revisions.at(-1)?.summary || detail?.topic.description || "";
   const evidenceCount = selected
     ? selected.occurrences.reduce((total, occurrence) => total + occurrence.evidence.length, 0)
     : 0;
+
+  const startRename = () => {
+    setRenameDraft(selectedName);
+    setRenameError(null);
+    setRenameOpen(true);
+  };
+
+  const saveRename = async () => {
+    if (!selected || renameBusy) return;
+    const title = renameDraft.trim();
+    if (!title) {
+      setRenameError("主题名称不能为空。");
+      return;
+    }
+    const topicId = selected.id;
+    setRenameBusy(true);
+    setRenameError(null);
+    try {
+      const renamed = await window.electronAPI.jarvis.renameTopic(topicId, title);
+      setTopics((current) =>
+        current.map((topic) =>
+          topic.id === topicId
+            ? {
+                ...topic,
+                name: renamed.canonical_title,
+                updatedAt: Math.max(topic.updatedAt, renamed.last_seen_at),
+              }
+            : topic
+        )
+      );
+      setDetail((current) =>
+        current?.topic.id === topicId
+          ? {
+              ...current,
+              topic: renamed,
+              todos: current.todos.map((todo) => ({
+                ...todo,
+                topic_title: todo.topic_id === topicId ? renamed.canonical_title : todo.topic_title,
+              })),
+              memories: current.memories.map((memory) => ({
+                ...memory,
+                topic_title:
+                  memory.topic_id === topicId ? renamed.canonical_title : memory.topic_title,
+              })),
+            }
+          : current
+      );
+      setRenameDraft(renamed.canonical_title);
+      setRenameOpen(false);
+    } catch {
+      setRenameError("主题名称保存失败，请重试。");
+    } finally {
+      setRenameBusy(false);
+    }
+  };
 
   return (
     <main className="jarvis-scroll-region min-w-0 overflow-y-scroll p-6 lg:col-span-2">
@@ -113,7 +226,9 @@ export default function TopicsView() {
                 );
               })}
               {!filtered.length && (
-                <p className="px-3 py-8 text-center text-sm text-muted-foreground">没有匹配的主题</p>
+                <p className="px-3 py-8 text-center text-sm text-muted-foreground">
+                  没有匹配的主题
+                </p>
               )}
             </div>
           </section>
@@ -121,17 +236,216 @@ export default function TopicsView() {
           <section className="rounded-xl border border-border/50 bg-card p-5 lg:sticky lg:top-0">
             {selected ? (
               <>
-                <p className="text-xs font-medium text-primary">主题详情</p>
-                <h2 className="mt-1 text-xl font-semibold">{selected.name}</h2>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-primary">主题详情</p>
+                    <h2 className="mt-1 text-xl font-semibold">{selectedName}</h2>
+                  </div>
+                  {!renameOpen && detailState === "ready" && (
+                    <button
+                      type="button"
+                      onClick={startRename}
+                      className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs hover:bg-muted/50"
+                    >
+                      <Pencil className="size-3.5" aria-hidden="true" />
+                      重命名主题
+                    </button>
+                  )}
+                </div>
+
+                {renameOpen && (
+                  <div className="mt-3 rounded-lg border border-border/60 bg-muted/20 p-3">
+                    <label className="text-xs font-medium" htmlFor="topic-rename-input">
+                      主题名称
+                    </label>
+                    <input
+                      id="topic-rename-input"
+                      aria-label="主题名称"
+                      value={renameDraft}
+                      onChange={(event) => setRenameDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void saveRename();
+                        if (event.key === "Escape" && !renameBusy) setRenameOpen(false);
+                      }}
+                      disabled={renameBusy}
+                      className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+                    />
+                    {renameError && (
+                      <p role="alert" className="mt-2 text-xs text-destructive">
+                        {renameError}
+                      </p>
+                    )}
+                    <div className="mt-2 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        disabled={renameBusy}
+                        onClick={() => setRenameOpen(false)}
+                        className="rounded-lg px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        disabled={renameBusy || !renameDraft.trim()}
+                        onClick={() => void saveRename()}
+                        className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+                      >
+                        保存主题名称
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
-                  {selected.revisions.at(-1)?.summary || "尚无主题摘要"}
+                  {selectedSummary || "尚无主题摘要"}
                 </p>
+                {detail?.topic.description && detail.topic.description !== selectedSummary && (
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    {detail.topic.description}
+                  </p>
+                )}
                 <div className="mt-4 flex flex-wrap gap-2 text-xs text-muted-foreground">
                   <span className="rounded-full bg-muted px-2.5 py-1">
                     {selected.occurrences.length} 条相关记录
                   </span>
                   <span className="rounded-full bg-muted px-2.5 py-1">{evidenceCount} 条证据</span>
+                  {detail && (
+                    <span className="rounded-full bg-muted px-2.5 py-1">
+                      {detail.topic.status === "active" ? "进行中" : "已归档"}
+                    </span>
+                  )}
                 </div>
+
+                {detailState === "loading" && (
+                  <p
+                    role="status"
+                    className="mt-5 flex items-center gap-2 text-sm text-muted-foreground"
+                  >
+                    <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
+                    正在读取主题关系…
+                  </p>
+                )}
+                {detailState === "error" && (
+                  <div className="mt-5 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
+                    <p role="alert">主题关系暂时无法读取。</p>
+                    <button
+                      type="button"
+                      onClick={() => setDetailRefreshKey((current) => current + 1)}
+                      className="mt-2 rounded-md border border-destructive/30 px-2.5 py-1 text-xs"
+                    >
+                      重试
+                    </button>
+                  </div>
+                )}
+
+                {detailState === "ready" && detail && (
+                  <div className="mt-5 space-y-4 border-t border-border/50 pt-4">
+                    <section aria-labelledby="topic-related-people">
+                      <h3 id="topic-related-people" className="text-sm font-medium">
+                        相关人物
+                      </h3>
+                      {detail.people.length > 0 ? (
+                        <ul className="mt-2 flex flex-wrap gap-2">
+                          {detail.people.map((person) => (
+                            <li
+                              key={person.id}
+                              className="rounded-full bg-muted px-2.5 py-1 text-xs"
+                            >
+                              {person.display_name}
+                              {person.is_self === 1 ? " · 我" : ""}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-1 text-xs text-muted-foreground">没有已确认的相关人物</p>
+                      )}
+                    </section>
+
+                    <section aria-labelledby="topic-related-sessions">
+                      <h3 id="topic-related-sessions" className="text-sm font-medium">
+                        相关会话
+                      </h3>
+                      {detail.sessions.length > 0 ? (
+                        <ul className="mt-2 space-y-2">
+                          {detail.sessions.map((session) => {
+                            const label = sessionLabel(session.started_at);
+                            return (
+                              <li key={session.id}>
+                                <button
+                                  type="button"
+                                  aria-label={`打开会话 ${label}`}
+                                  onClick={() => onOpenSession(session.id)}
+                                  className="flex w-full items-center justify-between rounded-lg bg-muted/35 px-3 py-2 text-left text-xs hover:bg-muted/60"
+                                >
+                                  <span>{label}</span>
+                                  <span className="text-muted-foreground">{session.status}</span>
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      ) : (
+                        <p className="mt-1 text-xs text-muted-foreground">没有相关会话</p>
+                      )}
+                    </section>
+
+                    {detail.decisions.length > 0 && (
+                      <section aria-labelledby="topic-related-decisions">
+                        <h3 id="topic-related-decisions" className="text-sm font-medium">
+                          决定
+                        </h3>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+                          {detail.decisions.map((decision, index) => (
+                            <li key={`${decision.sessionId}:${index}`}>{decision.content}</li>
+                          ))}
+                        </ul>
+                      </section>
+                    )}
+
+                    {detail.todos.length > 0 && (
+                      <section aria-labelledby="topic-related-todos">
+                        <h3 id="topic-related-todos" className="text-sm font-medium">
+                          相关待办
+                        </h3>
+                        <ul className="mt-2 space-y-2">
+                          {detail.todos.map((todo) => (
+                            <li key={todo.id} className="rounded-lg bg-muted/35 px-3 py-2 text-xs">
+                              <p>{todo.content}</p>
+                              {todo.owner_name && (
+                                <p className="mt-0.5 text-muted-foreground">
+                                  负责人：{todo.owner_name}
+                                </p>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    )}
+
+                    {detail.memories.length > 0 && (
+                      <section aria-labelledby="topic-related-memories">
+                        <h3 id="topic-related-memories" className="text-sm font-medium">
+                          相关记忆
+                        </h3>
+                        <ul className="mt-2 space-y-2">
+                          {detail.memories.map((memory) => (
+                            <li
+                              key={memory.id}
+                              className="rounded-lg bg-muted/35 px-3 py-2 text-xs"
+                            >
+                              <p>{memory.content}</p>
+                              {memory.person_name && (
+                                <p className="mt-0.5 text-muted-foreground">
+                                  相关人物：{memory.person_name}
+                                </p>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </section>
+                    )}
+                  </div>
+                )}
 
                 <details className="mt-5 rounded-lg border border-border/50 p-3">
                   <summary className="cursor-pointer text-sm font-medium">查看版本历史</summary>

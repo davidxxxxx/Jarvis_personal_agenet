@@ -1386,6 +1386,8 @@ export async function applyRecordingRetentionMode(
 
 export interface UseJarvisRecordingResult {
   session: SessionState;
+  /** Current local repository snapshot; optional only for legacy/test recording adapters. */
+  sessions?: JarvisSession[];
   segments: TranscriptSegment[];
   partialText: string;
   micLevel: number;
@@ -1409,6 +1411,7 @@ export interface UseJarvisRecordingResult {
 
 export function useJarvisRecording(): UseJarvisRecordingResult {
   const session = useJarvisStore((state) => state.session);
+  const sessions = useJarvisStore((state) => state.sessions);
   const controllerError = useJarvisStore((state) => state.error);
   const operation = useJarvisStore((state) => state.operation);
   const segments = useMeetingRecordingStore((state) => state.segments);
@@ -1707,6 +1710,7 @@ export function useJarvisRecording(): UseJarvisRecordingResult {
 
   return {
     session,
+    sessions,
     segments,
     partialText: [micPartial, systemPartial].filter(Boolean).join(" "),
     micLevel,

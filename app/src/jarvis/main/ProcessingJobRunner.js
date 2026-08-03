@@ -20,6 +20,8 @@ const DIARIZATION_SPEAKER_COUNT_VALIDATION =
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
+  "external_gpu_busy",
+  "gpu_utilization_high",
 ]);
 const NON_PREEMPTIVE_ACTIVE_CUDA_DIARIZATION_REASONS = new Set([
   "cpu_load_high",
@@ -202,6 +204,11 @@ class ProcessingJobRunner {
 
   recoverExpiredLeases(at = this.now()) {
     return this.store.recoverExpiredLeases(at);
+  }
+
+  wakeResourceDeferredJobs(at = this.now()) {
+    if (typeof this.store.wakeResourceDeferredJobs !== "function") return 0;
+    return this.store.wakeResourceDeferredJobs(at);
   }
 
   async _executeClaimedJob(job, { permit = null } = {}) {

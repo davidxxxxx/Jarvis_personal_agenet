@@ -75,6 +75,7 @@ test("unsigned Windows wrapper disables all certificate auto-discovery without a
     "--win",
     "--config",
     path.join(appRoot, "electron-builder.unsigned-win.json"),
+    `--config.directories.output=${path.join(appRoot, "dist")}`,
   ]);
 });
 

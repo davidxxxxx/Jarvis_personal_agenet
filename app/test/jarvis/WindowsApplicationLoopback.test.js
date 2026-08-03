@@ -17,6 +17,11 @@ test("native helper declares include-process capture and audio-session watch wit
   assert.match(source, /nativeCode/);
   assert.match(source, /IAudioSessionManager2_GetSessionEnumerator/);
   assert.match(source, /GetProcessId/);
+  assert.match(source, /IAudioMeterInformation/);
+  assert.match(source, /IAudioMeterInformation_GetPeakValue/);
+  assert.match(source, /IAudioMeterInformation_Release/);
+  assert.match(source, /\\"audible\\"/);
+  assert.doesNotMatch(source, /float peak = 1\.0f/);
   assert.doesNotMatch(source, /GetWindowText|windowTitle|processPath|commandLine/);
 });
 
@@ -50,10 +55,7 @@ test("loopback manager builds disjoint mixed and application process-tree argume
     "--sample-rate",
     "24000",
   ]);
-  assert.throws(
-    () => manager._buildStartArgs({ mode: "application", targetPid: 0 }),
-    /targetPid/
-  );
+  assert.throws(() => manager._buildStartArgs({ mode: "application", targetPid: 0 }), /targetPid/);
 });
 
 test("capability projection distinguishes mixed capture from application capture", async () => {

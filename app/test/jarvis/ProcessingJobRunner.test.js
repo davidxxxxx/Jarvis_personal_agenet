@@ -842,12 +842,77 @@ test("resource admission defers durably before the handler without counting an a
     {
       state: "retry",
       attempt_count: 2,
-      next_retry_at: 17_000,
+      next_retry_at: 2_000 + 30 * 60_000,
       blocked_reason: "external_gpu_busy",
       error_code: null,
       lease_owner: null,
       lease_expires_at: null,
       execution_device: null,
+    }
+  );
+});
+
+test("external GPU busy parks local work until an available-resource wake", async (t) => {
+  let now = 2_000;
+  let gpuBusy = true;
+  let handlerCalls = 0;
+  const governor = {
+    sample: async () => ({
+      state: gpuBusy ? "busy" : "available",
+      selectedGpuUuid: gpuBusy ? null : "GPU-a",
+    }),
+    admit: () =>
+      gpuBusy
+        ? { action: "defer", reason: "external_gpu_busy" }
+        : { action: "run_cpu", reason: "resources_available" },
+  };
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    governor,
+    heavyGate: new HeavyJobGate(),
+  });
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    handlerCalls += 1;
+    return { executionDevice: "cpu" };
+  });
+
+  assert.equal(await runner.runOnce(now), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, blocked_reason
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 2_000 + 30 * 60_000,
+      blocked_reason: "external_gpu_busy",
+    }
+  );
+
+  now += 15_000;
+  assert.equal(await runner.runOnce(now), 0);
+  assert.equal(handlerCalls, 0);
+
+  gpuBusy = false;
+  assert.equal(runner.wakeResourceDeferredJobs(now), 1);
+  assert.equal(await runner.runOnce(now), 1);
+  assert.equal(handlerCalls, 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, next_retry_at, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "completed",
+      next_retry_at: null,
+      blocked_reason: null,
+      completed_at: now,
     }
   );
 });

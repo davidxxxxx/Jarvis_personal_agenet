@@ -162,6 +162,57 @@ test("pool starts at most four independent application tracks while watcher rema
   );
 });
 
+test("silent active sessions do not open tracks until Chrome or KOOK is actually audible", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+
+  await harness.emit(active("chrome", 106, { peak: 0, audible: false }));
+  await harness.emit(active("kook", 107, { peak: 0.0004, audible: false }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  assert.equal(harness.managers.length, 0);
+
+  await harness.emit(active("chrome", 106, { peak: 0.12, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["chrome"]
+  );
+
+  await harness.emit(active("kook", 107, { peak: 0.24, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["chrome", "kook"]
+  );
+});
+
+test("a replacement process after restart or output-device change waits for real audio", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 108, { peak: 0.3, audible: true }));
+  await harness.emit({ ...active("chrome", 108), state: "inactive", peak: 0, audible: false });
+  await harness.emit(active("chrome", 109, { peak: 0, audible: false }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [108]
+  );
+
+  await harness.emit(active("chrome", 109, { peak: 0.2, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [108, 109]
+  );
+});
+
 test("equal-priority watcher updates keep the original selected tracks sticky", async () => {
   let at = 10_000;
   const harness = createHarness({ now: () => (at += 250), selectionDebounceMs: 500 });
@@ -232,9 +283,7 @@ test("a transient inactive watcher event keeps the same application capture gene
     1
   );
   assert.equal(
-    harness.events.some(
-      (event) => event.type === "ended" && event.applicationKey === "kook"
-    ),
+    harness.events.some((event) => event.type === "ended" && event.applicationKey === "kook"),
     false
   );
 });
