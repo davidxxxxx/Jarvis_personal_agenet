@@ -3,9 +3,12 @@
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
 Current verified prerelease: `0.2.0-alpha.29` with database schema target `v47`.
-Current release-candidate source target: `0.2.0-rc.1` with database schema target `v58`.
-It becomes the verified Phase 4 candidate only after the independent Windows package, packaged
-restart, and recorded hardware/live acceptance gates are complete.
+Current hardened source and packaged candidate: `0.2.0-rc.1` at
+`293bb057fa28b2667516c5c5e445783ea1874659` with database schema target `v58`.
+Its automated regression, static, virtual-endurance, Windows package, native-ABI, offline, and
+restart gates passed on 2026-08-03. It becomes the fully verified Phase 4 candidate only after the
+external legacy fixture and recorded physical microphone, real CUDA, private CAM++, and live
+MiniMax acceptance gates are complete.
 
 ## Version line
 

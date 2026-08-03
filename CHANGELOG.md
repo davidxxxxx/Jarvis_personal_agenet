@@ -5,7 +5,10 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 
 ## Unreleased
 
-No additional changes yet.
+- Record fixed candidate `293bb057fa28b2667516c5c5e445783ea1874659` as passing the automated
+  Phase 4 regression, static, virtual-endurance, Windows package, native-ABI, offline, restart,
+  migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
+  CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
 ## 0.2.0-rc.1 - 2026-08-03
 
