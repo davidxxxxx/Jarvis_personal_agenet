@@ -2222,6 +2222,11 @@ test("v50 upgrades active v49 local reprocessing with semantic SHA-256 baselines
     db.exec(`
       INSERT INTO sessions (id, started_at, ended_at, status, created_at, processing_state)
       VALUES ('v49-reprocessing', 10, 20, 'completed', 10, 'ready');
+      DROP TRIGGER personalization_feedback_events_immutable_update;
+      DROP TRIGGER personalization_feedback_events_immutable_delete;
+      DROP INDEX idx_personalization_feedback_events_effective;
+      DROP INDEX idx_personalization_feedback_events_source;
+      DROP TABLE personalization_feedback_events;
       DROP TABLE session_reprocessing_state;
       DROP TABLE session_summary_refresh_state;
       CREATE TABLE session_summary_refresh_state (
@@ -2280,6 +2285,20 @@ test("v50 upgrades active v49 local reprocessing with semantic SHA-256 baselines
         )
         .run("v49-reprocessing", "jarvis-hybrid-diarization-v2", 2_000)
     );
+    assert.equal(
+      db
+        .prepare(
+          `SELECT count(*) AS count FROM sqlite_master
+           WHERE type = 'table' AND name = 'personalization_feedback_events'`
+        )
+        .get().count,
+      1
+    );
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 3_000 }), {
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
+    });
+    assert.equal(db.pragma("integrity_check", { simple: true }), "ok");
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
     db.close();

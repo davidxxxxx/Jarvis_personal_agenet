@@ -20,6 +20,8 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   overflow, stop, and replacement races emit one consistent exact-or-fallback lifecycle.
 - Increment the session timeline only when duplicate relations actually change so Memory refreshes
   after a safe local backfill without triggering a new paid cloud summary.
+- Repair genuine schema-v48 upgrades by creating the additive personalization-event prerequisite
+  before v50 semantic baselines are rebuilt, with idempotent cold-reopen coverage.
 
 ## 0.2.0-rc.1 - 2026-08-03
 

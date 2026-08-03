@@ -9783,6 +9783,13 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 49) {
         upgradeActionCenterDeltaV49(db, migratedAt);
       }
+      if (fromVersion < 55) {
+        // The v50 semantic-baseline backfill constructs ActivityClassificationRepository,
+        // whose current implementation prepares the append-only feedback-event statements.
+        // A genuine v49-or-earlier database does not have that v55 table yet, so satisfy
+        // the independently idempotent schema prerequisite before hashing legacy rows.
+        upgradePersonalizationFeedbackEventsV55(db);
+      }
       if (fromVersion < 50) {
         upgradeSessionReprocessingV50(db);
       }
@@ -9797,9 +9804,6 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       }
       if (fromVersion < 54) {
         upgradeKnowledgeActionLifecycleV54(db);
-      }
-      if (fromVersion < 55) {
-        upgradePersonalizationFeedbackEventsV55(db);
       }
       if (fromVersion < 57) {
         upgradeKnowledgeActionProjectionBackfillV57(db);
