@@ -155,13 +155,33 @@ async function readDescriptor(filePath, fsImpl) {
   }
 }
 
-async function linkOrCopy(source, target, fsImpl) {
-  await fsImpl.rm(target, { force: true });
+function normalizedPathIdentity(filePath) {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function createStagingPath(target, label) {
+  return path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${label}-${crypto.randomUUID()}.tmp`
+  );
+}
+
+async function replaceTextFilesAtomically(files, fsImpl) {
+  const staged = [];
   try {
-    await fsImpl.link(source, target);
-  } catch (error) {
-    if (!new Set(["EXDEV", "EPERM", "EACCES", "ENOSYS"]).has(error?.code)) throw error;
-    await fsImpl.copyFile(source, target);
+    for (const file of files) {
+      const target = path.resolve(file.target);
+      const stagingPath = createStagingPath(target, "write");
+      staged.push({ stagingPath, target });
+      await fsImpl.mkdir(path.dirname(target), { recursive: true });
+      await fsImpl.writeFile(stagingPath, file.contents, { encoding: "utf8", flag: "wx" });
+    }
+    for (const file of staged) {
+      await fsImpl.rename(file.stagingPath, file.target);
+    }
+  } finally {
+    await Promise.all(staged.map(({ stagingPath }) => fsImpl.rm(stagingPath, { force: true })));
   }
 }
 
@@ -262,8 +282,13 @@ async function buildWindowsModelBundle({
 
   if (!descriptor || !sha512) throw new Error("model component descriptor is unavailable");
   const descriptorText = `${JSON.stringify(descriptor, null, 2)}\n`;
-  await fsImpl.writeFile(checksumPath, `${sha512}  ${names.archiveName}\n`, "utf8");
-  await fsImpl.writeFile(descriptorPath, descriptorText, "utf8");
+  await replaceTextFilesAtomically(
+    [
+      { target: checksumPath, contents: `${sha512}  ${names.archiveName}\n` },
+      { target: descriptorPath, contents: descriptorText },
+    ],
+    fsImpl
+  );
   await fsImpl.mkdir(path.dirname(safeIncludePath), { recursive: true });
   await fsImpl.writeFile(
     safeIncludePath,
@@ -290,13 +315,39 @@ async function publishWindowsModelBundle({
 } = {}) {
   if (!bundle || typeof bundle !== "object") throw new TypeError("bundle is required");
   const safeDistRoot = assertNonSystemDrive(path.resolve(distRoot), { systemDrive });
-  await fsImpl.mkdir(safeDistRoot, { recursive: true });
-  for (const [sourceKey, nameKey] of [
+  const artifacts = [
     ["archivePath", "archiveName"],
     ["checksumPath", "checksumName"],
     ["descriptorPath", "descriptorName"],
-  ]) {
-    await linkOrCopy(bundle[sourceKey], path.join(safeDistRoot, bundle[nameKey]), fsImpl);
+  ].map(([sourceKey, nameKey]) => {
+    const source = bundle[sourceKey];
+    const name = bundle[nameKey];
+    if (typeof source !== "string" || !path.isAbsolute(source)) {
+      throw new TypeError(`${sourceKey} must be absolute`);
+    }
+    if (typeof name !== "string" || name.length === 0 || path.basename(name) !== name) {
+      throw new TypeError(`${nameKey} must be a file name`);
+    }
+    const resolvedSource = path.resolve(source);
+    const target = path.join(safeDistRoot, name);
+    if (normalizedPathIdentity(resolvedSource) === normalizedPathIdentity(target)) {
+      throw new Error("model publication source and target must be different paths");
+    }
+    return { source: resolvedSource, target };
+  });
+  await fsImpl.mkdir(safeDistRoot, { recursive: true });
+  const staged = [];
+  try {
+    for (const artifact of artifacts) {
+      const stagingPath = createStagingPath(artifact.target, "publish");
+      staged.push({ ...artifact, stagingPath });
+      await fsImpl.copyFile(artifact.source, stagingPath, fs.constants.COPYFILE_EXCL);
+    }
+    for (const artifact of staged) {
+      await fsImpl.rename(artifact.stagingPath, artifact.target);
+    }
+  } finally {
+    await Promise.all(staged.map(({ stagingPath }) => fsImpl.rm(stagingPath, { force: true })));
   }
   return Object.freeze({
     distRoot: safeDistRoot,

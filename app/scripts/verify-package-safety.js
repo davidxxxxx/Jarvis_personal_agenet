@@ -4,7 +4,8 @@ const asar = require("@electron/asar");
 
 const PACKAGE_PATH_KEYS = new Set(["files", "extraFiles", "extraResources", "asarUnpack"]);
 const SECRET_BASENAME = /^(?:\.env(?:\..*)?|.*\.(?:pem|pfx|p12|key)|id_rsa|credentials\.json)$/i;
-const RUNTIME_BASENAME = /^(?:jarvis\.db(?:-(?:wal|shm))?|.*\.(?:db|sqlite|sqlite3|log|wav|part|pcm))$/i;
+const RUNTIME_BASENAME =
+  /^(?:jarvis\.db(?:-(?:wal|shm))?|.*\.(?:db|sqlite|sqlite3|log|wav|part|pcm))$/i;
 const RUNTIME_DIRECTORY = /^(?:logs?|recordings?|audio-captures?)$/i;
 const STRONG_PROFILE_PARTS = new Set(["user-data", "userdata", "user data", "profile"]);
 const PROFILE_STORAGE_PARTS = new Set([
@@ -83,6 +84,7 @@ const MAX_TEXT_BYTES = 32 * 1024 * 1024;
 const CREDENTIAL_PATTERNS = [
   { label: "openai", pattern: /\bsk-(?:cp-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b/ },
   { label: "anthropic", pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/ },
+  { label: "hugging-face", pattern: /\bhf_[A-Za-z0-9]{30,}\b/ },
   {
     label: "aws",
     pattern:
@@ -104,8 +106,10 @@ function isUnsafePackagePath(value) {
 
 function forbiddenRuntimePath(value) {
   const parts = value.replaceAll("\\", "/").split("/").filter(Boolean);
-  return parts.some((part) => RUNTIME_DIRECTORY.test(part)) ||
-    (parts.length > 0 && RUNTIME_BASENAME.test(parts.at(-1)));
+  return (
+    parts.some((part) => RUNTIME_DIRECTORY.test(part)) ||
+    (parts.length > 0 && RUNTIME_BASENAME.test(parts.at(-1)))
+  );
 }
 
 function splitPathParts(value) {
@@ -327,9 +331,7 @@ function findUnsafeConfigPaths(value, activePackagePath = false, found = []) {
 }
 
 function assertSafeBuilderConfig(configPath) {
-  const unsafe = loadConfigChain(configPath).flatMap(({ config }) =>
-    findUnsafeConfigPaths(config)
-  );
+  const unsafe = loadConfigChain(configPath).flatMap(({ config }) => findUnsafeConfigPaths(config));
   if (unsafe.length > 0) {
     throw new Error(`unsafe packaged resource configured: ${unsafe.join(", ")}`);
   }

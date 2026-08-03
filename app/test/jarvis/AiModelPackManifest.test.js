@@ -1,4 +1,6 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
 const test = require("node:test");
 const path = require("node:path");
 const {
@@ -8,6 +10,10 @@ const {
   normalizeManifest,
   resolveAiModelPackRoot,
 } = require("../../src/jarvis/main/AiModelPackManifest");
+const {
+  assertSafeModelPackSource,
+  verifyPrebuiltAiModelPack,
+} = require("../../scripts/verify-ai-model-pack-prebuilt");
 
 test("bounded model hashing preserves order, caps concurrency, and joins in-flight failures", async () => {
   let active = 0;
@@ -103,4 +109,93 @@ test("AI model pack permits real Python package paths but rejects traversal and 
       (error) => error.code === "AI_MODEL_PACK_INVALID"
     );
   }
+});
+
+function withModelPackFixture(run) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-model-pack-safety-"));
+  const files = [];
+  const write = (relativePath, contents) => {
+    const target = path.join(root, ...relativePath.split("/"));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, contents);
+    files.push({ path: relativePath });
+  };
+  return Promise.resolve()
+    .then(() => run({ root, files, write }))
+    .finally(() => fs.rmSync(root, { recursive: true, force: true }));
+}
+
+function assertModelPackSafetyFailure(operation, { label, relativePath, secret }) {
+  return assert.rejects(operation, (error) => {
+    assert.equal(error.code, "AI_MODEL_PACK_UNSAFE");
+    assert.equal(error.message, `model-pack-safety (${label}): ${relativePath}`);
+    if (secret) assert.doesNotMatch(error.message, new RegExp(secret));
+    return true;
+  });
+}
+
+test("prebuilt model-pack verification rejects unmanifested credential filenames without disclosure", async () => {
+  await withModelPackFixture(async ({ root, write }) => {
+    const secret = "fixture-secret-that-must-never-be-reported";
+    write("runtime/.env.local", `MINIMAX_API_KEY=${secret}\n`);
+    await assertModelPackSafetyFailure(
+      () =>
+        verifyPrebuiltAiModelPack({
+          root,
+          verifyModelPackImpl: async () => ({
+            root,
+            manifest: { packVersion: MODEL_PACK_VERSION, files: [] },
+          }),
+        }),
+      { label: "unmanifested-credential-file", relativePath: "runtime/.env.local", secret }
+    );
+  });
+});
+
+test("model-pack source scanning redacts cloud credentials in explicit text", async (t) => {
+  const privateBody = Buffer.from("google-service-account-private-material".repeat(4)).toString(
+    "base64"
+  );
+  const fixtures = [
+    ["openai", `sk-proj-${"O".repeat(40)}`],
+    ["minimax", `sk-cp-${"M".repeat(40)}`],
+    ["anthropic", `sk-ant-api03-${"A".repeat(40)}`],
+    ["hugging-face", `hf_${"H".repeat(34)}`],
+    ["aws", `AKIA${"A1".repeat(8)}`],
+    ["google", `AIza${"G".repeat(35)}`],
+    ["private-key", `-----BEGIN PRIVATE KEY-----\n${privateBody}\n-----END PRIVATE KEY-----`],
+  ];
+
+  for (const [label, secret] of fixtures) {
+    await t.test(label, async () => {
+      await withModelPackFixture(async ({ root, files, write }) => {
+        const relativePath = `runtime/${label}.txt`;
+        write(relativePath, `credential = ${secret}\n`);
+        await assertModelPackSafetyFailure(
+          () => assertSafeModelPackSource({ root, manifest: { files } }),
+          { label, relativePath, secret }
+        );
+      });
+    });
+  }
+});
+
+test("model-pack source scanning covers unmanifested text but skips known binary catalog files", async () => {
+  await withModelPackFixture(async ({ root, files, write }) => {
+    const secret = `sk-cp-${"S".repeat(40)}`;
+    write("runtime/python.cat", Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(secret)]));
+    write(
+      "runtime/Lib/site-packages/sklearn/estimator.css",
+      ".sk-estimator-accordion--label-container { display: grid; }\n"
+    );
+    await assert.doesNotReject(() => assertSafeModelPackSource({ root, manifest: { files } }));
+
+    const relativePath = "runtime/unlisted-notes.txt";
+    write(relativePath, `token = ${secret}\n`);
+    files.pop();
+    await assertModelPackSafetyFailure(
+      () => assertSafeModelPackSource({ root, manifest: { files } }),
+      { label: "minimax", relativePath, secret }
+    );
+  });
 });

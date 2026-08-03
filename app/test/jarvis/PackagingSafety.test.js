@@ -153,6 +153,29 @@ test("package safety redacts credentials embedded in ordinary loose JavaScript",
   }
 });
 
+test("package safety rejects Hugging Face tokens without exposing their contents", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-hugging-face-"));
+  const secret = `hf_${"H".repeat(34)}`;
+  const relativePath = "ordinary.js";
+  fs.writeFileSync(path.join(root, relativePath), `export const token = "${secret}";`);
+
+  try {
+    assert.throws(
+      () => assertSafeArtifactTree(root),
+      (error) => {
+        assert.equal(
+          error.message,
+          `credential content (hugging-face) found [redacted]: ${relativePath}`
+        );
+        assert.doesNotMatch(error.message, new RegExp(secret));
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("package safety scans ordinary JavaScript inside ASAR without exposing secrets", async () => {
   const asar = require("@electron/asar");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-asar-"));

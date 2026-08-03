@@ -102,8 +102,16 @@
     "desktop-app"
   ],
   "author": {
-    "name": "OpenWhispr Team",
-    "email": "support@openwhispr.com"
+    "name": "Jarvis Personal Agent Project",
+    "url": "https://github.com/davidxxxxx/Jarvis_personal_agenet"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/davidxxxxx/Jarvis_personal_agenet.git"
+  },
+  "homepage": "https://github.com/davidxxxxx/Jarvis_personal_agenet",
+  "bugs": {
+    "url": "https://github.com/davidxxxxx/Jarvis_personal_agenet/issues"
   },
   "license": "MIT",
   "devDependencies": {
