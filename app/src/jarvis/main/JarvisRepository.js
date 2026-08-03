@@ -1882,6 +1882,11 @@ class JarvisRepository {
           AND superseded_by IS NULL
           AND duplicate_of IS NULL
       `),
+      bumpSessionTimelineVersion: this.db.prepare(`
+        UPDATE sessions
+        SET timeline_version = timeline_version + 1
+        WHERE id = ?
+      `),
       getChunkForTranscriptCommit: this.db.prepare(`
         SELECT * FROM audio_chunks WHERE id = ?
       `),
@@ -2504,6 +2509,9 @@ class JarvisRepository {
           duplicateId,
           masterId,
         }).changes;
+      }
+      if (duplicatesMarked > 0) {
+        this.statements.bumpSessionTimelineVersion.run(sessionId);
       }
       return { duplicatesMarked };
     });
@@ -4798,6 +4806,10 @@ class JarvisRepository {
 
   getTranscriptSegment(segmentId) {
     return this.statements.getTranscriptSegment.get(assertId(segmentId, "segmentId")) ?? null;
+  }
+
+  listTranscriptDedupeCandidates(sessionId) {
+    return this.statements.listTranscriptDedupeCandidates.all(assertId(sessionId, "sessionId"));
   }
 
   reconcileTranscriptTransaction(sessionId, reconcile) {

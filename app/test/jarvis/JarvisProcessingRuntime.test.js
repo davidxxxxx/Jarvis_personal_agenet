@@ -101,6 +101,51 @@ test("dual speaker rollout rollback leaves diarization evidence available withou
   );
 });
 
+test("production acoustic dedupe requests low-priority maintenance admission", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const service = configurableService({
+    audioEvidenceReader: {
+      readVerifiedPcm: async () => null,
+      withVerifiedWav: async () => null,
+    },
+    flacCompressionWorker: { run: async () => {} },
+    previewAudioRing: { withPreviewWav: async () => null },
+  });
+  const sampled = {
+    state: "constrained",
+    reason: "cpu_load_high",
+    cpuLoadPct: 90,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
+    batterySaver: false,
+  };
+  let sampleCalls = 0;
+  const admittedKinds = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    governor: {
+      async sample() {
+        sampleCalls += 1;
+        return sampled;
+      },
+      admit(kind, snapshot) {
+        admittedKinds.push({ kind, snapshot });
+        return { action: "defer", reason: "cpu_load_high" };
+      },
+    },
+  });
+
+  assert.equal(await runtime.deduper.acousticAdmission(), false);
+  assert.equal(sampleCalls, 1);
+  assert.deepEqual(admittedKinds, [{ kind: "maintenance", snapshot: sampled }]);
+});
+
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
   const componentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-runtime-cuda-"));
   t.after(() => fs.rmSync(componentRoot, { recursive: true, force: true }));
@@ -471,10 +516,14 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
     reconciler: {
       reconcileSession: (id) => {
         order.push(`reconcile:${id}`);
-        if (id === "bad") throw new Error("bad transcript");
       },
     },
-    deduper: { dedupe: (id) => order.push(`dedupe:${id}`) },
+    deduper: {
+      dedupe: (id) => {
+        order.push(`dedupe:${id}`);
+        if (id === "bad") throw new Error("acoustic dedupe deferred");
+      },
+    },
     log: (entry) => order.push(`error:${entry.sessionId}`),
   });
 
@@ -482,6 +531,7 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
   assert.deepEqual(order, [
     "processing:bad",
     "reconcile:bad",
+    "dedupe:bad",
     "error:bad",
     "processing:good",
     "reconcile:good",

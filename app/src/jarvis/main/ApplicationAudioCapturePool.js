@@ -12,6 +12,7 @@ const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
 const WATCHER_AUDIBLE_PEAK_THRESHOLD = 0.0005;
 const MAX_CANDIDATE_COUNT = 256;
+const MAX_STARTUP_PCM_BYTES = 24_000 * 2 * 5;
 
 function safeReason(error, fallback = "application_capture_unavailable") {
   const candidate = typeof error?.code === "string" ? error.code : fallback;
@@ -155,7 +156,9 @@ class ApplicationAudioCapturePool {
     const tracks = [...this.activeTracks.values()];
     this.activeTracks.clear();
     for (const track of tracks) {
-      this._notifyTrackStopped(track, "pool_stopped", stoppedAt, sessionId);
+      if (track.registered) {
+        this._notifyTrackStopped(track, "pool_stopped", stoppedAt, sessionId);
+      }
     }
 
     const watcher = this.watcher;
@@ -168,7 +171,7 @@ class ApplicationAudioCapturePool {
       await pendingWork;
       const cleanupWork = [];
       if (watcher) cleanupWork.push(watcher.stop());
-      for (const track of tracks) cleanupWork.push(track.manager.stop());
+      for (const track of tracks) cleanupWork.push(this._stopManagerOnce(track));
       const settled = await Promise.allSettled(cleanupWork);
       for (const result of settled) {
         if (result.status === "rejected") {
@@ -412,8 +415,14 @@ class ApplicationAudioCapturePool {
       pid: candidate.pid,
       captureGeneration,
       manager,
-      startedAt: at,
+      startedAt: null,
       lastSoundAt: at,
+      registered: false,
+      startNotified: false,
+      startupChunks: [],
+      startupBytes: 0,
+      startupFailure: null,
+      managerStopWork: null,
     };
     this.activeTracks.set(candidate.applicationKey, track);
     try {
@@ -428,15 +437,31 @@ class ApplicationAudioCapturePool {
             code: safeReason(warning, "application_capture_warning"),
           }),
         onError: (error) => {
+          if (!track.registered) {
+            if (this._latchStartupFailure(track, error, this.now())) {
+              void this._enqueue(() => this._handleStartupFailure(track));
+            }
+            return;
+          }
           void this._enqueue(() => this._handleCaptureError(track, error));
         },
       });
     } catch (error) {
+      if (track.startupFailure) {
+        await this._handleStartupFailure(track);
+        return;
+      }
+      if (this.activeTracks.get(candidate.applicationKey) !== track) {
+        try {
+          await this._stopManagerOnce(track);
+        } catch {}
+        return;
+      }
       if (this.activeTracks.get(candidate.applicationKey) === track) {
         this.activeTracks.delete(candidate.applicationKey);
       }
       try {
-        await manager.stop();
+        await this._stopManagerOnce(track);
       } catch {}
       const retryAt = at + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
@@ -461,15 +486,29 @@ class ApplicationAudioCapturePool {
       return;
     }
 
+    if (track.startupFailure) {
+      await this._handleStartupFailure(track);
+      return;
+    }
+    if (this.activeTracks.get(candidate.applicationKey) !== track) {
+      try {
+        await this._stopManagerOnce(track);
+      } catch {}
+      return;
+    }
+    const captureStartedAt = track.startupChunks[0]?.at ?? this.now();
+    track.startedAt = captureStartedAt;
+    track.lastSoundAt = captureStartedAt;
     this.fallbacks.delete(candidate.applicationKey);
     try {
+      track.startNotified = true;
       this.onTrackStarted({
         sessionId: this.sessionId,
         applicationKey: track.applicationKey,
         applicationDisplayName: track.applicationDisplayName,
         pid: track.pid,
         captureGeneration,
-        startedAt: at,
+        startedAt: captureStartedAt,
       });
       if (this.prebufferMs > 0) {
         this.onAttributionChange({
@@ -488,31 +527,43 @@ class ApplicationAudioCapturePool {
         applicationDisplayName: track.applicationDisplayName,
         captureGeneration,
         attributionState: "exact",
-        at,
+        at: captureStartedAt,
         reason: "application_capture_started",
       });
+      track.registered = true;
+      const startupChunks = track.startupChunks;
+      track.startupChunks = [];
+      track.startupBytes = 0;
+      for (const startupChunk of startupChunks) {
+        this._deliverChunk(track, startupChunk.pcm, startupChunk.at);
+      }
     } catch (error) {
-      this.activeTracks.delete(candidate.applicationKey);
+      if (this.activeTracks.get(candidate.applicationKey) === track) {
+        this.activeTracks.delete(candidate.applicationKey);
+      }
       try {
-        await manager.stop();
+        await this._stopManagerOnce(track);
       } catch {}
-      const retryAt = at + this.retryDelayMs;
+      const failureAt = Math.max(captureStartedAt, this.now());
+      const retryAt = failureAt + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
       const failureCode = scopedFailureCode("evidence_registration_failed", error);
       this._setFallback(track, "evidence_registration_failed", retryAt, failureCode);
-      try {
-        this.onTrackEnded({
-          sessionId: this.sessionId,
-          applicationKey: track.applicationKey,
-          applicationDisplayName: track.applicationDisplayName,
-          pid: track.pid,
-          captureGeneration: track.captureGeneration,
-          endedAt: at,
-          reason: "evidence_registration_failed",
-          failureCode,
-        });
-      } catch {}
+      if (track.startNotified) {
+        try {
+          this.onTrackEnded({
+            sessionId: this.sessionId,
+            applicationKey: track.applicationKey,
+            applicationDisplayName: track.applicationDisplayName,
+            pid: track.pid,
+            captureGeneration: track.captureGeneration,
+            endedAt: failureAt,
+            reason: "evidence_registration_failed",
+            failureCode,
+          });
+        } catch {}
+      }
       this.onError(error);
     }
   }
@@ -522,7 +573,7 @@ class ApplicationAudioCapturePool {
     if (!track) return;
     this.activeTracks.delete(applicationKey);
     try {
-      await track.manager.stop();
+      await this._stopManagerOnce(track);
     } catch (error) {
       this.onWarning({
         applicationKey,
@@ -530,7 +581,16 @@ class ApplicationAudioCapturePool {
         code: safeReason(error, "capture_stop_failed"),
       });
     }
-    this._notifyTrackStopped(track, reason, at, this.sessionId, failureCode);
+    if (track.registered) {
+      this._notifyTrackStopped(track, reason, at, this.sessionId, failureCode);
+    }
+  }
+
+  _stopManagerOnce(track) {
+    if (!track.managerStopWork) {
+      track.managerStopWork = Promise.resolve().then(() => track.manager.stop());
+    }
+    return track.managerStopWork;
   }
 
   _notifyTrackStopped(track, reason, at, sessionId, failureCode = null) {
@@ -563,6 +623,25 @@ class ApplicationAudioCapturePool {
   _handleChunk(track, pcm) {
     if (this.activeTracks.get(track.applicationKey) !== track || !Buffer.isBuffer(pcm)) return;
     const at = this.now();
+    if (!track.registered) {
+      if (track.startupFailure) return;
+      if (track.startupBytes + pcm.length > MAX_STARTUP_PCM_BYTES) {
+        const error = new Error("Application audio startup PCM exceeded its bounded buffer");
+        error.code = "startup_pcm_overflow";
+        if (this._latchStartupFailure(track, error, at)) {
+          void this._enqueue(() => this._handleStartupFailure(track));
+        }
+        return;
+      }
+      track.startupChunks.push({ pcm: Buffer.from(pcm), at });
+      track.startupBytes += pcm.length;
+      return;
+    }
+    this._deliverChunk(track, pcm, at);
+  }
+
+  _deliverChunk(track, pcm, at) {
+    if (this.activeTracks.get(track.applicationKey) !== track || !track.registered) return;
     if (isAudiblePcm(pcm)) track.lastSoundAt = at;
     try {
       this.onChunk({
@@ -576,6 +655,70 @@ class ApplicationAudioCapturePool {
     } catch (error) {
       error.code = "evidence_delivery_failed";
       void this._enqueue(() => this._handleCaptureError(track, error));
+    }
+  }
+
+  _latchStartupFailure(track, error, at) {
+    if (
+      track.registered ||
+      track.startupFailure ||
+      this.activeTracks.get(track.applicationKey) !== track
+    ) {
+      return false;
+    }
+    const reason = safeReason(error);
+    const failureCode = safeFailureCode(error, reason);
+    const retryAt = at + this.retryDelayMs;
+    track.startupFailure = {
+      error,
+      at,
+      reason,
+      failureCode,
+      retryAt,
+      notified: false,
+    };
+    track.startupChunks = [];
+    track.startupBytes = 0;
+    const candidate = this.candidates.get(track.applicationKey);
+    if (candidate) candidate.blockedUntil = retryAt;
+    this._setFallback(track, reason, retryAt, failureCode);
+    return true;
+  }
+
+  async _handleStartupFailure(track) {
+    const failure = track.startupFailure;
+    if (!failure) return;
+    const isCurrent = this.activeTracks.get(track.applicationKey) === track;
+    if (isCurrent) {
+      this.activeTracks.delete(track.applicationKey);
+      if (!failure.notified) {
+        failure.notified = true;
+        try {
+          this.onAttributionChange({
+            sessionId: this.sessionId,
+            applicationKey: track.applicationKey,
+            applicationDisplayName: track.applicationDisplayName,
+            captureGeneration: track.captureGeneration,
+            attributionState: "mixed_unknown",
+            at: failure.at,
+            reason: failure.reason,
+            failureCode: failure.failureCode,
+          });
+        } catch (error) {
+          this.onError(error);
+        }
+      }
+    }
+    try {
+      await this._stopManagerOnce(track);
+    } catch (error) {
+      if (isCurrent) {
+        this.onWarning({
+          applicationKey: track.applicationKey,
+          captureGeneration: track.captureGeneration,
+          code: safeReason(error, "capture_stop_failed"),
+        });
+      }
     }
   }
 

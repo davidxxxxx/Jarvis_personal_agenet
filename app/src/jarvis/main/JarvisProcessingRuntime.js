@@ -8,6 +8,7 @@ const DualSpeakerEvidenceProvider = require("./DualSpeakerEvidenceProvider");
 const DualSpeakerIdentityResolver = require("./DualSpeakerIdentityResolver");
 const TranscriptReconciler = require("./TranscriptReconciler");
 const DualTrackTranscriptDeduper = require("./DualTrackTranscriptDeduper");
+const ApplicationMixAcousticMatcher = require("./ApplicationMixAcousticMatcher");
 const ResourceGovernor = require("./ResourceGovernor");
 const { JOB_PRIORITY } = ResourceGovernor;
 const HeavyJobGate = require("./HeavyJobGate");
@@ -1192,7 +1193,27 @@ function createJarvisProcessingRuntime({
     runner,
     repository,
     reconciler: new TranscriptReconciler({ repository }),
-    deduper: new DualTrackTranscriptDeduper({ repository }),
+    deduper: new DualTrackTranscriptDeduper({
+      repository,
+      acousticMatcher:
+        typeof service.audioEvidenceReader.readVerifiedPcm === "function"
+          ? new ApplicationMixAcousticMatcher({
+              audioEvidenceReader: service.audioEvidenceReader,
+              getAudioChunk: (chunkId) => repository.getAudioChunk(chunkId),
+              log,
+            })
+          : null,
+      acousticAdmission: async () => {
+        try {
+          const snapshot = await effectiveGovernor.sample();
+          const decision = effectiveGovernor.admit?.("maintenance", snapshot);
+          return decision?.action === "run_cpu";
+        } catch (error) {
+          log({ phase: "application_mix_acoustic_admission", error });
+          return false;
+        }
+      },
+    }),
     now,
     log,
     governor: effectiveGovernor,

@@ -10,6 +10,17 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.2 - 2026-08-04
+
+- Deduplicate application audio and the mixed-system safety track with local-only whole-window
+  waveform evidence, retaining both rows whenever audio is missing, ambiguous, weak, or unrelated.
+- Recheck low-priority resource admission between bounded acoustic batches so long recordings yield
+  to games and CPU pressure without silently treating deferred work as complete.
+- Anchor application tracks to their first real PCM, bound startup buffering, and make startup,
+  overflow, stop, and replacement races emit one consistent exact-or-fallback lifecycle.
+- Increment the session timeline only when duplicate relations actually change so Memory refreshes
+  after a safe local backfill without triggering a new paid cloud summary.
+
 ## 0.2.0-rc.1 - 2026-08-03
 
 - Switch immediately to a progressive session result after Finish & Summarize, with independent

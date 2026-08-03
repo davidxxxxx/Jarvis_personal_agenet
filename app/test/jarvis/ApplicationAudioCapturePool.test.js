@@ -32,6 +32,7 @@ function createHarness(options = {}) {
         async start(args) {
           this.starts.push(args);
           this.args = args;
+          if (options.managerStart) await options.managerStart(this, args);
         },
         async stop() {
           this.stops += 1;
@@ -160,6 +161,88 @@ test("pool starts at most four independent application tracks while watcher rema
     ).length,
     4
   );
+});
+
+test("anchors an application track to first PCM and delivers startup audio exactly once", async () => {
+  let at = 10_000;
+  const firstPcm = Buffer.alloc(4_800);
+  firstPcm.writeInt16LE(4_096, 0);
+  const harness = createHarness({
+    now: () => at,
+    selectionDebounceMs: 0,
+    async managerStart(_manager, args) {
+      at = 13_250;
+      args.onChunk(firstPcm);
+    },
+  });
+  await harness.pool.start({ sessionId: "session-first-pcm" });
+  await harness.emit(active("kook", 110));
+  await harness.pool.waitForIdle();
+
+  const started = harness.events.find((event) => event.type === "started");
+  const exact = harness.events.find(
+    (event) => event.type === "attribution" && event.attributionState === "exact"
+  );
+  const chunks = harness.events.filter((event) => event.type === "chunk");
+  assert.equal(started.startedAt, 13_250);
+  assert.equal(exact.at, 13_250);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].at, 13_250);
+  assert.deepEqual(chunks[0].pcm, firstPcm);
+  assert.ok(harness.events.indexOf(started) < harness.events.indexOf(chunks[0]));
+});
+
+test("startup PCM overflow latches the first failure and never registers or flushes a partial track", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    selectionDebounceMs: 0,
+    async managerStart(_manager, args) {
+      at = 12_000;
+      args.onChunk(Buffer.alloc(24_000 * 2 * 5));
+      at = 12_500;
+      args.onChunk(Buffer.alloc(2));
+      at = 13_000;
+      args.onChunk(Buffer.alloc(4_800));
+    },
+  });
+  await harness.pool.start({ sessionId: "session-startup-overflow" });
+  await harness.emit(active("kook", 111));
+  await harness.pool.waitForIdle();
+
+  const fallbacks = harness.events.filter(
+    (event) =>
+      event.type === "attribution" &&
+      event.applicationKey === "kook" &&
+      event.attributionState === "mixed_unknown" &&
+      event.reason === "startup_pcm_overflow"
+  );
+  assert.equal(fallbacks.length, 1);
+  assert.equal(fallbacks[0].at, 12_500);
+  assert.equal(
+    harness.events.some((event) => event.type === "started"),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "ended"),
+    false
+  );
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "attribution" && event.attributionState === "exact"
+    ),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "chunk"),
+    false
+  );
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  assert.deepEqual(
+    harness.pool.getStatus().fallbacks.map((fallback) => [fallback.reason, fallback.retryAt]),
+    [["startup_pcm_overflow", 17_500]]
+  );
+  assert.equal(harness.managers[0].stops, 1);
 });
 
 test("silent active sessions do not open tracks until Chrome or KOOK is actually audible", async () => {
@@ -336,9 +419,16 @@ test("confirmed silence waits for a new audible watcher event before reopening t
 });
 
 test("evidence registration failures retain the original bounded error code", async () => {
+  let at = 10_000;
   const error = new Error("invalid application interval");
   error.code = "SQLITE_CONSTRAINT_TRIGGER";
-  const harness = createHarness({ trackStartError: error });
+  const harness = createHarness({
+    now: () => at,
+    trackStartError: error,
+    managerStart: async () => {
+      at = 13_000;
+    },
+  });
   await harness.pool.start();
   await harness.emit(active("chrome", 350));
   await harness.pool.waitForIdle();
@@ -347,6 +437,7 @@ test("evidence registration failures retain the original bounded error code", as
     (event) => event.type === "ended" && event.applicationKey === "chrome"
   );
   assert.equal(ended.failureCode, "evidence_registration_failed_SQLITE_CONSTRAINT_TRIGGER");
+  assert.equal(ended.endedAt, 13_000);
 });
 
 test("fullscreen mode retains only the communication app and foreground game", async () => {
@@ -438,6 +529,52 @@ test("stop closes application evidence synchronously before native helpers finis
   assert.deepEqual(harness.pool.getStatus().activeTracks, []);
   releaseStop();
   await stopping;
+});
+
+test("stop and replacement start never publish or double-stop an unregistered startup track", async () => {
+  let releaseFirstStart;
+  const firstStartGate = new Promise((resolve) => {
+    releaseFirstStart = resolve;
+  });
+  const harness = createHarness({
+    selectionDebounceMs: 0,
+    managerStart: (manager) =>
+      manager.identity.captureGeneration === 1 ? firstStartGate : Promise.resolve(),
+  });
+  await harness.pool.start({ sessionId: "session-start-race-1" });
+  const firstSessionEvent = harness.emit(active("kook", 701));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(harness.managers.length, 1);
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  const stopping = harness.pool.stop();
+  const restarting = harness.pool.start({ sessionId: "session-start-race-2" });
+  assert.equal(
+    harness.events.some((event) => event.type === "started"),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "ended"),
+    false
+  );
+
+  releaseFirstStart();
+  await Promise.all([firstSessionEvent, stopping, restarting]);
+  assert.equal(harness.managers[0].stops, 1);
+  assert.equal(
+    harness.events.some(
+      (event) => event.captureGeneration === 1 && ["started", "ended"].includes(event.type)
+    ),
+    false
+  );
+
+  await harness.emit(active("kook", 702));
+  await harness.pool.waitForIdle();
+  const starts = harness.events.filter((event) => event.type === "started");
+  assert.deepEqual(
+    starts.map((event) => [event.sessionId, event.captureGeneration, event.pid]),
+    [["session-start-race-2", 2, 702]]
+  );
 });
 
 test("pool can restart on a replacement session after stop cleanup completes", async () => {

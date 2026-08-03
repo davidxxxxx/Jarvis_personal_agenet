@@ -22,6 +22,7 @@ function createApplicationAudioStatus({
     effectiveLimit,
     fullscreen: fullscreen === true,
     activeTracks: [...activeTracks.values()]
+      .filter((track) => track.registered === true)
       .map((track) => ({
         applicationKey: track.applicationKey,
         applicationDisplayName: track.applicationDisplayName,
