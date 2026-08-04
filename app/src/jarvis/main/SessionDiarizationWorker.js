@@ -79,12 +79,21 @@ function clustersCannotMerge(left, right, cannotLinks) {
   return false;
 }
 
-function safeClusterPairConsistency(left, right, floor) {
+function clusterMemberAgreement(members, centroid, floor) {
+  if (!Array.isArray(members) || members.length === 0) return 0;
+  let supported = 0;
+  for (const embedding of members) {
+    if (cosine(embedding, centroid) >= floor) supported += 1;
+  }
+  return supported / members.length;
+}
+
+function safeClusterPairConsistency(left, right, floor, agreementRatio = 1) {
   const leftMembers = Array.isArray(left.memberEmbeddings) ? left.memberEmbeddings : [];
   const rightMembers = Array.isArray(right.memberEmbeddings) ? right.memberEmbeddings : [];
   return (
-    leftMembers.every((embedding) => cosine(embedding, right.centroid) >= floor) &&
-    rightMembers.every((embedding) => cosine(embedding, left.centroid) >= floor)
+    clusterMemberAgreement(leftMembers, right.centroid, floor) >= agreementRatio &&
+    clusterMemberAgreement(rightMembers, left.centroid, floor) >= agreementRatio
   );
 }
 
@@ -105,7 +114,8 @@ function consolidateGlobalClusters(clusters, turns, segmentLinks, policy, cannot
           safeClusterPairConsistency(
             left,
             right,
-            policy.clusterMemberSimilarityFloor ?? RAW_LABEL_CONSISTENCY_FLOOR
+            policy.clusterMemberSimilarityFloor ?? RAW_LABEL_CONSISTENCY_FLOOR,
+            policy.clusterMemberAgreementRatio ?? 1
           ) &&
           (!best ||
             score > best.score ||
@@ -184,6 +194,50 @@ function summarizeSpeakerCandidates(clusters) {
     }
   }
   return summary;
+}
+
+function clusterQualityScore(cluster) {
+  if (
+    !(cluster.centroid instanceof Float32Array) ||
+    cluster.windowCount <= 0 ||
+    !Array.isArray(cluster.memberEmbeddings) ||
+    cluster.memberEmbeddings.length === 0
+  ) {
+    return null;
+  }
+  return Math.max(
+    0,
+    Math.min(
+      1,
+      ...cluster.memberEmbeddings.map((embedding) => cosine(embedding, cluster.centroid))
+    )
+  );
+}
+
+function clusterCommitInput(cluster, { hasExactSourceAttribution }) {
+  const qualityScore = clusterQualityScore(cluster);
+  const hasVoiceEmbedding = qualityScore !== null;
+  let qualityGateReason = hasVoiceEmbedding ? null : "missing_voice_embedding";
+  if (hasVoiceEmbedding && !hasExactSourceAttribution) {
+    qualityGateReason = "mixed_source_attribution";
+  } else if (hasVoiceEmbedding && qualityScore < IDENTITY_MIN_QUALITY) {
+    qualityGateReason = "low_cluster_consistency";
+  } else if (hasVoiceEmbedding && cluster.speechMs < DURABLE_SPEAKER_MIN_SPEECH_MS) {
+    qualityGateReason = "insufficient_speech";
+  } else if (hasVoiceEmbedding && cluster.windowCount < DURABLE_SPEAKER_MIN_WINDOWS) {
+    qualityGateReason = "insufficient_voice_windows";
+  }
+  return {
+    id: cluster.id,
+    localLabel: cluster.localLabel,
+    embedding: hasVoiceEmbedding ? cluster.centroid : null,
+    speechMs: hasVoiceEmbedding ? cluster.speechMs : 0,
+    windowCount: hasVoiceEmbedding ? cluster.windowCount : 0,
+    qualityScore,
+    identityEligible: qualityGateReason === null,
+    qualityGateReason,
+    firstAppearanceAt: cluster.firstAppearanceAt,
+  };
 }
 
 function normalizedTurn(raw, chunk, policy) {
@@ -944,13 +998,20 @@ class SessionDiarizationWorker {
       (cluster) => cluster.centroid instanceof Float32Array && cluster.windowCount > 0
     );
     const committedClusters = clusters;
+    const hasExactSourceAttribution =
+      snapshot.track.attribution_state === "exact" ||
+      snapshot.track.track_kind === "mic" ||
+      snapshot.track.source_type === "mic";
+    const committedClusterInputs = committedClusters.map((cluster) =>
+      clusterCommitInput(cluster, { hasExactSourceAttribution })
+    );
     const committedClusterIds = new Set(committedClusters.map((cluster) => cluster.id));
     const committedTurns = turns.filter((turn) => committedClusterIds.has(turn.clusterId));
     const committedSegmentLinks = [...segmentLinks.values()].filter((link) =>
       committedClusterIds.has(link.clusterId)
     );
-    const finalSpeakerCount = voiceClusters.length;
-    if (finalSpeakerCount > 64) {
+    const observedVoiceClusterCount = voiceClusters.length;
+    if (observedVoiceClusterCount > 64) {
       throw codedError("DIARIZATION_SPEAKER_LIMIT_EXCEEDED");
     }
     const countEvidence = chunkPipelineMetadata
@@ -965,30 +1026,54 @@ class SessionDiarizationWorker {
     const countConfidence =
       countEvidence.length > 0
         ? Math.min(...countEvidence.map((count) => count.confidence))
-        : finalSpeakerCount === 0
+        : observedVoiceClusterCount === 0
           ? 1
           : 0.72;
+    const trustedSpeakerCount = committedClusterInputs.filter(
+      (cluster) => cluster.identityEligible
+    ).length;
+    const evidenceMinimum =
+      countEvidence.length > 0 ? Math.max(...countEvidence.map((count) => count.minimum)) : 0;
+    const evidenceMaximum =
+      countEvidence.length > 0 ? Math.max(...countEvidence.map((count) => count.maximum)) : 0;
+    const evidencePreferred =
+      countEvidence.length > 0
+        ? Math.max(
+            ...countEvidence.map((count) =>
+              Number.isSafeInteger(count.preferred) ? count.preferred : count.minimum
+            )
+          )
+        : 0;
     const speakerCount = filterLongSessionFragments
-      ? {
+      ? (() => {
+          // On long recordings, short/noisy fragments are retained as audit evidence but
+          // must not masquerade as additional people.  Strong global clusters are a hard
+          // lower bound; the per-window models provide the uncertainty range.
+          const minimum = Math.max(trustedSpeakerCount, evidenceMinimum);
+          const maximum = Math.max(minimum, evidenceMaximum);
+          return {
+            minimum,
+            maximum,
+            preferred: Math.min(maximum, Math.max(minimum, evidencePreferred)),
+            confidence: countConfidence,
+            state:
+              observedVoiceClusterCount !== trustedSpeakerCount ||
+              speakerCandidates.brief > 0 ||
+              speakerCandidates.overlapOnly > 0
+                ? "models_disagree"
+                : "models_agree",
+          };
+        })()
+      : {
           minimum: Math.min(
-            finalSpeakerCount,
+            observedVoiceClusterCount,
             ...countEvidence.map((count) => count.minimum)
           ),
-          maximum: Math.min(
-            64,
-            Math.max(finalSpeakerCount, ...countEvidence.map((count) => count.maximum))
+          maximum: Math.max(
+            observedVoiceClusterCount,
+            ...countEvidence.map((count) => count.maximum)
           ),
-          preferred: finalSpeakerCount,
-          confidence: countConfidence,
-          state:
-            speakerCandidates.brief > 0 || speakerCandidates.overlapOnly > 0
-              ? "models_disagree"
-              : "models_agree",
-        }
-      : {
-          minimum: Math.min(finalSpeakerCount, ...countEvidence.map((count) => count.minimum)),
-          maximum: Math.max(finalSpeakerCount, ...countEvidence.map((count) => count.maximum)),
-          preferred: finalSpeakerCount,
+          preferred: observedVoiceClusterCount,
           confidence: countConfidence,
           state: countEvidence.some((count) => count.minimum !== count.maximum)
             ? "models_disagree"
@@ -1058,46 +1143,6 @@ class SessionDiarizationWorker {
         }
       }
     }
-    const committedClusterInputs = committedClusters.map((cluster) => {
-      const hasVoiceEmbedding =
-        cluster.centroid instanceof Float32Array &&
-        cluster.windowCount > 0 &&
-        cluster.memberEmbeddings.length > 0;
-      const qualityScore = hasVoiceEmbedding
-        ? Math.max(
-            0,
-            Math.min(
-              1,
-              ...cluster.memberEmbeddings.map((embedding) => cosine(embedding, cluster.centroid))
-            )
-          )
-        : null;
-      let qualityGateReason = hasVoiceEmbedding ? null : "missing_voice_embedding";
-      const hasExactSourceAttribution =
-        snapshot.track.attribution_state === "exact" ||
-        snapshot.track.track_kind === "mic" ||
-        snapshot.track.source_type === "mic";
-      if (hasVoiceEmbedding && !hasExactSourceAttribution) {
-        qualityGateReason = "mixed_source_attribution";
-      } else if (hasVoiceEmbedding && qualityScore < IDENTITY_MIN_QUALITY) {
-        qualityGateReason = "low_cluster_consistency";
-      } else if (hasVoiceEmbedding && cluster.speechMs < DURABLE_SPEAKER_MIN_SPEECH_MS) {
-        qualityGateReason = "insufficient_speech";
-      } else if (hasVoiceEmbedding && cluster.windowCount < DURABLE_SPEAKER_MIN_WINDOWS) {
-        qualityGateReason = "insufficient_voice_windows";
-      }
-      return {
-        id: cluster.id,
-        localLabel: cluster.localLabel,
-        embedding: hasVoiceEmbedding ? cluster.centroid : null,
-        speechMs: hasVoiceEmbedding ? cluster.speechMs : 0,
-        windowCount: hasVoiceEmbedding ? cluster.windowCount : 0,
-        qualityScore,
-        identityEligible: qualityGateReason === null,
-        qualityGateReason,
-        firstAppearanceAt: cluster.firstAppearanceAt,
-      };
-    });
     const committed = this.repository.commitDiarizationRun({
       expectedRevision: identity.evidenceRevision,
       validatedAt: completedAt,

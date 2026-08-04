@@ -10,6 +10,21 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.4 - 2026-08-05
+
+- Version the corrected long-recording clustering contract as hybrid diarization v4 so v3 runs
+  cannot be mistaken for current evidence; microphone and every logical application track are
+  reprocessed before a historical session may return to Ready.
+- Merge same-speaker clusters despite an isolated noisy voice window while retaining strict
+  simultaneous-speaker cannot-link edges and refusing long-term identity binding whenever the
+  merged cluster falls below the consistency gate.
+- Derive the visible long-session speaker range from durable high-consistency global clusters and
+  per-window count evidence, keeping low-quality fragments available for review without presenting
+  every fragment as another person.
+- Rank diarization runs by logical application rather than physical capture generation, so Memory
+  exposes only the newest KOOK, DOTA 2, Quark, or browser utterance timeline instead of replaying
+  stale generation-specific results alongside the current run.
+
 ## 0.2.0-rc.3 - 2026-08-05
 
 - Treat every capture generation from the same application as one logical audio track, recognize

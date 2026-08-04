@@ -60,6 +60,7 @@ const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
 const EXACT_APPLICATION_SYSTEM_MIX_COVERAGE_THRESHOLD = 0.8;
 const PUBLIC_SPEAKER_MIN_SPEECH_MS = 5_000;
 const PUBLIC_SPEAKER_MIN_WINDOWS = 3;
+const PUBLIC_SPEAKER_MIN_QUALITY = 0.72;
 const DIARIZATION_PRIORITY = Object.freeze({
   mic: 18,
   application: 26,
@@ -85,9 +86,10 @@ const IDENTITY_PROFILE_DIMENSIONS = new Map([
 function isPublicSpeakerCluster(cluster) {
   return Boolean(
     cluster &&
-    (cluster.linkState === "confirmed" ||
+      (cluster.linkState === "confirmed" ||
       (cluster.speechMs >= PUBLIC_SPEAKER_MIN_SPEECH_MS &&
-        cluster.windowCount >= PUBLIC_SPEAKER_MIN_WINDOWS))
+        cluster.windowCount >= PUBLIC_SPEAKER_MIN_WINDOWS &&
+        cluster.qualityScore >= PUBLIC_SPEAKER_MIN_QUALITY))
   );
 }
 
@@ -1575,31 +1577,40 @@ class JarvisRepository {
         ORDER BY ordinal
       `),
       listSessionSpeakerUtterances: this.db.prepare(`
+        WITH ranked_runs AS (
+          SELECT run.id,
+                 row_number() OVER (
+                   PARTITION BY COALESCE(logical.canonical_track_id, run.track_id)
+                   ORDER BY run.input_version DESC, run.commit_sequence DESC
+                 ) AS logical_rank
+          FROM speaker_diarization_runs AS run
+          LEFT JOIN logical_audio_track_members AS logical_member
+            ON logical_member.track_id = run.track_id
+          LEFT JOIN logical_audio_tracks AS logical
+            ON logical.id = logical_member.logical_track_id
+          WHERE run.session_id = @sessionId
+        )
         SELECT utterance.*,
                cluster.local_label, cluster.person_id, cluster.link_state,
                person.display_name AS person_display_name,
-               track.application_key, track.application_display_name, track.track_kind,
+               COALESCE(logical.application_key, track.application_key) AS application_key,
+               COALESCE(logical.application_display_name, track.application_display_name)
+                 AS application_display_name,
+               COALESCE(logical.track_kind, track.track_kind) AS track_kind,
                stem.path AS stem_path, stem.file_sha256 AS stem_file_sha256,
                stem.expires_at AS stem_expires_at, stem.deleted_at AS stem_deleted_at
         FROM speaker_utterances AS utterance
         JOIN speaker_clusters AS cluster ON cluster.id = utterance.cluster_id
         JOIN speaker_diarization_runs AS run ON run.id = utterance.run_id
+        JOIN ranked_runs AS ranked ON ranked.id = run.id AND ranked.logical_rank = 1
         JOIN audio_tracks AS track ON track.id = run.track_id
+        LEFT JOIN logical_audio_track_members AS logical_member
+          ON logical_member.track_id = run.track_id
+        LEFT JOIN logical_audio_tracks AS logical
+          ON logical.id = logical_member.logical_track_id
         LEFT JOIN people AS person ON person.id = cluster.person_id
         LEFT JOIN overlap_stem_evidence AS stem ON stem.id = utterance.stem_id
-        WHERE utterance.session_id = ?
-          AND run.input_version = (
-            SELECT max(preferred.input_version)
-            FROM speaker_diarization_runs AS preferred
-            WHERE preferred.session_id = run.session_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM speaker_diarization_runs AS newer
-            WHERE newer.session_id = run.session_id
-              AND newer.track_id = run.track_id
-              AND newer.policy_id = run.policy_id
-              AND newer.commit_sequence > run.commit_sequence
-          )
+        WHERE utterance.session_id = @sessionId
         ORDER BY utterance.started_at, utterance.ended_at, utterance.id
       `),
       getSpeakerUtteranceAudioEvidence: this.db.prepare(`
@@ -1617,6 +1628,13 @@ class JarvisRepository {
         JOIN speaker_diarization_runs AS run ON run.id = run_cluster.run_id
         WHERE run_cluster.run_id = ?
           AND run_cluster.identity_eligible = 1
+        ORDER BY run_cluster.first_appearance_at, run_cluster.cluster_id
+      `),
+      listDiarizationRunClusters: this.db.prepare(`
+        SELECT run_cluster.*, run.embedding_model_id
+        FROM speaker_diarization_run_clusters AS run_cluster
+        JOIN speaker_diarization_runs AS run ON run.id = run_cluster.run_id
+        WHERE run_cluster.run_id = ?
         ORDER BY run_cluster.first_appearance_at, run_cluster.cluster_id
       `),
       getLatestIdentityDiarizationRun: this.db.prepare(`
@@ -4011,19 +4029,31 @@ class JarvisRepository {
     const safeSessionId = assertId(sessionId, "sessionId");
     const allRuns = this.statements.listDiarizationRuns.all(safeSessionId);
     const preferredInputVersion = allRuns.some((run) => run.input_version === 2) ? 2 : 1;
+    const canonicalTrackIdByMember = new Map(
+      this.db
+        .prepare(
+          `SELECT member.track_id, logical.canonical_track_id
+           FROM logical_audio_track_members AS member
+           JOIN logical_audio_tracks AS logical ON logical.id = member.logical_track_id
+           WHERE logical.session_id = ?`
+        )
+        .all(safeSessionId)
+        .map((row) => [row.track_id, row.canonical_track_id])
+    );
     const latestByTrack = new Map();
     for (const run of allRuns) {
       if (run.input_version !== preferredInputVersion) continue;
-      const previous = latestByTrack.get(run.track_id);
+      const logicalTrackId = canonicalTrackIdByMember.get(run.track_id) ?? run.track_id;
+      const previous = latestByTrack.get(logicalTrackId);
       if (!previous || previous.commit_sequence < run.commit_sequence) {
-        latestByTrack.set(run.track_id, run);
+        latestByTrack.set(logicalTrackId, run);
       }
     }
     const latestRuns = [...latestByTrack.values()].sort(
       (left, right) => left.commit_sequence - right.commit_sequence
     );
     const latestRunClusters = latestRuns.flatMap((run) =>
-      this.statements.listIdentityResolutionRunClusters.all(run.id)
+      this.statements.listDiarizationRunClusters.all(run.id)
     );
     const clusterIds = new Set(latestRunClusters.map((cluster) => cluster.cluster_id));
     const confirmedClusterIds = new Set(
@@ -4035,7 +4065,8 @@ class JarvisRepository {
           (cluster) =>
             confirmedClusterIds.has(cluster.cluster_id) ||
             (cluster.speech_ms >= PUBLIC_SPEAKER_MIN_SPEECH_MS &&
-              cluster.window_count >= PUBLIC_SPEAKER_MIN_WINDOWS)
+              cluster.window_count >= PUBLIC_SPEAKER_MIN_WINDOWS &&
+              cluster.quality_score >= PUBLIC_SPEAKER_MIN_QUALITY)
         )
         .map((cluster) => cluster.cluster_id)
     );
@@ -5957,7 +5988,7 @@ class JarvisRepository {
       session,
       summary,
       segments: this.listTranscriptSegments(sessionId),
-      speakerUtterances: this.statements.listSessionSpeakerUtterances.all(sessionId),
+      speakerUtterances: this.statements.listSessionSpeakerUtterances.all({ sessionId }),
       audioChunks: includeAudioChunks ? this.listAudioChunks(sessionId) : [],
       topics: this.db
         .prepare(

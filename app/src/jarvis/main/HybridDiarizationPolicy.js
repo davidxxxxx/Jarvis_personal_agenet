@@ -1,7 +1,11 @@
 const { MODEL_PACK_VERSION } = require("./AiModelPackVersion");
 
 const HYBRID_DIARIZATION_POLICY = Object.freeze({
-  policyId: "jarvis-hybrid-diarization-v3",
+  // Bump the policy whenever clustering semantics change.  The policy id is part
+  // of the durable job identity, so reusing it would make an older v2 run look
+  // current even though it was produced before logical-track/global-clustering
+  // fixes were introduced.
+  policyId: "jarvis-hybrid-diarization-v4",
   diarizerModelId: "pyannote-community-1+sherpa-campplus-verifier+mossformer2-ss-16k",
   embeddingModelId: "3dspeaker-campplus-voxceleb-16k-v1",
   embeddingDimension: 512,
@@ -12,8 +16,9 @@ const HYBRID_DIARIZATION_POLICY = Object.freeze({
   inputVersion: 2,
   executionDevice: "cuda",
   modelPackVersion: MODEL_PACK_VERSION,
-  clusterSimilarityThreshold: 0.72,
-  clusterMemberSimilarityFloor: 0.58,
+  clusterSimilarityThreshold: 0.68,
+  clusterMemberSimilarityFloor: 0.5,
+  clusterMemberAgreementRatio: 0.75,
   // A raw diarizer label is only split when its embedding is grossly inconsistent.
   // Durable-person eligibility is guarded separately by the stricter cluster quality gate.
   rawLabelConsistencyFloor: 0.35,

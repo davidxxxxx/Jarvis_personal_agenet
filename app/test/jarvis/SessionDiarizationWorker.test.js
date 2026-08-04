@@ -627,6 +627,87 @@ test("worker globally consolidates a chunk-local cluster after its centroid conv
   );
 });
 
+test("v4 global clustering tolerates one noisy window but keeps the result out of identity", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+  const base = immutableWorkerSnapshot();
+  const snapshot = {
+    ...base,
+    session: { ...base.session, ended_at: 15_000 },
+    track: { ...base.track, ended_at: 15_000, track_kind: "mic" },
+    chunks: [
+      base.chunks[0],
+      {
+        ...base.chunks[1],
+        ended_at: 15_000,
+        duration_ms: 10_000,
+        finalSegments: [
+          { id: "segment-2", started_at: 5000, ended_at: 15_000, duplicate_of: null },
+        ],
+      },
+    ],
+  };
+  let committed;
+  let embeddingIndex = 0;
+  const worker = new SessionDiarizationWorker({
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: (input) => {
+        committed = input;
+        return { status: "completed", runId: input.run.id };
+      },
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
+    },
+    diarizeAudio: async ({ chunk }) =>
+      chunk.id === "chunk-1"
+        ? [{ start: 0, end: 1.6, speaker: "local_a" }]
+        : [
+            { start: 0, end: 1.6, speaker: "local_b" },
+            { start: 2, end: 3.6, speaker: "local_b" },
+            { start: 4, end: 5.6, speaker: "local_b" },
+            { start: 6, end: 7.6, speaker: "local_b" },
+          ],
+    embedWindow: async () => {
+      embeddingIndex += 1;
+      return embeddingIndex === 2 ? unitEmbedding(0, 1, 1.9845) : unitEmbedding(0);
+    },
+    modelArtifactSha256: "a".repeat(64),
+    clock: () => 20_000,
+  });
+
+  await worker.run(
+    {
+      id: "job-robust-global-clustering",
+      session_id: "session-worker",
+      track_id: "track-worker",
+      input_hash: buildDiarizationJobKey({
+        sessionId: "session-worker",
+        trackId: "track-worker",
+        evidenceRevision: snapshot.evidenceRevision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    },
+    { device: "cuda", renewLease: () => true, checkResources: async () => true }
+  );
+
+  assert.equal(committed.clusters.length, 1);
+  assert.equal(committed.clusters[0].windowCount, 5);
+  assert.equal(committed.clusters[0].identityEligible, false);
+  assert.equal(committed.clusters[0].qualityGateReason, "low_cluster_consistency");
+  assert.deepEqual(
+    [...new Set(committed.turns.map((turn) => turn.clusterId))],
+    [committed.clusters[0].id]
+  );
+});
+
 test("worker rejects invalid turn bounds and non-finite 512D embeddings before commit", async () => {
   const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
   const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");

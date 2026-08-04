@@ -28,8 +28,18 @@ test("public speaker projection keeps durable and user-confirmed speakers", () =
       linkState: "unknown",
       speechMs: 5_000,
       windowCount: 3,
+      qualityScore: 0.72,
     }),
     true
+  );
+  assert.equal(
+    isPublicSpeakerCluster({
+      linkState: "unknown",
+      speechMs: 20_000,
+      windowCount: 20,
+      qualityScore: 0.71,
+    }),
+    false
   );
   assert.equal(
     isPublicSpeakerCluster({

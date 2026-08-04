@@ -254,7 +254,7 @@ test("historical v1 sessions enqueue v2 locally without overwriting legacy evide
   });
 });
 
-test("completed v2 runs are eligible for reprocessing after the clustering policy bump", (t) => {
+test("completed v3 runs are eligible for reprocessing after the clustering policy bump", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
   const snapshot = seedFinalTrack(repo);
@@ -267,7 +267,7 @@ test("completed v2 runs are eligible for reprocessing after the clustering polic
       embedding_dimension, sample_rate, input_version, execution_device,
       commit_sequence, created_at, completed_at
     ) VALUES (
-      'bad-v2-run', 'session-cas', 'track-cas', ?, 'jarvis-hybrid-diarization-v2',
+      'bad-v3-run', 'session-cas', 'track-cas', ?, 'jarvis-hybrid-diarization-v3',
       'pyannote-community-1', '3dspeaker-campplus-voxceleb-16k-v1', ?,
       512, 16000, 2, 'cuda', 1, 5000, 5100
     )
@@ -1518,6 +1518,112 @@ test("fragmented application generations schedule one logical track with every g
       { id: "chunk-app-long", physicalTrackId: "track-app-long" },
     ]
   );
+});
+
+test("logical application generations expose only the newest run and utterances", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'kook',
+        application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks SET source_type = 'system' WHERE id = 'chunk-cas';
+    UPDATE transcript_segments SET source_type = 'system' WHERE id = 'segment-cas';
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state
+    ) VALUES (
+      'track-kook-generation-2', 'session-cas', 'system', 'kook', 'KOOK',
+      2, 24000, 1, 5000, 9000, 'ended'
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-kook-generation-2', 'session-cas', 'track-kook-generation-2',
+      'system', 0, 'kook-2.wav', 5000, 9000, 4000,
+      '${"e".repeat(64)}', 20000, 'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-kook-generation-2', 'session-cas', 5000, 9000,
+      'system', 'old generation text', 0.9, 1,
+      'track-kook-generation-2', 'chunk-kook-generation-2', 'system',
+      'final', 1, 'whisper-v1', 9000
+    );
+  `);
+  repo.refreshLogicalApplicationTracks("session-cas", 10_000);
+  repo.db.exec(`
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, link_state,
+      created_at, updated_at, identity_eligible
+    ) VALUES
+      ('cluster-kook-old', 'session-cas', 'track-kook-generation-2', 'speaker_1',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.9, 'unknown', 9000, 9000, 1),
+      ('cluster-kook-new', 'session-cas', 'track-cas', 'speaker_2',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.9, 'unknown', 10000, 10000, 1),
+      ('cluster-kook-fragment', 'session-cas', 'track-cas', 'speaker_3',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.4, 'unknown', 10000, 10000, 0);
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES
+      ('run-kook-old', 'session-cas', 'track-kook-generation-2', '${"1".repeat(64)}',
+       'jarvis-hybrid-diarization-v3', 'old-diarizer',
+       '3dspeaker-campplus-voxceleb-16k-v1', '${"f".repeat(64)}',
+       512, 16000, 2, 'cuda', 1, 9000, 9000),
+      ('run-kook-new', 'session-cas', 'track-cas', '${"2".repeat(64)}',
+       'jarvis-hybrid-diarization-v4', 'new-diarizer',
+       '3dspeaker-campplus-voxceleb-16k-v1', '${"a".repeat(64)}',
+       512, 16000, 2, 'cuda', 2, 10000, 10000);
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at, identity_eligible
+    ) VALUES
+      ('run-kook-old', 'cluster-kook-old', 'speaker_1', zeroblob(2048),
+       6000, 3, 0.9, 5100, 1),
+      ('run-kook-new', 'cluster-kook-new', 'speaker_2', zeroblob(2048),
+       6000, 3, 0.9, 1100, 1),
+      ('run-kook-new', 'cluster-kook-fragment', 'speaker_3', zeroblob(2048),
+       6000, 3, 0.4, 1900, 0);
+    INSERT INTO speaker_utterances (
+      id, session_id, run_id, chunk_id, cluster_id, source_segment_id,
+      started_at, ended_at, text, confidence, overlap_state,
+      evidence_kind, created_at
+    ) VALUES
+      ('utterance-kook-old', 'session-cas', 'run-kook-old',
+       'chunk-kook-generation-2', 'cluster-kook-old', 'segment-kook-generation-2',
+       5100, 5600, 'old utterance', 0.9, 'single', 'word_alignment', 9000),
+      ('utterance-kook-new', 'session-cas', 'run-kook-new',
+       'chunk-cas', 'cluster-kook-new', 'segment-cas',
+       1200, 1800, 'new utterance', 0.9, 'single', 'word_alignment', 10000);
+  `);
+
+  const detail = repo.getSessionDetail("session-cas");
+  assert.deepEqual(
+    detail.speakerUtterances.map((utterance) => ({
+      id: utterance.id,
+      text: utterance.text,
+      applicationKey: utterance.application_key,
+    })),
+    [{ id: "utterance-kook-new", text: "new utterance", applicationKey: "kook" }]
+  );
+  const processing = repo.getSessionSpeakerProcessing("session-cas");
+  assert.deepEqual(processing.latestRuns.map((run) => run.id), ["run-kook-new"]);
+  assert.deepEqual(processing.speakers.map((speaker) => speaker.id), ["cluster-kook-new"]);
+  assert.equal(processing.fragmentedEvidenceCount, 1);
 });
 
 test("virtual-audio infrastructure tracks never fan out diarization jobs", (t) => {
