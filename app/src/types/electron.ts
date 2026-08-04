@@ -661,6 +661,7 @@ declare global {
         ) => Promise<JarvisPersonDetail>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
         readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
+        readSpeakerUtteranceAudio: (utteranceId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
         getSessionTimeline: (
           sessionId: string,

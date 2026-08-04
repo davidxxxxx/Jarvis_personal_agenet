@@ -40,6 +40,10 @@ function finalSpeakerPolicy(model = "large-v3-turbo") {
 
 function configurableService(service) {
   return Object.assign(service, {
+    configureTranscriptionInputVersion(inputVersion) {
+      this.transcriptionInputVersion = inputVersion;
+      return this.transcriptionInputVersion;
+    },
     configureTranscriptionModelVersion(modelVersion) {
       this.transcriptionModelVersion = modelVersion.trim();
       return this.transcriptionModelVersion;
@@ -279,6 +283,7 @@ function insertJob(
     completedAt = null,
     leaseOwner = null,
     leaseExpiresAt = null,
+    inputVersion = 1,
   } = {}
 ) {
   repository.db
@@ -288,7 +293,7 @@ function insertJob(
       id, session_id, track_id, chunk_id, job_type, state,
       priority, input_hash, input_version, model_version, attempt_count,
       lease_owner, lease_expires_at, created_at, completed_at
-    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, 30, ?, 1, '', 0, ?, ?, 100, ?)
+    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, 30, ?, ?, '', 0, ?, ?, 100, ?)
   `
     )
     .run(
@@ -298,6 +303,7 @@ function insertJob(
       chunkId,
       state,
       chunkId.padEnd(64, "0").slice(0, 64),
+      inputVersion,
       leaseOwner,
       leaseExpiresAt,
       completedAt
@@ -1466,7 +1472,7 @@ test("production composition registers diarize_track as CPU speaker work", async
   });
 
   assert.equal(Object.isFrozen(runtime.speakerProcessingPolicy), true);
-  assert.equal(runtime.speakerProcessingPolicy.transcriptionInputVersion, 1);
+  assert.equal(runtime.speakerProcessingPolicy.transcriptionInputVersion, 2);
   assert.equal(runtime.speakerProcessingPolicy.transcriptionModelVersion, "large-v3-turbo");
 
   assert.equal(await runtime.drainOnce(), 1);
@@ -1567,13 +1573,13 @@ test("production composition builds the durable diarization worker from local ma
   insertTrack(repository, { endedAt: 4_000 });
   repository.db.prepare("UPDATE audio_tracks SET state = 'ended' WHERE id = 'track-mic'").run();
   insertChunk(repository, { startedAt: 100, endedAt: 4_000 });
-  insertJob(repository, { state: "completed", completedAt: 4_200 });
+  insertJob(repository, { state: "completed", completedAt: 4_200, inputVersion: 2 });
   repository.db
     .prepare("UPDATE processing_jobs SET model_version = 'large-v3-turbo' WHERE id = 'job-mic'")
     .run();
   insertFinalCoverage(repository, "chunk-mic", 4_200);
   const speakerProcessingPolicy = new SpeakerProcessingPolicy({
-    transcriptionInputVersion: 1,
+    transcriptionInputVersion: 2,
     transcriptionModelVersion: "large-v3-turbo",
   });
   const snapshot = repository.getDiarizationEvidenceSnapshot({

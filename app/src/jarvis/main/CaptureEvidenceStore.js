@@ -75,6 +75,17 @@ class CaptureEvidenceStore {
           @failureCode, @createdAt
         )
       `),
+      createApplicationAudioFallbackEvidence: db.prepare(`
+        INSERT INTO application_audio_fallback_evidence (
+          interval_id, attempted_application_key,
+          attempted_application_display_name, reason, failure_code,
+          capture_generation, created_at
+        ) VALUES (
+          @intervalId, @attemptedApplicationKey,
+          @attemptedApplicationDisplayName, @reason, @failureCode,
+          @captureGeneration, @createdAt
+        )
+      `),
       closeApplicationAudioInterval: db.prepare(`
         UPDATE application_audio_intervals
         SET ended_at = @endedAt
@@ -2082,20 +2093,60 @@ class CaptureEvidenceStore {
     if (failureCode !== null && !APPLICATION_FAILURE_CODE_PATTERN.test(failureCode)) {
       throw new TypeError("application failure code must be a safe bounded identifier");
     }
-    this.statements.createApplicationAudioInterval.run({
-      id,
-      sessionId: interval.sessionId,
-      trackId: interval.trackId,
-      intervalKind: interval.intervalKind,
-      applicationKey,
-      attributionState: interval.attributionState,
-      captureGeneration: interval.captureGeneration ?? 0,
-      startedAt: interval.startedAt,
-      endedAt,
-      reason: interval.reason ?? null,
-      failureCode,
-      createdAt,
+    const attemptedApplicationKey = interval.attemptedApplicationKey ?? null;
+    const attemptedApplicationDisplayName = interval.attemptedApplicationDisplayName ?? null;
+    if ((attemptedApplicationKey === null) !== (attemptedApplicationDisplayName === null)) {
+      throw new TypeError("fallback application key and display name must be provided together");
+    }
+    if (
+      attemptedApplicationKey !== null &&
+      !APPLICATION_KEY_PATTERN.test(attemptedApplicationKey)
+    ) {
+      throw new TypeError("fallback application key must be a canonical lowercase identifier");
+    }
+    if (
+      attemptedApplicationDisplayName !== null &&
+      (typeof attemptedApplicationDisplayName !== "string" ||
+        attemptedApplicationDisplayName.trim().length < 1 ||
+        attemptedApplicationDisplayName.trim().length > 80 ||
+        /[\\/:]/u.test(attemptedApplicationDisplayName))
+    ) {
+      throw new TypeError("fallback application display name must not contain path data");
+    }
+    if (
+      interval.attributionState === "exact" &&
+      (attemptedApplicationKey !== null || attemptedApplicationDisplayName !== null)
+    ) {
+      throw new TypeError("exact attribution cannot contain fallback evidence");
+    }
+    const persist = this.db.transaction(() => {
+      this.statements.createApplicationAudioInterval.run({
+        id,
+        sessionId: interval.sessionId,
+        trackId: interval.trackId,
+        intervalKind: interval.intervalKind,
+        applicationKey,
+        attributionState: interval.attributionState,
+        captureGeneration: interval.captureGeneration ?? 0,
+        startedAt: interval.startedAt,
+        endedAt,
+        reason: interval.reason ?? null,
+        failureCode,
+        createdAt,
+      });
+      if (interval.attributionState === "mixed_unknown") {
+        this.statements.createApplicationAudioFallbackEvidence.run({
+          intervalId: id,
+          attemptedApplicationKey,
+          attemptedApplicationDisplayName,
+          reason: interval.reason,
+          failureCode,
+          captureGeneration: interval.captureGeneration ?? 0,
+          createdAt,
+        });
+      }
     });
+    persist();
     return this.statements.getApplicationAudioInterval.get(id);
   }
 

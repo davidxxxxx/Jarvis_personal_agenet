@@ -32,6 +32,7 @@ import type {
 import ProcessingStatus from "./ProcessingStatus";
 import type { SessionStatus } from "./sessionMachine";
 import TranscriptTodoButton from "./TranscriptTodoButton";
+import SpeakerUtteranceTimeline from "./SpeakerUtteranceTimeline";
 
 type ResultTab = "summary" | "transcript" | "processing";
 type ProgressState = "complete" | "running" | "blocked" | "waiting";
@@ -889,6 +890,21 @@ export default function CurrentSessionResultView({
                 <FileAudio2 className="size-4 text-primary" aria-hidden="true" />
                 <h2 className="font-semibold">按来源、说话人和时间排列</h2>
               </div>
+              {detail && timeline && (detail.speakerUtterances?.length ?? 0) > 0 && (
+                <div className="mb-5 px-2">
+                  <SpeakerUtteranceTimeline
+                    utterances={detail.speakerUtterances ?? []}
+                    chunks={timeline.chunks}
+                    readChunk={window.electronAPI.jarvis.readAudioChunk}
+                    readIsolatedAudio={window.electronAPI.jarvis.readSpeakerUtteranceAudio}
+                  />
+                </div>
+              )}
+              {(detail?.speakerUtterances?.length ?? 0) > 0 && (
+                <p className="mb-2 px-3 text-xs font-medium text-muted-foreground">
+                  原始转写（审计）
+                </p>
+              )}
               <div className="space-y-1">
                 {transcript.map((segment) => {
                   const track = segment.track_id ? tracksById.get(segment.track_id) : null;

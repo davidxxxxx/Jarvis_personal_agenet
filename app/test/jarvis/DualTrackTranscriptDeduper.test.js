@@ -146,6 +146,57 @@ function finalApplicationSegment(
   );
 }
 
+test("exact application transcript hides the covered system-mix audit copy by default", (t) => {
+  const { repository } = fixture(t);
+  rawChunk(repository, {
+    id: "system-audit-chunk",
+    sourceType: "system",
+    sequenceNumber: 0,
+    startedAt: 100,
+    endedAt: 200,
+  });
+  repository.commitChunkTranscript({
+    chunk: repository.getAudioChunk("system-audit-chunk"),
+    result: { text: "KOOK 和 DOTA 的安全混音副本", confidence: 0.8 },
+    modelVersion: "whisper-test-v1",
+    completedAt: 201,
+  });
+  const systemSegment = repository.db
+    .prepare(
+      `SELECT id FROM transcript_segments
+       WHERE chunk_id = 'system-audit-chunk' AND result_kind = 'final'`
+    )
+    .get();
+  assert.deepEqual(repository.listTranscriptSegments("session-1").map((row) => row.id), [
+    systemSegment.id,
+  ]);
+
+  const application = finalApplicationSegment(repository, {
+    id: "kook-primary",
+    startedAt: 100,
+    endedAt: 200,
+    text: "KOOK 独立应用主转写",
+  });
+
+  assert.deepEqual(repository.listTranscriptSegments("session-1").map((row) => row.id), [
+    application.id,
+  ]);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT projection_state, projection_reason, duplicate_of
+         FROM transcript_segments WHERE id = ?`
+      )
+      .get(systemSegment.id),
+    {
+      projection_state: "audit_hidden",
+      projection_reason: "exact_application_primary",
+      duplicate_of: null,
+    }
+  );
+  assert.equal(repository.listAllTranscriptSegments("session-1").length, 2);
+});
+
 test("marks an acoustically proven MIC echo while retaining both rows and raw evidence", (t) => {
   const { repository, deduper } = fixture(t);
   const micChunkBefore = rawChunk(repository, {

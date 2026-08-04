@@ -30,6 +30,7 @@ const CHANNELS = Object.freeze({
   mergePeople: "jarvis:people:merge",
   listAudioChunks: "jarvis:audio:list",
   readAudioChunk: "jarvis:audio:read",
+  readSpeakerUtteranceAudio: "jarvis:speaker-utterance:audio:read",
   getSessionDetail: "jarvis:memory:session-detail",
   getSessionTimeline: "jarvis:memory:session-timeline",
   getSessionTimelineStatus: "jarvis:memory:session-timeline-status",

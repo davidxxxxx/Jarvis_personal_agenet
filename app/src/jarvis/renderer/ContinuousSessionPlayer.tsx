@@ -5,6 +5,7 @@ import type {
   JarvisContinuousSeekRequest,
   JarvisContinuousSeekResult,
   JarvisSessionTimeline,
+  JarvisSpeakerUtterance,
   JarvisSpeakerClusterView,
   JarvisTranscriptSegment,
 } from "../types";
@@ -12,6 +13,7 @@ import SpeakerChip from "./SpeakerChip";
 import { useJarvisStore } from "./jarvisStore";
 import { normalizeWavForPlayback } from "./playbackLoudness";
 import TranscriptTodoButton from "./TranscriptTodoButton";
+import SpeakerUtteranceTimeline from "./SpeakerUtteranceTimeline";
 
 type PlaybackMode = "mix" | "mic" | "system";
 
@@ -23,6 +25,9 @@ interface ContinuousSessionPlayerProps {
   focusSegmentId?: string | null;
   focusRequestId?: number | null;
   onTrackPageChange?: (offset: number) => void;
+  speakerUtterances?: JarvisSpeakerUtterance[];
+  readSpeakerUtteranceAudio?: (utteranceId: string) => Promise<Uint8Array | null>;
+  onOpenSpeakerReview?: (clusterId: string) => void;
 }
 
 interface SegmentBoundary {
@@ -118,6 +123,9 @@ export default function ContinuousSessionPlayer({
   focusSegmentId = null,
   focusRequestId = null,
   onTrackPageChange,
+  speakerUtterances = [],
+  readSpeakerUtteranceAudio,
+  onOpenSpeakerReview,
 }: ContinuousSessionPlayerProps) {
   const [mode, setMode] = useState<PlaybackMode>("mix");
   const [playing, setPlaying] = useState(false);
@@ -608,6 +616,14 @@ export default function ContinuousSessionPlayer({
             </div>
           )}
       </details>
+
+      <SpeakerUtteranceTimeline
+        utterances={speakerUtterances}
+        chunks={timeline.chunks}
+        readChunk={readChunk}
+        readIsolatedAudio={readSpeakerUtteranceAudio}
+        onOpenSpeakerReview={onOpenSpeakerReview}
+      />
 
       <section aria-labelledby="session-transcript-heading">
         <div className="flex items-end justify-between gap-3">

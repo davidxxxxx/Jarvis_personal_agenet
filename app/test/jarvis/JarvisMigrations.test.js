@@ -1127,6 +1127,8 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
         superseded_by: null,
         echo_score: null,
         duplicate_of: null,
+        projection_state: "visible",
+        projection_reason: null,
       }
     );
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [

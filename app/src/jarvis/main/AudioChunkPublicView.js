@@ -173,6 +173,37 @@ function toPublicSessionDetail(detail) {
     session: toRendererSession(detail.session),
     summary: detail.summary ?? null,
     segments: Array.isArray(detail.segments) ? detail.segments : [],
+    speakerUtterances: Array.isArray(detail.speakerUtterances)
+      ? detail.speakerUtterances.map((utterance) => ({
+          ...projectFields(utterance, [
+            "id",
+            "session_id",
+            "chunk_id",
+            "cluster_id",
+            "source_segment_id",
+            "stem_id",
+            "started_at",
+            "ended_at",
+            "text",
+            "confidence",
+            "overlap_state",
+            "evidence_kind",
+            "local_label",
+            "person_id",
+            "link_state",
+            "person_display_name",
+            "application_key",
+            "application_display_name",
+            "track_kind",
+          ]),
+          has_isolated_audio:
+            utterance.evidence_kind === "separated_stem" &&
+            typeof utterance.stem_path === "string" &&
+            utterance.stem_deleted_at === null &&
+            Number.isSafeInteger(utterance.stem_expires_at) &&
+            utterance.stem_expires_at > Date.now(),
+        }))
+      : [],
     audioChunks: Array.isArray(detail.audioChunks)
       ? detail.audioChunks.map(toRendererAudioChunk)
       : [],

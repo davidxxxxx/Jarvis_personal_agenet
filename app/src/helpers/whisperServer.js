@@ -730,7 +730,17 @@ class WhisperServerManager extends EventEmitter {
     parts.push(
       `--${boundary}\r\n` +
         `Content-Disposition: form-data; name="response_format"\r\n\r\n` +
-        `json\r\n`
+        `verbose_json\r\n`
+    );
+    parts.push(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="token_timestamps"\r\n\r\n` +
+        `true\r\n`
+    );
+    parts.push(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="split_on_word"\r\n\r\n` +
+        `true\r\n`
     );
     parts.push(`--${boundary}--\r\n`);
 

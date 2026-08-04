@@ -554,7 +554,7 @@ function assertNoV57ForeignKeyTargets(db) {
 }
 
 function assertReleaseHealth(db) {
-  assert.equal(db.pragma("user_version", { simple: true }), 58);
+  assert.equal(db.pragma("user_version", { simple: true }), TARGET_VERSION);
   assert.equal(db.pragma("foreign_keys", { simple: true }), 1);
   assert.equal(db.pragma("legacy_alter_table", { simple: true }), 0);
   assert.deepEqual(db.pragma("foreign_key_check"), []);
@@ -623,10 +623,10 @@ function schemaSnapshot(db) {
     .all();
 }
 
-test("file-backed v54, v56 and v57 fixtures cross the v58 RC gate after repository cold reopen", async (t) => {
-  assert.equal(TARGET_VERSION, 58);
+test("file-backed v54, v56 and v57 fixtures cross the v59 gate after repository cold reopen", async (t) => {
+  assert.equal(TARGET_VERSION, 59);
   for (const version of [54, 56, 57]) {
-    await t.test(`v${version} -> v58`, () => {
+    await t.test(`v${version} -> v59`, () => {
       const directory = createCaseDirectory(`v${version}`);
       const filename = path.join(directory, `jarvis-v${version}.db`);
       let repository;
@@ -644,8 +644,8 @@ test("file-backed v54, v56 and v57 fixtures cross the v58 RC gate after reposito
         assertSeededLineageSurvived(repository.db, ids);
         assert.deepEqual(durableCounts(repository.db), firstCounts);
         assert.deepEqual(applyJarvisMigrations(repository.db, { now: () => AT + 20_000 }), {
-          fromVersion: 58,
-          toVersion: 58,
+          fromVersion: 59,
+          toVersion: 59,
         });
         assertReleaseHealth(repository.db);
         assert.deepEqual(durableCounts(repository.db), firstCounts);

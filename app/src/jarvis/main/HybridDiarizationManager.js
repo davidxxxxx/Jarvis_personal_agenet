@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const OnDemandModelRuntime = require("./OnDemandModelRuntime");
 const DiarizationSidecarClient = require("./DiarizationSidecarClient");
@@ -111,6 +112,7 @@ class HybridDiarizationManager {
     log = () => {},
     runtime = null,
     verifierDiarizer = null,
+    evidenceRoot = null,
   } = {}) {
     if (typeof packRoot !== "string" || !path.isAbsolute(packRoot)) {
       throw new TypeError("packRoot must be absolute");
@@ -122,6 +124,22 @@ class HybridDiarizationManager {
       throw new TypeError("hybrid diarization dependencies are invalid");
     }
     this.packRoot = path.resolve(packRoot);
+    const inferredDataRoot =
+      typeof process.env.JARVIS_DATA_ROOT === "string" &&
+      path.isAbsolute(process.env.JARVIS_DATA_ROOT)
+        ? path.resolve(process.env.JARVIS_DATA_ROOT)
+        : path.resolve(this.packRoot, "..", "..");
+    this.evidenceRoot = path.resolve(
+      evidenceRoot ?? path.join(inferredDataRoot, "recordings-data", "overlap-stems")
+    );
+    const evidenceRelative = path.relative(inferredDataRoot, this.evidenceRoot);
+    if (
+      evidenceRelative.startsWith("..") ||
+      path.isAbsolute(evidenceRelative) ||
+      evidenceRelative === ""
+    ) {
+      throw new TypeError("overlap evidence root must be inside the Jarvis data root");
+    }
     this.policy = policy;
     this.verifyPack = verifyPack;
     this.fs = fsImpl;
@@ -180,6 +198,7 @@ class HybridDiarizationManager {
       executionContext = null,
       enableOverlapSeparation = true,
       releaseHighMemoryResources = false,
+      artifactKey = null,
     } = {}
   ) {
     if (typeof wavPath !== "string" || !path.isAbsolute(wavPath)) {
@@ -192,6 +211,13 @@ class HybridDiarizationManager {
       );
     }
     const selectedGpuUuid = executionContext.selectedGpuUuid ?? null;
+    const safeArtifactKey =
+      artifactKey === null
+        ? `overlap_${crypto.createHash("sha256").update(path.resolve(wavPath)).digest("hex").slice(0, 32)}`
+        : artifactKey;
+    if (typeof safeArtifactKey !== "string" || !/^[A-Za-z0-9_-]{1,180}$/.test(safeArtifactKey)) {
+      throw new TypeError("overlap artifactKey must be a safe identifier");
+    }
     if (
       this.modelRuntime.status().loaded &&
       this.loadedGpuUuid !== null &&
@@ -209,6 +235,8 @@ class HybridDiarizationManager {
           overlapPaddingMs: this.policy.overlapPaddingMs,
           enableOverlapSeparation: enableOverlapSeparation !== false,
           releaseOverlapSeparatorAfterRequest: releaseHighMemoryResources === true,
+          overlapOutputRoot: this.evidenceRoot,
+          artifactKey: safeArtifactKey,
           selectedGpuUuid,
         }),
       { selectedGpuUuid }
@@ -262,6 +290,41 @@ class HybridDiarizationManager {
       paddingMs: this.policy.overlapPaddingMs,
       durationMs,
     });
+    const rawSeparation = result.overlapSeparation ?? {
+      state: overlapWindows.length === 0 ? "not_needed" : "pending",
+      processed: 0,
+      total: overlapWindows.length,
+      stems: [],
+    };
+    const stems = Array.isArray(rawSeparation.stems)
+      ? rawSeparation.stems.map((stem) => {
+          const resolvedPath = path.resolve(String(stem?.path ?? ""));
+          const relative = path.relative(this.evidenceRoot, resolvedPath);
+          if (
+            relative.startsWith("..") ||
+            path.isAbsolute(relative) ||
+            !/^[0-9a-f]{64}$/.test(stem?.fileSha256 ?? "") ||
+            !/^[0-9a-f]{64}$/.test(stem?.pcmSha256 ?? "") ||
+            !Number.isSafeInteger(stem?.windowIndex) ||
+            !Number.isSafeInteger(stem?.stemIndex) ||
+            !Number.isSafeInteger(stem?.startMs) ||
+            !Number.isSafeInteger(stem?.endMs) ||
+            stem.endMs <= stem.startMs ||
+            stem.sampleRate !== 16_000 ||
+            stem.channels !== 1 ||
+            typeof stem.rms !== "number" ||
+            !Number.isFinite(stem.rms) ||
+            stem.rms < 0
+          ) {
+            throw codedError(
+              "DIARIZATION_SIDECAR_INVALID_RESULT",
+              "overlap separator returned invalid stem evidence"
+            );
+          }
+          return Object.freeze({ ...stem, path: resolvedPath });
+        })
+      : [];
+    const overlapSeparation = Object.freeze({ ...rawSeparation, stems: Object.freeze(stems) });
     const metadata = Object.freeze({
       schemaVersion: 1,
       stage: "final",
@@ -270,11 +333,7 @@ class HybridDiarizationManager {
       speakerCount: consensus,
       verifierState,
       overlapWindows,
-      overlapSeparation: result.overlapSeparation ?? {
-        state: overlapWindows.length === 0 ? "not_needed" : "pending",
-        processed: 0,
-        total: overlapWindows.length,
-      },
+      overlapSeparation,
       models: Object.freeze({
         primary: this.policy.models.primary.id,
         verifier: verifierCount === null ? null : this.policy.models.verifier.id,

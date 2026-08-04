@@ -4155,7 +4155,7 @@ test("reopens and reads a canonical legacy v2 analysis input under schema v58", 
 
     db = new Database(filename);
     db.pragma("foreign_keys = ON");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 58, toVersion: 58 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 59, toVersion: 59 });
     const repository = createRepository(db);
     assert.deepEqual(repository.getAnalysisInputForCloud("legacy-v2-input"), {
       inputHash,

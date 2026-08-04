@@ -291,10 +291,10 @@ test("a file-backed v57 analysis lineage upgrades to v58 with durable v2 and str
     db.close();
     db = null;
 
-    stage = "verify reopened v58 file";
+    stage = "verify reopened current file";
     db = new Database(filename);
     db.pragma("foreign_keys = ON");
-    assert.equal(db.pragma("user_version", { simple: true }), 58);
+    assert.equal(db.pragma("user_version", { simple: true }), TARGET_VERSION);
     assert.deepEqual(db.pragma("foreign_key_check"), []);
     assert.deepEqual(
       db

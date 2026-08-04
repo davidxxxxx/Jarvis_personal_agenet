@@ -22,6 +22,7 @@ const NORMALIZED_APPLICATIONS = Object.freeze({
   chrome: "Chrome",
   edge: "Edge",
   firefox: "Firefox",
+  quark: "Quark",
   kook: "KOOK",
   discord: "Discord",
   wechat: "WeChat",

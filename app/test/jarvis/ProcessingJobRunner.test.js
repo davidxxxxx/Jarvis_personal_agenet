@@ -626,6 +626,37 @@ test("blocks deterministic diarization validation failures after one attempt", a
   );
 });
 
+test("blocks a deterministic over-64-speaker result instead of retrying forever", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v3",
+  });
+  runner.register("diarize_track", async () => {
+    const error = new Error("DIARIZATION_SPEAKER_LIMIT_EXCEEDED");
+    error.code = "DIARIZATION_SPEAKER_LIMIT_EXCEEDED";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_SPEAKER_LIMIT_EXCEEDED",
+      completed_at: 2_000,
+    }
+  );
+});
+
 test("blocks a transcription lineage mismatch instead of retrying obsolete work", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db);

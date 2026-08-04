@@ -42,6 +42,8 @@ const {
 } = require("./AudioChunkPublicView");
 const { NORMALIZED_APPLICATIONS } = require("./ActivityClassificationInputBuilder");
 const path = require("node:path");
+const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 
 const REQUIRED_REPOSITORY_METHODS = [
   "createSession",
@@ -1556,6 +1558,51 @@ function registerJarvisIpc({
     } catch (error) {
       if (error?.code === "ENOENT") return null;
       throw error;
+    }
+  });
+  ipcMain.handle(CHANNELS.readSpeakerUtteranceAudio, async (_event, utteranceId) => {
+    const evidence = repository.getSpeakerUtteranceAudioEvidence?.(
+      assertId(utteranceId, "speakerUtteranceId")
+    );
+    if (
+      !evidence ||
+      evidence.evidence_kind !== "separated_stem" ||
+      evidence.stem_deleted_at !== null ||
+      !Number.isSafeInteger(evidence.stem_expires_at) ||
+      evidence.stem_expires_at <= now()
+    ) {
+      return null;
+    }
+    try {
+      const dataRoot = process.env.JARVIS_DATA_ROOT;
+      if (typeof dataRoot !== "string" || !path.isAbsolute(dataRoot)) {
+        throw new Error("speaker utterance data root is unavailable");
+      }
+      const allowedRoot = await fs.realpath(
+        path.join(path.resolve(dataRoot), "recordings-data", "overlap-stems")
+      );
+      const realPath = await fs.realpath(evidence.stem_path);
+      const relative = path.relative(allowedRoot, realPath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw new Error("speaker utterance evidence escaped its storage root");
+      }
+      const bytes = await fs.readFile(realPath);
+      const actualSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      if (actualSha256 !== evidence.stem_file_sha256) {
+        throw new Error("speaker utterance evidence integrity mismatch");
+      }
+      return bytes;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      log({
+        phase: "read_speaker_utterance_audio",
+        utteranceId: evidence.id,
+        errorCode: error?.code ?? "EVIDENCE_READ_FAILED",
+      });
+      throw publicBoundaryError(
+        "JARVIS_SPEAKER_UTTERANCE_AUDIO_UNAVAILABLE",
+        "Isolated speaker audio is unavailable"
+      );
     }
   });
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>

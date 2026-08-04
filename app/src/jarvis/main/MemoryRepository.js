@@ -660,6 +660,7 @@ class MemoryRepository {
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
                   segment.version, segment.text, segment.person_id, segment.result_kind,
                   segment.is_stable, segment.superseded_by, segment.duplicate_of,
+                  segment.projection_state,
                   segment.source_type,
                   track.device_label, track.track_kind, track.application_key,
                   track.application_display_name, track.attribution_state
@@ -686,6 +687,7 @@ class MemoryRepository {
         segment.is_stable !== 1 ||
         segment.superseded_by !== null ||
         segment.duplicate_of !== null ||
+        segment.projection_state !== "visible" ||
         typeof segment.text !== "string" ||
         segment.text.length === 0 ||
         !Number.isSafeInteger(segment.started_at) ||
@@ -1552,6 +1554,7 @@ class MemoryRepository {
              AND segment.is_stable = 1
              AND segment.superseded_by IS NULL
              AND segment.duplicate_of IS NULL
+             AND segment.projection_state = 'visible'
            ORDER BY segment.started_at, segment.id`
         )
         .all(boundary.endsAt, boundary.startsAt);
@@ -1633,6 +1636,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND superseded_by IS NULL
              AND duplicate_of IS NULL
+             AND projection_state = 'visible'
              AND (
                result_kind <> 'final' OR is_stable <> 1
              )`

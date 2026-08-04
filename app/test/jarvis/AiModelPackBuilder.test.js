@@ -20,6 +20,8 @@ test("model pack builder creates one verified offline component tree", async (t)
   const smallModels = path.join(root, "small-models");
   const clearerVoice = path.join(root, "clearervoice-studio");
   write(path.join(runtime, "python.exe"));
+  write(path.join(runtime, "jarvis_diarization_sidecar.py"), "stale sidecar");
+  write(path.join(runtime, "jarvis_overlap_separator.py"), "stale separator");
   write(path.join(runtime, "__pycache__", "ignored.pyc"));
   write(path.join(pyannote, "config.yaml"));
   write(path.join(pyannote, ".cache", "ignored-metadata"));
@@ -50,6 +52,14 @@ test("model pack builder creates one verified offline component tree", async (t)
   assert.equal(verified.manifest.createdAt, "2026-07-21T00:00:00.000Z");
   assert.ok(fs.existsSync(path.join(output, "runtime", "jarvis_diarization_sidecar.py")));
   assert.ok(fs.existsSync(path.join(output, "runtime", "jarvis_overlap_separator.py")));
+  assert.notEqual(
+    fs.readFileSync(path.join(output, "runtime", "jarvis_diarization_sidecar.py"), "utf8"),
+    "stale sidecar"
+  );
+  assert.notEqual(
+    fs.readFileSync(path.join(output, "runtime", "jarvis_overlap_separator.py"), "utf8"),
+    "stale separator"
+  );
   assert.ok(
     fs.existsSync(path.join(output, "vendor", "clearervoice-studio", "clearvoice", "__init__.py"))
   );

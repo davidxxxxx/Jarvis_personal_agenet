@@ -463,11 +463,30 @@ test("stores canonical application tracks and exact/fallback attribution interva
     captureGeneration: 3,
     startedAt: 30,
     reason: "application_capture_failed",
+    attemptedApplicationKey: "quark",
+    attemptedApplicationDisplayName: "Quark",
+    failureCode: "activation_failed_0x88890004",
   });
 
   assert.equal(exact.application_key, "chrome");
   assert.equal(fallback.application_key, null);
   assert.equal(store.closeApplicationAudioInterval("interval-exact", 29).changes, 1);
+  assert.deepEqual(
+    store.db
+      .prepare(
+        `SELECT attempted_application_key, attempted_application_display_name,
+                reason, failure_code
+         FROM application_audio_fallback_evidence
+         WHERE interval_id = 'interval-fallback'`
+      )
+      .get(),
+    {
+      attempted_application_key: "quark",
+      attempted_application_display_name: "Quark",
+      reason: "application_capture_failed",
+      failure_code: "activation_failed_0x88890004",
+    }
+  );
   assert.deepEqual(
     store.listApplicationAudioIntervals("s1").map((interval) => ({
       id: interval.id,

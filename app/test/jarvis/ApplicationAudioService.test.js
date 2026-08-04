@@ -118,6 +118,8 @@ test("attribution transitions use the system mix for fallback and app track for 
     null,
     "fallback evidence must never persist a guessed application source"
   );
+  assert.equal(intervals[0][1].attemptedApplicationKey, "kook");
+  assert.equal(intervals[0][1].attemptedApplicationDisplayName, "KOOK");
   assert.equal(intervals[1][1].trackId, track.trackId);
   assert.equal(intervals[1][1].intervalKind, "application_active");
   assert.equal(intervals[1][1].applicationKey, "kook");

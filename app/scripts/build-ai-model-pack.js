@@ -96,11 +96,15 @@ async function copyDirectory(source, destination) {
   });
 }
 
-async function copyFile(source, destination) {
+async function copyFile(source, destination, { replace = false } = {}) {
   const stat = await fs.promises.stat(source);
   if (!stat.isFile() || stat.size <= 0) throw new TypeError(`file is required: ${source}`);
   await fs.promises.mkdir(path.dirname(destination), { recursive: true });
-  await fs.promises.copyFile(source, destination, fs.constants.COPYFILE_EXCL);
+  await fs.promises.copyFile(
+    source,
+    destination,
+    replace ? 0 : fs.constants.COPYFILE_EXCL
+  );
 }
 
 async function sha256File(filePath) {
@@ -158,10 +162,15 @@ async function buildAiModelPack(input, { now = () => new Date(), systemDrive } =
     await fs.promises.mkdir(path.dirname(output), { recursive: true });
     await fs.promises.mkdir(staging, { recursive: false });
     await copyDirectory(path.resolve(input.pythonRuntime), path.join(staging, "runtime"));
-    await copyFile(SIDECAR_SOURCE, path.join(staging, "runtime", "jarvis_diarization_sidecar.py"));
+    await copyFile(
+      SIDECAR_SOURCE,
+      path.join(staging, "runtime", "jarvis_diarization_sidecar.py"),
+      { replace: true }
+    );
     await copyFile(
       OVERLAP_SIDECAR_SOURCE,
-      path.join(staging, "runtime", "jarvis_overlap_separator.py")
+      path.join(staging, "runtime", "jarvis_overlap_separator.py"),
+      { replace: true }
     );
     await copyDirectory(
       path.resolve(input.pyannoteDir),

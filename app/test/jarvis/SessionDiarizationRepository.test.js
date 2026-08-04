@@ -690,6 +690,91 @@ function revisedCommitInput(repo, suffix, clusters) {
   return input;
 }
 
+test("word timestamps project one transcript into overlapping per-speaker utterances", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const insertWord = repo.db.prepare(`
+    INSERT INTO transcript_words (
+      id, transcript_segment_id, chunk_id, ordinal, word,
+      started_at, ended_at, probability, created_at
+    ) VALUES (?, 'segment-cas', 'chunk-cas', ?, ?, ?, ?, ?, 5500)
+  `);
+  insertWord.run("word-1", 0, "你", 1200, 1380, 0.98);
+  insertWord.run("word-2", 1, "好", 1600, 1780, 0.94);
+  insertWord.run("word-3", 2, " okay", 2100, 2450, 0.86);
+
+  const input = commitInput(snapshot, "word_projection");
+  const secondCluster = {
+    id: "speaker_cluster_session_cas_2",
+    localLabel: "speaker_2",
+    embedding: vector(1),
+    speechMs: 1200,
+    windowCount: 1,
+    qualityScore: 0.96,
+    firstAppearanceAt: 1400,
+  };
+  input.clusters.push(secondCluster);
+  input.turns = [
+    { ...input.turns[0], startedAt: 1100, endedAt: 2700 },
+    {
+      ...input.turns[1],
+      id: "speaker_turn_word_projection_overlap",
+      clusterId: secondCluster.id,
+      localLabel: secondCluster.localLabel,
+      rawLabel: "raw_b",
+      startedAt: 1400,
+      endedAt: 2500,
+      embedding: vector(1),
+    },
+  ];
+  input.segmentLinks.push({
+    clusterId: secondCluster.id,
+    transcriptSegmentId: "segment-cas",
+  });
+  input.cannotLinks = [
+    {
+      leftClusterId: input.clusters[0].id,
+      rightClusterId: secondCluster.id,
+      reason: "simultaneous_turns",
+    },
+  ];
+
+  assert.equal(repo.commitDiarizationRun(input).status, "completed");
+  const detail = repo.getSessionDetail("session-cas");
+  assert.deepEqual(
+    detail.speakerUtterances.map((utterance) => ({
+      localLabel: utterance.local_label,
+      text: utterance.text,
+      overlapState: utterance.overlap_state,
+      evidenceKind: utterance.evidence_kind,
+    })),
+    [
+      {
+        localLabel: "speaker_1",
+        text: "你好 okay",
+        overlapState: "overlap",
+        evidenceKind: "word_alignment",
+      },
+      {
+        localLabel: "speaker_2",
+        text: "好 okay",
+        overlapState: "overlap",
+        evidenceKind: "word_alignment",
+      },
+    ]
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT reason FROM speaker_cluster_cannot_links
+         WHERE run_id = 'diarization_run_word_projection'`
+      )
+      .all(),
+    [{ reason: "simultaneous_turns" }]
+  );
+});
+
 function rebuildAsLegacyV20DiarizationSchema(
   db,
   { hasCommitSequence = false, hasRunLinks = false, allowDuplicateCommitSequence = false } = {}
@@ -710,6 +795,14 @@ function rebuildAsLegacyV20DiarizationSchema(
   const commitSequenceColumn = hasCommitSequence ? ", commit_sequence" : "";
   db.pragma("foreign_keys = OFF");
   db.exec(`
+    DROP TABLE IF EXISTS speaker_utterance_words;
+    DROP TABLE IF EXISTS speaker_utterances;
+    DROP TABLE IF EXISTS overlap_stem_evidence;
+    DROP TABLE IF EXISTS speaker_cluster_cannot_links;
+    DROP TABLE IF EXISTS transcript_words;
+    DROP TABLE IF EXISTS application_audio_fallback_evidence;
+    DROP TABLE IF EXISTS logical_audio_track_members;
+    DROP TABLE IF EXISTS logical_audio_tracks;
     DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
     DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_update;
     DROP TABLE IF EXISTS speaker_identity_resolutions;
@@ -807,8 +900,13 @@ function rebuildAsLegacyV20DiarizationSchema(
            ${commitSequenceColumn},
            created_at, completed_at
     FROM speaker_diarization_runs_v21_fixture;
-    INSERT INTO speaker_diarization_run_clusters
-    SELECT * FROM speaker_diarization_run_clusters_v21_fixture;
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    )
+    SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+           window_count, quality_score, first_appearance_at
+    FROM speaker_diarization_run_clusters_v21_fixture;
     INSERT INTO speaker_turns
     SELECT * FROM speaker_turns_v21_fixture;
 
@@ -1310,7 +1408,7 @@ test("short application tracks do not fan out diarization jobs", (t) => {
   );
 });
 
-test("fragmented application tracks schedule only the longest track per application", (t) => {
+test("fragmented application generations schedule one logical track with every generation", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
   seedFinalTrack(repo);
@@ -1343,7 +1441,7 @@ test("fragmented application tracks schedule only the longest track per applicat
       failure_code
     ) VALUES (
       'track-app-long', 'session-cas', 'system', 'kook', 'KOOK',
-      2, 24000, 1, 1000, 181000, 'ended', NULL
+      2, 24000, 1, 121000, 181000, 'ended', NULL
     );
     INSERT INTO audio_chunks (
       id, session_id, track_id, source_type, sequence_number, path,
@@ -1351,7 +1449,7 @@ test("fragmented application tracks schedule only the longest track per applicat
       transcription_status, write_state, format, sample_rate, channels
     ) VALUES (
       'chunk-app-long', 'session-cas', 'track-app-long', 'system', 0, 'app-long.wav',
-      1000, 181000, 180000,
+      121000, 181000, 60000,
       '${"e".repeat(64)}', 300000,
       'completed', 'committed', 'wav', 24000, 1
     );
@@ -1368,7 +1466,7 @@ test("fragmented application tracks schedule only the longest track per applicat
       is_stable, track_id, chunk_id, source_type, result_kind, version,
       model_version, completed_at
     ) VALUES (
-      'segment-app-long', 'session-cas', 1000, 181000, 'system', 'long call', 0.9,
+      'segment-app-long', 'session-cas', 121000, 181000, 'system', 'call continued', 0.9,
       1, 'track-app-long', 'chunk-app-long', 'system', 'final', 1, 'whisper-v1', 181100
     );
   `);
@@ -1380,7 +1478,7 @@ test("fragmented application tracks schedule only the longest track per applicat
 
   assert.equal(result.enqueued, 1);
   assert.deepEqual(result.skipped, [
-    { trackId: "track-cas", reason: "application_track_not_primary" },
+    { trackId: "track-app-long", reason: "application_track_not_primary" },
   ]);
   assert.deepEqual(
     repo.db
@@ -1393,15 +1491,31 @@ test("fragmented application tracks schedule only the longest track per applicat
       .all(),
     [
       {
-        track_id: "track-app-long",
-        state: "pending",
-        error_code: null,
+        track_id: "track-cas",
+        state: "superseded",
+        error_code: "DIARIZATION_EVIDENCE_SUPERSEDED",
       },
       {
         track_id: "track-cas",
-        state: "superseded",
-        error_code: "APPLICATION_TRACK_NOT_PRIMARY",
+        state: "pending",
+        error_code: null,
       },
+    ]
+  );
+  assert.deepEqual(
+    repo
+      .getDiarizationTrackEvidence({
+        sessionId: "session-cas",
+        trackId: "track-cas",
+        observedAt: 182000,
+      })
+      .chunks.map((entry) => ({
+        id: entry.audioChunk.id,
+        physicalTrackId: entry.audioChunk.physical_track_id,
+      })),
+    [
+      { id: "chunk-cas", physicalTrackId: "track-cas" },
+      { id: "chunk-app-long", physicalTrackId: "track-app-long" },
     ]
   );
 });
@@ -1944,6 +2058,8 @@ test("incoming cosine ambiguity cannot inherit a confirmed identity", (t) => {
     speechMs: 1600,
     windowCount: 1,
     qualityScore: 1,
+    identityEligible: 1,
+    qualityGateReason: null,
     at: 6000,
   });
   const ambiguous = revisedCommitInput(repo, "incoming_tie_revision", [

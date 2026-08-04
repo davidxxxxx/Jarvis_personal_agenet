@@ -921,14 +921,19 @@ function createJarvisProcessingRuntime({
   if (typeof service.configureTranscriptionModelVersion !== "function") {
     throw new TypeError("service.configureTranscriptionModelVersion must be a function");
   }
+  if (typeof service.configureTranscriptionInputVersion !== "function") {
+    throw new TypeError("service.configureTranscriptionInputVersion must be a function");
+  }
+  service.configureTranscriptionInputVersion(2);
   service.configureTranscriptionModelVersion(configuredModel);
   if (service.transcriptionModelVersion !== configuredModel) {
     throw new Error("Jarvis service transcription model does not match processing runtime");
   }
   const speakerProcessingPolicy = new SpeakerProcessingPolicy({
-    transcriptionInputVersion: 1,
+    transcriptionInputVersion: 2,
     transcriptionModelVersion: configuredModel,
   });
+  const transcribeWav = ipcHandlers.createJarvisTranscribeWavAdapter({ model: configuredModel });
   const whisperManager = ipcHandlers.whisperManager || null;
   const cudaManager = ipcHandlers.whisperCudaManager || null;
   const legacyDiarizationManager = ipcHandlers.diarizationManager || null;
@@ -991,11 +996,20 @@ function createJarvisProcessingRuntime({
       ? new SessionDiarizationWorker({
           repository,
           audioEvidenceReader: service.audioEvidenceReader,
-          diarizeAudio: ({ wavPath, executionContext, track, releaseHighMemoryResources }) =>
+          diarizeAudio: ({
+            wavPath,
+            executionContext,
+            track,
+            chunk,
+            releaseHighMemoryResources,
+          }) =>
             diarizationManager.diarizeStrict(wavPath, {
               executionContext,
               enableOverlapSeparation: shouldEnableOverlapSeparation(track),
               releaseHighMemoryResources,
+              artifactKey: `stem_${createHash("sha256")
+                .update(`${chunk.session_id}\0${chunk.id}`)
+                .digest("hex")}`,
             }),
           embedWindow: ({ wavPath, turn }) =>
             speakerEmbeddingHelper.extractEmbedding(
@@ -1003,6 +1017,7 @@ function createJarvisProcessingRuntime({
               turn.embeddingStartMs / 1_000,
               turn.embeddingEndMs / 1_000
             ),
+          transcribeStem: (input) => transcribeWav(input),
           modelArtifactSha256: combinedDiarizationArtifactHash,
           policy: selectedDiarizationPolicy,
           speakerProcessingPolicy,
@@ -1129,7 +1144,6 @@ function createJarvisProcessingRuntime({
   if (previewPersist !== null && typeof previewPersist !== "function") {
     throw new TypeError("previewPersist must be a function or null");
   }
-  const transcribeWav = ipcHandlers.createJarvisTranscribeWavAdapter({ model: configuredModel });
   const runner = new ProcessingJobRunner({
     store: repository.captureEvidenceStore,
     owner,

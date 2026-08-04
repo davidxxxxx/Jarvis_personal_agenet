@@ -11,6 +11,8 @@ const MAX_STORED_OVERLAP_WINDOWS_PER_CHUNK = 16;
 const LONG_SESSION_SPEAKER_EVIDENCE_MS = 5 * 60 * 1000;
 const DURABLE_SPEAKER_MIN_SPEECH_MS = 5_000;
 const DURABLE_SPEAKER_MIN_WINDOWS = 3;
+const IDENTITY_MIN_QUALITY = 0.72;
+const RAW_LABEL_CONSISTENCY_FLOOR = 0.35;
 
 function codedError(code) {
   const error = new Error(code);
@@ -62,7 +64,31 @@ function cosine(left, right) {
   return score;
 }
 
-function consolidateGlobalClusters(clusters, turns, segmentLinks, policy) {
+function cannotLinkKey(leftId, rightId) {
+  return leftId < rightId ? `${leftId}\0${rightId}` : `${rightId}\0${leftId}`;
+}
+
+function clustersCannotMerge(left, right, cannotLinks) {
+  const leftIds = left.lineageIds ?? new Set([left.id]);
+  const rightIds = right.lineageIds ?? new Set([right.id]);
+  for (const leftId of leftIds) {
+    for (const rightId of rightIds) {
+      if (cannotLinks.has(cannotLinkKey(leftId, rightId))) return true;
+    }
+  }
+  return false;
+}
+
+function safeClusterPairConsistency(left, right, floor) {
+  const leftMembers = Array.isArray(left.memberEmbeddings) ? left.memberEmbeddings : [];
+  const rightMembers = Array.isArray(right.memberEmbeddings) ? right.memberEmbeddings : [];
+  return (
+    leftMembers.every((embedding) => cosine(embedding, right.centroid) >= floor) &&
+    rightMembers.every((embedding) => cosine(embedding, left.centroid) >= floor)
+  );
+}
+
+function consolidateGlobalClusters(clusters, turns, segmentLinks, policy, cannotLinks) {
   const aliases = new Map();
   for (;;) {
     let best = null;
@@ -72,9 +98,15 @@ function consolidateGlobalClusters(clusters, turns, segmentLinks, policy) {
       for (let rightIndex = leftIndex + 1; rightIndex < clusters.length; rightIndex += 1) {
         const right = clusters[rightIndex];
         if (!(right.centroid instanceof Float32Array)) continue;
+        if (clustersCannotMerge(left, right, cannotLinks)) continue;
         const score = cosine(left.centroid, right.centroid);
         if (
           score >= policy.clusterSimilarityThreshold &&
+          safeClusterPairConsistency(
+            left,
+            right,
+            policy.clusterMemberSimilarityFloor ?? RAW_LABEL_CONSISTENCY_FLOOR
+          ) &&
           (!best ||
             score > best.score ||
             (score === best.score &&
@@ -93,6 +125,11 @@ function consolidateGlobalClusters(clusters, turns, segmentLinks, policy) {
     best.left.windowCount += best.right.windowCount;
     best.left.speechMs += best.right.speechMs;
     best.left.memberEmbeddings.push(...best.right.memberEmbeddings);
+    best.left.lineageIds ??= new Set([best.left.id]);
+    for (const id of best.right.lineageIds ?? new Set([best.right.id])) {
+      best.left.lineageIds.add(id);
+    }
+    best.left.separatedStem = best.left.separatedStem || best.right.separatedStem;
     best.left.firstAppearanceAt = Math.min(
       best.left.firstAppearanceAt,
       best.right.firstAppearanceAt
@@ -368,6 +405,7 @@ class SessionDiarizationWorker {
     audioEvidenceReader,
     diarizeAudio,
     embedWindow,
+    transcribeStem = null,
     modelArtifactSha256,
     policy = SESSION_DIARIZATION_POLICY,
     speakerProcessingPolicy,
@@ -391,6 +429,9 @@ class SessionDiarizationWorker {
     }
     if (typeof diarizeAudio !== "function" || typeof embedWindow !== "function") {
       throw new TypeError("diarizeAudio and embedWindow must be functions");
+    }
+    if (transcribeStem !== null && typeof transcribeStem !== "function") {
+      throw new TypeError("transcribeStem must be a function or null");
     }
     if (!(
       (typeof modelArtifactSha256 === "string" && SHA256.test(modelArtifactSha256)) ||
@@ -416,6 +457,7 @@ class SessionDiarizationWorker {
     this.audioEvidenceReader = audioEvidenceReader;
     this.diarizeAudio = diarizeAudio;
     this.embedWindow = embedWindow;
+    this.transcribeStem = transcribeStem;
     this.modelArtifactSha256 = modelArtifactSha256;
     this.policy = policy;
     this.speakerProcessingPolicy = speakerProcessingPolicy;
@@ -495,6 +537,9 @@ class SessionDiarizationWorker {
     const clusters = [];
     const turns = [];
     const segmentLinks = new Map();
+    const cannotLinks = new Map();
+    const stemCandidates = [];
+    const nextTurnIndexByChunk = new Map();
     const chunkPipelineMetadata = [];
 
     const admittedChunks = snapshot.chunks.map((entry) =>
@@ -522,14 +567,14 @@ class SessionDiarizationWorker {
         chunk,
         async (wavPath) => {
           await renewLease();
-           const rawTurns = await this.diarizeAudio({
-             wavPath,
-             chunk,
-             track: snapshot.track,
-             policy: this.policy,
-             executionContext: context,
-             releaseHighMemoryResources: chunkIndex === admittedChunks.length - 1,
-           });
+          const rawTurns = await this.diarizeAudio({
+            wavPath,
+            chunk,
+            track: snapshot.track,
+            policy: this.policy,
+            executionContext: context,
+            releaseHighMemoryResources: chunkIndex === admittedChunks.length - 1,
+          });
           await renewLease();
           await checkResources();
           if (!Array.isArray(rawTurns)) throw codedError("DIARIZATION_INVALID_TURN");
@@ -546,6 +591,12 @@ class SessionDiarizationWorker {
               overlapCentroidExcludedTurns: 0,
             };
             chunkPipelineMetadata.push(storedChunkMetadata);
+            const stems = rawMetadata?.overlapSeparation?.stems;
+            if (Array.isArray(stems)) {
+              for (const stem of stems) {
+                stemCandidates.push({ ...stem, chunk });
+              }
+            }
           }
           const normalizedTurns = rawTurns
             .map((raw) => normalizedTurn(raw, chunk, this.policy))
@@ -587,13 +638,35 @@ class SessionDiarizationWorker {
             if (overlapExcludedFromCentroid && storedChunkMetadata) {
               storedChunkMetadata.overlapCentroidExcludedTurns += 1;
             }
+            const forbiddenClusterIds = new Set(
+              turns
+                .filter(
+                  (candidate) =>
+                    candidate.chunkId === chunk.id &&
+                    candidate.rawLabel !== rawTurn.rawLabel &&
+                    candidate.startedAt < endedAt &&
+                    startedAt < candidate.endedAt
+                )
+                .map((candidate) => candidate.clusterId)
+            );
             let cluster = localLabels.get(rawTurn.rawLabel) ?? null;
+            if (
+              cluster &&
+              (forbiddenClusterIds.has(cluster.id) ||
+                (!overlapExcludedFromCentroid &&
+                  cluster.centroid instanceof Float32Array &&
+                  cosine(embedding, cluster.centroid) <
+                    (this.policy.rawLabelConsistencyFloor ?? RAW_LABEL_CONSISTENCY_FLOOR)))
+            ) {
+              cluster = null;
+            }
             if (!cluster) {
               let best = null;
               let bestScore = -1;
               if (!overlapExcludedFromCentroid) {
                 for (const candidate of clusters) {
                   if (!(candidate.centroid instanceof Float32Array)) continue;
+                  if (forbiddenClusterIds.has(candidate.id)) continue;
                   const score = cosine(embedding, candidate.centroid);
                   if (
                     score > bestScore ||
@@ -621,13 +694,25 @@ class SessionDiarizationWorker {
                   sum: new Float64Array(this.policy.embeddingDimension),
                   centroid: null,
                   memberEmbeddings: [],
+                  lineageIds: new Set(),
+                  separatedStem: false,
                   speechMs: 0,
                   windowCount: 0,
                   firstAppearanceAt: chunk.started_at + rawTurn.startMs,
                 };
+                cluster.lineageIds.add(cluster.id);
                 clusters.push(cluster);
               }
               localLabels.set(rawTurn.rawLabel, cluster);
+            }
+
+            for (const forbiddenClusterId of forbiddenClusterIds) {
+              if (forbiddenClusterId !== cluster.id) {
+                cannotLinks.set(
+                  cannotLinkKey(forbiddenClusterId, cluster.id),
+                  "simultaneous_turns"
+                );
+              }
             }
 
             if (!echo.excludedFromCentroid && !overlapExcludedFromCentroid) {
@@ -660,6 +745,10 @@ class SessionDiarizationWorker {
               overlapExcludedFromCentroid,
               ...echo,
             });
+            nextTurnIndexByChunk.set(
+              chunk.id,
+              Math.max(nextTurnIndexByChunk.get(chunk.id) ?? 0, turnIndex + 1)
+            );
             for (const matchedSegment of overlaps.matches) {
               segmentLinks.set(`${cluster.id}\0${matchedSegment.id}`, {
                 clusterId: cluster.id,
@@ -674,7 +763,147 @@ class SessionDiarizationWorker {
       await checkResources();
     }
 
-    consolidateGlobalClusters(clusters, turns, segmentLinks, this.policy);
+    const separatedStemEvidence = [];
+    if (stemCandidates.length > 0) {
+      await Promise.resolve(this.releaseResources?.()).catch(() => {});
+      const stemClustersByWindow = new Map();
+      for (const stem of stemCandidates) {
+        await renewLease();
+        await checkResources();
+        const durationMs = stem.endMs - stem.startMs;
+        if (
+          typeof stem.path !== "string" ||
+          !SHA256.test(stem.fileSha256 ?? "") ||
+          !SHA256.test(stem.pcmSha256 ?? "") ||
+          !Number.isSafeInteger(stem.windowIndex) ||
+          !Number.isSafeInteger(stem.stemIndex) ||
+          !Number.isSafeInteger(stem.startMs) ||
+          !Number.isSafeInteger(stem.endMs) ||
+          durationMs < this.policy.minimumEmbeddingMs
+        ) {
+          continue;
+        }
+        const embedding = normalizeEmbedding(
+          await this.embedWindow({
+            wavPath: stem.path,
+            chunk: stem.chunk,
+            turn: {
+              embeddingStartMs: 0,
+              embeddingEndMs: Math.min(durationMs, this.policy.maximumEmbeddingMs),
+            },
+            policy: this.policy,
+          }),
+          this.policy.embeddingDimension
+        );
+        let transcriptText = null;
+        let transcriptConfidence = null;
+        if (this.transcribeStem) {
+          const result = await this.transcribeStem({
+            path: stem.path,
+            language: null,
+            initialPrompt: "中文为主，保留自然出现的英文术语和人名。",
+            executionContext: context,
+          });
+          if (result?.success !== false && typeof result?.text === "string" && result.text.trim()) {
+            transcriptText = result.text.replace(/\s+/gu, " ").trim();
+            transcriptConfidence =
+              typeof result.confidence === "number" &&
+              Number.isFinite(result.confidence) &&
+              result.confidence >= 0 &&
+              result.confidence <= 1
+                ? result.confidence
+                : 0;
+          }
+        }
+        const localLabel = `speaker_${clusters.length + 1}`;
+        const cluster = {
+          id: deterministicId(
+            "speaker_cluster",
+            identity.sessionId,
+            identity.trackId,
+            identity.evidenceRevision,
+            identity.policyId,
+            stem.chunk.id,
+            String(stem.windowIndex),
+            String(stem.stemIndex)
+          ),
+          localLabel,
+          sum: Float64Array.from(embedding),
+          centroid: embedding,
+          memberEmbeddings: [embedding],
+          lineageIds: new Set(),
+          separatedStem: true,
+          speechMs: durationMs,
+          windowCount: 1,
+          firstAppearanceAt: stem.chunk.started_at + stem.startMs,
+        };
+        cluster.lineageIds.add(cluster.id);
+        clusters.push(cluster);
+        const turnIndex = nextTurnIndexByChunk.get(stem.chunk.id) ?? 0;
+        nextTurnIndexByChunk.set(stem.chunk.id, turnIndex + 1);
+        const turn = {
+          id: deterministicId(
+            "speaker_stem_turn",
+            identity.evidenceRevision,
+            stem.chunk.id,
+            String(stem.windowIndex),
+            String(stem.stemIndex)
+          ),
+          chunkId: stem.chunk.id,
+          transcriptSegmentId: null,
+          turnIndex,
+          rawLabel: `OVERLAP_STEM_${stem.stemIndex + 1}`,
+          localLabel,
+          clusterId: cluster.id,
+          startedAt: stem.chunk.started_at + stem.startMs,
+          endedAt: stem.chunk.started_at + stem.endMs,
+          embedding,
+          overlapExcludedFromCentroid: false,
+          echoState: "none",
+          duplicateOfTurnId: null,
+          excludedFromCentroid: false,
+          separatedStem: true,
+        };
+        turns.push(turn);
+        const windowKey = `${stem.chunk.id}\0${stem.windowIndex}`;
+        const windowClusters = stemClustersByWindow.get(windowKey) ?? [];
+        for (const other of windowClusters) {
+          cannotLinks.set(
+            cannotLinkKey(other.id, cluster.id),
+            "separated_overlap_stems"
+          );
+        }
+        windowClusters.push(cluster);
+        stemClustersByWindow.set(windowKey, windowClusters);
+        separatedStemEvidence.push({
+          id: deterministicId(
+            "overlap_stem",
+            identity.evidenceRevision,
+            stem.chunk.id,
+            String(stem.windowIndex),
+            String(stem.stemIndex)
+          ),
+          chunkId: stem.chunk.id,
+          clusterId: cluster.id,
+          windowIndex: stem.windowIndex,
+          stemIndex: stem.stemIndex,
+          startedAt: stem.chunk.started_at + stem.startMs,
+          endedAt: stem.chunk.started_at + stem.endMs,
+          path: stem.path,
+          fileSha256: stem.fileSha256,
+          pcmSha256: stem.pcmSha256,
+          sampleRate: stem.sampleRate,
+          channels: stem.channels,
+          rms: stem.rms,
+          expiresAt: stem.chunk.expires_at,
+          transcriptText,
+          confidence: transcriptConfidence,
+          turnId: turn.id,
+        });
+      }
+    }
+
+    consolidateGlobalClusters(clusters, turns, segmentLinks, this.policy, cannotLinks);
     await renewLease();
     await checkResources();
     const precommit = this.repository.getDiarizationEvidenceSnapshot({
@@ -707,26 +936,23 @@ class SessionDiarizationWorker {
     );
     const filterLongSessionFragments =
       this.policy.inputVersion === 2 && trackEvidenceMs >= LONG_SESSION_SPEAKER_EVIDENCE_MS;
-    const durableClusterIds = new Set(
-      clusters
-        .filter(
-          (cluster) =>
-            cluster.centroid instanceof Float32Array &&
-            cluster.speechMs >= DURABLE_SPEAKER_MIN_SPEECH_MS &&
-            cluster.windowCount >= DURABLE_SPEAKER_MIN_WINDOWS
-        )
-        .map((cluster) => cluster.id)
+    // Keep every observed turn/cluster as audit evidence.  Echo-only and overlap-only
+    // candidates intentionally have no centroid, so they must not inflate the validated
+    // speaker count or participate in identity matching, but dropping them here also
+    // dropped the associated turns from the review timeline.
+    const voiceClusters = clusters.filter(
+      (cluster) => cluster.centroid instanceof Float32Array && cluster.windowCount > 0
     );
-    const committedClusters = filterLongSessionFragments
-      ? clusters.filter((cluster) => durableClusterIds.has(cluster.id))
-      : clusters;
-    const committedTurns = filterLongSessionFragments
-      ? turns.filter((turn) => durableClusterIds.has(turn.clusterId))
-      : turns;
-    const committedSegmentLinks = filterLongSessionFragments
-      ? [...segmentLinks.values()].filter((link) => durableClusterIds.has(link.clusterId))
-      : [...segmentLinks.values()];
-    const finalSpeakerCount = committedClusters.length;
+    const committedClusters = clusters;
+    const committedClusterIds = new Set(committedClusters.map((cluster) => cluster.id));
+    const committedTurns = turns.filter((turn) => committedClusterIds.has(turn.clusterId));
+    const committedSegmentLinks = [...segmentLinks.values()].filter((link) =>
+      committedClusterIds.has(link.clusterId)
+    );
+    const finalSpeakerCount = voiceClusters.length;
+    if (finalSpeakerCount > 64) {
+      throw codedError("DIARIZATION_SPEAKER_LIMIT_EXCEEDED");
+    }
     const countEvidence = chunkPipelineMetadata
       .map((metadata) => metadata.speakerCount)
       .filter(
@@ -744,13 +970,19 @@ class SessionDiarizationWorker {
           : 0.72;
     const speakerCount = filterLongSessionFragments
       ? {
-          minimum: finalSpeakerCount,
-          maximum: finalSpeakerCount,
+          minimum: Math.min(
+            finalSpeakerCount,
+            ...countEvidence.map((count) => count.minimum)
+          ),
+          maximum: Math.min(
+            64,
+            Math.max(finalSpeakerCount, ...countEvidence.map((count) => count.maximum))
+          ),
           preferred: finalSpeakerCount,
           confidence: countConfidence,
           state:
             speakerCandidates.brief > 0 || speakerCandidates.overlapOnly > 0
-              ? "evidence_filtered"
+              ? "models_disagree"
               : "models_agree",
         }
       : {
@@ -799,6 +1031,73 @@ class SessionDiarizationWorker {
       overlapSeparationState,
       ...compactPipelineChunks(chunkPipelineMetadata),
     };
+    const turnsById = new Map(committedTurns.map((turn) => [turn.id, turn]));
+    const committedStemEvidence = separatedStemEvidence
+      .map((stem) => {
+        const canonicalTurn = turnsById.get(stem.turnId);
+        return canonicalTurn ? { ...stem, clusterId: canonicalTurn.clusterId } : null;
+      })
+      .filter(Boolean);
+    const committedCannotLinks = [];
+    for (let leftIndex = 0; leftIndex < committedClusters.length - 1; leftIndex += 1) {
+      const left = committedClusters[leftIndex];
+      for (let rightIndex = leftIndex + 1; rightIndex < committedClusters.length; rightIndex += 1) {
+        const right = committedClusters[rightIndex];
+        let reason = null;
+        for (const leftId of left.lineageIds ?? new Set([left.id])) {
+          for (const rightId of right.lineageIds ?? new Set([right.id])) {
+            reason ??= cannotLinks.get(cannotLinkKey(leftId, rightId)) ?? null;
+          }
+        }
+        if (reason) {
+          committedCannotLinks.push({
+            leftClusterId: left.id,
+            rightClusterId: right.id,
+            reason,
+          });
+        }
+      }
+    }
+    const committedClusterInputs = committedClusters.map((cluster) => {
+      const hasVoiceEmbedding =
+        cluster.centroid instanceof Float32Array &&
+        cluster.windowCount > 0 &&
+        cluster.memberEmbeddings.length > 0;
+      const qualityScore = hasVoiceEmbedding
+        ? Math.max(
+            0,
+            Math.min(
+              1,
+              ...cluster.memberEmbeddings.map((embedding) => cosine(embedding, cluster.centroid))
+            )
+          )
+        : null;
+      let qualityGateReason = hasVoiceEmbedding ? null : "missing_voice_embedding";
+      const hasExactSourceAttribution =
+        snapshot.track.attribution_state === "exact" ||
+        snapshot.track.track_kind === "mic" ||
+        snapshot.track.source_type === "mic";
+      if (hasVoiceEmbedding && !hasExactSourceAttribution) {
+        qualityGateReason = "mixed_source_attribution";
+      } else if (hasVoiceEmbedding && qualityScore < IDENTITY_MIN_QUALITY) {
+        qualityGateReason = "low_cluster_consistency";
+      } else if (hasVoiceEmbedding && cluster.speechMs < DURABLE_SPEAKER_MIN_SPEECH_MS) {
+        qualityGateReason = "insufficient_speech";
+      } else if (hasVoiceEmbedding && cluster.windowCount < DURABLE_SPEAKER_MIN_WINDOWS) {
+        qualityGateReason = "insufficient_voice_windows";
+      }
+      return {
+        id: cluster.id,
+        localLabel: cluster.localLabel,
+        embedding: hasVoiceEmbedding ? cluster.centroid : null,
+        speechMs: hasVoiceEmbedding ? cluster.speechMs : 0,
+        windowCount: hasVoiceEmbedding ? cluster.windowCount : 0,
+        qualityScore,
+        identityEligible: qualityGateReason === null,
+        qualityGateReason,
+        firstAppearanceAt: cluster.firstAppearanceAt,
+      };
+    });
     const committed = this.repository.commitDiarizationRun({
       expectedRevision: identity.evidenceRevision,
       validatedAt: completedAt,
@@ -824,31 +1123,11 @@ class SessionDiarizationWorker {
         createdAt: completedAt,
         completedAt,
       },
-      clusters: committedClusters.map((cluster) => {
-        const qualityScore =
-          cluster.windowCount > 0
-            ? Math.max(
-                0,
-                Math.min(
-                  1,
-                  ...cluster.memberEmbeddings.map((embedding) =>
-                    cosine(embedding, cluster.centroid)
-                  )
-                )
-              )
-            : null;
-        return {
-          id: cluster.id,
-          localLabel: cluster.localLabel,
-          embedding: cluster.centroid,
-          speechMs: cluster.speechMs,
-          windowCount: cluster.windowCount,
-          qualityScore,
-          firstAppearanceAt: cluster.firstAppearanceAt,
-        };
-      }),
+      clusters: committedClusterInputs,
       turns: committedTurns,
       segmentLinks: committedSegmentLinks,
+      cannotLinks: committedCannotLinks,
+      overlapStems: committedStemEvidence,
     });
     return {
       executionDevice,

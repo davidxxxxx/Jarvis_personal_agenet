@@ -127,6 +127,8 @@ test("v21 creates revisioned diarization evidence with constrained foreign keys"
       "window_count",
       "quality_score",
       "first_appearance_at",
+      "identity_eligible",
+      "quality_gate_reason",
     ]);
     assert.deepEqual(columns(db, "speaker_turns"), [
       "id",
@@ -1340,7 +1342,8 @@ test("worker persists minimum centroid consistency instead of perfect synthetic 
             { start: 2, end: 3.6, speaker: "same_raw_cluster" },
           ]
         : [],
-    embedWindow: async () => unitEmbedding(embeddingIndex++),
+    embedWindow: async () =>
+      embeddingIndex++ === 0 ? unitEmbedding(0) : unitEmbedding(0, 1, 0.88),
     modelArtifactSha256: "a".repeat(64),
     clock: () => 10_000,
   });
@@ -1357,8 +1360,8 @@ test("worker persists minimum centroid consistency instead of perfect synthetic 
     model_version: "jarvis-session-diarization-v1",
   });
 
-  assert.ok(committed.clusters[0].qualityScore > 0.7);
-  assert.ok(committed.clusters[0].qualityScore < 0.8);
+  assert.ok(committed.clusters[0].qualityScore > 0.9);
+  assert.ok(committed.clusters[0].qualityScore < 0.95);
   assert.notEqual(committed.clusters[0].qualityScore, 1);
 });
 
@@ -1458,6 +1461,127 @@ test("v2 worker persists CUDA count consensus and overlap separation metadata", 
   );
 });
 
+test("v2 worker embeds and transcribes every separated stem with a cannot-merge edge", async () => {
+  const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
+  const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+  const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+  const snapshot = immutableWorkerSnapshot();
+  let committed;
+  const transcribedPaths = [];
+  const worker = new SessionDiarizationWorker({
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: TEST_SPEAKER_PROCESSING_POLICY,
+    repository: {
+      getDiarizationEvidenceSnapshot: () => snapshot,
+      getDiarizationRun: () => null,
+      listDiarizationEchoCandidates: () => [],
+      commitDiarizationRun: (input) => {
+        committed = input;
+        return { status: "completed", runId: input.run.id };
+      },
+    },
+    audioEvidenceReader: {
+      withVerifiedWav: async (chunk, consume) => consume(`${chunk.id}.wav`),
+    },
+    diarizeAudio: async ({ chunk }) => {
+      const turns = [];
+      Object.defineProperty(turns, "metadata", {
+        value: {
+          schemaVersion: 1,
+          speakerCount: {
+            minimum: chunk.id === "chunk-1" ? 2 : 0,
+            maximum: chunk.id === "chunk-1" ? 2 : 0,
+            preferred: chunk.id === "chunk-1" ? 2 : 0,
+            confidence: 0.96,
+            state: "models_agree",
+          },
+          overlapWindows: chunk.id === "chunk-1" ? [{ startMs: 500, endMs: 2500 }] : [],
+          overlapSeparation: {
+            state: chunk.id === "chunk-1" ? "completed" : "not_needed",
+            stems:
+              chunk.id === "chunk-1"
+                ? [
+                    {
+                      windowIndex: 0,
+                      stemIndex: 0,
+                      startMs: 500,
+                      endMs: 2500,
+                      path: "G:\\JarvisData\\stem-a.wav",
+                      fileSha256: "1".repeat(64),
+                      pcmSha256: "2".repeat(64),
+                      sampleRate: 16000,
+                      channels: 1,
+                      rms: 0.12,
+                    },
+                    {
+                      windowIndex: 0,
+                      stemIndex: 1,
+                      startMs: 500,
+                      endMs: 2500,
+                      path: "G:\\JarvisData\\stem-b.wav",
+                      fileSha256: "3".repeat(64),
+                      pcmSha256: "4".repeat(64),
+                      sampleRate: 16000,
+                      channels: 1,
+                      rms: 0.1,
+                    },
+                  ]
+                : [],
+          },
+        },
+      });
+      return turns;
+    },
+    embedWindow: async ({ wavPath }) => unitEmbedding(wavPath.includes("stem-a") ? 0 : 1),
+    transcribeStem: async ({ path }) => {
+      transcribedPaths.push(path);
+      return {
+        success: true,
+        text: path.includes("stem-a") ? "第一位说话人" : "第二位说话人",
+        confidence: 0.91,
+      };
+    },
+    releaseResources: async () => undefined,
+    modelArtifactSha256: "a".repeat(64),
+    clock: () => 10_000,
+  });
+
+  await worker.run(
+    {
+      id: "job-separated-stems",
+      session_id: "session-worker",
+      track_id: "track-worker",
+      input_hash: buildDiarizationJobKey({
+        sessionId: "session-worker",
+        trackId: "track-worker",
+        evidenceRevision: snapshot.evidenceRevision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    },
+    { device: "cuda", renewLease: () => true, checkResources: async () => true }
+  );
+
+  assert.deepEqual(transcribedPaths, [
+    "G:\\JarvisData\\stem-a.wav",
+    "G:\\JarvisData\\stem-b.wav",
+  ]);
+  assert.equal(committed.overlapStems.length, 2);
+  assert.deepEqual(
+    committed.overlapStems.map((stem) => stem.transcriptText),
+    ["第一位说话人", "第二位说话人"]
+  );
+  assert.equal(committed.clusters.length, 2);
+  assert.equal(committed.turns.length, 2);
+  assert.deepEqual(committed.cannotLinks, [
+    {
+      leftClusterId: committed.clusters[0].id,
+      rightClusterId: committed.clusters[1].id,
+      reason: "separated_overlap_stems",
+    },
+  ]);
+});
+
 test("v2 worker keeps overlap speech out of durable identity centroids", async () => {
   const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
   const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
@@ -1529,7 +1653,7 @@ test("v2 worker keeps overlap speech out of durable identity centroids", async (
   assert.equal(committed.run.pipelineMetadata.chunks[0].overlapCentroidExcludedTurns, 2);
 });
 
-test("v2 worker reports only durable long-session speakers instead of overlap and brief fragments", async () => {
+test("v2 worker reports a range and retains brief and overlap candidates for review", async () => {
   const SessionDiarizationWorker = require("../../src/jarvis/main/SessionDiarizationWorker");
   const { buildDiarizationJobKey } = require("../../src/jarvis/main/SessionDiarizationPolicy");
   const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
@@ -1616,10 +1740,10 @@ test("v2 worker reports only durable long-session speakers instead of overlap an
 
   assert.deepEqual(committed.run.speakerCount, {
     minimum: 1,
-    maximum: 1,
-    preferred: 1,
+    maximum: 4,
+    preferred: 2,
     confidence: 0.55,
-    state: "evidence_filtered",
+    state: "models_disagree",
   });
   assert.deepEqual(committed.run.pipelineMetadata.speakerCandidates, {
     total: 4,
@@ -1627,12 +1751,16 @@ test("v2 worker reports only durable long-session speakers instead of overlap an
     brief: 1,
     overlapOnly: 2,
   });
-  assert.equal(committed.clusters.length, 1);
+  assert.equal(committed.clusters.length, 4);
   assert.equal(committed.clusters[0].windowCount, 3);
-  assert.equal(committed.turns.length, 3);
-  assert.ok(committed.turns.every((turn) => turn.clusterId === committed.clusters[0].id));
-  assert.ok(
-    committed.segmentLinks.every((link) => link.clusterId === committed.clusters[0].id)
+  assert.equal(committed.turns.length, 6);
+  assert.equal(committed.clusters.filter((cluster) => cluster.identityEligible).length, 1);
+  assert.deepEqual(
+    committed.clusters
+      .filter((cluster) => !cluster.identityEligible)
+      .map((cluster) => cluster.qualityGateReason)
+      .sort(),
+    ["insufficient_speech", "missing_voice_embedding", "missing_voice_embedding"]
   );
 });
 

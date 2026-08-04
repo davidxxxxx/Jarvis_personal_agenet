@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import traceback
 from typing import Any
+
+
+SAFE_ARTIFACT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,180}$")
 
 
 def _lower_windows_priority() -> None:
@@ -117,6 +122,18 @@ class MossFormerModels:
         windows = request.get("windows")
         if not isinstance(windows, list) or len(windows) > 10_000:
             raise ValueError("overlap windows are invalid")
+        output_root_value = request.get("outputRoot")
+        artifact_key = str(request.get("artifactKey", ""))
+        if not isinstance(output_root_value, str) or not Path(output_root_value).is_absolute():
+            raise ValueError("overlap output root must be absolute")
+        if not SAFE_ARTIFACT_KEY.fullmatch(artifact_key):
+            raise ValueError("overlap artifact key is invalid")
+        output_root = Path(output_root_value).resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+        artifact_root = (output_root / artifact_key).resolve()
+        if artifact_root.parent != output_root:
+            raise ValueError("overlap artifact path escapes its root")
+        artifact_root.mkdir(parents=True, exist_ok=True)
         separator = self.load()
         audio, sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=False)
         if sample_rate != 16000:
@@ -126,8 +143,9 @@ class MossFormerModels:
         if audio.ndim > 1:
             audio = np.mean(audio, axis=1, dtype=np.float32)
         stem_counts: list[int] = []
+        stem_evidence: list[dict[str, Any]] = []
         processed = 0
-        for window in windows:
+        for window_index, window in enumerate(windows):
             start_ms = int(window.get("startMs", -1))
             end_ms = int(window.get("endMs", -1))
             if start_ms < 0 or end_ms <= start_ms:
@@ -145,9 +163,34 @@ class MossFormerModels:
                 error.code = "OVERLAP_SEPARATION_INVALID_RESULT"
                 raise error
             audible = 0
-            for stem in separated[:, 0, :]:
+            for stem_index, stem in enumerate(separated[:, 0, :]):
                 rms = float(np.sqrt(np.mean(np.square(stem), dtype=np.float64)))
                 if np.isfinite(rms) and rms >= 0.001:
+                    bounded = np.clip(np.asarray(stem, dtype=np.float32), -1.0, 1.0)
+                    pcm = np.rint(bounded * 32767.0).astype("<i2", copy=False).tobytes()
+                    stem_path = artifact_root / f"window-{window_index:04d}-stem-{stem_index:02d}.wav"
+                    sf.write(
+                        str(stem_path),
+                        bounded,
+                        sample_rate,
+                        subtype="PCM_16",
+                        format="WAV",
+                    )
+                    file_bytes = stem_path.read_bytes()
+                    stem_evidence.append(
+                        {
+                            "windowIndex": window_index,
+                            "stemIndex": stem_index,
+                            "startMs": start_ms,
+                            "endMs": end_ms,
+                            "path": str(stem_path),
+                            "fileSha256": hashlib.sha256(file_bytes).hexdigest(),
+                            "pcmSha256": hashlib.sha256(pcm).hexdigest(),
+                            "sampleRate": sample_rate,
+                            "channels": 1,
+                            "rms": rms,
+                        }
+                    )
                     audible += 1
             stem_counts.append(audible)
             processed += 1
@@ -156,6 +199,7 @@ class MossFormerModels:
             "processed": processed,
             "total": len(windows),
             "stemCounts": stem_counts,
+            "stems": stem_evidence,
         }
 
 

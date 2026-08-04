@@ -828,6 +828,13 @@ export default function MemoryView() {
               <ContinuousSessionPlayer
                 timeline={timeline}
                 readChunk={window.electronAPI.jarvis.readAudioChunk}
+                speakerUtterances={detail.speakerUtterances ?? []}
+                readSpeakerUtteranceAudio={window.electronAPI.jarvis.readSpeakerUtteranceAudio}
+                onOpenSpeakerReview={() =>
+                  document
+                    .getElementById("session-speaker-review")
+                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
+                }
                 seekRequest={seekRequest}
                 onSeekResult={acknowledgeEvidencePlayback}
                 focusSegmentId={evidenceContext?.transcriptSegmentId}
@@ -855,7 +862,10 @@ export default function MemoryView() {
                 : "Transcript evidence is unavailable."}
             </p>
           )}
-          <section className="order-2 mt-6 rounded-xl border border-border/50 bg-card p-5">
+          <section
+            id="session-speaker-review"
+            className="order-2 mt-6 scroll-mt-4 rounded-xl border border-border/50 bg-card p-5"
+          >
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="flex items-start gap-3">
                 <span className="rounded-lg bg-primary/10 p-2 text-primary">

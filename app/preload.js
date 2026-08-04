@@ -352,6 +352,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     },
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
     readAudioChunk: (audioChunkId) => ipcRenderer.invoke("jarvis:audio:read", audioChunkId),
+    readSpeakerUtteranceAudio: (utteranceId) =>
+      ipcRenderer.invoke("jarvis:speaker-utterance:audio:read", utteranceId),
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),
     getSessionTimeline: (sessionId, page) =>
       page === undefined

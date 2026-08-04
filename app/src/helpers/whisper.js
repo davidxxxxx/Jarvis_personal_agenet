@@ -494,6 +494,58 @@ class WhisperManager {
     return text.replace(/\n/g, " ").replace(/\s+/g, " ").trim();
   }
 
+  normalizeWhisperTimeMs(value) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.round(value * 1_000);
+    }
+    if (typeof value !== "string") return null;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) return Math.round(numeric * 1_000);
+    const match = value.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/u);
+    if (!match) return null;
+    const hours = Number(match[1] ?? 0);
+    const minutes = Number(match[2]);
+    const seconds = Number(match[3]);
+    if (![hours, minutes, seconds].every(Number.isFinite)) return null;
+    return Math.round((hours * 3_600 + minutes * 60 + seconds) * 1_000);
+  }
+
+  extractWhisperWords(result) {
+    const segments = Array.isArray(result?.segments)
+      ? result.segments
+      : Array.isArray(result?.transcription)
+        ? result.transcription
+        : [];
+    const words = [];
+    for (const segment of segments) {
+      const candidates = Array.isArray(segment?.words) ? segment.words : [];
+      for (const candidate of candidates) {
+        const word = typeof candidate?.word === "string" ? candidate.word : candidate?.text;
+        const startedAtMs = this.normalizeWhisperTimeMs(candidate?.start ?? candidate?.from);
+        const endedAtMs = this.normalizeWhisperTimeMs(candidate?.end ?? candidate?.to);
+        const probability = candidate?.probability ?? candidate?.prob ?? null;
+        if (
+          typeof word !== "string" ||
+          !word.trim() ||
+          startedAtMs === null ||
+          endedAtMs === null ||
+          endedAtMs <= startedAtMs ||
+          (probability !== null &&
+            (typeof probability !== "number" ||
+              !Number.isFinite(probability) ||
+              probability < 0 ||
+              probability > 1))
+        ) {
+          continue;
+        }
+        words.push({ word, startedAtMs, endedAtMs, probability });
+      }
+    }
+    return words.sort(
+      (left, right) => left.startedAtMs - right.startedAtMs || left.endedAtMs - right.endedAtMs
+    );
+  }
+
   parseWhisperResult(output) {
     // Handle both string (from CLI) and object (from server) inputs
     let result;
@@ -522,7 +574,8 @@ class WhisperManager {
       if (!text || this.isBlankAudioMarker(text)) {
         return { success: false, message: "No audio detected" };
       }
-      return { success: true, text };
+      const words = this.extractWhisperWords(result);
+      return { success: true, text, words, language: result.language ?? null };
     }
 
     // Handle whisper-server format (has "text" field directly)
@@ -531,7 +584,21 @@ class WhisperManager {
       if (!text || this.isBlankAudioMarker(text)) {
         return { success: false, message: "No audio detected" };
       }
-      return { success: true, text };
+      const words = this.extractWhisperWords(result);
+      const probabilities = words
+        .map((word) => word.probability)
+        .filter((value) => typeof value === "number");
+      const confidence =
+        probabilities.length === 0
+          ? undefined
+          : probabilities.reduce((total, value) => total + value, 0) / probabilities.length;
+      return {
+        success: true,
+        text,
+        words,
+        language: result.language ?? null,
+        ...(confidence === undefined ? {} : { confidence }),
+      };
     }
 
     return { success: false, message: "No audio detected" };

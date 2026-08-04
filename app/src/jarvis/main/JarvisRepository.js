@@ -131,6 +131,31 @@ function coveredAudioRatio(targetChunks, coveringChunks) {
   return Math.min(1, coveredMs / targetMs);
 }
 
+function selectLogicalAudioChunks(chunks) {
+  const selected = [];
+  for (const chunk of [...chunks].sort(
+    (left, right) =>
+      left.started_at - right.started_at ||
+      right.ended_at - left.ended_at ||
+      left.id.localeCompare(right.id)
+  )) {
+    const previous = selected.at(-1);
+    if (!previous) {
+      selected.push(chunk);
+      continue;
+    }
+    if (chunk.started_at <= previous.started_at && chunk.ended_at >= previous.ended_at) {
+      selected[selected.length - 1] = chunk;
+      continue;
+    }
+    if (previous.started_at <= chunk.started_at && previous.ended_at >= chunk.ended_at) {
+      continue;
+    }
+    selected.push(chunk);
+  }
+  return selected;
+}
+
 function preferredSpeakerEvidenceTracks(
   tracks,
   chunks,
@@ -143,7 +168,6 @@ function preferredSpeakerEvidenceTracks(
       (audioMsByTrack.get(chunk.track_id) ?? 0) + Math.max(0, chunk.duration_ms ?? 0)
     );
   }
-  const preferredApplicationByKey = new Map();
   const applicationTracks = tracks
     .filter(
       (track) =>
@@ -152,26 +176,48 @@ function preferredSpeakerEvidenceTracks(
         !ApplicationAudioPolicy.isVirtualAudioInfrastructure({
           applicationKey: track.application_key,
           applicationDisplayName: track.application_display_name,
-        }) &&
-        ((audioMsByTrack.get(track.id) ?? 0) >= MIN_APPLICATION_DIARIZATION_AUDIO_MS ||
-          completedApplicationTrackIds.has(track.id))
+        })
     )
     .sort(
       (left, right) =>
-        (audioMsByTrack.get(right.id) ?? 0) - (audioMsByTrack.get(left.id) ?? 0) ||
+        (left.capture_generation ?? 0) - (right.capture_generation ?? 0) ||
         (left.started_at ?? 0) - (right.started_at ?? 0) ||
         left.id.localeCompare(right.id)
     );
+  const applicationTracksByKey = new Map();
   for (const track of applicationTracks) {
-    if (!preferredApplicationByKey.has(track.application_key)) {
-      preferredApplicationByKey.set(track.application_key, track);
+    const members = applicationTracksByKey.get(track.application_key) ?? [];
+    members.push(track);
+    applicationTracksByKey.set(track.application_key, members);
+  }
+  const preferredApplicationByKey = new Map();
+  const logicalMemberTrackIdsByCanonical = new Map();
+  const logicalCanonicalTrackIdByMember = new Map();
+  for (const [applicationKey, members] of applicationTracksByKey) {
+    const aggregateAudioMs = members.reduce(
+      (total, member) => total + (audioMsByTrack.get(member.id) ?? 0),
+      0
+    );
+    if (
+      aggregateAudioMs < MIN_APPLICATION_DIARIZATION_AUDIO_MS &&
+      !members.some((member) => completedApplicationTrackIds.has(member.id))
+    ) {
+      continue;
+    }
+    const canonical = members[0];
+    preferredApplicationByKey.set(applicationKey, canonical);
+    audioMsByTrack.set(canonical.id, aggregateAudioMs);
+    const memberIds = new Set(members.map((member) => member.id));
+    logicalMemberTrackIdsByCanonical.set(canonical.id, memberIds);
+    for (const memberId of memberIds) {
+      logicalCanonicalTrackIdByMember.set(memberId, canonical.id);
     }
   }
   const qualifiedApplicationTrackIds = new Set(
     [...preferredApplicationByKey.values()].map((track) => track.id)
   );
   const exactApplicationChunks = chunks.filter((chunk) =>
-    qualifiedApplicationTrackIds.has(chunk.track_id)
+    logicalCanonicalTrackIdByMember.has(chunk.track_id)
   );
   const coverageBySystemTrack = new Map();
   const preferred = tracks.filter((track) => {
@@ -190,6 +236,8 @@ function preferredSpeakerEvidenceTracks(
     preferred,
     coverageBySystemTrack,
     qualifiedApplicationTrackIds,
+    logicalMemberTrackIdsByCanonical,
+    logicalCanonicalTrackIdByMember,
     audioMsByTrack,
   };
 }
@@ -1117,6 +1165,56 @@ class JarvisRepository {
         WHERE session_id = ? AND result_kind = 'final'
         ORDER BY started_at, id
       `),
+      upsertLogicalApplicationTrack: this.db.prepare(`
+        INSERT INTO logical_audio_tracks (
+          id, session_id, canonical_track_id, track_kind, application_key,
+          application_display_name, started_at, ended_at, generation_count,
+          created_at, updated_at
+        ) VALUES (
+          @id, @sessionId, @canonicalTrackId, 'application', @applicationKey,
+          @applicationDisplayName, @startedAt, @endedAt, @generationCount,
+          @at, @at
+        )
+        ON CONFLICT(session_id, application_key) DO UPDATE SET
+          canonical_track_id = excluded.canonical_track_id,
+          application_display_name = excluded.application_display_name,
+          started_at = excluded.started_at,
+          ended_at = excluded.ended_at,
+          generation_count = excluded.generation_count,
+          updated_at = excluded.updated_at
+      `),
+      getLogicalApplicationTrack: this.db.prepare(`
+        SELECT * FROM logical_audio_tracks
+        WHERE session_id = @sessionId AND application_key = @applicationKey
+      `),
+      getLogicalApplicationTrackByCanonical: this.db.prepare(`
+        SELECT * FROM logical_audio_tracks
+        WHERE session_id = @sessionId AND canonical_track_id = @trackId
+      `),
+      deleteLogicalApplicationMembers: this.db.prepare(`
+        DELETE FROM logical_audio_track_members WHERE logical_track_id = ?
+      `),
+      insertLogicalApplicationMember: this.db.prepare(`
+        INSERT INTO logical_audio_track_members (
+          logical_track_id, track_id, capture_generation, member_index
+        ) VALUES (@logicalTrackId, @trackId, @captureGeneration, @memberIndex)
+      `),
+      listLogicalApplicationMembers: this.db.prepare(`
+        SELECT member.*, track.*
+        FROM logical_audio_track_members AS member
+        JOIN audio_tracks AS track ON track.id = member.track_id
+        WHERE member.logical_track_id = ?
+        ORDER BY member.member_index, track.id
+      `),
+      listLogicalDiarizationChunks: this.db.prepare(`
+        SELECT chunk.*
+        FROM audio_chunks AS chunk
+        JOIN logical_audio_track_members AS member ON member.track_id = chunk.track_id
+        WHERE chunk.session_id = @sessionId
+          AND member.logical_track_id = @logicalTrackId
+        ORDER BY chunk.started_at, chunk.ended_at, member.member_index,
+                 chunk.sequence_number, chunk.id
+      `),
       getDiarizationTrack: this.db.prepare(`
         SELECT * FROM audio_tracks
         WHERE id = @trackId AND session_id = @sessionId
@@ -1341,6 +1439,27 @@ class JarvisRepository {
           AND state IN ('pending','retry','blocked')
           AND completed_at IS NULL
       `),
+      supersedePriorDiarizationJobs: this.db.prepare(`
+        UPDATE processing_jobs
+        SET state = 'superseded',
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            error_code = 'DIARIZATION_EVIDENCE_SUPERSEDED',
+            blocked_reason = NULL,
+            execution_device = NULL,
+            completed_at = @at
+        WHERE job_type = 'diarize_track'
+          AND session_id = @sessionId
+          AND track_id = @trackId
+          AND state IN ('pending','retry','blocked')
+          AND completed_at IS NULL
+          AND NOT (
+            input_hash = @inputHash
+            AND input_version = @inputVersion
+            AND model_version = @modelVersion
+          )
+      `),
       reprioritizeDiarizationJobs: this.db.prepare(`
         UPDATE processing_jobs AS job
         SET priority = CASE (
@@ -1359,10 +1478,12 @@ class JarvisRepository {
       insertDiarizationStableCluster: this.db.prepare(`
         INSERT INTO speaker_clusters (
           id, session_id, track_id, local_label, model_id, embedding,
-          speech_ms, window_count, quality_score, link_state, created_at, updated_at
+          speech_ms, window_count, quality_score, identity_eligible,
+          quality_gate_reason, link_state, created_at, updated_at
         ) VALUES (
           @id, @sessionId, @trackId, @localLabel, @modelId, @embedding,
-          @speechMs, @windowCount, @qualityScore, 'unknown', @at, @at
+          @speechMs, @windowCount, @qualityScore, @identityEligible,
+          @qualityGateReason, 'unknown', @at, @at
         )
       `),
       getDiarizationStableCluster: this.db.prepare(`
@@ -1386,10 +1507,12 @@ class JarvisRepository {
       insertDiarizationRunCluster: this.db.prepare(`
         INSERT INTO speaker_diarization_run_clusters (
           run_id, cluster_id, local_label, embedding, speech_ms,
-          window_count, quality_score, first_appearance_at
+          window_count, quality_score, first_appearance_at,
+          identity_eligible, quality_gate_reason
         ) VALUES (
           @runId, @clusterId, @localLabel, @embedding, @speechMs,
-          @windowCount, @qualityScore, @firstAppearanceAt
+          @windowCount, @qualityScore, @firstAppearanceAt,
+          @identityEligible, @qualityGateReason
         )
       `),
       insertSpeakerTurn: this.db.prepare(`
@@ -1412,11 +1535,88 @@ class JarvisRepository {
           run_id, cluster_id, transcript_segment_id
         ) VALUES (@runId, @clusterId, @transcriptSegmentId)
       `),
+      insertSpeakerClusterCannotLink: this.db.prepare(`
+        INSERT INTO speaker_cluster_cannot_links (
+          run_id, left_cluster_id, right_cluster_id, reason, created_at
+        ) VALUES (@runId, @leftClusterId, @rightClusterId, @reason, @createdAt)
+      `),
+      insertOverlapStemEvidence: this.db.prepare(`
+        INSERT INTO overlap_stem_evidence (
+          id, run_id, chunk_id, cluster_id, window_index, stem_index,
+          started_at, ended_at, path, file_sha256, pcm_sha256,
+          sample_rate, channels, rms, expires_at, transcript_text,
+          confidence, created_at
+        ) VALUES (
+          @id, @runId, @chunkId, @clusterId, @windowIndex, @stemIndex,
+          @startedAt, @endedAt, @path, @fileSha256, @pcmSha256,
+          @sampleRate, @channels, @rms, @expiresAt, @transcriptText,
+          @confidence, @createdAt
+        )
+      `),
+      insertSpeakerUtterance: this.db.prepare(`
+        INSERT INTO speaker_utterances (
+          id, session_id, run_id, chunk_id, cluster_id,
+          source_segment_id, stem_id, started_at, ended_at, text,
+          confidence, overlap_state, evidence_kind, created_at
+        ) VALUES (
+          @id, @sessionId, @runId, @chunkId, @clusterId,
+          @sourceSegmentId, @stemId, @startedAt, @endedAt, @text,
+          @confidence, @overlapState, @evidenceKind, @createdAt
+        )
+      `),
+      insertSpeakerUtteranceWord: this.db.prepare(`
+        INSERT INTO speaker_utterance_words (
+          utterance_id, transcript_word_id, ordinal
+        ) VALUES (@utteranceId, @transcriptWordId, @ordinal)
+      `),
+      listTranscriptWordsForDiarizationSegment: this.db.prepare(`
+        SELECT * FROM transcript_words
+        WHERE transcript_segment_id = ?
+        ORDER BY ordinal
+      `),
+      listSessionSpeakerUtterances: this.db.prepare(`
+        SELECT utterance.*,
+               cluster.local_label, cluster.person_id, cluster.link_state,
+               person.display_name AS person_display_name,
+               track.application_key, track.application_display_name, track.track_kind,
+               stem.path AS stem_path, stem.file_sha256 AS stem_file_sha256,
+               stem.expires_at AS stem_expires_at, stem.deleted_at AS stem_deleted_at
+        FROM speaker_utterances AS utterance
+        JOIN speaker_clusters AS cluster ON cluster.id = utterance.cluster_id
+        JOIN speaker_diarization_runs AS run ON run.id = utterance.run_id
+        JOIN audio_tracks AS track ON track.id = run.track_id
+        LEFT JOIN people AS person ON person.id = cluster.person_id
+        LEFT JOIN overlap_stem_evidence AS stem ON stem.id = utterance.stem_id
+        WHERE utterance.session_id = ?
+          AND run.input_version = (
+            SELECT max(preferred.input_version)
+            FROM speaker_diarization_runs AS preferred
+            WHERE preferred.session_id = run.session_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM speaker_diarization_runs AS newer
+            WHERE newer.session_id = run.session_id
+              AND newer.track_id = run.track_id
+              AND newer.policy_id = run.policy_id
+              AND newer.commit_sequence > run.commit_sequence
+          )
+        ORDER BY utterance.started_at, utterance.ended_at, utterance.id
+      `),
+      getSpeakerUtteranceAudioEvidence: this.db.prepare(`
+        SELECT utterance.id, utterance.session_id, utterance.chunk_id,
+               utterance.evidence_kind, utterance.stem_id,
+               stem.path AS stem_path, stem.file_sha256 AS stem_file_sha256,
+               stem.expires_at AS stem_expires_at, stem.deleted_at AS stem_deleted_at
+        FROM speaker_utterances AS utterance
+        LEFT JOIN overlap_stem_evidence AS stem ON stem.id = utterance.stem_id
+        WHERE utterance.id = ?
+      `),
       listIdentityResolutionRunClusters: this.db.prepare(`
         SELECT run_cluster.*, run.embedding_model_id
         FROM speaker_diarization_run_clusters AS run_cluster
         JOIN speaker_diarization_runs AS run ON run.id = run_cluster.run_id
         WHERE run_cluster.run_id = ?
+          AND run_cluster.identity_eligible = 1
         ORDER BY run_cluster.first_appearance_at, run_cluster.cluster_id
       `),
       getLatestIdentityDiarizationRun: this.db.prepare(`
@@ -1779,6 +1979,7 @@ class JarvisRepository {
         WHERE segment.session_id = ?
           AND segment.superseded_by IS NULL
           AND segment.duplicate_of IS NULL
+          AND segment.projection_state = 'visible'
         ORDER BY segment.started_at ASC, segment.id ASC
       `),
       listTranscriptHistory: this.db.prepare(`
@@ -1793,6 +1994,7 @@ class JarvisRepository {
             AND track_id = @trackId
             AND superseded_by IS NULL
             AND duplicate_of IS NULL
+            AND projection_state = 'visible'
             AND ended_at > @from
             AND started_at < @to
             AND length(trim(text)) > 0
@@ -1807,6 +2009,7 @@ class JarvisRepository {
         WHERE session_id = ?
           AND superseded_by IS NULL
           AND duplicate_of IS NULL
+          AND projection_state = 'visible'
           AND is_stable = 1
           AND length(trim(text)) > 0
         ORDER BY ended_at DESC, id DESC
@@ -1818,6 +2021,7 @@ class JarvisRepository {
           AND track_id = @trackId
           AND superseded_by IS NULL
           AND duplicate_of IS NULL
+          AND projection_state = 'visible'
           AND is_stable = 1
           AND length(trim(text)) > 0
         ORDER BY ended_at DESC, id DESC
@@ -1887,6 +2091,126 @@ class JarvisRepository {
         SET timeline_version = timeline_version + 1
         WHERE id = ?
       `),
+      refreshSystemAuditProjection: this.db.prepare(`
+        UPDATE transcript_segments AS segment
+        SET projection_state = CASE
+              WHEN segment.result_kind = 'final'
+                AND segment.superseded_by IS NULL
+                AND segment.duplicate_of IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM audio_tracks AS mixed
+                  WHERE mixed.id = segment.track_id
+                    AND mixed.track_kind = 'system_mix'
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM transcript_segments AS application_segment
+                  JOIN audio_tracks AS application_track
+                    ON application_track.id = application_segment.track_id
+                  WHERE application_segment.session_id = segment.session_id
+                    AND application_segment.id <> segment.id
+                    AND application_segment.result_kind = 'final'
+                    AND application_segment.is_stable = 1
+                    AND application_segment.superseded_by IS NULL
+                    AND application_segment.duplicate_of IS NULL
+                    AND application_track.track_kind = 'application'
+                    AND application_segment.started_at < segment.ended_at
+                    AND segment.started_at < application_segment.ended_at
+                    AND min(segment.ended_at, application_segment.ended_at)
+                        - max(segment.started_at, application_segment.started_at)
+                        >= (segment.ended_at - segment.started_at) * 0.5
+                )
+              THEN 'audit_hidden'
+              ELSE 'visible'
+            END,
+            projection_reason = CASE
+              WHEN segment.result_kind = 'final'
+                AND segment.superseded_by IS NULL
+                AND segment.duplicate_of IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM audio_tracks AS mixed
+                  WHERE mixed.id = segment.track_id
+                    AND mixed.track_kind = 'system_mix'
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM transcript_segments AS application_segment
+                  JOIN audio_tracks AS application_track
+                    ON application_track.id = application_segment.track_id
+                  WHERE application_segment.session_id = segment.session_id
+                    AND application_segment.id <> segment.id
+                    AND application_segment.result_kind = 'final'
+                    AND application_segment.is_stable = 1
+                    AND application_segment.superseded_by IS NULL
+                    AND application_segment.duplicate_of IS NULL
+                    AND application_track.track_kind = 'application'
+                    AND application_segment.started_at < segment.ended_at
+                    AND segment.started_at < application_segment.ended_at
+                    AND min(segment.ended_at, application_segment.ended_at)
+                        - max(segment.started_at, application_segment.started_at)
+                        >= (segment.ended_at - segment.started_at) * 0.5
+                )
+              THEN 'exact_application_primary'
+              ELSE NULL
+            END
+        WHERE segment.session_id = @sessionId
+          AND (
+            segment.projection_state <> CASE
+              WHEN segment.result_kind = 'final'
+                AND segment.superseded_by IS NULL
+                AND segment.duplicate_of IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM audio_tracks AS mixed
+                  WHERE mixed.id = segment.track_id AND mixed.track_kind = 'system_mix'
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM transcript_segments AS application_segment
+                  JOIN audio_tracks AS application_track
+                    ON application_track.id = application_segment.track_id
+                  WHERE application_segment.session_id = segment.session_id
+                    AND application_segment.id <> segment.id
+                    AND application_segment.result_kind = 'final'
+                    AND application_segment.is_stable = 1
+                    AND application_segment.superseded_by IS NULL
+                    AND application_segment.duplicate_of IS NULL
+                    AND application_track.track_kind = 'application'
+                    AND application_segment.started_at < segment.ended_at
+                    AND segment.started_at < application_segment.ended_at
+                    AND min(segment.ended_at, application_segment.ended_at)
+                        - max(segment.started_at, application_segment.started_at)
+                        >= (segment.ended_at - segment.started_at) * 0.5
+                )
+              THEN 'audit_hidden' ELSE 'visible' END
+            OR segment.projection_reason IS NOT CASE
+              WHEN segment.result_kind = 'final'
+                AND segment.superseded_by IS NULL
+                AND segment.duplicate_of IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM audio_tracks AS mixed
+                  WHERE mixed.id = segment.track_id AND mixed.track_kind = 'system_mix'
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM transcript_segments AS application_segment
+                  JOIN audio_tracks AS application_track
+                    ON application_track.id = application_segment.track_id
+                  WHERE application_segment.session_id = segment.session_id
+                    AND application_segment.id <> segment.id
+                    AND application_segment.result_kind = 'final'
+                    AND application_segment.is_stable = 1
+                    AND application_segment.superseded_by IS NULL
+                    AND application_segment.duplicate_of IS NULL
+                    AND application_track.track_kind = 'application'
+                    AND application_segment.started_at < segment.ended_at
+                    AND segment.started_at < application_segment.ended_at
+                    AND min(segment.ended_at, application_segment.ended_at)
+                        - max(segment.started_at, application_segment.started_at)
+                        >= (segment.ended_at - segment.started_at) * 0.5
+                )
+              THEN 'exact_application_primary' ELSE NULL END
+          )
+      `),
       getChunkForTranscriptCommit: this.db.prepare(`
         SELECT * FROM audio_chunks WHERE id = ?
       `),
@@ -1904,6 +2228,30 @@ class JarvisRepository {
           @text, @confidence, 1, 'pending', @trackId, @chunkId,
           @sourceType, 'final', 1, @modelVersion, @completedAt
         )
+      `),
+      deleteTranscriptWords: this.db.prepare(`
+        DELETE FROM transcript_words WHERE transcript_segment_id = ?
+      `),
+      insertTranscriptWord: this.db.prepare(`
+        INSERT INTO transcript_words (
+          id, transcript_segment_id, chunk_id, ordinal, word,
+          started_at, ended_at, probability, created_at
+        ) VALUES (
+          @id, @transcriptSegmentId, @chunkId, @ordinal, @word,
+          @startedAt, @endedAt, @probability, @createdAt
+        )
+      `),
+      listTranscriptWordsBySegment: this.db.prepare(`
+        SELECT * FROM transcript_words
+        WHERE transcript_segment_id = ?
+        ORDER BY ordinal
+      `),
+      listSessionTranscriptWords: this.db.prepare(`
+        SELECT word.*
+        FROM transcript_words AS word
+        JOIN transcript_segments AS segment ON segment.id = word.transcript_segment_id
+        WHERE segment.session_id = ?
+        ORDER BY word.started_at, word.ended_at, word.ordinal, word.id
       `),
       setChunkTranscriptionStatus: this.db.prepare(`
         UPDATE audio_chunks
@@ -2511,6 +2859,7 @@ class JarvisRepository {
         }).changes;
       }
       if (duplicatesMarked > 0) {
+        this.statements.refreshSystemAuditProjection.run({ sessionId });
         this.statements.bumpSessionTimelineVersion.run(sessionId);
       }
       return { duplicatesMarked };
@@ -2666,6 +3015,33 @@ class JarvisRepository {
           segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
         }
         if (!segment) throw codedError("TRANSCRIPT_COMMIT_FAILED");
+        if (Array.isArray(result.words)) {
+          this.statements.deleteTranscriptWords.run(segment.id);
+          let ordinal = 0;
+          for (const word of result.words) {
+            const startedAt = Math.max(
+              current.started_at,
+              Math.min(current.ended_at - 1, current.started_at + word.startedAtMs)
+            );
+            const endedAt = Math.max(
+              startedAt + 1,
+              Math.min(current.ended_at, current.started_at + word.endedAtMs)
+            );
+            if (endedAt <= startedAt) continue;
+            this.statements.insertTranscriptWord.run({
+              id: derivedId("transcript_word", segment.id, ordinal, word.word, startedAt, endedAt),
+              transcriptSegmentId: segment.id,
+              chunkId: current.id,
+              ordinal,
+              word: word.word,
+              startedAt,
+              endedAt,
+              probability: word.probability,
+              createdAt: completedAt,
+            });
+            ordinal += 1;
+          }
+        }
         const finalWinner = this.statements.findFinalWinnerForRange.get({
           sessionId: current.session_id,
           trackId: current.track_id,
@@ -2685,6 +3061,12 @@ class JarvisRepository {
           status: "completed",
         });
         if (updated.changes !== 1) throw codedError("AUDIO_UNAVAILABLE");
+        const projectionChanges = this.statements.refreshSystemAuditProjection.run({
+          sessionId: current.session_id,
+        }).changes;
+        if (projectionChanges > 0) {
+          this.statements.bumpSessionTimelineVersion.run(current.session_id);
+        }
         return segment;
       }
     );
@@ -2836,7 +3218,7 @@ class JarvisRepository {
         modelId: input.run.embeddingModelId,
       });
       const reusableCandidates = stableCandidates
-        .filter((candidate) => candidate.embedding !== null)
+        .filter((candidate) => candidate.embedding !== null && candidate.identity_eligible === 1)
         .map((candidate) => ({
           ...candidate,
           normalizedEmbedding: l2NormalizeEmbedding(
@@ -2845,7 +3227,7 @@ class JarvisRepository {
         }))
         .filter((candidate) => candidate.normalizedEmbedding !== null);
       const incomingWithVoice = input.clusters
-        .filter((cluster) => cluster.embedding !== null)
+        .filter((cluster) => cluster.embedding !== null && cluster.identityEligible)
         .map((cluster) => ({
           ...cluster,
           normalizedEmbedding: l2NormalizeEmbedding(
@@ -2942,6 +3324,8 @@ class JarvisRepository {
             speechMs: cluster.speechMs,
             windowCount: cluster.windowCount,
             qualityScore: cluster.qualityScore,
+            identityEligible: cluster.identityEligible ? 1 : 0,
+            qualityGateReason: cluster.qualityGateReason,
             at: input.run.completedAt,
           });
           usedStableIds.add(stableId);
@@ -2961,6 +3345,8 @@ class JarvisRepository {
           windowCount: cluster.windowCount,
           qualityScore: cluster.qualityScore,
           firstAppearanceAt: cluster.firstAppearanceAt,
+          identityEligible: cluster.identityEligible ? 1 : 0,
+          qualityGateReason: cluster.qualityGateReason,
         });
       }
 
@@ -3012,6 +3398,152 @@ class JarvisRepository {
           clusterId,
           transcriptSegmentId: link.transcriptSegmentId,
         });
+      }
+      const persistedCannotLinks = new Set();
+      for (const link of input.cannotLinks) {
+        const rawLeft = persistedClusterIds.get(link.leftClusterId);
+        const rawRight = persistedClusterIds.get(link.rightClusterId);
+        if (!rawLeft || !rawRight || rawLeft === rawRight) {
+          throw codedError("DIARIZATION_INVALID_COMMIT");
+        }
+        const [leftClusterId, rightClusterId] = [rawLeft, rawRight].sort();
+        const key = `${leftClusterId}\0${rightClusterId}`;
+        if (persistedCannotLinks.has(key)) continue;
+        persistedCannotLinks.add(key);
+        this.statements.insertSpeakerClusterCannotLink.run({
+          runId: input.run.id,
+          leftClusterId,
+          rightClusterId,
+          reason: link.reason,
+          createdAt: input.run.completedAt,
+        });
+      }
+
+      for (const stem of input.overlapStems) {
+        const chunk = chunks.get(stem.chunkId);
+        const clusterId = persistedClusterIds.get(stem.clusterId);
+        if (
+          !chunk ||
+          !clusterId ||
+          stem.startedAt < chunk.started_at ||
+          stem.endedAt > chunk.ended_at ||
+          stem.endedAt <= stem.startedAt
+        ) {
+          throw codedError("DIARIZATION_INVALID_COMMIT");
+        }
+        this.statements.insertOverlapStemEvidence.run({
+          ...stem,
+          runId: input.run.id,
+          clusterId,
+          createdAt: input.run.completedAt,
+        });
+        if (stem.transcriptText) {
+          const utteranceId = derivedId("speaker_stem_utterance", input.run.id, stem.id);
+          this.statements.insertSpeakerUtterance.run({
+            id: utteranceId,
+            sessionId: input.run.sessionId,
+            runId: input.run.id,
+            chunkId: stem.chunkId,
+            clusterId,
+            sourceSegmentId: null,
+            stemId: stem.id,
+            startedAt: stem.startedAt,
+            endedAt: stem.endedAt,
+            text: stem.transcriptText,
+            confidence: stem.confidence,
+            overlapState: "overlap",
+            evidenceKind: "separated_stem",
+            createdAt: input.run.completedAt,
+          });
+        }
+      }
+
+      const persistedTurns = input.turns.map((turn) => ({
+        ...turn,
+        clusterId: persistedClusterIds.get(turn.clusterId),
+      }));
+      for (const entry of current.chunks) {
+        for (const segment of entry.transcriptSegments) {
+          const words = this.statements.listTranscriptWordsForDiarizationSegment.all(segment.id);
+          if (words.length === 0) continue;
+          const segmentTurns = persistedTurns.filter(
+            (turn) =>
+              turn.chunkId === entry.audioChunk.id &&
+              turn.transcriptSegmentId === segment.id &&
+              turn.startedAt < segment.ended_at &&
+              segment.started_at < turn.endedAt
+          );
+          for (const turn of segmentTurns) {
+            const matchedWords = words.filter((word) => {
+              const midpoint = (word.started_at + word.ended_at) / 2;
+              return midpoint >= turn.startedAt && midpoint < turn.endedAt;
+            });
+            if (matchedWords.length === 0) continue;
+            const text = matchedWords
+              .map((word) => word.word)
+              .join("")
+              .replace(/\s+/gu, " ")
+              .trim();
+            if (!text) continue;
+            const startedAt = Math.max(
+              turn.startedAt,
+              Math.min(...matchedWords.map((word) => word.started_at))
+            );
+            const endedAt = Math.min(
+              turn.endedAt,
+              Math.max(...matchedWords.map((word) => word.ended_at))
+            );
+            if (endedAt <= startedAt) continue;
+            const overlapState = persistedTurns.some(
+              (candidate) =>
+                candidate.id !== turn.id &&
+                candidate.clusterId !== turn.clusterId &&
+                candidate.startedAt < endedAt &&
+                startedAt < candidate.endedAt
+            )
+              ? "overlap"
+              : "single";
+            const probabilities = matchedWords
+              .map((word) => word.probability)
+              .filter((value) => typeof value === "number");
+            const confidence =
+              probabilities.length > 0
+                ? probabilities.reduce((total, value) => total + value, 0) /
+                  probabilities.length
+                : segment.confidence;
+            const utteranceId = derivedId(
+              "speaker_utterance",
+              input.run.id,
+              turn.id,
+              segment.id,
+              startedAt,
+              endedAt
+            );
+            this.statements.insertSpeakerUtterance.run({
+              id: utteranceId,
+              sessionId: input.run.sessionId,
+              runId: input.run.id,
+              chunkId: entry.audioChunk.id,
+              clusterId: turn.clusterId,
+              sourceSegmentId: segment.id,
+              stemId: null,
+              startedAt,
+              endedAt,
+              text,
+              confidence,
+              overlapState,
+              evidenceKind: "word_alignment",
+              createdAt: input.run.completedAt,
+            });
+            matchedWords.forEach((word, ordinal) => {
+              this.statements.insertSpeakerUtteranceWord.run({
+                utteranceId,
+                transcriptWordId: word.id,
+                ordinal,
+              });
+            });
+          }
+        }
       }
       if (input.run.inputVersion === 2 && priorSpeakerEvidence) {
         const hasSummary =
@@ -3299,28 +3831,120 @@ class JarvisRepository {
     return this.statements.listPendingJobs.all(assertId(sessionId, "sessionId"));
   }
 
+  refreshLogicalApplicationTracks(sessionId, at = Date.now()) {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    const safeAt = assertNonNegativeInteger(at, "at");
+    const tracks = this.statements.listSessionIdentityTracks
+      .all(safeSessionId)
+      .filter((track) => track.track_kind === "application" && track.application_key);
+    const byApplication = new Map();
+    for (const track of tracks) {
+      const members = byApplication.get(track.application_key) ?? [];
+      members.push(track);
+      byApplication.set(track.application_key, members);
+    }
+    const refresh = this.db.transaction(() => {
+      const logicalTracks = [];
+      for (const [applicationKey, unsortedMembers] of byApplication) {
+        const members = [...unsortedMembers].sort(
+          (left, right) =>
+            (left.capture_generation ?? 0) - (right.capture_generation ?? 0) ||
+            (left.started_at ?? 0) - (right.started_at ?? 0) ||
+            left.id.localeCompare(right.id)
+        );
+        const canonical = members[0];
+        const startedAt = Math.min(...members.map((member) => member.started_at));
+        const latestEndedAt = members.some((member) => member.ended_at === null)
+          ? null
+          : Math.max(...members.map((member) => member.ended_at));
+        const endedAt = latestEndedAt !== null && latestEndedAt > startedAt ? latestEndedAt : null;
+        this.statements.upsertLogicalApplicationTrack.run({
+          id: derivedId("logical_application_track", safeSessionId, applicationKey),
+          sessionId: safeSessionId,
+          canonicalTrackId: canonical.id,
+          applicationKey,
+          applicationDisplayName: canonical.application_display_name,
+          startedAt,
+          endedAt,
+          generationCount: members.length,
+          at: safeAt,
+        });
+        const logical = this.statements.getLogicalApplicationTrack.get({
+          sessionId: safeSessionId,
+          applicationKey,
+        });
+        if (!logical) throw new Error("logical application track was not persisted");
+        this.statements.deleteLogicalApplicationMembers.run(logical.id);
+        members.forEach((member, memberIndex) => {
+          this.statements.insertLogicalApplicationMember.run({
+            logicalTrackId: logical.id,
+            trackId: member.id,
+            captureGeneration: member.capture_generation ?? 0,
+            memberIndex,
+          });
+        });
+        logicalTracks.push({ ...logical, memberTrackIds: members.map((member) => member.id) });
+      }
+      return logicalTracks;
+    });
+    return this.db.inTransaction ? refresh() : refresh.immediate();
+  }
+
   getDiarizationTrackEvidence({ sessionId, trackId, observedAt = Date.now() } = {}) {
     const safeSessionId = assertId(sessionId, "sessionId");
     const safeTrackId = assertId(trackId, "trackId");
     const safeObservedAt = assertNonNegativeInteger(observedAt, "observedAt");
     const session = this.statements.getSession.get(safeSessionId);
-    const track = this.statements.getDiarizationTrack.get({
+    const physicalTrack = this.statements.getDiarizationTrack.get({
       sessionId: safeSessionId,
       trackId: safeTrackId,
     });
-    const chunks = this.statements.listDiarizationChunks.all({
+    const logical = this.statements.getLogicalApplicationTrackByCanonical.get({
       sessionId: safeSessionId,
       trackId: safeTrackId,
     });
+    const track =
+      physicalTrack && logical
+        ? {
+            ...physicalTrack,
+            started_at: logical.started_at,
+            ended_at: logical.ended_at,
+            logical_track_id: logical.id,
+            logical_generation_count: logical.generation_count,
+          }
+        : physicalTrack;
+    const rawChunks = logical
+      ? this.statements.listLogicalDiarizationChunks.all({
+          sessionId: safeSessionId,
+          logicalTrackId: logical.id,
+        })
+      : this.statements.listDiarizationChunks.all({
+          sessionId: safeSessionId,
+          trackId: safeTrackId,
+        });
+    const chunks = selectLogicalAudioChunks(rawChunks).map((audioChunk, sequenceNumber) => ({
+      ...audioChunk,
+      physical_track_id: audioChunk.track_id,
+      track_id: safeTrackId,
+      sequence_number: sequenceNumber,
+    }));
     return deepFreeze({
       observedAt: safeObservedAt,
       session: session ?? null,
       track: track ?? null,
       chunks: chunks.map((audioChunk) => ({
         audioChunk,
-        latestTranscriptionJob:
-          this.statements.getLatestChunkTranscriptionJob.get(audioChunk.id) ?? null,
-        transcriptSegments: this.statements.listDiarizationSegments.all(audioChunk.id),
+        latestTranscriptionJob: (() => {
+          const job = this.statements.getLatestChunkTranscriptionJob.get(audioChunk.id) ?? null;
+          return job ? { ...job, physical_track_id: job.track_id, track_id: safeTrackId } : null;
+        })(),
+        transcriptSegments: this.statements.listDiarizationSegments
+          .all(audioChunk.id)
+          .map((segment) => ({
+            ...segment,
+            physical_track_id: segment.track_id,
+            track_id: safeTrackId,
+          })),
       })),
     });
   }
@@ -4024,6 +4648,7 @@ class JarvisRepository {
     if (!speakerProcessingPolicy || typeof speakerProcessingPolicy.evaluate !== "function") {
       throw new TypeError("speakerProcessingPolicy.evaluate is required");
     }
+    this.refreshLogicalApplicationTracks(safeSessionId, safeAt);
     const tracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
     const chunks = this.statements.listSessionReadinessChunks.all(safeSessionId);
     const {
@@ -4141,6 +4766,10 @@ class JarvisRepository {
           inputVersion: policy.inputVersion,
           modelVersion: policy.policyId,
         };
+        this.statements.supersedePriorDiarizationJobs.run({
+          ...identity,
+          at: safeAt,
+        });
         const result = this.statements.insertDiarizationJob.run({
           id: derivedId("job_diarize", inputHash),
           ...identity,
@@ -4284,6 +4913,7 @@ class JarvisRepository {
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
       return { eligible: false, reason: "session_not_terminal" };
     }
+    this.refreshLogicalApplicationTracks(safeSessionId, at);
     const candidateTracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
     const chunks = this.statements.listSessionReadinessChunks.all(safeSessionId);
     const completedApplicationTrackIds = new Set(
@@ -4616,9 +5246,12 @@ class JarvisRepository {
     if (!Array.isArray(input.clusters) || !Array.isArray(input.turns)) {
       throw new TypeError("diarization clusters and turns must be arrays");
     }
+    const voicedClusterCount = input.clusters.filter(
+      (cluster) => Number.isSafeInteger(cluster?.windowCount) && cluster.windowCount > 0
+    ).length;
     if (
       normalizedRun.speakerCountMax !== null &&
-      input.clusters.length > normalizedRun.speakerCountMax
+      voicedClusterCount > normalizedRun.speakerCountMax
     ) {
       throw new TypeError("diarization cluster count exceeds the validated speaker count");
     }
@@ -4632,6 +5265,18 @@ class JarvisRepository {
       const speechMs = assertNonNegativeInteger(cluster.speechMs, "cluster.speechMs");
       const windowCount = assertNonNegativeInteger(cluster.windowCount, "cluster.windowCount");
       const qualityScore = assertOptionalUnitScore(cluster.qualityScore, "cluster.qualityScore");
+      const identityEligible = cluster.identityEligible !== false;
+      const qualityGateReason = cluster.qualityGateReason ?? null;
+      if (
+        typeof identityEligible !== "boolean" ||
+        (identityEligible && qualityGateReason !== null) ||
+        (!identityEligible &&
+          (typeof qualityGateReason !== "string" ||
+            !qualityGateReason.trim() ||
+            qualityGateReason.length > 128))
+      ) {
+        throw new TypeError("diarization cluster identity gate is invalid");
+      }
       const embedding =
         cluster.embedding === null ? null : encodeDiarizationEmbedding(cluster.embedding);
       if (
@@ -4647,6 +5292,8 @@ class JarvisRepository {
         speechMs,
         windowCount,
         qualityScore,
+        identityEligible,
+        qualityGateReason,
         firstAppearanceAt: assertNonNegativeInteger(
           cluster.firstAppearanceAt,
           "cluster.firstAppearanceAt"
@@ -4700,6 +5347,61 @@ class JarvisRepository {
       clusterId: assertId(link?.clusterId, "link.clusterId"),
       transcriptSegmentId: assertId(link?.transcriptSegmentId, "link.transcriptSegmentId"),
     }));
+    const rawCannotLinks = input.cannotLinks ?? [];
+    if (!Array.isArray(rawCannotLinks)) throw new TypeError("cannotLinks must be an array");
+    const cannotLinks = rawCannotLinks.map((link) => {
+      const rawLeft = assertId(link?.leftClusterId, "cannotLink.leftClusterId");
+      const rawRight = assertId(link?.rightClusterId, "cannotLink.rightClusterId");
+      if (rawLeft === rawRight || !clusterLabels.has(rawLeft) || !clusterLabels.has(rawRight)) {
+        throw new TypeError("cannot-link clusters are invalid");
+      }
+      const [leftClusterId, rightClusterId] = [rawLeft, rawRight].sort();
+      if (!new Set(["simultaneous_turns", "separated_overlap_stems", "user_split"]).has(link.reason)) {
+        throw new TypeError("cannot-link reason is invalid");
+      }
+      return { leftClusterId, rightClusterId, reason: link.reason };
+    });
+    const rawOverlapStems = input.overlapStems ?? [];
+    if (!Array.isArray(rawOverlapStems)) throw new TypeError("overlapStems must be an array");
+    const overlapStems = rawOverlapStems.map((stem) => {
+      const transcriptText = stem?.transcriptText ?? null;
+      const confidence = assertOptionalUnitScore(stem?.confidence ?? null, "stem.confidence");
+      if (
+        !clusterLabels.has(stem?.clusterId) ||
+        typeof stem?.path !== "string" ||
+        !path.isAbsolute(stem.path) ||
+        !/^[0-9a-f]{64}$/.test(stem?.fileSha256 ?? "") ||
+        !/^[0-9a-f]{64}$/.test(stem?.pcmSha256 ?? "") ||
+        stem?.sampleRate !== 16_000 ||
+        stem?.channels !== 1 ||
+        typeof stem?.rms !== "number" ||
+        !Number.isFinite(stem.rms) ||
+        stem.rms < 0 ||
+        (transcriptText !== null &&
+          (typeof transcriptText !== "string" || !transcriptText.trim())) ||
+        (transcriptText === null && confidence !== null)
+      ) {
+        throw new TypeError("overlap stem evidence is invalid");
+      }
+      return {
+        id: assertId(stem.id, "stem.id"),
+        chunkId: assertId(stem.chunkId, "stem.chunkId"),
+        clusterId: assertId(stem.clusterId, "stem.clusterId"),
+        windowIndex: assertNonNegativeInteger(stem.windowIndex, "stem.windowIndex"),
+        stemIndex: assertNonNegativeInteger(stem.stemIndex, "stem.stemIndex"),
+        startedAt: assertNonNegativeInteger(stem.startedAt, "stem.startedAt"),
+        endedAt: assertNonNegativeInteger(stem.endedAt, "stem.endedAt"),
+        path: path.resolve(stem.path),
+        fileSha256: stem.fileSha256,
+        pcmSha256: stem.pcmSha256,
+        sampleRate: stem.sampleRate,
+        channels: stem.channels,
+        rms: stem.rms,
+        expiresAt: assertNonNegativeInteger(stem.expiresAt, "stem.expiresAt"),
+        transcriptText: transcriptText?.trim() ?? null,
+        confidence,
+      };
+    });
     return this._commitDiarizationRun({
       expectedRevision: input.expectedRevision,
       validatedAt,
@@ -4708,6 +5410,8 @@ class JarvisRepository {
       clusters,
       turns,
       segmentLinks,
+      cannotLinks,
+      overlapStems,
     });
   }
 
@@ -4853,6 +5557,9 @@ class JarvisRepository {
       if (typeof result.text !== "string" || !result.text.trim()) {
         throw new TypeError("transcript text is required");
       }
+      if (result.words !== undefined && !Array.isArray(result.words)) {
+        throw new TypeError("transcript words must be an array when provided");
+      }
       if (
         typeof result.confidence !== "number" ||
         !Number.isFinite(result.confidence) ||
@@ -4871,10 +5578,24 @@ class JarvisRepository {
       result:
         result.noSpeech === true
           ? { noSpeech: true }
-          : { text: result.text.trim(), confidence: result.confidence },
+          : {
+              text: result.text.trim(),
+              confidence: result.confidence,
+              words: result.words ?? [],
+            },
       modelVersion: modelVersion.trim(),
       completedAt,
     });
+  }
+
+  listTranscriptWords(sessionId) {
+    return this.statements.listSessionTranscriptWords.all(assertId(sessionId, "sessionId"));
+  }
+
+  listTranscriptWordsForSegment(segmentId) {
+    return this.statements.listTranscriptWordsBySegment.all(
+      assertId(segmentId, "transcriptSegmentId")
+    );
   }
 
   renamePerson(input) {
@@ -5236,6 +5957,7 @@ class JarvisRepository {
       session,
       summary,
       segments: this.listTranscriptSegments(sessionId),
+      speakerUtterances: this.statements.listSessionSpeakerUtterances.all(sessionId),
       audioChunks: includeAudioChunks ? this.listAudioChunks(sessionId) : [],
       topics: this.db
         .prepare(
@@ -5268,6 +5990,14 @@ class JarvisRepository {
         .all(sessionId),
       speakerProcessing: this.getSessionSpeakerProcessing(sessionId),
     };
+  }
+
+  getSpeakerUtteranceAudioEvidence(utteranceId) {
+    return (
+      this.statements.getSpeakerUtteranceAudioEvidence.get(
+        assertId(utteranceId, "speakerUtteranceId")
+      ) ?? null
+    );
   }
 
   listPeopleOverview() {

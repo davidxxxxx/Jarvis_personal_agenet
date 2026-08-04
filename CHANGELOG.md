@@ -10,6 +10,25 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.3 - 2026-08-05
+
+- Treat every capture generation from the same application as one logical audio track, recognize
+  Quark, and preserve exact local fallback codes without leaking process paths or window titles.
+- Persist Whisper word timestamps and project them onto speaker turns so Memory can show and play
+  sentence-level speech instead of assigning a whole 60-second transcript to one person.
+- Persist independently separated MossFormer2 stems, transcribe and embed every audible stem, and
+  add cannot-link evidence so simultaneous speakers cannot collapse back into one identity.
+- Ship AI model pack 2026.08.1 so the pinned offline runtime returns durable separated channels
+  instead of reporting overlap metadata without preserving the resulting audio evidence.
+- Gate long-recording identity association on voice-window coverage and cluster consistency, while
+  keeping rejected fragments as local audit evidence rather than binding them to a named person.
+- Show overlapping speakers side by side with isolated playback and links to reversible split,
+  merge, naming, and correction history controls.
+- Keep mixed-system duplicate transcripts as hidden audit copies when exact application-primary
+  evidence exists, while retaining unknown-source audio when no exact application track covers it.
+- Migrate local data to schema v59 and requeue historical transcription and diarization under the
+  new evidence contract without automatically purchasing another MiniMax summary.
+
 ## 0.2.0-rc.2 - 2026-08-04
 
 - Deduplicate application audio and the mixed-system safety track with local-only whole-window

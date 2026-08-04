@@ -1,7 +1,7 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 const { computeSessionSemanticHashes } = require("./SessionReprocessingSemantics");
 
-const TARGET_VERSION = 58;
+const TARGET_VERSION = 59;
 const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
@@ -4885,8 +4885,13 @@ function migrateSessionDiarizationV21(db) {
            embedding_dimension, sample_rate, input_version, execution_device,
            ${commitSequenceExpression}, created_at, completed_at
     FROM speaker_diarization_runs;
-    INSERT INTO speaker_diarization_run_clusters_v21
-    SELECT * FROM speaker_diarization_run_clusters;
+    INSERT INTO speaker_diarization_run_clusters_v21 (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    )
+    SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+           window_count, quality_score, first_appearance_at
+    FROM speaker_diarization_run_clusters;
     INSERT INTO speaker_turns_v21 (
       id, run_id, cluster_id, chunk_id, transcript_segment_id, turn_index,
       raw_label, started_at, ended_at, embedding, echo_state,
@@ -6199,10 +6204,22 @@ function upgradeEncryptedDiarizationEvidenceV35(db) {
         CHECK((echo_state = 'confirmed') = (excluded_from_centroid = 1))
       );
 
-      INSERT INTO speaker_diarization_run_clusters_v35
-      SELECT * FROM speaker_diarization_run_clusters;
-      INSERT INTO speaker_turns_v35
-      SELECT * FROM speaker_turns;
+      INSERT INTO speaker_diarization_run_clusters_v35 (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      )
+      SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+             window_count, quality_score, first_appearance_at
+      FROM speaker_diarization_run_clusters;
+      INSERT INTO speaker_turns_v35 (
+        id, run_id, cluster_id, chunk_id, transcript_segment_id,
+        turn_index, raw_label, started_at, ended_at, embedding,
+        echo_state, duplicate_of_turn_id, excluded_from_centroid, created_at
+      )
+      SELECT id, run_id, cluster_id, chunk_id, transcript_segment_id,
+             turn_index, raw_label, started_at, ended_at, embedding,
+             echo_state, duplicate_of_turn_id, excluded_from_centroid, created_at
+      FROM speaker_turns;
 
       DROP TABLE speaker_turns;
       DROP TABLE speaker_diarization_run_clusters;
@@ -9436,6 +9453,318 @@ function upgradeAnalysisInputV3V58(db) {
   `);
 }
 
+const LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59 = `
+  CREATE TABLE IF NOT EXISTS logical_audio_tracks (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    canonical_track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    track_kind TEXT NOT NULL CHECK(track_kind IN ('application')),
+    application_key TEXT NOT NULL CHECK(
+      typeof(application_key) = 'text'
+      AND length(application_key) BETWEEN 1 AND 64
+      AND application_key = lower(application_key)
+      AND application_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    application_display_name TEXT NOT NULL CHECK(
+      typeof(application_display_name) = 'text'
+      AND length(trim(application_display_name)) BETWEEN 1 AND 80
+    ),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    generation_count INTEGER NOT NULL CHECK(generation_count > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(session_id, application_key),
+    UNIQUE(id, canonical_track_id),
+    CHECK(ended_at IS NULL OR ended_at > started_at)
+  );
+  CREATE INDEX IF NOT EXISTS idx_logical_audio_tracks_session_time
+    ON logical_audio_tracks(session_id, started_at, id);
+
+  CREATE TABLE IF NOT EXISTS logical_audio_track_members (
+    logical_track_id TEXT NOT NULL REFERENCES logical_audio_tracks(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL UNIQUE REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    capture_generation INTEGER NOT NULL CHECK(capture_generation >= 0),
+    member_index INTEGER NOT NULL CHECK(member_index >= 0),
+    PRIMARY KEY(logical_track_id, track_id),
+    UNIQUE(logical_track_id, member_index)
+  );
+  CREATE INDEX IF NOT EXISTS idx_logical_audio_track_members_track
+    ON logical_audio_track_members(track_id, logical_track_id);
+
+  CREATE TABLE IF NOT EXISTS application_audio_fallback_evidence (
+    interval_id TEXT PRIMARY KEY
+      REFERENCES application_audio_intervals(id) ON DELETE CASCADE,
+    attempted_application_key TEXT CHECK(
+      attempted_application_key IS NULL OR (
+        typeof(attempted_application_key) = 'text'
+        AND length(attempted_application_key) BETWEEN 1 AND 64
+        AND attempted_application_key = lower(attempted_application_key)
+        AND attempted_application_key NOT GLOB '*[^a-z0-9._-]*'
+      )
+    ),
+    attempted_application_display_name TEXT CHECK(
+      attempted_application_display_name IS NULL OR (
+        typeof(attempted_application_display_name) = 'text'
+        AND length(trim(attempted_application_display_name)) BETWEEN 1 AND 80
+      )
+    ),
+    reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 128),
+    failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    ),
+    capture_generation INTEGER NOT NULL CHECK(capture_generation >= 0),
+    created_at INTEGER NOT NULL,
+    CHECK(
+      (attempted_application_key IS NULL) =
+      (attempted_application_display_name IS NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS transcript_words (
+    id TEXT PRIMARY KEY,
+    transcript_segment_id TEXT NOT NULL
+      REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    word TEXT NOT NULL CHECK(length(word) > 0),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    probability REAL CHECK(
+      probability IS NULL OR (
+        typeof(probability) IN ('integer','real') AND probability BETWEEN 0 AND 1
+      )
+    ),
+    created_at INTEGER NOT NULL,
+    UNIQUE(transcript_segment_id, ordinal)
+  );
+  CREATE INDEX IF NOT EXISTS idx_transcript_words_segment_time
+    ON transcript_words(transcript_segment_id, started_at, ended_at, ordinal);
+  CREATE INDEX IF NOT EXISTS idx_transcript_words_chunk_time
+    ON transcript_words(chunk_id, started_at, ended_at, ordinal);
+
+  CREATE TABLE IF NOT EXISTS speaker_cluster_cannot_links (
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    left_cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    right_cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK(reason IN (
+      'simultaneous_turns','separated_overlap_stems','user_split'
+    )),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(run_id, left_cluster_id, right_cluster_id),
+    CHECK(left_cluster_id < right_cluster_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS overlap_stem_evidence (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    cluster_id TEXT REFERENCES speaker_clusters(id) ON DELETE SET NULL,
+    window_index INTEGER NOT NULL CHECK(window_index >= 0),
+    stem_index INTEGER NOT NULL CHECK(stem_index >= 0),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    path TEXT NOT NULL UNIQUE CHECK(length(trim(path)) > 0),
+    file_sha256 TEXT NOT NULL CHECK(
+      length(file_sha256) = 64 AND file_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    pcm_sha256 TEXT NOT NULL CHECK(
+      length(pcm_sha256) = 64 AND pcm_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+    channels INTEGER NOT NULL CHECK(channels = 1),
+    rms REAL NOT NULL CHECK(typeof(rms) IN ('integer','real') AND rms >= 0),
+    expires_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    transcript_text TEXT,
+    confidence REAL CHECK(
+      confidence IS NULL OR (
+        typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+      )
+    ),
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, chunk_id, window_index, stem_index),
+    CHECK(deleted_at IS NULL OR deleted_at >= created_at)
+  );
+  CREATE INDEX IF NOT EXISTS idx_overlap_stem_evidence_run_time
+    ON overlap_stem_evidence(run_id, started_at, ended_at, id);
+  CREATE INDEX IF NOT EXISTS idx_overlap_stem_evidence_expiry
+    ON overlap_stem_evidence(expires_at, deleted_at, id);
+
+  CREATE TABLE IF NOT EXISTS speaker_utterances (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    source_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    stem_id TEXT REFERENCES overlap_stem_evidence(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    text TEXT NOT NULL CHECK(length(trim(text)) > 0),
+    confidence REAL CHECK(
+      confidence IS NULL OR (
+        typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+      )
+    ),
+    overlap_state TEXT NOT NULL CHECK(overlap_state IN ('single','overlap')),
+    evidence_kind TEXT NOT NULL CHECK(
+      evidence_kind IN ('word_alignment','separated_stem')
+    ),
+    created_at INTEGER NOT NULL,
+    CHECK(
+      (evidence_kind = 'word_alignment' AND source_segment_id IS NOT NULL AND stem_id IS NULL)
+      OR
+      (evidence_kind = 'separated_stem' AND stem_id IS NOT NULL)
+    )
+  );
+  CREATE INDEX IF NOT EXISTS idx_speaker_utterances_session_time
+    ON speaker_utterances(session_id, started_at, ended_at, id);
+  CREATE INDEX IF NOT EXISTS idx_speaker_utterances_run_cluster_time
+    ON speaker_utterances(run_id, cluster_id, started_at, id);
+
+  CREATE TABLE IF NOT EXISTS speaker_utterance_words (
+    utterance_id TEXT NOT NULL REFERENCES speaker_utterances(id) ON DELETE CASCADE,
+    transcript_word_id TEXT NOT NULL REFERENCES transcript_words(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    PRIMARY KEY(utterance_id, transcript_word_id),
+    UNIQUE(utterance_id, ordinal)
+  );
+`;
+
+function upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt) {
+  db.exec(LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59);
+  addColumn(
+    db,
+    "transcript_segments",
+    "projection_state TEXT NOT NULL DEFAULT 'visible' CHECK(projection_state IN ('visible','audit_hidden'))"
+  );
+  addColumn(
+    db,
+    "transcript_segments",
+    "projection_reason TEXT CHECK(projection_reason IS NULL OR length(trim(projection_reason)) BETWEEN 1 AND 128)"
+  );
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_transcript_segments_projection
+      ON transcript_segments(session_id, projection_state, started_at, id);
+  `);
+  addColumn(
+    db,
+    "speaker_clusters",
+    "identity_eligible INTEGER NOT NULL DEFAULT 1 CHECK(identity_eligible IN (0,1))"
+  );
+  addColumn(
+    db,
+    "speaker_clusters",
+    "quality_gate_reason TEXT CHECK(quality_gate_reason IS NULL OR length(trim(quality_gate_reason)) BETWEEN 1 AND 128)"
+  );
+  addColumn(
+    db,
+    "speaker_diarization_run_clusters",
+    "identity_eligible INTEGER NOT NULL DEFAULT 1 CHECK(identity_eligible IN (0,1))"
+  );
+  addColumn(
+    db,
+    "speaker_diarization_run_clusters",
+    "quality_gate_reason TEXT CHECK(quality_gate_reason IS NULL OR length(trim(quality_gate_reason)) BETWEEN 1 AND 128)"
+  );
+  db.exec(`
+    UPDATE speaker_clusters
+    SET identity_eligible = CASE
+          WHEN embedding IS NOT NULL
+           AND speech_ms >= 5000
+           AND window_count >= 3
+           AND quality_score >= 0.72
+          THEN 1 ELSE 0 END,
+        quality_gate_reason = CASE
+          WHEN embedding IS NULL THEN 'missing_voice_embedding'
+          WHEN quality_score IS NULL OR quality_score < 0.72 THEN 'low_cluster_consistency'
+          WHEN speech_ms < 5000 THEN 'insufficient_speech'
+          WHEN window_count < 3 THEN 'insufficient_voice_windows'
+          ELSE NULL END;
+    UPDATE speaker_diarization_run_clusters
+    SET identity_eligible = CASE
+          WHEN embedding IS NOT NULL
+           AND speech_ms >= 5000
+           AND window_count >= 3
+           AND quality_score >= 0.72
+          THEN 1 ELSE 0 END,
+        quality_gate_reason = CASE
+          WHEN embedding IS NULL THEN 'missing_voice_embedding'
+          WHEN quality_score IS NULL OR quality_score < 0.72 THEN 'low_cluster_consistency'
+          WHEN speech_ms < 5000 THEN 'insufficient_speech'
+          WHEN window_count < 3 THEN 'insufficient_voice_windows'
+          ELSE NULL END;
+  `);
+  const groups = db
+    .prepare(
+      `SELECT session_id, application_key,
+              min(started_at) AS started_at,
+              max(COALESCE(ended_at, started_at)) AS ended_at,
+              count(*) AS generation_count
+       FROM audio_tracks
+       WHERE track_kind = 'application'
+       GROUP BY session_id, application_key
+       ORDER BY session_id, application_key`
+    )
+    .all();
+  const membersForGroup = db.prepare(
+    `SELECT id, application_display_name, capture_generation, started_at, ended_at
+     FROM audio_tracks
+     WHERE session_id = ? AND application_key = ? AND track_kind = 'application'
+     ORDER BY capture_generation, started_at, id`
+  );
+  const insertLogical = db.prepare(
+    `INSERT OR REPLACE INTO logical_audio_tracks (
+       id, session_id, canonical_track_id, track_kind, application_key,
+       application_display_name, started_at, ended_at, generation_count,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, 'application', ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const deleteMembers = db.prepare(
+    "DELETE FROM logical_audio_track_members WHERE logical_track_id = ?"
+  );
+  const insertMember = db.prepare(
+    `INSERT INTO logical_audio_track_members (
+       logical_track_id, track_id, capture_generation, member_index
+     ) VALUES (?, ?, ?, ?)`
+  );
+  for (const group of groups) {
+    const members = membersForGroup.all(group.session_id, group.application_key);
+    if (members.length === 0) continue;
+    const logicalId = `logical_${canonicalTupleHash([
+      "application_audio",
+      group.session_id,
+      group.application_key,
+    ]).slice(0, 48)}`;
+    const canonical = members[0];
+    const latestEndedAt = members.some((member) => member.ended_at === null)
+      ? null
+      : Math.max(...members.map((member) => member.ended_at));
+    const endedAt = latestEndedAt !== null && latestEndedAt > group.started_at ? latestEndedAt : null;
+    insertLogical.run(
+      logicalId,
+      group.session_id,
+      canonical.id,
+      group.application_key,
+      canonical.application_display_name,
+      group.started_at,
+      endedAt,
+      members.length,
+      migratedAt,
+      migratedAt
+    );
+    deleteMembers.run(logicalId);
+    members.forEach((member, index) => {
+      insertMember.run(logicalId, member.id, member.capture_generation, index);
+    });
+  }
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -9811,6 +10140,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 58) {
         upgradeAnalysisInputV3V58(db);
       }
+      if (fromVersion < 59) {
+        upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -9865,4 +10197,6 @@ module.exports = {
   upgradeKnowledgeActionProjectionBackfillV57,
   upgradeRuntimeStatusIndexesV38,
   upgradeHybridDiarizationV36,
+  LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59,
+  upgradeLogicalAudioAndSpeakerUtterancesV59,
 };

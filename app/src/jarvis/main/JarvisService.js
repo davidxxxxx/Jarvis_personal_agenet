@@ -126,6 +126,7 @@ class JarvisService {
     onChunkCommitted = () => {},
     previewAudioRing = undefined,
     onPreviewWatermark = () => {},
+    transcriptionInputVersion = 1,
     transcriptionModelVersion = "base",
   }) {
     if (!repository || typeof repository !== "object") {
@@ -187,6 +188,8 @@ class JarvisService {
     }
 
     this.repository = repository;
+    this.transcriptionInputVersion = null;
+    this.configureTranscriptionInputVersion(transcriptionInputVersion);
     this.transcriptionModelVersion = null;
     this.configureTranscriptionModelVersion(transcriptionModelVersion);
     if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
@@ -296,6 +299,14 @@ class JarvisService {
     }
     this.transcriptionModelVersion = modelVersion.trim();
     return this.transcriptionModelVersion;
+  }
+
+  configureTranscriptionInputVersion(inputVersion) {
+    if (!Number.isSafeInteger(inputVersion) || inputVersion < 1) {
+      throw new TypeError("transcriptionInputVersion must be a positive safe integer");
+    }
+    this.transcriptionInputVersion = inputVersion;
+    return this.transcriptionInputVersion;
   }
 
   startCapture(input) {
@@ -577,6 +588,7 @@ class JarvisService {
   recordApplicationAudioAttribution({
     sessionId,
     applicationKey,
+    applicationDisplayName = null,
     captureGeneration,
     attributionState,
     at,
@@ -588,6 +600,16 @@ class JarvisService {
     if (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey)) {
       throw new TypeError("applicationKey must be a canonical lowercase identifier");
     }
+    const activeApplication = this.applicationSources.get(applicationKey);
+    const fallbackIdentity =
+      applicationDisplayName === null
+        ? activeApplication
+          ? {
+              applicationKey,
+              applicationDisplayName: activeApplication.applicationDisplayName,
+            }
+          : null
+        : assertApplicationIdentity(applicationKey, applicationDisplayName);
     const generation = assertCaptureGeneration(captureGeneration);
     if (attributionState !== "exact" && attributionState !== "mixed_unknown") {
       throw new TypeError("attributionState must be exact or mixed_unknown");
@@ -635,6 +657,12 @@ class JarvisService {
       startedAt: transitionAt,
       endedAt: null,
       reason: attributionState === "exact" ? null : reason,
+      attemptedApplicationKey:
+        attributionState === "mixed_unknown" ? fallbackIdentity?.applicationKey ?? null : null,
+      attemptedApplicationDisplayName:
+        attributionState === "mixed_unknown"
+          ? fallbackIdentity?.applicationDisplayName ?? null
+          : null,
       failureCode:
         attributionState === "exact" || failureCode === null
           ? null
@@ -1997,6 +2025,7 @@ class JarvisService {
         if (this.closed) return null;
         const committed = this.repository.commitChunk({
           ...chunk,
+          inputVersion: this.transcriptionInputVersion,
           modelVersion: this.transcriptionModelVersion,
           fileBytes: this.fs.statSync(chunk.path).size,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
@@ -2211,11 +2240,13 @@ class JarvisService {
       }
       this.repository.enqueueChunkTranscription({
         ...chunk,
+        inputVersion: this.transcriptionInputVersion,
         modelVersion: this.transcriptionModelVersion,
       });
     } else {
       this.repository.commitChunk({
         ...chunk,
+        inputVersion: this.transcriptionInputVersion,
         modelVersion: this.transcriptionModelVersion,
       });
     }

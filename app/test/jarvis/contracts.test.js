@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   CHANNELS,
   assertId,
@@ -1214,6 +1217,60 @@ test("audio read IPC returns null for missing evidence and never returns unverif
   );
 });
 
+test("isolated speaker audio IPC verifies its G-drive storage root and content hash", async (t) => {
+  const testRoot = path.resolve(__dirname, "../../.tmp-tests/speaker-utterance-audio");
+  fs.mkdirSync(testRoot, { recursive: true });
+  const dataRoot = fs.mkdtempSync(path.join(testRoot, "case-"));
+  const allowedRoot = path.join(dataRoot, "recordings-data", "overlap-stems");
+  fs.mkdirSync(allowedRoot, { recursive: true });
+  const bytes = Buffer.from("verified-isolated-speaker-wav");
+  const stemPath = path.join(allowedRoot, "stem.wav");
+  fs.writeFileSync(stemPath, bytes);
+  const previousDataRoot = process.env.JARVIS_DATA_ROOT;
+  process.env.JARVIS_DATA_ROOT = dataRoot;
+  t.after(() => {
+    if (previousDataRoot === undefined) delete process.env.JARVIS_DATA_ROOT;
+    else process.env.JARVIS_DATA_ROOT = previousDataRoot;
+    fs.rmSync(dataRoot, { recursive: true, force: true });
+  });
+
+  let evidencePath = stemPath;
+  const handlers = new Map();
+  registerJarvisIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    repository: createRepository({
+      getSpeakerUtteranceAudioEvidence: () => ({
+        id: "utterance-1",
+        evidence_kind: "separated_stem",
+        stem_path: evidencePath,
+        stem_file_sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+        stem_expires_at: 2_000,
+        stem_deleted_at: null,
+      }),
+    }),
+    service: createService(),
+    voiceEnrollmentService: createVoiceEnrollmentService(),
+    environmentManager: { getOpenAIKey: () => null },
+    now: () => 1_000,
+  });
+
+  assert.deepEqual(
+    await handlers.get(CHANNELS.readSpeakerUtteranceAudio)(null, "utterance-1"),
+    bytes
+  );
+
+  evidencePath = path.join(dataRoot, "outside.wav");
+  fs.writeFileSync(evidencePath, bytes);
+  await assert.rejects(
+    handlers.get(CHANNELS.readSpeakerUtteranceAudio)(null, "utterance-1"),
+    (error) => {
+      assert.equal(error.code, "JARVIS_SPEAKER_UTTERANCE_AUDIO_UNAVAILABLE");
+      assert.doesNotMatch(error.message, /outside|jarvisdata|overlap-stems/iu);
+      return true;
+    }
+  );
+});
+
 test("session timeline IPC is reachable and keeps retired provenance private", () => {
   const handlers = new Map();
   const timeline = {
@@ -1888,6 +1945,7 @@ test("contract exposes only the named Jarvis channels", () => {
       "listAudioChunks",
       "listActivityClassifications",
       "readAudioChunk",
+      "readSpeakerUtteranceAudio",
       "listMemories",
       "listPeople",
       "listPeopleOverview",
@@ -1961,6 +2019,7 @@ test("IPC registers only request-response repository channels", () => {
       CHANNELS.listAudioChunks,
       CHANNELS.listActivityClassifications,
       CHANNELS.readAudioChunk,
+      CHANNELS.readSpeakerUtteranceAudio,
       CHANNELS.listPeople,
       CHANNELS.listSegments,
       CHANNELS.listSessions,

@@ -13,6 +13,10 @@ const HYBRID_DIARIZATION_POLICY = Object.freeze({
   executionDevice: "cuda",
   modelPackVersion: MODEL_PACK_VERSION,
   clusterSimilarityThreshold: 0.72,
+  clusterMemberSimilarityFloor: 0.58,
+  // A raw diarizer label is only split when its embedding is grossly inconsistent.
+  // Durable-person eligibility is guarded separately by the stricter cluster quality gate.
+  rawLabelConsistencyFloor: 0.35,
   echoSimilarityThreshold: 0.95,
   minimumSpeakers: 1,
   maximumSpeakers: 8,

@@ -292,7 +292,12 @@ class OfflineModels:
         windows = _overlap_windows(turns, padding_ms, duration_ms)
         enable_overlap_separation = request.get("enableOverlapSeparation") is not False
         separation = (
-            self._separate_overlap_windows(audio_path, windows)
+            self._separate_overlap_windows(
+                audio_path,
+                windows,
+                output_root=request.get("overlapOutputRoot"),
+                artifact_key=request.get("artifactKey"),
+            )
             if enable_overlap_separation
             else {
                 "state": "not_needed",
@@ -310,12 +315,25 @@ class OfflineModels:
         }
 
     def _separate_overlap_windows(
-        self, audio_path: Path, windows: list[dict[str, int]]
+        self,
+        audio_path: Path,
+        windows: list[dict[str, int]],
+        *,
+        output_root: Any,
+        artifact_key: Any,
     ) -> dict[str, Any]:
         if not windows:
             return {"state": "not_needed", "processed": 0, "total": 0, "stemCounts": []}
         separator = self.load_separator()
-        return separator.request("separate", {"audioPath": str(audio_path), "windows": windows})
+        return separator.request(
+            "separate",
+            {
+                "audioPath": str(audio_path),
+                "windows": windows,
+                "outputRoot": output_root,
+                "artifactKey": artifact_key,
+            },
+        )
 
 
 def _cuda_self_test(models: OfflineModels, *, load_primary: bool, load_separator: bool) -> dict[str, Any]:

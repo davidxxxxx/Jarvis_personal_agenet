@@ -703,11 +703,35 @@ export interface JarvisSessionDetail {
   session: JarvisSession;
   summary: JarvisSessionSummary | null;
   segments: JarvisTranscriptSegment[];
+  speakerUtterances?: JarvisSpeakerUtterance[];
   audioChunks: JarvisAudioChunk[];
   topics: JarvisTopic[];
   todos: JarvisTodo[];
   memories: JarvisMemoryItem[];
   speakerProcessing: JarvisSessionSpeakerProcessing | null;
+}
+
+export interface JarvisSpeakerUtterance {
+  id: string;
+  session_id: string;
+  chunk_id: string;
+  cluster_id: string;
+  source_segment_id: string | null;
+  stem_id: string | null;
+  started_at: number;
+  ended_at: number;
+  text: string;
+  confidence: number | null;
+  overlap_state: "single" | "overlap";
+  evidence_kind: "word_alignment" | "separated_stem";
+  local_label: string;
+  person_id: string | null;
+  link_state: "unknown" | "suggested" | "confirmed" | "rejected";
+  person_display_name: string | null;
+  application_key: string | null;
+  application_display_name: string | null;
+  track_kind: "mic" | "system_mix" | "application";
+  has_isolated_audio: boolean;
 }
 
 export interface JarvisDiarizationRunView {
