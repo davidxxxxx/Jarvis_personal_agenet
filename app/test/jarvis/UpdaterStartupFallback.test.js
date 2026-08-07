@@ -94,6 +94,14 @@ test("Jarvis updater owns its feed and treats an empty release channel as not av
       repo: "Jarvis_personal_agenet",
       private: false,
     });
+    const noReleaseError = new Error("No published versions on GitHub");
+    noReleaseError.code = "ERR_UPDATER_NO_PUBLISHED_VERSIONS";
+    updater.logger.error(noReleaseError);
+    updater.logger.error("Error: No published versions on GitHub");
+    assert.equal(errors.length, 0, "the updater's internal logger must suppress this benign state");
+    updater.logger.error(new Error("network unavailable"));
+    assert.equal(errors.length, 1, "unrelated update failures must remain visible");
+    errors.length = 0;
 
     manager.checkForUpdatesOnStartup();
     assert.equal(typeof scheduledStartupCheck, "function");

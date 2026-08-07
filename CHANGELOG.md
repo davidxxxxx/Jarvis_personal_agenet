@@ -10,6 +10,12 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.10 - 2026-08-08
+
+- Suppress electron-updater's own benign `ERR_UPDATER_NO_PUBLISHED_VERSIONS` logger output while
+  preserving unrelated update failures, so the first user-owned GitHub release can remain draft
+  without producing an error stack at every startup.
+
 ## 0.2.0-rc.9 - 2026-08-08
 
 - Stop historical identity jobs from retrying every few seconds when their diarization evidence is

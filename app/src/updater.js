@@ -15,10 +15,24 @@ const JARVIS_UPDATE_FEED = Object.freeze({
 });
 
 function isNoPublishedVersionsError(error) {
+  const message =
+    typeof error === "string" ? error : String(error?.message ?? error?.stack ?? error ?? "");
   return (
     error?.code === "ERR_UPDATER_NO_PUBLISHED_VERSIONS" ||
-    /no published versions/i.test(String(error?.message ?? ""))
+    /no published versions/i.test(message)
   );
+}
+
+function createUpdaterLogger() {
+  return {
+    debug: (...args) => console.debug(...args),
+    info: (...args) => console.log(...args),
+    warn: (...args) => console.warn(...args),
+    error: (...args) => {
+      if (args.some(isNoPublishedVersionsError)) return;
+      console.error(...args);
+    },
+  };
 }
 
 class UpdateManager {
@@ -97,7 +111,7 @@ class UpdateManager {
 
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.logger = console;
+    autoUpdater.logger = createUpdaterLogger();
 
     this.setupEventHandlers();
   }
