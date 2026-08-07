@@ -595,6 +595,7 @@ class MemoryRepository {
          ORDER BY revision DESC LIMIT 1`
       )
       .get(sessionId);
+    const participantProjectionActive = Boolean(participantSnapshot);
     if (participantSnapshotRevision !== undefined) {
       const matchesExpectedSnapshot =
         participantSnapshotRevision === null
@@ -716,6 +717,13 @@ class MemoryRepository {
           .prepare("SELECT id, display_name, is_self FROM people WHERE id = ?")
           .get(segment.person_id);
         if (!person?.display_name?.trim()) return [];
+        if (
+          participantProjectionActive &&
+          person.is_self !== 1 &&
+          projectedSegmentParticipant === null
+        ) {
+          return [];
+        }
         if (person.is_self !== 1) {
           const confirmed = this.db
             .prepare(
@@ -812,6 +820,7 @@ class MemoryRepository {
         const projectedParticipant =
           participantMembershipByCluster.get(cluster.id) ?? projectedSegmentParticipant;
         if (projectedParticipant?.membershipKind === "media") return [];
+        if (participantProjectionActive && !projectedParticipant) return [];
         const applicationSpeakerKey =
           cluster.track_kind === "application" &&
           cluster.attribution_state === "exact" &&

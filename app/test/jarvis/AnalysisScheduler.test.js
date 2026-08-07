@@ -22,6 +22,7 @@ function sessionDetail() {
         is_stable: 1,
         superseded_by: null,
         duplicate_of: null,
+        projection_state: "visible",
       },
       {
         id: "seg-final",
@@ -34,6 +35,7 @@ function sessionDetail() {
         is_stable: 1,
         superseded_by: null,
         duplicate_of: null,
+        projection_state: "visible",
       },
     ],
   };
@@ -105,7 +107,7 @@ function harness(options = {}) {
   const headHashes = new Map();
   let currentHead = null;
   const repository = {
-    getSessionDetail: () => sessionDetail(),
+    getSessionDetail: () => options.sessionDetail ?? sessionDetail(),
     listPeople: () => [{ id: "person-real", display_name: "real name", is_self: 0 }],
     markSessionSummaryRefreshRecommended(sessionId, reason, at) {
       events.push(["recommend_summary_refresh", { sessionId, reason, at }]);
@@ -409,6 +411,32 @@ test("local activity classification is durable before cloud input preparation an
   assert.ok(names.indexOf("classify_activity_local") < names.indexOf("prepare"));
   assert.ok(names.indexOf("classify_activity_local") < names.indexOf("enqueue"));
   assert.ok(names.indexOf("enqueue") < names.indexOf("classify_activity_cloud"));
+});
+
+test("hidden participant projection segments never enter a paid summary input", async () => {
+  const detail = sessionDetail();
+  detail.segments = [
+    ...detail.segments.map((segment) => ({ ...segment, projection_state: "visible" })),
+    {
+      id: "seg-media-hidden",
+      started_at: 3,
+      ended_at: 4,
+      version: 1,
+      person_id: null,
+      text: "game commentary that must stay out of the personal summary",
+      result_kind: "final",
+      is_stable: 1,
+      superseded_by: null,
+      duplicate_of: null,
+      projection_state: "audit_hidden",
+    },
+  ];
+  const { scheduler, events } = harness({ sessionDetail: detail });
+
+  const status = await scheduler.analyzeSession("s1", "final", { manual: true });
+
+  assert.equal(status.state, "queued");
+  assert.deepEqual(events.find(([name]) => name === "prepare")[1].segmentIds, ["seg-final"]);
 });
 
 test("checkpoint and stop triggers only enqueue an exact redacted durable cloud job", async () => {

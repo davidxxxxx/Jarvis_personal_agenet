@@ -2,9 +2,9 @@
 
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
-Current hardened source candidate: `0.2.0-rc.10` with database schema target `v60`.
+Current hardened source candidate: `0.2.0-rc.11` with database schema target `v60`.
 Its main-process regression and the retained rc.8 DOTA 2/KOOK identity reprocessing check passed on
-2026-08-08. The rc.10 Windows package, renderer/static gates, offline restart smoke, and controlled
+2026-08-08. The rc.11 Windows package, renderer/static gates, offline restart smoke, and controlled
 replacement are rerun before its tag is pushed. Three-hour endurance and a fresh physical-microphone
 recording remain separate manual acceptance gates and are never inferred from automated checks.
 
@@ -16,7 +16,7 @@ recording remain separate manual acceptance gates and are never inferred from au
 | Phase 1 complete       | `0.2.0-alpha.1` | `jarvis-v0.2.0-alpha.1` | Application-source and capture foundation |
 | Phase 2 complete       | `0.2.0-alpha.2` | `jarvis-v0.2.0-alpha.2` | Identity and activity classification      |
 | Phase 3 complete       | `0.2.0-beta.1`  | `jarvis-v0.2.0-beta.1`  | Actions and personalization               |
-| Phase 4 acceptance     | `0.2.0-rc.10`   | `jarvis-v0.2.0-rc.10`   | Packaged release candidate                |
+| Phase 4 acceptance     | `0.2.0-rc.11`   | `jarvis-v0.2.0-rc.11`   | Packaged release candidate                |
 | Final verified release | `0.2.0`         | `jarvis-v0.2.0`         | User-facing stable release                |
 
 Database versions and app versions are deliberately separate. For example, schema `v33` is an

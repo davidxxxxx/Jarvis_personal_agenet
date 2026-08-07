@@ -38,6 +38,7 @@ function eligibleSegments(detail) {
         segment.is_stable === 1 &&
         segment.superseded_by == null &&
         segment.duplicate_of == null &&
+        segment.projection_state === "visible" &&
         typeof segment.text === "string" &&
         segment.text.trim()
     )

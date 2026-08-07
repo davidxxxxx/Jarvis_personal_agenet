@@ -6471,7 +6471,10 @@ test("analysis input uses the durable participant projection to merge fragments 
         ('chunk-projected-peer', 'session-1', 'projected-peer.wav', 5100, 5200, 100,
          '${"7".repeat(64)}', 9500, 'completed', 'track-omitted', 'system', 1, 'committed'),
         ('chunk-projected-media', 'session-1', 'projected-media.wav', 5200, 5300, 100,
-         '${"8".repeat(64)}', 9500, 'completed', 'track-omitted', 'system', 2, 'committed');
+         '${"8".repeat(64)}', 9500, 'completed', 'track-omitted', 'system', 2, 'committed'),
+        ('chunk-unprojected-fragment', 'session-1', 'unprojected-fragment.wav',
+         5300, 5400, 100, '${"6".repeat(64)}', 9500, 'completed',
+         'track-omitted', 'system', 3, 'committed');
       INSERT INTO transcript_segments (
         id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
         is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
@@ -6482,7 +6485,11 @@ test("analysis input uses the durable participant projection to merge fragments 
          'chunk-projected-peer', 'system', 'final', 1, 'whisper-v1', 5200),
         ('segment-projected-media', 'session-1', 5200, 5300, NULL, 'media_fragment',
          'passive media commentary', 0.9, 1, 'pending', 'track-omitted',
-         'chunk-projected-media', 'system', 'final', 1, 'whisper-v1', 5300);
+         'chunk-projected-media', 'system', 'final', 1, 'whisper-v1', 5300),
+        ('segment-unprojected-fragment', 'session-1', 5300, 5400, NULL,
+         'unprojected_fragment', 'fragment omitted by the durable participant projection',
+         0.9, 1, 'pending', 'track-omitted', 'chunk-unprojected-fragment', 'system',
+         'final', 1, 'whisper-v1', 5400);
       INSERT INTO speaker_clusters (
         id, session_id, track_id, local_label, model_id, speech_ms, window_count,
         quality_score, person_id, link_state, created_at, updated_at
@@ -6490,10 +6497,14 @@ test("analysis input uses the durable participant projection to merge fragments 
         ('cluster-projected-peer', 'session-1', 'track-omitted', 'speaker_fragment',
          'speaker-v1', 12000, 4, 0.9, NULL, 'unknown', 5100, 5200),
         ('cluster-projected-media', 'session-1', 'track-omitted', 'media_fragment',
-         'speaker-v1', 12000, 4, 0.9, NULL, 'unknown', 5200, 5300);
+         'speaker-v1', 12000, 4, 0.9, NULL, 'unknown', 5200, 5300),
+        ('cluster-unprojected-fragment', 'session-1', 'track-omitted',
+         'unprojected_fragment', 'speaker-v1', 12000, 4, 0.9, NULL, 'unknown',
+         5300, 5400);
       INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id) VALUES
         ('cluster-projected-peer', 'segment-projected-peer'),
-        ('cluster-projected-media', 'segment-projected-media');
+        ('cluster-projected-media', 'segment-projected-media'),
+        ('cluster-unprojected-fragment', 'segment-unprojected-fragment');
       INSERT INTO session_participant_snapshots (
         id, session_id, revision, projector_version, source_hash, payload_json, created_at
       ) VALUES (
@@ -6517,6 +6528,7 @@ test("analysis input uses the durable participant projection to merge fragments 
           "segment-omitted",
           "segment-projected-peer",
           "segment-projected-media",
+          "segment-unprojected-fragment",
         ],
       })
     );

@@ -10,6 +10,14 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.11 - 2026-08-08
+
+- Keep hidden or audit-only transcript rows out of paid summary scheduling so participant
+  reprocessing can create a fresh immutable analysis input instead of failing as stale.
+- Treat the latest durable participant projection as the cloud identity boundary: projected SELF
+  and reviewed participants remain eligible, while media and unprojected diarization fragments stay
+  local and cannot leak into the MiniMax summary as invented people.
+
 ## 0.2.0-rc.10 - 2026-08-08
 
 - Suppress electron-updater's own benign `ERR_UPDATER_NO_PUBLISHED_VERSIONS` logger output while
