@@ -10,6 +10,13 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.12 - 2026-08-08
+
+- Exclude audit-only transcript projections from every Daily Review evidence section, keeping the
+  structured evidence manifest aligned with the visible transcript boundary.
+- Stop deterministic Daily Review evidence-boundary failures from retaining and repeatedly
+  reclaiming the only cloud execution slot; no MiniMax request or budget reservation is made.
+
 ## 0.2.0-rc.11 - 2026-08-08
 
 - Keep hidden or audit-only transcript rows out of paid summary scheduling so participant

@@ -1347,6 +1347,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT DISTINCT cluster.local_label AS value
          FROM active_manifest AS manifest
@@ -1402,6 +1403,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.kind, item.title, item.body
@@ -1433,6 +1435,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id, topic.id AS topic_id,
                 topic.name, revision.summary
@@ -1460,6 +1463,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id, todo.id AS todo_id,
                 todo.status, revision.title, revision.due_text
@@ -1488,6 +1492,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT conflict.id AS entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.title, item.body

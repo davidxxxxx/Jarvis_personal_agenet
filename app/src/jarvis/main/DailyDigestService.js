@@ -865,6 +865,16 @@ class DailyDigestService {
     return false;
   }
 
+  _ensureCurrentOrBlock(job, storedInput, requestId = null) {
+    try {
+      return this._ensureCurrent(job, storedInput, requestId) ? "current" : "superseded";
+    } catch (error) {
+      if (error?.code !== "DAILY_DIGEST_EVIDENCE_OUT_OF_SCOPE") throw error;
+      this._block(job.id, "daily_digest_evidence_out_of_scope");
+      return "blocked";
+    }
+  }
+
   _validateResponse(response) {
     const exceedsByteLimit =
       (Number.isSafeInteger(response?.requestBytes) &&
@@ -922,8 +932,9 @@ class DailyDigestService {
     }
     const prior = this._preparePriorAttempt(job, initial.attempts);
     if (prior.status) return prior;
-    if (!this._ensureCurrent(job, initial.input)) {
-      return { status: "superseded", jobId: job.id };
+    const initialFreshness = this._ensureCurrentOrBlock(job, initial.input);
+    if (initialFreshness !== "current") {
+      return { status: initialFreshness, jobId: job.id };
     }
     const initialDecision = this._decision(job, initial.input);
     if (!initialDecision.eligible) {
@@ -998,8 +1009,9 @@ class DailyDigestService {
       );
       throw error;
     }
-    if (!this._ensureCurrent(job, reloadedInput, requestId)) {
-      return { status: "superseded", jobId: job.id };
+    const finalFreshness = this._ensureCurrentOrBlock(job, reloadedInput, requestId);
+    if (finalFreshness !== "current") {
+      return { status: finalFreshness, jobId: job.id };
     }
     const finalDecision = this._decision(job, reloadedInput);
     if (!finalDecision.eligible) {

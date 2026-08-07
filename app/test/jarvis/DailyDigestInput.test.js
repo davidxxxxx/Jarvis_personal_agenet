@@ -480,6 +480,51 @@ test("daily evidence is a subset of one active overlapping segment manifest at m
   );
 });
 
+test("daily evidence excludes audit-only transcript projections", (t) => {
+  const { db, repository } = fixture(t);
+  const day = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });
+  seedSession(db, { id: "session-projection-boundary", startedAt: day.startsAt + 1_000 });
+  seedSegment(db, {
+    id: "visible-segment",
+    sessionId: "session-projection-boundary",
+    startedAt: day.startsAt + 2_000,
+    text: "visible daily evidence",
+    ordinal: 0,
+  });
+  seedSegment(db, {
+    id: "audit-hidden-segment",
+    sessionId: "session-projection-boundary",
+    startedAt: day.startsAt + 3_000,
+    text: "hidden media evidence",
+    ordinal: 1,
+  });
+  db.prepare(
+    "UPDATE transcript_segments SET projection_state = 'audit_hidden' WHERE id = ?"
+  ).run("audit-hidden-segment");
+  seedLegacyMemoryEvidence(db, {
+    id: "hidden-decision",
+    kind: "decision",
+    title: "Hidden media decision",
+    body: "hidden media evidence",
+    sessionId: "session-projection-boundary",
+    segmentIds: ["audit-hidden-segment"],
+    hashDigit: "8",
+  });
+
+  const result = repository.createDailyDigestInput({
+    localDate: "2026-07-17",
+    timezone: "Asia/Shanghai",
+    modelVersion: "MiniMax-M2.7",
+  });
+
+  assert.deepEqual(
+    result.inputWatermark.evidence.map((entry) => entry.segmentId),
+    ["visible-segment"]
+  );
+  assert.deepEqual(result.cloudPayload.sections.decisions, []);
+  assert.equal(result.cloudPayloadJson.includes("hidden media evidence"), false);
+});
+
 test("terminal superseded and duplicate transcript history does not make a final digest partial", (t) => {
   const { db, repository } = fixture(t);
   const { startsAt } = resolveLocalDate({ localDate: "2026-07-17", timezone: "Asia/Shanghai" });
