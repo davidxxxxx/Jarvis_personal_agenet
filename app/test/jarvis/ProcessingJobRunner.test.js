@@ -626,6 +626,38 @@ test("blocks deterministic diarization validation failures after one attempt", a
   );
 });
 
+test("blocks the exact diarization cluster-count validation failure after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v4",
+  });
+  runner.register("diarize_track", async () => {
+    throw new TypeError("diarization cluster count exceeds the validated speaker count");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_VALIDATION_FAILED",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
 test("blocks a deterministic over-64-speaker result instead of retrying forever", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, {

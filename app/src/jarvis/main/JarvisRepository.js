@@ -5304,12 +5304,15 @@ class JarvisRepository {
     if (!Array.isArray(input.clusters) || !Array.isArray(input.turns)) {
       throw new TypeError("diarization clusters and turns must be arrays");
     }
-    const voicedClusterCount = input.clusters.filter(
-      (cluster) => Number.isSafeInteger(cluster?.windowCount) && cluster.windowCount > 0
+    const identityEligibleVoicedClusterCount = input.clusters.filter(
+      (cluster) =>
+        Number.isSafeInteger(cluster?.windowCount) &&
+        cluster.windowCount > 0 &&
+        cluster.identityEligible !== false
     ).length;
     if (
       normalizedRun.speakerCountMax !== null &&
-      voicedClusterCount > normalizedRun.speakerCountMax
+      identityEligibleVoicedClusterCount > normalizedRun.speakerCountMax
     ) {
       throw new TypeError("diarization cluster count exceeds the validated speaker count");
     }

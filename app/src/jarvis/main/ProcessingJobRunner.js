@@ -20,6 +20,8 @@ const TERMINAL_DIARIZATION_ERRORS = new Set([
 ]);
 const DIARIZATION_SPEAKER_COUNT_VALIDATION =
   /^run\.speakerCount\.maximum must be between 0 and 64 or null$/;
+const DIARIZATION_CLUSTER_COUNT_VALIDATION =
+  /^diarization cluster count exceeds the validated speaker count$/;
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
@@ -64,7 +66,9 @@ function normalizeJobErrorCode(error, job) {
   } catch {
     return explicitCode;
   }
-  return typeof message === "string" && DIARIZATION_SPEAKER_COUNT_VALIDATION.test(message)
+  return typeof message === "string" &&
+    (DIARIZATION_SPEAKER_COUNT_VALIDATION.test(message) ||
+      DIARIZATION_CLUSTER_COUNT_VALIDATION.test(message))
     ? "DIARIZATION_VALIDATION_FAILED"
     : explicitCode;
 }

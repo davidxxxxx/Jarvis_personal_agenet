@@ -18,6 +18,11 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   finds speech, and exclude hidden audit text from speaker-diarization admission checks.
 - Migrate local data to schema v60 so contradictory no-speech/final-text rows no longer prevent
   microphone and logical application tracks from entering current speaker processing.
+- Validate long-recording speaker ranges against identity-eligible people while retaining
+  low-quality voiced fragments as local audit evidence, so real KOOK runs do not fail merely
+  because review-only fragments outnumber the trusted people range.
+- Stop retrying deterministic diarization cluster-count validation failures and surface them as
+  terminal local evidence errors instead of repeatedly consuming CUDA.
 
 ## 0.2.0-rc.4 - 2026-08-05
 

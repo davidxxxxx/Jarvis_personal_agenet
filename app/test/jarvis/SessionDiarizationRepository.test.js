@@ -690,6 +690,116 @@ function revisedCommitInput(repo, suffix, clusters) {
   return input;
 }
 
+function hybridCommitInput(snapshot, suffix) {
+  const input = commitInput(snapshot, suffix);
+  input.run = {
+    ...input.run,
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    diarizerModelId: HYBRID_DIARIZATION_POLICY.diarizerModelId,
+    inputVersion: 2,
+    executionDevice: "cuda",
+    pipelineMetadata: { schemaVersion: 1 },
+    speakerCount: { minimum: 2, maximum: 2, confidence: 0.94 },
+    overlapMs: 0,
+    overlapSeparationState: "not_needed",
+    modelPackVersion: HYBRID_DIARIZATION_POLICY.modelPackVersion,
+  };
+  return input;
+}
+
+test("v4 preserves voiced audit fragments outside the validated speaker count", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const input = hybridCommitInput(snapshot, "kook_audit_fragment");
+  input.clusters = [
+    {
+      ...input.clusters[0],
+      identityEligible: true,
+      qualityGateReason: null,
+    },
+    {
+      id: "speaker_cluster_kook_2",
+      localLabel: "speaker_2",
+      embedding: vector(1),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.98,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 2_900,
+    },
+    {
+      id: "speaker_cluster_kook_audit_fragment",
+      localLabel: "speaker_3",
+      embedding: vector(2),
+      speechMs: 800,
+      windowCount: 1,
+      qualityScore: 0.99,
+      identityEligible: false,
+      qualityGateReason: "insufficient_speech",
+      firstAppearanceAt: 4_000,
+    },
+  ];
+
+  assert.equal(repo.commitDiarizationRun(input).status, "completed");
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT local_label, identity_eligible, quality_gate_reason
+         FROM speaker_diarization_run_clusters
+         WHERE run_id = ?
+         ORDER BY local_label`
+      )
+      .all(input.run.id),
+    [
+      { local_label: "speaker_1", identity_eligible: 1, quality_gate_reason: null },
+      { local_label: "speaker_2", identity_eligible: 1, quality_gate_reason: null },
+      {
+        local_label: "speaker_3",
+        identity_eligible: 0,
+        quality_gate_reason: "insufficient_speech",
+      },
+    ]
+  );
+});
+
+test("v4 rejects identity-eligible clusters beyond the validated speaker count", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const input = hybridCommitInput(snapshot, "kook_invalid_speaker_count");
+  input.clusters.push(
+    {
+      id: "speaker_cluster_kook_2",
+      localLabel: "speaker_2",
+      embedding: vector(1),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.98,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 2_900,
+    },
+    {
+      id: "speaker_cluster_kook_3",
+      localLabel: "speaker_3",
+      embedding: vector(2),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.97,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 4_000,
+    }
+  );
+
+  assert.throws(
+    () => repo.commitDiarizationRun(input),
+    /diarization cluster count exceeds the validated speaker count/
+  );
+});
+
 test("word timestamps project one transcript into overlapping per-speaker utterances", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
