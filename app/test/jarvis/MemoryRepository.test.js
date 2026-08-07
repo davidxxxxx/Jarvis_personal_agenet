@@ -4072,7 +4072,7 @@ test("createAnalysisInput persists exact redacted payload and canonical v3 input
   }
 });
 
-test("reopens and reads a canonical legacy v2 analysis input under schema v58", () => {
+test("reopens and reads a canonical legacy v2 analysis input under the current schema", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-analysis-v2-reopen-"));
   const filename = path.join(directory, "memory.db");
   let db = createFixture(filename);
@@ -4155,7 +4155,7 @@ test("reopens and reads a canonical legacy v2 analysis input under schema v58", 
 
     db = new Database(filename);
     db.pragma("foreign_keys = ON");
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 59, toVersion: 59 });
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 60, toVersion: 60 });
     const repository = createRepository(db);
     assert.deepEqual(repository.getAnalysisInputForCloud("legacy-v2-input"), {
       inputHash,

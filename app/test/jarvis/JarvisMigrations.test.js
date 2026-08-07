@@ -79,6 +79,62 @@ test("clean migration creates the continuation table with foreign keys", () => {
   }
 });
 
+test("v60 hides final transcript rows contradicted by the latest no-speech state", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('no-speech-session', 10, 20, 'completed', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, strategy, sample_rate, channels,
+        started_at, ended_at, state
+      ) VALUES (
+        'no-speech-track', 'no-speech-session', 'mic', 'web-audio', 24000, 1,
+        10, 20, 'ended'
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state,
+        format, file_sha256, sample_rate, channels
+      ) VALUES (
+        'no-speech-chunk', 'no-speech-session', 'G:\\no-speech.wav', 10, 20, 10,
+        'pcm-no-speech', 999, 'no_speech', 'no-speech-track', 'mic', 0, 'committed',
+        'wav', 'file-no-speech', 24000, 1
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, chunk_id, source_type, result_kind, model_version,
+        completed_at
+      ) VALUES (
+        'stale-final', 'no-speech-session', 10, 20, 'mic', 'stale text', 0.5,
+        1, 'no-speech-track', 'no-speech-chunk', 'mic', 'final', 'turbo', 20
+      );
+      PRAGMA user_version = 59;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 200 }), {
+      fromVersion: 59,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT projection_state, projection_reason
+           FROM transcript_segments WHERE id = 'stale-final'`
+        )
+        .get(),
+      {
+        projection_state: "audit_hidden",
+        projection_reason: "latest_transcription_no_speech",
+      }
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
 test("creates dual-track evidence schema idempotently in an empty database", () => {
   const db = new Database(":memory:");
 

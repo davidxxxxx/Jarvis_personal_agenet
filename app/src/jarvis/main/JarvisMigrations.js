@@ -1,7 +1,7 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
 const { computeSessionSemanticHashes } = require("./SessionReprocessingSemantics");
 
-const TARGET_VERSION = 59;
+const TARGET_VERSION = 60;
 const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
 const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
 const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
@@ -9765,6 +9765,32 @@ function upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt) {
   }
 }
 
+function upgradeNoSpeechTranscriptProjectionV60(db) {
+  if (!tableExists(db, "transcript_segments") || !tableExists(db, "audio_chunks")) return;
+  const segmentColumns = columns(db, "transcript_segments");
+  const chunkColumns = columns(db, "audio_chunks");
+  if (
+    !segmentColumns.has("projection_state") ||
+    !segmentColumns.has("projection_reason") ||
+    !chunkColumns.has("transcription_status")
+  ) {
+    return;
+  }
+  db.prepare(
+    `UPDATE transcript_segments AS segment
+     SET projection_state = 'audit_hidden',
+         projection_reason = 'latest_transcription_no_speech'
+     WHERE segment.result_kind = 'final'
+       AND segment.projection_state = 'visible'
+       AND segment.chunk_id IS NOT NULL
+       AND EXISTS (
+         SELECT 1 FROM audio_chunks AS chunk
+         WHERE chunk.id = segment.chunk_id
+           AND chunk.transcription_status = 'no_speech'
+       )`
+  ).run();
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -10142,6 +10168,9 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       }
       if (fromVersion < 59) {
         upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt);
+      }
+      if (fromVersion < 60) {
+        upgradeNoSpeechTranscriptProjectionV60(db);
       }
 
       const violations = db.pragma("foreign_key_check");

@@ -10,6 +10,15 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.5 - 2026-08-08
+
+- Hide stale final transcript projections when the newest transcription result says the audio has
+  no speech, while retaining the old text as local audit evidence instead of deleting it.
+- Restore the same final segment, confidence, and word timestamps if a later transcription pass
+  finds speech, and exclude hidden audit text from speaker-diarization admission checks.
+- Migrate local data to schema v60 so contradictory no-speech/final-text rows no longer prevent
+  microphone and logical application tracks from entering current speaker processing.
+
 ## 0.2.0-rc.4 - 2026-08-05
 
 - Version the corrected long-recording clustering contract as hybrid diarization v4 so v3 runs

@@ -372,6 +372,79 @@ test("restart resumes a persisted pending chunk and no-speech can make it ready"
   assert.deepEqual(repository.listTranscriptSegments("s1"), []);
 });
 
+test("a newer no-speech result hides stale final text and later speech restores it", () => {
+  const repository = new JarvisRepository(":memory:");
+  try {
+    insertSession(repository);
+    insertTrack(repository);
+    insertChunk(repository);
+    const chunk = repository.getAudioChunk("chunk-mic");
+    const original = repository.commitChunkTranscript({
+      chunk,
+      result: {
+        text: "stale speech",
+        confidence: 0.7,
+        words: [{ word: "stale", startedAtMs: 0, endedAtMs: 100, probability: 0.7 }],
+      },
+      modelVersion: "large-v3-turbo",
+      completedAt: 1_000,
+    });
+
+    repository.commitChunkTranscript({
+      chunk,
+      result: { noSpeech: true },
+      modelVersion: "large-v3-turbo",
+      completedAt: 2_000,
+    });
+
+    assert.deepEqual(repository.listTranscriptSegments("s1"), []);
+    assert.deepEqual(
+      repository.db
+        .prepare(
+          `SELECT projection_state, projection_reason
+           FROM transcript_segments WHERE id = ?`
+        )
+        .get(original.id),
+      {
+        projection_state: "audit_hidden",
+        projection_reason: "latest_transcription_no_speech",
+      }
+    );
+
+    const restored = repository.commitChunkTranscript({
+      chunk,
+      result: {
+        text: "restored speech",
+        confidence: 0.95,
+        words: [{ word: "restored", startedAtMs: 10, endedAtMs: 200, probability: 0.95 }],
+      },
+      modelVersion: "large-v3-turbo",
+      completedAt: 3_000,
+    });
+
+    assert.equal(restored.id, original.id);
+    assert.equal(restored.text, "restored speech");
+    assert.equal(restored.projection_state, "visible");
+    assert.equal(restored.projection_reason, null);
+    assert.equal(repository.getAudioChunk("chunk-mic").transcription_status, "completed");
+    assert.deepEqual(repository.listTranscriptWordsForSegment(restored.id), [
+      {
+        id: repository.listTranscriptWordsForSegment(restored.id)[0].id,
+        transcript_segment_id: restored.id,
+        chunk_id: "chunk-mic",
+        ordinal: 0,
+        word: "restored",
+        started_at: chunk.started_at + 10,
+        ended_at: chunk.started_at + 200,
+        probability: 0.95,
+        created_at: 3_000,
+      },
+    ]);
+  } finally {
+    repository.close();
+  }
+});
+
 test("open sessions and every incomplete transcription job state stay non-ready", () => {
   const states = ["pending", "retry", "running", "retention_urgent", "blocked"];
   for (const state of states) {

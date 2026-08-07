@@ -1237,6 +1237,7 @@ class JarvisRepository {
       listDiarizationSegments: this.db.prepare(`
         SELECT * FROM transcript_segments
         WHERE chunk_id = ?
+          AND projection_state = 'visible'
         ORDER BY started_at, ended_at, id
       `),
       getDiarizationRun: this.db.prepare(`
@@ -2235,9 +2236,11 @@ class JarvisRepository {
       getFinalChunkTranscript: this.db.prepare(`
         SELECT * FROM transcript_segments
         WHERE chunk_id = ? AND result_kind = 'final' AND model_version = ?
+        ORDER BY completed_at DESC, id DESC
+        LIMIT 1
       `),
       insertFinalChunkTranscript: this.db.prepare(`
-        INSERT OR IGNORE INTO transcript_segments (
+        INSERT INTO transcript_segments (
           id, session_id, started_at, ended_at, person_id, speaker_label,
           text, confidence, is_stable, analysis_state, track_id, chunk_id,
           source_type, result_kind, version, model_version, completed_at
@@ -2246,6 +2249,27 @@ class JarvisRepository {
           @text, @confidence, 1, 'pending', @trackId, @chunkId,
           @sourceType, 'final', 1, @modelVersion, @completedAt
         )
+        ON CONFLICT(id) DO UPDATE SET
+          text = excluded.text,
+          confidence = excluded.confidence,
+          is_stable = 1,
+          analysis_state = 'pending',
+          completed_at = excluded.completed_at,
+          projection_state = 'visible',
+          projection_reason = NULL
+        WHERE transcript_segments.session_id = excluded.session_id
+          AND transcript_segments.track_id = excluded.track_id
+          AND transcript_segments.chunk_id = excluded.chunk_id
+          AND transcript_segments.result_kind = 'final'
+          AND transcript_segments.model_version = excluded.model_version
+      `),
+      hideChunkFinalTranscriptsForNoSpeech: this.db.prepare(`
+        UPDATE transcript_segments
+        SET projection_state = 'audit_hidden',
+            projection_reason = 'latest_transcription_no_speech'
+        WHERE chunk_id = @chunkId
+          AND result_kind = 'final'
+          AND projection_state = 'visible'
       `),
       deleteTranscriptWords: this.db.prepare(`
         DELETE FROM transcript_words WHERE transcript_segment_id = ?
@@ -2998,40 +3022,43 @@ class JarvisRepository {
         }
 
         if (result.noSpeech === true) {
+          const hidden = this.statements.hideChunkFinalTranscriptsForNoSpeech.run({
+            chunkId: current.id,
+          });
           const updated = this.statements.setChunkTranscriptionStatus.run({
             chunkId: current.id,
             status: "no_speech",
           });
           if (updated.changes !== 1) throw codedError("AUDIO_UNAVAILABLE");
+          if (hidden.changes > 0) {
+            this.statements.bumpSessionTimelineVersion.run(current.session_id);
+          }
           return null;
         }
 
-        let segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
-        if (!segment) {
-          const id = derivedId(
-            "chunk_transcript",
-            current.session_id,
-            current.track_id ?? "",
-            current.id,
-            current.sha256,
-            modelVersion
-          );
-          this.statements.insertFinalChunkTranscript.run({
-            id,
-            sessionId: current.session_id,
-            startedAt: current.started_at,
-            endedAt: current.ended_at,
-            speakerLabel: current.source_type,
-            text: result.text,
-            confidence: result.confidence,
-            trackId: current.track_id,
-            chunkId: current.id,
-            sourceType: current.source_type,
-            modelVersion,
-            completedAt,
-          });
-          segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
-        }
+        const id = derivedId(
+          "chunk_transcript",
+          current.session_id,
+          current.track_id ?? "",
+          current.id,
+          current.sha256,
+          modelVersion
+        );
+        this.statements.insertFinalChunkTranscript.run({
+          id,
+          sessionId: current.session_id,
+          startedAt: current.started_at,
+          endedAt: current.ended_at,
+          speakerLabel: current.source_type,
+          text: result.text,
+          confidence: result.confidence,
+          trackId: current.track_id,
+          chunkId: current.id,
+          sourceType: current.source_type,
+          modelVersion,
+          completedAt,
+        });
+        const segment = this.statements.getFinalChunkTranscript.get(current.id, modelVersion);
         if (!segment) throw codedError("TRANSCRIPT_COMMIT_FAILED");
         if (Array.isArray(result.words)) {
           this.statements.deleteTranscriptWords.run(segment.id);
