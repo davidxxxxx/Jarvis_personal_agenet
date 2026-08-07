@@ -10,6 +10,19 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.9 - 2026-08-08
+
+- Stop historical identity jobs from retrying every few seconds when their diarization evidence is
+  incomplete: pending dependencies now wait without consuming attempts or logging failures and wake
+  immediately when the same session's diarization lifecycle changes.
+- Treat identity dependencies as terminal when no diarization work can still satisfy them, blocking
+  once as `IDENTITY_RESOLUTION_DEPENDENCY_FAILED` instead of accumulating hundreds of retries.
+- Point automatic updates at `davidxxxxx/Jarvis_personal_agenet` and treat an empty GitHub release
+  channel as a normal “no update published yet” state rather than an application error.
+- Runtime-verify the rc.8 quality-gated identity fix on the retained DOTA 2/KOOK session: SELF stays
+  confirmed, media is separated, no KOOK voice is assigned to a named person, and participant
+  projection advances to revision 11.
+
 ## 0.2.0-rc.8 - 2026-08-08
 
 - Resolve identities only for speaker clusters that passed the durable identity-quality gate,

@@ -4969,8 +4969,20 @@ class JarvisRepository {
     assertExactIdentityResolutionPolicy(policy);
     const session = this.statements.getSession.get(safeSessionId);
     if (!session || !TERMINAL_SESSION_STATUSES.has(session.status)) {
-      return { eligible: false, reason: "session_not_terminal" };
+      return {
+        eligible: false,
+        reason: "session_not_terminal",
+        dependencyState: "pending",
+      };
     }
+    const dependencySnapshot = (reason) => ({
+      eligible: false,
+      reason,
+      dependencyState:
+        this.statements.countOpenSessionDiarizationJobs.get(safeSessionId).count > 0
+          ? "pending"
+          : "terminal",
+    });
     this.refreshLogicalApplicationTracks(safeSessionId, at);
     const candidateTracks = this.statements.listSessionIdentityTracks.all(safeSessionId);
     const chunks = this.statements.listSessionReadinessChunks.all(safeSessionId);
@@ -4991,7 +5003,7 @@ class JarvisRepository {
         qualifiedApplicationTrackIds.has(track.id) ||
         completedApplicationTrackIds.has(track.id)
     );
-    if (tracks.length === 0) return { eligible: false, reason: "no_tracks" };
+    if (tracks.length === 0) return dependencySnapshot("no_tracks");
     const evidenceRuns = [];
     const clusters = [];
     for (const track of tracks) {
@@ -5003,7 +5015,7 @@ class JarvisRepository {
         modelId: policy.modelId,
       });
       if (!run) {
-        if (primaryTrack) return { eligible: false, reason: "diarization_incomplete" };
+        if (primaryTrack) return dependencySnapshot("diarization_incomplete");
         continue;
       }
       const inputHash = buildDiarizationJobKey({
@@ -5020,7 +5032,7 @@ class JarvisRepository {
         modelVersion: diarizationPolicy.policyId,
       });
       if (!job || job.state !== "completed") {
-        if (primaryTrack) return { eligible: false, reason: "diarization_incomplete" };
+        if (primaryTrack) return dependencySnapshot("diarization_incomplete");
         continue;
       }
       const unfinished = this.statements.listIdentityDiarizationJobs
@@ -5030,10 +5042,10 @@ class JarvisRepository {
             candidate.job_sequence > job.job_sequence && candidate.state !== "completed"
         );
       if (unfinished && primaryTrack) {
-        return { eligible: false, reason: "diarization_incomplete" };
+        return dependencySnapshot("diarization_incomplete");
       }
       if (run.embedding_model_id !== policy.modelId) {
-        if (primaryTrack) return { eligible: false, reason: "diarization_model_mismatch" };
+        if (primaryTrack) return dependencySnapshot("diarization_model_mismatch");
         continue;
       }
       const runClusters = this.statements.listIdentityResolutionRunClusters.all(run.id);
@@ -5087,7 +5099,7 @@ class JarvisRepository {
       }
     }
     if (evidenceRuns.length === 0) {
-      return { eligible: false, reason: "diarization_incomplete" };
+      return dependencySnapshot("diarization_incomplete");
     }
     evidenceRuns.sort((left, right) => left.trackId.localeCompare(right.trackId));
     clusters.sort(

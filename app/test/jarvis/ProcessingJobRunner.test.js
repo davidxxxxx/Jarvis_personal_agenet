@@ -721,6 +721,117 @@ test("blocks the exact identity batch-coverage validation failure after one atte
   );
 });
 
+test("identity dependency waits do not consume attempts and wake when diarization completes", async (t) => {
+  let now = 2_000;
+  const failures = [];
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    dependencyRetryMs: 60_000,
+    log: (entry) => failures.push(entry),
+  });
+  seedJob(db, {
+    jobType: "resolve_identities",
+    priority: 45,
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+  });
+  let identityCalls = 0;
+  runner.register("resolve_identities", async () => {
+    identityCalls += 1;
+    if (identityCalls === 1) {
+      const error = new Error("IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE");
+      error.code = "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE";
+      throw error;
+    }
+    return { executionDevice: null };
+  });
+  runner.register("diarize_track", async () => ({ executionDevice: null }));
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 62_000,
+      error_code: null,
+      blocked_reason: "identity_dependency_incomplete",
+      completed_at: null,
+    }
+  );
+  assert.deepEqual(failures, []);
+  assert.equal(await runner.runOnce(), 0, "the safety retry window prevents hot polling");
+
+  seedJob(db, {
+    id: "diarization-finished",
+    jobType: "diarize_track",
+    priority: 35,
+    inputHash: "diarization-finished",
+    modelVersion: "jarvis-hybrid-diarization-v6",
+    createdAt: 200,
+  });
+  now = 3_000;
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db.prepare("SELECT state, next_retry_at FROM processing_jobs WHERE id = 'j1'").get(),
+    { state: "retry", next_retry_at: 3_000 }
+  );
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "completed",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: null,
+      blocked_reason: null,
+      completed_at: 3_000,
+    }
+  );
+});
+
+test("terminal identity dependency failure blocks after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "resolve_identities",
+    priority: 45,
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+  });
+  runner.register("resolve_identities", async () => {
+    const error = new Error("IDENTITY_RESOLUTION_DEPENDENCY_FAILED");
+    error.code = "IDENTITY_RESOLUTION_DEPENDENCY_FAILED";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
+      blocked_reason: null,
+      completed_at: 2_000,
+    }
+  );
+});
+
 test("blocks a deterministic over-64-speaker result instead of retrying forever", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, {

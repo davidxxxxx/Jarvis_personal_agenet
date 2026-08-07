@@ -733,6 +733,18 @@ class CaptureEvidenceStore {
           AND next_retry_at IS NOT NULL
           AND next_retry_at > @at
       `),
+      wakeIdentityDependencyJobs: db.prepare(`
+        UPDATE processing_jobs
+        SET next_retry_at = @at
+        WHERE lane = 'local'
+          AND session_id = @sessionId
+          AND job_type = 'resolve_identities'
+          AND state = 'retry'
+          AND completed_at IS NULL
+          AND blocked_reason = 'identity_dependency_incomplete'
+          AND next_retry_at IS NOT NULL
+          AND next_retry_at > @at
+      `),
       insertCloudJob: db.prepare(`
         INSERT OR IGNORE INTO processing_jobs (
           id, session_id, track_id, chunk_id, job_type, state, priority,
@@ -2610,6 +2622,12 @@ class CaptureEvidenceStore {
   wakeResourceDeferredJobs(at) {
     this._assertNonNegativeSafeInteger(at, "at");
     return this.statements.wakeResourceDeferredJobs.run({ at }).changes;
+  }
+
+  wakeIdentityDependencyJobs(sessionId, at) {
+    this._assertIdentifier(sessionId, "sessionId");
+    this._assertNonNegativeSafeInteger(at, "at");
+    return this.statements.wakeIdentityDependencyJobs.run({ sessionId, at }).changes;
   }
 
   renewJobLease(id, { owner, at, leaseMs }) {

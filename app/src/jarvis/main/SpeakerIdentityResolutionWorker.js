@@ -153,7 +153,15 @@ class SpeakerIdentityResolutionWorker {
       policy: this.policy,
       diarizationPolicy: this.diarizationPolicy,
     });
-    if (!snapshot.eligible) throw codedError("IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE");
+    if (!snapshot.eligible) {
+      const error = codedError(
+        snapshot.dependencyState === "terminal"
+          ? "IDENTITY_RESOLUTION_DEPENDENCY_FAILED"
+          : "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE"
+      );
+      error.dependencyReason = snapshot.reason;
+      throw error;
+    }
     if (
       snapshot.diarizationRevision !== identity.diarizationRevision ||
       snapshot.profileRevision !== identity.profileRevision

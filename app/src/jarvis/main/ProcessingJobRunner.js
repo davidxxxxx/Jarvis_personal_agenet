@@ -19,6 +19,7 @@ const TERMINAL_DIARIZATION_ERRORS = new Set([
   "DIARIZATION_SPEAKER_LIMIT_EXCEEDED",
 ]);
 const TERMINAL_IDENTITY_RESOLUTION_ERRORS = new Set([
+  "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
   "IDENTITY_RESOLUTION_VALIDATION_FAILED",
 ]);
 const DIARIZATION_SPEAKER_COUNT_VALIDATION =
@@ -153,6 +154,7 @@ class ProcessingJobRunner {
       "recordJobExecutionDevice",
       "completeJob",
       "retryJob",
+      "deferJob",
       "blockJob",
     ];
     if (!store || requiredMethods.some((method) => typeof store[method] !== "function")) {
@@ -230,6 +232,30 @@ class ProcessingJobRunner {
   wakeResourceDeferredJobs(at = this.now()) {
     if (typeof this.store.wakeResourceDeferredJobs !== "function") return 0;
     return this.store.wakeResourceDeferredJobs(at);
+  }
+
+  _wakeIdentityDependencyJobs(job, at) {
+    if (
+      job.job_type !== "diarize_track" ||
+      typeof this.store.wakeIdentityDependencyJobs !== "function"
+    ) {
+      return 0;
+    }
+    try {
+      return this.store.wakeIdentityDependencyJobs(job.session_id, at);
+    } catch (error) {
+      try {
+        this.log({
+          phase: "identity_dependency_wake_failed",
+          jobId: job.id,
+          jobType: job.job_type,
+          error,
+        });
+      } catch {
+        // Diagnostic logging must never alter the completed diarization transition.
+      }
+      return 0;
+    }
   }
 
   async _executeClaimedJob(job, { permit = null } = {}) {
@@ -368,10 +394,24 @@ class ProcessingJobRunner {
         executionDevice,
       });
       if (!completed) throw codedError("JOB_LEASE_LOST");
+      this._wakeIdentityDependencyJobs(job, this.now());
     } catch (error) {
       const errorCode = normalizeJobErrorCode(error, job);
       if (errorCode === "JOB_LEASE_LOST") throw error;
       const failedAt = this.now();
+      if (
+        job.job_type === "resolve_identities" &&
+        errorCode === "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE"
+      ) {
+        const deferred = this.store.deferJob(job.id, {
+          owner: this.owner,
+          at: failedAt,
+          nextRetryAt: Math.min(Number.MAX_SAFE_INTEGER, failedAt + this.dependencyRetryMs),
+          reason: "identity_dependency_incomplete",
+        });
+        if (!deferred) throw codedError("JOB_LEASE_LOST");
+        return 1;
+      }
       if (errorCode !== "JOB_RESOURCE_YIELD") {
         try {
           this.log({
@@ -415,6 +455,7 @@ class ProcessingJobRunner {
           errorCode,
         });
         if (!blocked) throw codedError("JOB_LEASE_LOST");
+        this._wakeIdentityDependencyJobs(job, failedAt);
         return 1;
       }
       const exponent = Math.max(0, Math.min(30, (job.attempt_count ?? 1) - 1));

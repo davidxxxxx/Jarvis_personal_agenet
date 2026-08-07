@@ -1468,7 +1468,11 @@ test("exact application coverage suppresses redundant system-mix diarization", (
       at: 122000,
       diarizationPolicy: SESSION_DIARIZATION_POLICY,
     }),
-    { eligible: false, reason: "diarization_incomplete" }
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "pending",
+    }
   );
 });
 

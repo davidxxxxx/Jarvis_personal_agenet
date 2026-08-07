@@ -1992,6 +1992,72 @@ test("worker revalidates immutable revisions and commits a complete resolution b
   await assert.rejects(() => worker.run(queued.job), { code: "IDENTITY_RESOLUTION_SUPERSEDED" });
 });
 
+test("worker distinguishes pending identity dependencies from terminal diarization failure", async (t) => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16_000 });
+  const worker = new SpeakerIdentityResolutionWorker({ repository, clock: () => 17_000 });
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, job_type, state, priority,
+         input_hash, input_version, model_version, created_at
+       ) VALUES (
+         'newer-diarization', 'session-ready', 'track-ready-0', 'diarize_track',
+         'pending', 35, ?, ?, ?, 16500
+       )`
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "session-ready",
+        trackId: "track-ready-0",
+        evidenceRevision: "b".repeat(64),
+        policyId: SESSION_DIARIZATION_POLICY.policyId,
+      }),
+      SESSION_DIARIZATION_POLICY.inputVersion,
+      SESSION_DIARIZATION_POLICY.policyId
+    );
+
+  let snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 17_000,
+  });
+  assert.deepEqual(
+    { eligible: snapshot.eligible, reason: snapshot.reason, dependencyState: snapshot.dependencyState },
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "pending",
+    }
+  );
+  await assert.rejects(() => worker.run(queued.job), {
+    code: "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE",
+  });
+
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'DIARIZATION_VALIDATION_FAILED', completed_at = 17500
+       WHERE id = 'newer-diarization'`
+    )
+    .run();
+  snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 18_000,
+  });
+  assert.deepEqual(
+    { eligible: snapshot.eligible, reason: snapshot.reason, dependencyState: snapshot.dependencyState },
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "terminal",
+    }
+  );
+  await assert.rejects(() => worker.run(queued.job), {
+    code: "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
+  });
+});
+
 test("v6 identity batches cover only eligible clusters from the selected current runs", async (t) => {
   const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
   const { repository, runIds, clusters } = seedReadyEvidence(t, { trackCount: 2 });

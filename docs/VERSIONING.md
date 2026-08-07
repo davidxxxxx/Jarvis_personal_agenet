@@ -2,14 +2,11 @@
 
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
-Current verified prerelease: `0.2.0-alpha.29` with database schema target `v47`.
-Current hardened source and packaged candidate: `0.2.0-rc.2` at
-`e0303215f8cf9a25430e851a6e1bb53e034e2776` with database schema target `v58`.
-Its candidate-specific main/renderer regression, static, Windows package, native-ABI, offline,
-restart, real v48 migration, and visible KOOK/system-mix deduplication checks passed on 2026-08-04.
-Three-hour endurance was not rerun for this candidate. It becomes the fully verified Phase 4
-candidate only after the remaining recorded physical microphone, real CUDA inference, private
-CAM++, live MiniMax, and migration-interruption acceptance gates are complete.
+Current hardened source candidate: `0.2.0-rc.9` with database schema target `v60`.
+Its main-process regression and the retained rc.8 DOTA 2/KOOK identity reprocessing check passed on
+2026-08-08. The rc.9 Windows package, renderer/static gates, offline restart smoke, and controlled
+replacement are rerun before its tag is pushed. Three-hour endurance and a fresh physical-microphone
+recording remain separate manual acceptance gates and are never inferred from automated checks.
 
 ## Version line
 
@@ -19,7 +16,7 @@ CAM++, live MiniMax, and migration-interruption acceptance gates are complete.
 | Phase 1 complete       | `0.2.0-alpha.1` | `jarvis-v0.2.0-alpha.1` | Application-source and capture foundation |
 | Phase 2 complete       | `0.2.0-alpha.2` | `jarvis-v0.2.0-alpha.2` | Identity and activity classification      |
 | Phase 3 complete       | `0.2.0-beta.1`  | `jarvis-v0.2.0-beta.1`  | Actions and personalization               |
-| Phase 4 acceptance     | `0.2.0-rc.2`    | `jarvis-v0.2.0-rc.2`    | Packaged release candidate                |
+| Phase 4 acceptance     | `0.2.0-rc.9`    | `jarvis-v0.2.0-rc.9`    | Packaged release candidate                |
 | Final verified release | `0.2.0`         | `jarvis-v0.2.0`         | User-facing stable release                |
 
 Database versions and app versions are deliberately separate. For example, schema `v33` is an
