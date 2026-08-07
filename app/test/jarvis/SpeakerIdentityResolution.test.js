@@ -1992,6 +1992,185 @@ test("worker revalidates immutable revisions and commits a complete resolution b
   await assert.rejects(() => worker.run(queued.job), { code: "IDENTITY_RESOLUTION_SUPERSEDED" });
 });
 
+test("v6 identity batches cover only eligible clusters from the selected current runs", async (t) => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const { repository, runIds, clusters } = seedReadyEvidence(t, { trackCount: 2 });
+  const runs = repository.db
+    .prepare("SELECT * FROM speaker_diarization_runs WHERE session_id = ? ORDER BY track_id")
+    .all("session-ready");
+  for (const run of runs) {
+    const inputHash = buildDiarizationJobKey({
+      sessionId: run.session_id,
+      trackId: run.track_id,
+      evidenceRevision: run.transcript_revision,
+      policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    });
+    repository.db
+      .prepare("UPDATE speaker_diarization_runs SET policy_id = ?, input_version = ? WHERE id = ?")
+      .run(HYBRID_DIARIZATION_POLICY.policyId, HYBRID_DIARIZATION_POLICY.inputVersion, run.id);
+    repository.db
+      .prepare(
+        `UPDATE processing_jobs
+         SET input_hash = ?, input_version = ?, model_version = ?
+         WHERE session_id = ? AND track_id = ? AND job_type = 'diarize_track'`
+      )
+      .run(
+        inputHash,
+        HYBRID_DIARIZATION_POLICY.inputVersion,
+        HYBRID_DIARIZATION_POLICY.policyId,
+        run.session_id,
+        run.track_id
+      );
+  }
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_clusters (
+         id, session_id, track_id, local_label, model_id, embedding,
+         speech_ms, window_count, quality_score, identity_eligible,
+         quality_gate_reason, link_state, created_at, updated_at
+       ) VALUES (?, 'session-ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 15000, 15000)`
+    )
+    .run(
+      "cluster-current-audit",
+      runs[0].track_id,
+      "speaker_audit",
+      MODEL_ID,
+      Buffer.from(vector(0.5, 0.5).buffer),
+      12_000,
+      3,
+      0.5,
+      0,
+      "low_cluster_consistency"
+    );
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_run_clusters (
+         run_id, cluster_id, local_label, embedding, speech_ms, window_count,
+         quality_score, first_appearance_at, identity_eligible, quality_gate_reason
+       ) VALUES (?, 'cluster-current-audit', 'speaker_audit', ?, 12000, 3, 0.5, 2000, 0,
+         'low_cluster_consistency')`
+    )
+    .run(runIds[0], Buffer.from(vector(0.5, 0.5).buffer));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_clusters (
+         id, session_id, track_id, local_label, model_id, embedding,
+         speech_ms, window_count, quality_score, identity_eligible,
+         quality_gate_reason, link_state, created_at, updated_at
+       ) VALUES (
+         'cluster-legacy-policy', 'session-ready', ?, 'speaker_legacy', ?, ?,
+         12000, 3, 0.9, 1, NULL, 'unknown', 15000, 15000
+       )`
+    )
+    .run(runs[0].track_id, MODEL_ID, Buffer.from(vector(0, 1).buffer));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_runs (
+         id, session_id, track_id, transcript_revision, policy_id,
+         diarizer_model_id, embedding_model_id, model_artifact_sha256,
+         embedding_dimension, sample_rate, input_version, execution_device,
+         commit_sequence, created_at, completed_at
+       ) VALUES (
+         'run-legacy-policy', 'session-ready', ?, ?, 'jarvis-hybrid-diarization-v5',
+         'legacy-hybrid', ?, ?, 512, 16000, 2, 'cuda', 99, 15000, 15000
+       )`
+    )
+    .run(runs[0].track_id, runs[0].transcript_revision, MODEL_ID, "9".repeat(64));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_run_clusters (
+         run_id, cluster_id, local_label, embedding, speech_ms, window_count,
+         quality_score, first_appearance_at, identity_eligible, quality_gate_reason
+       ) VALUES (
+         'run-legacy-policy', 'cluster-legacy-policy', 'speaker_legacy', ?,
+         12000, 3, 0.9, 1000, 1, NULL
+       )`
+    )
+    .run(Buffer.from(vector(0, 1).buffer));
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, runIds);
+  assert.deepEqual(
+    snapshot.clusters.map((cluster) => cluster.clusterId),
+    clusters.map((cluster) => cluster.clusterId)
+  );
+  const unknownResults = snapshot.clusters.map((cluster) => ({
+    evidenceRunId: cluster.evidenceRunId,
+    clusterId: cluster.clusterId,
+    candidatePersonId: null,
+    state: "unknown",
+    score: null,
+    margin: null,
+    reason: "no_candidate",
+  }));
+  const invalidBatch = {
+    sessionId: "session-ready",
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    evidenceRunIds: snapshot.evidenceRunIds,
+    at: 16_500,
+  };
+  assert.throws(
+    () =>
+      repository.applySystemSpeakerResolutions({
+        ...invalidBatch,
+        id: "resolution-missing-eligible",
+        diarizationRevision: "a".repeat(64),
+        profileRevision: "b".repeat(64),
+        results: unknownResults.slice(0, 1),
+      }),
+    /cover every evidence cluster exactly/
+  );
+  assert.throws(
+    () =>
+      repository.applySystemSpeakerResolutions({
+        ...invalidBatch,
+        id: "resolution-duplicate-eligible",
+        diarizationRevision: "c".repeat(64),
+        profileRevision: "d".repeat(64),
+        results: [unknownResults[0], unknownResults[0]],
+      }),
+    /cover every evidence cluster exactly/
+  );
+
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", {
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  const worker = new SpeakerIdentityResolutionWorker({
+    repository,
+    clock: () => 17_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  assert.deepEqual(await worker.run(queued.job), {
+    status: "completed",
+    executionDevice: "cpu",
+    resultCount: 2,
+  });
+  assert.equal((await worker.run(queued.job)).resultCount, 2);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT evidence_run_id, cluster_id
+         FROM speaker_identity_resolutions
+         WHERE actor = 'system'
+         ORDER BY evidence_run_id, cluster_id`
+      )
+      .all(),
+    clusters
+      .map((cluster) => ({ evidence_run_id: cluster.runId, cluster_id: cluster.clusterId }))
+      .sort(
+        (left, right) =>
+          left.evidence_run_id.localeCompare(right.evidence_run_id) ||
+          left.cluster_id.localeCompare(right.cluster_id)
+      )
+  );
+});
+
 test("identity worker renews deterministically and yields after every fixed cluster batch", async () => {
   const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
   const identity = {

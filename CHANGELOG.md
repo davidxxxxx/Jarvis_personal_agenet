@@ -10,6 +10,15 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.8 - 2026-08-08
+
+- Resolve identities only for speaker clusters that passed the durable identity-quality gate,
+  while retaining all rejected fragments as local audit evidence.
+- Stop retrying a deterministic identity-batch coverage invariant forever; surface it as a
+  terminal identity validation failure while ordinary transient identity errors still back off.
+- Add a v6 multi-track regression covering current-policy selection, legacy-policy exclusion,
+  audit fragments, missing or duplicate eligible evidence, and idempotent retries.
+
 ## 0.2.0-rc.7 - 2026-08-08
 
 - Namespace durable overlap-separation audio paths by diarization policy, so retained KOOK audio

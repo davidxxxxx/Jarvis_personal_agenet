@@ -18,10 +18,15 @@ const TERMINAL_DIARIZATION_ERRORS = new Set([
   "DIARIZATION_VALIDATION_FAILED",
   "DIARIZATION_SPEAKER_LIMIT_EXCEEDED",
 ]);
+const TERMINAL_IDENTITY_RESOLUTION_ERRORS = new Set([
+  "IDENTITY_RESOLUTION_VALIDATION_FAILED",
+]);
 const DIARIZATION_SPEAKER_COUNT_VALIDATION =
   /^run\.speakerCount\.maximum must be between 0 and 64 or null$/;
 const DIARIZATION_CLUSTER_COUNT_VALIDATION =
   /^diarization cluster count exceeds the validated speaker count$/;
+const IDENTITY_RESOLUTION_BATCH_COVERAGE_VALIDATION =
+  /^identity resolution batch must cover every evidence cluster exactly$/;
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
@@ -57,20 +62,29 @@ function normalizeErrorCode(error) {
 
 function normalizeJobErrorCode(error, job) {
   const explicitCode = normalizeErrorCode(error);
-  if (explicitCode !== "JOB_FAILED" || job?.job_type !== "diarize_track") {
-    return explicitCode;
-  }
+  if (explicitCode !== "JOB_FAILED") return explicitCode;
   let message;
   try {
     message = error?.message;
   } catch {
     return explicitCode;
   }
-  return typeof message === "string" &&
+  if (
+    job?.job_type === "diarize_track" &&
+    typeof message === "string" &&
     (DIARIZATION_SPEAKER_COUNT_VALIDATION.test(message) ||
       DIARIZATION_CLUSTER_COUNT_VALIDATION.test(message))
-    ? "DIARIZATION_VALIDATION_FAILED"
-    : explicitCode;
+  ) {
+    return "DIARIZATION_VALIDATION_FAILED";
+  }
+  if (
+    job?.job_type === "resolve_identities" &&
+    typeof message === "string" &&
+    IDENTITY_RESOLUTION_BATCH_COVERAGE_VALIDATION.test(message)
+  ) {
+    return "IDENTITY_RESOLUTION_VALIDATION_FAILED";
+  }
+  return explicitCode;
 }
 
 function codedError(code) {
@@ -391,7 +405,9 @@ class ProcessingJobRunner {
       if (
         terminalObsoleteJob ||
         TERMINAL_DATABASE_ERRORS.has(errorCode) ||
-        (job.job_type === "diarize_track" && TERMINAL_DIARIZATION_ERRORS.has(errorCode))
+        (job.job_type === "diarize_track" && TERMINAL_DIARIZATION_ERRORS.has(errorCode)) ||
+        (job.job_type === "resolve_identities" &&
+          TERMINAL_IDENTITY_RESOLUTION_ERRORS.has(errorCode))
       ) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,

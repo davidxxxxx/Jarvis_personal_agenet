@@ -466,6 +466,7 @@ class SpeakerIdentityRepository {
         FROM speaker_diarization_runs AS run
         JOIN speaker_diarization_run_clusters AS run_cluster ON run_cluster.run_id = run.id
         WHERE run.session_id = ?
+          AND run_cluster.identity_eligible = 1
         ORDER BY run.id, run_cluster.cluster_id
       `),
       getResolutionRun: db.prepare(`
