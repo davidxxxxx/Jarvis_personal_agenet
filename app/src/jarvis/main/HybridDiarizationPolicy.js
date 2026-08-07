@@ -5,7 +5,7 @@ const HYBRID_DIARIZATION_POLICY = Object.freeze({
   // of the durable job identity, so reusing it would make an older v2 run look
   // current even though it was produced before logical-track/global-clustering
   // fixes were introduced.
-  policyId: "jarvis-hybrid-diarization-v4",
+  policyId: "jarvis-hybrid-diarization-v5",
   diarizerModelId: "pyannote-community-1+sherpa-campplus-verifier+mossformer2-ss-16k",
   embeddingModelId: "3dspeaker-campplus-voxceleb-16k-v1",
   embeddingDimension: 512,

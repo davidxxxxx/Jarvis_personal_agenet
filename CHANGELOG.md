@@ -10,6 +10,14 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.6 - 2026-08-08
+
+- Version overlap-aware speaker processing as hybrid diarization v5 so sessions blocked by an
+  rc.5 overlap-evidence commit failure are automatically reprocessed from their durable audio.
+- Include the diarization policy in deterministic separated-stem turn and overlap-evidence IDs,
+  preventing a newer policy from reusing v3 or v4 SQLite primary keys while preserving restart
+  idempotency within the same policy.
+
 ## 0.2.0-rc.5 - 2026-08-08
 
 - Hide stale final transcript projections when the newest transcription result says the audio has

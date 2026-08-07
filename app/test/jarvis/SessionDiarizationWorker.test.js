@@ -1654,6 +1654,26 @@ test("v2 worker embeds and transcribes every separated stem with a cannot-merge 
   );
   assert.equal(committed.clusters.length, 2);
   assert.equal(committed.turns.length, 2);
+  const legacyStemTurnId = `speaker_stem_turn_${crypto
+    .createHash("sha256")
+    .update([snapshot.evidenceRevision, "chunk-1", "0", "0"].join("\0"))
+    .digest("hex")
+    .slice(0, 32)}`;
+  const legacyStemEvidenceId = `overlap_stem_${crypto
+    .createHash("sha256")
+    .update([snapshot.evidenceRevision, "chunk-1", "0", "0"].join("\0"))
+    .digest("hex")
+    .slice(0, 32)}`;
+  assert.notEqual(
+    committed.turns[0].id,
+    legacyStemTurnId,
+    "hybrid reprocessing must not reuse a prior-policy overlap-turn primary key"
+  );
+  assert.notEqual(
+    committed.overlapStems[0].id,
+    legacyStemEvidenceId,
+    "hybrid reprocessing must not reuse a prior-policy overlap-evidence primary key"
+  );
   assert.deepEqual(committed.cannotLinks, [
     {
       leftClusterId: committed.clusters[0].id,

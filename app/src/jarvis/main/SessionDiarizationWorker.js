@@ -899,6 +899,7 @@ class SessionDiarizationWorker {
           id: deterministicId(
             "speaker_stem_turn",
             identity.evidenceRevision,
+            identity.policyId,
             stem.chunk.id,
             String(stem.windowIndex),
             String(stem.stemIndex)
@@ -933,6 +934,7 @@ class SessionDiarizationWorker {
           id: deterministicId(
             "overlap_stem",
             identity.evidenceRevision,
+            identity.policyId,
             stem.chunk.id,
             String(stem.windowIndex),
             String(stem.stemIndex)

@@ -10,7 +10,7 @@ test("package exposes the Task 1 Jarvis contract", () => {
 
   assert.equal(pkg.name, "jarvis-memory-assistant");
   assert.equal(pkg.productName, "Jarvis Memory");
-  assert.equal(pkg.version, "0.2.0-rc.5");
+  assert.equal(pkg.version, "0.2.0-rc.6");
   assert.equal(pkg.description, "Local-first Windows conversation memory assistant");
   assert.equal(pkg.engines.node, ">=24");
   assert.equal(pkg.scripts["test:main"], "node scripts/run-jarvis-main-tests.js");
