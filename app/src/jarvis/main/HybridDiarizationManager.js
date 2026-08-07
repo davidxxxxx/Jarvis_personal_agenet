@@ -211,13 +211,20 @@ class HybridDiarizationManager {
       );
     }
     const selectedGpuUuid = executionContext.selectedGpuUuid ?? null;
-    const safeArtifactKey =
+    const rawArtifactKey =
       artifactKey === null
         ? `overlap_${crypto.createHash("sha256").update(path.resolve(wavPath)).digest("hex").slice(0, 32)}`
         : artifactKey;
-    if (typeof safeArtifactKey !== "string" || !/^[A-Za-z0-9_-]{1,180}$/.test(safeArtifactKey)) {
+    if (typeof rawArtifactKey !== "string" || !/^[A-Za-z0-9_-]{1,180}$/.test(rawArtifactKey)) {
       throw new TypeError("overlap artifactKey must be a safe identifier");
     }
+    // Sidecar output paths are durable database evidence. A stable chunk key is
+    // intentionally reused by retries within one policy, but it must not reuse
+    // the same UNIQUE path after a newer policy reprocesses the retained audio.
+    const safeArtifactKey = `stem_${crypto
+      .createHash("sha256")
+      .update(`${this.policy.policyId}\0${rawArtifactKey}`)
+      .digest("hex")}`;
     if (
       this.modelRuntime.status().loaded &&
       this.loadedGpuUuid !== null &&

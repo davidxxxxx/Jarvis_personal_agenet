@@ -8,7 +8,7 @@ const {
 const OnDemandModelRuntime = require("../../src/jarvis/main/OnDemandModelRuntime");
 
 test("hybrid policy pins the approved GPU-idle pipeline and five minute unload", () => {
-  assert.equal(HYBRID_DIARIZATION_POLICY.policyId, "jarvis-hybrid-diarization-v5");
+  assert.equal(HYBRID_DIARIZATION_POLICY.policyId, "jarvis-hybrid-diarization-v6");
   assert.equal(HYBRID_DIARIZATION_POLICY.clusterMemberAgreementRatio, 0.75);
   assert.equal(HYBRID_DIARIZATION_POLICY.executionDevice, "cuda");
   assert.equal(HYBRID_DIARIZATION_POLICY.unloadDelayMs, 300_000);

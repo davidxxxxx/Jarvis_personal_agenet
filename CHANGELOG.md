@@ -10,6 +10,13 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.7 - 2026-08-08
+
+- Namespace durable overlap-separation audio paths by diarization policy, so retained KOOK audio
+  can be reprocessed without colliding with the UNIQUE path of v3 stem evidence.
+- Version the corrected artifact lifecycle as hybrid diarization v6, automatically replacing the
+  terminal rc.6 KOOK task while preserving stable paths for retries within the same policy.
+
 ## 0.2.0-rc.6 - 2026-08-08
 
 - Version overlap-aware speaker processing as hybrid diarization v5 so sessions blocked by an

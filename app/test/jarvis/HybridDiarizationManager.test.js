@@ -4,6 +4,9 @@ const { PassThrough } = require("node:stream");
 const test = require("node:test");
 const DiarizationSidecarClient = require("../../src/jarvis/main/DiarizationSidecarClient");
 const HybridDiarizationManager = require("../../src/jarvis/main/HybridDiarizationManager");
+const {
+  HYBRID_DIARIZATION_POLICY,
+} = require("../../src/jarvis/main/HybridDiarizationPolicy");
 
 function runtime(result) {
   return {
@@ -125,6 +128,50 @@ test("hybrid manager can disable the high-memory overlap separator per track", a
   assert.equal(requestPayload.enableOverlapSeparation, false);
   assert.equal(requestPayload.releaseOverlapSeparatorAfterRequest, true);
   assert.equal(turns.metadata.overlapSeparation.reason, "policy_disabled");
+});
+
+test("hybrid manager namespaces stable overlap artifact paths by diarization policy", async () => {
+  const artifactKeys = [];
+  const makeManager = (policyId) =>
+    new HybridDiarizationManager({
+      packRoot: "G:\\JarvisData\\models\\ai-model-pack",
+      policy: Object.freeze({ ...HYBRID_DIARIZATION_POLICY, policyId }),
+      runtime: {
+        async run(operation) {
+          return operation({
+            request: async (_command, payload) => {
+              artifactKeys.push(payload.artifactKey);
+              return {
+                durationMs: 1_000,
+                turns: [{ speaker: "S1", startMs: 0, endMs: 1_000 }],
+                verifierCount: 1,
+                overlapSeparation: { state: "not_needed", processed: 0, total: 0, stems: [] },
+              };
+            },
+          });
+        },
+        status() {
+          return { loaded: true, loading: false, active: 0, unloadScheduled: true };
+        },
+        async dispose() {},
+      },
+      fsImpl: { existsSync: () => true },
+    });
+
+  const v5 = makeManager("jarvis-hybrid-diarization-v5");
+  const v6 = makeManager("jarvis-hybrid-diarization-v6");
+  const input = {
+    executionContext: { device: "cuda", selectedGpuUuid: "GPU-1" },
+    artifactKey: "stem_same_session_and_chunk",
+  };
+
+  await v5.diarizeStrict("G:\\recording.wav", input);
+  await v5.diarizeStrict("G:\\recording.wav", input);
+  await v6.diarizeStrict("G:\\recording.wav", input);
+
+  assert.match(artifactKeys[0], /^stem_[0-9a-f]{64}$/u);
+  assert.equal(artifactKeys[1], artifactKeys[0], "same-policy retries must reuse one path");
+  assert.notEqual(artifactKeys[2], artifactKeys[0], "new policies require a distinct path");
 });
 
 test("hybrid manager rejects malformed sidecar turns before persistence", async () => {

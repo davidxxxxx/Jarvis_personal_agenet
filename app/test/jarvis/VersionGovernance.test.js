@@ -11,12 +11,12 @@ const {
 const repoRoot = path.resolve(__dirname, "../../..");
 
 test("current Jarvis package, lockfile, changelog, and tag are consistent", () => {
-  const result = readVersionState(repoRoot, "jarvis-v0.2.0-rc.6");
+  const result = readVersionState(repoRoot, "jarvis-v0.2.0-rc.7");
 
   assert.deepEqual(result, {
     ok: true,
-    version: "0.2.0-rc.6",
-    expectedTag: "jarvis-v0.2.0-rc.6",
+    version: "0.2.0-rc.7",
+    expectedTag: "jarvis-v0.2.0-rc.7",
     prerelease: true,
     errors: [],
   });
