@@ -4,6 +4,10 @@ function safeReason(reason) {
     : "application_capture_unavailable";
 }
 
+function safeFailureCode(code) {
+  return typeof code === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(code) ? code : null;
+}
+
 function createApplicationAudioStatus({
   running,
   configuredLimit,
@@ -18,6 +22,7 @@ function createApplicationAudioStatus({
     effectiveLimit,
     fullscreen: fullscreen === true,
     activeTracks: [...activeTracks.values()]
+      .filter((track) => track.registered === true)
       .map((track) => ({
         applicationKey: track.applicationKey,
         applicationDisplayName: track.applicationDisplayName,
@@ -30,6 +35,7 @@ function createApplicationAudioStatus({
         applicationKey: fallback.applicationKey,
         applicationDisplayName: fallback.applicationDisplayName,
         reason: safeReason(fallback.reason),
+        failureCode: safeFailureCode(fallback.failureCode),
         retryAt: fallback.retryAt,
         state: "mixed_unknown",
       }))

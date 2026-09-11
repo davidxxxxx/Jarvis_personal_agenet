@@ -73,10 +73,10 @@ export default function MiniMaxAgentSettingsCard() {
           reserved: dollars(budget.reservedMicrousd),
         })
       : t("jarvis.miniMaxAgent.usageSummary", {
-        spent: dollars(budget.spentMicrousd),
-        reserved: dollars(budget.reservedMicrousd),
+          spent: dollars(budget.spentMicrousd),
+          reserved: dollars(budget.reservedMicrousd),
           remaining: dollars(budget.remainingMicrousd ?? 0),
-      })
+        })
     : "";
   const usedPercent = useMemo(() => {
     if (!budget || budget.mode !== "capped" || budget.monthlyLimitMicrousd === 0) return 0;
@@ -93,13 +93,22 @@ export default function MiniMaxAgentSettingsCard() {
       ? t("jarvis.miniMaxAgent.disabled")
       : budget.mode === "unlimited"
         ? t("jarvis.miniMaxAgent.unlimitedWarning")
-      : budget.blockedReason === "usage_unknown"
-        ? t("jarvis.miniMaxAgent.usageUnknown")
-        : budget.blockedReason === "over_limit"
-          ? t("jarvis.miniMaxAgent.overLimit")
-          : budget.blockedReason === "budget_exceeded"
-            ? t("jarvis.miniMaxAgent.budgetExceeded")
-            : null
+        : budget.blockedReason === "usage_unknown"
+          ? t("jarvis.miniMaxAgent.usageUnknown")
+          : budget.blockedReason === "over_limit"
+            ? t("jarvis.miniMaxAgent.overLimit")
+            : budget.blockedReason === "budget_exceeded"
+              ? t("jarvis.miniMaxAgent.budgetExceeded")
+              : null
+    : null;
+  const modelAvailability = config?.keyConfigured
+    ? config.fallbackUsed
+      ? t("jarvis.miniMaxAgent.modelFallback", { model: config.model })
+      : config.modelStatus === "ready"
+        ? t("jarvis.miniMaxAgent.modelReady")
+        : config.modelStatus === "model_unavailable"
+          ? t("jarvis.miniMaxAgent.modelUnavailable", { model: config.model })
+          : t("jarvis.miniMaxAgent.modelCheckUnavailable")
     : null;
 
   const saveKey = async () => {
@@ -144,13 +153,13 @@ export default function MiniMaxAgentSettingsCard() {
     if (busy || !budget) return;
     const parsed = Number(limitDollars);
     const parsedLimitMicrousd = Math.round(parsed * 1_000_000);
-    if (budgetMode === "capped" &&
-      (
-      !Number.isFinite(parsed) ||
-      parsed < 0 ||
+    if (
+      budgetMode === "capped" &&
+      (!Number.isFinite(parsed) ||
+        parsed < 0 ||
         parsed > 1_000_000 ||
-        !Number.isSafeInteger(parsedLimitMicrousd)
-      )) {
+        !Number.isSafeInteger(parsedLimitMicrousd))
+    ) {
       setMessage(null);
       setInvalidBudget(true);
       return;
@@ -242,6 +251,11 @@ export default function MiniMaxAgentSettingsCard() {
         {config && (
           <p className="text-[11px] text-muted-foreground">
             {t("jarvis.miniMaxAgent.model", { model: config.model })}
+          </p>
+        )}
+        {modelAvailability && (
+          <p role="status" className="text-[11px] text-muted-foreground">
+            {modelAvailability}
           </p>
         )}
         <label className="sr-only" htmlFor="jarvis-minimax-key">

@@ -10,6 +10,9 @@ const {
   createElectronNativeRebuildInvocation,
   createNodeNativeRestoreInvocation,
   createUnsignedBuilderInvocation,
+  createWindowsModelBundleInvocation,
+  parseCliArgs,
+  resolvePackageOutputDirectory,
   verifyNativeAbi,
 } = require("../../scripts/build-windows");
 
@@ -21,7 +24,6 @@ function successfulAuthenticodeResult() {
     status: 0,
     stdout: JSON.stringify([
       { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
-      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
     ]),
   };
 }
@@ -71,8 +73,97 @@ test("directory-only Windows packaging adds --dir without changing the trusted b
     "--win",
     "--config",
     path.join(appRoot, "electron-builder.unsigned-win.json"),
+    `--config.directories.output=${path.join(appRoot, "dist")}`,
     "--dir",
   ]);
+});
+
+test("model component preparation and publication use trusted Node entry points", () => {
+  const distRoot = path.join(appRoot, "release-output");
+  const prepare = createWindowsModelBundleInvocation({ appRoot });
+  const publish = createWindowsModelBundleInvocation({ appRoot, publishOnly: true, distRoot });
+
+  assert.equal(prepare.command, process.execPath);
+  assert.deepEqual(prepare.args, [path.join(appRoot, "scripts", "build-windows-model-bundle.js")]);
+  assert.deepEqual(publish.args, [
+    path.join(appRoot, "scripts", "build-windows-model-bundle.js"),
+    "--publish-only",
+    "--dist-root",
+    distRoot,
+  ]);
+  assert.equal(prepare.options.shell, false);
+  assert.throws(
+    () => createWindowsModelBundleInvocation({ appRoot, distRoot }),
+    /requires publish-only mode/i
+  );
+});
+
+test("release output CLI accepts one explicit directory and rejects ambiguous arguments", () => {
+  const outputDir = path.join(appRoot, "release-output");
+
+  assert.deepEqual(parseCliArgs(["--output-dir", outputDir]), {
+    dirOnly: false,
+    outputDir,
+  });
+  assert.deepEqual(parseCliArgs(["--dir", `--output-dir=${outputDir}`]), {
+    dirOnly: true,
+    outputDir,
+  });
+  assert.throws(() => parseCliArgs(["--output-dir"]), /requires a value/i);
+  assert.throws(
+    () => parseCliArgs(["--output-dir", outputDir, "--output-dir", outputDir]),
+    /only be provided once/i
+  );
+  assert.throws(() => parseCliArgs(["--unknown"]), /unsupported Windows build argument/i);
+});
+
+test("explicit release output must be absolute, off the system drive, and absent", () => {
+  const outputDir = path.resolve(appRoot, "..", "release-output-never-created");
+  const missingFs = { existsSync: () => false };
+
+  assert.equal(
+    resolvePackageOutputDirectory(outputDir, {
+      fsImpl: missingFs,
+      platform: process.platform,
+      systemDrive: "C:",
+    }),
+    outputDir
+  );
+  assert.throws(
+    () =>
+      resolvePackageOutputDirectory("relative-output", {
+        fsImpl: missingFs,
+        platform: process.platform,
+      }),
+    /must be absolute/i
+  );
+  assert.throws(
+    () =>
+      resolvePackageOutputDirectory(String.raw`C:\Jarvis\releases\0.2.0-rc.1`, {
+        fsImpl: missingFs,
+        platform: "win32",
+        systemDrive: "C:",
+      }),
+    /system drive/i
+  );
+  assert.throws(
+    () =>
+      resolvePackageOutputDirectory(outputDir, {
+        fsImpl: { existsSync: () => true },
+        platform: process.platform,
+        systemDrive: "C:",
+      }),
+    /must not already exist/i
+  );
+  assert.throws(
+    () =>
+      resolvePackageOutputDirectory("G:\\", {
+        fsImpl: missingFs,
+        platform: "win32",
+        systemDrive: "C:",
+      }),
+    /volume root/i
+  );
 });
 
 test("unsigned artifact verification retries a transient Windows signature result", () => {
@@ -99,7 +190,6 @@ test("unsigned artifact verification retries a transient Windows signature resul
           status: 0,
           stdout: JSON.stringify([
             { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "UnknownError" },
-            { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
           ]),
         };
       }
@@ -211,11 +301,20 @@ test("native verifier executes SELECT 1 through the real current Node runtime", 
 
 test("unsigned build enforces native rebuild, runtime smokes, scans, and Node restore order", () => {
   const order = [];
+  const outputDir = path.resolve(appRoot, "..", "release-output-never-created");
+  const observedArtifactRoots = [];
   const spawnSyncImpl = (command, args) => {
     if (args.includes("--runtime") && args.includes("electron")) order.push("electron-prebuild");
     else if (args.includes("--runtime") && args.includes("node")) order.push("node-restore");
-    else if (args.includes("--win")) order.push("builder");
-    else {
+    else if (args.includes("--win")) {
+      assert.equal(args.includes(`--config.directories.output=${outputDir}`), true);
+      order.push("builder");
+    } else if (args[0]?.endsWith("build-windows-model-bundle.js")) {
+      if (args.includes("--publish-only")) {
+        assert.deepEqual(args.slice(-2), ["--dist-root", outputDir]);
+      }
+      order.push(args.includes("--publish-only") ? "model-publish" : "model-prepare");
+    } else {
       order.push("auth-spawn");
       return successfulAuthenticodeResult();
     }
@@ -224,33 +323,47 @@ test("unsigned build enforces native rebuild, runtime smokes, scans, and Node re
 
   buildUnsignedWindows({
     appRoot,
+    outputDir,
+    outputFsImpl: { existsSync: () => false },
     platform: "win32",
     systemRoot: String.raw`C:\Windows`,
     spawnSyncImpl,
     assertSafeBuilderConfigImpl: () => order.push("setup"),
-    verifyNativeAbiImpl: ({ label }) => {
+    verifyNativeAbiImpl: ({ label, runtimePath }) => {
       order.push(label);
+      if (label === "packaged-electron") {
+        assert.equal(runtimePath, path.join(outputDir, "win-unpacked", "Jarvis Memory.exe"));
+      }
       return {
         ok: true,
         abi: label === "source-node" ? process.versions.modules : "145",
         value: 1,
       };
     },
-    assertSafeArtifactTreeImpl: () => order.push("package-scan"),
-    assertUnsignedWindowsArtifactsImpl: () => order.push("auth-scan"),
+    assertSafeArtifactTreeImpl: (artifactRoot) => {
+      order.push("package-scan");
+      observedArtifactRoots.push(artifactRoot);
+    },
+    assertUnsignedWindowsArtifactsImpl: ({ artifactRoot }) => {
+      order.push("auth-scan");
+      observedArtifactRoots.push(artifactRoot);
+    },
   });
 
   assert.deepEqual(order, [
     "setup",
+    "model-prepare",
     "electron-prebuild",
     "source-electron",
     "builder",
     "packaged-electron",
+    "model-publish",
     "package-scan",
     "auth-scan",
     "node-restore",
     "source-node",
   ]);
+  assert.deepEqual(observedArtifactRoots, [outputDir, outputDir]);
 });
 
 test("directory-only build still verifies ABI and scans package but skips installer signature checks", () => {
@@ -272,7 +385,11 @@ test("directory-only build still verifies ABI and scans package but skips instal
     assertSafeBuilderConfigImpl: () => order.push("setup"),
     verifyNativeAbiImpl: ({ label }) => {
       order.push(label);
-      return { ok: true, abi: label === "source-node" ? process.versions.modules : "145", value: 1 };
+      return {
+        ok: true,
+        abi: label === "source-node" ? process.versions.modules : "145",
+        value: 1,
+      };
     },
     assertSafeArtifactTreeImpl: () => order.push("package-scan"),
     assertUnsignedWindowsArtifactsImpl: () => order.push("auth-scan"),
@@ -305,10 +422,11 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
               order.push("electron-prebuild");
             } else if (args.includes("--runtime") && args.includes("node")) {
               order.push("node-restore");
-            }
-            else if (args.includes("--win")) {
+            } else if (args.includes("--win")) {
               order.push("builder");
               return { status: 17, stdout: "" };
+            } else if (args[0]?.endsWith("build-windows-model-bundle.js")) {
+              order.push("model-prepare");
             }
             return { status: 0, stdout: "" };
           },
@@ -328,6 +446,7 @@ test("unsigned build restores and verifies Node ABI after a builder failure", ()
     );
     assert.deepEqual(order, [
       "setup",
+      "model-prepare",
       "electron-prebuild",
       "source-electron",
       "builder",

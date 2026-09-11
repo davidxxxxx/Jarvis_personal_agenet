@@ -1,6 +1,10 @@
 const { canonicalTupleHash, canonicalizeText } = require("./MemoryMerger");
+const { computeSessionSemanticHashes } = require("./SessionReprocessingSemantics");
 
-const TARGET_VERSION = 34;
+const TARGET_VERSION = 60;
+const LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 3_000;
+const V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS = 15_000;
+const MIN_APPLICATION_DIARIZATION_AUDIO_MS = 60_000;
 const FLAC_ENCODER_VERSION = "ffmpeg-flac-v1";
 
 const PHASE2_INTELLIGENCE_SCHEMA = `
@@ -160,6 +164,13 @@ function audioTracksV32Schema(tableName, { ifNotExists = false } = {}) {
       started_at INTEGER NOT NULL,
       ended_at INTEGER,
       state TEXT NOT NULL,
+      failure_code TEXT CHECK(
+        failure_code IS NULL OR (
+          typeof(failure_code) = 'text'
+          AND length(failure_code) BETWEEN 1 AND 128
+          AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+        )
+      ),
       CHECK(
         (application_key IS NULL AND application_display_name IS NULL)
         OR (
@@ -187,7 +198,7 @@ const APPLICATION_AUDIO_TRACK_INDEXES = `
     ON audio_tracks(session_id)
     WHERE track_kind = 'system_mix';
   CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_tracks_session_application
-    ON audio_tracks(session_id, application_key)
+    ON audio_tracks(session_id, application_key, capture_generation)
     WHERE track_kind = 'application';
   CREATE INDEX IF NOT EXISTS idx_audio_tracks_session_kind_started
     ON audio_tracks(session_id, track_kind, started_at, id);
@@ -214,6 +225,13 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
     reason TEXT,
+    failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    ),
     created_at INTEGER NOT NULL,
     CHECK(ended_at IS NULL OR ended_at > started_at),
     CHECK(reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 128)
@@ -225,6 +243,10 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_application_time
     ON application_audio_intervals(application_key, started_at, id)
     WHERE application_key IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_recovery
+    ON application_audio_intervals(
+      session_id, capture_generation, ended_at, attribution_state
+    );
 
   CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_insert
   BEFORE INSERT ON application_audio_intervals
@@ -243,6 +265,7 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
             AND track.track_kind = 'application'
             AND track.application_key = NEW.application_key
             AND NEW.reason IS NULL
+            AND NEW.failure_code IS NULL
           )
           OR (
             NEW.interval_kind = 'mixed_fallback'
@@ -257,7 +280,8 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
 
   CREATE TRIGGER IF NOT EXISTS validate_application_audio_interval_update
   BEFORE UPDATE OF session_id, track_id, interval_kind, application_key,
-                   attribution_state, capture_generation, started_at, ended_at, reason
+                   attribution_state, capture_generation, started_at, ended_at,
+                   reason, failure_code
   ON application_audio_intervals
   BEGIN
     SELECT RAISE(ABORT, 'invalid application audio interval')
@@ -274,6 +298,7 @@ const APPLICATION_AUDIO_INTERVALS_SCHEMA = `
             AND track.track_kind = 'application'
             AND track.application_key = NEW.application_key
             AND NEW.reason IS NULL
+            AND NEW.failure_code IS NULL
           )
           OR (
             NEW.interval_kind = 'mixed_fallback'
@@ -950,11 +975,30 @@ const SESSION_DIARIZATION_SCHEMA = `
     ),
     embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
     sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
-    input_version INTEGER NOT NULL CHECK(input_version = 1),
-    execution_device TEXT NOT NULL CHECK(execution_device = 'cpu'),
+    input_version INTEGER NOT NULL CHECK(input_version IN (1,2)),
+    execution_device TEXT NOT NULL CHECK(execution_device IN ('cpu','cuda')),
+    pipeline_metadata_json TEXT NOT NULL DEFAULT '{}'
+      CHECK(json_valid(pipeline_metadata_json) AND json_type(pipeline_metadata_json) = 'object'),
+    speaker_count_min INTEGER CHECK(speaker_count_min IS NULL OR speaker_count_min BETWEEN 0 AND 64),
+    speaker_count_max INTEGER CHECK(speaker_count_max IS NULL OR speaker_count_max BETWEEN 0 AND 64),
+    speaker_count_confidence REAL CHECK(
+      speaker_count_confidence IS NULL OR (
+        typeof(speaker_count_confidence) IN ('integer','real')
+        AND speaker_count_confidence BETWEEN 0 AND 1
+      )
+    ),
+    overlap_ms INTEGER NOT NULL DEFAULT 0 CHECK(overlap_ms >= 0),
+    overlap_separation_state TEXT NOT NULL DEFAULT 'not_needed'
+      CHECK(overlap_separation_state IN ('not_needed','completed','partial','failed')),
+    model_pack_version TEXT,
     commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
     created_at INTEGER NOT NULL,
     completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+    CHECK(
+      (speaker_count_min IS NULL AND speaker_count_max IS NULL) OR
+      (speaker_count_min IS NOT NULL AND speaker_count_max IS NOT NULL
+       AND speaker_count_min <= speaker_count_max)
+    ),
     UNIQUE(session_id, track_id, transcript_revision, policy_id)
   );
   CREATE TABLE IF NOT EXISTS speaker_diarization_run_clusters (
@@ -962,7 +1006,13 @@ const SESSION_DIARIZATION_SCHEMA = `
     cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
     local_label TEXT NOT NULL,
     embedding BLOB CHECK(
-      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      embedding IS NULL OR (
+        typeof(embedding) = 'blob' AND (
+          length(embedding) = 2048 OR (
+            length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+          )
+        )
+      )
     ),
     speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
     window_count INTEGER NOT NULL CHECK(window_count >= 0),
@@ -990,7 +1040,13 @@ const SESSION_DIARIZATION_SCHEMA = `
     started_at INTEGER NOT NULL,
     ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
     embedding BLOB CHECK(
-      embedding IS NULL OR (typeof(embedding) = 'blob' AND length(embedding) = 2048)
+      embedding IS NULL OR (
+        typeof(embedding) = 'blob' AND (
+          length(embedding) = 2048 OR (
+            length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+          )
+        )
+      )
     ),
     echo_state TEXT NOT NULL DEFAULT 'none'
       CHECK(echo_state IN ('none','possible','confirmed')),
@@ -1021,6 +1077,48 @@ const SESSION_DIARIZATION_SCHEMA = `
     ON speaker_turns(transcript_segment_id, run_id);
   CREATE INDEX IF NOT EXISTS idx_diarization_run_cluster_segments_segment
     ON speaker_diarization_run_cluster_segments(transcript_segment_id, run_id, cluster_id);
+`;
+
+const HYBRID_DIARIZATION_HISTORY_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS session_summary_refresh_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    basis_policy_id TEXT,
+    latest_policy_id TEXT NOT NULL,
+    recommended INTEGER NOT NULL DEFAULT 0 CHECK(recommended IN (0,1)),
+    reason TEXT CHECK(reason IS NULL OR reason IN (
+      'speaker_count_changed','speaker_identity_changed','application_source_changed',
+      'transcript_changed','activity_classification_changed','manual_request'
+    )),
+    updated_at INTEGER NOT NULL,
+    CHECK(recommended = 1 OR reason IS NULL)
+  );
+  CREATE INDEX IF NOT EXISTS idx_summary_refresh_recommended
+    ON session_summary_refresh_state(recommended, updated_at DESC, session_id)
+    WHERE recommended = 1;
+  CREATE TABLE IF NOT EXISTS session_reprocessing_state (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    policy_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode = 'historical_local_only'),
+    state TEXT NOT NULL CHECK(state IN ('queued','processing','completed')),
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    baseline_content_sha256 TEXT NOT NULL CHECK(
+      length(baseline_content_sha256) = 64 AND
+      baseline_content_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    baseline_identity_sha256 TEXT NOT NULL CHECK(
+      length(baseline_identity_sha256) = 64 AND
+      baseline_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    baseline_classification_sha256 TEXT NOT NULL CHECK(
+      length(baseline_classification_sha256) = 64 AND
+      baseline_classification_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    CHECK((state = 'completed') = (completed_at IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS idx_session_reprocessing_active
+    ON session_reprocessing_state(state, started_at, session_id)
+    WHERE state IN ('queued','processing');
 `;
 
 const SPEAKER_IDENTITY_RESOLUTION_SCHEMA = `
@@ -4787,8 +4885,13 @@ function migrateSessionDiarizationV21(db) {
            embedding_dimension, sample_rate, input_version, execution_device,
            ${commitSequenceExpression}, created_at, completed_at
     FROM speaker_diarization_runs;
-    INSERT INTO speaker_diarization_run_clusters_v21
-    SELECT * FROM speaker_diarization_run_clusters;
+    INSERT INTO speaker_diarization_run_clusters_v21 (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    )
+    SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+           window_count, quality_score, first_appearance_at
+    FROM speaker_diarization_run_clusters;
     INSERT INTO speaker_turns_v21 (
       id, run_id, cluster_id, chunk_id, transcript_segment_id, turn_index,
       raw_label, started_at, ended_at, embedding, echo_state,
@@ -5768,10 +5871,7 @@ const ANALYSIS_BUDGET_MODES_V31_SCHEMA = `
 `;
 
 function upgradeAnalysisBudgetModesV31(db) {
-  for (const table of [
-    "analysis_budget_policy_revisions",
-    "analysis_budget_periods",
-  ]) {
+  for (const table of ["analysis_budget_policy_revisions", "analysis_budget_periods"]) {
     if (!tableExists(db, table)) throw new Error(`v31 analysis budget modes require ${table}`);
   }
   const hasPolicyModes = tableExists(db, "analysis_budget_policy_modes");
@@ -5876,12 +5976,12 @@ function upgradeApplicationAudioTracksV32(db) {
       INSERT INTO audio_tracks_v32 (
         id, session_id, source_type, application_key, application_display_name,
         capture_generation, device_id, device_label, strategy,
-        sample_rate, channels, started_at, ended_at, state
+        sample_rate, channels, started_at, ended_at, state, failure_code
       )
       SELECT
         id, session_id, source_type, NULL, NULL,
         0, device_id, device_label, strategy,
-        sample_rate, channels, started_at, ended_at, state
+        sample_rate, channels, started_at, ended_at, state, NULL
       FROM audio_tracks;
 
       DROP TABLE audio_tracks;
@@ -5895,9 +5995,7 @@ function upgradeApplicationAudioTracksV32(db) {
       })) {
       db.exec(object.sql);
     }
-    for (const object of dependentSchemaObjects.filter(
-      (candidate) => candidate.type === "index"
-    )) {
+    for (const object of dependentSchemaObjects.filter((candidate) => candidate.type === "index")) {
       db.exec(object.sql);
     }
   } catch (error) {
@@ -6032,6 +6130,3667 @@ function upgradePhase2IntelligenceV34(db) {
   db.exec(PHASE2_INTELLIGENCE_SCHEMA);
 }
 
+function upgradeEncryptedDiarizationEvidenceV35(db) {
+  if (!tableExists(db, "speaker_diarization_run_clusters") || !tableExists(db, "speaker_turns")) {
+    throw new Error("v35 encrypted diarization evidence requires v21 speaker tables");
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  try {
+    // Some old databases contain application-owned triggers whose target
+    // columns are added by the repository schema after evidence migration.
+    // Legacy rename mode keeps those unrelated definitions untouched while
+    // these replacement tables deliberately reference their final names.
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP INDEX IF EXISTS idx_diarization_run_clusters_cluster;
+      DROP INDEX IF EXISTS idx_speaker_turns_run_time;
+      DROP INDEX IF EXISTS idx_speaker_turns_segment;
+
+      CREATE TABLE speaker_diarization_run_clusters_v35 (
+        run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+        cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+        local_label TEXT NOT NULL,
+        embedding BLOB CHECK(
+          embedding IS NULL OR (
+            typeof(embedding) = 'blob' AND (
+              length(embedding) = 2048 OR (
+                length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+              )
+            )
+          )
+        ),
+        speech_ms INTEGER NOT NULL CHECK(speech_ms >= 0),
+        window_count INTEGER NOT NULL CHECK(window_count >= 0),
+        quality_score REAL CHECK(
+          quality_score IS NULL OR (
+            typeof(quality_score) IN ('integer','real') AND quality_score BETWEEN 0 AND 1
+          )
+        ),
+        first_appearance_at INTEGER NOT NULL,
+        PRIMARY KEY(run_id, local_label),
+        UNIQUE(run_id, cluster_id),
+        CHECK(
+          (window_count = 0 AND speech_ms = 0 AND embedding IS NULL AND quality_score IS NULL) OR
+          (window_count > 0 AND embedding IS NOT NULL AND quality_score IS NOT NULL)
+        )
+      );
+      CREATE TABLE speaker_turns_v35 (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+        cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+        chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+        transcript_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE SET NULL,
+        turn_index INTEGER NOT NULL CHECK(turn_index >= 0),
+        raw_label TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+        embedding BLOB CHECK(
+          embedding IS NULL OR (
+            typeof(embedding) = 'blob' AND (
+              length(embedding) = 2048 OR (
+                length(embedding) > 4 AND hex(substr(embedding, 1, 4)) = '4A564531'
+              )
+            )
+          )
+        ),
+        echo_state TEXT NOT NULL DEFAULT 'none'
+          CHECK(echo_state IN ('none','possible','confirmed')),
+        duplicate_of_turn_id TEXT REFERENCES speaker_turns(id) ON DELETE SET NULL,
+        excluded_from_centroid INTEGER NOT NULL DEFAULT 0 CHECK(excluded_from_centroid IN (0,1)),
+        created_at INTEGER NOT NULL,
+        UNIQUE(run_id, chunk_id, turn_index),
+        CHECK(duplicate_of_turn_id IS NULL OR duplicate_of_turn_id <> id),
+        CHECK((echo_state = 'confirmed') = (excluded_from_centroid = 1))
+      );
+
+      INSERT INTO speaker_diarization_run_clusters_v35 (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      )
+      SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+             window_count, quality_score, first_appearance_at
+      FROM speaker_diarization_run_clusters;
+      INSERT INTO speaker_turns_v35 (
+        id, run_id, cluster_id, chunk_id, transcript_segment_id,
+        turn_index, raw_label, started_at, ended_at, embedding,
+        echo_state, duplicate_of_turn_id, excluded_from_centroid, created_at
+      )
+      SELECT id, run_id, cluster_id, chunk_id, transcript_segment_id,
+             turn_index, raw_label, started_at, ended_at, embedding,
+             echo_state, duplicate_of_turn_id, excluded_from_centroid, created_at
+      FROM speaker_turns;
+
+      DROP TABLE speaker_turns;
+      DROP TABLE speaker_diarization_run_clusters;
+      ALTER TABLE speaker_diarization_run_clusters_v35
+        RENAME TO speaker_diarization_run_clusters;
+      ALTER TABLE speaker_turns_v35 RENAME TO speaker_turns;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+
+  addColumn(
+    db,
+    "audio_tracks",
+    `failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "application_audio_intervals",
+    `failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    )`
+  );
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS validate_application_audio_interval_insert;
+    DROP TRIGGER IF EXISTS validate_application_audio_interval_update;
+    DROP INDEX IF EXISTS idx_audio_tracks_session_application;
+    CREATE UNIQUE INDEX idx_audio_tracks_session_application
+      ON audio_tracks(session_id, application_key, capture_generation)
+      WHERE track_kind = 'application';
+
+    UPDATE audio_tracks
+    SET failure_code = 'evidence_registration_failed_invalid_interval_reason_v34'
+    WHERE state = 'failed'
+      AND track_kind = 'application'
+      AND ended_at = started_at
+      AND failure_code IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM application_audio_intervals AS interval
+        WHERE interval.session_id = audio_tracks.session_id
+          AND interval.capture_generation = audio_tracks.capture_generation
+          AND interval.interval_kind = 'mixed_fallback'
+          AND interval.reason = 'dynamic_start_prebuffer'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM application_audio_intervals AS interval
+        WHERE interval.session_id = audio_tracks.session_id
+          AND interval.capture_generation = audio_tracks.capture_generation
+          AND interval.interval_kind = 'application_active'
+      );
+
+    UPDATE application_audio_intervals
+    SET failure_code = 'capture_start_failed_legacy_detail_unavailable'
+    WHERE interval_kind = 'mixed_fallback'
+      AND reason = 'capture_start_failed'
+      AND failure_code IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending', next_retry_at = NULL,
+        lease_owner = NULL, lease_expires_at = NULL,
+        error_code = NULL, blocked_reason = NULL,
+        execution_device = NULL, completed_at = NULL
+    WHERE job_type IN ('diarize_track','resolve_identities')
+      AND state IN ('running','retry','blocked');
+  `);
+  db.exec(SESSION_DIARIZATION_SCHEMA);
+  db.exec(APPLICATION_AUDIO_TRACK_INDEXES);
+  db.exec(APPLICATION_AUDIO_INTERVALS_SCHEMA);
+}
+
+function upgradeHybridDiarizationV36(db) {
+  if (!tableExists(db, "speaker_diarization_runs")) {
+    throw new Error("v36 hybrid diarization requires v21 speaker tables");
+  }
+  const existingColumns = columns(db, "speaker_diarization_runs");
+  if (existingColumns.has("pipeline_metadata_json")) {
+    db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+    return;
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  try {
+    db.pragma("legacy_alter_table = ON");
+    db.exec(`
+      DROP INDEX IF EXISTS idx_diarization_run_revision;
+      DROP INDEX IF EXISTS idx_diarization_runs_session_sequence;
+
+      CREATE TABLE speaker_diarization_runs_v36 (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+        transcript_revision TEXT NOT NULL CHECK(
+          length(transcript_revision) = 64 AND
+          transcript_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        policy_id TEXT NOT NULL,
+        diarizer_model_id TEXT NOT NULL,
+        embedding_model_id TEXT NOT NULL,
+        model_artifact_sha256 TEXT NOT NULL CHECK(
+          length(model_artifact_sha256) = 64 AND
+          model_artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        embedding_dimension INTEGER NOT NULL CHECK(embedding_dimension = 512),
+        sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+        input_version INTEGER NOT NULL CHECK(input_version IN (1,2)),
+        execution_device TEXT NOT NULL CHECK(execution_device IN ('cpu','cuda')),
+        pipeline_metadata_json TEXT NOT NULL DEFAULT '{}'
+          CHECK(json_valid(pipeline_metadata_json) AND json_type(pipeline_metadata_json) = 'object'),
+        speaker_count_min INTEGER CHECK(speaker_count_min IS NULL OR speaker_count_min BETWEEN 0 AND 64),
+        speaker_count_max INTEGER CHECK(speaker_count_max IS NULL OR speaker_count_max BETWEEN 0 AND 64),
+        speaker_count_confidence REAL CHECK(
+          speaker_count_confidence IS NULL OR (
+            typeof(speaker_count_confidence) IN ('integer','real')
+            AND speaker_count_confidence BETWEEN 0 AND 1
+          )
+        ),
+        overlap_ms INTEGER NOT NULL DEFAULT 0 CHECK(overlap_ms >= 0),
+        overlap_separation_state TEXT NOT NULL DEFAULT 'not_needed'
+          CHECK(overlap_separation_state IN ('not_needed','completed','partial','failed')),
+        model_pack_version TEXT,
+        commit_sequence INTEGER NOT NULL UNIQUE CHECK(commit_sequence > 0),
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER NOT NULL CHECK(completed_at >= created_at),
+        CHECK(
+          (speaker_count_min IS NULL AND speaker_count_max IS NULL) OR
+          (speaker_count_min IS NOT NULL AND speaker_count_max IS NOT NULL
+           AND speaker_count_min <= speaker_count_max)
+        ),
+        UNIQUE(session_id, track_id, transcript_revision, policy_id)
+      );
+
+      INSERT INTO speaker_diarization_runs_v36 (
+        id, session_id, track_id, transcript_revision, policy_id,
+        diarizer_model_id, embedding_model_id, model_artifact_sha256,
+        embedding_dimension, sample_rate, input_version, execution_device,
+        pipeline_metadata_json, speaker_count_min, speaker_count_max,
+        speaker_count_confidence, overlap_ms, overlap_separation_state,
+        model_pack_version, commit_sequence, created_at, completed_at
+      )
+      SELECT id, session_id, track_id, transcript_revision, policy_id,
+             diarizer_model_id, embedding_model_id, model_artifact_sha256,
+             embedding_dimension, sample_rate, input_version, execution_device,
+             '{}', NULL, NULL, NULL, 0, 'not_needed', NULL,
+             commit_sequence, created_at, completed_at
+      FROM speaker_diarization_runs;
+
+      DROP TABLE speaker_diarization_runs;
+      ALTER TABLE speaker_diarization_runs_v36 RENAME TO speaker_diarization_runs;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+  db.exec(SESSION_DIARIZATION_SCHEMA);
+  db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+}
+
+function upgradeSpeakerSchedulingV37(db, migratedAt) {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_application_audio_intervals_recovery
+      ON application_audio_intervals(
+        session_id, capture_generation, ended_at, attribution_state
+      );
+  `);
+
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: LEGACY_MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 35
+      WHEN 'system_mix' THEN 36
+      ELSE 40
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+  `);
+}
+
+function upgradeRuntimeStatusIndexesV38(db) {
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_processing_jobs_chunk_type_order
+    ON processing_jobs(
+      chunk_id, job_type, created_at DESC, id DESC, state, model_version
+    )
+    WHERE chunk_id IS NOT NULL;
+  `);
+}
+
+function upgradePrimarySpeakerSchedulingV39(db, migratedAt) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: V39_MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+          SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+        )
+          WHEN 'mic' THEN 35
+          WHEN 'system_mix' THEN 36
+          ELSE 40
+        END,
+        state = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN 'pending'
+          ELSE state
+        END,
+        next_retry_at = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE next_retry_at
+        END,
+        error_code = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE error_code
+        END,
+        blocked_reason = CASE
+          WHEN EXISTS (
+            SELECT 1 FROM audio_tracks AS track
+            WHERE track.id = job.track_id
+              AND track.track_kind IN ('mic', 'system_mix')
+          ) THEN NULL
+          ELSE blocked_reason
+        END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+  `);
+}
+
+function upgradeSpeakerCompletionSchedulingV40(db, migratedAt) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+  `);
+
+  db.prepare(
+    `
+    UPDATE processing_jobs AS job
+    SET state = 'superseded',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = 'SPEAKER_AUDIO_TOO_SHORT',
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = @migratedAt
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM audio_tracks AS track
+        WHERE track.id = job.track_id
+          AND track.track_kind = 'application'
+      )
+      AND COALESCE((
+        SELECT SUM(chunk.duration_ms)
+        FROM audio_chunks AS chunk
+        WHERE chunk.track_id = job.track_id
+          AND chunk.write_state = 'committed'
+          AND chunk.deleted_at IS NULL
+      ), 0) < @minimumAudioMs
+  `
+  ).run({ migratedAt, minimumAudioMs: MIN_APPLICATION_DIARIZATION_AUDIO_MS });
+
+  db.exec(`
+    UPDATE processing_jobs
+    SET priority = 37,
+        state = CASE WHEN state = 'running' THEN 'pending' ELSE state END,
+        next_retry_at = CASE WHEN state = 'running' THEN NULL ELSE next_retry_at END,
+        lease_owner = CASE WHEN state = 'running' THEN NULL ELSE lease_owner END,
+        lease_expires_at = CASE WHEN state = 'running' THEN NULL ELSE lease_expires_at END,
+        execution_device = CASE WHEN state = 'running' THEN NULL ELSE execution_device END
+    WHERE job_type = 'resolve_identities'
+      AND state IN ('pending','retry','blocked','running')
+      AND completed_at IS NULL;
+  `);
+}
+
+function upgradeTodoActionsV41(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS todo_verification_decisions (
+      id TEXT PRIMARY KEY,
+      todo_instance_id TEXT NOT NULL REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      state TEXT NOT NULL CHECK(
+        typeof(state) = 'text'
+        AND state IN ('pending_confirmation','confirmed','dismissed')
+      ),
+      reason TEXT NOT NULL CHECK(
+        typeof(reason) = 'text'
+        AND reason IN (
+          'strict_self_commitment',
+          'assigned_and_accepted',
+          'user_confirmed',
+          'user_dismissed'
+        )
+      ),
+      actor TEXT NOT NULL CHECK(typeof(actor) = 'text' AND actor IN ('system','user')),
+      source_analysis_input_id TEXT REFERENCES analysis_inputs(id) ON DELETE SET NULL,
+      occurred_at INTEGER NOT NULL CHECK(typeof(occurred_at) = 'integer' AND occurred_at >= 0)
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_verification_decisions_latest
+      ON todo_verification_decisions(todo_instance_id, occurred_at DESC, id DESC);
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_immutable_update
+    BEFORE UPDATE OF id, todo_instance_id, state, reason, actor, occurred_at
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification decision is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_source_clear
+    BEFORE UPDATE OF source_analysis_input_id ON todo_verification_decisions
+    WHEN NOT (
+      OLD.source_analysis_input_id IS NOT NULL
+      AND NEW.source_analysis_input_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM analysis_inputs WHERE id = OLD.source_analysis_input_id)
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification source can only be cleared when its input is deleted');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_verification_decisions_immutable_delete
+    BEFORE DELETE ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification decision cannot be deleted');
+    END;
+
+    DROP TRIGGER IF EXISTS todos_v2_terminal_state;
+    DROP TRIGGER IF EXISTS todos_v2_require_transition;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_insert;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_state;
+
+    CREATE TRIGGER todos_v2_terminal_state
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN OLD.status = 'dismissed' AND (
+      NEW.status IS NOT OLD.status
+      OR NEW.completed_at IS NOT OLD.completed_at
+      OR NEW.dismissed_at IS NOT OLD.dismissed_at
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'dismissed todo state is immutable');
+    END;
+    CREATE TRIGGER todos_v2_require_transition
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todo_state_transitions AS transition
+      WHERE transition.todo_instance_id = OLD.id
+        AND transition.id = (
+          SELECT latest.id
+          FROM todo_state_transitions AS latest
+          WHERE latest.todo_instance_id = OLD.id
+          ORDER BY latest.rowid DESC
+          LIMIT 1
+        )
+        AND (
+          (
+            transition.from_status IS NULL
+            AND OLD.status = 'open'
+            AND NEW.status = 'open'
+            AND NEW.completed_at IS NULL
+            AND NEW.dismissed_at IS NULL
+          )
+          OR (
+            transition.from_status = OLD.status
+            AND transition.to_status = NEW.status
+            AND (
+              (
+                NEW.status = 'completed'
+                AND NEW.completed_at = transition.occurred_at
+                AND NEW.dismissed_at IS NULL
+              )
+              OR (
+                NEW.status = 'dismissed'
+                AND NEW.dismissed_at = transition.occurred_at
+                AND NEW.completed_at IS NULL
+              )
+              OR (
+                OLD.status = 'completed'
+                AND NEW.status = 'open'
+                AND NEW.completed_at IS NULL
+                AND NEW.dismissed_at IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state change requires transition history');
+    END;
+    CREATE TRIGGER todo_state_transitions_validate_insert
+    BEFORE INSERT ON todo_state_transitions
+    WHEN COALESCE(
+      (
+        (
+          NEW.reason IN ('analysis_created','recurrence')
+          AND NEW.actor = 'system'
+          AND NEW.source_analysis_input_id IS NOT NULL
+          AND NEW.from_status IS NULL
+          AND NEW.to_status = 'open'
+        )
+        OR (
+          NEW.reason IN ('user_action','suggestion_acceptance')
+          AND NEW.actor = 'user'
+          AND NEW.source_analysis_input_id IS NULL
+          AND (
+            (NEW.from_status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+            OR (NEW.from_status = 'completed' AND NEW.to_status = 'open')
+          )
+        )
+      ),
+      0
+    ) = 0
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition reason contract is invalid');
+    END;
+    CREATE TRIGGER todo_state_transitions_validate_state
+    BEFORE INSERT ON todo_state_transitions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todos_v2 AS todo
+      WHERE todo.id = NEW.todo_instance_id
+        AND (
+          (
+            NEW.from_status IS NULL
+            AND NEW.to_status = 'open'
+            AND todo.status = 'open'
+          )
+          OR (
+            NEW.from_status = todo.status
+            AND (
+              (todo.status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+              OR (todo.status = 'completed' AND NEW.to_status = 'open')
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition is invalid');
+    END;
+  `);
+}
+
+function upgradePersonalizationV42(db, migratedAt) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS personalization_feedback (
+      id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      source_entity_id TEXT NOT NULL CHECK(
+        typeof(source_entity_id) = 'text'
+        AND length(trim(source_entity_id)) BETWEEN 1 AND 200
+      ),
+      original_value TEXT,
+      corrected_value TEXT NOT NULL CHECK(
+        typeof(corrected_value) = 'text'
+        AND length(trim(corrected_value)) BETWEEN 1 AND 200
+      ),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text' AND length(pattern_key) = 64
+      ),
+      feature_json TEXT NOT NULL CHECK(
+        typeof(feature_json) = 'text'
+        AND json_valid(feature_json)
+        AND json_type(feature_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      ),
+      UNIQUE(domain, source_entity_id, corrected_value)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_pattern
+    ON personalization_feedback(domain, pattern_key, corrected_value, occurred_at, id);
+
+    CREATE TABLE IF NOT EXISTS personalization_rules (
+      id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text' AND length(pattern_key) = 64
+      ),
+      target_value TEXT NOT NULL CHECK(
+        typeof(target_value) = 'text'
+        AND length(trim(target_value)) BETWEEN 1 AND 200
+      ),
+      label TEXT NOT NULL CHECK(
+        typeof(label) = 'text' AND length(trim(label)) BETWEEN 1 AND 500
+      ),
+      rule_json TEXT NOT NULL CHECK(
+        typeof(rule_json) = 'text'
+        AND json_valid(rule_json)
+        AND json_type(rule_json) = 'object'
+      ),
+      support_count INTEGER NOT NULL CHECK(
+        typeof(support_count) = 'integer' AND support_count >= 3
+      ),
+      state TEXT NOT NULL CHECK(state IN ('proposed','enabled','disabled','deleted')),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      UNIQUE(domain, pattern_key, target_value)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_rules_state
+    ON personalization_rules(domain, state, updated_at DESC, id);
+
+    CREATE TABLE IF NOT EXISTS personalization_rule_events (
+      id TEXT PRIMARY KEY,
+      rule_id TEXT REFERENCES personalization_rules(id) ON DELETE SET NULL,
+      action TEXT NOT NULL CHECK(action IN (
+        'proposed','enabled','disabled','edited','deleted','reset'
+      )),
+      previous_state TEXT CHECK(
+        previous_state IS NULL
+        OR previous_state IN ('proposed','enabled','disabled','deleted')
+      ),
+      next_state TEXT CHECK(
+        next_state IS NULL
+        OR next_state IN ('proposed','enabled','disabled','deleted')
+      ),
+      detail_json TEXT NOT NULL CHECK(
+        typeof(detail_json) = 'text'
+        AND json_valid(detail_json)
+        AND json_type(detail_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS jarvis_notification_preferences (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      focus_mode INTEGER NOT NULL DEFAULT 0 CHECK(focus_mode IN (0,1)),
+      muted_until INTEGER CHECK(
+        muted_until IS NULL
+        OR (typeof(muted_until) = 'integer' AND muted_until >= 0)
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= 0
+      )
+    );
+
+    INSERT OR IGNORE INTO jarvis_notification_preferences (
+      singleton, focus_mode, muted_until, updated_at
+    ) VALUES (1, 0, NULL, ${Number(migratedAt)});
+
+    UPDATE audio_tracks
+    SET application_key = 'tencent_meeting',
+        application_display_name = '腾讯会议'
+    WHERE application_key IN ('wemeetapp','wemeet','tencentmeeting');
+
+    UPDATE application_audio_intervals
+    SET application_key = 'tencent_meeting'
+    WHERE application_key IN ('wemeetapp','wemeet','tencentmeeting');
+
+    UPDATE audio_tracks
+    SET application_key = 'wechat',
+        application_display_name = '微信'
+    WHERE application_key IN ('weixin','wechat');
+
+    UPDATE application_audio_intervals
+    SET application_key = 'wechat'
+    WHERE application_key IN ('weixin','wechat');
+
+    DROP TRIGGER IF EXISTS personalization_feedback_immutable_update;
+    DROP TRIGGER IF EXISTS personalization_feedback_immutable_delete;
+    DROP TRIGGER IF EXISTS personalization_rule_events_immutable_update;
+    DROP TRIGGER IF EXISTS personalization_rule_events_immutable_delete;
+
+    CREATE TRIGGER personalization_feedback_immutable_update
+    BEFORE UPDATE ON personalization_feedback
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback is immutable');
+    END;
+
+    CREATE TRIGGER personalization_feedback_immutable_delete
+    BEFORE DELETE ON personalization_feedback
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback is immutable');
+    END;
+
+    CREATE TRIGGER personalization_rule_events_immutable_update
+    BEFORE UPDATE ON personalization_rule_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization rule events are immutable');
+    END;
+
+    CREATE TRIGGER personalization_rule_events_immutable_delete
+    BEFORE DELETE ON personalization_rule_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization rule events are immutable');
+    END;
+  `);
+}
+
+function upgradePreferredSpeakerSchedulingV43(db) {
+  db.exec(`
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state = 'running'
+      AND completed_at IS NULL;
+
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 34
+      WHEN 'application' THEN 35
+      WHEN 'system_mix' THEN 45
+      ELSE priority
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL
+    WHERE job_type = 'resolve_identities'
+      AND state IN ('retry','blocked')
+      AND completed_at IS NULL;
+  `);
+}
+
+function upgradeRecoverableSpeakerWorkV44(db) {
+  db.exec(`
+    UPDATE processing_jobs AS job
+    SET priority = CASE (
+      SELECT track.track_kind FROM audio_tracks AS track WHERE track.id = job.track_id
+    )
+      WHEN 'mic' THEN 34
+      WHEN 'application' THEN 35
+      WHEN 'system_mix' THEN 45
+      ELSE priority
+    END
+    WHERE job.job_type = 'diarize_track'
+      AND job.state IN ('pending','retry','blocked')
+      AND job.completed_at IS NULL;
+
+    UPDATE processing_jobs
+    SET state = 'pending',
+        next_retry_at = NULL,
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        error_code = NULL,
+        blocked_reason = NULL,
+        execution_device = NULL,
+        completed_at = NULL
+    WHERE job_type = 'diarize_track'
+      AND state IN ('retry','blocked')
+      AND completed_at IS NULL
+      AND blocked_reason IN (
+        'cpu_load_high',
+        'cuda_unavailable',
+        'cuda_unavailable_cpu_backend',
+        'external_gpu_busy',
+        'fullscreen_game',
+        'gpu_utilization_high',
+        'insufficient_vram',
+        'recovery_hysteresis',
+        'resources_changed',
+        'telemetry_unavailable'
+      );
+  `);
+}
+
+function upgradeDailyDigestSnapshotRetentionV45(db) {
+  if (
+    !tableExists(db, "daily_digest_inputs") ||
+    !tableExists(db, "processing_jobs") ||
+    !tableExists(db, "daily_digest_response_candidates") ||
+    !tableExists(db, "daily_digests")
+  ) {
+    return;
+  }
+  db.exec(`
+    DELETE FROM processing_jobs
+    WHERE id IN (
+      SELECT job.id
+      FROM processing_jobs AS job
+      JOIN daily_digest_inputs AS input ON input.id = job.digest_input_id
+      WHERE job.job_type = 'generate_daily_digest'
+        AND job.state = 'superseded'
+        AND NOT EXISTS (
+          SELECT 1 FROM analysis_budget_attempts AS attempt
+          WHERE attempt.job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_digest_response_candidates AS candidate
+          WHERE candidate.job_id = job.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM daily_digests AS digest
+          WHERE digest.source_hash = input.source_hash
+        )
+    );
+
+    DROP TRIGGER IF EXISTS daily_digest_inputs_immutable_delete;
+    DELETE FROM daily_digest_inputs AS input
+    WHERE NOT EXISTS (
+      SELECT 1 FROM processing_jobs AS job
+      WHERE job.digest_input_id = input.id
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM daily_digest_response_candidates AS candidate
+        WHERE candidate.digest_input_id = input.id
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM daily_digests AS digest
+        WHERE digest.source_hash = input.source_hash
+      );
+    CREATE TRIGGER daily_digest_inputs_immutable_delete
+    BEFORE DELETE ON daily_digest_inputs
+    BEGIN
+      SELECT RAISE(ABORT, 'daily digest input is immutable');
+    END;
+  `);
+}
+
+function upgradeSpeakerTranscriptProjectionV46(db) {
+  if (
+    !tableExists(db, "transcript_segments") ||
+    !tableExists(db, "speaker_cluster_segments") ||
+    !tableExists(db, "speaker_clusters") ||
+    !tableExists(db, "people") ||
+    !tableExists(db, "analysis_input_segments")
+  ) {
+    return;
+  }
+  const transcriptColumns = columns(db, "transcript_segments");
+  const clusterColumns = columns(db, "speaker_clusters");
+  const peopleColumns = columns(db, "people");
+  if (
+    !transcriptColumns.has("person_id") ||
+    !transcriptColumns.has("speaker_label") ||
+    !clusterColumns.has("person_id") ||
+    !clusterColumns.has("link_state") ||
+    !clusterColumns.has("updated_at") ||
+    !peopleColumns.has("display_name")
+  ) {
+    return;
+  }
+  db.exec(`
+    UPDATE transcript_segments AS segment
+    SET person_id = (
+      SELECT CASE
+        WHEN cluster.link_state = 'confirmed' THEN cluster.person_id
+        ELSE NULL
+      END
+      FROM speaker_cluster_segments AS link
+      JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+      WHERE link.transcript_segment_id = segment.id
+      ORDER BY cluster.updated_at DESC, cluster.id DESC
+      LIMIT 1
+    )
+    WHERE EXISTS (
+      SELECT 1
+      FROM speaker_cluster_segments AS link
+      WHERE link.transcript_segment_id = segment.id
+    );
+
+    UPDATE transcript_segments AS segment
+    SET speaker_label = (
+      SELECT person.display_name
+      FROM speaker_cluster_segments AS link
+      JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+      JOIN people AS person ON person.id = cluster.person_id
+      WHERE link.transcript_segment_id = segment.id
+        AND cluster.link_state = 'confirmed'
+      ORDER BY cluster.updated_at DESC, cluster.id DESC
+      LIMIT 1
+    )
+    WHERE NOT EXISTS (
+      SELECT 1 FROM analysis_input_segments AS input
+      WHERE input.segment_id = segment.id
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN people AS person ON person.id = cluster.person_id
+        WHERE link.transcript_segment_id = segment.id
+          AND cluster.link_state = 'confirmed'
+      );
+  `);
+}
+
+function upgradeParticipantReviewV47(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_participant_snapshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 1),
+      projector_version TEXT NOT NULL CHECK(length(trim(projector_version)) BETWEEN 1 AND 128),
+      source_hash TEXT NOT NULL CHECK(
+        length(source_hash) = 64 AND source_hash NOT GLOB '*[^0-9a-f]*'
+      ),
+      payload_json TEXT NOT NULL CHECK(
+        json_valid(payload_json) AND json_type(payload_json) = 'object'
+      ),
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      UNIQUE(session_id, revision),
+      UNIQUE(session_id, source_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS session_participant_snapshot_clusters (
+      snapshot_id TEXT NOT NULL
+        REFERENCES session_participant_snapshots(id) ON DELETE CASCADE,
+      participant_ref TEXT NOT NULL CHECK(length(trim(participant_ref)) BETWEEN 1 AND 200),
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      membership_kind TEXT NOT NULL
+        CHECK(membership_kind IN ('self','known','anonymous','reviewed','temporary','media')),
+      PRIMARY KEY(snapshot_id, participant_ref, cluster_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS participant_review_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      action TEXT NOT NULL CHECK(action IN (
+        'confirm','split','merge','mark_media','restore_social',
+        'forget_identity','pin_evidence','unpin_evidence','undo'
+      )),
+      subject_ref TEXT NOT NULL CHECK(length(trim(subject_ref)) BETWEEN 1 AND 256),
+      payload_json TEXT NOT NULL CHECK(
+        json_valid(payload_json) AND json_type(payload_json) = 'object'
+      ),
+      previous_state_json TEXT NOT NULL CHECK(
+        json_valid(previous_state_json) AND json_type(previous_state_json) = 'object'
+      ),
+      next_state_json TEXT NOT NULL CHECK(
+        json_valid(next_state_json) AND json_type(next_state_json) = 'object'
+      ),
+      reverts_event_id TEXT UNIQUE REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      actor TEXT NOT NULL CHECK(actor IN ('user','system')),
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      CHECK(
+        (action = 'undo' AND reverts_event_id IS NOT NULL)
+        OR (action <> 'undo' AND reverts_event_id IS NULL)
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_cluster_review_overrides (
+      cluster_id TEXT PRIMARY KEY REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      group_ref TEXT CHECK(
+        group_ref IS NULL OR length(trim(group_ref)) BETWEEN 1 AND 200
+      ),
+      disposition TEXT NOT NULL CHECK(disposition IN ('social','media','unknown')),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_segment_review_overrides (
+      transcript_segment_id TEXT PRIMARY KEY
+        REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      group_ref TEXT NOT NULL CHECK(length(trim(group_ref)) BETWEEN 1 AND 200),
+      disposition TEXT NOT NULL CHECK(disposition IN ('social','media','unknown')),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS speaker_identity_review_overrides (
+      person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+      state TEXT NOT NULL CHECK(state = 'forgotten'),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0)
+    );
+
+    CREATE TABLE IF NOT EXISTS participant_review_backfill_batches (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL CHECK(scope IN ('recent_audio','all_retained_audio','metadata_cleanup')),
+      state TEXT NOT NULL CHECK(state IN ('queued','running','completed','failed','cancelled')),
+      session_count INTEGER NOT NULL DEFAULT 0 CHECK(session_count >= 0),
+      processed_count INTEGER NOT NULL DEFAULT 0 CHECK(
+        processed_count >= 0 AND processed_count <= session_count
+      ),
+      changed_count INTEGER NOT NULL DEFAULT 0 CHECK(
+        changed_count >= 0 AND changed_count <= processed_count
+      ),
+      error_code TEXT,
+      created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+      started_at INTEGER,
+      completed_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS pinned_speaker_evidence (
+      transcript_segment_id TEXT PRIMARY KEY
+        REFERENCES transcript_segments(id) ON DELETE CASCADE,
+      cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      label TEXT CHECK(label IS NULL OR length(trim(label)) BETWEEN 1 AND 200),
+      source_event_id TEXT NOT NULL
+        REFERENCES participant_review_events(id) ON DELETE RESTRICT,
+      pinned_at INTEGER NOT NULL CHECK(typeof(pinned_at) = 'integer' AND pinned_at >= 0)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_participant_snapshots_session_created
+      ON session_participant_snapshots(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_participant_review_events_session_created
+      ON participant_review_events(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cluster_review_overrides_session
+      ON speaker_cluster_review_overrides(session_id, disposition, group_ref);
+    CREATE INDEX IF NOT EXISTS idx_segment_review_overrides_session
+      ON speaker_segment_review_overrides(session_id, disposition, group_ref);
+    CREATE INDEX IF NOT EXISTS idx_identity_review_overrides_state
+      ON speaker_identity_review_overrides(state, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_participant_backfill_state_created
+      ON participant_review_backfill_batches(state, created_at);
+
+    CREATE TRIGGER IF NOT EXISTS participant_review_events_immutable_update
+    BEFORE UPDATE ON participant_review_events
+    BEGIN
+      SELECT RAISE(ABORT, 'participant review event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS participant_review_events_immutable_delete
+    BEFORE DELETE ON participant_review_events
+    BEGIN
+      SELECT RAISE(ABORT, 'participant review event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_cluster_review_override_insert
+    BEFORE INSERT ON speaker_cluster_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker cluster review session mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM speaker_clusters AS cluster
+        WHERE cluster.id = NEW.cluster_id AND cluster.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_cluster_review_override_update
+    BEFORE UPDATE OF cluster_id, session_id ON speaker_cluster_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker cluster review session mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1 FROM speaker_clusters AS cluster
+        WHERE cluster.id = NEW.cluster_id AND cluster.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_segment_review_override_insert
+    BEFORE INSERT ON speaker_segment_review_overrides
+    BEGIN
+      SELECT RAISE(ABORT, 'speaker segment review lineage mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN transcript_segments AS segment ON segment.id = link.transcript_segment_id
+        WHERE link.cluster_id = NEW.cluster_id
+          AND link.transcript_segment_id = NEW.transcript_segment_id
+          AND cluster.session_id = NEW.session_id
+          AND segment.session_id = NEW.session_id
+      );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS validate_pinned_speaker_evidence_insert
+    BEFORE INSERT ON pinned_speaker_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'pinned speaker evidence lineage mismatch')
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM speaker_cluster_segments AS link
+        JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+        JOIN transcript_segments AS segment ON segment.id = link.transcript_segment_id
+        WHERE link.cluster_id = NEW.cluster_id
+          AND link.transcript_segment_id = NEW.transcript_segment_id
+          AND cluster.session_id = NEW.session_id
+          AND segment.session_id = NEW.session_id
+      );
+    END;
+  `);
+}
+
+function upgradeRestrainedNotificationsV48(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS todo_reminders (
+      todo_instance_id TEXT PRIMARY KEY REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      reminder_at INTEGER NOT NULL CHECK(
+        typeof(reminder_at) = 'integer' AND reminder_at >= 0
+      ),
+      reminder_source TEXT NOT NULL CHECK(reminder_source = 'user'),
+      generation INTEGER NOT NULL DEFAULT 1 CHECK(
+        typeof(generation) = 'integer' AND generation >= 1
+      ),
+      state TEXT NOT NULL CHECK(state IN ('scheduled','deferred','delivered','cancelled')),
+      deferred_reason TEXT CHECK(
+        deferred_reason IS NULL OR (
+          typeof(deferred_reason) = 'text'
+          AND length(deferred_reason) BETWEEN 1 AND 128
+          AND deferred_reason NOT GLOB '*[^a-z0-9_]*'
+        )
+      ),
+      delivered_at INTEGER CHECK(
+        delivered_at IS NULL OR (typeof(delivered_at) = 'integer' AND delivered_at >= 0)
+      ),
+      cancelled_at INTEGER CHECK(
+        cancelled_at IS NULL OR (typeof(cancelled_at) = 'integer' AND cancelled_at >= 0)
+      ),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      CHECK(
+        (state IN ('scheduled','deferred') AND delivered_at IS NULL AND cancelled_at IS NULL)
+        OR (state = 'delivered' AND delivered_at IS NOT NULL AND cancelled_at IS NULL)
+        OR (state = 'cancelled' AND delivered_at IS NULL AND cancelled_at IS NOT NULL)
+      ),
+      CHECK(state = 'deferred' OR deferred_reason IS NULL)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_todo_reminders_due
+      ON todo_reminders(state, reminder_at, todo_instance_id)
+      WHERE state IN ('scheduled','deferred');
+
+    CREATE TRIGGER IF NOT EXISTS cancel_todo_reminder_on_terminal_state
+    AFTER UPDATE OF status ON todos_v2
+    WHEN NEW.status <> 'open'
+    BEGIN
+      UPDATE todo_reminders
+      SET state = 'cancelled',
+          deferred_reason = NULL,
+          delivered_at = NULL,
+          cancelled_at = MAX(NEW.updated_at, OLD.updated_at),
+          updated_at = MAX(NEW.updated_at, OLD.updated_at)
+      WHERE todo_instance_id = NEW.id
+        AND state IN ('scheduled','deferred');
+    END;
+  `);
+
+  // No reminder is inferred from due_text: only a later explicit user action may create one.
+}
+
+function upgradeActionCenterDeltaV49(db, migratedAt) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS action_center_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      action_kind TEXT NOT NULL CHECK(action_kind IN ('todo','suggestion')),
+      action_id TEXT NOT NULL CHECK(
+        typeof(action_id) = 'text' AND length(trim(action_id)) BETWEEN 1 AND 128
+      ),
+      session_id TEXT NOT NULL CHECK(
+        typeof(session_id) = 'text' AND length(trim(session_id)) BETWEEN 1 AND 128
+      ),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      UNIQUE(action_kind, action_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_action_center_events_session_sequence
+    ON action_center_events(session_id, sequence);
+
+    CREATE TABLE IF NOT EXISTS action_center_read_state (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      last_seen_sequence INTEGER NOT NULL DEFAULT 0 CHECK(
+        typeof(last_seen_sequence) = 'integer' AND last_seen_sequence >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= 0
+      )
+    );
+  `);
+
+  db.exec(`
+    INSERT OR IGNORE INTO action_center_events (
+      action_kind, action_id, session_id, created_at
+    )
+    SELECT action_kind, action_id, session_id, created_at
+    FROM (
+      SELECT
+        'todo' AS action_kind,
+        todo.id AS action_id,
+        MIN(COALESCE(occurrence.legacy_session_id, input.session_id)) AS session_id,
+        todo.created_at AS created_at
+      FROM todos_v2 AS todo
+      JOIN todo_occurrences AS occurrence
+        ON occurrence.todo_instance_id = todo.id
+       AND occurrence.created_at = todo.created_at
+      LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+      WHERE COALESCE(occurrence.legacy_session_id, input.session_id) IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM todo_occurrences AS earlier
+          WHERE earlier.todo_instance_id = todo.id
+            AND earlier.created_at < occurrence.created_at
+        )
+      GROUP BY todo.id
+      HAVING COUNT(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+
+      UNION ALL
+
+      SELECT
+        'suggestion' AS action_kind,
+        suggestion.id AS action_id,
+        MIN(COALESCE(occurrence.legacy_session_id, input.session_id)) AS session_id,
+        suggestion.created_at AS created_at
+      FROM suggestions_v2 AS suggestion
+      JOIN suggestion_occurrences AS occurrence
+        ON occurrence.suggestion_id = suggestion.id
+       AND occurrence.created_at = suggestion.created_at
+      LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+      WHERE COALESCE(occurrence.legacy_session_id, input.session_id) IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM suggestion_occurrences AS earlier
+          WHERE earlier.suggestion_id = suggestion.id
+            AND earlier.created_at < occurrence.created_at
+        )
+      GROUP BY suggestion.id
+      HAVING COUNT(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+    )
+    ORDER BY created_at, action_kind, action_id;
+  `);
+
+  db.prepare(
+    `INSERT OR IGNORE INTO action_center_read_state (
+       singleton, last_seen_sequence, updated_at
+     ) SELECT 1, COALESCE(MAX(sequence), 0), ? FROM action_center_events`
+  ).run(migratedAt);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS action_center_delta_todo_occurrence_insert
+    AFTER INSERT ON todo_occurrences
+    WHEN NEW.created_at = (
+      SELECT created_at FROM todos_v2 WHERE id = NEW.todo_instance_id
+    )
+      AND COALESCE(
+        NEW.legacy_session_id,
+        (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+      ) IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM todo_occurrences AS earlier
+        WHERE earlier.todo_instance_id = NEW.todo_instance_id
+          AND earlier.created_at < NEW.created_at
+      )
+    BEGIN
+      INSERT OR IGNORE INTO action_center_events (
+        action_kind, action_id, session_id, created_at
+      ) VALUES (
+        'todo',
+        NEW.todo_instance_id,
+        COALESCE(
+          NEW.legacy_session_id,
+          (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+        ),
+        NEW.created_at
+      );
+      DELETE FROM action_center_events
+      WHERE action_kind = 'todo'
+        AND action_id = NEW.todo_instance_id
+        AND EXISTS (
+          SELECT 1
+          FROM todo_occurrences AS peer
+          LEFT JOIN analysis_inputs AS peer_input ON peer_input.id = peer.analysis_input_id
+          WHERE peer.todo_instance_id = NEW.todo_instance_id
+            AND peer.created_at = NEW.created_at
+            AND COALESCE(peer.legacy_session_id, peer_input.session_id) IS NOT COALESCE(
+              NEW.legacy_session_id,
+              (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+            )
+        );
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS action_center_delta_suggestion_occurrence_insert
+    AFTER INSERT ON suggestion_occurrences
+    WHEN NEW.created_at = (
+      SELECT created_at FROM suggestions_v2 WHERE id = NEW.suggestion_id
+    )
+      AND COALESCE(
+        NEW.legacy_session_id,
+        (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+      ) IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM suggestion_occurrences AS earlier
+        WHERE earlier.suggestion_id = NEW.suggestion_id
+          AND earlier.created_at < NEW.created_at
+      )
+    BEGIN
+      INSERT OR IGNORE INTO action_center_events (
+        action_kind, action_id, session_id, created_at
+      ) VALUES (
+        'suggestion',
+        NEW.suggestion_id,
+        COALESCE(
+          NEW.legacy_session_id,
+          (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+        ),
+        NEW.created_at
+      );
+      DELETE FROM action_center_events
+      WHERE action_kind = 'suggestion'
+        AND action_id = NEW.suggestion_id
+        AND EXISTS (
+          SELECT 1
+          FROM suggestion_occurrences AS peer
+          LEFT JOIN analysis_inputs AS peer_input ON peer_input.id = peer.analysis_input_id
+          WHERE peer.suggestion_id = NEW.suggestion_id
+            AND peer.created_at = NEW.created_at
+            AND COALESCE(peer.legacy_session_id, peer_input.session_id) IS NOT COALESCE(
+              NEW.legacy_session_id,
+              (SELECT session_id FROM analysis_inputs WHERE id = NEW.analysis_input_id)
+            )
+        );
+    END;
+  `);
+}
+
+function upgradeSessionReprocessingV50(db) {
+  const hasReprocessing = tableExists(db, "session_reprocessing_state");
+  const hasSummaryRefresh = tableExists(db, "session_summary_refresh_state");
+  const reprocessingColumns = hasReprocessing
+    ? columns(db, "session_reprocessing_state")
+    : new Set();
+  const summarySql = hasSummaryRefresh
+    ? db
+        .prepare(
+          `SELECT sql FROM sqlite_master
+           WHERE type = 'table' AND name = 'session_summary_refresh_state'`
+        )
+        .get()?.sql
+    : null;
+  const rebuildReprocessing =
+    !reprocessingColumns.has("baseline_content_sha256") ||
+    !reprocessingColumns.has("baseline_identity_sha256") ||
+    !reprocessingColumns.has("baseline_classification_sha256");
+  const rebuildSummary =
+    typeof summarySql !== "string" || !summarySql.includes("activity_classification_changed");
+  if (!rebuildReprocessing && !rebuildSummary) return;
+
+  const reprocessingRows =
+    rebuildReprocessing && hasReprocessing
+      ? db.prepare("SELECT * FROM session_reprocessing_state ORDER BY session_id").all()
+      : [];
+  const summaryRows =
+    rebuildSummary && hasSummaryRefresh
+      ? db.prepare("SELECT * FROM session_summary_refresh_state ORDER BY session_id").all()
+      : [];
+  if (rebuildReprocessing && hasReprocessing) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_session_reprocessing_active;
+      ALTER TABLE session_reprocessing_state RENAME TO session_reprocessing_state_v49;
+    `);
+  }
+  if (rebuildSummary && hasSummaryRefresh) {
+    db.exec(`
+      DROP INDEX IF EXISTS idx_summary_refresh_recommended;
+      ALTER TABLE session_summary_refresh_state RENAME TO session_summary_refresh_state_v49;
+    `);
+  }
+  db.exec(HYBRID_DIARIZATION_HISTORY_SCHEMA);
+
+  if (rebuildSummary) {
+    const insertSummary = db.prepare(`
+      INSERT INTO session_summary_refresh_state (
+        session_id, basis_policy_id, latest_policy_id, recommended, reason, updated_at
+      ) VALUES (
+        @session_id, @basis_policy_id, @latest_policy_id, @recommended, @reason, @updated_at
+      )
+    `);
+    for (const row of summaryRows) insertSummary.run(row);
+    if (hasSummaryRefresh) db.exec("DROP TABLE session_summary_refresh_state_v49");
+  }
+  if (rebuildReprocessing) {
+    const insertReprocessing = db.prepare(`
+      INSERT INTO session_reprocessing_state (
+        session_id, policy_id, mode, state, started_at, completed_at,
+        baseline_content_sha256, baseline_identity_sha256,
+        baseline_classification_sha256
+      ) VALUES (
+        @sessionId, @policyId, @mode, @state, @startedAt, @completedAt,
+        @contentSha256, @identitySha256, @classificationSha256
+      )
+    `);
+    for (const row of reprocessingRows) {
+      insertReprocessing.run({
+        sessionId: row.session_id,
+        policyId: row.policy_id,
+        mode: row.mode,
+        state: row.state,
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        ...computeSessionSemanticHashes(db, row.session_id),
+      });
+    }
+    if (hasReprocessing) db.exec("DROP TABLE session_reprocessing_state_v49");
+  }
+}
+
+function upgradeTodoTrustV51(db) {
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "trust_policy_id TEXT NOT NULL DEFAULT 'legacy-unverified-v1' CHECK(typeof(trust_policy_id) = 'text' AND length(trim(trust_policy_id)) BETWEEN 1 AND 128)"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "trust_snapshot_state TEXT NOT NULL DEFAULT 'legacy_unverified' CHECK(trust_snapshot_state IN ('captured','legacy_unverified','user_override'))"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "application_snapshot_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(application_snapshot_json) AND json_type(application_snapshot_json) = 'array')"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "activity_snapshot_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(activity_snapshot_json) AND json_type(activity_snapshot_json) = 'array')"
+  );
+  for (const column of [
+    "semantic_confidence_snapshot",
+    "voiceprint_confidence_snapshot",
+    "scene_confidence_snapshot",
+    "transcript_context_confidence_snapshot",
+  ]) {
+    addColumn(
+      db,
+      "todo_verification_decisions",
+      `${column} REAL CHECK(${column} IS NULL OR (typeof(${column}) IN ('integer','real') AND ${column} BETWEEN 0 AND 1))`
+    );
+  }
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "automatic_eligible INTEGER NOT NULL DEFAULT 0 CHECK(automatic_eligible IN (0,1))"
+  );
+
+  db.exec(`
+    DROP VIEW IF EXISTS todo_effective_verification;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_strict_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_immutable_update;
+
+    CREATE TRIGGER todo_verification_decisions_trust_shape_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.automatic_eligible = 1 AND NOT (
+      NEW.actor = 'system'
+      AND NEW.state = 'confirmed'
+      AND NEW.reason = 'strict_self_commitment'
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+      AND json_array_length(NEW.application_snapshot_json) > 0
+      AND json_array_length(NEW.activity_snapshot_json) > 0
+      AND NEW.semantic_confidence_snapshot >= 0.9
+      AND NEW.voiceprint_confidence_snapshot >= 0.9
+      AND NEW.scene_confidence_snapshot >= 0.9
+      AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is invalid');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_strict_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.actor = 'system' AND NEW.state = 'confirmed' AND NOT (
+      NEW.reason = 'strict_self_commitment'
+      AND NEW.automatic_eligible = 1
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+      AND json_array_length(NEW.application_snapshot_json) > 0
+      AND json_array_length(NEW.activity_snapshot_json) > 0
+      AND NEW.semantic_confidence_snapshot >= 0.9
+      AND NEW.voiceprint_confidence_snapshot >= 0.9
+      AND NEW.scene_confidence_snapshot >= 0.9
+      AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is required');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_trust_immutable_update
+    BEFORE UPDATE OF
+      trust_policy_id, trust_snapshot_state, application_snapshot_json,
+      activity_snapshot_json, semantic_confidence_snapshot,
+      voiceprint_confidence_snapshot, scene_confidence_snapshot,
+      transcript_context_confidence_snapshot, automatic_eligible
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot is immutable');
+    END;
+
+    CREATE VIEW todo_effective_verification AS
+    SELECT decision.*,
+           CASE
+             WHEN decision.actor = 'user' THEN decision.state
+             WHEN decision.state = 'confirmed'
+              AND decision.reason = 'strict_self_commitment'
+              AND decision.trust_snapshot_state = 'captured'
+              AND decision.automatic_eligible = 1
+              AND decision.semantic_confidence_snapshot >= 0.9
+              AND decision.voiceprint_confidence_snapshot >= 0.9
+              AND decision.scene_confidence_snapshot >= 0.9
+             THEN 'confirmed'
+             WHEN decision.state = 'confirmed' THEN 'pending_confirmation'
+             ELSE decision.state
+           END AS effective_state
+    FROM todo_verification_decisions AS decision
+    WHERE decision.id = (
+      SELECT latest.id
+      FROM todo_verification_decisions AS latest
+      WHERE latest.todo_instance_id = decision.todo_instance_id
+      ORDER BY latest.occurred_at DESC, latest.id DESC
+      LIMIT 1
+    );
+  `);
+}
+
+function upgradeLearningGoalsV52(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS learning_goals (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text' AND length(trim(id)) BETWEEN 1 AND 128
+      ),
+      title TEXT NOT NULL CHECK(
+        typeof(title) = 'text' AND length(trim(title)) BETWEEN 1 AND 500
+      ),
+      normalized_title TEXT NOT NULL CHECK(
+        typeof(normalized_title) = 'text' AND length(trim(normalized_title)) BETWEEN 1 AND 500
+      ),
+      state TEXT NOT NULL CHECK(state IN ('confirmed','archived','deleted')),
+      created_at INTEGER NOT NULL CHECK(
+        typeof(created_at) = 'integer' AND created_at >= 0
+      ),
+      updated_at INTEGER NOT NULL CHECK(
+        typeof(updated_at) = 'integer' AND updated_at >= created_at
+      ),
+      confirmed_at INTEGER NOT NULL CHECK(
+        typeof(confirmed_at) = 'integer' AND confirmed_at >= created_at
+      ),
+      archived_at INTEGER CHECK(
+        archived_at IS NULL OR (typeof(archived_at) = 'integer' AND archived_at >= confirmed_at)
+      ),
+      deleted_at INTEGER CHECK(
+        deleted_at IS NULL OR (typeof(deleted_at) = 'integer' AND deleted_at >= confirmed_at)
+      ),
+      CHECK((state = 'archived') = (archived_at IS NOT NULL)),
+      CHECK((state = 'deleted') = (deleted_at IS NOT NULL))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_learning_goals_active_title
+      ON learning_goals(normalized_title) WHERE state <> 'deleted';
+    CREATE INDEX IF NOT EXISTS idx_learning_goals_state_updated
+      ON learning_goals(state, updated_at DESC, id);
+
+    CREATE TABLE IF NOT EXISTS learning_goal_events (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text' AND length(trim(id)) BETWEEN 1 AND 128
+      ),
+      learning_goal_id TEXT NOT NULL REFERENCES learning_goals(id) ON DELETE RESTRICT,
+      action TEXT NOT NULL CHECK(action IN ('created','edited','archived','restored','deleted')),
+      previous_json TEXT CHECK(
+        previous_json IS NULL OR (json_valid(previous_json) AND json_type(previous_json) = 'object')
+      ),
+      next_json TEXT NOT NULL CHECK(
+        json_valid(next_json) AND json_type(next_json) = 'object'
+      ),
+      actor TEXT NOT NULL CHECK(actor = 'user'),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_learning_goal_events_goal_time
+      ON learning_goal_events(learning_goal_id, occurred_at, id);
+
+    CREATE TRIGGER IF NOT EXISTS learning_goal_events_immutable_update
+    BEFORE UPDATE ON learning_goal_events
+    BEGIN
+      SELECT RAISE(ABORT, 'learning goal events are immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS learning_goal_events_immutable_delete
+    BEFORE DELETE ON learning_goal_events
+    BEGIN
+      SELECT RAISE(ABORT, 'learning goal events are immutable');
+    END;
+  `);
+}
+
+function upgradeTodoTrustHardeningV53(db) {
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "speaker_evidence_verified_snapshot INTEGER CHECK(speaker_evidence_verified_snapshot IS NULL OR speaker_evidence_verified_snapshot IN (0,1))"
+  );
+  addColumn(
+    db,
+    "todo_verification_decisions",
+    "overlap_detected_snapshot INTEGER CHECK(overlap_detected_snapshot IS NULL OR overlap_detected_snapshot IN (0,1))"
+  );
+  db.exec(`
+    DROP VIEW IF EXISTS todo_effective_verification;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_strict_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_snapshot_shape_insert;
+    DROP TRIGGER IF EXISTS todo_verification_decisions_trust_immutable_update;
+
+    UPDATE todo_verification_decisions
+    SET trust_policy_id = 'legacy-unverified-v1',
+        trust_snapshot_state = 'legacy_unverified',
+        application_snapshot_json = '[]',
+        activity_snapshot_json = '[]',
+        semantic_confidence_snapshot = NULL,
+        voiceprint_confidence_snapshot = NULL,
+        scene_confidence_snapshot = NULL,
+        transcript_context_confidence_snapshot = NULL,
+        automatic_eligible = 0
+    WHERE trust_snapshot_state = 'captured'
+      AND (
+        speaker_evidence_verified_snapshot IS NULL
+        OR overlap_detected_snapshot IS NULL
+      );
+
+    CREATE TRIGGER todo_verification_decisions_snapshot_shape_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NOT (
+      (
+        NEW.trust_snapshot_state = 'captured'
+        AND NEW.trust_policy_id <> 'legacy-unverified-v1'
+        AND NEW.actor = 'system'
+        AND json_array_length(NEW.application_snapshot_json) BETWEEN 1 AND 100
+        AND json_array_length(NEW.activity_snapshot_json) BETWEEN 1 AND 100
+        AND NEW.semantic_confidence_snapshot >= 0.9
+        AND NEW.voiceprint_confidence_snapshot >= 0.9
+        AND NEW.scene_confidence_snapshot >= 0.9
+        AND NEW.transcript_context_confidence_snapshot IS NOT NULL
+        AND NEW.speaker_evidence_verified_snapshot = 1
+        AND NEW.overlap_detected_snapshot = 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(NEW.application_snapshot_json) AS item
+          WHERE COALESCE(json_type(item.value), 'missing') <> 'object'
+             OR (SELECT COUNT(*) FROM json_each(item.value)) <> 4
+             OR EXISTS (
+               SELECT 1 FROM json_each(item.value) AS field
+               WHERE field.key NOT IN (
+                 'segmentId','applicationKey','sourceAttribution','speakerRelation'
+               )
+             )
+             OR COALESCE(json_type(item.value, '$.segmentId'), 'missing') <> 'text'
+             OR length(json_extract(item.value, '$.segmentId')) NOT BETWEEN 1 AND 128
+             OR json_extract(item.value, '$.segmentId') GLOB '*[^A-Za-z0-9_-]*'
+             OR COALESCE(json_type(item.value, '$.applicationKey'), 'missing')
+                  NOT IN ('null','text')
+             OR (
+               json_type(item.value, '$.applicationKey') = 'text'
+               AND (
+                 length(json_extract(item.value, '$.applicationKey')) NOT BETWEEN 1 AND 64
+                 OR json_extract(item.value, '$.applicationKey') GLOB '*[^a-z0-9._-]*'
+               )
+             )
+             OR COALESCE(json_extract(item.value, '$.sourceAttribution'), '')
+                  NOT IN ('application','microphone','application_and_microphone')
+             OR NOT (
+               json_extract(item.value, '$.speakerRelation') = 'SELF'
+               OR (
+                 substr(json_extract(item.value, '$.speakerRelation'), 1, 1) = 'P'
+                 AND length(json_extract(item.value, '$.speakerRelation')) BETWEEN 2 AND 20
+                 AND substr(json_extract(item.value, '$.speakerRelation'), 2, 1) BETWEEN '1' AND '9'
+                 AND substr(json_extract(item.value, '$.speakerRelation'), 2)
+                       NOT GLOB '*[^0-9]*'
+               )
+             )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM json_each(NEW.activity_snapshot_json) AS item
+          WHERE COALESCE(json_type(item.value), 'missing') <> 'object'
+             OR (SELECT COUNT(*) FROM json_each(item.value)) <> 4
+             OR EXISTS (
+               SELECT 1 FROM json_each(item.value) AS field
+               WHERE field.key NOT IN ('segmentId','category','confidence','decision')
+             )
+             OR COALESCE(json_type(item.value, '$.segmentId'), 'missing') <> 'text'
+             OR length(json_extract(item.value, '$.segmentId')) NOT BETWEEN 1 AND 128
+             OR json_extract(item.value, '$.segmentId') GLOB '*[^A-Za-z0-9_-]*'
+             OR COALESCE(json_extract(item.value, '$.category'), '') NOT IN (
+               'work_meeting','learning','social_call','in_person_conversation'
+             )
+             OR COALESCE(json_type(item.value, '$.confidence'), 'missing')
+                  NOT IN ('integer','real')
+             OR json_extract(item.value, '$.confidence') NOT BETWEEN 0.9 AND 1
+             OR COALESCE(json_extract(item.value, '$.decision'), '') <> 'adopted'
+        )
+        AND (
+          SELECT COUNT(*) FROM json_each(NEW.application_snapshot_json)
+        ) = (
+          SELECT COUNT(DISTINCT json_extract(item.value, '$.segmentId'))
+          FROM json_each(NEW.application_snapshot_json) AS item
+        )
+        AND (
+          SELECT COUNT(*) FROM json_each(NEW.activity_snapshot_json)
+        ) = (
+          SELECT COUNT(DISTINCT json_extract(item.value, '$.segmentId'))
+          FROM json_each(NEW.activity_snapshot_json) AS item
+        )
+        AND NOT EXISTS (
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.application_snapshot_json) AS item
+          EXCEPT
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.activity_snapshot_json) AS item
+        )
+        AND NOT EXISTS (
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.activity_snapshot_json) AS item
+          EXCEPT
+          SELECT json_extract(item.value, '$.segmentId')
+          FROM json_each(NEW.application_snapshot_json) AS item
+        )
+        AND (
+          (
+            NEW.automatic_eligible = 1
+            AND NEW.state = 'confirmed'
+            AND NEW.reason = 'strict_self_commitment'
+            AND NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') <> 'SELF'
+            )
+          )
+          OR (
+            NEW.automatic_eligible = 0
+            AND NEW.state = 'pending_confirmation'
+            AND NEW.reason = 'assigned_and_accepted'
+            AND EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') = 'SELF'
+            )
+            AND EXISTS (
+              SELECT 1 FROM json_each(NEW.application_snapshot_json) AS item
+              WHERE json_extract(item.value, '$.speakerRelation') GLOB 'P*'
+            )
+          )
+        )
+      )
+      OR (
+        NEW.trust_snapshot_state IN ('legacy_unverified','user_override')
+        AND json_array_length(NEW.application_snapshot_json) = 0
+        AND json_array_length(NEW.activity_snapshot_json) = 0
+        AND NEW.semantic_confidence_snapshot IS NULL
+        AND NEW.voiceprint_confidence_snapshot IS NULL
+        AND NEW.scene_confidence_snapshot IS NULL
+        AND NEW.transcript_context_confidence_snapshot IS NULL
+        AND NEW.speaker_evidence_verified_snapshot IS NULL
+        AND NEW.overlap_detected_snapshot IS NULL
+        AND NEW.automatic_eligible = 0
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot shape is invalid');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_strict_insert
+    BEFORE INSERT ON todo_verification_decisions
+    WHEN NEW.actor = 'system' AND NEW.state = 'confirmed' AND NOT (
+      NEW.reason = 'strict_self_commitment'
+      AND NEW.automatic_eligible = 1
+      AND NEW.trust_snapshot_state = 'captured'
+      AND NEW.speaker_evidence_verified_snapshot = 1
+      AND NEW.overlap_detected_snapshot = 0
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'strict todo trust snapshot is required');
+    END;
+
+    CREATE TRIGGER todo_verification_decisions_trust_immutable_update
+    BEFORE UPDATE OF
+      trust_policy_id, trust_snapshot_state, application_snapshot_json,
+      activity_snapshot_json, semantic_confidence_snapshot,
+      voiceprint_confidence_snapshot, scene_confidence_snapshot,
+      transcript_context_confidence_snapshot, automatic_eligible,
+      speaker_evidence_verified_snapshot, overlap_detected_snapshot
+    ON todo_verification_decisions
+    BEGIN
+      SELECT RAISE(ABORT, 'todo verification trust snapshot is immutable');
+    END;
+
+    CREATE VIEW todo_effective_verification AS
+    SELECT decision.*,
+           CASE
+             WHEN decision.actor = 'user' THEN decision.state
+             WHEN decision.state = 'confirmed'
+              AND decision.reason = 'strict_self_commitment'
+              AND decision.trust_snapshot_state = 'captured'
+              AND decision.automatic_eligible = 1
+              AND decision.semantic_confidence_snapshot >= 0.9
+              AND decision.voiceprint_confidence_snapshot >= 0.9
+              AND decision.scene_confidence_snapshot >= 0.9
+              AND decision.speaker_evidence_verified_snapshot = 1
+              AND decision.overlap_detected_snapshot = 0
+             THEN 'confirmed'
+             WHEN decision.state = 'confirmed' THEN 'pending_confirmation'
+             ELSE decision.state
+           END AS effective_state
+    FROM todo_verification_decisions AS decision
+    WHERE decision.id = (
+      SELECT latest.id
+      FROM todo_verification_decisions AS latest
+      WHERE latest.todo_instance_id = decision.todo_instance_id
+      ORDER BY latest.occurred_at DESC, latest.id DESC
+      LIMIT 1
+    );
+  `);
+}
+
+function upgradeKnowledgeActionLifecycleV54(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge_action_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      command_id TEXT NOT NULL UNIQUE CHECK(
+        typeof(command_id) = 'text'
+        AND length(command_id) BETWEEN 1 AND 192
+        AND substr(command_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND command_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      schema_version INTEGER NOT NULL CHECK(
+        typeof(schema_version) = 'integer' AND schema_version = 1
+      ),
+      command_fingerprint TEXT NOT NULL CHECK(
+        typeof(command_fingerprint) = 'text'
+        AND length(command_fingerprint) = 64
+        AND command_fingerprint NOT GLOB '*[^0-9a-f]*'
+      ),
+      action_type TEXT NOT NULL CHECK(
+        typeof(action_type) = 'text'
+        AND action_type IN (
+          'manual_create','transcript_create','todo_dismiss','todo_restore',
+          'suggestion_dismiss','suggestion_restore','suggestion_accept',
+          'suggestion_accept_undo','todo_pin','todo_unpin','urgency_set',
+          'title_due_edit'
+        )
+      ),
+      entity_kind TEXT NOT NULL CHECK(
+        typeof(entity_kind) = 'text' AND entity_kind IN ('todo','suggestion')
+      ),
+      entity_id TEXT NOT NULL CHECK(
+        typeof(entity_id) = 'text'
+        AND length(entity_id) BETWEEN 1 AND 192
+        AND substr(entity_id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND entity_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      payload_json TEXT NOT NULL CHECK(
+        typeof(payload_json) = 'text'
+        AND length(payload_json) BETWEEN 2 AND 32768
+        AND json_valid(payload_json)
+        AND json_type(payload_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      ),
+      CHECK(
+        (entity_kind = 'suggestion' AND action_type IN (
+          'suggestion_dismiss','suggestion_restore','suggestion_accept',
+          'suggestion_accept_undo'
+        ))
+        OR
+        (entity_kind = 'todo' AND action_type IN (
+          'manual_create','transcript_create','todo_dismiss','todo_restore',
+          'todo_pin','todo_unpin','urgency_set','title_due_edit'
+        ))
+      )
+    );
+    CREATE INDEX IF NOT EXISTS idx_knowledge_action_events_entity_sequence
+    ON knowledge_action_events(entity_kind, entity_id, sequence DESC);
+
+    CREATE TABLE IF NOT EXISTS todo_action_metadata (
+      todo_instance_id TEXT PRIMARY KEY REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      source_kind TEXT NOT NULL CHECK(
+        typeof(source_kind) = 'text'
+        AND source_kind IN ('existing','manual','transcript','suggestion')
+      ),
+      source_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL CHECK(
+        source_session_id IS NULL OR (
+          typeof(source_session_id) = 'text'
+          AND length(source_session_id) BETWEEN 1 AND 192
+          AND substr(source_session_id, 1, 1) GLOB '[A-Za-z0-9]'
+          AND source_session_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+        )
+      ),
+      pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0,1)),
+      urgency TEXT NOT NULL DEFAULT 'normal' CHECK(urgency IN ('normal','urgent')),
+      user_modified INTEGER NOT NULL DEFAULT 0 CHECK(user_modified IN (0,1)),
+      dismissed_from_verification_state TEXT CHECK(
+        dismissed_from_verification_state IS NULL
+        OR dismissed_from_verification_state IN ('pending_confirmation','confirmed')
+      ),
+      dismiss_reason_code TEXT CHECK(
+        dismiss_reason_code IS NULL OR dismiss_reason_code IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      ),
+      dismiss_local_note TEXT CHECK(
+        dismiss_local_note IS NULL OR (
+          typeof(dismiss_local_note) = 'text'
+          AND length(trim(dismiss_local_note)) BETWEEN 1 AND 500
+          AND instr(dismiss_local_note, char(0)) = 0
+        )
+      ),
+      suppressed INTEGER NOT NULL DEFAULT 0 CHECK(suppressed IN (0,1)),
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0),
+      last_event_sequence INTEGER REFERENCES knowledge_action_events(sequence) ON DELETE RESTRICT,
+      CHECK(source_kind <> 'transcript' OR source_session_id IS NOT NULL),
+      CHECK(source_kind NOT IN ('manual','suggestion') OR source_session_id IS NULL),
+      CHECK(
+        dismiss_reason_code IS NULL OR dismissed_from_verification_state IS NOT NULL
+      ),
+      CHECK(dismiss_local_note IS NULL OR dismiss_reason_code IS NOT NULL)
+    );
+
+    CREATE TABLE IF NOT EXISTS todo_action_segments (
+      todo_instance_id TEXT NOT NULL
+        REFERENCES todo_action_metadata(todo_instance_id) ON DELETE RESTRICT,
+      ordinal INTEGER NOT NULL CHECK(typeof(ordinal) = 'integer' AND ordinal BETWEEN 0 AND 511),
+      segment_id TEXT NOT NULL REFERENCES transcript_segments(id) ON DELETE RESTRICT,
+      PRIMARY KEY(todo_instance_id, ordinal),
+      UNIQUE(todo_instance_id, segment_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS suggestion_action_metadata (
+      suggestion_id TEXT PRIMARY KEY REFERENCES suggestions_v2(id) ON DELETE RESTRICT,
+      effective_state TEXT NOT NULL CHECK(
+        typeof(effective_state) = 'text'
+        AND effective_state IN ('proposed','accepted','dismissed')
+      ),
+      dismiss_reason_code TEXT CHECK(
+        dismiss_reason_code IS NULL OR dismiss_reason_code IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      ),
+      converted_todo_id TEXT REFERENCES todos_v2(id) ON DELETE RESTRICT,
+      acceptance_undone INTEGER NOT NULL DEFAULT 0 CHECK(acceptance_undone IN (0,1)),
+      updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at >= 0),
+      last_event_sequence INTEGER REFERENCES knowledge_action_events(sequence) ON DELETE RESTRICT,
+      CHECK(effective_state = 'dismissed' OR dismiss_reason_code IS NULL),
+      CHECK(
+        acceptance_undone = 0
+        OR (effective_state = 'proposed' AND converted_todo_id IS NOT NULL)
+      ),
+      CHECK(
+        last_event_sequence IS NULL
+        OR effective_state <> 'accepted'
+        OR converted_todo_id IS NOT NULL
+      ),
+      CHECK(
+        last_event_sequence IS NULL
+        OR effective_state <> 'dismissed'
+        OR dismiss_reason_code IS NOT NULL
+      )
+    );
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_validate_payload_insert
+    BEFORE INSERT ON knowledge_action_events
+    WHEN NOT (
+      (
+        NEW.action_type = 'manual_create'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('title','dueText')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+      )
+      OR (
+        NEW.action_type = 'transcript_create'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 4
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json)
+          WHERE key NOT IN ('title','dueText','sessionId','segmentIds')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.sessionId'), 'missing') = 'text'
+        AND length(json_extract(NEW.payload_json, '$.sessionId')) BETWEEN 1 AND 192
+        AND substr(json_extract(NEW.payload_json, '$.sessionId'), 1, 1) GLOB '[A-Za-z0-9]'
+        AND json_extract(NEW.payload_json, '$.sessionId') NOT GLOB '*[^A-Za-z0-9._:-]*'
+        AND COALESCE(json_type(NEW.payload_json, '$.segmentIds'), 'missing') = 'array'
+        AND json_array_length(NEW.payload_json, '$.segmentIds') BETWEEN 1 AND 512
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json, '$.segmentIds') AS segment
+          WHERE segment.type <> 'text'
+             OR length(segment.value) NOT BETWEEN 1 AND 192
+             OR substr(segment.value, 1, 1) NOT GLOB '[A-Za-z0-9]'
+             OR segment.value GLOB '*[^A-Za-z0-9._:-]*'
+        )
+        AND json_array_length(NEW.payload_json, '$.segmentIds') = (
+          SELECT count(DISTINCT segment.value)
+          FROM json_each(NEW.payload_json, '$.segmentIds') AS segment
+        )
+      )
+      OR (
+        NEW.action_type = 'todo_dismiss'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('reasonCode','localNote')
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.reasonCode'), '') IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.localNote'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.localNote') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.localNote'))) BETWEEN 1 AND 500
+        )
+      )
+      OR (
+        NEW.action_type IN ('todo_restore','todo_pin','todo_unpin')
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 0
+      )
+      OR (
+        NEW.action_type = 'suggestion_dismiss'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key <> 'reasonCode'
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.reasonCode'), '') IN (
+          'not_relevant','already_done','not_mine','wrong_context','low_value','other'
+        )
+      )
+      OR (
+        NEW.action_type IN ('suggestion_restore','suggestion_accept_undo')
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 0
+      )
+      OR (
+        NEW.action_type = 'suggestion_accept'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 3
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('todoId','title','dueText')
+        )
+        AND COALESCE(json_type(NEW.payload_json, '$.todoId'), 'missing') = 'text'
+        AND length(json_extract(NEW.payload_json, '$.todoId')) BETWEEN 1 AND 192
+        AND substr(json_extract(NEW.payload_json, '$.todoId'), 1, 1) GLOB '[A-Za-z0-9]'
+        AND json_extract(NEW.payload_json, '$.todoId') NOT GLOB '*[^A-Za-z0-9._:-]*'
+        AND COALESCE(json_type(NEW.payload_json, '$.title'), 'missing') = 'text'
+        AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+        AND COALESCE(json_type(NEW.payload_json, '$.dueText'), 'missing') IN ('null','text')
+        AND (
+          json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+        )
+      )
+      OR (
+        NEW.action_type = 'urgency_set'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key <> 'urgency'
+        )
+        AND COALESCE(json_extract(NEW.payload_json, '$.urgency'), '') IN ('normal','urgent')
+      )
+      OR (
+        NEW.action_type = 'title_due_edit'
+        AND (SELECT count(*) FROM json_each(NEW.payload_json)) BETWEEN 1 AND 2
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN ('title','dueText')
+        )
+        AND (
+          json_type(NEW.payload_json, '$.title') IS NULL
+          OR (
+            json_type(NEW.payload_json, '$.title') = 'text'
+            AND length(trim(json_extract(NEW.payload_json, '$.title'))) BETWEEN 1 AND 512
+          )
+        )
+        AND (
+          json_type(NEW.payload_json, '$.dueText') IS NULL
+          OR json_type(NEW.payload_json, '$.dueText') = 'null'
+          OR (
+            json_type(NEW.payload_json, '$.dueText') = 'text'
+            AND length(trim(json_extract(NEW.payload_json, '$.dueText'))) BETWEEN 1 AND 256
+          )
+        )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event payload is invalid');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_immutable_update
+    BEFORE UPDATE ON knowledge_action_events
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS knowledge_action_events_immutable_delete
+    BEFORE DELETE ON knowledge_action_events
+    BEGIN
+      SELECT RAISE(ABORT, 'knowledge action event is immutable');
+    END;
+  `);
+
+  db.exec(`
+    INSERT OR IGNORE INTO todo_action_metadata (
+      todo_instance_id, source_kind, source_session_id, pinned, urgency,
+      user_modified, dismissed_from_verification_state, dismiss_reason_code,
+      dismiss_local_note, suppressed, updated_at, last_event_sequence
+    )
+    SELECT
+      todo.id,
+      'existing',
+      (
+        SELECT CASE
+          WHEN count(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+          THEN min(COALESCE(occurrence.legacy_session_id, input.session_id))
+          ELSE NULL
+        END
+        FROM todo_occurrences AS occurrence
+        LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+        WHERE occurrence.todo_instance_id = todo.id
+      ),
+      0,
+      'normal',
+      0,
+      NULL,
+      NULL,
+      NULL,
+      CASE WHEN todo.status = 'dismissed' THEN 1 ELSE 0 END,
+      todo.updated_at,
+      NULL
+    FROM todos_v2 AS todo;
+
+    INSERT OR IGNORE INTO suggestion_action_metadata (
+      suggestion_id, effective_state, dismiss_reason_code, converted_todo_id,
+      acceptance_undone, updated_at, last_event_sequence
+    )
+    SELECT
+      suggestion.id,
+      suggestion.state,
+      NULL,
+      acceptance.todo_instance_id,
+      0,
+      suggestion.updated_at,
+      NULL
+    FROM suggestions_v2 AS suggestion
+    LEFT JOIN suggestion_acceptances AS acceptance
+      ON acceptance.suggestion_id = suggestion.id;
+
+    WITH stable_segments AS (
+      SELECT DISTINCT
+        occurrence.todo_instance_id AS todo_instance_id,
+        evidence.transcript_segment_id AS segment_id
+      FROM todo_occurrences AS occurrence
+      JOIN evidence_refs AS evidence
+        ON evidence.entity_type = 'todo_occurrence'
+       AND evidence.entity_id = occurrence.id
+    ), ranked_segments AS (
+      SELECT
+        stable.todo_instance_id,
+        row_number() OVER (
+          PARTITION BY stable.todo_instance_id
+          ORDER BY segment.started_at, segment.ended_at, stable.segment_id
+        ) - 1 AS ordinal,
+        stable.segment_id
+      FROM stable_segments AS stable
+      JOIN transcript_segments AS segment ON segment.id = stable.segment_id
+    )
+    INSERT OR IGNORE INTO todo_action_segments (todo_instance_id, ordinal, segment_id)
+    SELECT todo_instance_id, ordinal, segment_id
+    FROM ranked_segments
+    WHERE ordinal < 512;
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_validate_insert
+    BEFORE INSERT ON todo_action_metadata
+    WHEN NOT (
+      (
+        NEW.source_kind = 'existing'
+        AND NEW.last_event_sequence IS NULL
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM knowledge_action_events AS event
+        WHERE event.sequence = NEW.last_event_sequence
+          AND event.occurred_at = NEW.updated_at
+          AND NOT EXISTS (
+            SELECT 1 FROM knowledge_action_events AS later
+            WHERE later.entity_kind = event.entity_kind
+              AND later.entity_id = event.entity_id
+              AND later.sequence > event.sequence
+          )
+          AND (
+            (
+              NEW.source_kind = 'manual'
+              AND event.action_type = 'manual_create'
+              AND event.entity_kind = 'todo'
+              AND event.entity_id = NEW.todo_instance_id
+              AND NEW.source_session_id IS NULL
+            )
+            OR (
+              NEW.source_kind = 'transcript'
+              AND event.action_type = 'transcript_create'
+              AND event.entity_kind = 'todo'
+              AND event.entity_id = NEW.todo_instance_id
+              AND NEW.source_session_id = json_extract(event.payload_json, '$.sessionId')
+            )
+            OR (
+              NEW.source_kind = 'suggestion'
+              AND event.action_type = 'suggestion_accept'
+              AND event.entity_kind = 'suggestion'
+              AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+              AND NEW.source_session_id IS NULL
+            )
+          )
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata source event is invalid');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_immutable_identity
+    BEFORE UPDATE OF todo_instance_id, source_kind, source_session_id ON todo_action_metadata
+    WHEN
+      NEW.todo_instance_id IS NOT OLD.todo_instance_id
+      OR NEW.source_kind IS NOT OLD.source_kind
+      OR (
+        NEW.source_session_id IS NOT OLD.source_session_id
+        AND NOT (
+          OLD.source_session_id IS NOT NULL
+          AND NEW.source_session_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM sessions WHERE id = OLD.source_session_id
+          )
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata source is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_no_delete
+    BEFORE DELETE ON todo_action_metadata
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata cannot be deleted');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_validate_insert
+    BEFORE INSERT ON todo_action_segments
+    WHEN EXISTS (
+      SELECT 1
+      FROM todo_action_metadata AS metadata
+      WHERE metadata.todo_instance_id = NEW.todo_instance_id
+        AND metadata.source_kind = 'transcript'
+        AND metadata.last_event_sequence IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM knowledge_action_events AS event
+          WHERE event.sequence = metadata.last_event_sequence
+            AND event.action_type = 'transcript_create'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND json_extract(event.payload_json, '$.segmentIds[' || NEW.ordinal || ']') = NEW.segment_id
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment does not match its creation event');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_immutable_update
+    BEFORE UPDATE ON todo_action_segments
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment is immutable');
+    END;
+    CREATE TRIGGER IF NOT EXISTS todo_action_segments_immutable_delete
+    BEFORE DELETE ON todo_action_segments
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action segment is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_validate_insert
+    BEFORE INSERT ON suggestion_action_metadata
+    WHEN NEW.last_event_sequence IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata must begin from projected state');
+    END;
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_no_delete
+    BEFORE DELETE ON suggestion_action_metadata
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata cannot be deleted');
+    END;
+  `);
+
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS todo_action_metadata_require_latest_event
+    BEFORE UPDATE OF
+      pinned, urgency, user_modified, dismissed_from_verification_state,
+      dismiss_reason_code, dismiss_local_note, suppressed, updated_at,
+      last_event_sequence
+    ON todo_action_metadata
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM knowledge_action_events AS event
+      WHERE event.sequence = NEW.last_event_sequence
+        AND event.sequence > COALESCE(OLD.last_event_sequence, 0)
+        AND event.occurred_at = NEW.updated_at
+        AND NEW.updated_at >= OLD.updated_at
+        AND event.sequence = (
+          SELECT max(peer.sequence)
+          FROM knowledge_action_events AS peer
+          WHERE (
+            peer.entity_kind = 'todo' AND peer.entity_id = NEW.todo_instance_id
+          ) OR (
+            NEW.source_kind = 'suggestion'
+            AND peer.entity_kind = 'suggestion'
+            AND (
+              json_extract(peer.payload_json, '$.todoId') = NEW.todo_instance_id
+              OR EXISTS (
+                SELECT 1 FROM suggestion_acceptances AS acceptance
+                WHERE acceptance.suggestion_id = peer.entity_id
+                  AND acceptance.todo_instance_id = NEW.todo_instance_id
+              )
+            )
+          )
+        )
+        AND (
+          (
+            event.action_type = 'todo_dismiss'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND OLD.suppressed = 0
+            AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS NOT NULL
+            AND NEW.dismiss_reason_code = json_extract(event.payload_json, '$.reasonCode')
+            AND NEW.dismiss_local_note IS json_extract(event.payload_json, '$.localNote')
+          )
+          OR (
+            event.action_type = 'todo_restore'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND OLD.suppressed = 0
+            AND OLD.dismissed_from_verification_state IS NOT NULL
+            AND OLD.dismiss_reason_code IS NOT NULL
+            AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+          OR (
+            event.action_type = 'todo_pin'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND OLD.pinned = 0 AND NEW.pinned = 1
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'todo_unpin'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND OLD.pinned = 1 AND NEW.pinned = 0
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'urgency_set'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND NEW.urgency = json_extract(event.payload_json, '$.urgency')
+            AND NEW.urgency <> OLD.urgency
+            AND NEW.pinned = OLD.pinned
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'title_due_edit'
+            AND event.entity_kind = 'todo'
+            AND event.entity_id = NEW.todo_instance_id
+            AND EXISTS (
+              SELECT 1 FROM todos_v2 AS todo
+              WHERE todo.id = NEW.todo_instance_id AND todo.status = 'open'
+            )
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.suppressed = OLD.suppressed
+            AND NEW.user_modified = 1
+            AND NEW.dismissed_from_verification_state IS OLD.dismissed_from_verification_state
+            AND NEW.dismiss_reason_code IS OLD.dismiss_reason_code
+            AND NEW.dismiss_local_note IS OLD.dismiss_local_note
+          )
+          OR (
+            event.action_type = 'suggestion_accept_undo'
+            AND NEW.source_kind = 'suggestion'
+            AND event.entity_kind = 'suggestion'
+            AND EXISTS (
+              SELECT 1 FROM suggestion_acceptances AS acceptance
+              WHERE acceptance.suggestion_id = event.entity_id
+                AND acceptance.todo_instance_id = NEW.todo_instance_id
+            )
+            AND OLD.suppressed = 0 AND NEW.suppressed = 1
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = OLD.user_modified
+            AND NEW.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+          OR (
+            event.action_type = 'suggestion_accept'
+            AND NEW.source_kind = 'suggestion'
+            AND event.entity_kind = 'suggestion'
+            AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+            AND OLD.suppressed = 1 AND NEW.suppressed = 0
+            AND NEW.pinned = OLD.pinned
+            AND NEW.urgency = OLD.urgency
+            AND NEW.user_modified = OLD.user_modified
+            AND OLD.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismissed_from_verification_state = 'confirmed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.dismiss_local_note IS NULL
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo action metadata update requires the latest valid event');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS suggestion_action_metadata_require_latest_event
+    BEFORE UPDATE ON suggestion_action_metadata
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM knowledge_action_events AS event
+      WHERE event.sequence = NEW.last_event_sequence
+        AND event.sequence > COALESCE(OLD.last_event_sequence, 0)
+        AND event.entity_kind = 'suggestion'
+        AND event.entity_id = NEW.suggestion_id
+        AND event.occurred_at = NEW.updated_at
+        AND NEW.updated_at >= OLD.updated_at
+        AND event.sequence = (
+          SELECT max(peer.sequence)
+          FROM knowledge_action_events AS peer
+          WHERE peer.entity_kind = 'suggestion' AND peer.entity_id = NEW.suggestion_id
+        )
+        AND OLD.effective_state = (
+          SELECT suggestion.state FROM suggestions_v2 AS suggestion
+          WHERE suggestion.id = NEW.suggestion_id
+        )
+        AND (
+          (
+            event.action_type = 'suggestion_dismiss'
+            AND OLD.effective_state = 'proposed'
+            AND NEW.effective_state = 'dismissed'
+            AND NEW.dismiss_reason_code = json_extract(event.payload_json, '$.reasonCode')
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.acceptance_undone = OLD.acceptance_undone
+          )
+          OR (
+            event.action_type = 'suggestion_restore'
+            AND OLD.effective_state = 'dismissed'
+            AND NEW.effective_state = 'proposed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.acceptance_undone = OLD.acceptance_undone
+          )
+          OR (
+            event.action_type = 'suggestion_accept'
+            AND OLD.effective_state = 'proposed'
+            AND NEW.effective_state = 'accepted'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id = json_extract(event.payload_json, '$.todoId')
+            AND NEW.acceptance_undone = 0
+          )
+          OR (
+            event.action_type = 'suggestion_accept_undo'
+            AND OLD.effective_state = 'accepted'
+            AND NEW.effective_state = 'proposed'
+            AND NEW.dismiss_reason_code IS NULL
+            AND NEW.converted_todo_id IS OLD.converted_todo_id
+            AND NEW.converted_todo_id IS NOT NULL
+            AND NEW.acceptance_undone = 1
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'suggestion action metadata update requires the latest valid event');
+    END;
+  `);
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS todos_v2_terminal_state;
+    DROP TRIGGER IF EXISTS todos_v2_require_transition;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_insert;
+    DROP TRIGGER IF EXISTS todo_state_transitions_validate_state;
+    DROP TRIGGER IF EXISTS suggestions_v2_terminal_state;
+
+    CREATE TRIGGER todos_v2_terminal_state
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN OLD.status = 'dismissed'
+      AND (
+        NEW.status IS NOT OLD.status
+        OR NEW.completed_at IS NOT OLD.completed_at
+        OR NEW.dismissed_at IS NOT OLD.dismissed_at
+      )
+      AND NOT (
+        NEW.status = 'open'
+        AND NEW.completed_at IS NULL
+        AND NEW.dismissed_at IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM todo_state_transitions AS transition
+          JOIN todo_action_metadata AS metadata
+            ON metadata.todo_instance_id = OLD.id
+          JOIN knowledge_action_events AS event
+            ON event.sequence = metadata.last_event_sequence
+          WHERE transition.todo_instance_id = OLD.id
+            AND transition.id = (
+              SELECT latest.id
+              FROM todo_state_transitions AS latest
+              WHERE latest.todo_instance_id = OLD.id
+              ORDER BY latest.rowid DESC
+              LIMIT 1
+            )
+            AND transition.from_status = 'dismissed'
+            AND transition.to_status = 'open'
+            AND transition.reason = 'user_action'
+            AND transition.actor = 'user'
+            AND transition.source_analysis_input_id IS NULL
+            AND transition.occurred_at = event.occurred_at
+            AND (
+              (
+                event.action_type = 'todo_restore'
+                AND event.entity_kind = 'todo'
+                AND event.entity_id = OLD.id
+              )
+              OR (
+                metadata.source_kind = 'suggestion'
+                AND event.action_type = 'suggestion_accept'
+                AND event.entity_kind = 'suggestion'
+                AND json_extract(event.payload_json, '$.todoId') = OLD.id
+              )
+            )
+            AND event.sequence = (
+              SELECT max(peer.sequence)
+              FROM knowledge_action_events AS peer
+              WHERE (peer.entity_kind = 'todo' AND peer.entity_id = OLD.id)
+                 OR (
+                   metadata.source_kind = 'suggestion'
+                   AND peer.entity_kind = 'suggestion'
+                   AND (
+                     json_extract(peer.payload_json, '$.todoId') = OLD.id
+                     OR EXISTS (
+                       SELECT 1 FROM suggestion_acceptances AS acceptance
+                       WHERE acceptance.suggestion_id = peer.entity_id
+                         AND acceptance.todo_instance_id = OLD.id
+                     )
+                   )
+                 )
+            )
+            AND metadata.suppressed = 0
+            AND (
+              metadata.dismissed_from_verification_state IS NOT NULL
+              OR event.action_type = 'suggestion_accept'
+            )
+            AND metadata.dismiss_reason_code IS NULL
+            AND metadata.dismiss_local_note IS NULL
+            AND NEW.updated_at = max(OLD.updated_at, event.occurred_at)
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'dismissed todo can only be restored by its latest action event');
+    END;
+
+    CREATE TRIGGER todos_v2_require_transition
+    BEFORE UPDATE OF status, completed_at, dismissed_at ON todos_v2
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todo_state_transitions AS transition
+      WHERE transition.todo_instance_id = OLD.id
+        AND transition.id = (
+          SELECT latest.id
+          FROM todo_state_transitions AS latest
+          WHERE latest.todo_instance_id = OLD.id
+          ORDER BY latest.rowid DESC
+          LIMIT 1
+        )
+        AND (
+          (
+            transition.from_status IS NULL
+            AND OLD.status = 'open'
+            AND NEW.status = 'open'
+            AND NEW.completed_at IS NULL
+            AND NEW.dismissed_at IS NULL
+          )
+          OR (
+            transition.from_status = OLD.status
+            AND transition.to_status = NEW.status
+            AND (
+              (
+                NEW.status = 'completed'
+                AND NEW.completed_at = transition.occurred_at
+                AND NEW.dismissed_at IS NULL
+              )
+              OR (
+                NEW.status = 'dismissed'
+                AND NEW.dismissed_at = transition.occurred_at
+                AND NEW.completed_at IS NULL
+              )
+              OR (
+                OLD.status IN ('completed','dismissed')
+                AND NEW.status = 'open'
+                AND NEW.completed_at IS NULL
+                AND NEW.dismissed_at IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state change requires transition history');
+    END;
+
+    CREATE TRIGGER todo_state_transitions_validate_insert
+    BEFORE INSERT ON todo_state_transitions
+    WHEN COALESCE(
+      (
+        (
+          NEW.reason IN ('analysis_created','recurrence')
+          AND NEW.actor = 'system'
+          AND NEW.source_analysis_input_id IS NOT NULL
+          AND NEW.from_status IS NULL
+          AND NEW.to_status = 'open'
+        )
+        OR (
+          NEW.reason IN ('user_action','suggestion_acceptance')
+          AND NEW.actor = 'user'
+          AND NEW.source_analysis_input_id IS NULL
+          AND (
+            (NEW.from_status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+            OR (NEW.from_status = 'completed' AND NEW.to_status = 'open')
+            OR (
+              NEW.reason = 'user_action'
+              AND NEW.from_status = 'dismissed'
+              AND NEW.to_status = 'open'
+              AND EXISTS (
+                SELECT 1
+                FROM todo_action_metadata AS metadata
+                JOIN knowledge_action_events AS event
+                  ON event.sequence = metadata.last_event_sequence
+                WHERE metadata.todo_instance_id = NEW.todo_instance_id
+                  AND metadata.suppressed = 0
+                  AND (
+                    (
+                      event.action_type = 'todo_restore'
+                      AND event.entity_kind = 'todo'
+                      AND event.entity_id = NEW.todo_instance_id
+                    )
+                    OR (
+                      metadata.source_kind = 'suggestion'
+                      AND event.action_type = 'suggestion_accept'
+                      AND event.entity_kind = 'suggestion'
+                      AND json_extract(event.payload_json, '$.todoId') = NEW.todo_instance_id
+                    )
+                  )
+                  AND event.occurred_at = NEW.occurred_at
+                  AND event.sequence = (
+                    SELECT max(peer.sequence)
+                    FROM knowledge_action_events AS peer
+                    WHERE (
+                      peer.entity_kind = 'todo' AND peer.entity_id = NEW.todo_instance_id
+                    ) OR (
+                      metadata.source_kind = 'suggestion'
+                      AND peer.entity_kind = 'suggestion'
+                      AND (
+                        json_extract(peer.payload_json, '$.todoId') = NEW.todo_instance_id
+                        OR EXISTS (
+                          SELECT 1 FROM suggestion_acceptances AS acceptance
+                          WHERE acceptance.suggestion_id = peer.entity_id
+                            AND acceptance.todo_instance_id = NEW.todo_instance_id
+                        )
+                      )
+                    )
+                  )
+              )
+            )
+          )
+        )
+      ),
+      0
+    ) = 0
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition reason contract is invalid');
+    END;
+
+    CREATE TRIGGER todo_state_transitions_validate_state
+    BEFORE INSERT ON todo_state_transitions
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM todos_v2 AS todo
+      WHERE todo.id = NEW.todo_instance_id
+        AND (
+          (
+            NEW.from_status IS NULL
+            AND NEW.to_status = 'open'
+            AND todo.status = 'open'
+          )
+          OR (
+            NEW.from_status = todo.status
+            AND (
+              (todo.status = 'open' AND NEW.to_status IN ('completed','dismissed'))
+              OR (todo.status IN ('completed','dismissed') AND NEW.to_status = 'open')
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'todo state transition is invalid');
+    END;
+
+    CREATE TRIGGER suggestions_v2_terminal_state
+    BEFORE UPDATE OF state, decided_at ON suggestions_v2
+    WHEN OLD.state IN ('accepted','dismissed')
+      AND (NEW.state IS NOT OLD.state OR NEW.decided_at IS NOT OLD.decided_at)
+      AND NOT (
+        NEW.state = 'proposed'
+        AND NEW.decided_at IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM suggestion_action_metadata AS metadata
+          JOIN knowledge_action_events AS event
+            ON event.sequence = metadata.last_event_sequence
+          WHERE metadata.suggestion_id = OLD.id
+            AND metadata.effective_state = 'proposed'
+            AND metadata.dismiss_reason_code IS NULL
+            AND event.entity_kind = 'suggestion'
+            AND event.entity_id = OLD.id
+            AND event.action_type = CASE OLD.state
+              WHEN 'dismissed' THEN 'suggestion_restore'
+              WHEN 'accepted' THEN 'suggestion_accept_undo'
+            END
+            AND event.sequence = (
+              SELECT max(peer.sequence)
+              FROM knowledge_action_events AS peer
+              WHERE peer.entity_kind = 'suggestion' AND peer.entity_id = OLD.id
+            )
+            AND metadata.updated_at = event.occurred_at
+            AND NEW.updated_at = event.occurred_at
+            AND (
+              OLD.state <> 'accepted'
+              OR (
+                metadata.acceptance_undone = 1
+                AND metadata.converted_todo_id IS NOT NULL
+              )
+            )
+        )
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'terminal suggestion can only be restored by its latest action event');
+    END;
+  `);
+}
+
+function upgradePersonalizationFeedbackEventsV55(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS personalization_feedback_events (
+      id TEXT PRIMARY KEY CHECK(
+        typeof(id) = 'text'
+        AND length(id) BETWEEN 1 AND 192
+        AND substr(id, 1, 1) GLOB '[A-Za-z0-9]'
+        AND id NOT GLOB '*[^A-Za-z0-9._:-]*'
+      ),
+      domain TEXT NOT NULL CHECK(domain IN (
+        'activity_classification','suggestion','todo','person'
+      )),
+      source_entity_id TEXT NOT NULL CHECK(
+        typeof(source_entity_id) = 'text'
+        AND length(trim(source_entity_id)) BETWEEN 1 AND 200
+      ),
+      event_state TEXT NOT NULL CHECK(event_state IN ('active','retracted')),
+      original_value TEXT CHECK(
+        original_value IS NULL OR (
+          typeof(original_value) = 'text'
+          AND length(trim(original_value)) BETWEEN 1 AND 200
+        )
+      ),
+      corrected_value TEXT NOT NULL CHECK(
+        typeof(corrected_value) = 'text'
+        AND length(trim(corrected_value)) BETWEEN 1 AND 200
+      ),
+      pattern_key TEXT NOT NULL CHECK(
+        typeof(pattern_key) = 'text'
+        AND length(pattern_key) = 64
+        AND pattern_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      feature_json TEXT NOT NULL CHECK(
+        typeof(feature_json) = 'text'
+        AND json_valid(feature_json)
+        AND json_type(feature_json) = 'object'
+      ),
+      occurred_at INTEGER NOT NULL CHECK(
+        typeof(occurred_at) = 'integer' AND occurred_at >= 0
+      )
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_events_effective
+    ON personalization_feedback_events(
+      domain, pattern_key, source_entity_id, occurred_at DESC, id DESC
+    );
+    CREATE INDEX IF NOT EXISTS idx_personalization_feedback_events_source
+    ON personalization_feedback_events(domain, source_entity_id, occurred_at DESC, id DESC);
+
+    CREATE TRIGGER IF NOT EXISTS personalization_feedback_events_immutable_update
+    BEFORE UPDATE ON personalization_feedback_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback event is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS personalization_feedback_events_immutable_delete
+    BEFORE DELETE ON personalization_feedback_events
+    BEGIN
+      SELECT RAISE(ABORT, 'personalization feedback event is immutable');
+    END;
+  `);
+}
+
+function upgradeKnowledgeActionProjectionBackfillV57(db) {
+  db.exec(`
+    DROP TRIGGER IF EXISTS todo_action_metadata_immutable_identity;
+    DROP TRIGGER IF EXISTS todo_action_metadata_require_latest_event;
+  `);
+  upgradeKnowledgeActionLifecycleV54(db);
+  db.exec(`
+    INSERT OR IGNORE INTO todo_action_metadata (
+      todo_instance_id, source_kind, source_session_id, pinned, urgency,
+      user_modified, dismissed_from_verification_state, dismiss_reason_code,
+      dismiss_local_note, suppressed, updated_at, last_event_sequence
+    )
+    SELECT
+      todo.id,
+      'existing',
+      (
+        SELECT CASE
+          WHEN count(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+          THEN min(COALESCE(occurrence.legacy_session_id, input.session_id))
+          ELSE NULL
+        END
+        FROM todo_occurrences AS occurrence
+        LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+        WHERE occurrence.todo_instance_id = todo.id
+      ),
+      0,
+      'normal',
+      0,
+      NULL,
+      NULL,
+      NULL,
+      CASE WHEN todo.status = 'dismissed' THEN 1 ELSE 0 END,
+      todo.updated_at,
+      NULL
+    FROM todos_v2 AS todo;
+
+    INSERT OR IGNORE INTO suggestion_action_metadata (
+      suggestion_id, effective_state, dismiss_reason_code, converted_todo_id,
+      acceptance_undone, updated_at, last_event_sequence
+    )
+    SELECT
+      suggestion.id,
+      suggestion.state,
+      NULL,
+      acceptance.todo_instance_id,
+      0,
+      suggestion.updated_at,
+      NULL
+    FROM suggestions_v2 AS suggestion
+    LEFT JOIN suggestion_acceptances AS acceptance
+      ON acceptance.suggestion_id = suggestion.id;
+  `);
+
+  const missingProjection = db
+    .prepare(
+      `SELECT
+         (SELECT count(*)
+          FROM todos_v2 AS todo
+          LEFT JOIN todo_action_metadata AS metadata
+            ON metadata.todo_instance_id = todo.id
+          WHERE metadata.todo_instance_id IS NULL) AS todos,
+         (SELECT count(*)
+          FROM suggestions_v2 AS suggestion
+          LEFT JOIN suggestion_action_metadata AS metadata
+            ON metadata.suggestion_id = suggestion.id
+          WHERE metadata.suggestion_id IS NULL) AS suggestions`
+    )
+    .get();
+  if (missingProjection.todos !== 0 || missingProjection.suggestions !== 0) {
+    throw new Error("knowledge action metadata backfill is incomplete");
+  }
+}
+
+function upgradeAnalysisInputV3V58(db) {
+  if (!tableExists(db, "analysis_inputs") || !tableExists(db, "analysis_input_segments")) {
+    throw new Error("analysis input v3 migration requires the v57 lineage schema");
+  }
+
+  const previousLegacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  db.pragma("legacy_alter_table = ON");
+  try {
+    db.exec(`
+      DROP TRIGGER IF EXISTS analysis_inputs_immutable_update;
+      DROP TRIGGER IF EXISTS analysis_inputs_candidate_cas;
+      DROP TRIGGER IF EXISTS analysis_inputs_immutable_delete;
+      ALTER TABLE analysis_inputs RENAME TO analysis_inputs_v57;
+
+      CREATE TABLE analysis_inputs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        transcript_revision TEXT NOT NULL CHECK(
+          typeof(transcript_revision) = 'text' AND length(transcript_revision) = 64
+          AND transcript_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        identity_revision TEXT NOT NULL CHECK(
+          typeof(identity_revision) = 'text' AND length(identity_revision) = 64
+          AND identity_revision NOT GLOB '*[^0-9a-f]*'
+        ),
+        prompt_version TEXT NOT NULL CHECK(
+          typeof(prompt_version) = 'text' AND length(trim(prompt_version)) BETWEEN 1 AND 128
+        ),
+        input_hash TEXT NOT NULL UNIQUE CHECK(
+          typeof(input_hash) = 'text' AND length(input_hash) = 64
+          AND input_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        input_contract_version TEXT NOT NULL CHECK(
+          typeof(input_contract_version) = 'text'
+          AND input_contract_version IN ('jarvis-analysis-input-v2','jarvis-analysis-input-v3')
+        ),
+        redaction_version TEXT NOT NULL CHECK(
+          typeof(redaction_version) = 'text'
+          AND redaction_version = 'jarvis-redaction-v1'
+        ),
+        cloud_payload_json TEXT NOT NULL CHECK(
+          CASE
+            WHEN typeof(cloud_payload_json) = 'text' AND json_valid(cloud_payload_json)
+            THEN COALESCE(
+              json_type(cloud_payload_json) = 'object'
+              AND json_extract(cloud_payload_json, '$.inputVersion') = input_contract_version,
+              0
+            )
+            ELSE 0
+          END
+        ),
+        cloud_payload_bytes INTEGER NOT NULL CHECK(
+          typeof(cloud_payload_bytes) = 'integer'
+          AND cloud_payload_bytes BETWEEN 2 AND 393216
+          AND length(CAST(cloud_payload_json AS BLOB)) = cloud_payload_bytes
+        ),
+        cloud_payload_sha256 TEXT NOT NULL CHECK(
+          typeof(cloud_payload_sha256) = 'text' AND length(cloud_payload_sha256) = 64
+          AND cloud_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        candidate_hash TEXT CHECK(
+          candidate_hash IS NULL OR (
+            typeof(candidate_hash) = 'text' AND length(candidate_hash) = 64
+            AND candidate_hash NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        applied_at INTEGER CHECK(
+          applied_at IS NULL OR (typeof(applied_at) = 'integer' AND applied_at >= 0)
+        ),
+        created_at INTEGER NOT NULL CHECK(typeof(created_at) = 'integer' AND created_at >= 0),
+        CHECK(
+          (candidate_hash IS NULL AND applied_at IS NULL)
+          OR (candidate_hash IS NOT NULL AND applied_at IS NOT NULL)
+        )
+      );
+
+      INSERT INTO analysis_inputs (
+        id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, candidate_hash, applied_at, created_at
+      )
+      SELECT
+        id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, candidate_hash, applied_at, created_at
+      FROM analysis_inputs_v57;
+
+      DROP TABLE analysis_inputs_v57;
+
+      CREATE INDEX idx_analysis_inputs_session_created
+      ON analysis_inputs(session_id, created_at);
+
+      CREATE TRIGGER analysis_inputs_immutable_update
+      BEFORE UPDATE OF id, session_id, transcript_revision, identity_revision, prompt_version,
+        input_hash, input_contract_version, redaction_version, cloud_payload_json,
+        cloud_payload_bytes, cloud_payload_sha256, created_at
+      ON analysis_inputs
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input is immutable');
+      END;
+
+      CREATE TRIGGER analysis_inputs_candidate_cas
+      BEFORE UPDATE OF candidate_hash, applied_at ON analysis_inputs
+      WHEN NOT (
+        OLD.candidate_hash IS NULL AND OLD.applied_at IS NULL
+        AND NEW.candidate_hash IS NOT NULL AND NEW.applied_at IS NOT NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input candidate CAS is invalid');
+      END;
+
+      CREATE TRIGGER analysis_inputs_immutable_delete
+      BEFORE DELETE ON analysis_inputs
+      WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id)
+      BEGIN
+        SELECT RAISE(ABORT, 'analysis input is immutable');
+      END;
+    `);
+  } finally {
+    db.pragma(`legacy_alter_table = ${previousLegacyAlterTable ? "ON" : "OFF"}`);
+  }
+
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `application_key TEXT CHECK(
+      application_key IS NULL OR (
+        typeof(application_key) = 'text'
+        AND length(application_key) BETWEEN 1 AND 64
+        AND substr(application_key, 1, 1) GLOB '[a-z]'
+        AND application_key NOT GLOB '*[^a-z0-9._-]*'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `source_attribution TEXT CHECK(
+      source_attribution IS NULL OR source_attribution IN (
+        'application','microphone','application_and_microphone','mixed_unknown'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_category TEXT CHECK(
+      activity_category IS NULL OR activity_category IN (
+        'work_meeting','learning','social_call','in_person_conversation',
+        'entertainment','gaming','other','unknown'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_confidence REAL CHECK(
+      activity_confidence IS NULL OR (
+        typeof(activity_confidence) IN ('integer','real')
+        AND activity_confidence BETWEEN 0 AND 1
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `activity_decision TEXT CHECK(
+      activity_decision IS NULL OR activity_decision IN ('adopted','tentative','unknown')
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `self_participated INTEGER CHECK(
+      self_participated IS NULL OR (
+        typeof(self_participated) = 'integer' AND self_participated IN (0,1)
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `memory_mode TEXT CHECK(
+      memory_mode IS NULL OR memory_mode IN (
+        'transcript_only','summary_only','interest_only','full'
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `allowed_suggestion_bases_json TEXT CHECK(
+      allowed_suggestion_bases_json IS NULL OR (
+        CASE
+          WHEN typeof(allowed_suggestion_bases_json) = 'text'
+            AND json_valid(allowed_suggestion_bases_json)
+          THEN json_type(allowed_suggestion_bases_json) = 'array'
+            AND json_array_length(allowed_suggestion_bases_json) BETWEEN 0 AND 1
+            AND (
+              json_array_length(allowed_suggestion_bases_json) = 0
+              OR (
+                json_type(allowed_suggestion_bases_json, '$[0]') = 'text'
+                AND json_extract(allowed_suggestion_bases_json, '$[0]') IN (
+                  'work_context','learning_goal','explicit_agreement'
+                )
+              )
+            )
+          ELSE 0
+        END
+      )
+    )`
+  );
+  addColumn(
+    db,
+    "analysis_input_segments",
+    `todo_candidate_allowed INTEGER CHECK(
+      todo_candidate_allowed IS NULL OR (
+        typeof(todo_candidate_allowed) = 'integer' AND todo_candidate_allowed IN (0,1)
+      )
+    )`
+  );
+
+  db.exec(`
+    DROP TRIGGER IF EXISTS analysis_input_segments_validate_context;
+    CREATE TRIGGER analysis_input_segments_validate_context
+    BEFORE INSERT ON analysis_input_segments
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM analysis_inputs AS input
+      WHERE input.id = NEW.analysis_input_id
+        AND (
+          (
+            input.input_contract_version = 'jarvis-analysis-input-v2'
+            AND NEW.application_key IS NULL
+            AND NEW.source_attribution IS NULL
+            AND NEW.activity_category IS NULL
+            AND NEW.activity_confidence IS NULL
+            AND NEW.activity_decision IS NULL
+            AND NEW.self_participated IS NULL
+            AND NEW.memory_mode IS NULL
+            AND NEW.allowed_suggestion_bases_json IS NULL
+            AND NEW.todo_candidate_allowed IS NULL
+          )
+          OR (
+            input.input_contract_version = 'jarvis-analysis-input-v3'
+            AND NEW.source_attribution IS NOT NULL
+            AND NEW.activity_category IS NOT NULL
+            AND NEW.activity_confidence IS NOT NULL
+            AND NEW.activity_decision IS NOT NULL
+            AND NEW.self_participated IS NOT NULL
+            AND NEW.memory_mode IS NOT NULL
+            AND NEW.allowed_suggestion_bases_json IS NOT NULL
+            AND NEW.todo_candidate_allowed IS NOT NULL
+            AND (
+              (
+                NEW.source_attribution IN ('application','application_and_microphone')
+                AND NEW.application_key IS NOT NULL
+              )
+              OR (
+                NEW.source_attribution IN ('microphone','mixed_unknown')
+                AND NEW.application_key IS NULL
+              )
+            )
+          )
+        )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'analysis input segment context is invalid');
+    END;
+  `);
+}
+
+const LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59 = `
+  CREATE TABLE IF NOT EXISTS logical_audio_tracks (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    canonical_track_id TEXT NOT NULL REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    track_kind TEXT NOT NULL CHECK(track_kind IN ('application')),
+    application_key TEXT NOT NULL CHECK(
+      typeof(application_key) = 'text'
+      AND length(application_key) BETWEEN 1 AND 64
+      AND application_key = lower(application_key)
+      AND application_key NOT GLOB '*[^a-z0-9._-]*'
+    ),
+    application_display_name TEXT NOT NULL CHECK(
+      typeof(application_display_name) = 'text'
+      AND length(trim(application_display_name)) BETWEEN 1 AND 80
+    ),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    generation_count INTEGER NOT NULL CHECK(generation_count > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(session_id, application_key),
+    UNIQUE(id, canonical_track_id),
+    CHECK(ended_at IS NULL OR ended_at > started_at)
+  );
+  CREATE INDEX IF NOT EXISTS idx_logical_audio_tracks_session_time
+    ON logical_audio_tracks(session_id, started_at, id);
+
+  CREATE TABLE IF NOT EXISTS logical_audio_track_members (
+    logical_track_id TEXT NOT NULL REFERENCES logical_audio_tracks(id) ON DELETE CASCADE,
+    track_id TEXT NOT NULL UNIQUE REFERENCES audio_tracks(id) ON DELETE CASCADE,
+    capture_generation INTEGER NOT NULL CHECK(capture_generation >= 0),
+    member_index INTEGER NOT NULL CHECK(member_index >= 0),
+    PRIMARY KEY(logical_track_id, track_id),
+    UNIQUE(logical_track_id, member_index)
+  );
+  CREATE INDEX IF NOT EXISTS idx_logical_audio_track_members_track
+    ON logical_audio_track_members(track_id, logical_track_id);
+
+  CREATE TABLE IF NOT EXISTS application_audio_fallback_evidence (
+    interval_id TEXT PRIMARY KEY
+      REFERENCES application_audio_intervals(id) ON DELETE CASCADE,
+    attempted_application_key TEXT CHECK(
+      attempted_application_key IS NULL OR (
+        typeof(attempted_application_key) = 'text'
+        AND length(attempted_application_key) BETWEEN 1 AND 64
+        AND attempted_application_key = lower(attempted_application_key)
+        AND attempted_application_key NOT GLOB '*[^a-z0-9._-]*'
+      )
+    ),
+    attempted_application_display_name TEXT CHECK(
+      attempted_application_display_name IS NULL OR (
+        typeof(attempted_application_display_name) = 'text'
+        AND length(trim(attempted_application_display_name)) BETWEEN 1 AND 80
+      )
+    ),
+    reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 128),
+    failure_code TEXT CHECK(
+      failure_code IS NULL OR (
+        typeof(failure_code) = 'text'
+        AND length(failure_code) BETWEEN 1 AND 128
+        AND failure_code NOT GLOB '*[^A-Za-z0-9_-]*'
+      )
+    ),
+    capture_generation INTEGER NOT NULL CHECK(capture_generation >= 0),
+    created_at INTEGER NOT NULL,
+    CHECK(
+      (attempted_application_key IS NULL) =
+      (attempted_application_display_name IS NULL)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS transcript_words (
+    id TEXT PRIMARY KEY,
+    transcript_segment_id TEXT NOT NULL
+      REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    word TEXT NOT NULL CHECK(length(word) > 0),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    probability REAL CHECK(
+      probability IS NULL OR (
+        typeof(probability) IN ('integer','real') AND probability BETWEEN 0 AND 1
+      )
+    ),
+    created_at INTEGER NOT NULL,
+    UNIQUE(transcript_segment_id, ordinal)
+  );
+  CREATE INDEX IF NOT EXISTS idx_transcript_words_segment_time
+    ON transcript_words(transcript_segment_id, started_at, ended_at, ordinal);
+  CREATE INDEX IF NOT EXISTS idx_transcript_words_chunk_time
+    ON transcript_words(chunk_id, started_at, ended_at, ordinal);
+
+  CREATE TABLE IF NOT EXISTS speaker_cluster_cannot_links (
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    left_cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    right_cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK(reason IN (
+      'simultaneous_turns','separated_overlap_stems','user_split'
+    )),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(run_id, left_cluster_id, right_cluster_id),
+    CHECK(left_cluster_id < right_cluster_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS overlap_stem_evidence (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    cluster_id TEXT REFERENCES speaker_clusters(id) ON DELETE SET NULL,
+    window_index INTEGER NOT NULL CHECK(window_index >= 0),
+    stem_index INTEGER NOT NULL CHECK(stem_index >= 0),
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    path TEXT NOT NULL UNIQUE CHECK(length(trim(path)) > 0),
+    file_sha256 TEXT NOT NULL CHECK(
+      length(file_sha256) = 64 AND file_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    pcm_sha256 TEXT NOT NULL CHECK(
+      length(pcm_sha256) = 64 AND pcm_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    sample_rate INTEGER NOT NULL CHECK(sample_rate = 16000),
+    channels INTEGER NOT NULL CHECK(channels = 1),
+    rms REAL NOT NULL CHECK(typeof(rms) IN ('integer','real') AND rms >= 0),
+    expires_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    transcript_text TEXT,
+    confidence REAL CHECK(
+      confidence IS NULL OR (
+        typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+      )
+    ),
+    created_at INTEGER NOT NULL,
+    UNIQUE(run_id, chunk_id, window_index, stem_index),
+    CHECK(deleted_at IS NULL OR deleted_at >= created_at)
+  );
+  CREATE INDEX IF NOT EXISTS idx_overlap_stem_evidence_run_time
+    ON overlap_stem_evidence(run_id, started_at, ended_at, id);
+  CREATE INDEX IF NOT EXISTS idx_overlap_stem_evidence_expiry
+    ON overlap_stem_evidence(expires_at, deleted_at, id);
+
+  CREATE TABLE IF NOT EXISTS speaker_utterances (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES speaker_diarization_runs(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES audio_chunks(id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL REFERENCES speaker_clusters(id) ON DELETE CASCADE,
+    source_segment_id TEXT REFERENCES transcript_segments(id) ON DELETE CASCADE,
+    stem_id TEXT REFERENCES overlap_stem_evidence(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL CHECK(ended_at > started_at),
+    text TEXT NOT NULL CHECK(length(trim(text)) > 0),
+    confidence REAL CHECK(
+      confidence IS NULL OR (
+        typeof(confidence) IN ('integer','real') AND confidence BETWEEN 0 AND 1
+      )
+    ),
+    overlap_state TEXT NOT NULL CHECK(overlap_state IN ('single','overlap')),
+    evidence_kind TEXT NOT NULL CHECK(
+      evidence_kind IN ('word_alignment','separated_stem')
+    ),
+    created_at INTEGER NOT NULL,
+    CHECK(
+      (evidence_kind = 'word_alignment' AND source_segment_id IS NOT NULL AND stem_id IS NULL)
+      OR
+      (evidence_kind = 'separated_stem' AND stem_id IS NOT NULL)
+    )
+  );
+  CREATE INDEX IF NOT EXISTS idx_speaker_utterances_session_time
+    ON speaker_utterances(session_id, started_at, ended_at, id);
+  CREATE INDEX IF NOT EXISTS idx_speaker_utterances_run_cluster_time
+    ON speaker_utterances(run_id, cluster_id, started_at, id);
+
+  CREATE TABLE IF NOT EXISTS speaker_utterance_words (
+    utterance_id TEXT NOT NULL REFERENCES speaker_utterances(id) ON DELETE CASCADE,
+    transcript_word_id TEXT NOT NULL REFERENCES transcript_words(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    PRIMARY KEY(utterance_id, transcript_word_id),
+    UNIQUE(utterance_id, ordinal)
+  );
+`;
+
+function upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt) {
+  db.exec(LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59);
+  addColumn(
+    db,
+    "transcript_segments",
+    "projection_state TEXT NOT NULL DEFAULT 'visible' CHECK(projection_state IN ('visible','audit_hidden'))"
+  );
+  addColumn(
+    db,
+    "transcript_segments",
+    "projection_reason TEXT CHECK(projection_reason IS NULL OR length(trim(projection_reason)) BETWEEN 1 AND 128)"
+  );
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_transcript_segments_projection
+      ON transcript_segments(session_id, projection_state, started_at, id);
+  `);
+  addColumn(
+    db,
+    "speaker_clusters",
+    "identity_eligible INTEGER NOT NULL DEFAULT 1 CHECK(identity_eligible IN (0,1))"
+  );
+  addColumn(
+    db,
+    "speaker_clusters",
+    "quality_gate_reason TEXT CHECK(quality_gate_reason IS NULL OR length(trim(quality_gate_reason)) BETWEEN 1 AND 128)"
+  );
+  addColumn(
+    db,
+    "speaker_diarization_run_clusters",
+    "identity_eligible INTEGER NOT NULL DEFAULT 1 CHECK(identity_eligible IN (0,1))"
+  );
+  addColumn(
+    db,
+    "speaker_diarization_run_clusters",
+    "quality_gate_reason TEXT CHECK(quality_gate_reason IS NULL OR length(trim(quality_gate_reason)) BETWEEN 1 AND 128)"
+  );
+  db.exec(`
+    UPDATE speaker_clusters
+    SET identity_eligible = CASE
+          WHEN embedding IS NOT NULL
+           AND speech_ms >= 5000
+           AND window_count >= 3
+           AND quality_score >= 0.72
+          THEN 1 ELSE 0 END,
+        quality_gate_reason = CASE
+          WHEN embedding IS NULL THEN 'missing_voice_embedding'
+          WHEN quality_score IS NULL OR quality_score < 0.72 THEN 'low_cluster_consistency'
+          WHEN speech_ms < 5000 THEN 'insufficient_speech'
+          WHEN window_count < 3 THEN 'insufficient_voice_windows'
+          ELSE NULL END;
+    UPDATE speaker_diarization_run_clusters
+    SET identity_eligible = CASE
+          WHEN embedding IS NOT NULL
+           AND speech_ms >= 5000
+           AND window_count >= 3
+           AND quality_score >= 0.72
+          THEN 1 ELSE 0 END,
+        quality_gate_reason = CASE
+          WHEN embedding IS NULL THEN 'missing_voice_embedding'
+          WHEN quality_score IS NULL OR quality_score < 0.72 THEN 'low_cluster_consistency'
+          WHEN speech_ms < 5000 THEN 'insufficient_speech'
+          WHEN window_count < 3 THEN 'insufficient_voice_windows'
+          ELSE NULL END;
+  `);
+  const groups = db
+    .prepare(
+      `SELECT session_id, application_key,
+              min(started_at) AS started_at,
+              max(COALESCE(ended_at, started_at)) AS ended_at,
+              count(*) AS generation_count
+       FROM audio_tracks
+       WHERE track_kind = 'application'
+       GROUP BY session_id, application_key
+       ORDER BY session_id, application_key`
+    )
+    .all();
+  const membersForGroup = db.prepare(
+    `SELECT id, application_display_name, capture_generation, started_at, ended_at
+     FROM audio_tracks
+     WHERE session_id = ? AND application_key = ? AND track_kind = 'application'
+     ORDER BY capture_generation, started_at, id`
+  );
+  const insertLogical = db.prepare(
+    `INSERT OR REPLACE INTO logical_audio_tracks (
+       id, session_id, canonical_track_id, track_kind, application_key,
+       application_display_name, started_at, ended_at, generation_count,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, 'application', ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const deleteMembers = db.prepare(
+    "DELETE FROM logical_audio_track_members WHERE logical_track_id = ?"
+  );
+  const insertMember = db.prepare(
+    `INSERT INTO logical_audio_track_members (
+       logical_track_id, track_id, capture_generation, member_index
+     ) VALUES (?, ?, ?, ?)`
+  );
+  for (const group of groups) {
+    const members = membersForGroup.all(group.session_id, group.application_key);
+    if (members.length === 0) continue;
+    const logicalId = `logical_${canonicalTupleHash([
+      "application_audio",
+      group.session_id,
+      group.application_key,
+    ]).slice(0, 48)}`;
+    const canonical = members[0];
+    const latestEndedAt = members.some((member) => member.ended_at === null)
+      ? null
+      : Math.max(...members.map((member) => member.ended_at));
+    const endedAt = latestEndedAt !== null && latestEndedAt > group.started_at ? latestEndedAt : null;
+    insertLogical.run(
+      logicalId,
+      group.session_id,
+      canonical.id,
+      group.application_key,
+      canonical.application_display_name,
+      group.started_at,
+      endedAt,
+      members.length,
+      migratedAt,
+      migratedAt
+    );
+    deleteMembers.run(logicalId);
+    members.forEach((member, index) => {
+      insertMember.run(logicalId, member.id, member.capture_generation, index);
+    });
+  }
+}
+
+function upgradeNoSpeechTranscriptProjectionV60(db) {
+  if (!tableExists(db, "transcript_segments") || !tableExists(db, "audio_chunks")) return;
+  const segmentColumns = columns(db, "transcript_segments");
+  const chunkColumns = columns(db, "audio_chunks");
+  if (
+    !segmentColumns.has("projection_state") ||
+    !segmentColumns.has("projection_reason") ||
+    !chunkColumns.has("transcription_status")
+  ) {
+    return;
+  }
+  db.prepare(
+    `UPDATE transcript_segments AS segment
+     SET projection_state = 'audit_hidden',
+         projection_reason = 'latest_transcription_no_speech'
+     WHERE segment.result_kind = 'final'
+       AND segment.projection_state = 'visible'
+       AND segment.chunk_id IS NOT NULL
+       AND EXISTS (
+         SELECT 1 FROM audio_chunks AS chunk
+         WHERE chunk.id = segment.chunk_id
+           AND chunk.transcription_status = 'no_speech'
+       )`
+  ).run();
+}
+
 function applyJarvisMigrations(db, { now = Date.now } = {}) {
   const fromVersion = db.pragma("user_version", { simple: true });
   if (fromVersion >= TARGET_VERSION) {
@@ -6057,10 +9816,19 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
     fromVersion < 34 &&
     typeof budgetPriceSql === "string" &&
     !budgetPriceSql.includes("activity_classification");
+  const rebuildsEncryptedDiarizationEvidence =
+    fromVersion < 35 &&
+    tableExists(db, "speaker_diarization_run_clusters") &&
+    tableExists(db, "speaker_turns");
+  const rebuildsHybridDiarization = fromVersion < 36 && tableExists(db, "speaker_diarization_runs");
+  const rebuildsAnalysisInputV3 = fromVersion < 58;
   const rebuildsReferencedSchema =
     rebuildsTranscriptSegments ||
     rebuildsApplicationAudioTracks ||
-    rebuildsAnalysisBudgetPrices;
+    rebuildsAnalysisBudgetPrices ||
+    rebuildsEncryptedDiarizationEvidence ||
+    rebuildsHybridDiarization ||
+    rebuildsAnalysisInputV3;
   const foreignKeysWereEnabled = db.pragma("foreign_keys", { simple: true }) === 1;
   if (rebuildsReferencedSchema && db.inTransaction) {
     throw new Error("referenced schema migration must own the outer transaction");
@@ -6325,6 +10093,85 @@ function applyJarvisMigrations(db, { now = Date.now } = {}) {
       if (fromVersion < 34) {
         upgradePhase2IntelligenceV34(db);
       }
+      if (fromVersion < 35) {
+        upgradeEncryptedDiarizationEvidenceV35(db);
+      }
+      if (fromVersion < 36) {
+        upgradeHybridDiarizationV36(db);
+      }
+      if (fromVersion < 37) {
+        upgradeSpeakerSchedulingV37(db, migratedAt);
+      }
+      if (fromVersion < 38) {
+        upgradeRuntimeStatusIndexesV38(db);
+      }
+      if (fromVersion < 39) {
+        upgradePrimarySpeakerSchedulingV39(db, migratedAt);
+      }
+      if (fromVersion < 40) {
+        upgradeSpeakerCompletionSchedulingV40(db, migratedAt);
+      }
+      if (fromVersion < 41) {
+        upgradeTodoActionsV41(db);
+      }
+      if (fromVersion < 42) {
+        upgradePersonalizationV42(db, migratedAt);
+      }
+      if (fromVersion < 43) {
+        upgradePreferredSpeakerSchedulingV43(db);
+      }
+      if (fromVersion < 44) {
+        upgradeRecoverableSpeakerWorkV44(db);
+      }
+      if (fromVersion < 45) {
+        upgradeDailyDigestSnapshotRetentionV45(db);
+      }
+      if (fromVersion < 46) {
+        upgradeSpeakerTranscriptProjectionV46(db);
+      }
+      if (fromVersion < 47) {
+        upgradeParticipantReviewV47(db);
+      }
+      if (fromVersion < 48) {
+        upgradeRestrainedNotificationsV48(db);
+      }
+      if (fromVersion < 49) {
+        upgradeActionCenterDeltaV49(db, migratedAt);
+      }
+      if (fromVersion < 55) {
+        // The v50 semantic-baseline backfill constructs ActivityClassificationRepository,
+        // whose current implementation prepares the append-only feedback-event statements.
+        // A genuine v49-or-earlier database does not have that v55 table yet, so satisfy
+        // the independently idempotent schema prerequisite before hashing legacy rows.
+        upgradePersonalizationFeedbackEventsV55(db);
+      }
+      if (fromVersion < 50) {
+        upgradeSessionReprocessingV50(db);
+      }
+      if (fromVersion < 51) {
+        upgradeTodoTrustV51(db);
+      }
+      if (fromVersion < 52) {
+        upgradeLearningGoalsV52(db);
+      }
+      if (fromVersion < 53) {
+        upgradeTodoTrustHardeningV53(db);
+      }
+      if (fromVersion < 54) {
+        upgradeKnowledgeActionLifecycleV54(db);
+      }
+      if (fromVersion < 57) {
+        upgradeKnowledgeActionProjectionBackfillV57(db);
+      }
+      if (fromVersion < 58) {
+        upgradeAnalysisInputV3V58(db);
+      }
+      if (fromVersion < 59) {
+        upgradeLogicalAudioAndSpeakerUtterancesV59(db, migratedAt);
+      }
+      if (fromVersion < 60) {
+        upgradeNoSpeechTranscriptProjectionV60(db);
+      }
 
       const violations = db.pragma("foreign_key_check");
       if (violations.length > 0) {
@@ -6349,6 +10196,7 @@ module.exports = {
   TRANSCRIPT_SEGMENTS_INDEXES_AND_TRIGGERS,
   SPEAKER_IDENTITY_SCHEMA,
   SESSION_DIARIZATION_SCHEMA,
+  HYBRID_DIARIZATION_HISTORY_SCHEMA,
   AGENT_WORKLOAD_SCHEMA,
   upgradeAgentWorkloadV26,
   upgradeDailyDigestV29,
@@ -6358,4 +10206,26 @@ module.exports = {
   upgradeApplicationAudioTracksV32,
   PHASE2_INTELLIGENCE_SCHEMA,
   upgradePhase2IntelligenceV34,
+  upgradeEncryptedDiarizationEvidenceV35,
+  upgradeSpeakerSchedulingV37,
+  upgradePrimarySpeakerSchedulingV39,
+  upgradeSpeakerCompletionSchedulingV40,
+  upgradeTodoActionsV41,
+  upgradePersonalizationV42,
+  upgradePreferredSpeakerSchedulingV43,
+  upgradeRecoverableSpeakerWorkV44,
+  upgradeDailyDigestSnapshotRetentionV45,
+  upgradeSpeakerTranscriptProjectionV46,
+  upgradeRestrainedNotificationsV48,
+  upgradeActionCenterDeltaV49,
+  upgradeTodoTrustV51,
+  upgradeLearningGoalsV52,
+  upgradeTodoTrustHardeningV53,
+  upgradeKnowledgeActionLifecycleV54,
+  upgradePersonalizationFeedbackEventsV55,
+  upgradeKnowledgeActionProjectionBackfillV57,
+  upgradeRuntimeStatusIndexesV38,
+  upgradeHybridDiarizationV36,
+  LOGICAL_AUDIO_AND_SPEAKER_UTTERANCE_SCHEMA_V59,
+  upgradeLogicalAudioAndSpeakerUtterancesV59,
 };

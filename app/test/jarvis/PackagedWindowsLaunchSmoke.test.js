@@ -10,7 +10,9 @@ const {
   createOfflineSmokeEnvironment,
   evaluatePageViaCdp,
   exerciseSessionThroughCdp,
+  parseCliArgs,
   probeElectron,
+  resolveCleanGitHead,
   runPackagedWindowsSmoke,
   waitForExitWithin,
 } = require("../../scripts/packaged-windows-smoke");
@@ -42,6 +44,31 @@ function fakeChild(pid) {
   return child;
 }
 
+function writeArtifactManifest(executablePath, overrides = {}) {
+  const resourcesDir = path.join(path.dirname(executablePath), "resources");
+  fs.mkdirSync(resourcesDir, { recursive: true });
+  const manifest = {
+    manifestVersion: 1,
+    verification: {
+      state: "built-unverified",
+      provenance: "git-head",
+      commitFormat: "sha1-40",
+      sourceTree: "clean",
+    },
+    appVersion: "0.2.0-rc.1",
+    gitCommit: "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c",
+    schemaVersion: 58,
+    builtAtUtc: "2026-08-03T01:02:03.004Z",
+    ...overrides,
+  };
+  fs.writeFileSync(
+    path.join(resourcesDir, "jarvis-build.json"),
+    `${JSON.stringify(manifest)}\n`,
+    "utf8"
+  );
+  return manifest;
+}
+
 test("packaged smoke launches offline twice with one isolated G: profile and graceful exits", async (t) => {
   const runtimeRoot = makeTestRoot("success");
   t.after(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }));
@@ -53,6 +80,9 @@ test("packaged smoke launches offline twice with one isolated G: profile and gra
   const sessionChecks = [];
   const profileEntriesAtLaunch = [];
   const gitCommit = "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c";
+  const artifactBuild = writeArtifactManifest(executablePath, { gitCommit });
+  const artifactManifestPath = path.join(runtimeRoot, "resources", "jarvis-build.json");
+  const frozenArtifactManifest = fs.readFileSync(artifactManifestPath, "utf8");
   const result = await runPackagedWindowsSmoke({
     executablePath,
     runtimeRoot,
@@ -68,7 +98,7 @@ test("packaged smoke launches offline twice with one isolated G: profile and gra
       JARVIS_RECORDINGS_DIR: String.raw`C:\unsafe-recordings`,
       JARVIS_STORAGE_ROOT: String.raw`C:\unsafe-storage`,
     },
-    gitCommit,
+    expectedCommit: gitCommit,
     allocatePort: async (index) => 48_000 + index,
     spawnImpl(command, args, options) {
       const child = fakeChild(9_000 + launches.length);
@@ -118,7 +148,9 @@ test("packaged smoke launches offline twice with one isolated G: profile and gra
     diagnosticPath: result.diagnosticPath,
     artifactName: "Jarvis Memory.exe",
     artifactSha256: createHash("sha256").update("fixture").digest("hex"),
-    gitCommit,
+    artifactCommit: gitCommit,
+    expectedCommit: gitCommit,
+    artifactBuild,
     assertions: {
       storageRootUnderRunProfile: true,
       nativeDatabaseInitialized: true,
@@ -134,6 +166,17 @@ test("packaged smoke launches offline twice with one isolated G: profile and gra
   assert.deepEqual(profileEntriesAtLaunch[0], []);
   assert.deepEqual(profileEntriesAtLaunch[1], ["jarvis"]);
   assert.equal(launches.length, 2);
+  const diagnostics = fs
+    .readFileSync(result.diagnosticPath, "utf8")
+    .trim()
+    .split(/\r?\n/u)
+    .map((line) => JSON.parse(line));
+  assert.equal(diagnostics.length > 0, true);
+  assert.equal(
+    diagnostics.every((entry) => entry.artifactCommit === gitCommit),
+    true
+  );
+  assert.equal(fs.readFileSync(artifactManifestPath, "utf8"), frozenArtifactManifest);
   assert.deepEqual(
     sessionChecks.map(({ launchIndex, pageWebSocketUrl, sessionId, allowedStorageRoot }) => ({
       launchIndex,
@@ -454,8 +497,8 @@ test("offline smoke environment removes inherited secrets and redirects writable
   }
 });
 
-test("packaged smoke fails closed when the Git commit cannot be identified", async (t) => {
-  const runtimeRoot = makeTestRoot("missing-commit");
+test("packaged smoke fails closed when the artifact build manifest is missing", async (t) => {
+  const runtimeRoot = makeTestRoot("missing-manifest");
   t.after(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }));
   const executablePath = path.join(runtimeRoot, "Jarvis Memory.exe");
   fs.writeFileSync(executablePath, "fixture");
@@ -466,7 +509,7 @@ test("packaged smoke fails closed when the Git commit cannot be identified", asy
       executablePath,
       runtimeRoot,
       platform: "win32",
-      gitCommit: null,
+      expectedCommit: "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c",
       spawnImpl() {
         spawnCalls += 1;
       },
@@ -478,6 +521,133 @@ test("packaged smoke fails closed when the Git commit cannot be identified", asy
     }
   );
   assert.equal(spawnCalls, 0);
+});
+
+test("packaged smoke rejects an artifact from a different commit before spawning", async (t) => {
+  const runtimeRoot = makeTestRoot("commit-mismatch");
+  t.after(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }));
+  const executablePath = path.join(runtimeRoot, "Jarvis Memory.exe");
+  fs.writeFileSync(executablePath, "fixture");
+  writeArtifactManifest(executablePath, {
+    gitCommit: "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c",
+  });
+  let spawnCalls = 0;
+
+  await assert.rejects(
+    runPackagedWindowsSmoke({
+      executablePath,
+      runtimeRoot,
+      platform: "win32",
+      expectedCommit: "2ebfb03ca4cf511622648f6348bae098a374ddae",
+      spawnImpl() {
+        spawnCalls += 1;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "PACKAGED_ARTIFACT_COMMIT_MISMATCH");
+      assert.equal(error.message, "Packaged artifact does not match the expected Git commit");
+      assert.equal(error.artifactCommit, "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c");
+      assert.equal(error.diagnosticFile, "packaged-smoke.jsonl");
+      return true;
+    }
+  );
+  assert.equal(spawnCalls, 0);
+  const runDirectories = fs.readdirSync(path.join(runtimeRoot, "runs"));
+  assert.equal(runDirectories.length, 1);
+  const diagnostics = fs
+    .readFileSync(path.join(runtimeRoot, "runs", runDirectories[0], "packaged-smoke.jsonl"), "utf8")
+    .trim()
+    .split(/\r?\n/u)
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(
+    diagnostics.map(({ stage, code, artifactCommit }) => ({ stage, code, artifactCommit })),
+    [
+      {
+        stage: "artifact_identity",
+        code: "OK",
+        artifactCommit: "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c",
+      },
+      {
+        stage: "artifact_expectation",
+        code: "PACKAGED_ARTIFACT_COMMIT_MISMATCH",
+        artifactCommit: "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c",
+      },
+    ]
+  );
+});
+
+test("packaged smoke rejects a manifest that claims an unrecognized verification state", async (t) => {
+  const runtimeRoot = makeTestRoot("verification-state");
+  t.after(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }));
+  const executablePath = path.join(runtimeRoot, "Jarvis Memory.exe");
+  fs.writeFileSync(executablePath, "fixture");
+  const gitCommit = "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c";
+  writeArtifactManifest(executablePath, {
+    gitCommit,
+    verification: {
+      state: "packaged-smoke-passed",
+      provenance: "git-head",
+      commitFormat: "sha1-40",
+      sourceTree: "clean",
+    },
+  });
+  let spawnCalls = 0;
+
+  await assert.rejects(
+    runPackagedWindowsSmoke({
+      executablePath,
+      runtimeRoot,
+      platform: "win32",
+      expectedCommit: gitCommit,
+      spawnImpl() {
+        spawnCalls += 1;
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "PACKAGED_ARTIFACT_IDENTITY_UNAVAILABLE");
+      return true;
+    }
+  );
+  assert.equal(spawnCalls, 0);
+});
+
+test("clean repository HEAD is only an expectation and cannot replace artifact identity", () => {
+  const gitCommit = "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c";
+  const cleanCalls = [];
+  const clean = resolveCleanGitHead((command, args) => {
+    cleanCalls.push({ command, args });
+    return args[0] === "rev-parse" ? `${gitCommit}\n` : "";
+  });
+  const dirty = resolveCleanGitHead((_command, args) =>
+    args[0] === "rev-parse" ? `${gitCommit}\n` : " M src/main.js\n"
+  );
+
+  assert.equal(clean, gitCommit);
+  assert.equal(dirty, null);
+  assert.deepEqual(
+    cleanCalls.map(({ args }) => args),
+    [
+      ["rev-parse", "--verify", "HEAD^{commit}"],
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+    ]
+  );
+});
+
+test("packaged smoke CLI accepts an explicit expected artifact commit", () => {
+  const gitCommit = "7356b3bbff883bbfb5fad49bb69bd2fa381deb7c";
+  assert.deepEqual(
+    parseCliArgs([
+      "--runtime-root",
+      String.raw`G:\Jarvis\.runtime-cache\packaged-smoke`,
+      "--executable=G:\\Jarvis\\release\\Jarvis Memory.exe",
+      `--expected-commit=${gitCommit}`,
+    ]),
+    {
+      runtimeRoot: String.raw`G:\Jarvis\.runtime-cache\packaged-smoke`,
+      executablePath: String.raw`G:\Jarvis\release\Jarvis Memory.exe`,
+      expectedCommit: gitCommit,
+    }
+  );
 });
 
 test("release matrix limits packaged restart to a fresh profile session persistence gate", () => {
@@ -506,6 +676,7 @@ test("packaged native binding startup failures retain only safe diagnostics", as
   t.after(() => fs.rmSync(runtimeRoot, { recursive: true, force: true }));
   const executablePath = path.join(runtimeRoot, "Jarvis Memory.exe");
   fs.writeFileSync(executablePath, "fixture");
+  const artifactBuild = writeArtifactManifest(executablePath);
   const secret = "sk-cp-private-native-secret";
   const privatePath = String.raw`C:\Users\private\better_sqlite3.node`;
 
@@ -514,6 +685,7 @@ test("packaged native binding startup failures retain only safe diagnostics", as
       executablePath,
       runtimeRoot,
       platform: "win32",
+      expectedCommit: artifactBuild.gitCommit,
       allocatePort: async () => 49_001,
       spawnImpl() {
         const child = fakeChild(9_101);
@@ -537,6 +709,7 @@ test("packaged native binding startup failures retain only safe diagnostics", as
       assert.equal(error.message.includes(secret), false);
       assert.equal(error.message.includes(privatePath), false);
       assert.match(error.diagnosticFile, /^[A-Za-z0-9_.-]+$/u);
+      assert.equal(error.artifactCommit, artifactBuild.gitCommit);
       return true;
     }
   );

@@ -91,6 +91,27 @@ test("startup backfills legacy evidence before constructing retention cleanup", 
   assert.ok(retentionIndex > backfillIndex);
 });
 
+test("startup reconciles historical speaker readiness with the selected runtime policy", () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
+  const profileIndex = mainSource.indexOf("const voiceProfileStore = new VoiceProfileStore");
+  const runtimeIndex = mainSource.indexOf(
+    "const processingRuntime = startJarvisProcessingRuntime();",
+    profileIndex
+  );
+  const reconciliationIndex = mainSource.indexOf(
+    "jarvisRepository.reconcileHistoricalSpeakerReadiness",
+    runtimeIndex
+  );
+
+  assert.ok(profileIndex >= 0);
+  assert.ok(runtimeIndex > profileIndex);
+  assert.ok(reconciliationIndex > runtimeIndex);
+  assert.match(
+    mainSource.slice(reconciliationIndex, reconciliationIndex + 300),
+    /diarizationPolicy:\s*processingRuntime\.diarizationPolicy/u
+  );
+});
+
 test("model download wiring reports VAD recovery only after verified initialization", () => {
   const mainSource = fs.readFileSync(path.join(__dirname, "..", "..", "main.js"), "utf8");
 
@@ -122,9 +143,15 @@ test("main registers runtime and production composition providers without option
   assert.match(provider, /jarvisRepository\.checkpointForMigration\(\)/);
   assert.match(provider, /jarvisRepository\.close\(\)/);
   assert.match(provider, /reconfigureStorageHolders/);
-  assert.match(provider, /resumeAnalysis: \(\) => jarvisAnalysisScheduler\.resume\(\)/);
+  assert.match(
+    provider,
+    /resumeAnalysis: \(\) => \{[\s\S]*?jarvisAnalysisScheduler\.resume\(\);[\s\S]*?jarvisNotificationScheduler\?\.start\(\);[\s\S]*?\}/
+  );
   assert.match(provider, /startRetention: \(\) => retentionCleaner\.start\(\)/);
-  assert.doesNotMatch(provider, /quiesce\?\.|resume\?\.|stop\?\.|start\?\./);
+  assert.doesNotMatch(
+    provider,
+    /jarvisAnalysisScheduler\?\.(?:quiesce|resume)|retentionCleaner\?\.(?:stop|start)/
+  );
   assert.match(composition, /whisperCudaManager/);
   assert.match(composition, /whisperManager/);
   assert.match(composition, /parakeetManager/);

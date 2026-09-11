@@ -2,8 +2,11 @@
 
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
-Current verified prerelease: `0.2.0-alpha.2` with database schema target `v34`.
-Current development target: `0.2.0-beta.1`; its database schema target is not assigned yet.
+Current source candidate: `0.2.0-rc.13` with unchanged database schema target `v60`.
+This is a behavior-preserving modularization checkpoint, not a new Windows package or a claim of
+production recording acceptance. See [the rc.13 verification record](testing/rc13-modularization.md).
+Historical rc.12 package/runtime evidence remains associated with rc.12 and is not inherited as proof
+for a new binary. Three-hour endurance and fresh physical-microphone recording remain separate gates.
 
 ## Version line
 
@@ -13,7 +16,8 @@ Current development target: `0.2.0-beta.1`; its database schema target is not as
 | Phase 1 complete       | `0.2.0-alpha.1` | `jarvis-v0.2.0-alpha.1` | Application-source and capture foundation |
 | Phase 2 complete       | `0.2.0-alpha.2` | `jarvis-v0.2.0-alpha.2` | Identity and activity classification      |
 | Phase 3 complete       | `0.2.0-beta.1`  | `jarvis-v0.2.0-beta.1`  | Actions and personalization               |
-| Phase 4 acceptance     | `0.2.0-rc.1`    | `jarvis-v0.2.0-rc.1`    | Packaged release candidate                |
+| Phase 4 acceptance     | `0.2.0-rc.12`   | `jarvis-v0.2.0-rc.12`   | Packaged release candidate                |
+| Module organization    | `0.2.0-rc.13`   | `jarvis-v0.2.0-rc.13`   | Source-only maintenance checkpoint        |
 | Final verified release | `0.2.0`         | `jarvis-v0.2.0`         | User-facing stable release                |
 
 Database versions and app versions are deliberately separate. For example, schema `v33` is an
@@ -21,8 +25,8 @@ internal migration target and does not imply app version `33`.
 
 ## Source-control rules
 
-- Development stays on `codex/jarvis-start-budget-ui` until the dirty baseline has been safely
-  checkpointed.
+- Integration stays on `codex/jarvis-start-budget-ui`; isolated `codex/` worktrees may fast-forward
+  that branch after verification. Do not overwrite or stage an unrelated dirty root checkout.
 - Each phase receives a focused checkpoint commit after its scoped tests pass.
 - A phase version is changed only after all tasks and gates for that phase pass.
 - Every packaged artifact records the app version, full Git commit, schema target, build time, and
@@ -34,9 +38,10 @@ internal migration target and does not imply app version `33`.
 
 ## GitHub tracking
 
-The current checkout has only the upstream `openwhispr` remote. Jarvis changes must never be pushed
-there. Before the first phase tag, add a user-owned GitHub repository as `origin`, push the current
-branch, and use a draft pull request as the durable change log.
+The user-owned `origin` is
+`https://github.com/davidxxxxx/Jarvis_personal_agenet.git`; the upstream OpenWhispr remote must not
+receive Jarvis branches or tags. Draft PR #1 is the durable prerelease change log and must be updated
+instead of creating duplicate pull requests.
 
 Each GitHub prerelease should contain:
 
@@ -71,12 +76,12 @@ comparison; Jarvis branches and tags go only to `origin`.
 ## Phase release sequence
 
 ```powershell
-cd G:\Jarvis\.worktrees\jarvis-all-day-runtime\app
-npm run release:check -- --tag jarvis-v0.2.0-alpha.2
+# From the verified worktree's app/ directory:
+npm run release:check -- --tag jarvis-vX.Y.Z
 cd ..
-git tag -a jarvis-v0.2.0-alpha.2 -m "Jarvis Memory 0.2.0-alpha.2"
-git push origin codex/jarvis-start-budget-ui
-git push origin jarvis-v0.2.0-alpha.2
+git tag -a jarvis-vX.Y.Z -m "Jarvis Memory X.Y.Z"
+git push origin HEAD:codex/jarvis-start-budget-ui
+git push origin jarvis-vX.Y.Z
 ```
 
 Never move or overwrite a published tag. If a tagged build fails acceptance, increment the

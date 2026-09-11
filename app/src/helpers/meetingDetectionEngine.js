@@ -418,6 +418,10 @@ class MeetingDetectionEngine {
     return { ...this.preferences };
   }
 
+  isMeetingModeActive() {
+    return this._meetingModeActive === true;
+  }
+
   start() {
     debugLogger.info("Meeting detection engine started", this.preferences, "meeting");
     if (this.preferences.processDetection) this.meetingProcessDetector.start();

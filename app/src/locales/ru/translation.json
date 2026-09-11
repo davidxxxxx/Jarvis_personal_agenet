@@ -96,6 +96,7 @@
     "voiceEnrollmentSaved": "Your local voice profile is saved.",
     "voiceEnrollmentPending": "Preparing voice calibration",
     "voiceEnrollmentWindowProgress": "Sample {{current}} of {{total}}",
+    "voiceEnrollmentSpeechDiagnostics": "Detected speech per sample: {{values}} seconds; each sample needs at least {{threshold}} seconds",
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
@@ -233,6 +234,10 @@
       "keyConfigured": "MiniMax key configured",
       "keyNotConfigured": "MiniMax key not configured",
       "model": "Model: {{model}}",
+      "modelReady": "Доступность модели MiniMax подтверждена.",
+      "modelCheckUnavailable": "Не удалось проверить доступность модели MiniMax. Это не влияет на локальную запись.",
+      "modelUnavailable": "Модель {{model}} недоступна для этого ключа. Облачный анализ останется приостановленным.",
+      "modelFallback": "Настроенная модель была недоступна. Jarvis будет использовать {{model}}.",
       "keyLabel": "MiniMax subscription key",
       "saveKey": "Save MiniMax key",
       "removeKey": "Remove MiniMax key",
@@ -276,14 +281,34 @@
       "description": "Choose how quickly Jarvis yields the GPU and resumes background processing.",
       "loading": "Loading resource settings…",
       "profiles": {
-        "game_priority": { "title": "Game priority", "description": "Yield early and resume slowly." },
-        "balanced": { "title": "Balanced", "description": "Ignore light GPU use and share safely." },
-        "processing_priority": { "title": "Processing priority", "description": "Use more idle GPU capacity." }
+        "game_priority": {
+          "title": "Game priority",
+          "description": "Yield early and resume slowly."
+        },
+        "balanced": {
+          "title": "Balanced",
+          "description": "Ignore light GPU use and share safely."
+        },
+        "processing_priority": {
+          "title": "Processing priority",
+          "description": "Use more idle GPU capacity."
+        }
       },
       "applicationAudio": {
         "title": "Разделять звук компьютера по приложениям",
         "description": "Отслеживать только приложения, которые воспроизводят звук. При сбое переходить на системный микс, не угадывая источник.",
         "trackLimit": "Максимум одновременных аудиодорожек приложений",
+        "fallbackPolicy": "When an app track falls back to mixed system audio",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "Conservative summary",
+            "description": "Keep mixed audio and the full transcript. Allow only evidence-checkable summaries; block suggestions, todos, and identity learning."
+          },
+          "transcript_only": {
+            "title": "Transcript only",
+            "description": "Keep mixed audio and the full transcript. Block summaries, suggestions, todos, and identity learning."
+          }
+        },
         "runtime": "Записывается дорожек приложений: {{active}} (лимит {{limit}}) · источников в режиме отката: {{fallback}}",
         "idle": "Запустится со следующей записью; в полноэкранной игре сохраняются не более двух дорожек."
       },

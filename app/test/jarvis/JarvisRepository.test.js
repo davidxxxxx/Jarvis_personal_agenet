@@ -76,6 +76,90 @@ test("persists the selected capture mode on session creation", (t) => {
   assert.equal(repo.getSession("dual-session").capture_mode, "dual");
 });
 
+test("incomplete active summaries expose an explicit paid refresh recommendation", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "incremental-summary-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "mic",
+  });
+  repo.db
+    .prepare(
+      `INSERT INTO session_summary_revisions (
+         id, session_id, revision, previous_revision_id, completeness, lifecycle,
+         content_json, source_analysis_input_id, provenance, created_at
+       ) VALUES (
+         'summary-incremental', 'incremental-summary-session', 1, NULL,
+         'incremental', 'active', ?, NULL, 'evidence_linked', 2_000
+       )`
+    )
+    .run(JSON.stringify({ title: "Partial", summary: "Only part of the session was covered." }));
+
+  assert.deepEqual(repo.getSessionSpeakerProcessing("incremental-summary-session").summaryRefresh, {
+    basis_policy_id: null,
+    latest_policy_id: "jarvis-session-diarization-v1",
+    recommended: 1,
+    reason: "summary_incomplete",
+    updated_at: 2_000,
+  });
+});
+
+test("activity classification corrections idempotently recommend a paid summary refresh", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  repo.createSession({
+    id: "classification-refresh-session",
+    startedAt: 1_000,
+    micDeviceId: "physical-mic",
+    captureMode: "mic",
+  });
+  repo.db
+    .prepare(
+      `INSERT INTO session_summary_revisions (
+         id, session_id, revision, previous_revision_id, completeness, lifecycle,
+         content_json, source_analysis_input_id, provenance, created_at
+       ) VALUES (
+         'summary-classification-refresh', 'classification-refresh-session', 1, NULL,
+         'final', 'active', ?, NULL, 'evidence_linked', 2_000
+       )`
+    )
+    .run(JSON.stringify({ title: "Paid summary", summary: "Keep this local result." }));
+
+  const first = repo.markSessionSummaryRefreshRecommended(
+    "classification-refresh-session",
+    "activity_classification_changed",
+    3_000
+  );
+  const repeated = repo.markSessionSummaryRefreshRecommended(
+    "classification-refresh-session",
+    "activity_classification_changed",
+    3_000
+  );
+
+  assert.deepEqual(repeated, first);
+  assert.deepEqual(first, {
+    session_id: "classification-refresh-session",
+    basis_policy_id: null,
+    latest_policy_id: "jarvis-session-diarization-v1",
+    recommended: 1,
+    reason: "activity_classification_changed",
+    updated_at: 3_000,
+  });
+  assert.equal(
+    repo.db
+      .prepare("SELECT count(*) AS count FROM session_summary_refresh_state WHERE session_id = ?")
+      .get("classification-refresh-session").count,
+    1
+  );
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
+  );
+});
+
 test("session timeline returns deterministic source evidence, visible text, and job counts", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -342,6 +426,26 @@ test("session timeline exposes distinct application tracks and conservative fall
     endedAt: 2_500,
     reason: "application_process_restarted",
   });
+  repo.db
+    .prepare(
+      `INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, source_type, result_kind
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      "kook-segment",
+      "application-session",
+      1_200,
+      1_600,
+      "说话人 1",
+      "来自 KOOK 的文字",
+      0.9,
+      1,
+      "track-kook",
+      "system",
+      "provisional"
+    );
 
   const timeline = repo.getSessionTimeline("application-session");
   assert.deepEqual(
@@ -366,6 +470,32 @@ test("session timeline exposes distinct application tracks and conservative fall
   );
   assert.equal(repo.getSessionApplicationTrack("application-session", "chrome").id, "track-chrome");
   assert.equal(repo.getSessionApplicationTrack("application-session", "dota2"), null);
+  assert.deepEqual(
+    timeline.segments.map((segment) => [segment.id, segment.application_display_name]),
+    [["kook-segment", "KOOK"]]
+  );
+
+  const paged = repo.getSessionTimeline("application-session", {
+    trackOffset: 1,
+    trackLimit: 2,
+    intervalOffset: 1,
+    intervalLimit: 1,
+  });
+  assert.deepEqual(
+    paged.tracks.map((track) => track.id),
+    ["track-chrome", "track-kook"]
+  );
+  assert.deepEqual(
+    paged.application_audio_intervals.map((interval) => interval.id),
+    ["chrome-fallback"]
+  );
+  assert.deepEqual(paged.evidence_page, {
+    tracks: { total: 4, offset: 1, limit: 2 },
+    intervals: { total: 2, offset: 1, limit: 1 },
+  });
+  assert.equal(paged.application_capture.exact_duration_ms, 950);
+  assert.equal(paged.application_capture.fallback_duration_ms, 500);
+  assert.equal(paged.application_capture.degraded_interval_count, 1);
 });
 
 test("system-only session persistence cannot retain a microphone device id", (t) => {
@@ -792,6 +922,7 @@ test("retired provenance is private across repository audio views", (t) => {
     assert.equal(Object.hasOwn(chunk, "retired_format"), false);
     assert.equal(Object.hasOwn(chunk, "retired_file_sha256"), false);
   }
+  assert.deepEqual(repo.getSessionDetail("s1", { includeAudioChunks: false }).audioChunks, []);
 });
 
 test("schema initialization is idempotent and file databases use WAL", () => {
@@ -806,6 +937,9 @@ test("schema initialization is idempotent and file databases use WAL", () => {
     const second = new JarvisRepository(dbPath);
     assert.equal(second.getSession("s1").language, "zh");
     assert.equal(second.db.pragma("journal_mode", { simple: true }), "wal");
+    assert.equal(second.db.pragma("synchronous", { simple: true }), 2);
+    assert.equal(second.db.pragma("busy_timeout", { simple: true }), 5_000);
+    assert.equal(second.db.pragma("wal_autocheckpoint", { simple: true }), 1_000);
     assert.equal(second.db.pragma("foreign_keys", { simple: true }), 1);
     second.close();
   } finally {
@@ -1343,6 +1477,17 @@ test("derived memory analysis is idempotent and queryable from every Jarvis view
   assert.equal(detail.topics.length, 1);
   assert.equal(detail.todos.length, 1);
   assert.equal(repo.listTopics().length, 1);
+  const changesBeforeTopicRead = repo.db.prepare("SELECT total_changes() AS count").get().count;
+  const topicDetail = repo.getTopicDetail(repo.listTopics()[0].id);
+  const changesAfterTopicRead = repo.db.prepare("SELECT total_changes() AS count").get().count;
+  assert.equal(changesAfterTopicRead, changesBeforeTopicRead);
+  assert.equal(topicDetail.people[0].id, "person-2");
+  assert.deepEqual(topicDetail.decisions, [
+    { sessionId: "history-1", content: "采用厂商提供的 SDK" },
+  ]);
+  assert.equal(topicDetail.sessions[0].id, "history-1");
+  assert.equal(topicDetail.todos[0].owner_name, "说话人 2");
+  assert.equal(topicDetail.memories[0].person_name, "说话人 2");
   assert.equal(repo.listTodos().length, 1);
   assert.equal(repo.listMemories().length, 1);
   const people = repo.listPeopleOverview();

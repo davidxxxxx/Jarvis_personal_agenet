@@ -39,7 +39,7 @@ function createDesiredIdentity({ prepared }) {
     throw new TypeError("prepared analysis segments are required");
   }
   return {
-    responseSchemaVersion: "jarvis-analysis-v2",
+    responseSchemaVersion: "jarvis-analysis-v3",
     pseudonymBindingRevision: revisionFrom(prepared.identityRevision),
     modelVersion: MODEL,
     segmentSubjectRevisions: prepared.segments.map((segment) => ({
@@ -105,7 +105,9 @@ function createProductionAgentCloudComposition({
   fetchImpl = globalThis.fetch,
   governor,
   previewScheduler,
+  calendarEventsProvider = () => [],
   timezoneProvider,
+  activityClassificationEnabled = true,
   now = Date.now,
   owner = `agent-${process.pid}`,
   createRequestId = () => `agent_${crypto.randomUUID().replaceAll("-", "")}`,
@@ -119,8 +121,14 @@ function createProductionAgentCloudComposition({
   requiredMethod(previewScheduler, "status", "previewScheduler");
   if (typeof getApiKey !== "function") throw new TypeError("getApiKey must be a function");
   if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
+  if (typeof calendarEventsProvider !== "function") {
+    throw new TypeError("calendarEventsProvider must be a function");
+  }
   if (typeof timezoneProvider !== "function") {
     throw new TypeError("timezoneProvider must be a function");
+  }
+  if (typeof activityClassificationEnabled !== "boolean") {
+    throw new TypeError("activityClassificationEnabled must be a boolean");
   }
   if (typeof now !== "function" || typeof createRequestId !== "function") {
     throw new TypeError("clock and request id factory are required");
@@ -166,7 +174,7 @@ function createProductionAgentCloudComposition({
     now,
     createRequestId,
   });
-  const activityBuilder = new SessionActivityBuilder(repository.db);
+  const activityBuilder = new SessionActivityBuilder(repository.db, { calendarEventsProvider });
   const commonAdmission = (job, priorityBefore) => ({
     backlog: store.listAgentAdmissionBacklog({ priorityBefore, excludeJobId: job.id }),
     captureActive: Boolean(
@@ -249,6 +257,7 @@ function createProductionAgentCloudComposition({
     desiredIdentityProvider: createDesiredIdentity,
     activityClassificationService,
     activityBuilder,
+    activityCloudReviewEnabled: activityClassificationEnabled,
     cloudQueue: store,
     cloudTransportEnabled: true,
     now,

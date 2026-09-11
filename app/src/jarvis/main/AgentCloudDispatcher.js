@@ -103,6 +103,11 @@ class AgentCloudDispatcher {
     return wrapped;
   }
 
+  recoverStartup() {
+    if (this.stopping) return Promise.resolve();
+    return this._ensureRecoveryReady();
+  }
+
   drainOnce() {
     if (this.stopping) return Promise.resolve(0);
     if (this.inFlight) return this.inFlight;

@@ -4,9 +4,11 @@
 // final installer (DMG/NSIS/AppImage) is created. Operates only on the output
 // directory — never touches source node_modules/.
 //
-// 1. Strips non-target platform/arch binaries from onnxruntime-node
+// 1. Writes immutable build provenance for Windows packages. The manifest
+//    deliberately remains built-unverified; smoke evidence is stored outside it.
+// 2. Strips non-target platform/arch binaries from onnxruntime-node
 //    (saves 150–180 MB per build).
-// 2. Wraps the Linux binary in a shell script that forces XWayland, reads
+// 3. Wraps the Linux binary in a shell script that forces XWayland, reads
 //    user flags from ~/.config/open-whispr-flags.conf, and falls back to
 //    --no-sandbox where the Chromium sandbox cannot work (AppImage/tar.gz
 //    on distros that restrict unprivileged user namespaces).
@@ -16,6 +18,127 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 const { Arch } = require("app-builder-lib");
 const { buildLinuxWrapperScript } = require("./lib/linux-launcher");
+
+const BUILD_MANIFEST_FILE = "jarvis-build.json";
+const BUILD_MANIFEST_VERSION = 1;
+const GIT_SHA1_PATTERN = /^[a-f0-9]{40}$/u;
+
+function buildManifestError(message) {
+  return new Error(`afterPack: ${message}`);
+}
+
+function resolveCleanGitSource({ sourceRoot, execFileSyncImpl = execFileSync }) {
+  let gitCommit;
+  let status;
+  try {
+    const options = {
+      cwd: sourceRoot,
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    };
+    gitCommit = String(
+      execFileSyncImpl("git", ["rev-parse", "--verify", "HEAD^{commit}"], options)
+    ).trim();
+    status = String(
+      execFileSyncImpl("git", ["status", "--porcelain=v1", "--untracked-files=all"], options)
+    ).trim();
+  } catch {
+    throw buildManifestError("a verified Git source commit is required");
+  }
+  if (!GIT_SHA1_PATTERN.test(gitCommit)) {
+    throw buildManifestError("a 40-character Git source commit is required");
+  }
+  if (status.length !== 0) {
+    throw buildManifestError("a clean Git source tree is required");
+  }
+  return gitCommit;
+}
+
+function resolveSourceVersion({ context, sourceRoot, fsImpl = fs }) {
+  let sourcePackage;
+  try {
+    sourcePackage = JSON.parse(fsImpl.readFileSync(path.join(sourceRoot, "package.json"), "utf8"));
+  } catch {
+    throw buildManifestError("the source package version is unavailable");
+  }
+  const sourceVersion = sourcePackage?.version;
+  const packagedVersion = context?.packager?.appInfo?.version;
+  if (
+    typeof sourceVersion !== "string" ||
+    sourceVersion.length < 1 ||
+    sourceVersion.length > 64 ||
+    /[\0\r\n]/u.test(sourceVersion) ||
+    packagedVersion !== sourceVersion
+  ) {
+    throw buildManifestError("the packaged app version does not match source");
+  }
+  return sourceVersion;
+}
+
+function resolveDatabaseSchemaVersion() {
+  const { TARGET_VERSION } = require("../src/jarvis/main/JarvisMigrations");
+  return TARGET_VERSION;
+}
+
+function writeWindowsBuildManifest(
+  context,
+  {
+    fsImpl = fs,
+    sourceRoot = path.resolve(__dirname, ".."),
+    execFileSyncImpl = execFileSync,
+    schemaVersion,
+    now = () => new Date(),
+  } = {}
+) {
+  if (context?.electronPlatformName !== "win32") return null;
+  const databaseSchemaVersion =
+    schemaVersion === undefined ? resolveDatabaseSchemaVersion() : schemaVersion;
+  if (!Number.isSafeInteger(databaseSchemaVersion) || databaseSchemaVersion < 1) {
+    throw buildManifestError("the database schema version is invalid");
+  }
+  const resourcesDir = resolveResourcesDir(context);
+  if (!fsImpl.existsSync(resourcesDir) || !fsImpl.statSync(resourcesDir).isDirectory()) {
+    throw buildManifestError("the packaged resources directory is unavailable");
+  }
+  const gitCommit = resolveCleanGitSource({ sourceRoot, execFileSyncImpl });
+  const appVersion = resolveSourceVersion({ context, sourceRoot, fsImpl });
+  const builtAt = now();
+  if (!(builtAt instanceof Date) || Number.isNaN(builtAt.getTime())) {
+    throw buildManifestError("the UTC build time is invalid");
+  }
+  const manifest = {
+    manifestVersion: BUILD_MANIFEST_VERSION,
+    verification: {
+      state: "built-unverified",
+      provenance: "git-head",
+      commitFormat: "sha1-40",
+      sourceTree: "clean",
+    },
+    appVersion,
+    gitCommit,
+    schemaVersion: databaseSchemaVersion,
+    builtAtUtc: builtAt.toISOString(),
+  };
+  const manifestPath = path.join(resourcesDir, BUILD_MANIFEST_FILE);
+  const temporaryPath = `${manifestPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fsImpl.writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+    fsImpl.rmSync(manifestPath, { force: true });
+    fsImpl.renameSync(temporaryPath, manifestPath);
+  } catch (error) {
+    try {
+      fsImpl.rmSync(temporaryPath, { force: true });
+    } catch {
+      // The build still fails closed if cleanup itself is unavailable.
+    }
+    throw buildManifestError(`could not write ${BUILD_MANIFEST_FILE}: ${error.message}`);
+  }
+  return { manifestPath, manifest };
+}
 
 // ---------------------------------------------------------------------------
 // macOS resource binary signing
@@ -204,9 +327,18 @@ function verifyMeetingAecHelper(context) {
 // Main hook
 // ---------------------------------------------------------------------------
 
-exports.default = async function (context) {
+async function afterPack(context) {
+  writeWindowsBuildManifest(context);
   stripOnnxruntimeBinaries(context);
   wrapLinuxBinary(context);
   verifyMeetingAecHelper(context);
   registerMacResourceBinariesForSigning(context);
+}
+
+module.exports = {
+  BUILD_MANIFEST_FILE,
+  BUILD_MANIFEST_VERSION,
+  default: afterPack,
+  resolveCleanGitSource,
+  writeWindowsBuildManifest,
 };

@@ -9,6 +9,24 @@ const MODEL_VERSION = "large-v3-turbo";
 const INPUT_VERSION = 1;
 const COMPLETED_AT = 500_000;
 
+function silentPcm16Wav({ sampleRate = 16_000, sampleCount = 1_600 } = {}) {
+  const wav = Buffer.alloc(44 + sampleCount * 2);
+  wav.write("RIFF", 0, "ascii");
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write("WAVE", 8, "ascii");
+  wav.write("fmt ", 12, "ascii");
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36, "ascii");
+  wav.writeUInt32LE(sampleCount * 2, 40);
+  return wav;
+}
+
 function transcriptionJob(chunkId = "chunk-1", overrides = {}) {
   return {
     chunk_id: chunkId,
@@ -89,6 +107,7 @@ for (const format of ["wav", "flac"]) {
         endedAt: 2_000,
         personId: null,
         speakerLabel: "mic",
+        sourceType: "system",
         text: "明天 review 产品 roadmap",
         confidence: 0.8,
         isStable: true,
@@ -142,6 +161,124 @@ for (const format of ["wav", "flac"]) {
     assert.equal(repository.getAudioChunk("chunk-1").transcription_status, "completed");
   });
 }
+
+test("excludes unsupported scripts and repeated hallucinations from the rolling prompt", async (t) => {
+  const repository = seedChunk(t);
+  repository.upsertTranscriptSegments("session-1", [
+    {
+      id: "valid-context",
+      startedAt: 1_100,
+      endedAt: 2_000,
+      personId: null,
+      speakerLabel: "mic",
+      sourceType: "system",
+      text: "明天 review 产品 roadmap",
+      confidence: 0.8,
+      isStable: true,
+    },
+    {
+      id: "unsupported-script",
+      startedAt: 2_100,
+      endedAt: 3_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "保留这段中文 Игорь שלום カタカナ 한글",
+      confidence: 0.4,
+      isStable: true,
+    },
+    {
+      id: "repeated-hallucination",
+      startedAt: 3_100,
+      endedAt: 4_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "alpha beta gamma alpha beta gamma alpha beta gamma",
+      confidence: 0.2,
+      isStable: true,
+    },
+  ]);
+  let transcriptionInput;
+  const { worker } = workerFixture(repository, async (input) => {
+    transcriptionInput = input;
+    return { text: "新的正常结果", confidence: 0.9 };
+  });
+
+  await worker.handle(transcriptionJob());
+
+  assert.match(transcriptionInput.initialPrompt, /review 产品 roadmap/u);
+  assert.match(transcriptionInput.initialPrompt, /保留这段中文/u);
+  assert.doesNotMatch(transcriptionInput.initialPrompt, /Игорь|שלום|カタカナ|한글/u);
+  assert.doesNotMatch(transcriptionInput.initialPrompt, /alpha beta gamma/u);
+});
+
+test("keeps the rolling prompt isolated to the current audio track", async (t) => {
+  const repository = seedChunk(t);
+  repository.createTrack({
+    id: "track-2",
+    sessionId: "session-1",
+    sourceType: "system",
+    deviceId: null,
+    deviceLabel: "DOTA 2",
+    applicationKey: "dota2",
+    applicationDisplayName: "DOTA 2",
+    captureGeneration: 1,
+    strategy: "include-process-tree",
+    sampleRate: 24_000,
+    channels: 1,
+    startedAt: 1_000,
+  });
+  repository.commitChunk({
+    id: "other-track-chunk",
+    sessionId: "session-1",
+    trackId: "track-2",
+    sourceType: "system",
+    sequenceNumber: 0,
+    path: "other-track-chunk.wav",
+    startedAt: 2_000,
+    endedAt: 9_000,
+    durationMs: 7_000,
+    sha256: "b".repeat(64),
+    expiresAt: 600_000,
+  });
+  const otherTrackChunk = repository.getAudioChunk("other-track-chunk");
+  repository.commitChunkTranscript({
+    chunk: otherTrackChunk,
+    result: {
+      text: "DOTA Roshan buyback barracks 游戏解说上下文",
+      confidence: 0.91,
+    },
+    modelVersion: MODEL_VERSION,
+    completedAt: COMPLETED_AT - 1_000,
+  });
+  repository.upsertTranscriptSegments("session-1", [
+    {
+      id: "same-track-context",
+      startedAt: 1_100,
+      endedAt: 2_000,
+      personId: null,
+      speakerLabel: "system",
+      sourceType: "system",
+      text: "麦克风所在音轨的产品 roadmap",
+      confidence: 0.8,
+      isStable: true,
+    },
+  ]);
+  let transcriptionInput;
+  const { worker } = workerFixture(repository, async (input) => {
+    transcriptionInput = input;
+    return { text: "新的正常结果", confidence: 0.9 };
+  });
+
+  await worker.handle(transcriptionJob());
+
+  assert.match(transcriptionInput.initialPrompt, /麦克风所在音轨的产品 roadmap/u);
+  assert.doesNotMatch(
+    transcriptionInput.initialPrompt,
+    /DOTA|Roshan|buyback|barracks|游戏解说上下文/u
+  );
+});
 
 test("keeps MIC lineage and replaying the same input and model is idempotent", async (t) => {
   const repository = seedChunk(t, { sourceType: "mic" });
@@ -369,9 +506,224 @@ test("the IPC adapter keeps verified WAV bytes local and uses auto language", as
         model: MODEL_VERSION,
         language: null,
         initialPrompt: "中英 context",
+        vadEnabled: true,
       },
     },
   ]);
+});
+
+test("the IPC adapter locally retries suspicious scripts with Chinese as the primary language", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return options.language === "zh"
+          ? { success: true, text: "我们讨论 API 预算", executionDevice: "cuda" }
+          : { success: true, text: "我们讨论 этот API budget", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => Buffer.from("verified-local-wav"),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      initialPrompt: "中英 context",
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "我们讨论 API 预算", executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].language, null);
+  assert.equal(calls[1].language, "zh");
+  assert.match(calls[1].initialPrompt, /主要语言是中文/);
+  assert.equal(calls[1].requireCuda, true);
+});
+
+test("the IPC adapter retries common Whisper boilerplate instead of accepting it as speech", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return options.language === "zh"
+          ? { success: true, text: "我们继续讨论这个方案", executionDevice: "cuda" }
+          : { success: true, text: "Thank you.", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => Buffer.from("verified-local-wav"),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      initialPrompt: "中英 context",
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "我们继续讨论这个方案", executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].language, "zh");
+});
+
+test("the IPC adapter does not persist identical boilerplate from effectively silent audio", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const calls = [];
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper(_bytes, options) {
+        calls.push(options);
+        return { success: true, text: "Thank you.", executionDevice: "cuda" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => silentPcm16Wav(),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      executionContext: {
+        action: "run_cuda",
+        device: "cuda",
+        selectedGpuUuid: "GPU-test",
+      },
+    }),
+    { success: true, text: "", noSpeech: true, executionDevice: "cuda" }
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].vadEnabled, true);
+  assert.equal(calls[1].vadEnabled, true);
+});
+
+test("the IPC adapter records punctuation-only Whisper output as no speech", async () => {
+  const ipcHandlersPath = path.resolve(__dirname, "../../src/helpers/ipcHandlers.js");
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "electron") {
+      return {
+        ipcMain: {},
+        app: {},
+        shell: {},
+        BrowserWindow: {},
+        systemPreferences: {},
+        net: {},
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let createAdapter;
+  try {
+    delete require.cache[ipcHandlersPath];
+    ({ createJarvisTranscribeWavAdapter: createAdapter } = require(ipcHandlersPath));
+  } finally {
+    Module._load = originalLoad;
+    delete require.cache[ipcHandlersPath];
+  }
+
+  const adapter = createAdapter({
+    whisperManager: {
+      async transcribeLocalWhisper() {
+        return { success: true, text: "... ...", executionDevice: "cpu" };
+      },
+    },
+    model: MODEL_VERSION,
+    readFile: async () => silentPcm16Wav(),
+  });
+
+  assert.deepEqual(
+    await adapter({
+      path: "verified.wav",
+      language: null,
+      executionContext: { action: "run_cpu", device: "cpu" },
+    }),
+    { success: true, text: "", noSpeech: true, executionDevice: "cpu" }
+  );
 });
 
 test("the IPC adapter maps CPU admission to explicit bounded Whisper options", async () => {
@@ -434,6 +786,7 @@ test("the IPC adapter maps CPU admission to explicit bounded Whisper options", a
       gpuUuid: null,
       threads: 4,
       lowPriority: true,
+      vadEnabled: true,
     },
   ]);
 });

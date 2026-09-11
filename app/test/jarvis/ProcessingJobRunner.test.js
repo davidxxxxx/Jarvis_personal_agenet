@@ -371,6 +371,102 @@ test("permit draining preserves durable retry and resource deferral transitions"
   );
 });
 
+test("a running CUDA job yields durably when resources become busy", async (t) => {
+  let admissions = 0;
+  const governor = {
+    sample: async () => ({
+      state: admissions === 0 ? "available" : "busy",
+      selectedGpuUuid: "GPU-1",
+    }),
+    admit: () => {
+      admissions += 1;
+      return admissions === 1
+        ? { action: "run_cuda", reason: "resources_available" }
+        : { action: "defer", reason: "external_gpu_busy" };
+    },
+  };
+  const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+  seedJob(db, { priority: 30 });
+  runner.register("transcribe_chunk", async (_job, context) => {
+    assert.equal(context.device, "cuda");
+    await context.checkResources();
+    assert.fail("resource checkpoint should have yielded");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `
+      SELECT state, attempt_count, next_retry_at, error_code, blocked_reason,
+             lease_owner, lease_expires_at
+      FROM processing_jobs WHERE id = 'j1'
+    `
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 17_000,
+      error_code: null,
+      blocked_reason: "external_gpu_busy",
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
+for (const transientReason of [
+  "cpu_load_high",
+  "external_gpu_busy",
+  "gpu_utilization_high",
+  "insufficient_vram",
+  "recovery_hysteresis",
+  "telemetry_unavailable",
+]) {
+  test(`an active CUDA diarization job survives ${transientReason}`, async (t) => {
+    let admissions = 0;
+    const governor = {
+      sample: async () => ({
+        state: admissions === 0 ? "available" : "constrained",
+        selectedGpuUuid: "GPU-1",
+      }),
+      admit: () => {
+        admissions += 1;
+        return admissions === 1
+          ? { action: "run_cuda", reason: "resources_available" }
+          : { action: "defer", reason: transientReason };
+      },
+    };
+    const { db, runner } = fixture(t, { governor, heavyGate: new HeavyJobGate() });
+    seedJob(db, { jobType: "diarize_track", priority: 35 });
+    runner.register("diarize_track", async (_job, context) => {
+      assert.equal(context.device, "cuda");
+      assert.equal(await context.checkResources(), true);
+      return { executionDevice: "cuda" };
+    });
+
+    assert.equal(await runner.runOnce(), 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `
+        SELECT state, attempt_count, error_code, blocked_reason, execution_device
+        FROM processing_jobs WHERE id = 'j1'
+      `
+        )
+        .get(),
+      {
+        state: "completed",
+        attempt_count: 1,
+        error_code: null,
+        blocked_reason: null,
+        execution_device: "cuda",
+      }
+    );
+  });
+}
+
 test("local runner leaves unknown and cloud work unclaimed instead of classifying maintenance", async (t) => {
   const { db, runner } = fixture(t);
   seedJob(db, { jobType: "unknown_job" });
@@ -420,15 +516,24 @@ test("local runner leaves unknown and cloud work unclaimed instead of classifyin
 });
 
 test("records handler failure with backoff without losing durable input metadata", async (t) => {
-  const { db, runner } = fixture(t);
+  const failures = [];
+  const { db, runner } = fixture(t, { log: (entry) => failures.push(entry) });
   seedJob(db);
+  const failure = new Error("temporary outage");
+  failure.code = "TRANSIENT";
   runner.register("transcribe_chunk", async () => {
-    const error = new Error("temporary outage");
-    error.code = "TRANSIENT";
-    throw error;
+    throw failure;
   });
 
   assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(failures, [
+    {
+      phase: "processing_job_failed",
+      jobId: "j1",
+      jobType: "transcribe_chunk",
+      error: failure,
+    },
+  ]);
   assert.deepEqual(
     db
       .prepare(
@@ -450,6 +555,310 @@ test("records handler failure with backoff without losing durable input metadata
       completed_at: null,
       lease_owner: null,
       lease_expires_at: null,
+    }
+  );
+});
+
+test("blocks deterministic database constraints after one attempt instead of retrying forever", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 40,
+    modelVersion: "jarvis-session-diarization-v1",
+  });
+  runner.register("diarize_track", async () => {
+    const error = new Error("encrypted embedding violates an obsolete schema constraint");
+    error.code = "SQLITE_CONSTRAINT_CHECK";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "SQLITE_CONSTRAINT_CHECK",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+  assert.equal(await runner.runOnce(), 0);
+});
+
+test("blocks deterministic diarization validation failures after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v2",
+  });
+  runner.register("diarize_track", async () => {
+    throw new TypeError("run.speakerCount.maximum must be between 0 and 64 or null");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_VALIDATION_FAILED",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
+test("blocks the exact diarization cluster-count validation failure after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v4",
+  });
+  runner.register("diarize_track", async () => {
+    throw new TypeError("diarization cluster count exceeds the validated speaker count");
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_VALIDATION_FAILED",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
+test("blocks the exact identity batch-coverage validation failure after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "resolve_identities",
+    priority: 45,
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+  });
+  seedJob(db, {
+    id: "ordinary-identity",
+    jobType: "resolve_identities",
+    priority: 45,
+    inputHash: "ordinary-identity",
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+    createdAt: 101,
+  });
+  runner.register("resolve_identities", async (job) => {
+    throw new Error(
+      job.id === "j1"
+        ? "identity resolution batch must cover every evidence cluster exactly"
+        : "identity provider temporarily unavailable"
+    );
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "IDENTITY_RESOLUTION_VALIDATION_FAILED",
+      completed_at: 2_000,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at,
+                lease_owner, lease_expires_at
+         FROM processing_jobs WHERE id = 'ordinary-identity'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 1,
+      next_retry_at: 3_000,
+      error_code: "JOB_FAILED",
+      completed_at: null,
+      lease_owner: null,
+      lease_expires_at: null,
+    }
+  );
+});
+
+test("identity dependency waits do not consume attempts and wake when diarization completes", async (t) => {
+  let now = 2_000;
+  const failures = [];
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    dependencyRetryMs: 60_000,
+    log: (entry) => failures.push(entry),
+  });
+  seedJob(db, {
+    jobType: "resolve_identities",
+    priority: 45,
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+  });
+  let identityCalls = 0;
+  runner.register("resolve_identities", async () => {
+    identityCalls += 1;
+    if (identityCalls === 1) {
+      const error = new Error("IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE");
+      error.code = "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE";
+      throw error;
+    }
+    return { executionDevice: null };
+  });
+  runner.register("diarize_track", async () => ({ executionDevice: null }));
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 62_000,
+      error_code: null,
+      blocked_reason: "identity_dependency_incomplete",
+      completed_at: null,
+    }
+  );
+  assert.deepEqual(failures, []);
+  assert.equal(await runner.runOnce(), 0, "the safety retry window prevents hot polling");
+
+  seedJob(db, {
+    id: "diarization-finished",
+    jobType: "diarize_track",
+    priority: 35,
+    inputHash: "diarization-finished",
+    modelVersion: "jarvis-hybrid-diarization-v6",
+    createdAt: 200,
+  });
+  now = 3_000;
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db.prepare("SELECT state, next_retry_at FROM processing_jobs WHERE id = 'j1'").get(),
+    { state: "retry", next_retry_at: 3_000 }
+  );
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "completed",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: null,
+      blocked_reason: null,
+      completed_at: 3_000,
+    }
+  );
+});
+
+test("terminal identity dependency failure blocks after one attempt", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "resolve_identities",
+    priority: 45,
+    modelVersion: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
+  });
+  runner.register("resolve_identities", async () => {
+    const error = new Error("IDENTITY_RESOLUTION_DEPENDENCY_FAILED");
+    error.code = "IDENTITY_RESOLUTION_DEPENDENCY_FAILED";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
+      blocked_reason: null,
+      completed_at: 2_000,
+    }
+  );
+});
+
+test("blocks a deterministic over-64-speaker result instead of retrying forever", async (t) => {
+  const { db, runner } = fixture(t);
+  seedJob(db, {
+    jobType: "diarize_track",
+    priority: 35,
+    modelVersion: "jarvis-hybrid-diarization-v3",
+  });
+  runner.register("diarize_track", async () => {
+    const error = new Error("DIARIZATION_SPEAKER_LIMIT_EXCEEDED");
+    error.code = "DIARIZATION_SPEAKER_LIMIT_EXCEEDED";
+    throw error;
+  });
+
+  assert.equal(await runner.runOnce(), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, error_code, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "blocked",
+      attempt_count: 1,
+      next_retry_at: null,
+      error_code: "DIARIZATION_SPEAKER_LIMIT_EXCEEDED",
+      completed_at: 2_000,
     }
   );
 });
@@ -670,12 +1079,77 @@ test("resource admission defers durably before the handler without counting an a
     {
       state: "retry",
       attempt_count: 2,
-      next_retry_at: 17_000,
+      next_retry_at: 2_000 + 30 * 60_000,
       blocked_reason: "external_gpu_busy",
       error_code: null,
       lease_owner: null,
       lease_expires_at: null,
       execution_device: null,
+    }
+  );
+});
+
+test("external GPU busy parks local work until an available-resource wake", async (t) => {
+  let now = 2_000;
+  let gpuBusy = true;
+  let handlerCalls = 0;
+  const governor = {
+    sample: async () => ({
+      state: gpuBusy ? "busy" : "available",
+      selectedGpuUuid: gpuBusy ? null : "GPU-a",
+    }),
+    admit: () =>
+      gpuBusy
+        ? { action: "defer", reason: "external_gpu_busy" }
+        : { action: "run_cpu", reason: "resources_available" },
+  };
+  const { db, runner } = fixture(t, {
+    now: () => now,
+    governor,
+    heavyGate: new HeavyJobGate(),
+  });
+  seedJob(db);
+  runner.register("transcribe_chunk", async () => {
+    handlerCalls += 1;
+    return { executionDevice: "cpu" };
+  });
+
+  assert.equal(await runner.runOnce(now), 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, attempt_count, next_retry_at, blocked_reason
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "retry",
+      attempt_count: 0,
+      next_retry_at: 2_000 + 30 * 60_000,
+      blocked_reason: "external_gpu_busy",
+    }
+  );
+
+  now += 15_000;
+  assert.equal(await runner.runOnce(now), 0);
+  assert.equal(handlerCalls, 0);
+
+  gpuBusy = false;
+  assert.equal(runner.wakeResourceDeferredJobs(now), 1);
+  assert.equal(await runner.runOnce(now), 1);
+  assert.equal(handlerCalls, 1);
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT state, next_retry_at, blocked_reason, completed_at
+         FROM processing_jobs WHERE id = 'j1'`
+      )
+      .get(),
+    {
+      state: "completed",
+      next_retry_at: null,
+      blocked_reason: null,
+      completed_at: now,
     }
   );
 });

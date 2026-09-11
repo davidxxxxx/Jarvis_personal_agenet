@@ -2,15 +2,50 @@ const crypto = require("node:crypto");
 const {
   ANALYSIS_TOOL,
   AnalysisSchemaError,
+  salvageCandidateAnalysis,
   validateCandidateAnalysis,
 } = require("./JarvisAnalysisSchema");
+const {
+  INPUT_CONTRACT_VERSION,
+  LEGACY_INPUT_CONTRACT_VERSION,
+  normalizedSegmentContext,
+} = require("./AnalysisInputBuilder");
 
 const DEFAULT_BASE_URL = "https://api.minimaxi.com/v1";
 const DEFAULT_MODEL = "MiniMax-M2.7";
-const DEFAULT_MAX_REQUEST_BYTES = 128 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES = 512 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
 const DEFAULT_TIMEOUT_MS = 240_000;
 const OFFICIAL_HOSTS = new Set(["api.minimaxi.com", "api.minimax.io"]);
+const ANONYMOUS_SPEAKER_PATTERN = /^(?:SELF|P[1-9][0-9]*)$/u;
+const LEARNING_GOAL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const V2_SEGMENT_KEYS = ["segmentId", "startedAt", "endedAt", "speakerLabel", "text"];
+const V3_SEGMENT_KEYS = [
+  "segmentId",
+  "startedAt",
+  "endedAt",
+  "speakerLabel",
+  "applicationKey",
+  "sourceAttribution",
+  "activityCategory",
+  "activityConfidence",
+  "activityDecision",
+  "selfParticipated",
+  "memoryMode",
+  "allowedSuggestionBases",
+  "todoCandidateAllowed",
+  "text",
+];
+const RAW_SENSITIVE_TEXT_PATTERNS = Object.freeze([
+  /\bBearer\s+[^\s"'<>]+/iu,
+  /\bsk-(?:cp-)?[A-Za-z0-9_-]{8,}\b/u,
+  /\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/u,
+  /\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/iu,
+  /(["'])(?:[A-Za-z]:[\\/]|\\\\|\/)[^"'\r\n]*\1/u,
+  /(^|[\s(=])(?:[A-Za-z]:[\\/]|\\\\)[^"'<>\r\n,;)\]}]*/u,
+  /(^|[\s(=])\/(?!\/)[^"'<>\r\n,;)\]}]*/u,
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u,
+]);
 const LOG_KEYS = new Set([
   "requestId",
   "inputHash",
@@ -62,22 +97,99 @@ function parseOfficialEndpoint(baseUrl) {
   return `${parsed.origin}/v1/chat/completions`;
 }
 
-function exactKeys(value, expected) {
+function isPlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function exactKeys(value, expected) {
+  if (!isPlainObject(value)) return false;
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function containsRawSensitiveText(value) {
+  return RAW_SENSITIVE_TEXT_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function validOpaqueId(value) {
+  return (
+    typeof value === "string" &&
+    Boolean(value) &&
+    value === value.trim() &&
+    Array.from(value).length <= 512 &&
+    !containsRawSensitiveText(value)
+  );
+}
+
+function sameSet(left, right) {
+  return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
+function validateOmittedRanges(ranges) {
+  let previous = null;
+  for (const range of ranges) {
+    if (
+      !exactKeys(range, ["startedAt", "endedAt"]) ||
+      !Number.isSafeInteger(range.startedAt) ||
+      !Number.isSafeInteger(range.endedAt) ||
+      range.startedAt < 0 ||
+      range.endedAt <= range.startedAt ||
+      (previous !== null && range.startedAt <= previous.endedAt)
+    ) {
+      throw clientError("invalid_structure");
+    }
+    previous = range;
+  }
+}
+
+function validateV3SegmentContext(segment) {
+  let normalized;
+  try {
+    normalized = normalizedSegmentContext({
+      applicationKey: segment.applicationKey,
+      sourceAttribution: segment.sourceAttribution,
+      activityCategory: segment.activityCategory,
+      activityConfidence: segment.activityConfidence,
+      activityDecision: segment.activityDecision,
+      selfParticipated: segment.selfParticipated,
+      speakerBindingLabel: segment.speakerLabel,
+    });
+  } catch {
+    throw clientError("invalid_structure");
+  }
+  const supplied = Object.fromEntries(Object.keys(normalized).map((key) => [key, segment[key]]));
+  if (JSON.stringify(supplied) !== JSON.stringify(normalized)) {
+    throw clientError("invalid_structure");
+  }
+}
+
 function normalizeInput(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
+  const inputHasLearningGoalIds = isPlainObject(input) && hasOwn(input, "allowedLearningGoalIds");
+  const expectedInputKeys = inputHasLearningGoalIds
+    ? [
+        "cloudPayloadJson",
+        "inputHash",
+        "allowedSegmentIds",
+        "allowedOwnerLabels",
+        "allowedLearningGoalIds",
+      ]
+    : ["cloudPayloadJson", "inputHash", "allowedSegmentIds", "allowedOwnerLabels"];
+  if (!exactKeys(input, expectedInputKeys)) {
     throw clientError("invalid_structure");
   }
   if (
     typeof input.cloudPayloadJson !== "string" ||
     !/^[0-9a-f]{64}$/u.test(input.inputHash) ||
     !Array.isArray(input.allowedSegmentIds) ||
-    !Array.isArray(input.allowedOwnerLabels)
+    !Array.isArray(input.allowedOwnerLabels) ||
+    (inputHasLearningGoalIds && !Array.isArray(input.allowedLearningGoalIds))
   ) {
     throw clientError("invalid_structure");
   }
@@ -87,35 +199,110 @@ function normalizeInput(input) {
   } catch {
     throw clientError("invalid_json");
   }
+  const allowedLearningGoalIdValues = input.allowedLearningGoalIds ?? [];
+  const allowedSegmentIds = new Set(input.allowedSegmentIds);
+  const allowedOwnerLabels = new Set(input.allowedOwnerLabels);
+  const allowedLearningGoalIds = new Set(allowedLearningGoalIdValues);
   if (
-    !exactKeys(cloudPayload, ["inputVersion", "segments", "omittedRanges"]) ||
-    cloudPayload.inputVersion !== "jarvis-analysis-input-v2" ||
+    allowedSegmentIds.size !== input.allowedSegmentIds.length ||
+    allowedOwnerLabels.size !== input.allowedOwnerLabels.length ||
+    allowedLearningGoalIds.size !== allowedLearningGoalIdValues.length ||
+    input.allowedSegmentIds.some((segmentId) => !validOpaqueId(segmentId)) ||
+    input.allowedOwnerLabels.some(
+      (ownerLabel) => typeof ownerLabel !== "string" || !ANONYMOUS_SPEAKER_PATTERN.test(ownerLabel)
+    ) ||
+    allowedLearningGoalIdValues.some(
+      (goalId) => typeof goalId !== "string" || !LEARNING_GOAL_ID_PATTERN.test(goalId)
+    )
+  ) {
+    throw clientError("invalid_structure");
+  }
+  const payloadHasLearningGoals = hasOwn(cloudPayload, "learningGoals");
+  const expectedPayloadKeys = payloadHasLearningGoals
+    ? ["inputVersion", "learningGoals", "segments", "omittedRanges"]
+    : ["inputVersion", "segments", "omittedRanges"];
+  if (
+    !exactKeys(cloudPayload, expectedPayloadKeys) ||
+    !new Set([INPUT_CONTRACT_VERSION, LEGACY_INPUT_CONTRACT_VERSION]).has(
+      cloudPayload.inputVersion
+    ) ||
+    (payloadHasLearningGoals && !Array.isArray(cloudPayload.learningGoals)) ||
     !Array.isArray(cloudPayload.segments) ||
     cloudPayload.segments.length === 0 ||
     !Array.isArray(cloudPayload.omittedRanges)
   ) {
     throw clientError("invalid_structure");
   }
-  const allowedSegmentIds = new Set(input.allowedSegmentIds);
-  const allowedOwnerLabels = new Set(input.allowedOwnerLabels);
-  if (
-    allowedSegmentIds.size !== input.allowedSegmentIds.length ||
-    allowedOwnerLabels.size !== input.allowedOwnerLabels.length
-  ) {
+  if ((cloudPayload.learningGoals ?? []).length > 32) {
     throw clientError("invalid_structure");
   }
-  for (const segment of cloudPayload.segments) {
+  const payloadLearningGoalIds = new Set();
+  for (const goal of cloudPayload.learningGoals ?? []) {
     if (
-      !exactKeys(segment, ["segmentId", "startedAt", "endedAt", "speakerLabel", "text"]) ||
-      !allowedSegmentIds.has(segment.segmentId) ||
-      !allowedOwnerLabels.has(segment.speakerLabel) ||
-      typeof segment.text !== "string" ||
-      !segment.text
+      !exactKeys(goal, ["goalId", "title"]) ||
+      typeof goal.goalId !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(goal.goalId) ||
+      !allowedLearningGoalIds.has(goal.goalId) ||
+      payloadLearningGoalIds.has(goal.goalId) ||
+      typeof goal.title !== "string" ||
+      !goal.title.trim() ||
+      goal.title !== goal.title.trim() ||
+      Array.from(goal.title).length > 500 ||
+      containsRawSensitiveText(goal.title)
     ) {
       throw clientError("invalid_structure");
     }
+    payloadLearningGoalIds.add(goal.goalId);
   }
-  if (cloudPayload.segments.length !== allowedSegmentIds.size) {
+  if (
+    payloadLearningGoalIds.size !== allowedLearningGoalIds.size ||
+    [...allowedLearningGoalIds].some((goalId) => !payloadLearningGoalIds.has(goalId))
+  ) {
+    throw clientError("invalid_structure");
+  }
+  const payloadOwnerLabels = new Set();
+  const payloadSegmentIds = new Set();
+  let previousSegment = null;
+  for (const segment of cloudPayload.segments) {
+    const expectedSegmentKeys =
+      cloudPayload.inputVersion === INPUT_CONTRACT_VERSION ? V3_SEGMENT_KEYS : V2_SEGMENT_KEYS;
+    if (
+      !exactKeys(segment, expectedSegmentKeys) ||
+      !validOpaqueId(segment.segmentId) ||
+      payloadSegmentIds.has(segment.segmentId) ||
+      !allowedSegmentIds.has(segment.segmentId) ||
+      !Number.isSafeInteger(segment.startedAt) ||
+      !Number.isSafeInteger(segment.endedAt) ||
+      segment.startedAt < 0 ||
+      segment.endedAt <= segment.startedAt ||
+      typeof segment.speakerLabel !== "string" ||
+      !ANONYMOUS_SPEAKER_PATTERN.test(segment.speakerLabel) ||
+      !allowedOwnerLabels.has(segment.speakerLabel) ||
+      typeof segment.text !== "string" ||
+      !segment.text ||
+      containsRawSensitiveText(segment.text) ||
+      (previousSegment !== null &&
+        (segment.startedAt < previousSegment.startedAt ||
+          (segment.startedAt === previousSegment.startedAt &&
+            segment.endedAt < previousSegment.endedAt) ||
+          (segment.startedAt === previousSegment.startedAt &&
+            segment.endedAt === previousSegment.endedAt &&
+            segment.segmentId.localeCompare(previousSegment.segmentId) < 0)))
+    ) {
+      throw clientError("invalid_structure");
+    }
+    if (cloudPayload.inputVersion === INPUT_CONTRACT_VERSION) {
+      validateV3SegmentContext(segment);
+    }
+    payloadSegmentIds.add(segment.segmentId);
+    payloadOwnerLabels.add(segment.speakerLabel);
+    previousSegment = segment;
+  }
+  validateOmittedRanges(cloudPayload.omittedRanges);
+  if (
+    !sameSet(payloadSegmentIds, allowedSegmentIds) ||
+    !sameSet(payloadOwnerLabels, allowedOwnerLabels)
+  ) {
     throw clientError("invalid_structure");
   }
   return {
@@ -123,6 +310,7 @@ function normalizeInput(input) {
     inputHash: input.inputHash,
     allowedSegmentIds,
     allowedOwnerLabels,
+    allowedLearningGoalIds,
   };
 }
 
@@ -364,14 +552,17 @@ class MiniMaxAnalysisClient {
           {
             role: "system",
             content:
-              "Analyze only the supplied pseudonymous transcript text. Call submit_jarvis_analysis exactly once with one concise jarvis-analysis-v2 object; do not answer with prose. Use at most 20 memories, 12 topics, 20 todos, and 12 suggestions, with 1-6 strongest evidence IDs per item. Every factual item must cite only supplied segment IDs. Never invent IDs, state, dates, or calendar actions.",
+              "Analyze only the supplied pseudonymous transcript text and its explicit normalized application/activity policy fields. Treat the recording as a hierarchy: first derive a concise local account for each represented 20-minute time window using its timestamps, then reconcile recurring topics, decisions, people, and actions across windows into one session-level result. Do not over-weight only the beginning or end, and do not merge unrelated activities merely because they share words. Call submit_jarvis_analysis exactly once with one concise jarvis-analysis-v3 object; do not answer with prose. Copy evidenceSegmentIds character-for-character only from supplied segmentId values; never invent, shorten, translate, or reformat an ID. Pn speaker labels may be diarization evidence clusters, not verified people. Never infer participant count, language count, identity, gender, or relationships from the number of Pn labels; omit such counts unless the transcript explicitly states them. Treat isolated unexpected scripts and generic subtitle phrases as possible ASR noise unless corroborated by nearby evidence. Use ownerLabel only when it is exactly one supplied speakerLabel, otherwise use null. A todo is allowed only for an explicit SELF commitment or an assignment that SELF explicitly accepts; otherwise omit it. Every todo must include semanticConfidence and actionKind. For actionKind self_commitment, assignmentSegmentIds and acceptanceSegmentIds must both be empty and evidenceSegmentIds must contain only the SELF commitment sentence(s). For actionKind assignment_accepted, assignmentSegmentIds must contain only the other speaker's explicit assignment, acceptanceSegmentIds must contain only SELF's later explicit acceptance, and evidenceSegmentIds must be exactly their union. Never label mere co-occurrence of SELF and another speaker as assignment acceptance. Never turn commands, tactics, or dialogue from games, videos, streams, podcasts, courses, or entertainment into a todo. Every suggestion must cite SELF-participating evidence and set basis to exactly one of work_context, learning_goal, or explicit_agreement. For learning_goal, copy learningGoalId character-for-character from one supplied learningGoals entry and make the suggestion directly advance that goal; if no supplied goal matches, omit the suggestion. For work_context and explicit_agreement, learningGoalId must be null. Use explicit_agreement only when the cited dialogue contains an explicit agreement, not an inferred social obligation. Never invent a goal ID. Omit suggestions for games, entertainment, passive media, or uncertain activity. Omit any optional item that cannot cite an exact supplied segment ID. Use at most 20 memories, 12 topics, 20 todos, and 12 suggestions, with 1-6 strongest evidence IDs per item. For long recordings, prefer evidence spanning distinct relevant time windows. Never invent state, dates, or calendar actions.",
           },
           { role: "user", content: normalized.cloudPayloadJson },
         ],
         tools: [ANALYSIS_TOOL],
-        tool_choice: "auto",
+        tool_choice: {
+          type: "function",
+          function: { name: "submit_jarvis_analysis" },
+        },
         reasoning_split: true,
-        temperature: 1,
+        temperature: 0.1,
         max_completion_tokens: 8192,
         stream: false,
       });
@@ -431,10 +622,17 @@ class MiniMaxAnalysisClient {
         }
         let result;
         try {
-          result = validateCandidateAnalysis(parsed, {
+          const validationContext = {
             allowedSegmentIds: normalized.allowedSegmentIds,
             allowedOwnerLabels: normalized.allowedOwnerLabels,
-          });
+            allowedLearningGoalIds: normalized.allowedLearningGoalIds,
+          };
+          try {
+            result = validateCandidateAnalysis(parsed, validationContext);
+          } catch (error) {
+            if (!(error instanceof AnalysisSchemaError)) throw error;
+            result = salvageCandidateAnalysis(parsed, validationContext);
+          }
         } catch (error) {
           if (error instanceof AnalysisSchemaError) {
             throw attachAuthoritativeUsage(

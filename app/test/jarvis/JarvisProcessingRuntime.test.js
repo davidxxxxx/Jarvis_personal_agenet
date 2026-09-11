@@ -15,10 +15,12 @@ const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
 const {
   JarvisProcessingRuntime,
   createJarvisProcessingRuntime,
   createCommittedAudioPreviewExecutor,
+  shouldEnableOverlapSeparation,
 } = require("../../src/jarvis/main/JarvisProcessingRuntime");
 
 function deferred() {
@@ -38,12 +40,115 @@ function finalSpeakerPolicy(model = "large-v3-turbo") {
 
 function configurableService(service) {
   return Object.assign(service, {
+    configureTranscriptionInputVersion(inputVersion) {
+      this.transcriptionInputVersion = inputVersion;
+      return this.transcriptionInputVersion;
+    },
     configureTranscriptionModelVersion(modelVersion) {
       this.transcriptionModelVersion = modelVersion.trim();
       return this.transcriptionModelVersion;
     },
   });
 }
+
+test("high-memory overlap separation is limited to microphone and communication tracks", () => {
+  assert.equal(shouldEnableOverlapSeparation({ source_type: "mic" }), true);
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "kook" }),
+    true
+  );
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "tencent_meeting" }),
+    true
+  );
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: "dota2" }),
+    false
+  );
+  assert.equal(
+    shouldEnableOverlapSeparation({ source_type: "system", application_key: null }),
+    false
+  );
+});
+
+test("dual speaker rollout rollback leaves diarization evidence available without constructing verifier", (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const service = configurableService({
+    audioEvidenceReader: { withVerifiedWav: async () => null },
+    flacCompressionWorker: { run: async () => {} },
+    previewAudioRing: { withPreviewWav: async () => null },
+  });
+
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    dualSpeakerVerificationEnabled: false,
+  });
+
+  assert.equal(runtime.dualSpeakerVerifier, null);
+  assert.ok(runtime.speakerProcessingPolicy);
+  assert.throws(
+    () =>
+      createJarvisProcessingRuntime({
+        repository,
+        service,
+        ipcHandlers: { createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }) },
+        model: "large-v3-turbo",
+        dualSpeakerVerificationEnabled: "false",
+      }),
+    /dualSpeakerVerificationEnabled/u
+  );
+});
+
+test("production acoustic dedupe requests low-priority maintenance admission", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  const service = configurableService({
+    audioEvidenceReader: {
+      readVerifiedPcm: async () => null,
+      withVerifiedWav: async () => null,
+    },
+    flacCompressionWorker: { run: async () => {} },
+    previewAudioRing: { withPreviewWav: async () => null },
+  });
+  const sampled = {
+    state: "constrained",
+    reason: "cpu_load_high",
+    cpuLoadPct: 90,
+    cpuTelemetryAvailable: true,
+    powerTelemetryAvailable: true,
+    batterySaver: false,
+  };
+  let sampleCalls = 0;
+  const admittedKinds = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service,
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    model: "large-v3-turbo",
+    governor: {
+      async sample() {
+        sampleCalls += 1;
+        return sampled;
+      },
+      admit(kind, snapshot) {
+        admittedKinds.push({ kind, snapshot });
+        return { action: "defer", reason: "cpu_load_high" };
+      },
+    },
+  });
+
+  assert.equal(await runtime.deduper.acousticAdmission(), false);
+  assert.equal(sampleCalls, 1);
+  assert.deepEqual(admittedKinds, [{ kind: "maintenance", snapshot: sampled }]);
+});
 
 async function makeVerifiedCudaManager(t, { peakVramMb, gpuUuid }) {
   const componentRoot = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-runtime-cuda-"));
@@ -178,6 +283,7 @@ function insertJob(
     completedAt = null,
     leaseOwner = null,
     leaseExpiresAt = null,
+    inputVersion = 1,
   } = {}
 ) {
   repository.db
@@ -187,7 +293,7 @@ function insertJob(
       id, session_id, track_id, chunk_id, job_type, state,
       priority, input_hash, input_version, model_version, attempt_count,
       lease_owner, lease_expires_at, created_at, completed_at
-    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, 30, ?, 1, '', 0, ?, ?, 100, ?)
+    ) VALUES (?, ?, ?, ?, 'transcribe_chunk', ?, 30, ?, ?, '', 0, ?, ?, 100, ?)
   `
     )
     .run(
@@ -197,6 +303,7 @@ function insertJob(
       chunkId,
       state,
       chunkId.padEnd(64, "0").slice(0, 64),
+      inputVersion,
       leaseOwner,
       leaseExpiresAt,
       completedAt
@@ -263,6 +370,79 @@ test("restart resumes a persisted pending chunk and no-speech can make it ready"
   assert.equal(repository.getAudioChunk("chunk-mic").transcription_status, "no_speech");
   assert.equal(repository.listPendingJobs("s1").length, 0);
   assert.deepEqual(repository.listTranscriptSegments("s1"), []);
+});
+
+test("a newer no-speech result hides stale final text and later speech restores it", () => {
+  const repository = new JarvisRepository(":memory:");
+  try {
+    insertSession(repository);
+    insertTrack(repository);
+    insertChunk(repository);
+    const chunk = repository.getAudioChunk("chunk-mic");
+    const original = repository.commitChunkTranscript({
+      chunk,
+      result: {
+        text: "stale speech",
+        confidence: 0.7,
+        words: [{ word: "stale", startedAtMs: 0, endedAtMs: 100, probability: 0.7 }],
+      },
+      modelVersion: "large-v3-turbo",
+      completedAt: 1_000,
+    });
+
+    repository.commitChunkTranscript({
+      chunk,
+      result: { noSpeech: true },
+      modelVersion: "large-v3-turbo",
+      completedAt: 2_000,
+    });
+
+    assert.deepEqual(repository.listTranscriptSegments("s1"), []);
+    assert.deepEqual(
+      repository.db
+        .prepare(
+          `SELECT projection_state, projection_reason
+           FROM transcript_segments WHERE id = ?`
+        )
+        .get(original.id),
+      {
+        projection_state: "audit_hidden",
+        projection_reason: "latest_transcription_no_speech",
+      }
+    );
+
+    const restored = repository.commitChunkTranscript({
+      chunk,
+      result: {
+        text: "restored speech",
+        confidence: 0.95,
+        words: [{ word: "restored", startedAtMs: 10, endedAtMs: 200, probability: 0.95 }],
+      },
+      modelVersion: "large-v3-turbo",
+      completedAt: 3_000,
+    });
+
+    assert.equal(restored.id, original.id);
+    assert.equal(restored.text, "restored speech");
+    assert.equal(restored.projection_state, "visible");
+    assert.equal(restored.projection_reason, null);
+    assert.equal(repository.getAudioChunk("chunk-mic").transcription_status, "completed");
+    assert.deepEqual(repository.listTranscriptWordsForSegment(restored.id), [
+      {
+        id: repository.listTranscriptWordsForSegment(restored.id)[0].id,
+        transcript_segment_id: restored.id,
+        chunk_id: "chunk-mic",
+        ordinal: 0,
+        word: "restored",
+        started_at: chunk.started_at + 10,
+        ended_at: chunk.started_at + 200,
+        probability: 0.95,
+        created_at: 3_000,
+      },
+    ]);
+  } finally {
+    repository.close();
+  }
 });
 
 test("open sessions and every incomplete transcription job state stay non-ready", () => {
@@ -415,10 +595,14 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
     reconciler: {
       reconcileSession: (id) => {
         order.push(`reconcile:${id}`);
-        if (id === "bad") throw new Error("bad transcript");
       },
     },
-    deduper: { dedupe: (id) => order.push(`dedupe:${id}`) },
+    deduper: {
+      dedupe: (id) => {
+        order.push(`dedupe:${id}`);
+        if (id === "bad") throw new Error("acoustic dedupe deferred");
+      },
+    },
     log: (entry) => order.push(`error:${entry.sessionId}`),
   });
 
@@ -426,6 +610,7 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
   assert.deepEqual(order, [
     "processing:bad",
     "reconcile:bad",
+    "dedupe:bad",
     "error:bad",
     "processing:good",
     "reconcile:good",
@@ -433,6 +618,170 @@ test("post-processing runs reconcile then dedupe before readiness and isolates s
     "diarize:good",
     "ready:good",
   ]);
+});
+
+test("coded acoustic deferral cools down only that session until retry expiry", async () => {
+  let now = 1_000;
+  let jobPhaseCalls = 0;
+  let deferredAttempts = 0;
+  const activeSessions = new Set(["deferred", "healthy"]);
+  const events = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => 0,
+      runOnce: async () => {
+        jobPhaseCalls += 1;
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () =>
+        [...activeSessions].map((id) => ({ id, finalized_at: id === "deferred" ? 1 : 2 })),
+      isSessionReadyForPostProcessing: () => true,
+      markSessionProcessing: (id) => events.push(`processing:${id}`),
+      enqueueDiarizationJobs: (id) => events.push(`diarize:${id}`),
+      refreshSessionReadiness: (id) => {
+        events.push(`ready:${id}`);
+        activeSessions.delete(id);
+        return { processing_state: "ready" };
+      },
+    },
+    reconciler: {
+      reconcileSession: (id) => events.push(`reconcile:${id}`),
+    },
+    deduper: {
+      dedupe: (id) => {
+        events.push(`dedupe:${id}`);
+        if (id === "deferred" && deferredAttempts++ === 0) {
+          const error = new Error("acoustic dedupe deferred");
+          error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+          throw error;
+        }
+      },
+    },
+    now: () => now,
+    acousticDedupeRetryMs: 60_000,
+    log: (entry) => events.push(`error:${entry.sessionId}`),
+  });
+
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 1);
+  assert.equal(activeSessions.has("healthy"), false);
+  assert.deepEqual(events.slice(0, 9), [
+    "processing:deferred",
+    "reconcile:deferred",
+    "dedupe:deferred",
+    "error:deferred",
+    "processing:healthy",
+    "reconcile:healthy",
+    "dedupe:healthy",
+    "diarize:healthy",
+    "ready:healthy",
+  ]);
+
+  const jobsAfterFirstDrain = jobPhaseCalls;
+  now = 60_999;
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 1);
+  assert.equal(events.filter((event) => event === "reconcile:deferred").length, 1);
+  assert.ok(jobPhaseCalls > jobsAfterFirstDrain);
+
+  now = 61_000;
+  await runtime.drainOnce();
+  assert.equal(deferredAttempts, 2);
+  assert.equal(events.filter((event) => event === "reconcile:deferred").length, 2);
+  assert.equal(activeSessions.has("deferred"), false);
+});
+
+test("expired acoustic cooldown is swept after its session leaves the processing list", async () => {
+  let now = 1_000;
+  let listed = true;
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => (listed ? [{ id: "orphaned" }] : []),
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "processing" }),
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: {
+      dedupe() {
+        const error = new Error("acoustic dedupe deferred");
+        error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+        throw error;
+      },
+    },
+    now: () => now,
+    acousticDedupeRetryMs: 60_000,
+  });
+
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 1);
+  listed = false;
+
+  now = 60_999;
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 1);
+
+  now = 61_000;
+  await runtime.drainOnce();
+  assert.equal(runtime.acousticDedupeRetryAtBySession.size, 0);
+});
+
+test("recovered maintenance admission releases acoustic cooldown before expiry", async () => {
+  let now = 1_000;
+  let available = false;
+  let attempts = 0;
+  const activeSessions = new Set(["deferred"]);
+  const governor = {
+    async sample() {
+      return available
+        ? { state: "available", reason: "resources_available" }
+        : { state: "constrained", reason: "recovery_hysteresis" };
+    },
+    admit(kind) {
+      assert.equal(kind, "maintenance");
+      return available
+        ? { action: "run_cpu", reason: "resources_available" }
+        : { action: "defer", reason: "recovery_hysteresis" };
+    },
+  };
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases: () => 0, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [...activeSessions].map((id) => ({ id })),
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: (id) => {
+        activeSessions.delete(id);
+        return { processing_state: "ready" };
+      },
+    },
+    reconciler: { reconcileSession: () => {} },
+    deduper: {
+      dedupe() {
+        attempts += 1;
+        if (attempts === 1) {
+          const error = new Error("acoustic dedupe deferred");
+          error.code = "ACOUSTIC_DEDUPE_RESOURCE_DEFERRED";
+          throw error;
+        }
+      },
+    },
+    now: () => now,
+    governor,
+    acousticDedupeRetryMs: 60_000,
+  });
+
+  await runtime.drainOnce();
+  now = 6_000;
+  await runtime.drainOnce();
+  assert.equal(attempts, 1);
+
+  available = true;
+  now = 11_000;
+  await runtime.drainOnce();
+  assert.equal(attempts, 2);
+  assert.equal(activeSessions.size, 0);
 });
 
 test("start recovers expired leases immediately and owns an unref polling timer", async () => {
@@ -513,7 +862,108 @@ test("ready sessions enqueue final analysis before exact-session digest and clou
   assert.equal(calls.indexOf("digest_stop") < calls.indexOf("cloud_stop"), true);
 });
 
-test("startup repairs one missed ready-session analysis before starting the cloud dispatcher", async () => {
+test("historical local-only reprocessing preserves summaries and never queues cloud analysis", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [{ id: "historical-session" }],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+      isHistoricalLocalOnlyReprocessing: () => true,
+      startHistoricalLocalOnlyReprocessing: (sessionId) => {
+        calls.push(`local_start:${sessionId}`);
+        return { state: "processing" };
+      },
+      refreshSessionParticipantSnapshot: (sessionId) =>
+        calls.push(`participant_refresh:${sessionId}`),
+      finalizeHistoricalLocalOnlyReprocessing: (sessionId) => {
+        calls.push(`local_finalize:${sessionId}`);
+        return { state: "completed" };
+      },
+    },
+    reconciler: { reconcileSession: () => calls.push("reconcile") },
+    deduper: { dedupe: () => calls.push("dedupe") },
+    analysisScheduler: {
+      analyzeSession: () => calls.push("unexpected_cloud_analysis"),
+      classifySessionLocally: (sessionId, options) =>
+        calls.push(`local_classify:${sessionId}:${options.force}`),
+    },
+    dailyDigestScheduler: {
+      start() {},
+      tick() {},
+      onSessionReady: () => calls.push("unexpected_digest_refresh"),
+      stop() {},
+    },
+  });
+
+  await runtime.drainOnce();
+  assert.deepEqual(calls, [
+    "reconcile",
+    "dedupe",
+    "local_start:historical-session",
+    "local_classify:historical-session:true",
+    "participant_refresh:historical-session",
+    "local_finalize:historical-session",
+  ]);
+});
+
+test("historical local-only failures remain retryable at every durable finalize step", async (t) => {
+  for (const failureStage of ["classify", "participant", "finalize"]) {
+    await t.test(failureStage, async () => {
+      let shouldFail = true;
+      let finalized = 0;
+      const calls = [];
+      const failOnce = (stage) => {
+        calls.push(stage);
+        if (failureStage === stage && shouldFail) {
+          shouldFail = false;
+          throw new Error(`${stage} failed`);
+        }
+      };
+      const runtime = new JarvisProcessingRuntime({
+        runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+        repository: {
+          listProcessingSessions: () => [{ id: "historical-retry", ended_at: 1 }],
+          isSessionReadyForPostProcessing: () => true,
+          refreshSessionReadiness: () => ({ processing_state: "ready" }),
+          isHistoricalLocalOnlyReprocessing: () => true,
+          startHistoricalLocalOnlyReprocessing: () => {
+            calls.push("start");
+            return { state: "processing" };
+          },
+          refreshSessionParticipantSnapshot: () => failOnce("participant"),
+          finalizeHistoricalLocalOnlyReprocessing: () => {
+            failOnce("finalize");
+            finalized += 1;
+            return { state: "completed" };
+          },
+        },
+        reconciler: { reconcileSession() {} },
+        deduper: { dedupe() {} },
+        analysisScheduler: {
+          analyzeSession() {
+            throw new Error("cloud analysis must stay disabled");
+          },
+          classifySessionLocally() {
+            failOnce("classify");
+          },
+        },
+        now: () => 10,
+        log: ({ phase }) => calls.push(`error:${phase}`),
+      });
+
+      await runtime.drainOnce();
+      assert.equal(finalized, 0);
+      await runtime.drainOnce();
+      assert.equal(finalized, 1);
+      assert.equal(calls.filter((entry) => entry === "start").length, 2);
+      assert.equal(calls.filter((entry) => entry === "error:post_process").length, 1);
+    });
+  }
+});
+
+test("startup repairs a bounded historical analysis batch before starting the cloud dispatcher", async () => {
   const calls = [];
   const runtime = new JarvisProcessingRuntime({
     runner: {
@@ -528,10 +978,12 @@ test("startup repairs one missed ready-session analysis before starting the clou
     reconciler: { reconcileSession() {} },
     deduper: { dedupe() {} },
     analysisScheduler: {
-      recoverReadySessions: async () => calls.push("recover_analysis"),
+      recoverReadySessions: async (options) =>
+        calls.push(`recover_analysis:${options?.limit ?? "missing"}`),
       analyzeSession() {},
     },
     cloudDispatcher: {
+      recoverStartup: () => calls.push("recover_budget"),
       start: () => calls.push("cloud_start"),
       drainOnce() {},
       stop() {},
@@ -542,8 +994,118 @@ test("startup repairs one missed ready-session analysis before starting the clou
 
   await runtime.start();
   await runtime.stop();
-  assert.equal(calls.indexOf("recover_analysis") > calls.indexOf("recover_leases"), true);
-  assert.equal(calls.indexOf("recover_analysis") < calls.indexOf("cloud_start"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") > calls.indexOf("recover_leases"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") > calls.indexOf("recover_budget"), true);
+  assert.equal(calls.indexOf("recover_analysis:25") < calls.indexOf("cloud_start"), true);
+});
+
+test("periodically recovers sessions that become ready after startup processing", async () => {
+  let now = 1_000;
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: ({ limit }) => calls.push(`recover:${limit}:${now}`),
+      analyzeSession() {},
+    },
+    now: () => now,
+    analysisRecoveryIntervalMs: 30_000,
+  });
+
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 10_000;
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 20_000;
+  await runtime.drainOnce();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls, ["recover:1:1000", "recover:1:31000"]);
+});
+
+test("failed budget recovery prevents direct activity recovery until the cloud gate can retry", async () => {
+  const calls = [];
+  const runtime = new JarvisProcessingRuntime({
+    runner: { recoverExpiredLeases() {}, runOnce: async () => 0 },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: () => calls.push("unsafe_activity_recovery"),
+      analyzeSession() {},
+    },
+    cloudDispatcher: {
+      recoverStartup: async () => {
+        throw new Error("budget database unavailable");
+      },
+      start: () => calls.push("cloud_retry"),
+      drainOnce() {},
+      stop() {},
+    },
+    log: ({ phase }) => calls.push(phase),
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  await runtime.start();
+  await runtime.stop();
+  assert.equal(calls.includes("unsafe_activity_recovery"), false);
+  assert.deepEqual(calls, ["analysis_budget_recovery", "cloud_retry"]);
+});
+
+test("slow cloud startup recovery does not block the local processing queue", async () => {
+  const calls = [];
+  const cloudRecovery = deferred();
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases: () => calls.push("recover_leases"),
+      runOnce: async (_at, { priorityBefore } = {}) => {
+        if (priorityBefore === 20) return 0;
+        calls.push("local_drain");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => true,
+      refreshSessionReadiness: () => ({ processing_state: "ready" }),
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    analysisScheduler: {
+      recoverReadySessions: () => calls.push("recover_analysis"),
+      analyzeSession() {},
+    },
+    cloudDispatcher: {
+      recoverStartup: () => cloudRecovery.promise,
+      start: () => calls.push("cloud_start"),
+      drainOnce() {},
+      stop() {},
+    },
+    setIntervalImpl: () => ({ unref() {} }),
+    clearIntervalImpl() {},
+  });
+
+  const startup = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ["recover_leases", "local_drain"]);
+
+  cloudRecovery.resolve();
+  await startup;
+  await runtime.stop();
+  assert.deepEqual(calls, ["recover_leases", "local_drain", "recover_analysis", "cloud_start"]);
 });
 
 test("ready notification failures are isolated so analysis and digest both get a chance", async () => {
@@ -983,7 +1545,7 @@ test("production composition registers diarize_track as CPU speaker work", async
   });
 
   assert.equal(Object.isFrozen(runtime.speakerProcessingPolicy), true);
-  assert.equal(runtime.speakerProcessingPolicy.transcriptionInputVersion, 1);
+  assert.equal(runtime.speakerProcessingPolicy.transcriptionInputVersion, 2);
   assert.equal(runtime.speakerProcessingPolicy.transcriptionModelVersion, "large-v3-turbo");
 
   assert.equal(await runtime.drainOnce(), 1);
@@ -997,6 +1559,86 @@ test("production composition registers diarize_track as CPU speaker work", async
   );
 });
 
+test("offline model pack selects v2 CUDA diarization and is disposed on shutdown", async (t) => {
+  const repository = new JarvisRepository(":memory:");
+  t.after(() => repository.close());
+  insertSession(repository);
+  insertTrack(repository);
+  const revision = "d".repeat(64);
+  repository.db
+    .prepare(
+      `
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'hybrid-job', 's1', 'track-mic', NULL, 'diarize_track', 'pending', 40,
+      ?, 2, ?, 100
+    )
+  `
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "s1",
+        trackId: "track-mic",
+        evidenceRevision: revision,
+        policyId: HYBRID_DIARIZATION_POLICY.policyId,
+      }),
+      HYBRID_DIARIZATION_POLICY.policyId
+    );
+  let disposed = 0;
+  const capabilities = [];
+  const runtime = createJarvisProcessingRuntime({
+    repository,
+    service: configurableService({
+      audioEvidenceReader: { withVerifiedWav: async () => null },
+      flacCompressionWorker: { run: async () => {} },
+      previewAudioRing: { withPreviewWav: async () => null },
+    }),
+    ipcHandlers: {
+      createJarvisTranscribeWavAdapter: () => async () => ({ noSpeech: true }),
+    },
+    hybridDiarizationManager: {
+      isAvailable: () => true,
+      diarizeStrict: async () => [],
+      getModelArtifactSha256: async () => "e".repeat(64),
+      dispose: async () => {
+        disposed += 1;
+      },
+    },
+    sessionDiarizationWorker: {
+      run: async (_job, context) => {
+        assert.equal(context.device, "cuda");
+        assert.equal(context.selectedGpuUuid, "GPU-hybrid");
+        return { executionDevice: "cuda" };
+      },
+    },
+    model: "large-v3-turbo",
+    now: () => 2_000,
+    governor: {
+      sample: async () => ({ state: "available", selectedGpuUuid: "GPU-hybrid" }),
+      admit: (kind, _snapshot, capability) => {
+        capabilities.push({ kind, capability });
+        return { action: "run_cuda", reason: "resources_available" };
+      },
+    },
+    heavyGate: new HeavyJobGate(),
+    maxJobsPerDrain: 1,
+  });
+
+  assert.equal(runtime.diarizationPolicy, HYBRID_DIARIZATION_POLICY);
+  assert.equal(await runtime.drainOnce(), 1);
+  assert.deepEqual(capabilities, [{ kind: "speaker", capability: { executionDevice: "cuda" } }]);
+  assert.equal(
+    repository.db
+      .prepare("SELECT execution_device FROM processing_jobs WHERE id = 'hybrid-job'")
+      .get().execution_device,
+    "cuda"
+  );
+  await runtime.stop();
+  assert.equal(disposed, 1);
+});
+
 test("production composition builds the durable diarization worker from local managers", async (t) => {
   const repository = new JarvisRepository(":memory:");
   t.after(() => repository.close());
@@ -1004,13 +1646,13 @@ test("production composition builds the durable diarization worker from local ma
   insertTrack(repository, { endedAt: 4_000 });
   repository.db.prepare("UPDATE audio_tracks SET state = 'ended' WHERE id = 'track-mic'").run();
   insertChunk(repository, { startedAt: 100, endedAt: 4_000 });
-  insertJob(repository, { state: "completed", completedAt: 4_200 });
+  insertJob(repository, { state: "completed", completedAt: 4_200, inputVersion: 2 });
   repository.db
     .prepare("UPDATE processing_jobs SET model_version = 'large-v3-turbo' WHERE id = 'job-mic'")
     .run();
   insertFinalCoverage(repository, "chunk-mic", 4_200);
   const speakerProcessingPolicy = new SpeakerProcessingPolicy({
-    transcriptionInputVersion: 1,
+    transcriptionInputVersion: 2,
     transcriptionModelVersion: "large-v3-turbo",
   });
   const snapshot = repository.getDiarizationEvidenceSnapshot({
@@ -1092,12 +1734,16 @@ test("production composition builds the durable diarization worker from local ma
   });
 
   assert.equal(await runtime.drainOnce(), 1);
-  assert.deepEqual(capabilities, [
-    {
-      kind: "speaker",
-      capability: { executionDevice: "cpu", available: true },
-    },
-  ]);
+  assert.ok(capabilities.length >= 2);
+  assert.equal(
+    capabilities.every(
+      (entry) =>
+        entry.kind === "speaker" &&
+        entry.capability.executionDevice === "cpu" &&
+        entry.capability.available === true
+    ),
+    true
+  );
   assert.deepEqual(calls, [
     ["diarize", "verified-final.wav"],
     ["embed", "verified-final.wav", 0, 2],
@@ -2333,6 +2979,61 @@ test("generic recovery runs while fullscreen and its first-exit recovery stay pa
     "resource:recovery_hysteresis",
     "preview:recovery_hysteresis",
   ]);
+});
+
+test("an available resource snapshot wakes parked local jobs before the job phase", async () => {
+  const calls = [];
+  const available = {
+    state: "available",
+    reason: "resources_available",
+    restrictiveForMs: 0,
+    previewEnabled: true,
+  };
+  const snapshots = [
+    available,
+    available,
+    {
+      state: "busy",
+      reason: "external_gpu_busy",
+      restrictiveForMs: 0,
+      previewEnabled: true,
+    },
+    available,
+  ];
+  const runtime = new JarvisProcessingRuntime({
+    runner: {
+      recoverExpiredLeases() {},
+      wakeResourceDeferredJobs(at) {
+        calls.push(`wake:${at}`);
+        return 2;
+      },
+      async runOnce() {
+        calls.push("job");
+        return 0;
+      },
+    },
+    repository: {
+      listProcessingSessions: () => [],
+      isSessionReadyForPostProcessing: () => false,
+      refreshSessionReadiness() {},
+    },
+    reconciler: { reconcileSession() {} },
+    deduper: { dedupe() {} },
+    governor: {
+      sample: async () => snapshots.shift(),
+    },
+    onResourceSnapshot: (snapshot) => calls.push(`resource:${snapshot.reason}`),
+    now: () => 2_000,
+  });
+
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.deepEqual(calls.slice(0, 3), ["resource:resources_available", "wake:2000", "job"]);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 1);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 1);
+  assert.equal(await runtime.drainOnce(), 0);
+  assert.equal(calls.filter((entry) => entry === "wake:2000").length, 2);
 });
 
 test("stop during governor sampling prevents a late preview from escaping the shutdown join", async () => {

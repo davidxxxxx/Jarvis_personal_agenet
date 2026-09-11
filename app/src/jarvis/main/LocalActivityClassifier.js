@@ -1,5 +1,7 @@
 "use strict";
 
+const { ActivityOutputPolicy } = require("./ActivityOutputPolicy");
+
 const ACTIVITY_CATEGORIES = Object.freeze([
   "work_meeting",
   "learning",
@@ -69,12 +71,7 @@ const DAILY_HINTS = new Set([
   "personal",
 ]);
 
-const ACTION_ELIGIBLE_CATEGORIES = new Set([
-  "work_meeting",
-  "learning",
-  "social_call",
-  "in_person_conversation",
-]);
+const activityOutputPolicy = new ActivityOutputPolicy();
 
 function isPlainObject(value) {
   return Boolean(
@@ -186,7 +183,8 @@ function add(scores, reasons, category, amount, reason) {
   if (amount > 0 && !reasons[category].includes(reason)) reasons[category].push(reason);
 }
 
-function applyConfidenceGate(category, confidence, { sourceAttribution = "application" } = {}) {
+function applyConfidenceGate(category, confidence, options = {}) {
+  const { sourceAttribution = "application" } = options;
   if (!ACTIVITY_CATEGORY_SET.has(category)) throw new TypeError("category is invalid");
   if (typeof confidence !== "number" || !Number.isFinite(confidence)) {
     throw new TypeError("confidence must be finite");
@@ -206,15 +204,23 @@ function applyConfidenceGate(category, confidence, { sourceAttribution = "applic
   } else {
     finalCategory = "unknown";
   }
-  const activityPolicyEligible =
-    decision === "adopted" && ACTION_ELIGIBLE_CATEGORIES.has(finalCategory);
+  const permissions = activityOutputPolicy.evaluate({
+    category: finalCategory,
+    confidence: Number(boundedConfidence.toFixed(4)),
+    decision,
+    sourceAttribution,
+    selfParticipated:
+      options.selfParticipated === true ||
+      options.selfDetected === true ||
+      options.microphoneParticipated === true,
+  });
   return {
     category: finalCategory,
     confidence: Number(boundedConfidence.toFixed(4)),
     decision,
-    allowSummary: decision !== "unknown",
-    allowSuggestions: activityPolicyEligible,
-    allowTodos: activityPolicyEligible,
+    allowSummary: permissions.allowSummary,
+    allowSuggestions: permissions.allowSuggestions,
+    allowTodos: permissions.allowTodos,
   };
 }
 

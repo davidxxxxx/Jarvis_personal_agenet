@@ -19,9 +19,16 @@ interface SummaryView {
 
 type PanelState =
   | { kind: "hidden" }
-  | { kind: "loading" }
+  | { kind: "loading"; outcome: AnalysisOutcome }
   | { kind: "ready"; view: SummaryView }
-  | { kind: "unavailable"; errorCode: string | null };
+  | {
+      kind: "unavailable";
+      outcome: Extract<AnalysisOutcome, "offline" | "quota_limited" | "retry_needed">;
+      errorCode: string | null;
+    };
+
+type AnalysisOutcome =
+  "waiting" | "analyzing" | "ready" | "offline" | "quota_limited" | "retry_needed";
 
 const TERMINAL_ANALYSIS_STATES = new Set<JarvisAnalysisStatus["state"]>([
   "quota_limited",
@@ -30,6 +37,20 @@ const TERMINAL_ANALYSIS_STATES = new Set<JarvisAnalysisStatus["state"]>([
 ]);
 const MAX_POLL_ATTEMPTS = 120;
 const POLL_INTERVAL_MS = 1_000;
+
+function analysisOutcome(status: JarvisAnalysisStatus): AnalysisOutcome {
+  if (status.state === "waiting" || status.state === "preparing") return "waiting";
+  if (status.state === "queued" || status.state === "analyzing") return "analyzing";
+  if (status.state === "ready") return "ready";
+  if (status.state === "quota_limited") return "quota_limited";
+  if (
+    status.state === "blocked" &&
+    (status.errorCode === "offline" || status.errorCode === "analysis_runtime_not_ready")
+  ) {
+    return "offline";
+  }
+  return "retry_needed";
+}
 
 function stringArray(value: string): string[] {
   try {
@@ -93,7 +114,7 @@ export default function SessionSummaryPanel({
     let cancelled = false;
     let timer: number | null = null;
     let attempt = 0;
-    setState({ kind: "loading" });
+    setState({ kind: "loading", outcome: "waiting" });
 
     const refresh = async () => {
       attempt += 1;
@@ -109,16 +130,33 @@ export default function SessionSummaryPanel({
         const status = await window.electronAPI.jarvis.getAnalysisStatus(sessionId);
         if (cancelled) return;
         if (TERMINAL_ANALYSIS_STATES.has(status.state)) {
-          setState({ kind: "unavailable", errorCode: status.errorCode });
+          const outcome = analysisOutcome(status);
+          setState({
+            kind: "unavailable",
+            outcome:
+              outcome === "offline" || outcome === "quota_limited" ? outcome : "retry_needed",
+            errorCode: status.errorCode,
+          });
           return;
         }
+        setState({ kind: "loading", outcome: analysisOutcome(status) });
         if (attempt >= MAX_POLL_ATTEMPTS) {
-          setState({ kind: "unavailable", errorCode: "analysis_timeout" });
+          setState({
+            kind: "unavailable",
+            outcome: "retry_needed",
+            errorCode: "analysis_timeout",
+          });
           return;
         }
         timer = window.setTimeout(() => void refresh(), POLL_INTERVAL_MS);
       } catch {
-        if (!cancelled) setState({ kind: "unavailable", errorCode: "analysis_failed" });
+        if (!cancelled) {
+          setState({
+            kind: "unavailable",
+            outcome: "retry_needed",
+            errorCode: "analysis_failed",
+          });
+        }
       }
     };
 
@@ -131,16 +169,38 @@ export default function SessionSummaryPanel({
 
   const retry = useCallback(async () => {
     if (!sessionId) return;
-    setState({ kind: "loading" });
+    setState({ kind: "loading", outcome: "waiting" });
     try {
       await window.electronAPI.jarvis.analyzeSession(sessionId, "final");
       setRefreshGeneration((generation) => generation + 1);
     } catch {
-      setState({ kind: "unavailable", errorCode: "analysis_failed" });
+      setState({
+        kind: "unavailable",
+        outcome: "retry_needed",
+        errorCode: "analysis_failed",
+      });
     }
   }, [sessionId]);
 
   if (state.kind === "hidden") return null;
+
+  const outcome = state.kind === "ready" ? "ready" : state.outcome;
+  const outcomeLabel =
+    outcome === "waiting"
+      ? t("jarvis.currentSummary.status.waiting", { defaultValue: "Waiting for analysis" })
+      : outcome === "analyzing"
+        ? t("jarvis.currentSummary.status.analyzing", { defaultValue: "Analyzing" })
+        : outcome === "ready"
+          ? t("jarvis.currentSummary.status.ready", { defaultValue: "Ready" })
+          : outcome === "offline"
+            ? t("jarvis.currentSummary.status.offline", { defaultValue: "Offline" })
+            : outcome === "quota_limited"
+              ? t("jarvis.currentSummary.status.quotaLimited", {
+                  defaultValue: "Quota limited",
+                })
+              : t("jarvis.currentSummary.status.retryNeeded", {
+                  defaultValue: "Retry needed",
+                });
 
   return (
     <section
@@ -159,6 +219,9 @@ export default function SessionSummaryPanel({
         <h2 id="current-session-summary-title" className="text-sm font-semibold text-foreground">
           {t("jarvis.currentSummary.title")}
         </h2>
+        <span className="ml-auto rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+          {outcomeLabel}
+        </span>
       </div>
 
       {state.kind === "loading" && (
@@ -184,6 +247,25 @@ export default function SessionSummaryPanel({
           <p className="whitespace-pre-wrap text-sm leading-6 text-foreground/85">
             {state.view.summary.summary}
           </p>
+          {state.view.detail.topics.length > 0 && (
+            <div>
+              <h3 className="text-xs font-semibold text-foreground">
+                {t("jarvis.currentSummary.topics", { defaultValue: "Topics" })}
+              </h3>
+              <ul className="mt-2 space-y-2">
+                {state.view.detail.topics.slice(0, 8).map((topic) => (
+                  <li key={topic.id} className="rounded-lg bg-muted/35 px-3 py-2">
+                    <p className="text-xs font-medium text-foreground">{topic.canonical_title}</p>
+                    {topic.description && (
+                      <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+                        {topic.description}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           {state.view.decisions.length > 0 && (
             <div>
               <h3 className="text-xs font-semibold text-foreground">

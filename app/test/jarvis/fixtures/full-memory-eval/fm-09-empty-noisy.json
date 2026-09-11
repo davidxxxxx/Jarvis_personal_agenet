@@ -1,0 +1,70 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-09-empty-noisy",
+  "coverage": ["empty-noisy"],
+  "sessionId": "session-fm-09",
+  "request": {
+    "inputHash": "3cd79878d16fc0ee26341dae166005f201e3d7614b25eda621c4c9b915ca702d",
+    "allowedSegmentIds": ["seg-fm-09-1"],
+    "allowedOwnerLabels": ["SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-09-1",
+          "startedAt": 1000,
+          "endedAt": 2200,
+          "speakerLabel": "SELF",
+          "applicationKey": null,
+          "sourceAttribution": "mixed_unknown",
+          "activityCategory": "unknown",
+          "activityConfidence": 0,
+          "activityDecision": "unknown",
+          "selfParticipated": true,
+          "memoryMode": "transcript_only",
+          "allowedSuggestionBases": [],
+          "todoCandidateAllowed": false,
+          "text": "[NOISE] 嗯…… [NO_SPEECH]"
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-09-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "No stable conversation",
+          "summary": "No stable conversational content was available beyond noise markers.",
+          "evidenceSegmentIds": ["seg-fm-09-1"]
+        },
+        "memories": [],
+        "topics": [],
+        "todos": [],
+        "suggestions": []
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-09",
+      "inputHash": "3cd79878d16fc0ee26341dae166005f201e3d7614b25eda621c4c9b915ca702d",
+      "requestBytes": 760,
+      "responseBytes": 360,
+      "durationMs": 7,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 31,
+      "outputTokens": 36
+    }
+  ],
+  "rendered": {
+    "memories": [],
+    "topics": [],
+    "todos": []
+  }
+}

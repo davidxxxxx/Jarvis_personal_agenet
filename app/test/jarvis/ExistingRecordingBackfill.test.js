@@ -109,6 +109,14 @@ function createRuntime(repository, recordingsRoot, owner) {
         modelVersion: TEST_TRANSCRIPTION_MODEL,
         at: NOW,
       }),
+    analysisScheduler: {
+      analyzeSession() {
+        throw new Error("historical recording backfill must not enqueue cloud analysis");
+      },
+      classifySessionLocally() {
+        return null;
+      },
+    },
     now: () => NOW,
     maxJobsPerDrain: 10,
     maxSessionsPerDrain: 10,
@@ -172,7 +180,7 @@ function assertTerminalAndTruthful(repository) {
         job_type: "transcribe_chunk",
         job_state: "completed",
         error_code: null,
-        processing_state: "processing",
+        processing_state: "ready",
       },
     ]
   );
@@ -254,6 +262,25 @@ test("a copied legacy database reaches terminal truthful transcription states id
     recordingsRoot: copiedRecordingsRoot,
   });
   assert.deepEqual(backfill, { linked: 2, orphaned: [], jobsCreated: 2 });
+  const queuedReprocessing = repository.db
+    .prepare(
+      `SELECT session_id, state, baseline_content_sha256,
+              baseline_identity_sha256, baseline_classification_sha256
+       FROM session_reprocessing_state ORDER BY session_id`
+    )
+    .all();
+  assert.deepEqual(
+    queuedReprocessing.map(({ session_id, state }) => ({ session_id, state })),
+    [
+      { session_id: "blocked-session", state: "queued" },
+      { session_id: "ready-session", state: "queued" },
+    ]
+  );
+  for (const row of queuedReprocessing) {
+    assert.match(row.baseline_content_sha256, /^[0-9a-f]{64}$/u);
+    assert.match(row.baseline_identity_sha256, /^[0-9a-f]{64}$/u);
+    assert.match(row.baseline_classification_sha256, /^[0-9a-f]{64}$/u);
+  }
   repository.db
     .prepare(
       `
@@ -268,6 +295,21 @@ test("a copied legacy database reaches terminal truthful transcription states id
   assert.equal(await runtime.drainOnce(), 2);
   assert.equal(await runtime.drainOnce(), 1);
   assertTerminalAndTruthful(repository);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT session_id, state FROM session_reprocessing_state ORDER BY session_id")
+      .all(),
+    [
+      { session_id: "blocked-session", state: "queued" },
+      { session_id: "ready-session", state: "completed" },
+    ]
+  );
+  assert.equal(
+    repository.db
+      .prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'")
+      .get().count,
+    0
+  );
   assertIdempotentBackfill(
     backfillLegacyRecordings({ repository, recordingsRoot: copiedRecordingsRoot })
   );
@@ -307,6 +349,19 @@ test("a copied legacy database reaches terminal truthful transcription states id
   repository.close();
 
   repository = new JarvisRepository(copiedDatabasePath);
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT session_id, state FROM session_reprocessing_state ORDER BY session_id")
+      .all(),
+    [
+      { session_id: "blocked-session", state: "queued" },
+      { session_id: "ready-session", state: "completed" },
+    ]
+  );
+  assert.deepEqual(
+    repository.listProcessingSessions().map((session) => session.id),
+    ["blocked-session"]
+  );
   assertIdempotentBackfill(
     backfillLegacyRecordings({ repository, recordingsRoot: copiedRecordingsRoot })
   );

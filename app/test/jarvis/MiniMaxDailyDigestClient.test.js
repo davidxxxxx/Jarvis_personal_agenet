@@ -6,9 +6,7 @@ const {
   DailyDigestClientError,
   DEFAULT_MAX_REQUEST_BYTES,
 } = require("../../src/jarvis/main/MiniMaxDailyDigestClient");
-const {
-  MAX_DAILY_DIGEST_INPUT_BYTES,
-} = require("../../src/jarvis/main/DailyDigestContractLimits");
+const { MAX_DAILY_DIGEST_INPUT_BYTES } = require("../../src/jarvis/main/DailyDigestContractLimits");
 
 const SOURCE_HASH = "a".repeat(64);
 const SUBJECT_REF = "subject-0123456789abcdef";
@@ -177,11 +175,117 @@ test("accepts documented MiniMax reasoning content beside a valid digest tool ca
   assert.equal(result.result.schemaVersion, "jarvis-daily-digest-v1");
 });
 
+test("accepts MiniMax digest tool-call compatibility fields and legacy function calls", async () => {
+  const messages = [
+    {
+      content: [{ type: "text", text: "reasoning metadata" }],
+      function_call: null,
+      tool_calls: responseEnvelope().choices[0].message.tool_calls,
+    },
+    {
+      content: null,
+      tool_calls: [],
+      function_call: {
+        name: "submit_jarvis_daily_digest",
+        arguments: JSON.stringify(digestCandidate()),
+      },
+    },
+  ];
+  let index = 0;
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () =>
+      jsonResponse({
+        choices: [{ message: messages[index++] }],
+        usage: { prompt_tokens: 321, completion_tokens: 123 },
+      }),
+  });
+
+  for (const _message of messages) {
+    const result = await client.generate(clientInput());
+    assert.deepEqual(result.result, digestCandidate());
+  }
+});
+
+test("salvages grounded digest sections while dropping invalid refs and deriving processing state", async () => {
+  const candidate = digestCandidate();
+  candidate.sections.today.push({
+    text: "Invented unsupported item.",
+    evidenceSegmentIds: ["outside-input"],
+  });
+  candidate.sections.interactions.push({
+    subjectRef: "subject-ffffffffffffffff",
+    text: "Unknown person.",
+    evidenceSegmentIds: ["segment-1"],
+  });
+  candidate.processing.missingStages = ["upstream_processing"];
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(responseEnvelope(candidate)),
+  });
+
+  const result = await client.generate(clientInput());
+
+  assert.deepEqual(result.result.sections.today, digestCandidate().sections.today);
+  assert.deepEqual(result.result.sections.interactions, digestCandidate().sections.interactions);
+  assert.deepEqual(result.result.processing, digestCandidate().processing);
+});
+
+test("salvages MiniMax responses that omit empty sections or untrusted processing metadata", async () => {
+  const candidate = digestCandidate();
+  delete candidate.sections.worthRemembering;
+  delete candidate.processing;
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(responseEnvelope(candidate)),
+  });
+
+  const result = await client.generate(clientInput());
+
+  assert.deepEqual(result.result, digestCandidate());
+});
+
+test("rejects a materially incomplete digest instead of defaulting most sections", async () => {
+  const candidate = digestCandidate();
+  for (const key of Object.keys(candidate.sections)) {
+    if (key !== "today") delete candidate.sections[key];
+  }
+  delete candidate.processing;
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () => jsonResponse(responseEnvelope(candidate)),
+  });
+
+  await assert.rejects(
+    () => client.generate(clientInput()),
+    (error) =>
+      expectClientError("invalid_structure")(error) &&
+      error.issueCode === "schema.sections_incomplete"
+  );
+});
+
+test("rejects a schema shell with no meaningful daily review section", async () => {
+  const client = new MiniMaxDailyDigestClient({
+    getApiKey: () => "secret",
+    fetchImpl: async () =>
+      jsonResponse(
+        responseEnvelope({
+          schemaVersion: "jarvis-daily-digest-v1",
+          sections: {},
+        })
+      ),
+  });
+
+  await assert.rejects(
+    () => client.generate(clientInput()),
+    (error) =>
+      expectClientError("invalid_structure")(error) && error.issueCode === "schema.empty_digest"
+  );
+});
+
 function expectClientError(code, retryable = false) {
   return (error) =>
-    error instanceof DailyDigestClientError &&
-    error.code === code &&
-    error.retryable === retryable;
+    error instanceof DailyDigestClientError && error.code === code && error.retryable === retryable;
 }
 
 test("allows only the two official MiniMax HTTPS v1 origins", () => {
@@ -195,15 +299,19 @@ test("allows only the two official MiniMax HTTPS v1 origins", () => {
     "https://api.minimaxi.com/v2",
   ]) {
     assert.throws(
-      () => new MiniMaxDailyDigestClient({ baseUrl, fetchImpl: async () => {}, getApiKey: () => "x" }),
+      () =>
+        new MiniMaxDailyDigestClient({ baseUrl, fetchImpl: async () => {}, getApiKey: () => "x" }),
       expectClientError("configuration")
     );
   }
-  assert.doesNotThrow(() => new MiniMaxDailyDigestClient({
-    baseUrl: "https://api.minimax.io/v1",
-    fetchImpl: async () => {},
-    getApiKey: () => "x",
-  }));
+  assert.doesNotThrow(
+    () =>
+      new MiniMaxDailyDigestClient({
+        baseUrl: "https://api.minimax.io/v1",
+        fetchImpl: async () => {},
+        getApiKey: () => "x",
+      })
+  );
 });
 
 test("fails redirects closed and does not retry inside the client", async () => {
@@ -228,7 +336,9 @@ test("aborts a timed-out request and marks it retryable", async () => {
     fetchImpl: async (_url, options) => {
       calls += 1;
       return new Promise((_resolve, reject) => {
-        options.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        options.signal.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError"))
+        );
       });
     },
   });
@@ -241,8 +351,14 @@ test("enforces the request byte cap before reading credentials or sending", asyn
   let calls = 0;
   const client = new MiniMaxDailyDigestClient({
     maxRequestBytes: 100,
-    getApiKey: () => { keyReads += 1; return "secret"; },
-    fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+    getApiKey: () => {
+      keyReads += 1;
+      return "secret";
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse(responseEnvelope());
+    },
   });
   await assert.rejects(
     () => client.generate(clientInput()),
@@ -262,7 +378,10 @@ test("sends a valid persisted payload above 128 KiB under the shared 1 MiB bound
   let calls = 0;
   const client = new MiniMaxDailyDigestClient({
     getApiKey: () => "secret",
-    fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse(responseEnvelope());
+    },
   });
 
   const result = await client.generate(clientInput(payload));
@@ -277,11 +396,20 @@ test("rejects a persisted payload above the shared 1 MiB boundary before credent
   let keyReads = 0;
   let calls = 0;
   const client = new MiniMaxDailyDigestClient({
-    getApiKey: () => { keyReads += 1; return "secret"; },
-    fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+    getApiKey: () => {
+      keyReads += 1;
+      return "secret";
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return jsonResponse(responseEnvelope());
+    },
   });
 
-  await assert.rejects(() => client.generate(clientInput(payload)), expectClientError("input_too_large"));
+  await assert.rejects(
+    () => client.generate(clientInput(payload)),
+    expectClientError("input_too_large")
+  );
   assert.equal(keyReads, 0);
   assert.equal(calls, 0);
 });
@@ -290,10 +418,11 @@ test("enforces declared and streamed response byte caps", async () => {
   const declared = new MiniMaxDailyDigestClient({
     maxResponseBytes: 100,
     getApiKey: () => "secret",
-    fetchImpl: async () => new Response("{}", {
-      status: 200,
-      headers: { "content-length": "101" },
-    }),
+    fetchImpl: async () =>
+      new Response("{}", {
+        status: 200,
+        headers: { "content-length": "101" },
+      }),
   });
   await assert.rejects(
     () => declared.generate(clientInput()),
@@ -304,13 +433,19 @@ test("enforces declared and streamed response byte caps", async () => {
   const streamed = new MiniMaxDailyDigestClient({
     maxResponseBytes: 100,
     getApiKey: () => "secret",
-    fetchImpl: async () => new Response(new ReadableStream({
-      start(controller) {
-        controller.enqueue(new Uint8Array(60));
-        controller.enqueue(new Uint8Array(60));
-      },
-      cancel() { cancelled = true; },
-    }), { status: 200 }),
+    fetchImpl: async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array(60));
+            controller.enqueue(new Uint8Array(60));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 }
+      ),
   });
   await assert.rejects(
     () => streamed.generate(clientInput()),
@@ -328,7 +463,10 @@ test("rejects a non-streaming response body without unbounded arrayBuffer fallba
       ok: true,
       headers: { get: () => null },
       body: null,
-      arrayBuffer: async () => { arrayBufferReads += 1; return new ArrayBuffer(0); },
+      arrayBuffer: async () => {
+        arrayBufferReads += 1;
+        return new ArrayBuffer(0);
+      },
     }),
   });
 
@@ -350,7 +488,10 @@ test("maps authoritative HTTP statuses without following another request", async
     let calls = 0;
     const client = new MiniMaxDailyDigestClient({
       getApiKey: () => "secret",
-      fetchImpl: async () => { calls += 1; return new Response("rejected", { status }); },
+      fetchImpl: async () => {
+        calls += 1;
+        return new Response("rejected", { status });
+      },
     });
     await assert.rejects(() => client.generate(clientInput()), expectClientError(code, retryable));
     assert.equal(calls, 1);
@@ -365,7 +506,10 @@ test("binds finish_reason to the matching tool or content response path", async 
       getApiKey: () => "secret",
       fetchImpl: async () => jsonResponse(envelope),
     });
-    await assert.rejects(() => client.generate(clientInput()), expectClientError("invalid_structure"));
+    await assert.rejects(
+      () => client.generate(clientInput()),
+      expectClientError("invalid_structure")
+    );
   }
 
   const validTool = responseEnvelope();
@@ -374,7 +518,10 @@ test("binds finish_reason to the matching tool or content response path", async 
     getApiKey: () => "secret",
     fetchImpl: async () => jsonResponse(validTool),
   });
-  assert.equal((await toolClient.generate(clientInput())).result.schemaVersion, "jarvis-daily-digest-v1");
+  assert.equal(
+    (await toolClient.generate(clientInput())).result.schemaVersion,
+    "jarvis-daily-digest-v1"
+  );
 
   const validContent = responseEnvelope();
   validContent.choices[0] = {
@@ -385,7 +532,10 @@ test("binds finish_reason to the matching tool or content response path", async 
     getApiKey: () => "secret",
     fetchImpl: async () => jsonResponse(validContent),
   });
-  assert.equal((await contentClient.generate(clientInput())).result.schemaVersion, "jarvis-daily-digest-v1");
+  assert.equal(
+    (await contentClient.generate(clientInput())).result.schemaVersion,
+    "jarvis-daily-digest-v1"
+  );
 
   validContent.choices[0].finish_reason = "tool_calls";
   const mismatchedContent = new MiniMaxDailyDigestClient({
@@ -435,7 +585,7 @@ test("accepts only the exact persisted digest cloud payload contract", async () 
   }
 });
 
-test("binds interaction evidence to the subject mapping in persisted input", async () => {
+test("drops an interaction whose evidence belongs to another persisted subject", async () => {
   const payload = cloudPayload();
   payload.sections.sessions[0].segments.push({
     segmentId: "segment-2",
@@ -464,11 +614,11 @@ test("binds interaction evidence to the subject mapping in persisted input", asy
     fetchImpl: async () => jsonResponse(responseEnvelope(output)),
   });
 
-  await assert.rejects(
-    () => client.generate(clientInput(payload)),
-    (error) =>
-      expectClientError("invalid_structure")(error) &&
-      error.issueCode === "schema.interaction_evidence_out_of_scope"
+  const result = await client.generate(clientInput(payload));
+  assert.deepEqual(result.result.sections.interactions, []);
+  assert.deepEqual(
+    result.result.processing.transcriptCoverage,
+    payload.sections.transcriptCoverage
   );
 });
 
@@ -487,8 +637,14 @@ test("rejects secret and absolute-path text before reading credentials or sendin
     let calls = 0;
     const logs = [];
     const client = new MiniMaxDailyDigestClient({
-      getApiKey: () => { keyReads += 1; return "secret"; },
-      fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+      getApiKey: () => {
+        keyReads += 1;
+        return "secret";
+      },
+      fetchImpl: async () => {
+        calls += 1;
+        return jsonResponse(responseEnvelope());
+      },
       logger: (record) => logs.push(record),
     });
 
@@ -504,15 +660,23 @@ test("rejects secret and absolute-path text before reading credentials or sendin
 
 test("rejects secrets and paths in every outbound string field before credentials", async () => {
   const cases = [
-    (payload) => { payload.sections.sessions[0].processingState = "MINIMAX_API_KEY=top-secret-value"; },
-    (payload) => { payload.sections.sessions[0].sessionRef = "C:\\private\\session"; },
-    (payload) => { payload.sections.sessions[0].segments[0].segmentId = "sk-cp-unitsecretvalue123"; },
     (payload) => {
-      payload.sections.topics = [{
-        topicRef: "/private/topic/ref",
-        text: "Safe topic text",
-        evidenceSegmentIds: ["segment-1"],
-      }];
+      payload.sections.sessions[0].processingState = "MINIMAX_API_KEY=top-secret-value";
+    },
+    (payload) => {
+      payload.sections.sessions[0].sessionRef = "C:\\private\\session";
+    },
+    (payload) => {
+      payload.sections.sessions[0].segments[0].segmentId = "sk-cp-unitsecretvalue123";
+    },
+    (payload) => {
+      payload.sections.topics = [
+        {
+          topicRef: "/private/topic/ref",
+          text: "Safe topic text",
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ];
     },
   ];
   for (const mutate of cases) {
@@ -523,8 +687,14 @@ test("rejects secrets and paths in every outbound string field before credential
     let calls = 0;
     const logs = [];
     const client = new MiniMaxDailyDigestClient({
-      getApiKey: () => { keyReads += 1; return "secret"; },
-      fetchImpl: async () => { calls += 1; return jsonResponse(responseEnvelope()); },
+      getApiKey: () => {
+        keyReads += 1;
+        return "secret";
+      },
+      fetchImpl: async () => {
+        calls += 1;
+        return jsonResponse(responseEnvelope());
+      },
       logger: (record) => logs.push(record),
     });
 
@@ -552,8 +722,8 @@ test("accepts an all-day persisted input with more than one hundred evidence seg
     subjectRef: SUBJECT_REF,
     text: `Evidence ${index + 1}`,
   }));
-  payload.sections.peopleInteractions[0].evidenceSegmentIds = payload.sections.sessions[0]
-    .segments.map((segment) => segment.segmentId);
+  payload.sections.peopleInteractions[0].evidenceSegmentIds =
+    payload.sections.sessions[0].segments.map((segment) => segment.segmentId);
   payload.sections.transcriptCoverage = {
     selectedSegmentCount: 101,
     incompleteSegmentCount: 0,
@@ -600,11 +770,13 @@ test("accepts repeated derived entity refs from distinct persisted occurrences",
 test("accepts persisted multiline evidence text without normalizing it", async () => {
   const payload = cloudPayload();
   payload.sections.sessions[0].segments[0].text = " Line one\nLine two ";
-  payload.sections.topics = [{
-    topicRef: "topic-0123456789abcdef",
-    text: " Launch\nnotes ",
-    evidenceSegmentIds: ["segment-1"],
-  }];
+  payload.sections.topics = [
+    {
+      topicRef: "topic-0123456789abcdef",
+      text: " Launch\nnotes ",
+      evidenceSegmentIds: ["segment-1"],
+    },
+  ];
   const client = new MiniMaxDailyDigestClient({
     getApiKey: () => "secret",
     fetchImpl: async () => jsonResponse(responseEnvelope()),
@@ -616,10 +788,13 @@ test("accepts persisted multiline evidence text without normalizing it", async (
 });
 
 test("returns authoritative token usage and response bytes on invalid model output", async () => {
-  const envelope = responseEnvelope({ ...digestCandidate(), createdAt: 123 }, {
-    prompt_tokens: 17,
-    completion_tokens: 9,
-  });
+  const envelope = responseEnvelope(
+    { ...digestCandidate(), createdAt: 123 },
+    {
+      prompt_tokens: 17,
+      completion_tokens: 9,
+    }
+  );
   const client = new MiniMaxDailyDigestClient({
     getApiKey: () => "secret",
     fetchImpl: async () => jsonResponse(envelope),
@@ -639,13 +814,27 @@ test("returns authoritative token usage and response bytes on invalid model outp
 
 test("fails closed when authoritative usage is missing invalid or conflicting", async () => {
   const cases = [
-    (envelope) => { delete envelope.usage; },
-    (envelope) => { envelope.usage = {}; },
-    (envelope) => { envelope.usage.prompt_tokens = -1; },
-    (envelope) => { envelope.usage.completion_tokens = "123"; },
-    (envelope) => { delete envelope.usage.completion_tokens; },
-    (envelope) => { envelope.usage.input_tokens = 999; },
-    (envelope) => { envelope.usage.output_tokens = 999; },
+    (envelope) => {
+      delete envelope.usage;
+    },
+    (envelope) => {
+      envelope.usage = {};
+    },
+    (envelope) => {
+      envelope.usage.prompt_tokens = -1;
+    },
+    (envelope) => {
+      envelope.usage.completion_tokens = "123";
+    },
+    (envelope) => {
+      delete envelope.usage.completion_tokens;
+    },
+    (envelope) => {
+      envelope.usage.input_tokens = 999;
+    },
+    (envelope) => {
+      envelope.usage.output_tokens = 999;
+    },
   ];
   for (const mutate of cases) {
     const envelope = responseEnvelope();
@@ -653,7 +842,10 @@ test("fails closed when authoritative usage is missing invalid or conflicting", 
     let calls = 0;
     const client = new MiniMaxDailyDigestClient({
       getApiKey: () => "secret",
-      fetchImpl: async () => { calls += 1; return jsonResponse(envelope); },
+      fetchImpl: async () => {
+        calls += 1;
+        return jsonResponse(envelope);
+      },
     });
     await assert.rejects(
       () => client.generate(clientInput()),
@@ -690,7 +882,10 @@ test("allowlists diagnostics and never logs credentials or private payload conte
     getApiKey: () => apiKey,
     logger: (record) => logs.push(record),
     createRequestId: () => "digest_request_safe",
-    now: (() => { let value = 1_000; return () => value += 10; })(),
+    now: (() => {
+      let value = 1_000;
+      return () => (value += 10);
+    })(),
     fetchImpl: async (_url, options) => {
       assert.equal(options.headers.Authorization, `Bearer ${apiKey}`);
       assert.equal(options.credentials, "omit");
@@ -700,16 +895,19 @@ test("allowlists diagnostics and never logs credentials or private payload conte
   });
   await client.generate(input);
   assert.equal(logs.length, 1);
-  assert.deepEqual(Object.keys(logs[0]).sort(), [
-    "durationMs",
-    "inputHash",
-    "inputTokens",
-    "model",
-    "outputTokens",
-    "requestBytes",
-    "requestId",
-    "responseBytes",
-  ].sort());
+  assert.deepEqual(
+    Object.keys(logs[0]).sort(),
+    [
+      "durationMs",
+      "inputHash",
+      "inputTokens",
+      "model",
+      "outputTokens",
+      "requestBytes",
+      "requestId",
+      "responseBytes",
+    ].sort()
+  );
   const serialized = JSON.stringify(logs);
   for (const secret of [
     apiKey,

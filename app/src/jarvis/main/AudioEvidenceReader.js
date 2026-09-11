@@ -58,7 +58,15 @@ function parsePcmWav(wav) {
   };
 }
 
-function runFfmpeg(args, { spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
+function runFfmpeg(
+  args,
+  {
+    spawnImpl = spawn,
+    getPath = getFFmpegPath,
+    input = null,
+    maxOutputBytes = 16 * 1024 * 1024,
+  } = {}
+) {
   return new Promise((resolve, reject) => {
     const ffmpegPath = getPath();
     if (!ffmpegPath) {
@@ -68,7 +76,7 @@ function runFfmpeg(args, { spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
     let child;
     try {
       child = spawnImpl(ffmpegPath, args, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [Buffer.isBuffer(input) ? "pipe" : "ignore", "pipe", "pipe"],
         windowsHide: true,
       });
     } catch (error) {
@@ -89,13 +97,17 @@ function runFfmpeg(args, { spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
     });
     child.stdout.on("data", (data) => {
       stdoutBytes += data.length;
-      if (stdoutBytes > 16 * 1024 * 1024) {
+      if (stdoutBytes > maxOutputBytes) {
         child.kill();
         settle(reject, new Error("FFmpeg decoded evidence exceeds the bounded PCM size"));
         return;
       }
       stdout.push(data);
     });
+    if (Buffer.isBuffer(input)) {
+      child.stdin.on("error", (error) => settle(reject, ffmpegProcessError(error)));
+      child.stdin.end(input);
+    }
     child.on("error", (error) => settle(reject, ffmpegProcessError(error)));
     child.on("close", (code) => {
       if (code === 0) settle(resolve, Buffer.concat(stdout));
@@ -169,6 +181,55 @@ function wavForPcm(pcm) {
   header.write("data", 36);
   header.writeUInt32LE(pcm.bytes.length, 40);
   return Buffer.concat([header, pcm.bytes]);
+}
+
+class FfmpegPcmNormalizer {
+  constructor({ spawnImpl = spawn, getPath = getFFmpegPath } = {}) {
+    this.spawn = spawnImpl;
+    this.getPath = getPath;
+  }
+
+  async normalize(pcm, { sampleRate, channels }) {
+    if (!Number.isSafeInteger(sampleRate) || sampleRate <= 0) {
+      throw new TypeError("target PCM sampleRate must be a positive integer");
+    }
+    if (!Number.isSafeInteger(channels) || channels <= 0) {
+      throw new TypeError("target PCM channels must be a positive integer");
+    }
+    if (pcm.sampleRate === sampleRate && pcm.channels === channels) return pcm;
+
+    const normalizedWav = await runFfmpeg(
+      [
+        "-v",
+        "error",
+        "-f",
+        "wav",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:a:0",
+        "-ar",
+        String(sampleRate),
+        "-ac",
+        String(channels),
+        "-c:a",
+        "pcm_s16le",
+        "-f",
+        "wav",
+        "pipe:1",
+      ],
+      {
+        spawnImpl: this.spawn,
+        getPath: this.getPath,
+        input: wavForPcm(pcm),
+      }
+    );
+    const normalized = parsePcmWav(normalizeStreamedWav(normalizedWav));
+    if (normalized.sampleRate !== sampleRate || normalized.channels !== channels) {
+      throw new Error("normalized_pcm_format_mismatch");
+    }
+    return normalized;
+  }
 }
 
 function defaultTemporaryWav(recordingsRoot, fsImpl = fs.promises) {
@@ -282,6 +343,7 @@ function defaultTemporaryWav(recordingsRoot, fsImpl = fs.promises) {
 class AudioEvidenceReader {
   constructor({
     decoder = new FfmpegPcmDecoder(),
+    normalizer = new FfmpegPcmNormalizer(),
     temporaryWav = null,
     recordingsRoot = null,
     fsImpl = fs.promises,
@@ -293,10 +355,14 @@ class AudioEvidenceReader {
     if (!decoder || typeof decoder.decode !== "function") {
       throw new TypeError("decoder.decode must be a function");
     }
+    if (!normalizer || typeof normalizer.normalize !== "function") {
+      throw new TypeError("normalizer.normalize must be a function");
+    }
     if (!temporaryWav || typeof temporaryWav.write !== "function") {
       throw new TypeError("temporaryWav.write must be a function");
     }
     this.decoder = decoder;
+    this.normalizer = normalizer;
     this.temporaryWav = temporaryWav;
     this.recordingsRoot = typeof recordingsRoot === "string" ? path.resolve(recordingsRoot) : null;
     this.fs = fsImpl;
@@ -322,7 +388,11 @@ class AudioEvidenceReader {
     return pcm;
   }
 
-  async withVerifiedWav(chunk, consume, { deadline: requestedDeadline } = {}) {
+  async withVerifiedWav(
+    chunk,
+    consume,
+    { deadline: requestedDeadline, sampleRate = null, channels = null } = {}
+  ) {
     if (typeof consume !== "function") throw new TypeError("consume must be a function");
     const deadlines = [chunk?.expires_at, requestedDeadline].filter(Number.isFinite);
     const hasDeadline = deadlines.length > 0;
@@ -335,8 +405,15 @@ class AudioEvidenceReader {
       }
     };
     assertLive();
-    const pcm = await this.readVerifiedPcm(chunk);
+    let pcm = await this.readVerifiedPcm(chunk);
     assertLive();
+    if (sampleRate !== null || channels !== null) {
+      pcm = await this.normalizer.normalize(pcm, {
+        sampleRate: sampleRate ?? pcm.sampleRate,
+        channels: channels ?? pcm.channels,
+      });
+      assertLive();
+    }
     const temporary = await this.temporaryWav.write(pcm, {
       chunkId: chunk.id,
       pcmSha256: chunk.pcm_sha256 ?? chunk.sha256,
@@ -447,4 +524,5 @@ module.exports = AudioEvidenceReader;
 module.exports.wavForPcm = wavForPcm;
 module.exports.parsePcmWav = parsePcmWav;
 module.exports.FfmpegPcmDecoder = FfmpegPcmDecoder;
+module.exports.FfmpegPcmNormalizer = FfmpegPcmNormalizer;
 module.exports.isTransientIoError = isTransientIoError;

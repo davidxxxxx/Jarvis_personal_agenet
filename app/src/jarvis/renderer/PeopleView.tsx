@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { UserRound } from "lucide-react";
+import { Clock3, Fingerprint, ShieldCheck, UserRound } from "lucide-react";
 import type {
+  JarvisPeopleReviewOverview,
   JarvisPersonDetail,
   JarvisPersonOverview,
   JarvisSpeakerCorrectionScope,
   JarvisSpeakerLinkState,
 } from "../types";
 import { useJarvisStore } from "./jarvisStore";
+import SpeakerChip from "./SpeakerChip";
 
 const PROFILE_SOURCE_KEYS = {
   enrollment: "jarvis.peopleProfileSourceEnrollment",
@@ -36,6 +38,11 @@ const CORRECTION_KIND_KEYS = {
   merge: "jarvis.peopleCorrectionKindMerge",
 } as const;
 
+const EMPTY_REVIEW_OVERVIEW: JarvisPeopleReviewOverview = {
+  anonymous: [],
+  needsReview: [],
+};
+
 function identityDate(at: number): string {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
@@ -50,10 +57,23 @@ function personName(
   return person.is_self ? selfLabel : person.display_name;
 }
 
+function speechDurationLabel(speechMs: number): string {
+  const seconds = Math.max(0, Math.round(speechMs / 1_000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} 分${seconds % 60 ? ` ${seconds % 60} 秒` : ""}`;
+}
+
+function speakerCountLabel(minimum: number, maximum: number): string {
+  return minimum === maximum ? `${minimum} 人` : `${minimum}–${maximum} 人`;
+}
+
 export default function PeopleView() {
   const { t } = useTranslation();
   const mergePeople = useJarvisStore((state) => state.mergePeople);
   const [people, setPeople] = useState<JarvisPersonOverview[]>([]);
+  const [reviewOverview, setReviewOverview] =
+    useState<JarvisPeopleReviewOverview>(EMPTY_REVIEW_OVERVIEW);
   const [detail, setDetail] = useState<JarvisPersonDetail | null>(null);
   const [mergeTargetId, setMergeTargetId] = useState("");
   const [reviewingMerge, setReviewingMerge] = useState(false);
@@ -61,7 +81,16 @@ export default function PeopleView() {
   const [error, setError] = useState<string | null>(null);
 
   const refreshOverview = async () => {
-    setPeople(await window.electronAPI.jarvis.listPeopleOverview());
+    const reviewRequest =
+      typeof window.electronAPI.jarvis.listPeopleReviewOverview === "function"
+        ? window.electronAPI.jarvis.listPeopleReviewOverview()
+        : Promise.resolve(EMPTY_REVIEW_OVERVIEW);
+    const [nextPeople, nextReview] = await Promise.all([
+      window.electronAPI.jarvis.listPeopleOverview(),
+      reviewRequest,
+    ]);
+    setPeople(nextPeople);
+    setReviewOverview(nextReview);
   };
 
   useEffect(() => {
@@ -91,6 +120,8 @@ export default function PeopleView() {
   const attributedMemories = detail
     ? detail.memories.filter((memory) => memory.person_id === detail.person.id)
     : [];
+  const selfPeople = people.filter((person) => person.is_self);
+  const knownPeople = people.filter((person) => !person.is_self);
 
   const commitMerge = async () => {
     if (!source || !target || source.is_self || mergeBusy) return;
@@ -110,36 +141,194 @@ export default function PeopleView() {
   };
 
   return (
-    <main className="min-w-0 overflow-y-auto p-6 lg:col-span-2">
-      <h1 className="text-2xl font-semibold">{t("jarvis.peopleTitle")}</h1>
-      <p className="mt-1 text-sm text-muted-foreground">{t("jarvis.peopleDescription")}</p>
+    <main className="jarvis-scroll-region min-w-0 overflow-y-scroll p-6 lg:col-span-2">
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold">人物 People</h1>
+          <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+            这里显示你本人和高置信度确认过的长期人物。没有确认的声音会继续保留为匿名说话人。
+          </p>
+        </div>
+        <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+          {people.length + reviewOverview.anonymous.length} 个长期人物
+        </span>
+      </header>
+
+      <section className="mt-5 flex items-start gap-3 rounded-xl border border-border/50 bg-card p-4">
+        <ShieldCheck className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+        <div>
+          <p className="text-sm font-medium">人物档案只收录真实互动对象</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            媒体声音和短碎片不会进入人物库；未命名人物可跨会话关联，待复核内容不会被当成确定身份。
+          </p>
+        </div>
+      </section>
       {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
-      <div className="mt-6 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {people.map((person) => (
-          <button
-            type="button"
-            key={person.id}
-            onClick={() => void open(person.id)}
-            className="rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
-          >
-            <div className="flex items-center gap-3">
-              <span className="grid size-10 place-items-center rounded-full bg-primary/10 text-primary">
-                <UserRound className="size-5" aria-hidden="true" />
-              </span>
-              <div>
-                <p className="font-medium">{personName(person, selfLabel)}</p>
-                <p className="text-xs text-muted-foreground">
-                  {person.session_count} {t("jarvis.peopleSessions")} · {person.open_todo_count}{" "}
-                  {t("jarvis.peopleOpenTodos")}
-                </p>
-              </div>
+      <div className="mt-6 space-y-6">
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="font-semibold">我</h2>
+            <span className="text-xs text-muted-foreground">{selfPeople.length}</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {selfPeople.map((person) => (
+              <button
+                type="button"
+                key={person.id}
+                onClick={() => void open(person.id)}
+                className="rounded-xl border border-primary/20 bg-primary/5 p-4 text-left hover:border-primary/40"
+              >
+                <div className="flex items-center gap-3">
+                  <span className="grid size-10 place-items-center rounded-full bg-primary/10 text-primary">
+                    <Fingerprint className="size-5" aria-hidden="true" />
+                  </span>
+                  <div>
+                    <p className="font-medium">
+                      {personName(person, selfLabel)}
+                      <span className="ml-2 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                        SELF
+                      </span>
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      已确认会话 {person.session_count} · 本人声纹档案
+                    </p>
+                  </div>
+                </div>
+              </button>
+            ))}
+            {selfPeople.length === 0 && (
+              <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+                尚未恢复或确认本人声纹。
+              </p>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="font-semibold">常见人物</h2>
+            <span className="text-xs text-muted-foreground">{knownPeople.length}</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {knownPeople.map((person) => (
+              <button
+                type="button"
+                key={person.id}
+                onClick={() => void open(person.id)}
+                className="rounded-xl border border-border/50 bg-card p-4 text-left hover:border-primary/40"
+              >
+                <div className="flex items-center gap-3">
+                  <span className="grid size-10 place-items-center rounded-full bg-primary/10 text-primary">
+                    <UserRound className="size-5" aria-hidden="true" />
+                  </span>
+                  <div>
+                    <p className="font-medium">{personName(person, selfLabel)}</p>
+                    <p className="text-xs text-muted-foreground">
+                      已确认会话 {person.session_count} · 未完成待办 {person.open_todo_count}
+                    </p>
+                  </div>
+                </div>
+              </button>
+            ))}
+            {knownPeople.length === 0 && (
+              <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+                你命名并确认后，人物会出现在这里。
+              </p>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="font-semibold">未命名人物</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                双模型已经把这些声音跨会话关联，但尚未由你命名。
+              </p>
             </div>
-          </button>
-        ))}
+            <span className="text-xs text-muted-foreground">
+              {reviewOverview.anonymous.length}
+            </span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {reviewOverview.anonymous.map((person) => (
+              <article
+                key={person.id}
+                className="rounded-xl border border-border/50 bg-card p-4"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-medium">{person.displayName}</p>
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {person.sourceNames.join("、")} · {person.sessionCount} 次会话
+                    </p>
+                  </div>
+                  <SpeakerChip
+                    cluster={person.representativeCluster}
+                    localLabel={person.displayName}
+                  />
+                </div>
+                <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Clock3 className="size-3.5" aria-hidden="true" />
+                  {speechDurationLabel(person.speechMs)} 清晰语音 · {person.clusterCount} 组证据
+                </p>
+              </article>
+            ))}
+            {reviewOverview.anonymous.length === 0 && (
+              <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+                暂无达到跨会话关联门槛的匿名人物。
+              </p>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h2 className="font-semibold">待复核</h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                只显示达到会话门槛、但身份或人数仍不确定的近期声音。
+              </p>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              {reviewOverview.needsReview.length}
+            </span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {reviewOverview.needsReview.map((candidate) => (
+              <article
+                key={candidate.id}
+                className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-medium">
+                      预计 {speakerCountLabel(candidate.minimumCount, candidate.maximumCount)}
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {new Date(candidate.sessionStartedAt).toLocaleString("zh-CN")} ·{" "}
+                      {candidate.sourceNames.join("、")}
+                    </p>
+                  </div>
+                  <SpeakerChip
+                    cluster={candidate.representativeCluster}
+                    localLabel="待复核人物"
+                  />
+                </div>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {speechDurationLabel(candidate.speechMs)} 清晰语音 · {candidate.clusterCount}{" "}
+                  个候选声纹簇
+                </p>
+              </article>
+            ))}
+            {reviewOverview.needsReview.length === 0 && (
+              <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+                当前没有需要你处理的高价值复核项。
+              </p>
+            )}
+          </div>
+        </section>
       </div>
-      {!people.length && !error && (
-        <p className="mt-8 text-sm text-muted-foreground">{t("jarvis.peopleEmpty")}</p>
-      )}
       {detail && (
         <section className="mt-6 rounded-xl border border-border/50 bg-card p-5">
           <div className="flex justify-between gap-4">
@@ -247,7 +436,12 @@ export default function PeopleView() {
               </ul>
             )}
           </section>
-          <div className="mt-6 grid gap-4 lg:grid-cols-3">
+          <details className="mt-5 rounded-lg border border-border/50 p-4">
+            <summary className="cursor-pointer text-sm font-semibold">声纹与识别详情</summary>
+            <p className="mt-2 text-xs text-muted-foreground">
+              这里是模型样本、出现记录和人工纠错等高级信息，日常使用不需要查看。
+            </p>
+            <div className="mt-4 grid gap-4 lg:grid-cols-3">
             <section>
               <h3 className="text-sm font-semibold">{t("jarvis.peopleSamples")}</h3>
               <ul className="mt-2 space-y-2 text-xs text-muted-foreground">
@@ -303,9 +497,12 @@ export default function PeopleView() {
                 ))}
               </ul>
             </section>
-          </div>
+            </div>
+          </details>
           {!detail.person.is_self && (
-            <section className="mt-6 border-t border-border/50 pt-4">
+            <details className="mt-4 rounded-lg border border-border/50 p-4">
+              <summary className="cursor-pointer text-sm font-semibold">人物管理（高级）</summary>
+              <section className="mt-4">
               <label className="block text-sm font-medium" htmlFor="people-merge-target">
                 {t("jarvis.peopleMergeInto")}
               </label>
@@ -364,7 +561,8 @@ export default function PeopleView() {
                   </div>
                 </div>
               )}
-            </section>
+              </section>
+            </details>
           )}
         </section>
       )}

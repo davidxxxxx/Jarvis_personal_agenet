@@ -20,6 +20,7 @@ const { normalizeAnalysisStatus } = require("../../src/jarvis/shared/contracts")
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const HASH_C = "c".repeat(64);
+const HASH_D = "d".repeat(64);
 
 function loadMemoryRepository() {
   return require("../../src/jarvis/main/MemoryRepository");
@@ -97,6 +98,76 @@ function createFixture(filename = ":memory:") {
     VALUES ('cluster-other', 'segment-omitted');
   `);
   return db;
+}
+
+function installTrustedSelfResolution(db, { score = 0.97 } = {}) {
+  db.exec(`
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, person_id, link_state,
+      match_score, match_margin, created_at, updated_at
+    ) VALUES (
+      'cluster-self-trusted', 'session-1', 'track-1', 'SELF',
+      '3dspeaker-campplus', zeroblob(2048), 12000, 4, 0.98,
+      'person-self', 'confirmed', ${score}, 0.2, 5000, 5000
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-self-trusted', 'segment-1');
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'run-self-trusted', 'session-1', 'track-1', '${HASH_A}',
+      'jarvis-hybrid-diarization-v3', 'pyannote-local', '3dspeaker-campplus',
+      '${HASH_B}', 512, 16000, 1, 'cuda', 10, 5000, 5000
+    );
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    ) VALUES (
+      'run-self-trusted', 'cluster-self-trusted', 'SELF', zeroblob(2048),
+      12000, 4, 0.98, 1000
+    );
+    INSERT INTO speaker_cluster_model_embeddings (
+      cluster_id, model_id, artifact_version, embedding_space, embedding,
+      source_kind, attribution_state, speech_ms, window_count, quality_score,
+      overlap_detected, echo_detected, created_at
+    ) VALUES
+      ('cluster-self-trusted', '3dspeaker-campplus', '2026.07.4', 'campplus-v1',
+       zeroblob(16), 'mic', 'exact', 12000, 4, 0.98, 0, 0, 5000),
+      ('cluster-self-trusted', 'eres2netv2', '2026.07.4', 'eres2netv2-v1',
+       zeroblob(16), 'mic', 'exact', 12000, 4, 0.97, 0, 0, 5000);
+    INSERT INTO speaker_identity_resolution_runs (
+      id, session_id, diarization_revision, profile_revision, policy_id,
+      commit_sequence, expected_cluster_count, created_at, completed_at
+    ) VALUES (
+      'identity-run-self-trusted', 'session-1', '${HASH_A}', '${HASH_B}',
+      'speaker-identity/campplus-eres2netv2-dual-zh-cn@2',
+      10, 1, 5100, 5100
+    );
+    INSERT INTO speaker_identity_resolutions (
+      id, resolution_run_id, session_id, evidence_run_id, cluster_id,
+      diarization_revision, profile_revision, policy_id, candidate_person_id,
+      candidate_person_ref, resolution_state, match_score, match_margin, reason,
+      actor, correction_id, projection_applied, created_at
+    ) VALUES (
+      'identity-self-trusted', 'identity-run-self-trusted', 'session-1',
+      'run-self-trusted', 'cluster-self-trusted', '${HASH_A}', '${HASH_B}',
+      'speaker-identity/campplus-eres2netv2-dual-zh-cn@2',
+      'person-self', 'person:self', 'confirmed', ${score}, 0.2,
+      'dual_model_self_enrollment_confirmed', 'system', NULL, 1, 5100
+    );
+    INSERT INTO speaker_identity_resolution_model_evidence (
+      resolution_id, model_id, artifact_version, embedding_space,
+      similarity, margin, passed, created_at
+    ) VALUES
+      ('identity-self-trusted', '3dspeaker-campplus', '2026.07.4', 'campplus-v1',
+       ${score}, 0.2, 1, 5100),
+      ('identity-self-trusted', 'eres2netv2', '2026.07.4', 'eres2netv2-v1',
+       ${score}, 0.2, 1, 5100);
+  `);
 }
 
 function createLegacyAnalysisSchema(db) {
@@ -403,18 +474,46 @@ function validInput(overrides = {}) {
 
 function validCloudPayload(overrides = {}) {
   return {
-    inputVersion: "jarvis-analysis-input-v2",
+    inputVersion: "jarvis-analysis-input-v3",
     segments: [
       {
         segmentId: "segment-1",
         startedAt: 1000,
         endedAt: 5000,
         speakerLabel: "SELF",
+        applicationKey: null,
+        sourceAttribution: "microphone",
+        activityCategory: "unknown",
+        activityConfidence: 0,
+        activityDecision: "unknown",
+        selfParticipated: true,
+        memoryMode: "transcript_only",
+        allowedSuggestionBases: [],
+        todoCandidateAllowed: false,
         text: "redacted evidence",
       },
     ],
     omittedRanges: [],
     ...overrides,
+  };
+}
+
+function cloudSegmentFromPrepared(segment, text = `redacted ${segment.segmentId}`) {
+  return {
+    segmentId: segment.segmentId,
+    startedAt: segment.startedAt,
+    endedAt: segment.endedAt,
+    speakerLabel: segment.speakerBindingLabel,
+    applicationKey: segment.applicationKey,
+    sourceAttribution: segment.sourceAttribution,
+    activityCategory: segment.activityCategory,
+    activityConfidence: segment.activityConfidence,
+    activityDecision: segment.activityDecision,
+    selfParticipated: segment.selfParticipated,
+    memoryMode: segment.memoryMode,
+    allowedSuggestionBases: segment.allowedSuggestionBases,
+    todoCandidateAllowed: segment.todoCandidateAllowed,
+    text,
   };
 }
 
@@ -446,6 +545,15 @@ function expectedPrepareToken() {
           supersededBy: null,
           duplicateOf: null,
           speakerBindingLabel: "SELF",
+          applicationKey: null,
+          sourceAttribution: "microphone",
+          activityCategory: "unknown",
+          activityConfidence: 0,
+          activityDecision: "unknown",
+          selfParticipated: true,
+          memoryMode: "transcript_only",
+          allowedSuggestionBases: [],
+          todoCandidateAllowed: false,
         },
       ],
     })
@@ -456,7 +564,7 @@ function validCreateInput(overrides = {}) {
   return {
     ...validInput(),
     prepareToken: expectedPrepareToken(),
-    inputContractVersion: "jarvis-analysis-input-v2",
+    inputContractVersion: "jarvis-analysis-input-v3",
     redactionVersion: "jarvis-redaction-v1",
     cloudPayloadJson: JSON.stringify(validCloudPayload()),
     ...overrides,
@@ -481,15 +589,24 @@ function expectedInputIdentity(cloudPayloadJson = validCreateInput().cloudPayloa
       segmentVersion: 1,
       textHash: sha256("durable evidence"),
       speakerBindingLabel: "SELF",
+      applicationKey: null,
+      sourceAttribution: "microphone",
+      activityCategory: "unknown",
+      activityConfidence: 0,
+      activityDecision: "unknown",
+      selfParticipated: true,
+      memoryMode: "transcript_only",
+      allowedSuggestionBases: [],
+      todoCandidateAllowed: false,
     },
   ];
   const tuple = {
-    schemaVersion: "jarvis-analysis-input-canonical-v2",
+    schemaVersion: "jarvis-analysis-input-canonical-v3",
     sessionId: "session-1",
     transcriptRevision: HASH_A,
     identityRevision: HASH_B,
     promptVersion: "jarvis-analysis-v2",
-    inputContractVersion: "jarvis-analysis-input-v2",
+    inputContractVersion: "jarvis-analysis-input-v3",
     redactionVersion: "jarvis-redaction-v1",
     cloudPayloadBytes,
     cloudPayloadSha256,
@@ -524,8 +641,8 @@ function createRepository(db, counters = { ids: 0, clocks: 0 }, overrides = {}) 
 }
 
 function validCandidate(overrides = {}) {
-  return {
-    schemaVersion: "jarvis-analysis-v2",
+  const candidate = {
+    schemaVersion: "jarvis-analysis-v3",
     sessionSummary: {
       title: "Session title",
       summary: "A durable session summary.",
@@ -552,6 +669,7 @@ function validCandidate(overrides = {}) {
         title: "Prepare the release",
         ownerLabel: "SELF",
         dueText: null,
+        semanticConfidence: 0.95,
         evidenceSegmentIds: ["segment-1"],
       },
     ],
@@ -563,6 +681,10 @@ function validCandidate(overrides = {}) {
       },
     ],
     ...overrides,
+  };
+  return {
+    ...candidate,
+    todos: candidate.todos.map((todo) => ({ semanticConfidence: 0.95, ...todo })),
   };
 }
 
@@ -591,17 +713,11 @@ function createInputForSegments(repository, segmentIds, identity, sessionId = "s
   return repository.createAnalysisInput({
     ...request,
     prepareToken: prepared.prepareToken,
-    inputContractVersion: "jarvis-analysis-input-v2",
+    inputContractVersion: "jarvis-analysis-input-v3",
     redactionVersion: "jarvis-redaction-v1",
     cloudPayloadJson: JSON.stringify({
-      inputVersion: "jarvis-analysis-input-v2",
-      segments: prepared.segments.map((segment) => ({
-        segmentId: segment.segmentId,
-        startedAt: segment.startedAt,
-        endedAt: segment.endedAt,
-        speakerLabel: segment.speakerBindingLabel,
-        text: `redacted ${segment.segmentId}`,
-      })),
+      inputVersion: "jarvis-analysis-input-v3",
+      segments: prepared.segments.map((segment) => cloudSegmentFromPrepared(segment)),
       omittedRanges: [],
     }),
   });
@@ -611,7 +727,7 @@ function setDesiredHead(repository, input, overrides = {}) {
   return repository.setAnalysisDesiredHead({
     sessionId: "session-1",
     analysisInputId: input.analysisInputId,
-    responseSchemaVersion: "jarvis-analysis-v2",
+    responseSchemaVersion: "jarvis-analysis-v3",
     pseudonymBindingRevision: 1,
     modelVersion: "MiniMax-M2.7",
     segmentSubjectRevisions: [{ segmentId: "segment-1", subjectRevision: 1 }],
@@ -901,9 +1017,10 @@ test("durably advances one exact analysis desired head without mutating immutabl
     assert.equal(first.transcriptRevision, HASH_A);
     assert.equal(first.identityRevision, HASH_B);
     assert.equal(first.promptVersion, "jarvis-analysis-v2");
-    assert.equal(first.responseSchemaVersion, "jarvis-analysis-v2");
+    assert.equal(first.responseSchemaVersion, "jarvis-analysis-v3");
     assert.equal(first.pseudonymBindingRevision, 1);
     assert.equal(first.modelVersion, "MiniMax-M2.7");
+    assert.equal(first.activityClassificationRevision, null);
     assert.equal(first.cloudPayloadHash, expectedInputIdentity().cloudPayloadSha256);
     assert.deepEqual(first.segments, [
       {
@@ -940,6 +1057,27 @@ test("durably advances one exact analysis desired head without mutating immutabl
   }
 });
 
+test("activity classification revision alone advances the durable analysis desired head", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const first = setDesiredHead(repository, input, {
+      activityClassificationRevision: HASH_C,
+    });
+    const second = setDesiredHead(repository, input, {
+      activityClassificationRevision: HASH_D,
+    });
+
+    assert.equal(first.activityClassificationRevision, HASH_C);
+    assert.equal(second.activityClassificationRevision, HASH_D);
+    assert.equal(second.analysisInputId, first.analysisInputId);
+    assert.equal(second.headRevision, first.headRevision + 1);
+    assert.notEqual(second.desiredVectorHash, first.desiredVectorHash);
+  } finally {
+    db.close();
+  }
+});
+
 test("cloud analysis enqueue accepts only the exact current desired head", () => {
   const db = createFixture();
   try {
@@ -962,7 +1100,7 @@ test("a changed desired vector can enqueue a replacement job for the same immuta
     const firstHead = setDesiredHead(repository, input);
     const { store, job: firstJob } = createCloudJob(db, firstHead);
     const secondHead = setDesiredHead(repository, input, {
-      responseSchemaVersion: "jarvis-analysis-v3",
+      responseSchemaVersion: "jarvis-analysis-v4",
     });
     const secondJob = store.enqueueCloudJob({
       sessionId: "session-1",
@@ -1385,6 +1523,511 @@ test("persists a validated candidate linked to job input head and reconciled bud
   }
 });
 
+test("cloud action projection rejects gaming advice and requires grounded SELF commitments", () => {
+  const applyCandidate = ({ classification, candidate, learningGoal = null }) => {
+    const db = createFixture();
+    installTrustedSelfResolution(db);
+    if (learningGoal) {
+      db.prepare(
+        `INSERT INTO learning_goals (
+           id, title, normalized_title, state, created_at, updated_at, confirmed_at,
+           archived_at, deleted_at
+         ) VALUES (?, ?, ?, 'confirmed', 100, 100, 100, NULL, NULL)`
+      ).run(learningGoal.id, learningGoal.title, learningGoal.title.toLocaleLowerCase());
+    }
+    db.prepare(
+      `INSERT INTO activity_classifications (
+         id, session_id, started_at, ended_at, category, confidence, decision,
+         source, reason, source_attribution, evidence_json, supersedes_id,
+         user_corrected_at, created_at, updated_at
+       ) VALUES (?, 'session-1', 1000, 5000, ?, ?, ?, 'local', ?,
+         ?, ?, NULL, NULL, 5500, 5500)`
+    ).run(
+      `classification-${classification.category}`,
+      classification.category,
+      classification.confidence,
+      classification.decision ?? "adopted",
+      classification.reason,
+      classification.sourceAttribution ?? "microphone",
+      JSON.stringify({
+        activityId: `activity-${classification.category}`,
+        applicationKeys: [],
+        allowSummary: true,
+        allowSuggestions: classification.allowSuggestions,
+        allowTodos: classification.allowTodos,
+        evidenceSegmentIds: ["segment-1"],
+        inputHash: null,
+      })
+    );
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(validInput());
+    const input = repository.createAnalysisInput({
+      ...validInput(),
+      prepareToken: prepared.prepareToken,
+      inputContractVersion: "jarvis-analysis-input-v3",
+      redactionVersion: "jarvis-redaction-v1",
+      cloudPayloadJson: JSON.stringify({
+        inputVersion: "jarvis-analysis-input-v3",
+        ...(prepared.learningGoals.length > 0
+          ? { learningGoals: prepared.learningGoals.map((goal) => ({ ...goal })) }
+          : {}),
+        segments: [cloudSegmentFromPrepared(prepared.segments[0], "redacted evidence")],
+        omittedRanges: [],
+      }),
+    });
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(
+        db,
+        job.id,
+        `budget-action-${classification.category}`
+      ),
+      candidate,
+    });
+    repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+    return { db, repository };
+  };
+
+  const gaming = applyCandidate({
+    classification: {
+      category: "gaming",
+      confidence: 0.95,
+      reason: "game application",
+      allowSuggestions: false,
+      allowTodos: false,
+    },
+    candidate: validCandidate({
+      memories: [
+        validCandidate().memories[0],
+        {
+          kind: "preference",
+          title: "Game interest",
+          body: "SELF watched strategy content about this game.",
+          confidence: 0.91,
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      todos: [
+        {
+          title: "Improve the item build",
+          ownerLabel: null,
+          dueText: null,
+          evidenceSegmentIds: ["segment-1"],
+        },
+      ],
+      suggestions: [
+        {
+          title: "Farm before the team fight",
+          rationale: "A game tactic is not personal-agent advice.",
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(gaming.db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(gaming.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 0);
+    assert.deepEqual(gaming.db.prepare("SELECT kind, title FROM memory_items_v2").all(), [
+      { kind: "preference", title: "Game interest" },
+    ]);
+    assert.equal(gaming.db.prepare("SELECT count(*) AS count FROM topics_v2").get().count, 1);
+  } finally {
+    gaming.db.close();
+  }
+
+  const sourceUnknown = applyCandidate({
+    classification: {
+      category: "work_meeting",
+      confidence: 0.7,
+      decision: "tentative",
+      reason: "application source unavailable",
+      sourceAttribution: "mixed_unknown",
+      allowSuggestions: true,
+      allowTodos: true,
+    },
+    candidate: validCandidate(),
+  });
+  try {
+    assert.deepEqual(
+      sourceUnknown.db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM memory_items_v2) AS memories,
+             (SELECT count(*) FROM topics_v2) AS topics,
+             (SELECT count(*) FROM todos_v2) AS todos,
+             (SELECT count(*) FROM suggestions_v2) AS suggestions`
+        )
+        .get(),
+      { memories: 0, topics: 0, todos: 0, suggestions: 0 }
+    );
+  } finally {
+    sourceUnknown.db.close();
+  }
+
+  const commitment = {
+    kind: "commitment",
+    title: "Prepare the release",
+    body: "SELF explicitly committed to prepare the release.",
+    confidence: 0.98,
+    evidenceSegmentIds: ["segment-1"],
+  };
+  const work = applyCandidate({
+    classification: {
+      category: "work_meeting",
+      confidence: 0.95,
+      reason: "meeting application",
+      allowSuggestions: true,
+      allowTodos: true,
+    },
+    candidate: validCandidate({
+      memories: [commitment],
+      suggestions: [
+        {
+          title: "Review the release",
+          rationale: "SELF participated in the allowed work context.",
+          basis: "work_context",
+          learningGoalId: null,
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(work.db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
+    assert.equal(work.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 1);
+    assert.equal(work.db.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
+    const verification = work.db
+      .prepare(
+        `SELECT effective_state, trust_snapshot_state, trust_policy_id,
+                semantic_confidence_snapshot, voiceprint_confidence_snapshot,
+                scene_confidence_snapshot, transcript_context_confidence_snapshot,
+                automatic_eligible, application_snapshot_json, activity_snapshot_json
+         FROM todo_effective_verification`
+      )
+      .get();
+    assert.equal(verification.effective_state, "confirmed");
+    assert.equal(verification.trust_snapshot_state, "captured");
+    assert.equal(verification.trust_policy_id, "todo-attribution-v2");
+    assert.equal(verification.semantic_confidence_snapshot, 0.95);
+    assert.equal(verification.voiceprint_confidence_snapshot, 0.97);
+    assert.equal(verification.scene_confidence_snapshot, 0.95);
+    assert.equal(verification.transcript_context_confidence_snapshot, 0.9);
+    assert.equal(verification.automatic_eligible, 1);
+    assert.deepEqual(JSON.parse(verification.application_snapshot_json), [
+      {
+        applicationKey: null,
+        segmentId: "segment-1",
+        sourceAttribution: "microphone",
+        speakerRelation: "SELF",
+      },
+    ]);
+    assert.deepEqual(JSON.parse(verification.activity_snapshot_json), [
+      {
+        category: "work_meeting",
+        confidence: 0.95,
+        decision: "adopted",
+        segmentId: "segment-1",
+      },
+    ]);
+    const projected = work.repository.readPublicSnapshot();
+    const projectedTodo = projected.todos[0];
+    assert.equal(projectedTodo.trustSnapshot.state, "captured");
+    assert.equal(projectedTodo.trustSnapshot.automaticEligible, true);
+    assert.deepEqual(projectedTodo.cardContext, {
+      sessionId: "session-1",
+      startedAt: 1000,
+      applicationName: "Microphone",
+      activityCategory: "work_meeting",
+      activityConfidence: 0.95,
+      sourceAttribution: "microphone",
+    });
+    assert.deepEqual(projected.suggestions[0].cardContext, projectedTodo.cardContext);
+    const handle = projectedTodo.occurrences[0].evidence[0].handle;
+    assert.deepEqual(work.repository.getEvidenceContext(handle).actionAttribution, {
+      basis: "captured_todo_snapshot",
+      applicationKey: null,
+      applicationName: "Microphone",
+      sourceAttribution: "microphone",
+      speakerRelation: "SELF",
+      semanticConfidence: 0.95,
+      voiceConfidence: 0.97,
+      transcriptConfidence: 0.9,
+      activityClassification: {
+        id: null,
+        category: "work_meeting",
+        confidence: 0.95,
+        decision: "adopted",
+        source: "captured_snapshot",
+        reason: null,
+      },
+    });
+    work.db
+      .prepare(
+        `UPDATE activity_classifications
+         SET category = 'gaming', confidence = 0.95, updated_at = 7200
+         WHERE id = 'classification-work_meeting'`
+      )
+      .run();
+    work.db.prepare("UPDATE people SET voice_confidence = 0.1 WHERE id = 'person-self'").run();
+    const afterMutableCorrections = work.repository.getEvidenceContext(handle).actionAttribution;
+    assert.equal(afterMutableCorrections.basis, "captured_todo_snapshot");
+    assert.equal(afterMutableCorrections.activityClassification.category, "work_meeting");
+    assert.equal(afterMutableCorrections.voiceConfidence, 0.97);
+    const afterMutableSnapshot = work.repository.readPublicSnapshot();
+    assert.equal(afterMutableSnapshot.todos[0].cardContext.activityCategory, "work_meeting");
+    assert.equal(afterMutableSnapshot.suggestions[0].cardContext.activityCategory, "gaming");
+    work.db
+      .prepare(
+        `UPDATE activity_classifications
+         SET decision = 'tentative', confidence = 0.7, updated_at = 7300
+         WHERE id = 'classification-work_meeting'`
+      )
+      .run();
+    const afterTentative = work.repository.readPublicSnapshot();
+    assert.equal(afterTentative.todos[0].cardContext.activityCategory, "work_meeting");
+    assert.equal(afterTentative.suggestions[0].cardContext.activityCategory, null);
+    assert.equal(afterTentative.suggestions[0].cardContext.activityConfidence, null);
+  } finally {
+    work.db.close();
+  }
+
+  const learning = applyCandidate({
+    learningGoal: { id: "goal-mandarin", title: "Improve Mandarin" },
+    classification: {
+      category: "learning",
+      confidence: 0.95,
+      reason: "learning evidence",
+      // The coarse activity pass cannot bind a later candidate to one goal.
+      allowSuggestions: false,
+      allowTodos: true,
+    },
+    candidate: validCandidate({
+      todos: [],
+      suggestions: [
+        {
+          title: "Review today's vocabulary",
+          rationale: "This directly advances the confirmed Mandarin goal.",
+          basis: "learning_goal",
+          learningGoalId: "goal-mandarin",
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(
+      learning.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count,
+      1
+    );
+  } finally {
+    learning.db.close();
+  }
+
+  const social = applyCandidate({
+    classification: {
+      category: "social_call",
+      confidence: 0.95,
+      reason: "social call evidence",
+      allowSuggestions: false,
+      allowTodos: false,
+    },
+    candidate: validCandidate({
+      todos: [],
+      suggestions: [
+        {
+          title: "Follow the explicit agreement",
+          rationale: "SELF explicitly agreed in this social call.",
+          basis: "explicit_agreement",
+          learningGoalId: null,
+          basedOnEvidenceSegmentIds: ["segment-1"],
+        },
+      ],
+    }),
+  });
+  try {
+    assert.equal(social.db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 1);
+  } finally {
+    social.db.close();
+  }
+});
+
+test("cloud Todo projection fails closed when the real dual-model SELF score is below 90%", () => {
+  const db = createFixture();
+  try {
+    installTrustedSelfResolution(db, { score: 0.899 });
+    const { repository, input } = createStoredInput(db);
+    db.prepare(
+      `INSERT INTO activity_classifications (
+         id, session_id, started_at, ended_at, category, confidence, decision,
+         source, reason, source_attribution, evidence_json, created_at, updated_at
+       ) VALUES (
+         'classification-low-voice', 'session-1', 1000, 5000, 'work_meeting',
+         0.99, 'adopted', 'local', 'trusted meeting', 'microphone', ?, 5500, 5500
+       )`
+    ).run(
+      JSON.stringify({
+        applicationKeys: [],
+        allowSummary: true,
+        allowSuggestions: true,
+        allowTodos: true,
+        evidenceSegmentIds: ["segment-1"],
+      })
+    );
+    const head = setDesiredHead(repository, input);
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(db, job.id, "budget-low-voice"),
+      candidate: validCandidate({
+        memories: [
+          {
+            kind: "commitment",
+            title: "Prepare the release",
+            body: "SELF explicitly committed to prepare the release.",
+            confidence: 0.99,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+        todos: [
+          {
+            title: "Prepare the release",
+            ownerLabel: "SELF",
+            dueText: null,
+            semanticConfidence: 0.99,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+    repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM todo_verification_decisions").get().count,
+      0
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("stale MiniMax evidence basis cannot override newer local action policy lineage", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const insertClassification = db.prepare(`
+      INSERT INTO activity_classifications (
+        id, session_id, started_at, ended_at, category, confidence, decision,
+        source, reason, source_attribution, evidence_json, supersedes_id,
+        user_corrected_at, created_at, updated_at
+      ) VALUES (?, 'session-1', 1000, 5000, ?, ?, 'adopted', ?, ?,
+        'microphone', ?, NULL, NULL, ?, ?)
+    `);
+    insertClassification.run(
+      "classification-local-new-basis",
+      "gaming",
+      0.95,
+      "local",
+      "new game evidence",
+      JSON.stringify({
+        applicationKeys: ["dota2"],
+        microphoneParticipated: true,
+        selfDetected: true,
+        speakerCount: 1,
+        timeBucket: "evening",
+        allowSummary: true,
+        allowSuggestions: false,
+        allowTodos: false,
+        evidenceSegmentIds: ["segment-1"],
+      }),
+      5_700,
+      5_700
+    );
+    const localRevision = repository.getActivityActionPolicyRevision("session-1");
+
+    insertClassification.run(
+      "classification-minimax-stale-basis",
+      "work_meeting",
+      0.99,
+      "minimax",
+      "stale meeting evidence",
+      JSON.stringify({
+        applicationKeys: ["kook"],
+        microphoneParticipated: true,
+        selfDetected: true,
+        speakerCount: 2,
+        timeBucket: "morning",
+        allowSummary: true,
+        allowSuggestions: true,
+        allowTodos: true,
+        evidenceSegmentIds: ["segment-1"],
+      }),
+      5_800,
+      5_800
+    );
+    assert.equal(
+      repository.getActivityActionPolicyRevision("session-1"),
+      localRevision,
+      "a stale cloud basis must not change action-policy lineage"
+    );
+
+    const head = setDesiredHead(repository, input, {
+      activityClassificationRevision: localRevision,
+    });
+    const { store, job } = createCloudJob(db, head);
+    store.claimCloudJobs({ owner: "cloud-worker", at: 7_000, leaseMs: 1_000 });
+    const persisted = repository.persistValidatedAnalysisCandidate({
+      jobId: job.id,
+      analysisInputId: input.analysisInputId,
+      budgetAttemptId: reconcileBudgetAttempt(db, job.id, "budget-stale-classification"),
+      candidate: validCandidate({
+        memories: [
+          {
+            kind: "commitment",
+            title: "Prepare the release",
+            body: "SELF explicitly committed to prepare the release.",
+            confidence: 0.98,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+        suggestions: [
+          {
+            title: "Review the release",
+            rationale: "This would be allowed only by the stale cloud classification.",
+            basedOnEvidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+    repository.applyStoredAnalysisCandidate({
+      candidateId: persisted.candidateId,
+      jobId: job.id,
+      owner: "cloud-worker",
+      at: 7_100,
+    });
+
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM suggestions_v2").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
 test("stored candidate exact retry avoids planner clock and ID work while returning both hashes", () => {
   const db = createFixture();
   const counters = { ids: 0, clocks: 0 };
@@ -1722,7 +2365,38 @@ test("two SQLite connections serialize contending application of the same stored
         },
       },
     });
-    const input = firstRepository.createAnalysisInput(validCreateInput());
+    firstDb
+      .prepare(
+        `INSERT INTO activity_classifications (
+         id, session_id, started_at, ended_at, category, confidence, decision,
+         source, reason, source_attribution, evidence_json, supersedes_id,
+         user_corrected_at, created_at, updated_at
+       ) VALUES (
+         'classification-two-connections', 'session-1', 1000, 5000,
+         'work_meeting', 0.95, 'adopted', 'local', 'trusted work context',
+         'microphone', ?, NULL, NULL, 5500, 5500
+       )`
+      )
+      .run(
+        JSON.stringify({
+          selfDetected: true,
+          allowSummary: true,
+          allowSuggestions: true,
+          allowTodos: true,
+        })
+      );
+    const prepared = firstRepository.prepareAnalysisInput(validInput());
+    const input = firstRepository.createAnalysisInput({
+      ...validInput(),
+      prepareToken: prepared.prepareToken,
+      inputContractVersion: "jarvis-analysis-input-v3",
+      redactionVersion: "jarvis-redaction-v1",
+      cloudPayloadJson: JSON.stringify({
+        inputVersion: "jarvis-analysis-input-v3",
+        segments: [cloudSegmentFromPrepared(prepared.segments[0], "redacted evidence")],
+        omittedRanges: [],
+      }),
+    });
     const head = setDesiredHead(firstRepository, input);
     const cloud = createCloudJob(firstDb, head);
     job = cloud.job;
@@ -1767,7 +2441,7 @@ test("two SQLite connections serialize contending application of the same stored
     );
     assert.equal(secondPlannerCalls, 0);
     assert.equal(secondDb.prepare("SELECT count(*) AS count FROM memory_items_v2").get().count, 1);
-    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 4);
+    assert.equal(secondDb.prepare("SELECT count(*) AS count FROM evidence_refs").get().count, 3);
   } finally {
     secondDb.close();
     firstDb.close();
@@ -2406,20 +3080,30 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       candidate: validCandidate({ memories: [], topics: [], todos: [] }),
     });
     const accepted = db.prepare("SELECT id FROM suggestions_v2").get();
-    assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 }), {
-      status: "accepted",
-      suggestionId: accepted.id,
-      decidedAt: 7000,
-    });
+    const acceptedResult = repository.acceptSuggestion({ suggestionId: accepted.id, at: 7000 });
+    assert.equal(acceptedResult.status, "accepted");
+    assert.equal(acceptedResult.suggestionId, accepted.id);
+    assert.equal(acceptedResult.decidedAt, 7000);
+    assert.match(acceptedResult.todoId, /^todo-/u);
     assert.deepEqual(repository.acceptSuggestion({ suggestionId: accepted.id, at: 7001 }), {
       status: "already_accepted",
       suggestionId: accepted.id,
       decidedAt: 7000,
+      todoId: acceptedResult.todoId,
     });
     assert.throws(() => repository.dismissSuggestion({ suggestionId: accepted.id, at: 7000 }), {
       code: "MEMORY_SUGGESTION_ALREADY_DECIDED",
     });
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT state, reason, actor
+           FROM todo_verification_decisions WHERE todo_instance_id = ?`
+        )
+        .get(acceptedResult.todoId),
+      { state: "confirmed", reason: "user_confirmed", actor: "user" }
+    );
 
     const nextInput = createAlternativeInput(repository, "second suggestion input");
     repository.applyCandidateAnalysis({
@@ -2487,13 +3171,13 @@ test("suggestion accept and dismiss are explicit terminal idempotent repository 
       db.prepare("SELECT count(*) AS count FROM suggestion_occurrences").get().count,
       terminalOccurrenceCount
     );
-    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 0);
+    assert.equal(db.prepare("SELECT count(*) AS count FROM todos_v2").get().count, 1);
   } finally {
     db.close();
   }
 });
 
-test("completeTodo records one forward-only user transition and is idempotent", () => {
+test("todo decisions require confirmation, complete idempotently, and allow one user reopen", () => {
   const db = createFixture();
   try {
     const { repository, input } = createStoredInput(db);
@@ -2507,6 +3191,10 @@ test("completeTodo records one forward-only user transition and is idempotent", 
       .prepare("SELECT count(*) AS count FROM todo_state_transitions WHERE todo_instance_id = ?")
       .get(todo.id).count;
 
+    assert.throws(() => repository.completeTodo({ todoId: todo.id }), {
+      code: "MEMORY_TODO_CONFIRMATION_REQUIRED",
+    });
+    assert.equal(repository.decideTodo({ todoId: todo.id, action: "confirm" }).status, "confirmed");
     const first = repository.completeTodo({ todoId: todo.id });
     assert.equal(first.status, "completed");
     assert.equal(first.todoId, todo.id);
@@ -2537,6 +3225,16 @@ test("completeTodo records one forward-only user transition and is idempotent", 
         actor: "user",
         occurred_at: first.completedAt,
       }
+    );
+    const reopened = repository.decideTodo({ todoId: todo.id, action: "reopen" });
+    assert.equal(reopened.status, "reopened");
+    assert.equal(
+      db.prepare("SELECT status FROM todos_v2 WHERE id = ?").get(todo.id).status,
+      "open"
+    );
+    assert.equal(
+      repository.decideTodo({ todoId: todo.id, action: "reopen" }).status,
+      "already_open"
     );
     assert.throws(() => repository.completeTodo({ todoId: "missing" }), {
       code: "MEMORY_TODO_NOT_FOUND",
@@ -2677,6 +3375,10 @@ test("post-v27 legacy memory imports persist a canonical-v1 bridge for later con
     const repository = createRepository(db);
 
     repository.importLegacyAnalysis();
+    assert.equal(
+      repository.readPublicSnapshot().todos[0].verificationState,
+      "pending_confirmation"
+    );
 
     const imported = db
       .prepare(
@@ -3073,6 +3775,10 @@ test("importLegacyAnalysis completes a todo monotonically and never reopens it",
     seedLegacyAnalysis(db);
     const repository = createRepository(db);
     repository.importLegacyAnalysis();
+    assert.equal(
+      repository.readPublicSnapshot().todos[0].verificationState,
+      "pending_confirmation"
+    );
 
     db.prepare(
       `UPDATE todos
@@ -3084,6 +3790,7 @@ test("importLegacyAnalysis completes a todo monotonically and never reopens it",
       status: "completed",
       completed_at: 5200,
     });
+    assert.equal(repository.readPublicSnapshot().todos[0].verificationState, "confirmed");
 
     db.prepare(
       `UPDATE todos
@@ -3238,6 +3945,15 @@ test("prepareAnalysisInput returns a worker-private live snapshot, bindings, and
         startedAt: 1000,
         endedAt: 5000,
         speakerBindingLabel: "SELF",
+        applicationKey: null,
+        sourceAttribution: "microphone",
+        activityCategory: "unknown",
+        activityConfidence: 0,
+        activityDecision: "unknown",
+        selfParticipated: true,
+        memoryMode: "transcript_only",
+        allowedSuggestionBases: [],
+        todoCandidateAllowed: false,
       },
     ]);
     assert.deepEqual(prepared.speakerBindings, [
@@ -3295,7 +4011,7 @@ test("prepareAnalysisInput orders the complete manifest before assigning SELF an
   }
 });
 
-test("createAnalysisInput persists exact redacted payload and canonical v2 input identity", () => {
+test("createAnalysisInput persists exact redacted payload and canonical v3 input identity", () => {
   const db = createFixture();
   try {
     const repository = createRepository(db);
@@ -3319,7 +4035,7 @@ test("createAnalysisInput persists exact redacted payload and canonical v2 input
         .get(),
       {
         input_hash: identity.inputHash,
-        input_contract_version: "jarvis-analysis-input-v2",
+        input_contract_version: "jarvis-analysis-input-v3",
         redaction_version: "jarvis-redaction-v1",
         cloud_payload_json: createInput.cloudPayloadJson,
         cloud_payload_bytes: identity.cloudPayloadBytes,
@@ -3334,6 +4050,15 @@ test("createAnalysisInput persists exact redacted payload and canonical v2 input
       text_hash: sha256("durable evidence"),
       text_snapshot: "durable evidence",
       speaker_binding_label: "SELF",
+      application_key: null,
+      source_attribution: "microphone",
+      activity_category: "unknown",
+      activity_confidence: 0,
+      activity_decision: "unknown",
+      self_participated: 1,
+      memory_mode: "transcript_only",
+      allowed_suggestion_bases_json: "[]",
+      todo_candidate_allowed: 0,
     });
     assert.deepEqual(db.prepare("SELECT * FROM analysis_input_speaker_bindings").get(), {
       analysis_input_id: "analysis_input-1",
@@ -3344,6 +4069,104 @@ test("createAnalysisInput persists exact redacted payload and canonical v2 input
     });
   } finally {
     db.close();
+  }
+});
+
+test("reopens and reads a canonical legacy v2 analysis input under the current schema", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-analysis-v2-reopen-"));
+  const filename = path.join(directory, "memory.db");
+  let db = createFixture(filename);
+  try {
+    const cloudPayloadJson = JSON.stringify({
+      inputVersion: "jarvis-analysis-input-v2",
+      segments: [
+        {
+          segmentId: "segment-1",
+          startedAt: 1_000,
+          endedAt: 5_000,
+          speakerLabel: "SELF",
+          text: "redacted legacy evidence",
+        },
+      ],
+      omittedRanges: [],
+    });
+    const cloudPayloadBytes = Buffer.byteLength(cloudPayloadJson, "utf8");
+    const cloudPayloadSha256 = sha256(cloudPayloadJson);
+    const inputHash = sha256(
+      canonicalJson({
+        schemaVersion: "jarvis-analysis-input-canonical-v2",
+        sessionId: "session-1",
+        transcriptRevision: HASH_A,
+        identityRevision: HASH_B,
+        promptVersion: "jarvis-analysis-v2",
+        inputContractVersion: "jarvis-analysis-input-v2",
+        redactionVersion: "jarvis-redaction-v1",
+        cloudPayloadBytes,
+        cloudPayloadSha256,
+        speakerBindings: [
+          {
+            label: "SELF",
+            subjectKind: "person",
+            subjectId: "person-self",
+            subjectDisplayNameSnapshot: "Local Self",
+          },
+        ],
+        segments: [
+          {
+            ordinal: 0,
+            segmentId: "segment-1",
+            segmentVersion: 1,
+            textHash: sha256("durable evidence"),
+            speakerBindingLabel: "SELF",
+          },
+        ],
+      })
+    );
+
+    db.prepare(
+      `INSERT INTO analysis_inputs (
+         id, session_id, transcript_revision, identity_revision, prompt_version, input_hash,
+         input_contract_version, redaction_version, cloud_payload_json,
+         cloud_payload_bytes, cloud_payload_sha256, created_at
+       ) VALUES (?, 'session-1', ?, ?, 'jarvis-analysis-v2', ?,
+         'jarvis-analysis-input-v2', 'jarvis-redaction-v1', ?, ?, ?, 6000)`
+    ).run(
+      "legacy-v2-input",
+      HASH_A,
+      HASH_B,
+      inputHash,
+      cloudPayloadJson,
+      cloudPayloadBytes,
+      cloudPayloadSha256
+    );
+    db.prepare(
+      `INSERT INTO analysis_input_speaker_bindings (
+         analysis_input_id, label, subject_kind, subject_id, subject_display_name_snapshot
+       ) VALUES ('legacy-v2-input', 'SELF', 'person', 'person-self', 'Local Self')`
+    ).run();
+    db.prepare(
+      `INSERT INTO analysis_input_segments (
+         analysis_input_id, ordinal, segment_id, segment_version, text_hash,
+         text_snapshot, speaker_binding_label
+       ) VALUES ('legacy-v2-input', 0, 'segment-1', 1, ?, 'durable evidence', 'SELF')`
+    ).run(sha256("durable evidence"));
+    db.close();
+    db = null;
+
+    db = new Database(filename);
+    db.pragma("foreign_keys = ON");
+    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 60, toVersion: 60 });
+    const repository = createRepository(db);
+    assert.deepEqual(repository.getAnalysisInputForCloud("legacy-v2-input"), {
+      inputHash,
+      cloudPayloadJson,
+      allowedSegmentIds: ["segment-1"],
+      allowedOwnerLabels: ["SELF"],
+      allowedLearningGoalIds: [],
+    });
+  } finally {
+    db?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -3445,6 +4268,7 @@ test("getAnalysisInputForCloud returns exact payload scope without local identit
       cloudPayloadJson: validCreateInput().cloudPayloadJson,
       allowedSegmentIds: ["segment-1"],
       allowedOwnerLabels: ["SELF"],
+      allowedLearningGoalIds: [],
     });
     assert.equal("sessionId" in first, false);
     assert.equal("speakerBindings" in first, false);
@@ -3561,10 +4385,12 @@ test("applyCandidateAnalysis writes closed entities, occurrences, revisions, and
            (SELECT count(*) FROM todos_v2) AS todos,
            (SELECT count(*) FROM todo_revisions) AS todo_revisions,
            (SELECT count(*) FROM todo_occurrences) AS todo_occurrences,
-           (SELECT count(*) FROM todo_state_transitions) AS todo_transitions,
-           (SELECT count(*) FROM suggestions_v2) AS suggestions,
-           (SELECT count(*) FROM suggestion_occurrences) AS suggestion_occurrences,
-           (SELECT count(*) FROM session_summary_revisions) AS summaries,
+          (SELECT count(*) FROM todo_state_transitions) AS todo_transitions,
+          (SELECT count(*) FROM todo_action_metadata) AS todo_action_metadata,
+          (SELECT count(*) FROM suggestions_v2) AS suggestions,
+          (SELECT count(*) FROM suggestion_occurrences) AS suggestion_occurrences,
+          (SELECT count(*) FROM suggestion_action_metadata) AS suggestion_action_metadata,
+          (SELECT count(*) FROM session_summary_revisions) AS summaries,
            (SELECT count(*) FROM evidence_refs) AS evidence`
         )
         .get(),
@@ -3578,8 +4404,10 @@ test("applyCandidateAnalysis writes closed entities, occurrences, revisions, and
         todo_revisions: 1,
         todo_occurrences: 1,
         todo_transitions: 1,
+        todo_action_metadata: 1,
         suggestions: 1,
         suggestion_occurrences: 1,
+        suggestion_action_metadata: 1,
         summaries: 1,
         evidence: 4,
       }
@@ -3630,6 +4458,191 @@ test("applyCandidateAnalysis writes closed entities, occurrences, revisions, and
     }
   } finally {
     db.close();
+  }
+});
+
+test("analysis-created actions support pin, suggestion acceptance, and safe undo", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({ memories: [], topics: [] }),
+    });
+    const initial = repository.readPublicSnapshot();
+    const todo = initial.todos[0];
+    const suggestion = initial.suggestions[0];
+    assert.ok(todo);
+    assert.ok(suggestion);
+
+    repository.applyKnowledgeAction({
+      commandId: "analysis-todo-pin",
+      type: "todo_pin",
+      todoId: todo.id,
+      at: 7_000,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT pinned, user_modified FROM todo_action_metadata
+           WHERE todo_instance_id = ?`
+        )
+        .get(todo.id),
+      { pinned: 1, user_modified: 1 }
+    );
+
+    repository.applyKnowledgeAction({
+      commandId: "analysis-suggestion-accept",
+      type: "suggestion_accept",
+      suggestionId: suggestion.id,
+      todoId: "todo-from-analysis-suggestion",
+      title: suggestion.title,
+      dueText: null,
+      at: 7_001,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT effective_state, converted_todo_id, acceptance_undone
+           FROM suggestion_action_metadata WHERE suggestion_id = ?`
+        )
+        .get(suggestion.id),
+      {
+        effective_state: "accepted",
+        converted_todo_id: "todo-from-analysis-suggestion",
+        acceptance_undone: 0,
+      }
+    );
+
+    repository.applyKnowledgeAction({
+      commandId: "analysis-suggestion-accept-undo",
+      type: "suggestion_accept_undo",
+      suggestionId: suggestion.id,
+      at: 7_002,
+    });
+    const undone = repository
+      .readPublicSnapshot()
+      .suggestions.find((entry) => entry.id === suggestion.id);
+    assert.equal(undone.state, "proposed");
+    assert.equal(undone.acceptanceUndone, true);
+    assert.equal(
+      repository
+        .readPublicSnapshot()
+        .todos.some((entry) => entry.id === "todo-from-analysis-suggestion"),
+      false
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis reuses actions only after restoring their missing metadata projections", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const candidate = validCandidate({ memories: [], topics: [] });
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate,
+    });
+    db.exec(`
+      DROP TRIGGER todo_action_metadata_no_delete;
+      DROP TRIGGER suggestion_action_metadata_no_delete;
+      DELETE FROM todo_action_metadata;
+      DELETE FROM suggestion_action_metadata;
+    `);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM todo_action_metadata) AS todos,
+             (SELECT count(*) FROM suggestion_action_metadata) AS suggestions`
+        )
+        .get(),
+      { todos: 0, suggestions: 0 }
+    );
+
+    const reusedInput = createAlternativeInput(repository, "same actions, later input");
+    repository.applyCandidateAnalysis({
+      analysisInputId: reusedInput.analysisInputId,
+      inputHash: reusedInput.inputHash,
+      candidate,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT
+             (SELECT count(*) FROM todo_action_metadata) AS todos,
+             (SELECT count(*) FROM suggestion_action_metadata) AS suggestions`
+        )
+        .get(),
+      { todos: 1, suggestions: 1 }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis metadata initialization failures roll back every derived row", () => {
+  for (const entityKind of ["todo", "suggestion"]) {
+    const db = createFixture();
+    try {
+      const { repository, input } = createStoredInput(db);
+      const table = entityKind === "todo" ? "todo_action_metadata" : "suggestion_action_metadata";
+      db.exec(`
+        CREATE TRIGGER reject_${entityKind}_action_metadata
+        BEFORE INSERT ON ${table}
+        BEGIN
+          SELECT RAISE(ABORT, 'blocked action metadata');
+        END;
+      `);
+      const candidate =
+        entityKind === "todo"
+          ? validCandidate({ memories: [], topics: [], suggestions: [] })
+          : validCandidate({ memories: [], topics: [], todos: [] });
+      assert.throws(
+        () =>
+          repository.applyCandidateAnalysis({
+            analysisInputId: input.analysisInputId,
+            inputHash: input.inputHash,
+            candidate,
+          }),
+        /blocked action metadata/u
+      );
+      assert.deepEqual(
+        db
+          .prepare(
+            `SELECT
+               (SELECT count(*) FROM todos_v2) AS todos,
+               (SELECT count(*) FROM todo_occurrences) AS todo_occurrences,
+               (SELECT count(*) FROM todo_action_metadata) AS todo_metadata,
+               (SELECT count(*) FROM suggestions_v2) AS suggestions,
+               (SELECT count(*) FROM suggestion_occurrences) AS suggestion_occurrences,
+               (SELECT count(*) FROM suggestion_action_metadata) AS suggestion_metadata,
+               (SELECT count(*) FROM evidence_refs) AS evidence`
+          )
+          .get(),
+        {
+          todos: 0,
+          todo_occurrences: 0,
+          todo_metadata: 0,
+          suggestions: 0,
+          suggestion_occurrences: 0,
+          suggestion_metadata: 0,
+          evidence: 0,
+        }
+      );
+      assert.equal(
+        db
+          .prepare("SELECT candidate_hash FROM analysis_inputs WHERE id = ?")
+          .get(input.analysisInputId).candidate_hash,
+        null
+      );
+    } finally {
+      db.close();
+    }
   }
 });
 
@@ -4875,19 +5888,11 @@ test("strictly later evidence applies a closed todo A to B to C recurrence chain
     const nextInput = repository.createAnalysisInput({
       ...request,
       prepareToken: prepared.prepareToken,
-      inputContractVersion: "jarvis-analysis-input-v2",
+      inputContractVersion: "jarvis-analysis-input-v3",
       redactionVersion: "jarvis-redaction-v1",
       cloudPayloadJson: JSON.stringify({
-        inputVersion: "jarvis-analysis-input-v2",
-        segments: [
-          {
-            segmentId: "segment-omitted",
-            startedAt: 5000,
-            endedAt: 5500,
-            speakerLabel: "P1",
-            text: "later redacted evidence",
-          },
-        ],
+        inputVersion: "jarvis-analysis-input-v3",
+        segments: [cloudSegmentFromPrepared(prepared.segments[0], "later redacted evidence")],
         omittedRanges: [],
       }),
     });
@@ -5053,7 +6058,7 @@ test("cloud authorization is derived only from selected payload segments and the
     const input = repository.createAnalysisInput({
       ...request,
       prepareToken: prepared.prepareToken,
-      inputContractVersion: "jarvis-analysis-input-v2",
+      inputContractVersion: "jarvis-analysis-input-v3",
       redactionVersion: "jarvis-redaction-v1",
       cloudPayloadJson,
     });
@@ -5062,6 +6067,7 @@ test("cloud authorization is derived only from selected payload segments and the
       cloudPayloadJson,
       allowedSegmentIds: ["segment-1"],
       allowedOwnerLabels: ["SELF"],
+      allowedLearningGoalIds: [],
     });
     assert.throws(
       () =>
@@ -5127,6 +6133,499 @@ test("analysis input skips unattributed segments without blocking attributable e
   }
 });
 
+test("analysis input excludes short fragmented anonymous speakers from cloud summaries", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-fragment', 'session-1', 'fragment.wav', 5100, 5200, 100,
+        '${"d".repeat(64)}', 9500, 'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-fragment', 'session-1', 5100, 5200, NULL, 'fragment',
+        'one accidental fragment', 0.7, 1, 'pending', 'track-1',
+        'chunk-fragment', 'mic',
+        'final', 1, 'whisper-v1', 5200
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, speech_ms, window_count,
+        quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-fragment', 'session-1', 'track-1', 'fragment', 'speaker-v1',
+        1000, 1, 0.9, NULL, 'unknown', 5100, 5200
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-fragment', 'segment-fragment');
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-fragment"] })
+    );
+
+    assert.deepEqual(prepared.segmentIds, ["segment-1"]);
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [{ label: "SELF", subjectId: "person-self" }]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input ignores clusters that are absent from the latest diarization run", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 30000,
+          window_count = 10, quality_score = 0.99
+      WHERE id = 'cluster-other';
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-current', 'session-1', 'track-omitted', 'speaker_current',
+        'speaker-v2', NULL, 18000, 6, 0.94, NULL, 'unknown', 5600, 5600
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-current', 'segment-omitted');
+      INSERT INTO speaker_diarization_runs (
+        id, session_id, track_id, transcript_revision, policy_id, diarizer_model_id,
+        embedding_model_id, model_artifact_sha256, embedding_dimension, sample_rate,
+        input_version, execution_device, commit_sequence, created_at, completed_at
+      ) VALUES
+        ('run-stale', 'session-1', 'track-omitted', '${HASH_A}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_B}',
+         512, 16000, 1, 'cpu', 1, 5500, 5500),
+        ('run-current', 'session-1', 'track-omitted', '${HASH_B}',
+         'jarvis-session-diarization-v2', 'diarizer', 'speaker-v2', '${HASH_C}',
+         512, 16000, 2, 'cuda', 2, 5600, 5600);
+      INSERT INTO speaker_diarization_run_clusters (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      ) VALUES
+        ('run-stale', 'cluster-other', 'P1', zeroblob(2048), 30000, 10, 0.99, 5000),
+        ('run-current', 'cluster-current', 'speaker_current',
+         zeroblob(2048), 18000, 6, 0.94, 5000);
+    `);
+
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-omitted"] })
+    );
+
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [
+        { label: "SELF", subjectId: "person-self" },
+        { label: "P1", subjectId: "cluster-current" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input merges durable anonymous speakers across tracks by local dual-model reference", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-anonymous-peer', 'session-1', 'anonymous-peer.wav', 5200, 5400, 200,
+        '${"e".repeat(64)}', 9500, 'completed', 'track-1', 'mic', 1, 'committed'
+      );
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 12000,
+          window_count = 3, quality_score = 0.9
+      WHERE id = 'cluster-other';
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-anonymous-peer', 'session-1', 5200, 5400, NULL, 'speaker_app',
+        'same durable anonymous speaker', 0.9, 1, 'pending', 'track-1',
+        'chunk-anonymous-peer', 'mic',
+        'final', 1, 'whisper-v1', 5400
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-anonymous-peer', 'session-1', 'track-1',
+        'speaker_app', 'speaker-v1',
+        NULL, 14000, 4, 0.91, NULL, 'unknown', 5200, 5400
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-anonymous-peer', 'segment-anonymous-peer');
+      INSERT INTO speaker_diarization_runs (
+        id, session_id, track_id, transcript_revision, policy_id, diarizer_model_id,
+        embedding_model_id, model_artifact_sha256, embedding_dimension, sample_rate,
+        input_version, execution_device, commit_sequence, created_at, completed_at
+      ) VALUES
+        ('run-anon-other', 'session-1', 'track-omitted', '${HASH_A}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_B}',
+         512, 16000, 1, 'cpu', 1, 5500, 5500),
+        ('run-anon-peer', 'session-1', 'track-1', '${HASH_B}',
+         'jarvis-session-diarization-v1', 'diarizer', 'speaker-v1', '${HASH_C}',
+         512, 16000, 1, 'cpu', 2, 5500, 5500);
+      INSERT INTO speaker_diarization_run_clusters (
+        run_id, cluster_id, local_label, embedding, speech_ms,
+        window_count, quality_score, first_appearance_at
+      ) VALUES
+        ('run-anon-other', 'cluster-other', 'P1', zeroblob(2048), 12000, 3, 0.9, 5000),
+        ('run-anon-peer', 'cluster-anonymous-peer', 'speaker_app',
+         zeroblob(2048), 14000, 4, 0.91, 5200);
+      INSERT INTO speaker_identity_resolution_runs (
+        id, session_id, diarization_revision, profile_revision, policy_id,
+        commit_sequence, expected_cluster_count, created_at, completed_at
+      ) VALUES (
+        'resolution-anonymous-group', 'session-1', '${HASH_A}', '${HASH_B}',
+        'jarvis-speaker-identity-v1', 1, 2, 5600, 5600
+      );
+      INSERT INTO speaker_identity_resolutions (
+        id, resolution_run_id, session_id, evidence_run_id, cluster_id,
+        diarization_revision, profile_revision, policy_id, candidate_person_id,
+        candidate_person_ref, resolution_state, match_score, match_margin, reason,
+        actor, correction_id, projection_applied, created_at
+      ) VALUES
+        ('resolution-anon-other', 'resolution-anonymous-group', 'session-1',
+         'run-anon-other', 'cluster-other', '${HASH_A}', '${HASH_B}',
+         'jarvis-speaker-identity-v1', NULL, 'anonymous-speaker-shared',
+         'unknown', 0.95, 0.1, 'dual_model_anonymous_group', 'system', NULL, 1, 5600),
+        ('resolution-anon-peer', 'resolution-anonymous-group', 'session-1',
+         'run-anon-peer', 'cluster-anonymous-peer', '${HASH_A}', '${HASH_B}',
+         'jarvis-speaker-identity-v1', NULL, 'anonymous-speaker-shared',
+         'unknown', 0.95, 0.1, 'dual_model_anonymous_group', 'system', NULL, 1, 5600);
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({
+        segmentIds: ["segment-1", "segment-omitted", "segment-anonymous-peer"],
+      })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ segmentId, speakerBindingLabel }) => ({
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+        { segmentId: "segment-anonymous-peer", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectKind, subjectId }) => ({
+        label,
+        subjectKind,
+        subjectId,
+      })),
+      [
+        { label: "SELF", subjectKind: "person", subjectId: "person-self" },
+        { label: "P1", subjectKind: "speaker_cluster", subjectId: "cluster-other" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input collapses exact application track churn by application and local speaker", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE audio_tracks
+      SET application_key = 'kook', application_display_name = 'KOOK'
+      WHERE id = 'track-omitted';
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET local_label = 'speaker_1', person_id = NULL, link_state = 'unknown',
+          speech_ms = 12000, window_count = 4, quality_score = 0.9
+      WHERE id = 'cluster-other';
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, sample_rate, channels, started_at, ended_at, state,
+        application_key, application_display_name, capture_generation
+      ) VALUES (
+        'track-kook-peer', 'session-1', 'system', 24000, 1, 5200, 5400, 'stopped',
+        'kook', 'KOOK', 1
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES (
+        'chunk-kook-peer', 'session-1', 'kook-peer.wav', 5200, 5400, 200,
+        '${"f".repeat(64)}', 9500, 'completed', 'track-kook-peer', 'system', 0, 'committed'
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES (
+        'segment-kook-peer', 'session-1', 5200, 5400, NULL, 'speaker_1',
+        'same application speaker after track restart', 0.9, 1, 'pending',
+        'track-kook-peer', 'chunk-kook-peer', 'system', 'final', 1, 'whisper-v1', 5400
+      );
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, embedding, speech_ms,
+        window_count, quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES (
+        'cluster-kook-peer', 'session-1', 'track-kook-peer', 'speaker_1',
+        'speaker-v1', NULL, 14000, 5, 0.91, NULL, 'unknown', 5200, 5400
+      );
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+      VALUES ('cluster-kook-peer', 'segment-kook-peer');
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({
+        segmentIds: ["segment-1", "segment-omitted", "segment-kook-peer"],
+      })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ segmentId, speakerBindingLabel }) => ({
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+        { segmentId: "segment-kook-peer", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectKind, subjectId }) => ({
+        label,
+        subjectKind,
+        subjectId,
+      })),
+      [
+        { label: "SELF", subjectKind: "person", subjectId: "person-self" },
+        { label: "P1", subjectKind: "speaker_cluster", subjectId: "cluster-other" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input excludes virtual audio infrastructure duplicates", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      UPDATE audio_tracks
+      SET application_key = 'audiodg',
+          application_display_name = 'Windows Audio Device Graph Isolation'
+      WHERE id = 'track-omitted';
+      UPDATE transcript_segments
+      SET person_id = NULL
+      WHERE id = 'segment-omitted';
+      UPDATE speaker_clusters
+      SET person_id = NULL, link_state = 'unknown', speech_ms = 12000,
+          window_count = 4, quality_score = 0.9
+      WHERE id = 'cluster-other';
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({ segmentIds: ["segment-1", "segment-omitted"] })
+    );
+
+    assert.deepEqual(prepared.segmentIds, ["segment-1"]);
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectId }) => ({ label, subjectId })),
+      [{ label: "SELF", subjectId: "person-self" }]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("analysis input uses the durable participant projection to merge fragments and exclude media", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state
+      ) VALUES
+        ('chunk-projected-peer', 'session-1', 'projected-peer.wav', 5100, 5200, 100,
+         '${"7".repeat(64)}', 9500, 'completed', 'track-omitted', 'system', 1, 'committed'),
+        ('chunk-projected-media', 'session-1', 'projected-media.wav', 5200, 5300, 100,
+         '${"8".repeat(64)}', 9500, 'completed', 'track-omitted', 'system', 2, 'committed'),
+        ('chunk-unprojected-fragment', 'session-1', 'unprojected-fragment.wav',
+         5300, 5400, 100, '${"6".repeat(64)}', 9500, 'completed',
+         'track-omitted', 'system', 3, 'committed');
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, person_id, speaker_label, text, confidence,
+        is_stable, analysis_state, track_id, chunk_id, source_type, result_kind,
+        version, model_version, completed_at
+      ) VALUES
+        ('segment-projected-peer', 'session-1', 5100, 5200, NULL, 'speaker_fragment',
+         'same projected person on another cluster', 0.9, 1, 'pending', 'track-omitted',
+         'chunk-projected-peer', 'system', 'final', 1, 'whisper-v1', 5200),
+        ('segment-projected-media', 'session-1', 5200, 5300, NULL, 'media_fragment',
+         'passive media commentary', 0.9, 1, 'pending', 'track-omitted',
+         'chunk-projected-media', 'system', 'final', 1, 'whisper-v1', 5300),
+        ('segment-unprojected-fragment', 'session-1', 5300, 5400, NULL,
+         'unprojected_fragment', 'fragment omitted by the durable participant projection',
+         0.9, 1, 'pending', 'track-omitted', 'chunk-unprojected-fragment', 'system',
+         'final', 1, 'whisper-v1', 5400);
+      INSERT INTO speaker_clusters (
+        id, session_id, track_id, local_label, model_id, speech_ms, window_count,
+        quality_score, person_id, link_state, created_at, updated_at
+      ) VALUES
+        ('cluster-projected-peer', 'session-1', 'track-omitted', 'speaker_fragment',
+         'speaker-v1', 12000, 4, 0.9, NULL, 'unknown', 5100, 5200),
+        ('cluster-projected-media', 'session-1', 'track-omitted', 'media_fragment',
+         'speaker-v1', 12000, 4, 0.9, NULL, 'unknown', 5200, 5300),
+        ('cluster-unprojected-fragment', 'session-1', 'track-omitted',
+         'unprojected_fragment', 'speaker-v1', 12000, 4, 0.9, NULL, 'unknown',
+         5300, 5400);
+      INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id) VALUES
+        ('cluster-projected-peer', 'segment-projected-peer'),
+        ('cluster-projected-media', 'segment-projected-media'),
+        ('cluster-unprojected-fragment', 'segment-unprojected-fragment');
+      INSERT INTO session_participant_snapshots (
+        id, session_id, revision, projector_version, source_hash, payload_json, created_at
+      ) VALUES (
+        'participant-snapshot-analysis', 'session-1', 1, 'session-participants-v1',
+        '${"9".repeat(64)}', '{"participants":[],"mediaVoices":[]}', 5400
+      );
+      INSERT INTO session_participant_snapshot_clusters (
+        snapshot_id, participant_ref, cluster_id, membership_kind
+      ) VALUES
+        ('participant-snapshot-analysis', 'participant:known:shared', 'cluster-other', 'known'),
+        ('participant-snapshot-analysis', 'participant:known:shared',
+         'cluster-projected-peer', 'known'),
+        ('participant-snapshot-analysis', 'participant:media:passive',
+         'cluster-projected-media', 'media');
+    `);
+    const repository = createRepository(db);
+    const prepared = repository.prepareAnalysisInput(
+      validInput({
+        segmentIds: [
+          "segment-1",
+          "segment-omitted",
+          "segment-projected-peer",
+          "segment-projected-media",
+          "segment-unprojected-fragment",
+        ],
+      })
+    );
+
+    assert.deepEqual(
+      prepared.segments.map(({ segmentId, speakerBindingLabel }) => ({
+        segmentId,
+        speakerBindingLabel,
+      })),
+      [
+        { segmentId: "segment-1", speakerBindingLabel: "SELF" },
+        { segmentId: "segment-omitted", speakerBindingLabel: "P1" },
+        { segmentId: "segment-projected-peer", speakerBindingLabel: "P1" },
+      ]
+    );
+    assert.deepEqual(
+      prepared.speakerBindings.map(({ label, subjectKind, subjectId }) => ({
+        label,
+        subjectKind,
+        subjectId,
+      })),
+      [
+        { label: "SELF", subjectKind: "person", subjectId: "person-self" },
+        { label: "P1", subjectKind: "person", subjectId: "person-other" },
+      ]
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("participant snapshot changes invalidate the prepare/create CAS", () => {
+  const db = createFixture();
+  try {
+    db.exec(`
+      INSERT INTO session_participant_snapshots (
+        id, session_id, revision, projector_version, source_hash, payload_json, created_at
+      ) VALUES (
+        'participant-snapshot-cas-1', 'session-1', 1, 'session-participants-v1',
+        '${"9".repeat(64)}', '{"participants":[],"mediaVoices":[]}', 5400
+      );
+    `);
+    const repository = createRepository(db);
+    const request = validInput({
+      participantSnapshotRevision: {
+        revision: 1,
+        sourceHash: "9".repeat(64),
+        projectorVersion: "session-participants-v1",
+      },
+    });
+    const prepared = repository.prepareAnalysisInput(request);
+
+    db.exec(`
+      INSERT INTO session_participant_snapshots (
+        id, session_id, revision, projector_version, source_hash, payload_json, created_at
+      ) VALUES (
+        'participant-snapshot-cas-2', 'session-1', 2, 'session-participants-v2',
+        '${"8".repeat(64)}', '{"participants":[],"mediaVoices":[]}', 5500
+      );
+    `);
+
+    assert.throws(
+      () =>
+        repository.createAnalysisInput({
+          ...validCreateInput(),
+          ...request,
+          prepareToken: prepared.prepareToken,
+        }),
+      { code: "MEMORY_PREPARE_STALE" }
+    );
+
+    const replacementRequest = validInput({
+      identityRevision: HASH_C,
+      participantSnapshotRevision: {
+        revision: 2,
+        sourceHash: "8".repeat(64),
+        projectorVersion: "session-participants-v2",
+      },
+    });
+    const replacementPrepared = repository.prepareAnalysisInput(replacementRequest);
+    const created = repository.createAnalysisInput({
+      ...validCreateInput(),
+      ...replacementRequest,
+      prepareToken: replacementPrepared.prepareToken,
+    });
+    assert.equal(created.status, "created");
+    assert.equal(
+      db
+        .prepare("SELECT identity_revision FROM analysis_inputs WHERE id = ?")
+        .get(created.analysisInputId).identity_revision,
+      HASH_C
+    );
+  } finally {
+    db.close();
+  }
+});
+
 test("analysis input remains blocked when every segment is unattributed", () => {
   const db = createFixture();
   try {
@@ -5184,7 +6683,7 @@ test("cloud payload partitions every manifest segment into selected or fully omi
           repository.createAnalysisInput({
             ...request,
             prepareToken: prepared.prepareToken,
-            inputContractVersion: "jarvis-analysis-input-v2",
+            inputContractVersion: "jarvis-analysis-input-v3",
             redactionVersion: "jarvis-redaction-v1",
             cloudPayloadJson: JSON.stringify(cloudPayload),
           }),
@@ -5192,6 +6691,51 @@ test("cloud payload partitions every manifest segment into selected or fully omi
       );
     }
     assert.equal(db.prepare("SELECT count(*) AS count FROM analysis_inputs").get().count, 0);
+  } finally {
+    db.close();
+  }
+});
+
+test("cloud payload accepts canonical omitted ranges that overlap a selected application track", () => {
+  const db = createFixture();
+  try {
+    db.prepare(
+      `UPDATE audio_tracks
+       SET started_at = 2000, ended_at = 3000
+       WHERE id = 'track-omitted'`
+    ).run();
+    db.prepare(
+      `UPDATE audio_chunks
+       SET started_at = 2000, ended_at = 3000, duration_ms = 1000
+       WHERE id = 'chunk-omitted'`
+    ).run();
+    db.prepare(
+      `UPDATE transcript_segments
+       SET started_at = 2000, ended_at = 3000
+       WHERE id = 'segment-omitted'`
+    ).run();
+    const repository = createRepository(db);
+    const request = validInput({ segmentIds: ["segment-1", "segment-omitted"] });
+    const prepared = repository.prepareAnalysisInput(request);
+    const cloudPayloadJson = JSON.stringify(
+      validCloudPayload({ omittedRanges: [{ startedAt: 2000, endedAt: 3000 }] })
+    );
+
+    const input = repository.createAnalysisInput({
+      ...request,
+      prepareToken: prepared.prepareToken,
+      inputContractVersion: "jarvis-analysis-input-v3",
+      redactionVersion: "jarvis-redaction-v1",
+      cloudPayloadJson,
+    });
+
+    assert.deepEqual(repository.getAnalysisInputForCloud(input.analysisInputId), {
+      inputHash: input.inputHash,
+      cloudPayloadJson,
+      allowedSegmentIds: ["segment-1"],
+      allowedOwnerLabels: ["SELF"],
+      allowedLearningGoalIds: [],
+    });
   } finally {
     db.close();
   }
@@ -5378,6 +6922,119 @@ test("persists a canonical validated daily digest candidate against immutable in
         state: "validated",
         disposition_at: null,
       }
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("daily digest tomorrow suggestions reuse activity source SELF and evidence authorization", () => {
+  const runCase = ({ suffix, category, allowSuggestions }) => {
+    const db = createFixture();
+    try {
+      const context = createStoredDailyDigestContext(db, suffix);
+      db.prepare(
+        `INSERT INTO activity_classifications (
+           id, session_id, started_at, ended_at, category, confidence, decision,
+           source, reason, source_attribution, evidence_json, supersedes_id,
+           user_corrected_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 0.95, 'adopted', 'local', ?, 'microphone', ?,
+           NULL, NULL, ?, ?)`
+      ).run(
+        `digest-classification-${suffix}`,
+        context.sessionId,
+        context.startsAt,
+        context.startsAt + 4_000,
+        category,
+        `${category} policy`,
+        JSON.stringify({
+          applicationKeys: [],
+          selfDetected: true,
+          allowSummary: true,
+          allowSuggestions,
+          allowTodos: allowSuggestions,
+        }),
+        context.startsAt + 4_100,
+        context.startsAt + 4_100
+      );
+      const segmentId = context.input.cloudPayload.sections.sessions[0].segments[0].segmentId;
+      const candidate = {
+        ...context.candidate,
+        sections: {
+          ...context.candidate.sections,
+          tomorrowSuggestions: [
+            {
+              text: "Review tomorrow's plan.",
+              rationale: "Grounded in today's activity.",
+              evidenceSegmentIds: [segmentId],
+              allowedActions: ["accept", "dismiss", "convert_to_todo"],
+            },
+          ],
+        },
+      };
+      context.repository.persistValidatedDailyDigestCandidate({
+        jobId: context.job.id,
+        digestInputId: context.input.digestInputId,
+        budgetAttemptId: context.budgetAttemptId,
+        candidate,
+      });
+      return JSON.parse(
+        db
+          .prepare("SELECT candidate_json FROM daily_digest_response_candidates WHERE job_id = ?")
+          .get(context.job.id).candidate_json
+      ).sections.tomorrowSuggestions;
+    } finally {
+      db.close();
+    }
+  };
+
+  assert.equal(
+    runCase({ suffix: "policy-gaming", category: "gaming", allowSuggestions: false }).length,
+    0
+  );
+  assert.equal(
+    runCase({ suffix: "policy-work", category: "work_meeting", allowSuggestions: true }).length,
+    1
+  );
+});
+
+test("daily digest policy never persists a candidate made empty by suggestion filtering", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "policy-empty");
+    const segmentId = context.input.cloudPayload.sections.sessions[0].segments[0].segmentId;
+    const candidate = {
+      ...context.candidate,
+      sections: {
+        today: [],
+        interactions: [],
+        topicsAndDecisions: [],
+        commitmentsAndTodos: [],
+        worthRemembering: [],
+        tomorrowSuggestions: [
+          {
+            text: "Act on an untrusted suggestion.",
+            rationale: "This is the only candidate section.",
+            evidenceSegmentIds: [segmentId],
+            allowedActions: ["dismiss"],
+          },
+        ],
+      },
+    };
+
+    assert.throws(
+      () =>
+        context.repository.persistValidatedDailyDigestCandidate({
+          jobId: context.job.id,
+          digestInputId: context.input.digestInputId,
+          budgetAttemptId: context.budgetAttemptId,
+          candidate,
+        }),
+      (error) => error?.code === "invalid_structure" && error?.issueCode === "schema.empty_digest"
+    );
+    assert.equal(
+      db.prepare("SELECT count(*) AS count FROM daily_digest_response_candidates").get().count,
+      0
     );
   } finally {
     db.close();
@@ -5746,6 +7403,73 @@ test("daily digest candidate CAS failure rolls back revision evidence and prior 
   }
 });
 
+test("daily digest watermark stays stable while same-type upstream jobs drain", () => {
+  const db = createFixture();
+  try {
+    const context = createStoredDailyDigestContext(db, "stable-pending-watermark");
+    appendDailyDigestSegment(db, context, "stable-pending-watermark-extra");
+    const insertJob = db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, chunk_id, job_type, state, priority,
+         input_hash, input_version, model_version, attempt_count, lane, created_at
+       ) VALUES (?, ?, ?, ?, 'compress_chunk', 'pending', 60, ?, 1,
+         'ffmpeg-flac-v1', 0, 'local', ?)`
+    );
+    insertJob.run(
+      "digest-pending-job-one",
+      context.sessionId,
+      context.trackId,
+      context.chunkId,
+      HASH_A,
+      8_000
+    );
+    insertJob.run(
+      "digest-pending-job-two",
+      context.sessionId,
+      context.trackId,
+      "digest-chunk-stable-pending-watermark-extra",
+      HASH_B,
+      8_001
+    );
+
+    const first = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(first.completeness, "partial");
+    assert.equal(first.inputWatermark.schemaVersion, "jarvis-daily-digest-watermark-v2");
+    assert.deepEqual(first.inputWatermark.pendingUpstreamJobs, [
+      {
+        sessionRef: first.inputWatermark.sessionStates[0].sessionRef,
+        jobType: "compress_chunk",
+      },
+    ]);
+
+    db.prepare("DELETE FROM processing_jobs WHERE id = ?").run("digest-pending-job-one");
+    const whileDraining = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(whileDraining.status, "existing");
+    assert.equal(whileDraining.digestInputId, first.digestInputId);
+
+    db.prepare("DELETE FROM processing_jobs WHERE id = ?").run("digest-pending-job-two");
+    const drained = context.repository.createDailyDigestInput({
+      localDate: context.input.localDate,
+      timezone: context.input.timezone,
+      modelVersion: "MiniMax-M2.7",
+    });
+    assert.equal(drained.status, "created");
+    assert.notEqual(drained.digestInputId, first.digestInputId);
+    assert.equal(drained.completeness, "final");
+    assert.deepEqual(drained.inputWatermark.pendingUpstreamJobs, []);
+  } finally {
+    db.close();
+  }
+});
+
 test("a paid candidate for an older immutable daily input becomes terminal superseded", () => {
   const db = createFixture();
   try {
@@ -6088,7 +7812,7 @@ test("a newer final daily input appends one evidence-backed revision", () => {
 
 test("two repositories applying one durable candidate converge on one revision", () => {
   const filename = path.join(
-    "G:\\Jarvis\\.runtime-cache\\temp",
+    os.tmpdir(),
     `jarvis-digest-apply-${process.pid}-${Date.now()}.sqlite`
   );
   const firstDb = createFixture(filename);
@@ -6575,6 +8299,7 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     assert.equal(snapshot.topics.length, 1);
     assert.equal(snapshot.todos.length, 1);
     assert.equal(snapshot.suggestions.length, 1);
+    assert.equal(snapshot.todos[0].verificationState, "pending_confirmation");
     const memoryEvidenceId = db
       .prepare(
         `SELECT ref.id FROM evidence_refs AS ref
@@ -6658,6 +8383,217 @@ test("readPublicSnapshot exposes only renderer-safe allowlisted fields and fresh
     const fresh = repository.readPublicSnapshot();
     assert.equal(fresh.memories[0].title, "Deployment choice");
     assert.equal(fresh.memories[0].occurrences[0].evidence.length, 1);
+    repository.decideTodo({ todoId: snapshot.todos[0].id, action: "confirm" });
+    repository.completeTodo({ todoId: snapshot.todos[0].id });
+    assert.equal(repository.readPublicSnapshot().todos[0].verificationState, "confirmed");
+  } finally {
+    db.close();
+  }
+});
+
+test("action center watermark changes for durable todo, verification, and suggestion state", () => {
+  const db = createFixture();
+  try {
+    const { repository, input } = createStoredInput(db);
+    const empty = repository.getActionCenterWatermark();
+    assert.equal(empty.todoCount, 0);
+    assert.equal(empty.suggestionCount, 0);
+    assert.deepEqual(repository.getActionCenterWatermark(), empty);
+
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate(),
+    });
+    const projected = repository.getActionCenterWatermark();
+    assert.notEqual(projected.revision, empty.revision);
+    assert.equal(projected.todoCount, 1);
+    assert.equal(projected.suggestionCount, 1);
+    assert.deepEqual(repository.getActionCenterWatermark(), projected);
+
+    const snapshot = repository.readPublicSnapshot();
+    repository.decideTodo({ todoId: snapshot.todos[0].id, action: "confirm" });
+    const confirmed = repository.getActionCenterWatermark();
+    assert.notEqual(confirmed.revision, projected.revision);
+    assert.equal(confirmed.todoCount, 1);
+    assert.equal(confirmed.suggestionCount, 1);
+
+    db.prepare(
+      `INSERT INTO todo_reminders (
+         todo_instance_id, reminder_at, reminder_source, generation, state,
+         deferred_reason, delivered_at, cancelled_at, created_at, updated_at
+       ) VALUES (?, 9000, 'user', 1, 'scheduled', NULL, NULL, NULL, 7000, 7000)`
+    ).run(snapshot.todos[0].id);
+    const scheduled = repository.getActionCenterWatermark();
+    assert.notEqual(scheduled.revision, confirmed.revision);
+    assert.equal(scheduled.updatedAt, 7_000);
+
+    db.prepare(
+      `UPDATE todo_reminders
+       SET state = 'delivered', delivered_at = 7500, updated_at = 7500
+       WHERE todo_instance_id = ?`
+    ).run(snapshot.todos[0].id);
+    const delivered = repository.getActionCenterWatermark();
+    assert.notEqual(delivered.revision, scheduled.revision);
+    assert.equal(delivered.updatedAt, 7_500);
+
+    repository.dismissSuggestion({ suggestionId: snapshot.suggestions[0].id, at: 8_000 });
+    const dismissed = repository.getActionCenterWatermark();
+    assert.notEqual(dismissed.revision, delivered.revision);
+    assert.equal(dismissed.updatedAt, 8_000);
+  } finally {
+    db.close();
+  }
+});
+
+test("steady action center watermark reads stay O(1) after one durable initialization scan", () => {
+  const db = createFixture();
+  try {
+    const repository = createRepository(db);
+    const initial = repository.getActionCenterWatermark();
+    const prepare = db.prepare.bind(db);
+    let prepareCalls = 0;
+    db.prepare = (...args) => {
+      prepareCalls += 1;
+      return prepare(...args);
+    };
+
+    for (let index = 0; index < 100; index += 1) {
+      assert.deepEqual(repository.getActionCenterWatermark(), initial);
+    }
+    assert.equal(prepareCalls, 0, "steady polling must reuse one singleton lookup");
+
+    prepare(
+      `INSERT INTO suggestions_v2 (
+         id, canonical_key, title, rationale, state, source_analysis_input_id,
+         provenance, decided_at, created_at, updated_at
+       ) VALUES ('watermark-late-suggestion', ?, 'Late action', 'Old session completed',
+                 'proposed', NULL, 'legacy_unverified', NULL, 9000, 9000)`
+    ).run(sha256("watermark-late-suggestion"));
+    const changed = repository.getActionCenterWatermark();
+    assert.notEqual(changed.revision, initial.revision);
+    assert.equal(changed.suggestionCount, 1);
+    assert.equal(changed.updatedAt, 9_000);
+    assert.equal(prepareCalls, 0, "an action trigger must update the cached singleton in O(1)");
+  } finally {
+    db.close();
+  }
+});
+
+test("action deltas survive repository restart, stay per-session, and do not repeat occurrences", () => {
+  const db = createFixture();
+  try {
+    const counters = { ids: 0, clocks: 0 };
+    const { repository, input } = createStoredInput(db, counters);
+    repository.applyCandidateAnalysis({
+      analysisInputId: input.analysisInputId,
+      inputHash: input.inputHash,
+      candidate: validCandidate({
+        todos: [
+          ...validCandidate().todos,
+          {
+            title: "Confirm the meeting owner",
+            ownerLabel: "SELF",
+            dueText: null,
+            evidenceSegmentIds: ["segment-1"],
+          },
+        ],
+      }),
+    });
+    const snapshot = repository.readPublicSnapshot();
+    const confirmedTodo = snapshot.todos.find((todo) => todo.title === "Prepare the release");
+    assert.ok(confirmedTodo);
+    repository.decideTodo({ todoId: confirmedTodo.id, action: "confirm" });
+
+    const unread = repository.getActionCenterDelta();
+    assert.deepEqual(unread, {
+      throughSequence: 3,
+      lastSeenSequence: 0,
+      confirmedTodoCount: 1,
+      pendingTodoCount: 1,
+      suggestionCount: 1,
+      total: 3,
+      sessions: [
+        {
+          sessionId: "session-1",
+          confirmedTodoCount: 1,
+          pendingTodoCount: 1,
+          suggestionCount: 1,
+          total: 3,
+        },
+      ],
+    });
+
+    const restarted = createRepository(db, counters);
+    assert.deepEqual(restarted.getActionCenterDelta(), unread);
+    const marked = restarted.markActionCenterRead({ throughSequence: unread.throughSequence });
+    assert.equal(marked.lastSeenSequence, 3);
+    assert.ok(Number.isSafeInteger(marked.markedAt));
+    assert.deepEqual(repository.getActionCenterDelta(), {
+      throughSequence: 3,
+      lastSeenSequence: 3,
+      confirmedTodoCount: 0,
+      pendingTodoCount: 0,
+      suggestionCount: 0,
+      total: 0,
+      sessions: [],
+    });
+
+    const revision = db
+      .prepare(
+        `SELECT id FROM todo_revisions
+         WHERE todo_instance_id = ? ORDER BY revision DESC LIMIT 1`
+      )
+      .get(confirmedTodo.id);
+    db.prepare(
+      `INSERT INTO todo_occurrences (
+         id, todo_instance_id, todo_revision_id, legacy_session_id,
+         occurrence_key, candidate_item_fingerprint, created_at
+       ) VALUES (?, ?, ?, 'session-2', ?, ?, 9000)`
+    ).run(
+      "delta-repeat-occurrence",
+      confirmedTodo.id,
+      revision.id,
+      sha256("delta-repeat-occurrence-key"),
+      sha256("delta-repeat-occurrence-fingerprint")
+    );
+    assert.equal(repository.getActionCenterDelta().throughSequence, 3);
+    assert.equal(repository.getActionCenterDelta().total, 0);
+
+    db.prepare(
+      `INSERT INTO suggestions_v2 (
+         id, canonical_key, title, rationale, state, source_analysis_input_id,
+         provenance, decided_at, created_at, updated_at
+       ) VALUES (?, ?, 'Later suggestion', 'Created after the read boundary',
+                 'proposed', NULL, 'legacy_unverified', NULL, 10000, 10000)`
+    ).run("delta-later-suggestion", sha256("delta-later-suggestion"));
+    db.prepare(
+      `INSERT INTO suggestion_occurrences (
+         id, suggestion_id, analysis_input_id, legacy_session_id,
+         occurrence_key, candidate_item_fingerprint, created_at
+       ) VALUES (?, 'delta-later-suggestion', NULL, 'session-2', ?, ?, 10000)`
+    ).run(
+      "delta-later-suggestion-occurrence",
+      sha256("delta-later-suggestion-occurrence-key"),
+      sha256("delta-later-suggestion-occurrence-fingerprint")
+    );
+    assert.deepEqual(createRepository(db, counters).getActionCenterDelta(), {
+      throughSequence: 4,
+      lastSeenSequence: 3,
+      confirmedTodoCount: 0,
+      pendingTodoCount: 0,
+      suggestionCount: 1,
+      total: 1,
+      sessions: [
+        {
+          sessionId: "session-2",
+          confirmedTodoCount: 0,
+          pendingTodoCount: 0,
+          suggestionCount: 1,
+          total: 1,
+        },
+      ],
+    });
   } finally {
     db.close();
   }
@@ -6904,6 +8840,8 @@ test("getEvidenceContext validates semantic owner membership before returning sa
       "endedAt",
       "quoteText",
       "audioState",
+      "transcriptContext",
+      "actionAttribution",
     ].sort();
     for (const handle of handles) {
       const context = repository.getEvidenceContext(handle);
@@ -6916,7 +8854,23 @@ test("getEvidenceContext validates semantic owner membership before returning sa
       assert.equal(context.endedAt <= context.sessionEndedAt, true);
       assert.equal(JSON.stringify(context).includes("capture-"), false);
       assert.equal(JSON.stringify(context).includes(HASH_A), false);
+      assert.equal(Array.isArray(context.transcriptContext), true);
+      if (context.transcriptContext.length > 0) {
+        assert.deepEqual(
+          context.transcriptContext
+            .filter((entry) => entry.isEvidence)
+            .map((entry) => entry.segmentId),
+          [context.transcriptSegmentId]
+        );
+        assert.equal(context.transcriptContext.length <= 7, true);
+      }
     }
+    const memoryContext = repository.getEvidenceContext(handles[0]);
+    assert.equal(memoryContext.transcriptContext.length > 1, true);
+    assert.equal(
+      memoryContext.transcriptContext.some((entry) => entry.segmentId === "segment-1"),
+      true
+    );
 
     const otherMemory = db
       .prepare("SELECT id FROM memory_items_v2 WHERE title = 'Storage preference'")
@@ -6986,23 +8940,17 @@ test("session deletion removes source occurrences but preserves durable public h
     const request = validInput({ segmentIds: ["segment-1", "segment-omitted"] });
     const prepared = repository.prepareAnalysisInput(request);
     const cloudPayloadJson = JSON.stringify({
-      inputVersion: "jarvis-analysis-input-v2",
+      inputVersion: "jarvis-analysis-input-v3",
       segments: [
-        validCloudPayload().segments[0],
-        {
-          segmentId: "segment-omitted",
-          startedAt: 5000,
-          endedAt: 5500,
-          speakerLabel: "P1",
-          text: "redacted private evidence",
-        },
+        cloudSegmentFromPrepared(prepared.segments[0], "redacted evidence"),
+        cloudSegmentFromPrepared(prepared.segments[1], "redacted private evidence"),
       ],
       omittedRanges: [],
     });
     const input = repository.createAnalysisInput({
       ...request,
       prepareToken: prepared.prepareToken,
-      inputContractVersion: "jarvis-analysis-input-v2",
+      inputContractVersion: "jarvis-analysis-input-v3",
       redactionVersion: "jarvis-redaction-v1",
       cloudPayloadJson,
     });

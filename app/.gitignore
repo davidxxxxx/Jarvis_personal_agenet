@@ -177,6 +177,7 @@ public
 # Temporary folders
 tmp/
 temp/
+.tmp-tests/
 
 # Electron specific
 out/
@@ -191,6 +192,12 @@ build/
 
 # Generated Globe listener binary
 resources/bin/
+resources/ai-model-pack/prebuilt/*
+!resources/ai-model-pack/prebuilt/.gitkeep
+resources/nsis/model-pack-release.generated.nsh
+release-components/
+resources/ai-model-pack/runtime/__pycache__/
+resources/ai-model-pack/runtime/*.pyc
 native/meeting-aec-helper/build/
 native/meeting-aec-helper/third_party/
 

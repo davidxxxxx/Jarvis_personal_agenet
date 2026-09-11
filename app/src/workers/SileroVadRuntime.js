@@ -15,6 +15,16 @@ function normalizedStateName(name) {
     .toLowerCase();
 }
 
+function isStateOutputForInput(inputName, outputName) {
+  const input = normalizedStateName(inputName);
+  const output = normalizedStateName(outputName);
+  if (!input || !output) return false;
+  if (output === input || output.startsWith(input)) return true;
+  return ["new", "next", "updated", "output"].some(
+    (prefix) => output === `${prefix}${input}` || output.startsWith(`${prefix}${input}`)
+  );
+}
+
 function appendFloat32(left, right) {
   if (left.length === 0) return new Float32Array(right);
   if (right.length === 0) return left;
@@ -121,11 +131,16 @@ class SileroVadRuntime {
       intraOpNumThreads: 1,
       executionMode: "sequential",
     });
+    const inputNames = session.inputNames || [];
+    const outputNames = session.outputNames || [];
+    const stateInputNames = inputNames.filter((name) => /state|^h$|^c$/i.test(name));
     return {
       session,
       modelPath,
-      stateInputNames: (session.inputNames || []).filter((name) => /state|^h$|^c$/i.test(name)),
-      stateOutputNames: (session.outputNames || []).filter((name) => /state|^h|^c/i.test(name)),
+      stateInputNames,
+      stateOutputNames: outputNames.filter((outputName) =>
+        stateInputNames.some((inputName) => isStateOutputForInput(inputName, outputName))
+      ),
     };
   }
 
@@ -339,9 +354,8 @@ class SileroVadRuntime {
 
     const results = await this.session.run(feeds);
     for (const inputName of this.stateInputNames) {
-      const expected = normalizedStateName(inputName);
       const outputName = this.stateOutputNames.find((name) =>
-        normalizedStateName(name).startsWith(expected)
+        isStateOutputForInput(inputName, name)
       );
       const output = (outputName && results[outputName]) || results[inputName];
       if (output?.data) stream.states.set(inputName, new Float32Array(output.data));

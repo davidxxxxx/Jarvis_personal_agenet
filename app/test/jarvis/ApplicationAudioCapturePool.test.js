@@ -32,6 +32,7 @@ function createHarness(options = {}) {
         async start(args) {
           this.starts.push(args);
           this.args = args;
+          if (options.managerStart) await options.managerStart(this, args);
         },
         async stop() {
           this.stops += 1;
@@ -40,7 +41,10 @@ function createHarness(options = {}) {
       managers.push(manager);
       return manager;
     },
-    onTrackStarted: (event) => events.push({ type: "started", ...event }),
+    onTrackStarted: (event) => {
+      events.push({ type: "started", ...event });
+      if (options.trackStartError) throw options.trackStartError;
+    },
     onTrackEnded: (event) => events.push({ type: "ended", ...event }),
     onAttributionChange: (event) => events.push({ type: "attribution", ...event }),
     onChunk: (event) => events.push({ type: "chunk", ...event }),
@@ -48,6 +52,8 @@ function createHarness(options = {}) {
     clearIntervalImpl: options.clearIntervalImpl ?? (() => {}),
     silenceReleaseMs: options.silenceReleaseMs,
     retryDelayMs: options.retryDelayMs,
+    selectionDebounceMs: options.selectionDebounceMs,
+    sessionInactiveGraceMs: options.sessionInactiveGraceMs,
   });
   return {
     pool,
@@ -90,6 +96,27 @@ test("policy clamps settings to 1-8 and ranks calls, foreground, browsers, then 
   assert.deepEqual(
     selected.map((entry) => entry.applicationKey),
     ["zoom", "notepad", "chrome", "dota2"]
+  );
+});
+
+test("policy excludes virtual-audio infrastructure from application tracks", () => {
+  const policy = new ApplicationAudioPolicy();
+  const selected = policy.select(
+    [
+      active("SteelSeriesSonar", 201, {
+        applicationDisplayName: "SteelSeries Sonar Virtual Audio Device",
+      }),
+      active("audiodg", 202, {
+        applicationDisplayName: "Windows Audio Device Graph Isolation",
+      }),
+      active("zoom", 203),
+    ],
+    { configuredLimit: 4 }
+  );
+
+  assert.deepEqual(
+    selected.map((entry) => entry.applicationKey),
+    ["zoom"]
   );
 });
 
@@ -136,6 +163,283 @@ test("pool starts at most four independent application tracks while watcher rema
   );
 });
 
+test("anchors an application track to first PCM and delivers startup audio exactly once", async () => {
+  let at = 10_000;
+  const firstPcm = Buffer.alloc(4_800);
+  firstPcm.writeInt16LE(4_096, 0);
+  const harness = createHarness({
+    now: () => at,
+    selectionDebounceMs: 0,
+    async managerStart(_manager, args) {
+      at = 13_250;
+      args.onChunk(firstPcm);
+    },
+  });
+  await harness.pool.start({ sessionId: "session-first-pcm" });
+  await harness.emit(active("kook", 110));
+  await harness.pool.waitForIdle();
+
+  const started = harness.events.find((event) => event.type === "started");
+  const exact = harness.events.find(
+    (event) => event.type === "attribution" && event.attributionState === "exact"
+  );
+  const chunks = harness.events.filter((event) => event.type === "chunk");
+  assert.equal(started.startedAt, 13_250);
+  assert.equal(exact.at, 13_250);
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0].at, 13_250);
+  assert.deepEqual(chunks[0].pcm, firstPcm);
+  assert.ok(harness.events.indexOf(started) < harness.events.indexOf(chunks[0]));
+});
+
+test("startup PCM overflow latches the first failure and never registers or flushes a partial track", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    selectionDebounceMs: 0,
+    async managerStart(_manager, args) {
+      at = 12_000;
+      args.onChunk(Buffer.alloc(24_000 * 2 * 5));
+      at = 12_500;
+      args.onChunk(Buffer.alloc(2));
+      at = 13_000;
+      args.onChunk(Buffer.alloc(4_800));
+    },
+  });
+  await harness.pool.start({ sessionId: "session-startup-overflow" });
+  await harness.emit(active("kook", 111));
+  await harness.pool.waitForIdle();
+
+  const fallbacks = harness.events.filter(
+    (event) =>
+      event.type === "attribution" &&
+      event.applicationKey === "kook" &&
+      event.attributionState === "mixed_unknown" &&
+      event.reason === "startup_pcm_overflow"
+  );
+  assert.equal(fallbacks.length, 1);
+  assert.equal(fallbacks[0].at, 12_500);
+  assert.equal(
+    harness.events.some((event) => event.type === "started"),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "ended"),
+    false
+  );
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "attribution" && event.attributionState === "exact"
+    ),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "chunk"),
+    false
+  );
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  assert.deepEqual(
+    harness.pool.getStatus().fallbacks.map((fallback) => [fallback.reason, fallback.retryAt]),
+    [["startup_pcm_overflow", 17_500]]
+  );
+  assert.equal(harness.managers[0].stops, 1);
+});
+
+test("silent active sessions do not open tracks until Chrome or KOOK is actually audible", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+
+  await harness.emit(active("chrome", 106, { peak: 0, audible: false }));
+  await harness.emit(active("kook", 107, { peak: 0.0004, audible: false }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  assert.equal(harness.managers.length, 0);
+
+  await harness.emit(active("chrome", 106, { peak: 0.12, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["chrome"]
+  );
+
+  await harness.emit(active("kook", 107, { peak: 0.24, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["chrome", "kook"]
+  );
+});
+
+test("a replacement process after restart or output-device change waits for real audio", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 108, { peak: 0.3, audible: true }));
+  await harness.emit({ ...active("chrome", 108), state: "inactive", peak: 0, audible: false });
+  await harness.emit(active("chrome", 109, { peak: 0, audible: false }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [108]
+  );
+
+  await harness.emit(active("chrome", 109, { peak: 0.2, audible: true }));
+  await harness.pool.waitForIdle();
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [108, 109]
+  );
+});
+
+test("equal-priority watcher updates keep the original selected tracks sticky", async () => {
+  let at = 10_000;
+  const harness = createHarness({ now: () => (at += 250), selectionDebounceMs: 500 });
+  await harness.pool.start({ configuredLimit: 4 });
+  for (const [key, pid] of [
+    ["alpha", 111],
+    ["bravo", 112],
+    ["charlie", 113],
+    ["delta", 114],
+    ["echo", 115],
+  ]) {
+    await harness.emit(active(key, pid));
+  }
+  for (let index = 0; index < 20; index += 1) {
+    await harness.emit(
+      active(["alpha", "bravo", "charlie", "delta", "echo"][index % 5], 111 + (index % 5))
+    );
+  }
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.pool.getStatus().activeTracks.map((track) => track.applicationKey),
+    ["alpha", "bravo", "charlie", "delta"]
+  );
+  assert.equal(harness.events.filter((event) => event.type === "started").length, 4);
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "ended" && event.reason === "application_not_selected"
+    ),
+    false
+  );
+});
+
+test("an active application keeps its current PID while that PID remains present", async () => {
+  const harness = createHarness({ selectionDebounceMs: 0 });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 301));
+  await harness.emit(active("chrome", 302, { peak: 1 }));
+  await harness.emit(active("chrome", 301, { peak: 0.1 }));
+  await harness.pool.waitForIdle();
+
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === "started" && event.applicationKey === "chrome")
+      .map((event) => event.pid),
+    [301]
+  );
+});
+
+test("a transient inactive watcher event keeps the same application capture generation", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    sessionInactiveGraceMs: 5_000,
+    silenceReleaseMs: 60_000,
+  });
+  await harness.pool.start();
+  await harness.emit(active("kook", 320));
+  at += 1_000;
+  await harness.emit({ ...active("kook", 320), state: "inactive", peak: 0 });
+  at += 1_000;
+  await harness.emit(active("kook", 320));
+  await harness.pool.waitForIdle();
+
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "ended" && event.applicationKey === "kook"),
+    false
+  );
+});
+
+test("confirmed silence waits for a new audible watcher event before reopening the app track", async () => {
+  let at = 10_000;
+  const harness = createHarness({
+    now: () => at,
+    silenceReleaseMs: 60_000,
+    retryDelayMs: 5_000,
+  });
+  await harness.pool.start();
+  await harness.emit(active("kook", 321, { peak: 0.8 }));
+  await harness.pool.waitForIdle();
+
+  at += 60_001;
+  await harness.pool.sweep();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+  assert.equal(
+    harness.events.some(
+      (event) =>
+        event.type === "ended" &&
+        event.applicationKey === "kook" &&
+        event.reason === "confirmed_silence"
+    ),
+    true
+  );
+
+  at += 6_000;
+  await harness.pool.sweep();
+  await harness.emit(active("kook", 321, { peak: 0 }));
+  await harness.pool.waitForIdle();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    1
+  );
+
+  await harness.emit(active("kook", 321, { peak: 0.4 }));
+  await harness.pool.waitForIdle();
+  assert.equal(
+    harness.events.filter((event) => event.type === "started" && event.applicationKey === "kook")
+      .length,
+    2
+  );
+});
+
+test("evidence registration failures retain the original bounded error code", async () => {
+  let at = 10_000;
+  const error = new Error("invalid application interval");
+  error.code = "SQLITE_CONSTRAINT_TRIGGER";
+  const harness = createHarness({
+    now: () => at,
+    trackStartError: error,
+    managerStart: async () => {
+      at = 13_000;
+    },
+  });
+  await harness.pool.start();
+  await harness.emit(active("chrome", 350));
+  await harness.pool.waitForIdle();
+
+  const ended = harness.events.find(
+    (event) => event.type === "ended" && event.applicationKey === "chrome"
+  );
+  assert.equal(ended.failureCode, "evidence_registration_failed_SQLITE_CONSTRAINT_TRIGGER");
+  assert.equal(ended.endedAt, 13_000);
+});
+
 test("fullscreen mode retains only the communication app and foreground game", async () => {
   const harness = createHarness();
   await harness.pool.start({ configuredLimit: 8 });
@@ -176,9 +480,7 @@ test("application PID replacement closes the old generation and starts a new one
   assert.equal(
     harness.events.some(
       (event) =>
-        event.type === "ended" &&
-        event.applicationKey === "chrome" &&
-        event.captureGeneration === 1
+        event.type === "ended" && event.applicationKey === "chrome" && event.captureGeneration === 1
     ),
     true
   );
@@ -192,7 +494,10 @@ test("stop closes all app helpers and the one watcher without touching the mixed
   await harness.pool.stop();
 
   assert.equal(harness.watcher.stopped, 1);
-  assert.equal(harness.managers.every((manager) => manager.stops === 1), true);
+  assert.equal(
+    harness.managers.every((manager) => manager.stops === 1),
+    true
+  );
   assert.deepEqual(harness.pool.getStatus().activeTracks, []);
   assert.equal(
     harness.events.some((event) => event.type === "ended" && event.reason === "pool_stopped"),
@@ -224,6 +529,52 @@ test("stop closes application evidence synchronously before native helpers finis
   assert.deepEqual(harness.pool.getStatus().activeTracks, []);
   releaseStop();
   await stopping;
+});
+
+test("stop and replacement start never publish or double-stop an unregistered startup track", async () => {
+  let releaseFirstStart;
+  const firstStartGate = new Promise((resolve) => {
+    releaseFirstStart = resolve;
+  });
+  const harness = createHarness({
+    selectionDebounceMs: 0,
+    managerStart: (manager) =>
+      manager.identity.captureGeneration === 1 ? firstStartGate : Promise.resolve(),
+  });
+  await harness.pool.start({ sessionId: "session-start-race-1" });
+  const firstSessionEvent = harness.emit(active("kook", 701));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(harness.managers.length, 1);
+  assert.deepEqual(harness.pool.getStatus().activeTracks, []);
+  const stopping = harness.pool.stop();
+  const restarting = harness.pool.start({ sessionId: "session-start-race-2" });
+  assert.equal(
+    harness.events.some((event) => event.type === "started"),
+    false
+  );
+  assert.equal(
+    harness.events.some((event) => event.type === "ended"),
+    false
+  );
+
+  releaseFirstStart();
+  await Promise.all([firstSessionEvent, stopping, restarting]);
+  assert.equal(harness.managers[0].stops, 1);
+  assert.equal(
+    harness.events.some(
+      (event) => event.captureGeneration === 1 && ["started", "ended"].includes(event.type)
+    ),
+    false
+  );
+
+  await harness.emit(active("kook", 702));
+  await harness.pool.waitForIdle();
+  const starts = harness.events.filter((event) => event.type === "started");
+  assert.deepEqual(
+    starts.map((event) => [event.sessionId, event.captureGeneration, event.pid]),
+    [["session-start-race-2", 2, 702]]
+  );
 });
 
 test("pool can restart on a replacement session after stop cleanup completes", async () => {

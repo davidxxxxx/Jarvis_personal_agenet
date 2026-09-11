@@ -10,7 +10,7 @@ physical-hardware or live-network approval.
 Run its machine boundary from `app/`:
 
 ```powershell
-Set-Location G:\Jarvis\.worktrees\jarvis-all-day-runtime\app
+# Run from the current verified checkout's app/ directory.
 $env:TEMP='G:\Jarvis\.runtime-cache\temp'
 $env:TMP=$env:TEMP
 node --test test/jarvis/ReleaseAcceptanceMatrix.test.js

@@ -35,6 +35,7 @@ const RENDERER_AUDIO_CHUNK_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "duration_ms",
+  "transcription_status",
   "track_id",
   "source_type",
   "sequence_number",
@@ -57,6 +58,7 @@ const RENDERER_AUDIO_TRACK_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "state",
+  "failure_code",
 ]);
 
 const RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS = Object.freeze([
@@ -70,6 +72,7 @@ const RENDERER_APPLICATION_AUDIO_INTERVAL_FIELDS = Object.freeze([
   "started_at",
   "ended_at",
   "reason",
+  "failure_code",
 ]);
 
 const RENDERER_AUDIO_GAP_FIELDS = Object.freeze([
@@ -170,12 +173,47 @@ function toPublicSessionDetail(detail) {
     session: toRendererSession(detail.session),
     summary: detail.summary ?? null,
     segments: Array.isArray(detail.segments) ? detail.segments : [],
+    speakerUtterances: Array.isArray(detail.speakerUtterances)
+      ? detail.speakerUtterances.map((utterance) => ({
+          ...projectFields(utterance, [
+            "id",
+            "session_id",
+            "chunk_id",
+            "cluster_id",
+            "source_segment_id",
+            "stem_id",
+            "started_at",
+            "ended_at",
+            "text",
+            "confidence",
+            "overlap_state",
+            "evidence_kind",
+            "local_label",
+            "person_id",
+            "link_state",
+            "person_display_name",
+            "application_key",
+            "application_display_name",
+            "track_kind",
+          ]),
+          has_isolated_audio:
+            utterance.evidence_kind === "separated_stem" &&
+            typeof utterance.stem_path === "string" &&
+            utterance.stem_deleted_at === null &&
+            Number.isSafeInteger(utterance.stem_expires_at) &&
+            utterance.stem_expires_at > Date.now(),
+        }))
+      : [],
     audioChunks: Array.isArray(detail.audioChunks)
       ? detail.audioChunks.map(toRendererAudioChunk)
       : [],
     topics: Array.isArray(detail.topics) ? detail.topics : [],
     todos: Array.isArray(detail.todos) ? detail.todos : [],
     memories: Array.isArray(detail.memories) ? detail.memories : [],
+    speakerProcessing:
+      detail.speakerProcessing && typeof detail.speakerProcessing === "object"
+        ? detail.speakerProcessing
+        : null,
   };
 }
 
@@ -197,6 +235,14 @@ function toRendererPreviewStatus(status) {
 
 function toRendererSessionTimeline(timeline, previewStatus = null) {
   if (!timeline || typeof timeline !== "object") return timeline;
+  const intervalPage = Array.isArray(timeline.application_audio_intervals)
+    ? timeline.application_audio_intervals
+    : [];
+  const pageCapture = summarizeApplicationAudio(intervalPage);
+  const aggregateCapture =
+    timeline.application_capture && typeof timeline.application_capture === "object"
+      ? timeline.application_capture
+      : null;
   return {
     ...projectFields(timeline, [
       "session_id",
@@ -209,14 +255,22 @@ function toRendererSessionTimeline(timeline, previewStatus = null) {
       "ready_at",
     ]),
     tracks: Array.isArray(timeline.tracks) ? timeline.tracks.map(toRendererAudioTrack) : [],
-    application_audio_intervals: Array.isArray(timeline.application_audio_intervals)
-      ? timeline.application_audio_intervals.map(toRendererApplicationAudioInterval)
-      : [],
-    application_capture: summarizeApplicationAudio(
-      Array.isArray(timeline.application_audio_intervals)
-        ? timeline.application_audio_intervals
-        : []
-    ),
+    application_audio_intervals: intervalPage.map(toRendererApplicationAudioInterval),
+    application_capture: {
+      exact_duration_ms: aggregateCapture?.exact_duration_ms ?? pageCapture.exact_duration_ms,
+      fallback_duration_ms:
+        aggregateCapture?.fallback_duration_ms ?? pageCapture.fallback_duration_ms,
+      exact_coverage_pct: aggregateCapture?.exact_coverage_pct ?? pageCapture.exact_coverage_pct,
+      degraded_intervals: pageCapture.degraded_intervals,
+      degraded_interval_count:
+        aggregateCapture?.degraded_interval_count ?? pageCapture.degraded_intervals.length,
+      recovery_points: pageCapture.recovery_points,
+      recovery_count: aggregateCapture?.recovery_count ?? pageCapture.recovery_points.length,
+    },
+    evidence_page:
+      timeline.evidence_page && typeof timeline.evidence_page === "object"
+        ? timeline.evidence_page
+        : null,
     gaps: Array.isArray(timeline.gaps) ? timeline.gaps.map(toRendererAudioGap) : [],
     chunks: Array.isArray(timeline.chunks) ? timeline.chunks.map(toRendererAudioChunk) : [],
     segments: Array.isArray(timeline.segments) ? timeline.segments : [],

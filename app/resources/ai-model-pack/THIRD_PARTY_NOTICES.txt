@@ -1,0 +1,42 @@
+Jarvis AI Model Pack - Third Party Notices
+
+pyannote.audio
+  Source: https://github.com/pyannote/pyannote-audio
+  Code license: MIT
+
+pyannote speaker-diarization-community-1
+  Source: https://huggingface.co/pyannote/speaker-diarization-community-1
+  Model revision: 3533c8cf8e369892e6b79ff1bf80f7b0286a54ee
+  Model license: CC-BY-4.0
+  Attribution: Herve Bredin and the pyannote contributors.
+
+sherpa-onnx and bundled speaker models
+  Source: https://github.com/k2-fsa/sherpa-onnx
+  Code license: Apache-2.0
+  Individual model cards and notices are retained beside their artifacts.
+
+CAM++ and ERes2NetV2 speaker models
+  Source: https://modelscope.cn/organization/iic
+  Individual model notices are retained beside their artifacts.
+
+ClearerVoice-Studio and MossFormer2_SS_16K
+  Source: https://github.com/modelscope/ClearerVoice-Studio
+  Source revision: a170d81ae1372201d8ad14f1cb80bb95e5e7e65b
+  Model revision: 407cb030cd66340918ebb6c8cc63b18f8592cdbe
+  License: Apache-2.0
+
+Silero VAD
+  Source: https://github.com/snakers4/silero-vad
+  License: MIT
+
+Python
+  Source: https://www.python.org/
+  License: PSF License Version 2
+
+PyTorch
+  Source: https://github.com/pytorch/pytorch
+  License: BSD-style license
+
+The complete license texts distributed by each component are included in the
+model pack. No model receives recorded audio from the network; inference is
+performed locally with offline mode enabled.

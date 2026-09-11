@@ -1,0 +1,112 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-04-repeated-topic",
+  "coverage": ["repeated-topic"],
+  "sessionId": "session-fm-04",
+  "request": {
+    "inputHash": "d6f42d93b84e211e14414a3eb1c753be685ec3c7ba288d451cb4d70f1cb63697",
+    "allowedSegmentIds": ["seg-fm-04-1", "seg-fm-04-2"],
+    "allowedOwnerLabels": ["SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-04-1",
+          "startedAt": 1000,
+          "endedAt": 2600,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.94,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "the sync strategy needs one canonical cursor."
+        },
+        {
+          "segmentId": "seg-fm-04-2",
+          "startedAt": 5000,
+          "endedAt": 6600,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.94,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "back to the sync strategy, the canonical cursor remains the decision."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-04-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "Sync strategy",
+          "summary": "The repeated discussion converged on one canonical cursor for synchronization.",
+          "evidenceSegmentIds": ["seg-fm-04-1", "seg-fm-04-2"]
+        },
+        "memories": [
+          {
+            "kind": "decision",
+            "title": "Canonical sync cursor",
+            "body": "Synchronization will use one canonical cursor.",
+            "confidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-04-1", "seg-fm-04-2"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "Sync strategy",
+            "summary": "A single canonical cursor was discussed twice and retained as the decision.",
+            "evidenceSegmentIds": ["seg-fm-04-1", "seg-fm-04-2"]
+          }
+        ],
+        "todos": [],
+        "suggestions": []
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-04",
+      "inputHash": "d6f42d93b84e211e14414a3eb1c753be685ec3c7ba288d451cb4d70f1cb63697",
+      "requestBytes": 1040,
+      "responseBytes": 620,
+      "durationMs": 10,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 75,
+      "outputTokens": 76
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-04",
+        "sourceSegmentId": "seg-fm-04-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-04",
+        "sourceSegmentId": "seg-fm-04-2"
+      }
+    ],
+    "todos": []
+  }
+}

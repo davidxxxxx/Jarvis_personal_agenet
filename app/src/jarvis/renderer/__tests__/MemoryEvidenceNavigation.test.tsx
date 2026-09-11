@@ -47,6 +47,7 @@ function detail(summary: JarvisSessionDetail["summary"] = null): JarvisSessionDe
     topics: [],
     todos: [],
     memories: [],
+    speakerProcessing: null,
   };
 }
 
@@ -85,6 +86,7 @@ function evidenceContext(audioState: "available" | "expired" | "missing"): Jarvi
     endedAt: segment.ended_at,
     quoteText: segment.text,
     audioState,
+    actionAttribution: null,
   };
 }
 
@@ -105,6 +107,28 @@ describe("MemoryView evidence navigation", () => {
       selectedSessionId: null,
       evidenceNavigation: { phase: "idle", requestId: 0 },
     });
+  });
+
+  it("opens a recent session selected directly from Today", async () => {
+    const getSessionDetail = vi.fn(async () => detail());
+    Object.assign(window, {
+      electronAPI: {
+        jarvis: {
+          getSessionDetail,
+          getSessionTimeline: vi.fn(async () => timeline()),
+          readAudioChunk: vi.fn(),
+          searchMemory: vi.fn(async () => []),
+          analyzeSession: vi.fn(),
+        },
+      },
+    });
+    useJarvisStore.getState().openSession(session.id);
+
+    render(<MemoryView />);
+
+    await waitFor(() => expect(getSessionDetail).toHaveBeenCalledWith(session.id));
+    expect(await screen.findByText("Durable evidence transcript")).toBeInTheDocument();
+    expect(useJarvisStore.getState().evidenceNavigation.phase).toBe("idle");
   });
 
   it("opens an authoritative session absent from the list and stays transcript-only after expiry", async () => {

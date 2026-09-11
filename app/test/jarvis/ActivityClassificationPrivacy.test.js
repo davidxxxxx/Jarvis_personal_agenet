@@ -21,7 +21,7 @@ function privateInput() {
             startedAt: 0,
             endedAt: 10_000,
             speakerLabel: "P1",
-            text: "张三说请联系李四，token=sk-cp-not-a-real-key-123456。麦克风 SteelSeries Sonar，文件在 C:\\Users\\xujie\\secret.txt。",
+            text: "张三说请联系李四，token=sk-cp-not-a-real-key-123456。麦克风 SteelSeries Sonar，文件在 C:\\Users\\ExampleUser\\secret.txt。",
           },
         ],
         statistics: {
@@ -90,7 +90,7 @@ test("cloud payload contains only normalized apps, anonymous speakers, transcrip
     "张三",
     "李四",
     "SteelSeries Sonar",
-    "C:\\Users\\xujie",
+    "C:\\Users\\ExampleUser",
     "secret.txt",
     "sk-cp-not-a-real-key",
   ]) {
@@ -130,6 +130,52 @@ test("rejects executable paths masquerading as normalized application names", ()
   const input = privateInput();
   input.activities[0].applications = ["C:\\Program Files\\KOOK\\kook.exe"];
   assert.throws(() => builder.build(input), /unsupported or duplicate key/u);
+});
+
+test("long all-day transcripts are sampled across the full timeline within the cloud byte limit", () => {
+  const input = {
+    activities: [
+      {
+        activityId: "long-gaming-activity",
+        applications: ["dota2"],
+        sourceAttribution: "application",
+        speakerLabels: ["P1"],
+        segments: Array.from({ length: 600 }, (_unused, index) => ({
+          segmentId: `segment-${String(index).padStart(4, "0")}`,
+          startedAt: index * 1_000,
+          endedAt: index * 1_000 + 900,
+          speakerLabel: "P1",
+          text: `Dota 2 match discussion sample ${index}`,
+        })),
+        statistics: {
+          durationMs: 600_000,
+          microphoneParticipated: false,
+          selfDetected: false,
+          speakerCount: 1,
+          turnCount: 600,
+          turnTakingScore: 0,
+          foregroundAppKey: "dota2",
+        },
+      },
+    ],
+    redactionTerms: { participants: [], otherPeople: [], deviceLabels: [] },
+  };
+  const builder = new ActivityClassificationInputBuilder({ maxPayloadBytes: 8_000 });
+  const first = builder.build(input);
+  const second = builder.build(input);
+  const segments = first.cloudPayload.activities[0].segments;
+
+  assert.ok(segments.length > 1 && segments.length <= 256);
+  assert.equal(segments[0].segmentId, "segment-0000");
+  assert.equal(segments.at(-1).segmentId, "segment-0599");
+  assert.equal(first.cloudPayload.activities[0].statistics.turnCount, 600);
+  assert.deepEqual(
+    first.validationContext.segmentIdsByActivity["long-gaming-activity"],
+    segments.map((segment) => segment.segmentId)
+  );
+  assert.ok(first.inputBytes <= 8_000);
+  assert.equal(first.inputHash, second.inputHash);
+  assert.equal(builder.verifyCloudPayload(first.cloudPayload), true);
 });
 
 test("MiniMax request never serializes local redaction dictionaries or metadata-only logs", async () => {

@@ -9,6 +9,7 @@ module.exports = [
       "src/dist/**",
       "*.min.js",
       "build/**",
+      "resources/ai-model-pack/prebuilt/**",
       "src/**", // src has its own config
     ],
   },

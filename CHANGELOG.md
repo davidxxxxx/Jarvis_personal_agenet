@@ -5,10 +5,492 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
 
 ## Unreleased
 
-### Planned for 0.2.0
+- Record fixed candidate `293bb057fa28b2667516c5c5e445783ea1874659` as passing the automated
+  Phase 4 regression, static, virtual-endurance, Windows package, native-ABI, offline, restart,
+  migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
+  CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
-- Evidence-gated Todos, suggestions, and local personalization.
-- Progressive Finish & Summarize session page and a compact home Action Center.
+## 0.2.0-rc.13 - 2026-09-12
+
+- Add a Jarvis-first repository guide, evidence-backed feature inventory, module map and development/configuration/testing documentation; preserve upstream and historical design records.
+- Separate background lifecycle, worker composition and committed-audio preview while preserving the original runtime exports.
+- Extract IPC public projections, analysis validation/support and speaker logical-track selection from oversized orchestration/repository files; retain database schema v60 and existing transaction ownership.
+- Extract Memory presentation helpers and summary card without changing the UI or authorizing automatic paid refreshes.
+- Add module-boundary and summary-interaction regression tests. Make database fixture paths portable and inject native port discovery so mocked lifecycle tests do not depend on host port availability.
+- Source-only maintenance candidate: no new Windows installer, production data reprocessing, paid cloud request or physical-device/endurance acceptance is included.
+
+## 0.2.0-rc.12 - 2026-08-08
+
+- Exclude audit-only transcript projections from every Daily Review evidence section, keeping the
+  structured evidence manifest aligned with the visible transcript boundary.
+- Stop deterministic Daily Review evidence-boundary failures from retaining and repeatedly
+  reclaiming the only cloud execution slot; no MiniMax request or budget reservation is made.
+
+## 0.2.0-rc.11 - 2026-08-08
+
+- Keep hidden or audit-only transcript rows out of paid summary scheduling so participant
+  reprocessing can create a fresh immutable analysis input instead of failing as stale.
+- Treat the latest durable participant projection as the cloud identity boundary: projected SELF
+  and reviewed participants remain eligible, while media and unprojected diarization fragments stay
+  local and cannot leak into the MiniMax summary as invented people.
+
+## 0.2.0-rc.10 - 2026-08-08
+
+- Suppress electron-updater's own benign `ERR_UPDATER_NO_PUBLISHED_VERSIONS` logger output while
+  preserving unrelated update failures, so the first user-owned GitHub release can remain draft
+  without producing an error stack at every startup.
+
+## 0.2.0-rc.9 - 2026-08-08
+
+- Stop historical identity jobs from retrying every few seconds when their diarization evidence is
+  incomplete: pending dependencies now wait without consuming attempts or logging failures and wake
+  immediately when the same session's diarization lifecycle changes.
+- Treat identity dependencies as terminal when no diarization work can still satisfy them, blocking
+  once as `IDENTITY_RESOLUTION_DEPENDENCY_FAILED` instead of accumulating hundreds of retries.
+- Point automatic updates at `davidxxxxx/Jarvis_personal_agenet` and treat an empty GitHub release
+  channel as a normal “no update published yet” state rather than an application error.
+- Runtime-verify the rc.8 quality-gated identity fix on the retained DOTA 2/KOOK session: SELF stays
+  confirmed, media is separated, no KOOK voice is assigned to a named person, and participant
+  projection advances to revision 11.
+
+## 0.2.0-rc.8 - 2026-08-08
+
+- Resolve identities only for speaker clusters that passed the durable identity-quality gate,
+  while retaining all rejected fragments as local audit evidence.
+- Stop retrying a deterministic identity-batch coverage invariant forever; surface it as a
+  terminal identity validation failure while ordinary transient identity errors still back off.
+- Add a v6 multi-track regression covering current-policy selection, legacy-policy exclusion,
+  audit fragments, missing or duplicate eligible evidence, and idempotent retries.
+
+## 0.2.0-rc.7 - 2026-08-08
+
+- Namespace durable overlap-separation audio paths by diarization policy, so retained KOOK audio
+  can be reprocessed without colliding with the UNIQUE path of v3 stem evidence.
+- Version the corrected artifact lifecycle as hybrid diarization v6, automatically replacing the
+  terminal rc.6 KOOK task while preserving stable paths for retries within the same policy.
+
+## 0.2.0-rc.6 - 2026-08-08
+
+- Version overlap-aware speaker processing as hybrid diarization v5 so sessions blocked by an
+  rc.5 overlap-evidence commit failure are automatically reprocessed from their durable audio.
+- Include the diarization policy in deterministic separated-stem turn and overlap-evidence IDs,
+  preventing a newer policy from reusing v3 or v4 SQLite primary keys while preserving restart
+  idempotency within the same policy.
+
+## 0.2.0-rc.5 - 2026-08-08
+
+- Hide stale final transcript projections when the newest transcription result says the audio has
+  no speech, while retaining the old text as local audit evidence instead of deleting it.
+- Restore the same final segment, confidence, and word timestamps if a later transcription pass
+  finds speech, and exclude hidden audit text from speaker-diarization admission checks.
+- Migrate local data to schema v60 so contradictory no-speech/final-text rows no longer prevent
+  microphone and logical application tracks from entering current speaker processing.
+- Validate long-recording speaker ranges against identity-eligible people while retaining
+  low-quality voiced fragments as local audit evidence, so real KOOK runs do not fail merely
+  because review-only fragments outnumber the trusted people range.
+- Stop retrying deterministic diarization cluster-count validation failures and surface them as
+  terminal local evidence errors instead of repeatedly consuming CUDA.
+
+## 0.2.0-rc.4 - 2026-08-05
+
+- Version the corrected long-recording clustering contract as hybrid diarization v4 so v3 runs
+  cannot be mistaken for current evidence; microphone and every logical application track are
+  reprocessed before a historical session may return to Ready.
+- Merge same-speaker clusters despite an isolated noisy voice window while retaining strict
+  simultaneous-speaker cannot-link edges and refusing long-term identity binding whenever the
+  merged cluster falls below the consistency gate.
+- Derive the visible long-session speaker range from durable high-consistency global clusters and
+  per-window count evidence, keeping low-quality fragments available for review without presenting
+  every fragment as another person.
+- Rank diarization runs by logical application rather than physical capture generation, so Memory
+  exposes only the newest KOOK, DOTA 2, Quark, or browser utterance timeline instead of replaying
+  stale generation-specific results alongside the current run.
+
+## 0.2.0-rc.3 - 2026-08-05
+
+- Treat every capture generation from the same application as one logical audio track, recognize
+  Quark, and preserve exact local fallback codes without leaking process paths or window titles.
+- Persist Whisper word timestamps and project them onto speaker turns so Memory can show and play
+  sentence-level speech instead of assigning a whole 60-second transcript to one person.
+- Persist independently separated MossFormer2 stems, transcribe and embed every audible stem, and
+  add cannot-link evidence so simultaneous speakers cannot collapse back into one identity.
+- Ship AI model pack 2026.08.1 so the pinned offline runtime returns durable separated channels
+  instead of reporting overlap metadata without preserving the resulting audio evidence.
+- Gate long-recording identity association on voice-window coverage and cluster consistency, while
+  keeping rejected fragments as local audit evidence rather than binding them to a named person.
+- Show overlapping speakers side by side with isolated playback and links to reversible split,
+  merge, naming, and correction history controls.
+- Keep mixed-system duplicate transcripts as hidden audit copies when exact application-primary
+  evidence exists, while retaining unknown-source audio when no exact application track covers it.
+- Migrate local data to schema v59 and requeue historical transcription and diarization under the
+  new evidence contract without automatically purchasing another MiniMax summary.
+
+## 0.2.0-rc.2 - 2026-08-04
+
+- Deduplicate application audio and the mixed-system safety track with local-only whole-window
+  waveform evidence, retaining both rows whenever audio is missing, ambiguous, weak, or unrelated.
+- Recheck low-priority resource admission between bounded acoustic batches so long recordings yield
+  to games and CPU pressure without silently treating deferred work as complete.
+- Anchor application tracks to their first real PCM, bound startup buffering, and make startup,
+  overflow, stop, and replacement races emit one consistent exact-or-fallback lifecycle.
+- Increment the session timeline only when duplicate relations actually change so Memory refreshes
+  after a safe local backfill without triggering a new paid cloud summary.
+- Repair genuine schema-v48 upgrades by creating the additive personalization-event prerequisite
+  before v50 semantic baselines are rebuilt, with idempotent cold-reopen coverage.
+
+## 0.2.0-rc.1 - 2026-08-03
+
+- Switch immediately to a progressive session result after Finish & Summarize, with independent
+  audio, final-transcript, participant-review, and MiniMax progress plus durable local fallback
+  and an explicit paid-retry confirmation when cloud summarization fails.
+- Organize the home Action Center into now, confirmation, candidate suggestion, later, and today's
+  completed sections; expose explicit reminder controls only for confirmed Todos.
+- Migrate locally to schema v58 and deliver restrained Windows reminders only at user-selected
+  times, deferring and merging them during games, meetings, presentations, focus, or mute modes.
+- Build MiniMax summaries from durable participant projections instead of fragmented diarization
+  labels, exclude media voices, and invalidate cached analysis whenever participant evidence changes.
+- Recover completed sessions from deterministic speaker failures without hiding the failure detail,
+  and salvage only bounded MiniMax Daily Review defects while rejecting empty or severely incomplete
+  responses.
+- Add a 12-case anonymous Full Memory release gate for bilingual output, evidence scope, privacy,
+  idempotency, safe Todo lifecycle, and navigable source evidence.
+- Verify real-shaped v54, v56, and v57 databases through v58 migration, cold reopen, integrity,
+  idempotency, and deterministic rollback gates.
+- Allow the guarded Windows builder to publish every application, native, and model artifact to one
+  new off-system-drive output directory without overwriting a running installation.
+
+## 0.2.0-alpha.29 - 2026-07-30
+
+- Replace raw diarization cluster counts with a session participant projection that identifies
+  verified SELF, known people, durable anonymous people, temporary candidates, and media voices
+  without presenting algorithm fragments as real people.
+- Add evidence-based participant review in Memory: playable clips, segment splits, reversible
+  merges, media marking, identity forgetting, pinned evidence, impact previews, and audit history.
+- Reorganize People into understandable SELF, known, anonymous, and review sections while keeping
+  game, video, duplicate capture, and anomalous legacy speaker evidence out of social profiles.
+- Migrate locally to schema v47 with immutable participant review events and idempotent participant
+  snapshots; trickle bounded historical snapshot backfill only while recording is idle.
+- Show conservative participant ranges until review is complete, preserve raw technical evidence
+  behind details, and report the larger of projector and legacy fragmented-evidence counts.
+
+## 0.2.0-alpha.28 - 2026-07-28
+
+- Verify SQLite integrity before any startup write, use full WAL durability for Jarvis data, and
+  migrate safely to schema v46 after repairing the live recording database.
+- Stop immutable Daily Review snapshots from multiplying as individual background jobs finish;
+  prune 767 obsolete, unpaid snapshots and compact the live database by about 660 MB.
+- Keep application tracks released after confirmed silence until Windows reports audible output
+  again, preventing repeated 60-second KOOK, DOTA 2, and browser track restarts.
+- Project only the latest durable speaker run into memory, preserve verified SELF identity, and
+  collapse unresolved per-application track churn without inventing cross-session people.
+- Exclude virtual audio infrastructure such as audiodg and SteelSeries Sonar from semantic
+  application evidence while retaining the mixed system track as the safety fallback.
+- Cover a typical multi-hour transcript completely in one grounded MiniMax analysis input and
+  offer an explicit paid refresh when an older summary used only partial timeline evidence.
+- Preserve grounded MiniMax summaries when optional collections are malformed or oversized, and
+  persist a safe schema-specific reason when a paid response still cannot be accepted.
+- Ship AI model pack 2026.07.4 and release the high-memory overlap separator after every completed
+  job so an idle Jarvis does not keep its model allocation indefinitely.
+
+## 0.2.0-alpha.27 - 2026-07-27
+
+- Process the physical microphone first, then exact application tracks, and use the mixed system
+  track only as a safety fallback for speaker analysis.
+- Retire a mixed-system diarization job when exact application audio covers at least 80 percent of
+  it, preventing Tencent Meeting or KOOK speech from being counted again as hundreds of people.
+- Persist only durable long-session speaker clusters and reject internally inconsistent runs,
+  while allowing completed short application evidence to join a later identity revision without
+  blocking the primary microphone and meeting tracks.
+- Wake speaker jobs deferred only by GPU, fullscreen, or recovery resource gates after upgrade,
+  while leaving deterministic validation and database failures terminal.
+
+## 0.2.0-alpha.26 - 2026-07-27
+
+- Keep short and one-window speaker fragments out of MiniMax summaries unless the exact segment is
+  attached to a confirmed person; durable anonymous evidence still remains eligible.
+- Select cloud-summary evidence across the beginning, middle, and end of long recordings instead
+  of filling the payload only from the first transcript window.
+- Compare unnamed speakers locally with both CAM++ and ERes2NetV2, require conservative dual-model
+  agreement, and reuse one anonymous label when the same voice appears on different exact tracks.
+  Voice vectors and real application details remain local.
+
+## 0.2.0-alpha.25 - 2026-07-27
+
+- Keep crash-safe FLAC recovery, but skip expensive FFmpeg decoding for healthy completed audio
+  that has no partial, temporary, duplicate-WAV, or other crash artifact. This prevents thousands
+  of already-verified Memory chunks from blocking lease recovery and new-session processing after
+  every restart.
+
+## 0.2.0-alpha.24 - 2026-07-27
+
+- Keep short, duplicate, and overlap-only diarization fragments auditable but hide them from the
+  Memory people list, so hundreds of raw cluster rows are no longer presented as real people.
+- Tell local Whisper to preserve colloquial speech and profanity verbatim without translating,
+  euphemizing, censoring, or replacing it with homophones; prevent MiniMax from interpreting raw
+  diarization labels as verified participant or language counts.
+- Normalize Memory playback non-destructively, boosting quiet microphone PCM by up to 12 dB while
+  leaving confirmed silence and already-loud audio unchanged.
+
+## 0.2.0-alpha.23 - 2026-07-26
+
+- Preserve the selected v3 hybrid speaker-readiness policy during startup reconciliation, so
+  sessions already verified as ready are not temporarily downgraded by legacy defaults.
+- Accept exact canonical omission ranges that overlap selected segments on independent microphone
+  and application tracks, allowing long multi-track recordings to reach MiniMax analysis without
+  weakening segment scope, pseudonym, or redaction validation.
+
+## 0.2.0-alpha.22 - 2026-07-26
+
+- Treat retained chunks shorter than the speaker model's minimum embedding window as verified empty
+  speaker evidence, preventing deterministic insufficient-audio jobs from retrying forever and
+  repeatedly loading the large diarization sidecar.
+- Periodically recover sessions that become ready after asynchronous speaker and identity work,
+  while preserving the existing fail-closed MiniMax budget startup gate.
+- Keep Whisper rolling context isolated to the current audio track so microphone, KOOK, games,
+  browsers, and the mixed system fallback cannot contaminate one another's bilingual transcript.
+
+## 0.2.0-alpha.21 - 2026-07-26
+
+- Carry the selected v3 hybrid diarization policy into identity-resolution scheduling and session
+  readiness, so completed CAM++ evidence can advance to SELF matching, anonymous people, activity
+  classification, and summaries instead of remaining permanently "processing".
+- Add regression coverage for both repository enqueueing and runtime lifecycle policy propagation.
+
+## 0.2.0-alpha.20 - 2026-07-26
+
+- Apply long-session speaker evidence gating to the production repository snapshot shape, where
+  each admitted chunk wraps its durable audio metadata. This prevents a correct durable-candidate
+  count from being displayed as the unfiltered raw cluster range.
+- Add a production-shaped regression fixture so packaged runs cannot silently regress to inflated
+  person counts while still reporting the correct candidate breakdown.
+
+## 0.2.0-alpha.19 - 2026-07-26
+
+- Gate long-session speaker counts on durable evidence: at least five seconds of speech and
+  three embedding windows. Brief fragments and overlap-only placeholders remain auditable but
+  no longer inflate the displayed person count or create formal identities.
+- Persist a compact candidate breakdown alongside the trusted count so the UI and later review
+  can distinguish durable speakers, brief candidates, and overlap-only evidence.
+
+## 0.2.0-alpha.18 - 2026-07-26
+
+- Namespace durable speaker-turn identifiers by diarization policy so a retained recording can
+  migrate from v2 to v3 without colliding with the earlier run's primary keys.
+- Keep the resulting deterministic database failure terminal while allowing the corrected v3
+  task to be explicitly restored and reprocessed from the retained audio.
+
+## 0.2.0-alpha.17 - 2026-07-25
+
+- Stop deterministic diarization validation failures instead of retrying them forever.
+- Consolidate chunk-local speaker fragments with a final global centroid pass and invalidate
+  stale v2 speaker results so retained sessions are recomputed with the v3 policy.
+- Exclude Windows `audiodg` and SteelSeries Sonar virtual-audio infrastructure from the dynamic
+  application track pool.
+- Treat unexpected Japanese and Korean scripts like other Whisper hallucinations, retry the
+  affected clip with Chinese-first bilingual decoding, and keep those fragments out of rolling
+  prompt context.
+
+## 0.2.0-alpha.16 - 2026-07-25
+
+- Start the dynamic per-application Windows audio pool even when mixed system capture falls back from native WASAPI to Chromium loopback.
+- Detect unexpected writing systems and repeated Whisper hallucinations, then retry only suspicious local final-transcription clips with Chinese as the primary language while preserving English terms.
+- Remove unsupported-script fragments and repeated hallucinations from Whisper's rolling context so an older bad segment cannot contaminate later chunks.
+
+## 0.2.0-alpha.15 - 2026-07-25
+
+- Validate the first application-capture fallback and suspicious-transcript retry fixes in a packaged runtime before adding prompt-context isolation.
+
+## 0.2.0-alpha.14 - 2026-07-25
+
+- Auto-correct pyannote fragment boundaries that drift by up to 2 ms at the audio tail instead of invalidating a completed long-track result.
+- Drop only padding-only turns that begin beyond the authoritative WAV duration while preserving every valid speaker turn from the same recording.
+
+## 0.2.0-alpha.13 - 2026-07-24
+
+- Preserve valid sub-millisecond pyannote turns by expanding millisecond-rounding collapses to a bounded 1 ms interval instead of rejecting an entire long recording.
+- Generate corrected boundaries in future AI model packs while retaining strict rejection for inverted bounds and malformed speaker labels.
+
+## 0.2.0-alpha.12 - 2026-07-24
+
+- Treat free-VRAM admission as a pre-load check for CUDA diarization; once the models are resident, their own allocation no longer preempts the track.
+- Preserve direct CUDA out-of-memory errors, fullscreen yielding, and device-unavailable handling as runtime safety paths.
+
+## 0.2.0-alpha.11 - 2026-07-24
+
+- Prevent an already admitted CUDA diarization run from discarding long-track progress when an external GPU workload appears after model load.
+- Keep insufficient VRAM, fullscreen activity, and device failure as preemptive safety boundaries.
+
+## 0.2.0-alpha.10 - 2026-07-24
+
+- Keep an admitted CUDA diarization run alive through its own GPU utilization and transient telemetry noise, so long tracks are not discarded and restarted.
+- Preserve pre-start yielding for external GPU pressure, insufficient VRAM, and fullscreen activity.
+
+## 0.2.0-alpha.9 - 2026-07-24
+
+This prerelease completes long-session speaker analysis without letting an optional native
+speaker-count verifier discard the primary CUDA result.
+
+### Fixed
+
+- A Windows access violation in the optional Sherpa speaker-count verifier now opens a local
+  circuit breaker and records a primary-only result instead of restarting the full track.
+- Application fragments shorter than one minute are retired from high-cost speaker processing;
+  their audio and transcription remain available through the mixed-system and application
+  evidence paths.
+- Identity resolution now runs immediately after microphone and mixed-system diarization, ahead
+  of lower-value application speaker jobs.
+- Database v40 wakes interrupted speaker work, migrates identity jobs to the new priority, and
+  retires existing sub-minute application fragments without deleting recordings or transcripts.
+
+## 0.2.0-alpha.8 - 2026-07-24
+
+This prerelease unblocks high-accuracy speaker analysis for retained historical recordings.
+
+### Fixed
+
+- Runtime-status polling no longer performs an unindexed per-chunk scan of the entire processing
+  queue. The new v38 index reduces long-history coverage and backlog reads from tens of seconds to
+  indexed lookups, preventing Electron's main thread from freezing on navigation.
+- Memory detail avoids serializing the same audio-chunk collection twice and polls background
+  status every five seconds while visible or fifteen seconds while hidden.
+- Memory session detail now places the complete summary, speakers and voiceprints, topics, Todos,
+  and expanded background progress above audio playback and the full transcript.
+- Transient Windows audio-session inactive events retain the current application capture
+  generation for a grace period, and quiet application tracks remain sticky for one minute,
+  preventing short KOOK, game, and system-audio track storms.
+- Windows resource governance now backs GPU-pressure probes off to one sample per minute and caches
+  slow-changing power status for five minutes, reducing WMI amplification from process-monitoring
+  software while a game is running.
+- CUDA runtime integrity performs a complete hash check once per process and again whenever its
+  pointer or file metadata changes; routine resource polling now uses a cheap file fingerprint
+  instead of synchronously rehashing roughly one gigabyte of runtime files.
+- Historical hybrid diarization now uses revision-scoped cluster identifiers, preventing v2
+  reprocessing from colliding with speaker clusters created by the legacy policy.
+- Verified 24 kHz recordings are converted to a private 16 kHz mono model lease before final
+  diarization, allowing overlap separation to finish without modifying the original evidence.
+- Final speaker evidence now tolerates up to two milliseconds of capture-boundary overlap, so
+  harmless recorder timestamp jitter cannot reject an otherwise complete microphone track.
+- Microphone and mixed-system diarization now form a hard primary lane: application speaker work
+  cannot claim a worker until the session's primary work finishes. Application fragments shorter
+  than fifteen seconds are retired instead of loading the high-accuracy speaker stack.
+- Once a primary diarization job is running on CUDA, its own short CPU spike or recovery
+  hysteresis no longer cancels and restarts the entire recording. Full-screen games, external GPU
+  use, device changes, and other real yield conditions remain preemptive.
+- Long recordings now persist bounded per-chunk pipeline diagnostics plus complete aggregate
+  speaker evidence, preventing hundreds of chunk metadata rows from exceeding the durable run
+  limit after expensive CUDA processing has already finished.
+- Equal-priority speaker jobs now process the newest completed session first, so a requested
+  reprocessing run finishes its microphone and system-mix lanes before older historical backlog.
+- Local transcription and speaker queues now begin before slow cloud/daily-review crash recovery;
+  MiniMax dispatch remains locked until paid-request reconciliation completes.
+
+### Database
+
+- Database target advanced to v39 with a migration-safe processing-job index and speaker queue
+  repair. Existing recordings, transcripts, people, and queued work are preserved; primary speaker
+  jobs are woken and obsolete short application jobs are superseded.
+
+## 0.2.0-alpha.7 - 2026-07-23
+
+This prerelease makes first-run speech-model preparation visible instead of appearing to leave
+Start Listening stuck at an idle audio meter.
+
+### Fixed
+
+- Start Listening now reports Whisper model download progress with a determinate progress bar.
+- The startup panel explicitly remains in a not-recording state until audio capture really starts,
+  avoiding both the misleading **Waiting to record** meter and a false recording indicator.
+- Progress events are scoped to the exact Whisper model requested by Jarvis, so unrelated model
+  downloads cannot overwrite recording startup state.
+
+## 0.2.0-alpha.6 - 2026-07-23
+
+This prerelease fixes the packaged recording controls discovered during the first isolated
+real-data canary and makes the Windows package self-contained for local text embeddings.
+
+### Fixed
+
+- Clicking **Finish & Summarize** immediately enters the finalizing state and freezes the elapsed
+  timer while microphone and system-audio sources finish flushing safely in the background.
+- The standalone Jarvis window now mounts the existing microphone analyser sampler, so captured
+  microphone PCM drives the live waveform instead of leaving it at zero.
+- Windows builds now bundle the MiniLM ONNX embedding model and tokenizer instead of attempting a
+  first-run download.
+
+## 0.2.0-alpha.5 - 2026-07-22
+
+This prerelease stabilizes application-aware capture and makes large Memory sessions responsive
+while ensuring continuous audio completes speaker identity work first.
+
+### Changed
+
+- Dynamic application-audio selection is sticky, process-affine, and debounced to prevent rapid
+  capture-generation churn when several equal-priority applications are audible.
+- Microphone and mixed-system tracks run diarization before application tracks; application shards
+  under three seconds are retired instead of repeatedly entering the high-accuracy speaker queue.
+- SELF and anonymous-person resolution advances as soon as continuous primary tracks complete, then
+  incorporates application-track evidence in a later immutable revision.
+- Memory uses a virtualized session list, paged source evidence, progressive transcript rendering,
+  and a compact five-second processing poll instead of repeatedly loading the full timeline.
+- Source lanes and transcript rows show normalized application names, and bounded native capture
+  failure codes remain available in processing details.
+- The installed AI model pack and hybrid diarization policy now share one version source.
+
+### Database
+
+- Database target advanced to v37. Existing short application diarization jobs are safely
+  superseded, continuous-track priorities are repaired, and application recovery lookups are
+  indexed without deleting historical recordings.
+
+## 0.2.0-alpha.4 - 2026-07-22
+
+This prerelease makes the preinstalled high-accuracy speaker models deliverable through one
+Windows setup entry without forcing the 5+ GiB model tree into NSIS's 32-bit archive process.
+
+### Added
+
+- A separately updateable `Jarvis AI Model Pack` sibling archive generated by a pinned 7-Zip
+  build dependency and published next to Setup.
+- Installer-time SHA-512 verification followed by Jarvis's existing per-file SHA-256 verification
+  and atomic adoption under the configured non-system data root.
+- Manifest-whitelisted archiving so Python caches or other post-validation files cannot enter the
+  release component.
+
+### Changed
+
+- Windows packaging now emits one assisted Setup plus its required model component instead of a
+  multi-gigabyte embedded NSIS executable and a model-less portable target.
+- NSIS is pinned to the current 3.12 toolset, avoiding the large-memory-map failure in legacy
+  32-bit packaging.
+- Application version advanced to `0.2.0-alpha.4`.
+
+## 0.2.0-alpha.3 - 2026-07-21
+
+This prerelease adds the high-accuracy, offline, post-recording speaker pipeline and safe
+historical reprocessing foundation.
+
+### Added
+
+- GPU-idle pyannote Community-1 final diarization with a second local diarizer for conservative
+  speaker-count consensus.
+- MossFormer2 overlap-window review that protects long-term voice profiles from mixed speech.
+- Five-minute on-demand model lifetime, exact selected-GPU binding, real CUDA inference checks,
+  and immediate release when the active GPU changes.
+- A separately versioned, per-file SHA-256 verified offline AI model component that is adopted
+  atomically under `JARVIS_DATA_ROOT` and never installed on the Windows system drive.
+- Local-only historical backfill for every retained completed session, including sessions that
+  never had legacy speaker results.
+- Memory speaker-processing detail showing final speaker count, SELF status, anonymous people,
+  overlap review, CUDA state, and a paid-summary-refresh action when evidence changed.
+
+### Changed
+
+- Historical reprocessing reuses paid summaries and does not enqueue MiniMax analysis or daily
+  review. A refresh is recommended only when durable speaker evidence materially changes.
+- Overlapped turns remain transcribed but are excluded from durable SELF/person centroid learning.
+- Windows release preparation now fails closed unless the preinstalled offline model component
+  passes a complete digest and dependency verification.
+- Database target advanced to v36 and the application version to `0.2.0-alpha.3`.
 
 ## 0.2.0-alpha.2 - 2026-07-20
 

@@ -118,6 +118,12 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
     (micRequired && recording.micRecoveryStatus === "reconnecting");
   const isRecordingWithoutActiveSource = isRecording && !hasActiveCaptureSource;
   const isActivelyListening = isRecording && hasActiveCaptureSource;
+  const isPreparingModel =
+    session.status === "starting" && recording.preparationStage === "downloading_model";
+  const preparationPercentage = Math.max(
+    0,
+    Math.min(100, Math.round(recording.preparationProgress?.percentage ?? 0))
+  );
   const availableCaptureMode: JarvisCaptureMode | null =
     isAvailable(sourceStates.mic) && isAvailable(sourceStates.system)
       ? "dual"
@@ -311,15 +317,54 @@ export default function RecordingControls({ recording }: RecordingControlsProps)
           )}
         </div>
         <div className="mt-4">
-          <InputLevelWave
-            level={monitoredLevel}
-            label={t("jarvis.audioLevel")}
-            active={isActivelyListening}
-            idleLabel={t("jarvis.micLevelState.idle")}
-            quietLabel={t("jarvis.micLevelState.quiet")}
-            audibleLabel={t("jarvis.micLevelState.audible")}
-            sourceLabel={monitoredSourceLabel}
-          />
+          {isPreparingModel ? (
+            <div
+              role={recording.preparationProgress ? "progressbar" : "status"}
+              aria-label={t("jarvis.preparation.downloading_model")}
+              aria-valuemin={recording.preparationProgress ? 0 : undefined}
+              aria-valuemax={recording.preparationProgress ? 100 : undefined}
+              aria-valuenow={recording.preparationProgress ? preparationPercentage : undefined}
+              className="rounded-xl border border-primary/25 bg-primary/[0.04] px-4 py-3"
+            >
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="font-medium text-foreground">
+                  {recording.preparationProgress
+                    ? `${t("jarvis.preparation.downloading_model")} ${preparationPercentage}%`
+                    : t("jarvis.preparation.downloading_model")}
+                </span>
+                {recording.preparationProgress && (
+                  <span className="font-mono tabular-nums text-muted-foreground">
+                    {preparationPercentage}%
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 h-2 overflow-hidden rounded-full bg-muted">
+                <div
+                  className={`h-full rounded-full bg-primary transition-[width] duration-300 ${
+                    recording.preparationProgress ? "" : "w-1/3 animate-pulse"
+                  }`}
+                  style={
+                    recording.preparationProgress
+                      ? { width: `${preparationPercentage}%` }
+                      : undefined
+                  }
+                />
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t("jarvis.status.idle")}
+              </p>
+            </div>
+          ) : (
+            <InputLevelWave
+              level={monitoredLevel}
+              label={t("jarvis.audioLevel")}
+              active={isActivelyListening}
+              idleLabel={t("jarvis.micLevelState.idle")}
+              quietLabel={t("jarvis.micLevelState.quiet")}
+              audibleLabel={t("jarvis.micLevelState.audible")}
+              sourceLabel={monitoredSourceLabel}
+            />
+          )}
         </div>
         {(recording.error || actionError) && (
           <p role="alert" className="mt-3 text-xs text-destructive">

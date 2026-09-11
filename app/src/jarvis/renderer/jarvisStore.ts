@@ -88,6 +88,7 @@ interface JarvisRendererState {
   setSessions: (sessions: JarvisSession[]) => void;
   setPeople: (people: JarvisPerson[]) => void;
   setSelectedView: (view: JarvisView) => void;
+  openSession: (sessionId: string) => void;
   openEvidence: (handle: JarvisEvidenceHandle) => Promise<void>;
   markEvidenceSessionOpened: (requestId: number) => void;
   failEvidenceSession: (requestId: number) => void;
@@ -148,6 +149,15 @@ export const useJarvisStore = create<JarvisRendererState>()((set, get) => ({
           }
         : { selectedView }
     ),
+  openSession: (selectedSessionId) =>
+    set((current) => ({
+      selectedView: "memory",
+      selectedSessionId,
+      evidenceNavigation: {
+        phase: "idle",
+        requestId: current.evidenceNavigation.requestId + 1,
+      },
+    })),
   openEvidence: async (handle) => {
     const requestId = get().evidenceNavigation.requestId + 1;
     set({ evidenceNavigation: { phase: "resolving", requestId, handle } });

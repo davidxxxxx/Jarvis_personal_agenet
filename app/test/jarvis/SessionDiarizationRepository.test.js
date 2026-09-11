@@ -5,17 +5,35 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
+const VoiceEmbeddingCipher = require("../../src/jarvis/main/VoiceEmbeddingCipher");
 const SpeakerProcessingPolicy = require("../../src/jarvis/main/SpeakerProcessingPolicy");
 const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
 
 function vector(index) {
   const value = new Float32Array(512);
   value[index] = 1;
   return value;
+}
+
+function encryptedVoiceCipher() {
+  return new VoiceEmbeddingCipher({
+    secretCrypto: {
+      isAvailable: () => true,
+      encrypt(value) {
+        return Buffer.from(`sealed:${value}`, "utf8");
+      },
+      decrypt(value) {
+        const text = Buffer.from(value).toString("utf8");
+        if (!text.startsWith("sealed:")) throw new Error("invalid test ciphertext");
+        return { value: text.slice("sealed:".length), needsReencrypt: false };
+      },
+    },
+  });
 }
 
 function scaledVector(index, scale) {
@@ -97,6 +115,41 @@ function enqueueFinalDiarization(repo, sessionId, input) {
   });
 }
 
+function saveLocalActivityClassification(repo, category, createdAt) {
+  return repo.saveActivityClassificationBatch({
+    sessionId: "session-cas",
+    activities: [
+      {
+        activityId: "activity-session-cas",
+        startedAt: 1_000,
+        endedAt: 5_000,
+        applications: [],
+        sourceAttribution: "microphone",
+        statistics: {
+          microphoneParticipated: true,
+          selfDetected: false,
+          speakerCount: 1,
+        },
+      },
+    ],
+    classifications: [
+      {
+        activityId: "activity-session-cas",
+        category,
+        confidence: 0.91,
+        decision: "adopted",
+        source: "local",
+        reason: "test_local_classification",
+        allowSummary: true,
+        allowSuggestions: true,
+        allowTodos: false,
+        evidenceSegmentIds: ["segment-cas"],
+      },
+    ],
+    createdAt,
+  });
+}
+
 test("repository exposes raw speaker evidence before final-evidence policy filtering", (t) => {
   const repo = new JarvisRepository(":memory:");
   t.after(() => repo.close());
@@ -134,6 +187,382 @@ test("repository exposes raw speaker evidence before final-evidence policy filte
   assert.deepEqual(
     raw.chunks[0].transcriptSegments.map((segment) => segment.id),
     ["segment-cas"]
+  );
+});
+
+test("historical v1 sessions enqueue v2 locally without overwriting legacy evidence", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.db
+    .prepare(
+      `
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'legacy-run', 'session-cas', 'track-cas', ?, ?,
+      'legacy-diarizer', '3dspeaker-campplus-voxceleb-16k-v1', ?,
+      512, 16000, 1, 'cpu', 1, 5000, 5100
+    )
+  `
+    )
+    .run(snapshot.evidenceRevision, SESSION_DIARIZATION_POLICY.policyId, "f".repeat(64));
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
+
+  assert.deepEqual(
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
+    ["session-cas"]
+  );
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
+  assert.equal(repo.getSession("session-cas").processing_state, "processing");
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM speaker_diarization_runs").get().count,
+    1
+  );
+  const hybridJob = repo.db
+    .prepare(
+      `
+    SELECT input_version, model_version, state
+    FROM processing_jobs
+    WHERE job_type = 'diarize_track' AND model_version = ?
+  `
+    )
+    .get(HYBRID_DIARIZATION_POLICY.policyId);
+  assert.deepEqual(hybridJob, {
+    input_version: 2,
+    model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    state: "pending",
+  });
+});
+
+test("completed v3 runs are eligible for reprocessing after the clustering policy bump", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.db
+    .prepare(
+      `
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'bad-v3-run', 'session-cas', 'track-cas', ?, 'jarvis-hybrid-diarization-v3',
+      'pyannote-community-1', '3dspeaker-campplus-voxceleb-16k-v1', ?,
+      512, 16000, 2, 'cuda', 1, 5000, 5100
+    )
+  `
+    )
+    .run(snapshot.evidenceRevision, "f".repeat(64));
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
+
+  assert.deepEqual(
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
+    ["session-cas"]
+  );
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT state, input_version, model_version
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track' AND model_version = ?`
+      )
+      .get(HYBRID_DIARIZATION_POLICY.policyId),
+    {
+      state: "pending",
+      input_version: 2,
+      model_version: HYBRID_DIARIZATION_POLICY.policyId,
+    }
+  );
+});
+
+test("historical sessions without legacy speaker results are also eligible for local v2 analysis", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = 'session-cas'"
+    )
+    .run();
+
+  assert.deepEqual(
+    repo
+      .listHistoricalHybridCandidates({
+        at: 6000,
+        policy: HYBRID_DIARIZATION_POLICY,
+        limit: 25,
+      })
+      .map((session) => session.id),
+    ["session-cas"]
+  );
+
+  const queued = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(queued.enqueued, 1);
+  assert.equal(repo.isHistoricalLocalOnlyReprocessing("session-cas"), true);
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
+  );
+});
+
+test("zero-enqueue historical work stays active and ready sessions remain discoverable", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db
+    .prepare("UPDATE sessions SET processing_state = 'ready', ready_at = 5200 WHERE id = ?")
+    .run("session-cas");
+
+  const first = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6_000,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(first.enqueued, 1);
+  repo.db.exec(`
+    UPDATE processing_jobs
+    SET state = 'completed', completed_at = 6100
+    WHERE job_type = 'diarize_track';
+    UPDATE sessions
+    SET processing_state = 'ready', ready_at = 6100
+    WHERE id = 'session-cas';
+  `);
+
+  const second = repo.enqueueHistoricalHybridReprocessing("session-cas", {
+    at: 6_200,
+    policy: HYBRID_DIARIZATION_POLICY,
+    speakerProcessingPolicy: finalSpeakerPolicy(),
+  });
+  assert.equal(second.enqueued, 0);
+  const state = repo.db
+    .prepare("SELECT * FROM session_reprocessing_state WHERE session_id = ?")
+    .get("session-cas");
+  assert.equal(state.state, "queued");
+  for (const column of [
+    "baseline_content_sha256",
+    "baseline_identity_sha256",
+    "baseline_classification_sha256",
+  ]) {
+    assert.match(state[column], /^[0-9a-f]{64}$/u);
+  }
+  assert.deepEqual(
+    repo.listProcessingSessions().map((session) => session.id),
+    ["session-cas"]
+  );
+});
+
+test("atomic local finalize preserves summaries and recommends only semantic changes", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "semantic_baseline"));
+  repo.db.exec(`
+    INSERT INTO analysis_runs (
+      id, session_id, kind, window_start, window_end, input_hash,
+      model, status, attempt_count, created_at, completed_at
+    ) VALUES (
+      'analysis-semantic', 'session-cas', 'final', 1000, 5000, 'semantic-summary-input',
+      'MiniMax-M2.7', 'completed', 1, 6000, 6000
+    );
+    INSERT INTO session_summaries (
+      session_id, summary, decisions_json, suggestions_json,
+      analysis_run_id, updated_at, is_final
+    ) VALUES (
+      'session-cas', 'keep this paid summary', '[]', '[]',
+      'analysis-semantic', 6000, 1
+    );
+    UPDATE sessions SET processing_state = 'ready', ready_at = 6000
+    WHERE id = 'session-cas';
+  `);
+  const requeue = (at) => {
+    repo.enqueueHistoricalHybridReprocessing("session-cas", {
+      at,
+      policy: HYBRID_DIARIZATION_POLICY,
+      speakerProcessingPolicy: finalSpeakerPolicy(),
+    });
+    repo.startHistoricalLocalOnlyReprocessing("session-cas", at + 1);
+  };
+  const refreshState = () =>
+    repo.db
+      .prepare("SELECT recommended, reason FROM session_summary_refresh_state WHERE session_id = ?")
+      .get("session-cas");
+
+  requeue(6_100);
+  repo.db
+    .prepare(
+      "UPDATE speaker_clusters SET match_score = 0.01, quality_score = 0.02, updated_at = 6110"
+    )
+    .run();
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_120);
+  assert.deepEqual(refreshState(), { recommended: 0, reason: null });
+
+  requeue(6_200);
+  repo.db.exec(`
+    INSERT INTO people (id, display_name, is_self, created_at, last_seen_at)
+    VALUES ('semantic-person', 'Semantic Person', 0, 6200, 6200);
+    UPDATE speaker_clusters
+    SET person_id = 'semantic-person', link_state = 'confirmed', updated_at = 6210;
+  `);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_220);
+  assert.deepEqual(refreshState(), { recommended: 1, reason: "speaker_identity_changed" });
+
+  saveLocalActivityClassification(repo, "work_meeting", 6_300);
+  requeue(6_310);
+  saveLocalActivityClassification(repo, "social_call", 6_320);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_330);
+  assert.deepEqual(refreshState(), {
+    recommended: 1,
+    reason: "activity_classification_changed",
+  });
+
+  requeue(6_400);
+  repo.db
+    .prepare("UPDATE transcript_segments SET text = ? WHERE id = ?")
+    .run("semantic transcript changed", "segment-cas");
+  repo.db.prepare("UPDATE speaker_clusters SET person_id = NULL, link_state = 'unknown'").run();
+  saveLocalActivityClassification(repo, "entertainment", 6_410);
+  repo.finalizeHistoricalLocalOnlyReprocessing("session-cas", 6_420);
+  assert.deepEqual(refreshState(), { recommended: 1, reason: "transcript_changed" });
+  assert.equal(
+    repo.db.prepare("SELECT summary FROM session_summaries WHERE session_id = ?").get("session-cas")
+      .summary,
+    "keep this paid summary"
+  );
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
+  );
+});
+
+test("v2 speaker-count changes preserve the old summary and only recommend a refresh", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  repo.commitDiarizationRun(commitInput(snapshot, "summary_v1"));
+  repo.db.exec(`
+    INSERT INTO analysis_runs (
+      id, session_id, kind, window_start, window_end, input_hash,
+      model, status, attempt_count, created_at, completed_at
+    ) VALUES (
+      'analysis-old', 'session-cas', 'final', 1000, 5000, 'old-summary-input',
+      'MiniMax-M2.7', 'completed', 1, 6000, 6000
+    );
+    INSERT INTO session_summaries (
+      session_id, summary, decisions_json, suggestions_json,
+      analysis_run_id, updated_at, is_final
+    ) VALUES (
+      'session-cas', 'keep this paid summary', '[]', '[]',
+      'analysis-old', 6000, 1
+    );
+  `);
+  const hybrid = commitInput(snapshot, "summary_v2");
+  hybrid.run = {
+    ...hybrid.run,
+    id: "diarization_run_summary_v2",
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    diarizerModelId: HYBRID_DIARIZATION_POLICY.diarizerModelId,
+    inputVersion: 2,
+    executionDevice: "cuda",
+    pipelineMetadata: { schemaVersion: 1 },
+    speakerCount: { minimum: 2, maximum: 2, confidence: 0.94 },
+    overlapMs: 0,
+    overlapSeparationState: "not_needed",
+    modelPackVersion: HYBRID_DIARIZATION_POLICY.modelPackVersion,
+    completedAt: 6100,
+  };
+  hybrid.validatedAt = 6100;
+  const secondCluster = {
+    id: "speaker_cluster_session_cas_2",
+    localLabel: "speaker_2",
+    embedding: vector(1),
+    speechMs: 1600,
+    windowCount: 1,
+    qualityScore: 0.98,
+    firstAppearanceAt: 2900,
+  };
+  hybrid.clusters[0] = { ...hybrid.clusters[0], speechMs: 1600, windowCount: 1 };
+  hybrid.clusters.push(secondCluster);
+  hybrid.turns[1] = {
+    ...hybrid.turns[1],
+    clusterId: secondCluster.id,
+    localLabel: secondCluster.localLabel,
+    rawLabel: "raw_b",
+    embedding: vector(1),
+  };
+  hybrid.segmentLinks.push({
+    clusterId: secondCluster.id,
+    transcriptSegmentId: "segment-cas",
+  });
+
+  assert.equal(repo.commitDiarizationRun(hybrid).status, "completed");
+  assert.equal(
+    repo.db.prepare("SELECT summary FROM session_summaries WHERE session_id = 'session-cas'").get()
+      .summary,
+    "keep this paid summary"
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `
+      SELECT recommended, reason, basis_policy_id, latest_policy_id
+      FROM session_summary_refresh_state WHERE session_id = 'session-cas'
+    `
+      )
+      .get(),
+    {
+      recommended: 1,
+      reason: "speaker_count_changed",
+      basis_policy_id: SESSION_DIARIZATION_POLICY.policyId,
+      latest_policy_id: HYBRID_DIARIZATION_POLICY.policyId,
+    }
+  );
+  assert.equal(
+    repo.db.prepare("SELECT count(*) AS count FROM processing_jobs WHERE lane = 'cloud'").get()
+      .count,
+    0
   );
 });
 
@@ -261,6 +690,201 @@ function revisedCommitInput(repo, suffix, clusters) {
   return input;
 }
 
+function hybridCommitInput(snapshot, suffix) {
+  const input = commitInput(snapshot, suffix);
+  input.run = {
+    ...input.run,
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    diarizerModelId: HYBRID_DIARIZATION_POLICY.diarizerModelId,
+    inputVersion: 2,
+    executionDevice: "cuda",
+    pipelineMetadata: { schemaVersion: 1 },
+    speakerCount: { minimum: 2, maximum: 2, confidence: 0.94 },
+    overlapMs: 0,
+    overlapSeparationState: "not_needed",
+    modelPackVersion: HYBRID_DIARIZATION_POLICY.modelPackVersion,
+  };
+  return input;
+}
+
+test("v4 preserves voiced audit fragments outside the validated speaker count", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const input = hybridCommitInput(snapshot, "kook_audit_fragment");
+  input.clusters = [
+    {
+      ...input.clusters[0],
+      identityEligible: true,
+      qualityGateReason: null,
+    },
+    {
+      id: "speaker_cluster_kook_2",
+      localLabel: "speaker_2",
+      embedding: vector(1),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.98,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 2_900,
+    },
+    {
+      id: "speaker_cluster_kook_audit_fragment",
+      localLabel: "speaker_3",
+      embedding: vector(2),
+      speechMs: 800,
+      windowCount: 1,
+      qualityScore: 0.99,
+      identityEligible: false,
+      qualityGateReason: "insufficient_speech",
+      firstAppearanceAt: 4_000,
+    },
+  ];
+
+  assert.equal(repo.commitDiarizationRun(input).status, "completed");
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT local_label, identity_eligible, quality_gate_reason
+         FROM speaker_diarization_run_clusters
+         WHERE run_id = ?
+         ORDER BY local_label`
+      )
+      .all(input.run.id),
+    [
+      { local_label: "speaker_1", identity_eligible: 1, quality_gate_reason: null },
+      { local_label: "speaker_2", identity_eligible: 1, quality_gate_reason: null },
+      {
+        local_label: "speaker_3",
+        identity_eligible: 0,
+        quality_gate_reason: "insufficient_speech",
+      },
+    ]
+  );
+});
+
+test("v4 rejects identity-eligible clusters beyond the validated speaker count", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const input = hybridCommitInput(snapshot, "kook_invalid_speaker_count");
+  input.clusters.push(
+    {
+      id: "speaker_cluster_kook_2",
+      localLabel: "speaker_2",
+      embedding: vector(1),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.98,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 2_900,
+    },
+    {
+      id: "speaker_cluster_kook_3",
+      localLabel: "speaker_3",
+      embedding: vector(2),
+      speechMs: 6_000,
+      windowCount: 3,
+      qualityScore: 0.97,
+      identityEligible: true,
+      qualityGateReason: null,
+      firstAppearanceAt: 4_000,
+    }
+  );
+
+  assert.throws(
+    () => repo.commitDiarizationRun(input),
+    /diarization cluster count exceeds the validated speaker count/
+  );
+});
+
+test("word timestamps project one transcript into overlapping per-speaker utterances", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+  const insertWord = repo.db.prepare(`
+    INSERT INTO transcript_words (
+      id, transcript_segment_id, chunk_id, ordinal, word,
+      started_at, ended_at, probability, created_at
+    ) VALUES (?, 'segment-cas', 'chunk-cas', ?, ?, ?, ?, ?, 5500)
+  `);
+  insertWord.run("word-1", 0, "你", 1200, 1380, 0.98);
+  insertWord.run("word-2", 1, "好", 1600, 1780, 0.94);
+  insertWord.run("word-3", 2, " okay", 2100, 2450, 0.86);
+
+  const input = commitInput(snapshot, "word_projection");
+  const secondCluster = {
+    id: "speaker_cluster_session_cas_2",
+    localLabel: "speaker_2",
+    embedding: vector(1),
+    speechMs: 1200,
+    windowCount: 1,
+    qualityScore: 0.96,
+    firstAppearanceAt: 1400,
+  };
+  input.clusters.push(secondCluster);
+  input.turns = [
+    { ...input.turns[0], startedAt: 1100, endedAt: 2700 },
+    {
+      ...input.turns[1],
+      id: "speaker_turn_word_projection_overlap",
+      clusterId: secondCluster.id,
+      localLabel: secondCluster.localLabel,
+      rawLabel: "raw_b",
+      startedAt: 1400,
+      endedAt: 2500,
+      embedding: vector(1),
+    },
+  ];
+  input.segmentLinks.push({
+    clusterId: secondCluster.id,
+    transcriptSegmentId: "segment-cas",
+  });
+  input.cannotLinks = [
+    {
+      leftClusterId: input.clusters[0].id,
+      rightClusterId: secondCluster.id,
+      reason: "simultaneous_turns",
+    },
+  ];
+
+  assert.equal(repo.commitDiarizationRun(input).status, "completed");
+  const detail = repo.getSessionDetail("session-cas");
+  assert.deepEqual(
+    detail.speakerUtterances.map((utterance) => ({
+      localLabel: utterance.local_label,
+      text: utterance.text,
+      overlapState: utterance.overlap_state,
+      evidenceKind: utterance.evidence_kind,
+    })),
+    [
+      {
+        localLabel: "speaker_1",
+        text: "你好 okay",
+        overlapState: "overlap",
+        evidenceKind: "word_alignment",
+      },
+      {
+        localLabel: "speaker_2",
+        text: "好 okay",
+        overlapState: "overlap",
+        evidenceKind: "word_alignment",
+      },
+    ]
+  );
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT reason FROM speaker_cluster_cannot_links
+         WHERE run_id = 'diarization_run_word_projection'`
+      )
+      .all(),
+    [{ reason: "simultaneous_turns" }]
+  );
+});
+
 function rebuildAsLegacyV20DiarizationSchema(
   db,
   { hasCommitSequence = false, hasRunLinks = false, allowDuplicateCommitSequence = false } = {}
@@ -281,6 +905,14 @@ function rebuildAsLegacyV20DiarizationSchema(
   const commitSequenceColumn = hasCommitSequence ? ", commit_sequence" : "";
   db.pragma("foreign_keys = OFF");
   db.exec(`
+    DROP TABLE IF EXISTS speaker_utterance_words;
+    DROP TABLE IF EXISTS speaker_utterances;
+    DROP TABLE IF EXISTS overlap_stem_evidence;
+    DROP TABLE IF EXISTS speaker_cluster_cannot_links;
+    DROP TABLE IF EXISTS transcript_words;
+    DROP TABLE IF EXISTS application_audio_fallback_evidence;
+    DROP TABLE IF EXISTS logical_audio_track_members;
+    DROP TABLE IF EXISTS logical_audio_tracks;
     DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_insert;
     DROP TRIGGER IF EXISTS validate_identity_resolution_evidence_session_update;
     DROP TABLE IF EXISTS speaker_identity_resolutions;
@@ -378,8 +1010,13 @@ function rebuildAsLegacyV20DiarizationSchema(
            ${commitSequenceColumn},
            created_at, completed_at
     FROM speaker_diarization_runs_v21_fixture;
-    INSERT INTO speaker_diarization_run_clusters
-    SELECT * FROM speaker_diarization_run_clusters_v21_fixture;
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    )
+    SELECT run_id, cluster_id, local_label, embedding, speech_ms,
+           window_count, quality_score, first_appearance_at
+    FROM speaker_diarization_run_clusters_v21_fixture;
     INSERT INTO speaker_turns
     SELECT * FROM speaker_turns_v21_fixture;
 
@@ -524,6 +1161,38 @@ test("atomic diarization commit is idempotent and preserves revision history", (
     { runs: 2, run_clusters: 2, stable_clusters: 1, turns: 4 }
   );
   assert.equal(repo.listDiarizationRuns("session-cas").length, 2);
+});
+
+test("diarization commits encrypt cluster and turn embeddings under the v35 envelope constraint", (t) => {
+  const repo = new JarvisRepository(":memory:", { embeddingCipher: encryptedVoiceCipher() });
+  t.after(() => repo.close());
+  const snapshot = seedFinalTrack(repo);
+
+  assert.equal(
+    repo.commitDiarizationRun(commitInput(snapshot, "encrypted_v35")).status,
+    "completed"
+  );
+  const blobs = repo.db
+    .prepare(
+      `SELECT embedding FROM speaker_clusters
+       UNION ALL SELECT embedding FROM speaker_diarization_run_clusters
+       UNION ALL SELECT embedding FROM speaker_turns`
+    )
+    .all();
+  assert.equal(blobs.length, 4);
+  assert.equal(
+    blobs.every(
+      ({ embedding }) =>
+        Buffer.isBuffer(embedding) &&
+        embedding.subarray(0, 4).equals(Buffer.from("JVE1")) &&
+        embedding.length > 2048
+    ),
+    true
+  );
+  assert.equal(
+    repo.speakerIdentityRepository.decodeStoredEmbedding(blobs[0].embedding, 512).length,
+    512
+  );
 });
 
 test("stale diarization CAS rolls back run clusters turns and links", (t) => {
@@ -685,7 +1354,7 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
     {
       job_type: "diarize_track",
       state: "pending",
-      priority: 40,
+      priority: 18,
       input_hash: expectedKey,
       input_version: 1,
       model_version: "jarvis-session-diarization-v1",
@@ -694,6 +1363,412 @@ test("final evidence enqueues one restart-safe exact diarization job identity", 
       chunk_id: null,
     }
   );
+});
+
+test("exact application coverage suppresses redundant system-mix diarization", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE sessions SET ended_at = 121000, finalized_at = 121000 WHERE id = 'session-cas';
+    UPDATE audio_tracks
+    SET source_type = 'system', ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', started_at = 1000, ended_at = 121000,
+        duration_ms = 120000, expires_at = 300000
+    WHERE id = 'chunk-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', started_at = 1000, ended_at = 121000
+    WHERE id = 'segment-cas';
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state,
+      failure_code
+    ) VALUES (
+      'track-app', 'session-cas', 'system', 'tencent_meeting', '腾讯会议',
+      1, 24000, 1, 1000, 121000, 'ended', NULL
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-app', 'session-cas', 'track-app', 'system', 0, 'app.wav',
+      1000, 121000, 120000,
+      '${"c".repeat(64)}', 300000,
+      'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, created_at, completed_at
+    ) VALUES (
+      'job-app-transcript', 'session-cas', 'track-app', 'chunk-app',
+      'transcribe_chunk', 'completed', 30,
+      '${"c".repeat(64)}', 1, 'whisper-v1', 1, 2000, 121100
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-app', 'session-cas', 1000, 121000, 'system', 'meeting', 0.9,
+      1, 'track-app', 'chunk-app', 'system', 'final', 1, 'whisper-v1', 121100
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-system-mix-diarization', 'session-cas', 'track-cas',
+      'diarize_track', 'retry', 36,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 121200
+    );
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 122000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 1);
+  assert.deepEqual(result.skipped, [
+    {
+      trackId: "track-cas",
+      reason: "covered_by_exact_application",
+      coverage: 1,
+    },
+  ]);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT track_id, state, priority, error_code
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track'
+         ORDER BY track_id, created_at`
+      )
+      .all(),
+    [
+      {
+        track_id: "track-app",
+        state: "pending",
+        priority: 26,
+        error_code: null,
+      },
+      {
+        track_id: "track-cas",
+        state: "superseded",
+        priority: 28,
+        error_code: "SYSTEM_MIX_COVERED_BY_EXACT_APPLICATION",
+      },
+    ]
+  );
+  assert.deepEqual(
+    repo.getSpeakerIdentityResolutionSnapshot({
+      sessionId: "session-cas",
+      at: 122000,
+      diarizationPolicy: SESSION_DIARIZATION_POLICY,
+    }),
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "pending",
+    }
+  );
+});
+
+test("short application tracks do not fan out diarization jobs", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'chrome',
+        application_display_name = 'Chrome', capture_generation = 1,
+        ended_at = 60000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', ended_at = 60000, duration_ms = 59000,
+        expires_at = 200000
+    WHERE track_id = 'track-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', ended_at = 60000
+    WHERE track_id = 'track-cas';
+    UPDATE sessions SET ended_at = 70000 WHERE id = 'session-cas';
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-short-app-job', 'session-cas', 'track-cas', 'diarize_track', 'retry', 40,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 5500
+    );
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 80000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 0);
+  assert.deepEqual(result.skipped, [{ trackId: "track-cas", reason: "speaker_audio_too_short" }]);
+  assert.deepEqual(
+    repo.db
+      .prepare("SELECT state, error_code, completed_at FROM processing_jobs WHERE id = ?")
+      .get("stale-short-app-job"),
+    {
+      state: "superseded",
+      error_code: "SPEAKER_AUDIO_TOO_SHORT",
+      completed_at: 80000,
+    }
+  );
+});
+
+test("fragmented application generations schedule one logical track with every generation", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE sessions SET ended_at = 181000, finalized_at = 181000 WHERE id = 'session-cas';
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'kook',
+        application_display_name = 'KOOK', capture_generation = 1,
+        ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', started_at = 1000, ended_at = 121000,
+        duration_ms = 120000, expires_at = 300000
+    WHERE id = 'chunk-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', started_at = 1000, ended_at = 121000
+    WHERE id = 'segment-cas';
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, job_type, state, priority,
+      input_hash, input_version, model_version, created_at
+    ) VALUES (
+      'stale-shorter-app-diarization', 'session-cas', 'track-cas',
+      'diarize_track', 'retry', 26,
+      '${"d".repeat(64)}', 1, 'stale-diarizer', 121200
+    );
+
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state,
+      failure_code
+    ) VALUES (
+      'track-app-long', 'session-cas', 'system', 'kook', 'KOOK',
+      2, 24000, 1, 121000, 181000, 'ended', NULL
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-app-long', 'session-cas', 'track-app-long', 'system', 0, 'app-long.wav',
+      121000, 181000, 60000,
+      '${"e".repeat(64)}', 300000,
+      'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO processing_jobs (
+      id, session_id, track_id, chunk_id, job_type, state, priority,
+      input_hash, input_version, model_version, attempt_count, created_at, completed_at
+    ) VALUES (
+      'job-app-long-transcript', 'session-cas', 'track-app-long', 'chunk-app-long',
+      'transcribe_chunk', 'completed', 30,
+      '${"e".repeat(64)}', 1, 'whisper-v1', 1, 2000, 181100
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-app-long', 'session-cas', 121000, 181000, 'system', 'call continued', 0.9,
+      1, 'track-app-long', 'chunk-app-long', 'system', 'final', 1, 'whisper-v1', 181100
+    );
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 182000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 1);
+  assert.deepEqual(result.skipped, [
+    { trackId: "track-app-long", reason: "application_track_not_primary" },
+  ]);
+  assert.deepEqual(
+    repo.db
+      .prepare(
+        `SELECT track_id, state, error_code
+         FROM processing_jobs
+         WHERE job_type = 'diarize_track'
+         ORDER BY track_id, created_at`
+      )
+      .all(),
+    [
+      {
+        track_id: "track-cas",
+        state: "superseded",
+        error_code: "DIARIZATION_EVIDENCE_SUPERSEDED",
+      },
+      {
+        track_id: "track-cas",
+        state: "pending",
+        error_code: null,
+      },
+    ]
+  );
+  assert.deepEqual(
+    repo
+      .getDiarizationTrackEvidence({
+        sessionId: "session-cas",
+        trackId: "track-cas",
+        observedAt: 182000,
+      })
+      .chunks.map((entry) => ({
+        id: entry.audioChunk.id,
+        physicalTrackId: entry.audioChunk.physical_track_id,
+      })),
+    [
+      { id: "chunk-cas", physicalTrackId: "track-cas" },
+      { id: "chunk-app-long", physicalTrackId: "track-app-long" },
+    ]
+  );
+});
+
+test("logical application generations expose only the newest run and utterances", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'kook',
+        application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks SET source_type = 'system' WHERE id = 'chunk-cas';
+    UPDATE transcript_segments SET source_type = 'system' WHERE id = 'segment-cas';
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      capture_generation, sample_rate, channels, started_at, ended_at, state
+    ) VALUES (
+      'track-kook-generation-2', 'session-cas', 'system', 'kook', 'KOOK',
+      2, 24000, 1, 5000, 9000, 'ended'
+    );
+    INSERT INTO audio_chunks (
+      id, session_id, track_id, source_type, sequence_number, path,
+      started_at, ended_at, duration_ms, sha256, expires_at,
+      transcription_status, write_state, format, sample_rate, channels
+    ) VALUES (
+      'chunk-kook-generation-2', 'session-cas', 'track-kook-generation-2',
+      'system', 0, 'kook-2.wav', 5000, 9000, 4000,
+      '${"e".repeat(64)}', 20000, 'completed', 'committed', 'wav', 24000, 1
+    );
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, chunk_id, source_type, result_kind, version,
+      model_version, completed_at
+    ) VALUES (
+      'segment-kook-generation-2', 'session-cas', 5000, 9000,
+      'system', 'old generation text', 0.9, 1,
+      'track-kook-generation-2', 'chunk-kook-generation-2', 'system',
+      'final', 1, 'whisper-v1', 9000
+    );
+  `);
+  repo.refreshLogicalApplicationTracks("session-cas", 10_000);
+  repo.db.exec(`
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, link_state,
+      created_at, updated_at, identity_eligible
+    ) VALUES
+      ('cluster-kook-old', 'session-cas', 'track-kook-generation-2', 'speaker_1',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.9, 'unknown', 9000, 9000, 1),
+      ('cluster-kook-new', 'session-cas', 'track-cas', 'speaker_2',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.9, 'unknown', 10000, 10000, 1),
+      ('cluster-kook-fragment', 'session-cas', 'track-cas', 'speaker_3',
+       '3dspeaker-campplus-voxceleb-16k-v1', zeroblob(2048),
+       6000, 3, 0.4, 'unknown', 10000, 10000, 0);
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES
+      ('run-kook-old', 'session-cas', 'track-kook-generation-2', '${"1".repeat(64)}',
+       'jarvis-hybrid-diarization-v3', 'old-diarizer',
+       '3dspeaker-campplus-voxceleb-16k-v1', '${"f".repeat(64)}',
+       512, 16000, 2, 'cuda', 1, 9000, 9000),
+      ('run-kook-new', 'session-cas', 'track-cas', '${"2".repeat(64)}',
+       'jarvis-hybrid-diarization-v4', 'new-diarizer',
+       '3dspeaker-campplus-voxceleb-16k-v1', '${"a".repeat(64)}',
+       512, 16000, 2, 'cuda', 2, 10000, 10000);
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at, identity_eligible
+    ) VALUES
+      ('run-kook-old', 'cluster-kook-old', 'speaker_1', zeroblob(2048),
+       6000, 3, 0.9, 5100, 1),
+      ('run-kook-new', 'cluster-kook-new', 'speaker_2', zeroblob(2048),
+       6000, 3, 0.9, 1100, 1),
+      ('run-kook-new', 'cluster-kook-fragment', 'speaker_3', zeroblob(2048),
+       6000, 3, 0.4, 1900, 0);
+    INSERT INTO speaker_utterances (
+      id, session_id, run_id, chunk_id, cluster_id, source_segment_id,
+      started_at, ended_at, text, confidence, overlap_state,
+      evidence_kind, created_at
+    ) VALUES
+      ('utterance-kook-old', 'session-cas', 'run-kook-old',
+       'chunk-kook-generation-2', 'cluster-kook-old', 'segment-kook-generation-2',
+       5100, 5600, 'old utterance', 0.9, 'single', 'word_alignment', 9000),
+      ('utterance-kook-new', 'session-cas', 'run-kook-new',
+       'chunk-cas', 'cluster-kook-new', 'segment-cas',
+       1200, 1800, 'new utterance', 0.9, 'single', 'word_alignment', 10000);
+  `);
+
+  const detail = repo.getSessionDetail("session-cas");
+  assert.deepEqual(
+    detail.speakerUtterances.map((utterance) => ({
+      id: utterance.id,
+      text: utterance.text,
+      applicationKey: utterance.application_key,
+    })),
+    [{ id: "utterance-kook-new", text: "new utterance", applicationKey: "kook" }]
+  );
+  const processing = repo.getSessionSpeakerProcessing("session-cas");
+  assert.deepEqual(processing.latestRuns.map((run) => run.id), ["run-kook-new"]);
+  assert.deepEqual(processing.speakers.map((speaker) => speaker.id), ["cluster-kook-new"]);
+  assert.equal(processing.fragmentedEvidenceCount, 1);
+});
+
+test("virtual-audio infrastructure tracks never fan out diarization jobs", (t) => {
+  const repo = new JarvisRepository(":memory:");
+  t.after(() => repo.close());
+  seedFinalTrack(repo);
+  repo.db.exec(`
+    UPDATE audio_tracks
+    SET source_type = 'system', application_key = 'audiodg',
+        application_display_name = 'audiodg', capture_generation = 1,
+        ended_at = 121000
+    WHERE id = 'track-cas';
+    UPDATE audio_chunks
+    SET source_type = 'system', ended_at = 121000, duration_ms = 120000,
+        expires_at = 300000
+    WHERE track_id = 'track-cas';
+    UPDATE transcript_segments
+    SET source_type = 'system', ended_at = 121000
+    WHERE track_id = 'track-cas';
+    UPDATE sessions SET ended_at = 130000 WHERE id = 'session-cas';
+  `);
+
+  const result = enqueueFinalDiarization(repo, "session-cas", {
+    at: 140000,
+    policy: SESSION_DIARIZATION_POLICY,
+  });
+
+  assert.equal(result.enqueued, 0);
+  assert.deepEqual(result.skipped, [
+    { trackId: "track-cas", reason: "virtual_audio_infrastructure" },
+  ]);
 });
 
 test("nonterminal latest transcription never schedules diarization", (t) => {
@@ -1203,6 +2278,8 @@ test("incoming cosine ambiguity cannot inherit a confirmed identity", (t) => {
     speechMs: 1600,
     windowCount: 1,
     qualityScore: 1,
+    identityEligible: 1,
+    qualityGateReason: null,
     at: 6000,
   });
   const ambiguous = revisedCommitInput(repo, "incoming_tie_revision", [

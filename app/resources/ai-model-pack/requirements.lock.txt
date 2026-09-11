@@ -1,0 +1,16 @@
+# Jarvis offline diarization runtime, Python 3.11 x64.
+# CUDA torch wheels are installed first from the official PyTorch cu128 index.
+# ClearerVoice-Studio v0.1.2 source is vendored separately; do not install the
+# PyPI clearvoice wrapper because its NumPy <2 metadata conflicts with
+# pyannote-core 6, which correctly requires NumPy >=2.
+numpy==2.3.5
+pyannote-audio==4.0.7
+soundfile==0.12.1
+huggingface-hub==0.35.3
+librosa==0.10.2.post1
+pydub==0.25.1
+PyYAML==6.0.3
+yamlargparse==1.31.1
+tqdm==4.67.1
+torchinfo==1.8.0
+rotary-embedding-torch==0.8.3

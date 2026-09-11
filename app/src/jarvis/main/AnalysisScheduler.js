@@ -1,7 +1,7 @@
 const crypto = require("node:crypto");
 const { assertId } = require("../shared/contracts");
 
-const PROMPT_VERSION = "jarvis-analysis-v2";
+const PROMPT_VERSION = "jarvis-analysis-hierarchical-v3";
 
 function hashJson(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
@@ -9,6 +9,25 @@ function hashJson(value) {
 
 function isCallable(value, method) {
   return value && typeof value[method] === "function";
+}
+
+function isMissingCloudJob(workState) {
+  return (
+    workState?.state === "retry_needed" &&
+    workState.retryable === true &&
+    workState.errorCode === "analysis_runtime_not_ready" &&
+    workState.nextRetryAt === null &&
+    workState.attemptCount === 0
+  );
+}
+
+function getActivityClassificationRevision(memoryRepository, sessionId) {
+  if (!isCallable(memoryRepository, "getActivityActionPolicyRevision")) return undefined;
+  const revision = memoryRepository.getActivityActionPolicyRevision(sessionId);
+  if (typeof revision !== "string" || !/^[0-9a-f]{64}$/u.test(revision)) {
+    throw new TypeError("activity classification revision is invalid");
+  }
+  return revision;
 }
 
 function eligibleSegments(detail) {
@@ -19,6 +38,7 @@ function eligibleSegments(detail) {
         segment.is_stable === 1 &&
         segment.superseded_by == null &&
         segment.duplicate_of == null &&
+        segment.projection_state === "visible" &&
         typeof segment.text === "string" &&
         segment.text.trim()
     )
@@ -30,7 +50,12 @@ function eligibleSegments(detail) {
     );
 }
 
-function inputRevisions(segments, people) {
+function inputRevisions(
+  segments,
+  people,
+  participantSnapshotRevision = undefined,
+  activityClassificationRevision = undefined
+) {
   const transcriptRevision = hashJson(
     segments.map((segment) => ({
       id: segment.id,
@@ -41,16 +66,47 @@ function inputRevisions(segments, people) {
       personId: segment.person_id ?? null,
     }))
   );
+  const peopleRevision = people
+    .map((person) => ({
+      id: person.id,
+      displayName: person.display_name ?? null,
+      isSelf: person.is_self === 1,
+    }))
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const identityEvidence =
+    participantSnapshotRevision === undefined
+      ? peopleRevision
+      : { people: peopleRevision, participantSnapshotRevision };
   const identityRevision = hashJson(
-    people
-      .map((person) => ({
-        id: person.id,
-        displayName: person.display_name ?? null,
-        isSelf: person.is_self === 1,
-      }))
-      .sort((left, right) => left.id.localeCompare(right.id))
+    activityClassificationRevision === undefined
+      ? identityEvidence
+      : { identity: identityEvidence, activityClassificationRevision }
   );
   return { transcriptRevision, identityRevision };
+}
+
+function getParticipantSnapshotRevision(repository, sessionId) {
+  if (!isCallable(repository, "getLatestParticipantSnapshot")) return undefined;
+  const snapshot = repository.getLatestParticipantSnapshot(sessionId);
+  if (snapshot === null) return null;
+  if (
+    !snapshot ||
+    !Number.isSafeInteger(snapshot.revision) ||
+    snapshot.revision < 1 ||
+    typeof snapshot.sourceHash !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(snapshot.sourceHash) ||
+    typeof snapshot.projectorVersion !== "string" ||
+    !snapshot.projectorVersion.trim()
+  ) {
+    const error = new Error("participant snapshot revision unavailable");
+    error.code = "analysis_participant_snapshot_invalid";
+    throw error;
+  }
+  return {
+    revision: snapshot.revision,
+    sourceHash: snapshot.sourceHash,
+    projectorVersion: snapshot.projectorVersion,
+  };
 }
 
 class AnalysisScheduler {
@@ -61,6 +117,7 @@ class AnalysisScheduler {
     desiredIdentityProvider,
     activityClassificationService = null,
     activityBuilder = null,
+    activityCloudReviewEnabled = true,
     cloudQueue = repository?.captureEvidenceStore,
     cloudTransportEnabled = false,
     now = Date.now,
@@ -71,6 +128,9 @@ class AnalysisScheduler {
     if (typeof now !== "function") throw new TypeError("now must be a function");
     if (typeof cloudTransportEnabled !== "boolean") {
       throw new TypeError("cloudTransportEnabled must be a boolean");
+    }
+    if (typeof activityCloudReviewEnabled !== "boolean") {
+      throw new TypeError("activityCloudReviewEnabled must be a boolean");
     }
     if (cloudTransportEnabled) {
       for (const method of [
@@ -102,9 +162,9 @@ class AnalysisScheduler {
     }
     if (
       activityClassificationService !== null &&
-      typeof activityClassificationService.classifySession !== "function"
+      typeof activityClassificationService.classifyLocal !== "function"
     ) {
-      throw new TypeError("activityClassificationService.classifySession is required");
+      throw new TypeError("activityClassificationService.classifyLocal is required");
     }
     if (activityBuilder !== null && typeof activityBuilder.build !== "function") {
       throw new TypeError("activityBuilder.build is required");
@@ -115,6 +175,7 @@ class AnalysisScheduler {
     this.desiredIdentityProvider = desiredIdentityProvider;
     this.activityClassificationService = activityClassificationService;
     this.activityBuilder = activityBuilder;
+    this.activityCloudReviewEnabled = activityCloudReviewEnabled;
     this.cloudQueue = cloudQueue;
     this.cloudTransportEnabled = cloudTransportEnabled;
     this.now = now;
@@ -157,11 +218,7 @@ class AnalysisScheduler {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new RangeError("analysis recovery limit must be between 1 and 100");
     }
-    if (
-      this.quiesced ||
-      !this.cloudTransportEnabled ||
-      !isCallable(this.repository, "listSessions")
-    ) {
+    if (this.quiesced || !isCallable(this.repository, "listSessions")) {
       return 0;
     }
 
@@ -173,17 +230,56 @@ class AnalysisScheduler {
       if (
         !session?.id ||
         !new Set(["completed", "recovered"]).has(session.status) ||
-        session.processing_state !== "ready"
+        session.processing_state !== "ready" ||
+        this.repository.isHistoricalLocalOnlyReprocessing?.(session.id) === true
       ) {
         continue;
       }
       const detail = this.repository.getSessionDetail(session.id);
-      if (!detail || detail.summary || eligibleSegments(detail).length === 0) continue;
-      if (this.getStatus(session.id).state !== "waiting") continue;
+      if (!detail || eligibleSegments(detail).length === 0) continue;
+      const workState = this.getStatus(session.id);
+      // A desired head is committed before its cloud job so a local enqueue failure
+      // cannot roll lineage back. The durable no-job state is uniquely distinguishable
+      // from normal rate-limit/offline retries and enqueueCloudJob is identity-idempotent.
+      const needsAnalysis =
+        this.cloudTransportEnabled &&
+        ((!detail.summary && workState.state === "waiting") || isMissingCloudJob(workState));
+      const activityClassifications = isCallable(
+        this.repository,
+        "listSessionActivityClassifications"
+      )
+        ? this.repository.listSessionActivityClassifications(session.id)
+        : null;
+      const needsActivityClassification =
+        this.activityClassificationService !== null &&
+        this.activityBuilder !== null &&
+        Array.isArray(activityClassifications) &&
+        activityClassifications.length === 0;
+      const currentActivityClassificationRevision =
+        Array.isArray(activityClassifications) && activityClassifications.length > 0
+          ? getActivityClassificationRevision(this.memoryRepository, session.id)
+          : undefined;
+      const desiredHead =
+        currentActivityClassificationRevision !== undefined &&
+        isCallable(this.memoryRepository, "getAnalysisDesiredHead")
+          ? this.memoryRepository.getAnalysisDesiredHead(session.id)
+          : null;
+      const needsActivityRefreshRecommendation =
+        currentActivityClassificationRevision !== undefined &&
+        desiredHead?.activityClassificationRevision !== currentActivityClassificationRevision;
+      if (!needsAnalysis && !needsActivityClassification && !needsActivityRefreshRecommendation) {
+        continue;
+      }
 
       attempted += 1;
       const status = await this.analyzeSession(session.id, "final");
-      if (status.state === "queued" || status.state === "ready") scheduled += 1;
+      if (
+        status.state === "queued" ||
+        status.state === "ready" ||
+        status.localClassification === "completed"
+      ) {
+        scheduled += 1;
+      }
     }
     return scheduled;
   }
@@ -206,8 +302,28 @@ class AnalysisScheduler {
       error.code = "STORAGE_MIGRATION_IN_PROGRESS";
       throw error;
     }
+    let activityReviewPlan = null;
+    try {
+      activityReviewPlan = this.classifySessionLocally(id);
+    } catch (error) {
+      this._setFailureStatus(id, error);
+      throw error;
+    }
+    if (!manual) {
+      try {
+        const recommendation = this._recommendActivityClassificationRefresh(id);
+        if (recommendation !== null) return Promise.resolve(recommendation);
+      } catch (error) {
+        this._setFailureStatus(id, error);
+        throw error;
+      }
+    }
     if (!this.cloudTransportEnabled) {
-      return Promise.resolve(this._setStatus(id, "blocked", "analysis_runtime_not_ready"));
+      return Promise.resolve(
+        this._setStatus(id, "blocked", "analysis_runtime_not_ready", {
+          ...(activityReviewPlan === null ? {} : { localClassification: "completed" }),
+        })
+      );
     }
     let plan;
     try {
@@ -218,11 +334,18 @@ class AnalysisScheduler {
     }
     if (plan.status) return Promise.resolve(plan.status);
     try {
-      return Promise.resolve(this._enqueue({ ...plan, manual, allowUsageUnknown }));
+      return Promise.resolve(
+        this._enqueue({ ...plan, activityReviewPlan, manual, allowUsageUnknown })
+      );
     } catch (error) {
       this._setFailureStatus(id, error);
       throw error;
     }
+  }
+
+  refreshAfterActivityClassification(sessionId) {
+    const id = assertId(sessionId, "sessionId");
+    return Promise.resolve(this._recommendActivityClassificationRefresh(id) ?? this.getStatus(id));
   }
 
   async quiesce() {
@@ -245,6 +368,55 @@ class AnalysisScheduler {
     return this._setStatus(sessionId, state, errorCode);
   }
 
+  classifySessionLocally(sessionId, { force = false } = {}) {
+    const id = assertId(sessionId, "sessionId");
+    if (typeof force !== "boolean") throw new TypeError("force must be a boolean");
+    if (this.activityClassificationService === null) {
+      if (force) throw new Error("local activity classification is unavailable");
+      return null;
+    }
+    if (
+      !force &&
+      isCallable(this.repository, "listSessionActivityClassifications") &&
+      this.repository.listSessionActivityClassifications(id).length > 0
+    ) {
+      return null;
+    }
+    const prepared = this.activityBuilder.build(id);
+    if (!Array.isArray(prepared?.activities) || prepared.activities.length === 0) return null;
+    this.activityClassificationService.classifyLocal({
+      sessionId: id,
+      activities: prepared.activities,
+    });
+    return prepared;
+  }
+
+  _recommendActivityClassificationRefresh(sessionId) {
+    const currentRevision = getActivityClassificationRevision(this.memoryRepository, sessionId);
+    if (currentRevision === undefined) return null;
+    const desiredHead = isCallable(this.memoryRepository, "getAnalysisDesiredHead")
+      ? this.memoryRepository.getAnalysisDesiredHead(sessionId)
+      : null;
+    if (desiredHead?.activityClassificationRevision === currentRevision) return null;
+    const detail = this.repository.getSessionDetail(sessionId);
+    if (!detail?.summary) return null;
+    if (!isCallable(this.repository, "markSessionSummaryRefreshRecommended")) {
+      const error = new Error("summary refresh recommendation is unavailable");
+      error.code = "analysis_summary_refresh_unavailable";
+      throw error;
+    }
+    const refresh = this.repository.markSessionSummaryRefreshRecommended(
+      sessionId,
+      "activity_classification_changed",
+      this.now()
+    );
+    return {
+      ...this.getStatus(sessionId),
+      summaryRefreshRecommended: refresh?.recommended === 1,
+      summaryRefreshReason: refresh?.reason ?? "activity_classification_changed",
+    };
+  }
+
   _prepare(sessionId, kind) {
     const detail = this.repository.getSessionDetail(sessionId);
     if (!detail) {
@@ -257,16 +429,27 @@ class AnalysisScheduler {
       return { status: this._setStatus(sessionId, "blocked", "analysis_input_empty") };
     }
     const people = isCallable(this.repository, "listPeople") ? this.repository.listPeople() : [];
-    const revisions = inputRevisions(segments, people);
+    const participantSnapshotRevision = getParticipantSnapshotRevision(this.repository, sessionId);
+    const activityClassificationRevision = getActivityClassificationRevision(
+      this.memoryRepository,
+      sessionId
+    );
+    const revisions = inputRevisions(
+      segments,
+      people,
+      participantSnapshotRevision,
+      activityClassificationRevision
+    );
     const request = {
       sessionId,
       ...revisions,
       promptVersion: PROMPT_VERSION,
       segmentIds: segments.map((segment) => segment.id),
+      ...(participantSnapshotRevision === undefined ? {} : { participantSnapshotRevision }),
     };
     this._setStatus(sessionId, "preparing");
     const prepared = this.memoryRepository.prepareAnalysisInput(request);
-    const built = this.inputBuilder.build(prepared);
+    const built = this.inputBuilder.build(prepared, { strategy: "hierarchical" });
     if (!built?.sendable) {
       return {
         status: this._setStatus(sessionId, "blocked", built?.reason || "analysis_input_invalid"),
@@ -291,7 +474,15 @@ class AnalysisScheduler {
       error.code = "analysis_input_state_invalid";
       throw error;
     }
-    return { sessionId, kind, persisted, prepared, segments, people };
+    return {
+      sessionId,
+      kind,
+      persisted,
+      prepared,
+      segments,
+      people,
+      activityClassificationRevision,
+    };
   }
 
   _enqueue({
@@ -301,6 +492,8 @@ class AnalysisScheduler {
     prepared,
     segments,
     people,
+    activityClassificationRevision,
+    activityReviewPlan,
     manual,
     allowUsageUnknown,
   }) {
@@ -322,6 +515,7 @@ class AnalysisScheduler {
       pseudonymBindingRevision: identity.pseudonymBindingRevision,
       modelVersion: identity.modelVersion,
       segmentSubjectRevisions: identity.segmentSubjectRevisions,
+      ...(activityClassificationRevision === undefined ? {} : { activityClassificationRevision }),
     });
     if (
       !head ||
@@ -356,7 +550,12 @@ class AnalysisScheduler {
       error.code = "analysis_cloud_job_invalid";
       throw error;
     }
-    this._scheduleActivityClassification(sessionId, job.id);
+    this._scheduleActivityCloudReview(
+      sessionId,
+      job.id,
+      activityReviewPlan,
+      activityClassificationRevision
+    );
     const reused = persisted.status === "existing";
     const state =
       reused && persisted.candidateState === "applied" && job.state === "completed"
@@ -369,37 +568,32 @@ class AnalysisScheduler {
     });
   }
 
-  _scheduleActivityClassification(sessionId, jobId) {
+  _scheduleActivityCloudReview(sessionId, jobId, prepared, scheduledRevision) {
     if (
       this.activityClassificationService === null ||
+      !this.activityCloudReviewEnabled ||
+      !isCallable(this.activityClassificationService, "reviewSessionWithCloud") ||
+      prepared === null ||
       this.quiesced ||
       this.inFlight.has(sessionId)
     ) {
       return;
     }
-    if (
-      isCallable(this.repository, "listSessionActivityClassifications") &&
-      this.repository.listSessionActivityClassifications(sessionId).length > 0
-    ) {
-      return;
-    }
-    let prepared;
-    try {
-      prepared = this.activityBuilder.build(sessionId);
-    } catch {
-      return;
-    }
-    if (!Array.isArray(prepared?.activities) || prepared.activities.length === 0) return;
     const operation = Promise.resolve()
       .then(() =>
-        this.activityClassificationService.classifySession({
+        this.activityClassificationService.reviewSessionWithCloud({
           sessionId,
           jobId,
           activities: prepared.activities,
           redactionTerms: prepared.redactionTerms,
-          cloudReview: true,
         })
       )
+      .then(() => {
+        if (this.quiesced) return null;
+        const currentRevision = getActivityClassificationRevision(this.memoryRepository, sessionId);
+        if (currentRevision === undefined || currentRevision === scheduledRevision) return null;
+        return this.refreshAfterActivityClassification(sessionId);
+      })
       .catch(() => null)
       .finally(() => {
         if (this.inFlight.get(sessionId) === operation) this.inFlight.delete(sessionId);

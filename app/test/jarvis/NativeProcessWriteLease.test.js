@@ -51,7 +51,10 @@ test("native server synchronous spawn failures release capture authority", async
   await assert.rejects(llama._startWithBinary("llama", [], {}, 100), /injected spawn failure/);
   await expectGateIdle();
 
-  const parakeet = new ParakeetWsServer({ spawnImpl: spawnFailure });
+  const parakeet = new ParakeetWsServer({
+    spawnImpl: spawnFailure,
+    findAvailablePortImpl: async () => 6006,
+  });
   parakeet.getWsBinaryPath = () => "parakeet";
   await assert.rejects(parakeet._doStart("model", modelDir), /injected spawn failure/);
   await expectGateIdle();
@@ -88,7 +91,10 @@ test("native server error events retain authority until the corresponding close 
     },
     {
       create(child) {
-        const manager = new ParakeetWsServer({ spawnImpl: () => child });
+        const manager = new ParakeetWsServer({
+          spawnImpl: () => child,
+          findAvailablePortImpl: async () => 6006,
+        });
         manager.getWsBinaryPath = () => "parakeet";
         return {
           manager,

@@ -61,13 +61,20 @@ test("dynamic application pool recycles helpers and state across a long event st
   }
   await pool.waitForIdle();
 
+  // Sticky selection deliberately retains the bounded active helper set while
+  // applications churn. Once the confirmed-silence window expires, the sweep
+  // must release every helper and all candidate/fallback state.
+  now += 60_001;
+  await pool.sweep();
+  await pool.waitForIdle();
+
   assert.equal(pool.candidates.size, 0);
   assert.equal(pool.activeTracks.size, 0);
   assert.equal(pool.fallbacks.size, 0);
   assert.equal(Object.hasOwn(pool, "generations"), false);
-  assert.equal(pool.nextCaptureGeneration, 500);
-  assert.equal(createdManagers, 500);
-  assert.equal(stoppedManagers, 500);
+  assert.equal(pool.nextCaptureGeneration, createdManagers);
+  assert.equal(stoppedManagers, createdManagers);
+  assert.equal(createdManagers > 0 && createdManagers <= 100, true);
   assert.equal(intervalsCreated, 1);
 
   await pool.stop();

@@ -11,16 +11,28 @@ const {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
+  normalizeKnowledgeActionInput,
+  normalizeActionCenterReadInput,
+  normalizeActivityCorrectionInput,
+  normalizePersonalizationRuleDecisionInput,
+  normalizeLearningGoalCreateInput,
+  normalizeLearningGoalEditInput,
+  normalizeLearningGoalIdInput,
+  normalizeNotificationPreferencesInput,
+  normalizeTodoReminderInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
   normalizeMiniMaxConfig,
   normalizeResourceGovernanceSettings,
   normalizeApplicationAudioSettings,
+  normalizeJarvisRolloutFlags,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,
 } = require("../shared/contracts");
+const { DEFAULT_JARVIS_ROLLOUT_FLAGS } = require("./JarvisRolloutFlags");
 const { normalizeCaptureStartInput } = require("../shared/captureModes");
 const {
   toRendererAudioChunk,
@@ -29,6 +41,8 @@ const {
   toRendererSessionTimeline,
 } = require("./AudioChunkPublicView");
 const path = require("node:path");
+const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 
 const REQUIRED_REPOSITORY_METHODS = [
   "createSession",
@@ -77,64 +91,40 @@ function assertExactKeys(input, expected, name) {
   }
 }
 
-function toPublicActivityClassification(entry) {
-  const applications = (
-    Array.isArray(entry?.evidence?.applicationKeys) ? entry.evidence.applicationKeys : []
-  )
-    .filter(
-      (value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,79}$/.test(value)
-    )
-    .slice(0, 8);
-  const evidenceSegmentIds = (
-    Array.isArray(entry?.evidence?.evidenceSegmentIds) ? entry.evidence.evidenceSegmentIds : []
-  )
-    .slice(0, 100)
-    .map((value) => assertId(value, "evidenceSegmentId"));
-  return {
-    id: assertId(entry?.id, "activityClassificationId"),
-    sessionId: assertId(entry?.sessionId, "sessionId"),
-    startedAt: entry.startedAt,
-    endedAt: entry.endedAt,
-    category: entry.category,
-    confidence: entry.confidence,
-    decision: entry.decision,
-    source: entry.source,
-    reason: entry.reason,
-    sourceAttribution: entry.sourceAttribution,
-    applications,
-    allowSummary: entry?.evidence?.allowSummary === true,
-    allowSuggestions: entry?.evidence?.allowSuggestions === true,
-    allowTodos: entry?.evidence?.allowTodos === true,
-    evidenceSegmentIds,
-    createdAt: entry.createdAt,
-    updatedAt: entry.updatedAt,
-  };
+function normalizeTimelinePage(input) {
+  if (input === undefined || input === null) return {};
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("session timeline page must be an object");
+  }
+  const allowed = new Set(["trackOffset", "trackLimit", "intervalOffset", "intervalLimit"]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw new TypeError("session timeline page has an invalid structure");
+  }
+  const page = {};
+  for (const key of allowed) {
+    if (input[key] === undefined) continue;
+    if (!Number.isSafeInteger(input[key]) || input[key] < 0) {
+      throw new TypeError(`session timeline ${key} must be a non-negative safe integer`);
+    }
+    page[key] = input[key];
+  }
+  return page;
 }
 
-function toPublicAmbiguousSpeakerFailure(error) {
-  if (error?.code !== "ambiguous_duplicate_name") throw error;
-  if (!Array.isArray(error.candidates)) {
-    throw new TypeError("ambiguous speaker candidates must be an array");
-  }
-  const candidates = error.candidates.map((candidate) => {
-    const id = assertId(candidate?.id, "candidate personId");
-    if (
-      typeof candidate?.displayName !== "string" ||
-      !candidate.displayName.trim() ||
-      Array.from(candidate.displayName).length > 80 ||
-      typeof candidate.isSelf !== "boolean"
-    ) {
-      throw new TypeError("ambiguous speaker candidate is invalid");
-    }
-    return { id, displayName: candidate.displayName, isSelf: candidate.isSelf };
-  });
-  return {
-    speakerCorrectionError: {
-      code: "ambiguous_duplicate_name",
-      candidates,
-    },
-  };
-}
+const {
+  toRendererSessionTimelineStatus,
+  toPublicTopicDetail,
+  toPublicActivityClassification,
+  toPublicPersonalizationRule,
+  toPublicLearningGoal,
+  toPublicLearningGoalResult,
+  toPublicActionCenterWatermark,
+  toPublicActionCenterDelta,
+  toPublicActionCenterReadResult,
+  toPublicNotificationPreferences,
+  toPublicTodoReminder,
+  toPublicAmbiguousSpeakerFailure,
+} = require("./ipc/PublicEntityViews");
 
 function assertLifecycleTime(value) {
   if (!Number.isSafeInteger(value) || value < 0) {
@@ -211,247 +201,9 @@ function nextRecoveryAction({ capture, resources, queue, disk }) {
   return null;
 }
 
-function toPublicDailyDigestContent(content) {
-  const factual = (items) =>
-    (Array.isArray(items) ? items : []).map((item) => ({
-      text: item.text,
-      evidenceSegmentIds: [...item.evidenceSegmentIds],
-    }));
-  return {
-    schemaVersion: content.schemaVersion,
-    sections: {
-      today: factual(content.sections.today),
-      interactions: content.sections.interactions.map((item) => ({
-        subjectRef: item.subjectRef,
-        text: item.text,
-        evidenceSegmentIds: [...item.evidenceSegmentIds],
-      })),
-      topicsAndDecisions: factual(content.sections.topicsAndDecisions),
-      commitmentsAndTodos: factual(content.sections.commitmentsAndTodos),
-      worthRemembering: factual(content.sections.worthRemembering),
-      tomorrowSuggestions: content.sections.tomorrowSuggestions.map((item) => ({
-        text: item.text,
-        rationale: item.rationale,
-        evidenceSegmentIds: [...item.evidenceSegmentIds],
-        allowedActions: [...item.allowedActions],
-      })),
-    },
-    processing: {
-      completeness: content.processing.completeness,
-      missingStages: [...content.processing.missingStages],
-      transcriptCoverage: {
-        selectedSegmentCount: content.processing.transcriptCoverage.selectedSegmentCount,
-        incompleteSegmentCount: content.processing.transcriptCoverage.incompleteSegmentCount,
-        sessionCount: content.processing.transcriptCoverage.sessionCount,
-        startsAt: content.processing.transcriptCoverage.startsAt,
-        endsAt: content.processing.transcriptCoverage.endsAt,
-      },
-    },
-  };
-}
+const { toPublicDailyDigest, toPublicDailyDigestStatus } = require("./ipc/PublicDailyDigestViews");
 
-function toPublicDailyDigest(digest) {
-  if (!digest) return null;
-  return {
-    localDate: digest.localDate,
-    revision: digest.revision,
-    completeness: digest.completeness,
-    content: toPublicDailyDigestContent(digest.content),
-    evidence: digest.evidence.map((entry) => ({
-      sessionId: entry.sessionId,
-      segmentId: entry.segmentId,
-      startedAt: entry.startedAt,
-      endedAt: entry.endedAt,
-      quote: entry.quote,
-      audioState: entry.audioState,
-      handle: normalizeEvidenceContextRequest(entry.handle),
-    })),
-    createdAt: digest.createdAt,
-    updatedAt: digest.updatedAt,
-  };
-}
-
-function toPublicDailyDigestStatus(status) {
-  const states = new Set([
-    "not_generated",
-    "empty",
-    "queued",
-    "running",
-    "retry_needed",
-    "ready",
-    "blocked",
-  ]);
-  const errorCodes = new Set([
-    "offline",
-    "budget_unavailable",
-    "usage_unknown",
-    "invalid_response",
-    "runtime_unavailable",
-    "generation_failed",
-  ]);
-  if (!status || !states.has(status.state)) {
-    return {
-      state: "blocked",
-      retryable: false,
-      errorCode: "generation_failed",
-      nextRetryAt: null,
-      attemptCount: 0,
-    };
-  }
-  return {
-    state: status.state,
-    retryable: status.retryable === true,
-    errorCode: errorCodes.has(status.errorCode) ? status.errorCode : null,
-    nextRetryAt: Number.isSafeInteger(status.nextRetryAt) ? status.nextRetryAt : null,
-    attemptCount:
-      Number.isSafeInteger(status.attemptCount) && status.attemptCount >= 0
-        ? status.attemptCount
-        : 0,
-  };
-}
-
-const KNOWLEDGE_LIST_LIMIT = 100;
-const KNOWLEDGE_HISTORY_LIMIT = 20;
-const KNOWLEDGE_EVIDENCE_LIMIT = 8;
-
-function limited(items, limit) {
-  return (Array.isArray(items) ? items : []).slice(0, limit);
-}
-
-function toPublicKnowledgeEvidence(entry) {
-  return {
-    sessionId: entry.sessionId,
-    segmentId: entry.segmentId,
-    startedAt: entry.startedAt,
-    endedAt: entry.endedAt,
-    quote: entry.quote,
-    audioState: entry.audioState,
-    handle: normalizeEvidenceContextRequest(entry.handle),
-  };
-}
-
-function publicEvidence(items) {
-  return limited(items, KNOWLEDGE_EVIDENCE_LIMIT).map(toPublicKnowledgeEvidence);
-}
-
-function toPublicKnowledgeOverview(snapshot) {
-  const memories = limited(snapshot?.memories, KNOWLEDGE_LIST_LIMIT).map((item) => ({
-    id: item.id,
-    kind: item.kind,
-    title: item.title,
-    body: item.body,
-    confidence: item.confidence,
-    lifecycle: item.lifecycle,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
-      id: occurrence.id,
-      sessionId: occurrence.sessionId,
-      startedAt: occurrence.startedAt,
-      endedAt: occurrence.endedAt,
-      confidence: occurrence.confidence,
-      createdAt: occurrence.createdAt,
-      evidence: publicEvidence(occurrence.evidence),
-    })),
-  }));
-  const topics = limited(snapshot?.topics, KNOWLEDGE_LIST_LIMIT).map((item) => ({
-    id: item.id,
-    name: item.name,
-    lifecycle: item.lifecycle,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({
-      id: revision.id,
-      revision: revision.revision,
-      summary: revision.summary,
-      createdAt: revision.createdAt,
-    })),
-    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
-      id: occurrence.id,
-      sessionId: occurrence.sessionId,
-      revisionId: occurrence.revisionId,
-      createdAt: occurrence.createdAt,
-      evidence: publicEvidence(occurrence.evidence),
-    })),
-  }));
-  const todos = limited(snapshot?.todos, KNOWLEDGE_LIST_LIMIT).map((item) => ({
-    id: item.id,
-    title: item.title,
-    ownerLabel: item.ownerLabel,
-    status: item.status,
-    completedAt: item.completedAt,
-    dismissedAt: item.dismissedAt,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    revisions: limited(item.revisions, KNOWLEDGE_HISTORY_LIMIT).map((revision) => ({
-      id: revision.id,
-      revision: revision.revision,
-      title: revision.title,
-      dueText: revision.dueText,
-      createdAt: revision.createdAt,
-    })),
-    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
-      id: occurrence.id,
-      sessionId: occurrence.sessionId,
-      revisionId: occurrence.revisionId,
-      startedAt: occurrence.startedAt,
-      endedAt: occurrence.endedAt,
-      createdAt: occurrence.createdAt,
-      evidence: publicEvidence(occurrence.evidence),
-    })),
-    transitions: limited(item.transitions, KNOWLEDGE_HISTORY_LIMIT).map((transition) => ({
-      id: transition.id,
-      fromStatus: transition.fromStatus,
-      toStatus: transition.toStatus,
-      occurredAt: transition.occurredAt,
-    })),
-  }));
-  const suggestions = limited(snapshot?.suggestions, KNOWLEDGE_LIST_LIMIT).map((item) => ({
-    id: item.id,
-    title: item.title,
-    rationale: item.rationale,
-    state: item.state,
-    decidedAt: item.decidedAt,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    occurrences: limited(item.occurrences, KNOWLEDGE_HISTORY_LIMIT).map((occurrence) => ({
-      id: occurrence.id,
-      sessionId: occurrence.sessionId,
-      createdAt: occurrence.createdAt,
-      evidence: publicEvidence(occurrence.evidence),
-    })),
-  }));
-  const conflicts = limited(snapshot?.memoryConflicts, KNOWLEDGE_LIST_LIMIT).map((item) => ({
-    id: item.id,
-    episode: item.episode,
-    state: item.state,
-    selectedMemoryItemId: item.selectedMemoryItemId,
-    resolvedAt: item.resolvedAt,
-    createdAt: item.createdAt,
-    updatedAt: item.updatedAt,
-    members: limited(item.members, KNOWLEDGE_HISTORY_LIMIT).map((member) => ({
-      memoryItemId: member.memoryItemId,
-      title: member.title,
-      body: member.body,
-      lifecycle: member.lifecycle,
-      selected: member.selected === true,
-    })),
-  }));
-  return {
-    memories,
-    topics,
-    todos,
-    suggestions,
-    conflicts,
-    truncated: [
-      snapshot?.memories,
-      snapshot?.topics,
-      snapshot?.todos,
-      snapshot?.suggestions,
-      snapshot?.memoryConflicts,
-    ].some((items) => Array.isArray(items) && items.length > KNOWLEDGE_LIST_LIMIT),
-  };
-}
+const { toPublicKnowledgeOverview } = require("./ipc/PublicKnowledgeViews");
 
 function publicBoundaryError(code, message) {
   const error = new Error(message);
@@ -459,84 +211,29 @@ function publicBoundaryError(code, message) {
   return error;
 }
 
-function toPublicResourceGovernanceSettings(input) {
-  return normalizeResourceGovernanceSettings({
-    profile: input?.profile,
-    externalGpuThresholdPct: input?.externalGpuThresholdPct,
-    recoveryWaitMs: input?.recoveryWaitMs,
-  });
+const PUBLIC_TODO_REMINDER_ERRORS = new Map([
+  ["JARVIS_TODO_NOT_FOUND", "Todo is unavailable"],
+  ["JARVIS_TODO_NOT_OPEN", "Only open todos can have reminders"],
+  ["JARVIS_TODO_REMINDER_CONFIRMATION_REQUIRED", "Confirm this todo before setting a reminder"],
+]);
+
+function safeTodoReminderCall(operation, normalize) {
+  try {
+    return normalize(operation());
+  } catch (error) {
+    const safeMessage = PUBLIC_TODO_REMINDER_ERRORS.get(error?.code);
+    if (safeMessage) throw publicBoundaryError(error.code, safeMessage);
+    throw publicBoundaryError(
+      "JARVIS_TODO_REMINDER_UNAVAILABLE",
+      "Todo reminder is temporarily unavailable"
+    );
+  }
 }
 
-function assertApplicationKey(value) {
-  if (typeof value !== "string" || !/^[a-z0-9._-]{1,64}$/.test(value)) {
-    throw new TypeError("application audio key is invalid");
-  }
-  return value;
-}
-
-function assertApplicationDisplayName(value) {
-  if (
-    typeof value !== "string" ||
-    !value.trim() ||
-    Array.from(value.trim()).length > 80 ||
-    /[\\/:]/u.test(value)
-  ) {
-    throw new TypeError("application audio display name is invalid");
-  }
-  return value.trim();
-}
-
-function toPublicApplicationAudioStatus(input) {
-  const settings = normalizeApplicationAudioSettings({
-    enabled: input?.enabled,
-    trackLimit: input?.trackLimit,
-  });
-  const runtime = input?.runtime;
-  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
-    throw new TypeError("application audio runtime status is required");
-  }
-  const activeTracks = Array.isArray(runtime.activeTracks) ? runtime.activeTracks : [];
-  const fallbacks = Array.isArray(runtime.fallbacks) ? runtime.fallbacks : [];
-  const boundedInteger = (value, name, minimum, maximum) => {
-    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-      throw new RangeError(`${name} is invalid`);
-    }
-    return value;
-  };
-  return {
-    ...settings,
-    runtime: {
-      running: runtime.running === true,
-      configuredLimit: boundedInteger(runtime.configuredLimit, "configuredLimit", 1, 8),
-      effectiveLimit: boundedInteger(runtime.effectiveLimit, "effectiveLimit", 1, 8),
-      fullscreen: runtime.fullscreen === true,
-      activeTracks: activeTracks.slice(0, 8).map((track) => ({
-        applicationKey: assertApplicationKey(track?.applicationKey),
-        applicationDisplayName: assertApplicationDisplayName(track?.applicationDisplayName),
-        captureGeneration: boundedInteger(
-          track?.captureGeneration,
-          "captureGeneration",
-          1,
-          Number.MAX_SAFE_INTEGER
-        ),
-        state: "recording",
-      })),
-      fallbacks: fallbacks.slice(0, 256).map((fallback) => ({
-        applicationKey: assertApplicationKey(fallback?.applicationKey),
-        applicationDisplayName: assertApplicationDisplayName(fallback?.applicationDisplayName),
-        reason:
-          typeof fallback?.reason === "string" && /^[a-z0-9_-]{1,64}$/i.test(fallback.reason)
-            ? fallback.reason
-            : "application_capture_unavailable",
-        retryAt:
-          Number.isSafeInteger(fallback?.retryAt) && fallback.retryAt >= 0
-            ? fallback.retryAt
-            : null,
-        state: "mixed_unknown",
-      })),
-    },
-  };
-}
+const {
+  toPublicResourceGovernanceSettings,
+  toPublicApplicationAudioStatus,
+} = require("./ipc/PublicRuntimeViews");
 
 function safePublicCall(operation, normalize, code, message) {
   try {
@@ -565,12 +262,16 @@ function registerJarvisIpc({
   analysisBudgetGuard = null,
   resourceSettings = null,
   applicationAudioSettings = null,
+  rolloutFlags = DEFAULT_JARVIS_ROLLOUT_FLAGS,
+  miniMaxModelDiscovery = null,
   dailyDigestScheduler = null,
+  notificationScheduler = null,
   audioEvidenceReader,
   storageManager,
   pickStorageDirectory,
   processingLifecycle = null,
   now = Date.now,
+  log = () => {},
 }) {
   if (!ipcMain || typeof ipcMain.handle !== "function") {
     throw new TypeError("ipcMain with a handle method is required");
@@ -578,6 +279,7 @@ function registerJarvisIpc({
   if (!repository || typeof repository !== "object") {
     throw new TypeError("repository is required");
   }
+  if (typeof log !== "function") throw new TypeError("log must be a function");
   for (const method of REQUIRED_REPOSITORY_METHODS) {
     if (typeof repository[method] !== "function") {
       throw new TypeError(`repository.${method} must be a function`);
@@ -633,6 +335,10 @@ function registerJarvisIpc({
   ) {
     throw new TypeError("applicationAudioSettings public methods are required");
   }
+  if (notificationScheduler !== null && typeof notificationScheduler.wake !== "function") {
+    throw new TypeError("notificationScheduler.wake must be a function");
+  }
+  const publicRolloutFlags = normalizeJarvisRolloutFlags(rolloutFlags);
 
   const cloudBudgetStatus = () => ({
     ...repository.getCloudBudgetStatus(),
@@ -687,6 +393,137 @@ function registerJarvisIpc({
       .listSessionActivityClassifications(assertId(args[0], "sessionId"))
       .map(toPublicActivityClassification);
   });
+  if (
+    typeof repository.correctActivityClassification === "function" &&
+    typeof repository.listPersonalizationRules === "function" &&
+    typeof repository.decidePersonalizationRule === "function" &&
+    typeof repository.resetPersonalizationRules === "function" &&
+    typeof repository.getNotificationPreferences === "function" &&
+    typeof repository.setNotificationPreferences === "function"
+  ) {
+    ipcMain.handle(CHANNELS.correctActivityClassification, async (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("activity correction requires one argument");
+      const input = normalizeActivityCorrectionInput(args[0]);
+      const result = repository.correctActivityClassification({ ...input, correctedAt: now() });
+      const sessionId = assertId(result?.classification?.sessionId, "sessionId");
+      if (typeof analysisScheduler?.refreshAfterActivityClassification === "function") {
+        try {
+          await Promise.resolve(analysisScheduler.refreshAfterActivityClassification(sessionId));
+        } catch (error) {
+          const errorCode =
+            typeof error?.code === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(error.code)
+              ? error.code
+              : "ANALYSIS_REFRESH_FAILED";
+          try {
+            await Promise.resolve(
+              log({
+                phase: "activity_classification_refresh",
+                state: "deferred",
+                sessionId,
+                errorCode,
+              })
+            );
+          } catch {
+            // The correction is already durable; diagnostics must not turn it into a failure.
+          }
+        }
+      }
+      return {
+        classification: toPublicActivityClassification(result.classification),
+        proposedRule: result.proposedRule ? toPublicPersonalizationRule(result.proposedRule) : null,
+        supportCount: result.supportCount,
+      };
+    });
+    ipcMain.handle(CHANNELS.getPersonalizationSettings, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("personalization settings take no arguments");
+      return {
+        rules: repository.listPersonalizationRules().map(toPublicPersonalizationRule),
+        notifications: toPublicNotificationPreferences(repository.getNotificationPreferences()),
+      };
+    });
+    ipcMain.handle(CHANNELS.decidePersonalizationRule, (_event, ...args) => {
+      if (args.length !== 1)
+        throw new TypeError("personalization rule decision requires one argument");
+      const input = normalizePersonalizationRuleDecisionInput(args[0]);
+      return toPublicPersonalizationRule(
+        repository.decidePersonalizationRule({ ...input, at: now() })
+      );
+    });
+    ipcMain.handle(CHANNELS.resetPersonalizationRules, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("personalization reset takes no arguments");
+      return repository.resetPersonalizationRules({ at: now() });
+    });
+    ipcMain.handle(CHANNELS.setNotificationPreferences, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("notification preferences require one argument");
+      const input = normalizeNotificationPreferencesInput(args[0]);
+      const result = toPublicNotificationPreferences(
+        repository.setNotificationPreferences({ ...input, at: now() })
+      );
+      notificationScheduler?.wake();
+      return result;
+    });
+  }
+  const callLearningGoalRepository = (method, input) => {
+    if (typeof repository[method] !== "function") {
+      throw new Error("Learning goals are unavailable");
+    }
+    return repository[method](input);
+  };
+  ipcMain.handle(CHANNELS.listLearningGoals, (_event, ...args) => {
+    if (args.length !== 0) throw new TypeError("learning goal list takes no arguments");
+    const goals = callLearningGoalRepository("listLearningGoals");
+    if (!Array.isArray(goals)) throw new TypeError("learning goal list is invalid");
+    return goals.map(toPublicLearningGoal);
+  });
+  ipcMain.handle(CHANNELS.createLearningGoal, (_event, ...args) => {
+    if (args.length !== 1) throw new TypeError("learning goal create requires one argument");
+    const input = normalizeLearningGoalCreateInput(args[0]);
+    return toPublicLearningGoalResult(
+      callLearningGoalRepository("createLearningGoal", { ...input, at: now() })
+    );
+  });
+  ipcMain.handle(CHANNELS.editLearningGoal, (_event, ...args) => {
+    if (args.length !== 1) throw new TypeError("learning goal edit requires one argument");
+    const input = normalizeLearningGoalEditInput(args[0]);
+    return toPublicLearningGoalResult(
+      callLearningGoalRepository("editLearningGoal", { ...input, at: now() })
+    );
+  });
+  for (const [channel, method, action] of [
+    [CHANNELS.archiveLearningGoal, "archiveLearningGoal", "archive"],
+    [CHANNELS.restoreLearningGoal, "restoreLearningGoal", "restore"],
+    [CHANNELS.deleteLearningGoal, "deleteLearningGoal", "delete"],
+  ]) {
+    ipcMain.handle(channel, (_event, ...args) => {
+      if (args.length !== 1) {
+        throw new TypeError(`learning goal ${action} requires one argument`);
+      }
+      const input = normalizeLearningGoalIdInput(args[0]);
+      return toPublicLearningGoalResult(
+        callLearningGoalRepository(method, { ...input, at: now() })
+      );
+    });
+  }
+  if (
+    typeof repository.getTodoReminder === "function" &&
+    typeof repository.setTodoReminder === "function"
+  ) {
+    ipcMain.handle(CHANNELS.getTodoReminder, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("todo reminder request requires todoId");
+      const todoId = assertId(args[0], "todoId");
+      return safeTodoReminderCall(() => repository.getTodoReminder(todoId), toPublicTodoReminder);
+    });
+    ipcMain.handle(CHANNELS.setTodoReminder, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("todo reminder update requires one argument");
+      const input = normalizeTodoReminderInput(args[0]);
+      const result = safeTodoReminderCall(
+        () => repository.setTodoReminder({ ...input, at: now() }),
+        toPublicTodoReminder
+      );
+      notificationScheduler?.wake();
+      return result;
+    });
+  }
   ipcMain.handle(CHANNELS.renamePerson, (_event, input) => repository.renamePerson(input));
   ipcMain.handle(CHANNELS.listPeople, () => repository.listPeople());
   ipcMain.handle(CHANNELS.listSessionSpeakerClusters, (_event, sessionId) =>
@@ -737,11 +574,65 @@ function registerJarvisIpc({
       throw error;
     }
   });
+  ipcMain.handle(CHANNELS.readSpeakerUtteranceAudio, async (_event, utteranceId) => {
+    const evidence = repository.getSpeakerUtteranceAudioEvidence?.(
+      assertId(utteranceId, "speakerUtteranceId")
+    );
+    if (
+      !evidence ||
+      evidence.evidence_kind !== "separated_stem" ||
+      evidence.stem_deleted_at !== null ||
+      !Number.isSafeInteger(evidence.stem_expires_at) ||
+      evidence.stem_expires_at <= now()
+    ) {
+      return null;
+    }
+    try {
+      const dataRoot = process.env.JARVIS_DATA_ROOT;
+      if (typeof dataRoot !== "string" || !path.isAbsolute(dataRoot)) {
+        throw new Error("speaker utterance data root is unavailable");
+      }
+      const allowedRoot = await fs.realpath(
+        path.join(path.resolve(dataRoot), "recordings-data", "overlap-stems")
+      );
+      const realPath = await fs.realpath(evidence.stem_path);
+      const relative = path.relative(allowedRoot, realPath);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw new Error("speaker utterance evidence escaped its storage root");
+      }
+      const bytes = await fs.readFile(realPath);
+      const actualSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+      if (actualSha256 !== evidence.stem_file_sha256) {
+        throw new Error("speaker utterance evidence integrity mismatch");
+      }
+      return bytes;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      log({
+        phase: "read_speaker_utterance_audio",
+        utteranceId: evidence.id,
+        errorCode: error?.code ?? "EVIDENCE_READ_FAILED",
+      });
+      throw publicBoundaryError(
+        "JARVIS_SPEAKER_UTTERANCE_AUDIO_UNAVAILABLE",
+        "Isolated speaker audio is unavailable"
+      );
+    }
+  });
   ipcMain.handle(CHANNELS.getSessionDetail, (_event, sessionId) =>
-    toPublicSessionDetail(repository.getSessionDetail(assertId(sessionId, "sessionId")))
+    toPublicSessionDetail(
+      repository.getSessionDetail(assertId(sessionId, "sessionId"), {
+        // Memory playback uses the paged timeline as its single audio-chunk source.
+        // Avoid serializing the same potentially thousands-long chunk list twice.
+        includeAudioChunks: false,
+      })
+    )
   );
-  ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId) => {
-    const timeline = repository.getSessionTimeline(assertId(sessionId, "sessionId"));
+  ipcMain.handle(CHANNELS.getSessionTimeline, (_event, sessionId, page) => {
+    const timeline = repository.getSessionTimeline(
+      assertId(sessionId, "sessionId"),
+      normalizeTimelinePage(page)
+    );
     if (!timeline) return null;
     const activeCapture = typeof service.getState === "function" ? service.getState() : null;
     const activelyRecording =
@@ -753,6 +644,23 @@ function registerJarvisIpc({
         ? (processingLifecycle?.runtime?.previewStatus?.() ?? null)
         : null;
     return toRendererSessionTimeline(timeline, previewStatus);
+  });
+  ipcMain.handle(CHANNELS.getSessionTimelineStatus, (_event, sessionId) => {
+    const safeSessionId = assertId(sessionId, "sessionId");
+    if (typeof repository.getSessionTimelineStatus === "function") {
+      return toRendererSessionTimelineStatus(repository.getSessionTimelineStatus(safeSessionId));
+    }
+    const timeline = repository.getSessionTimeline(safeSessionId);
+    if (!timeline) return null;
+    return toRendererSessionTimelineStatus({
+      session_id: timeline.session_id,
+      status: timeline.status,
+      processing_state: timeline.processing_state,
+      timeline_version: timeline.timeline_version,
+      finalized_at: timeline.finalized_at,
+      ready_at: timeline.ready_at,
+      processing_counts: timeline.processing_counts,
+    });
   });
   ipcMain.handle(CHANNELS.getRuntimeStatus, async () => {
     const observedAt = now();
@@ -841,12 +749,25 @@ function registerJarvisIpc({
     return sessions.map(toRendererSession);
   });
   ipcMain.handle(CHANNELS.listPeopleOverview, () => repository.listPeopleOverview());
+  ipcMain.handle(CHANNELS.listPeopleReviewOverview, () => repository.listPeopleReviewOverview());
+  ipcMain.handle(CHANNELS.previewParticipantReview, (_event, input) =>
+    repository.previewParticipantReview(input)
+  );
+  ipcMain.handle(CHANNELS.applyParticipantReview, (_event, input) =>
+    repository.applyParticipantReview(input)
+  );
+  ipcMain.handle(CHANNELS.undoParticipantReview, (_event, eventId) =>
+    repository.undoParticipantReview(assertId(eventId, "participantReviewEventId"))
+  );
+  ipcMain.handle(CHANNELS.listParticipantReviewHistory, (_event, sessionId) =>
+    repository.listParticipantReviewHistory(assertId(sessionId, "sessionId"))
+  );
   ipcMain.handle(CHANNELS.getPersonDetail, (_event, personId) =>
     repository.getPersonDetail(assertId(personId, "personId"))
   );
   ipcMain.handle(CHANNELS.listTopics, () => repository.listTopics());
   ipcMain.handle(CHANNELS.getTopicDetail, (_event, topicId) =>
-    repository.getTopicDetail(assertId(topicId, "topicId"))
+    toPublicTopicDetail(repository.getTopicDetail(assertId(topicId, "topicId")))
   );
   ipcMain.handle(CHANNELS.renameTopic, (_event, topicId, title) =>
     repository.renameTopic(assertId(topicId, "topicId"), title)
@@ -864,11 +785,16 @@ function registerJarvisIpc({
     const currentKnowledgeRepository = () => {
       const memoryRepository = repository.memoryRepository;
       for (const method of [
+        "getActionCenterWatermark",
+        "getActionCenterDelta",
+        "markActionCenterRead",
         "readPublicSnapshot",
         "acceptSuggestion",
         "dismissSuggestion",
         "resolveMemoryConflict",
         "completeTodo",
+        "decideTodo",
+        "applyKnowledgeAction",
         "getEvidenceContext",
       ]) {
         if (!memoryRepository || typeof memoryRepository[method] !== "function") {
@@ -877,20 +803,69 @@ function registerJarvisIpc({
       }
       return memoryRepository;
     };
+    ipcMain.handle(CHANNELS.getActionCenterWatermark, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("action center watermark takes no arguments");
+      return toPublicActionCenterWatermark(currentKnowledgeRepository().getActionCenterWatermark());
+    });
+    ipcMain.handle(CHANNELS.getActionCenterDelta, (_event, ...args) => {
+      if (args.length !== 0) throw new TypeError("action center delta takes no arguments");
+      return toPublicActionCenterDelta(currentKnowledgeRepository().getActionCenterDelta());
+    });
+    ipcMain.handle(CHANNELS.markActionCenterRead, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("action center read requires one argument");
+      const input = normalizeActionCenterReadInput(args[0]);
+      return toPublicActionCenterReadResult(
+        currentKnowledgeRepository().markActionCenterRead(input)
+      );
+    });
     ipcMain.handle(CHANNELS.getKnowledgeOverview, (_event, ...args) => {
       if (args.length !== 0) throw new TypeError("knowledge overview takes no arguments");
-      return toPublicKnowledgeOverview(currentKnowledgeRepository().readPublicSnapshot());
+      const overview = toPublicKnowledgeOverview(currentKnowledgeRepository().readPublicSnapshot());
+      if (typeof repository.getSuggestionPersonalizationPenalty === "function") {
+        overview.suggestions.sort(
+          (left, right) =>
+            repository.getSuggestionPersonalizationPenalty(left.title) -
+              repository.getSuggestionPersonalizationPenalty(right.title) ||
+            right.createdAt - left.createdAt ||
+            left.id.localeCompare(right.id)
+        );
+      }
+      return overview;
     });
     ipcMain.handle(CHANNELS.decideKnowledgeSuggestion, (_event, ...args) => {
       if (args.length !== 1) throw new TypeError("suggestion decision requires one argument");
       const input = normalizeSuggestionDecisionInput(args[0]);
+      const suggestion =
+        input.action === "dismiss"
+          ? currentKnowledgeRepository()
+              .readPublicSnapshot()
+              .suggestions?.find((entry) => entry.id === input.suggestionId)
+          : null;
       const result = currentKnowledgeRepository()[
         input.action === "accept" ? "acceptSuggestion" : "dismissSuggestion"
       ]({ suggestionId: input.suggestionId, at: now() });
+      if (
+        input.action === "dismiss" &&
+        result.status === "dismissed" &&
+        suggestion &&
+        typeof repository.recordSuggestionDismissalFeedback === "function"
+      ) {
+        try {
+          repository.recordSuggestionDismissalFeedback({
+            suggestionId: input.suggestionId,
+            summary:
+              suggestion.title ?? suggestion.summary ?? suggestion.text ?? input.suggestionId,
+            occurredAt: now(),
+          });
+        } catch {
+          // Local learning is best-effort and must never block the user's dismissal.
+        }
+      }
       return {
         status: result.status,
         suggestionId: result.suggestionId,
         decidedAt: result.decidedAt,
+        todoId: result.todoId,
       };
     });
     ipcMain.handle(CHANNELS.resolveKnowledgeConflict, (_event, ...args) => {
@@ -907,10 +882,37 @@ function registerJarvisIpc({
       if (args.length !== 1) throw new TypeError("todo completion requires one argument");
       const input = normalizeKnowledgeTodoCompletionInput(args[0]);
       const result = currentKnowledgeRepository().completeTodo(input);
-      return {
+      const response = {
         status: result.status,
         todoId: result.todoId,
         completedAt: result.completedAt,
+      };
+      notificationScheduler?.wake();
+      return response;
+    });
+    ipcMain.handle(CHANNELS.decideKnowledgeTodo, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("todo decision requires one argument");
+      const input = normalizeKnowledgeTodoDecisionInput(args[0]);
+      const result = currentKnowledgeRepository().decideTodo(input);
+      notificationScheduler?.wake();
+      return result;
+    });
+    ipcMain.handle(CHANNELS.applyKnowledgeAction, (_event, ...args) => {
+      if (args.length !== 1) throw new TypeError("knowledge action requires one argument");
+      const input = normalizeKnowledgeActionInput(args[0]);
+      const result = currentKnowledgeRepository().applyKnowledgeAction({
+        ...input,
+        at: now(),
+      });
+      notificationScheduler?.wake();
+      return {
+        status: result.status,
+        commandId: result.commandId,
+        type: result.type,
+        entityKind: result.entityKind,
+        entityId: result.entityId,
+        occurredAt: result.occurredAt,
+        todoId: result.todoId,
       };
     });
     ipcMain.handle(CHANNELS.getEvidenceContext, (_event, ...args) => {
@@ -1042,20 +1044,39 @@ function registerJarvisIpc({
       );
     });
   }
+  ipcMain.handle(CHANNELS.getRolloutFlags, (_event, ...args) => {
+    if (args.length !== 0) throw new TypeError("rollout flags take no arguments");
+    return { ...publicRolloutFlags };
+  });
   if (
     typeof environmentManager.getMiniMaxKey === "function" &&
     typeof environmentManager.saveMiniMaxKey === "function" &&
     typeof environmentManager.clearMiniMaxKey === "function"
   ) {
-    const miniMaxConfig = () =>
-      normalizeMiniMaxConfig({
-        keyConfigured: Boolean(environmentManager.getMiniMaxKey()),
+    if (miniMaxModelDiscovery !== null && typeof miniMaxModelDiscovery.discover !== "function") {
+      throw new TypeError("miniMaxModelDiscovery.discover must be a function");
+    }
+    const miniMaxConfig = async ({ force = false } = {}) => {
+      const keyConfigured = Boolean(environmentManager.getMiniMaxKey());
+      const discovered = miniMaxModelDiscovery
+        ? await miniMaxModelDiscovery.discover({ force })
+        : {
+            status: keyConfigured ? "unavailable" : "not_configured",
+            fallbackUsed: false,
+            checkedAt: null,
+          };
+      return normalizeMiniMaxConfig({
+        keyConfigured,
         model: "MiniMax-M2.7",
+        modelStatus: keyConfigured ? discovered.status : "not_configured",
+        fallbackUsed: keyConfigured && discovered.fallbackUsed === true,
+        checkedAt: keyConfigured ? (discovered.checkedAt ?? null) : null,
       });
-    ipcMain.handle(CHANNELS.getMiniMaxConfig, (_event, ...args) => {
+    };
+    ipcMain.handle(CHANNELS.getMiniMaxConfig, async (_event, ...args) => {
       if (args.length !== 0) throw new TypeError("MiniMax config takes no arguments");
-      return safePublicCall(
-        miniMaxConfig,
+      return safePublicCallAsync(
+        () => miniMaxConfig(),
         normalizeMiniMaxConfig,
         "MINIMAX_SETTINGS_UNAVAILABLE",
         "MiniMax settings are unavailable"
@@ -1067,7 +1088,7 @@ function registerJarvisIpc({
       return safePublicCallAsync(
         async () => {
           await environmentManager.saveMiniMaxKey(key);
-          return miniMaxConfig();
+          return miniMaxConfig({ force: true });
         },
         normalizeMiniMaxConfig,
         "MINIMAX_SETTINGS_UNAVAILABLE",
@@ -1079,7 +1100,7 @@ function registerJarvisIpc({
       return safePublicCallAsync(
         async () => {
           await environmentManager.clearMiniMaxKey();
-          return miniMaxConfig();
+          return miniMaxConfig({ force: true });
         },
         normalizeMiniMaxConfig,
         "MINIMAX_SETTINGS_UNAVAILABLE",

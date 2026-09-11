@@ -48,25 +48,6 @@ let cachedGpuList = null;
 
 const LIVE_QUERY_TIMEOUT_MS = 5_000;
 const WINDOWS_ACTIVE_GPU_PROCESS_MIN_PCT = 10;
-const WINDOWS_GPU_ENGINE_QUERY = String.raw`
-$ErrorActionPreference = "Stop"
-$totals = @{}
-Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine |
-  ForEach-Object {
-    if ($_.Name -match "^pid_(\d+)_" -and $_.UtilizationPercentage -ne $null) {
-      $pidValue = [int]$Matches[1]
-      $utilization = [double]$_.UtilizationPercentage
-      if (-not $totals.ContainsKey($pidValue)) { $totals[$pidValue] = 0.0 }
-      $totals[$pidValue] += $utilization
-    }
-  }
-$totals.GetEnumerator() |
-  Sort-Object Name |
-  ForEach-Object {
-    $bounded = [Math]::Min(100, [Math]::Max(0, [Math]::Round([double]$_.Value)))
-    [Console]::Out.WriteLine(("{0},{1}" -f $_.Key, $bounded))
-  }
-`;
 
 function parseInteger(value) {
   const parsed = Number.parseInt(String(value).trim(), 10);
@@ -166,41 +147,52 @@ function parseNvidiaSmiTelemetry({
   };
 }
 
-function parseWindowsGpuEngineTelemetry(output) {
-  const utilizationByPid = new Map();
+function parseNvidiaPmonMetric(value) {
+  if (String(value).trim() === "-") return 0;
+  const parsed = parseInteger(value);
+  return parsed !== null && parsed <= 100 ? parsed : null;
+}
+
+function parseNvidiaPmonTelemetry(
+  output,
+  gpus,
+  activeProcessMinPct = WINDOWS_ACTIVE_GPU_PROCESS_MIN_PCT
+) {
+  const gpuUuidByIndex = new Map(gpus.map((gpu) => [gpu.index, gpu.uuid]));
+  const processes = [];
   for (const line of String(output ?? "")
     .trim()
     .split(/\r?\n/u)
-    .filter(Boolean)) {
-    const fields = line.split(",").map((field) => field.trim());
-    const pid = parseInteger(fields[0]);
-    const utilizationPct = parseInteger(fields[1]);
-    if (fields.length !== 2 || pid === null || utilizationPct === null || utilizationPct > 100) {
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && !entry.startsWith("#"))) {
+    const fields = line.split(/\s+/u);
+    const gpuIndex = parseInteger(fields[0]);
+    const pid = parseInteger(fields[1]);
+    const engineMetrics = fields.slice(3, 9).map(parseNvidiaPmonMetric);
+    const usedVramMb = fields[9] === "-" ? 0 : parseInteger(fields[9]);
+    if (
+      fields.length < 11 ||
+      gpuIndex === null ||
+      pid === null ||
+      !gpuUuidByIndex.has(gpuIndex) ||
+      engineMetrics.length !== 6 ||
+      engineMetrics.some((value) => value === null) ||
+      usedVramMb === null
+    ) {
       return null;
     }
-    utilizationByPid.set(pid, utilizationPct);
-  }
-  return utilizationByPid;
-}
 
-function parseNvidiaProcessIdentities(processOutput, knownGpuUuids) {
-  const identities = [];
-  for (const line of String(processOutput ?? "")
-    .trim()
-    .split(/\r?\n/u)
-    .filter(Boolean)) {
-    const fields = line.split(",").map((field) => field.trim());
-    const pid = parseInteger(fields[0]);
-    if (fields.length !== 3 || pid === null || !knownGpuUuids.has(fields[1])) {
-      return null;
+    const utilizationPct = Math.max(...engineMetrics);
+    if (utilizationPct >= activeProcessMinPct) {
+      processes.push({
+        pid,
+        gpuUuid: gpuUuidByIndex.get(gpuIndex),
+        usedVramMb,
+        utilizationPct,
+      });
     }
-    identities.push({
-      pid,
-      gpuUuid: fields[1],
-      usedVramMb: parseInteger(fields[2]),
-    });
   }
-  return identities;
+  return processes;
 }
 
 function execNvidiaQuery(execFileImpl, args) {
@@ -217,41 +209,21 @@ function execNvidiaQuery(execFileImpl, args) {
   });
 }
 
-function execWindowsGpuEngineQuery(execFileImpl) {
-  return new Promise((resolve, reject) => {
-    execFileImpl(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_GPU_ENGINE_QUERY],
-      { timeout: LIVE_QUERY_TIMEOUT_MS, windowsHide: true },
-      (error, stdout) => {
-        if (error) reject(error);
-        else resolve(stdout);
-      }
-    );
-  });
+function execNvidiaPmonQuery(execFileImpl) {
+  return execNvidiaQuery(execFileImpl, ["pmon", "-c", "1", "-s", "um"]);
 }
 
-function buildWindowsWddmTelemetry({
+function buildWindowsPmonTelemetry({
   parsed,
-  processOutput,
-  engineOutput,
+  pmonOutput,
   ownedPids,
   activeProcessMinPct = WINDOWS_ACTIVE_GPU_PROCESS_MIN_PCT,
 }) {
-  const knownGpuUuids = new Set(parsed.gpus.map((gpu) => gpu.uuid));
-  const identities = parseNvidiaProcessIdentities(processOutput, knownGpuUuids);
-  const utilizationByPid = parseWindowsGpuEngineTelemetry(engineOutput);
-  if (!identities || !utilizationByPid) return parsed;
+  const processes = parseNvidiaPmonTelemetry(pmonOutput, parsed.gpus, activeProcessMinPct);
+  if (!processes) return parsed;
 
   const normalizedOwnedPids = [...new Set(ownedPids.filter((pid) => parseInteger(pid) === pid))];
   const owned = new Set(normalizedOwnedPids);
-  const processes = identities
-    .map((identity) => ({
-      ...identity,
-      usedVramMb: identity.usedVramMb ?? 0,
-      utilizationPct: utilizationByPid.get(identity.pid) ?? 0,
-    }))
-    .filter((entry) => entry.utilizationPct >= activeProcessMinPct);
   return {
     telemetryAvailable: true,
     processTelemetryAvailable: true,
@@ -259,7 +231,7 @@ function buildWindowsWddmTelemetry({
     processes,
     ownedPids: normalizedOwnedPids,
     externalGpuBusy: processes.some((entry) => !owned.has(entry.pid)),
-    telemetrySource: "windows_wddm",
+    telemetrySource: "nvidia_pmon",
   };
 }
 
@@ -311,11 +283,10 @@ async function sampleNvidiaGpuTelemetry({
   }
 
   try {
-    const engineOutput = await execWindowsGpuEngineQuery(execFileImpl);
-    return buildWindowsWddmTelemetry({
+    const pmonOutput = await execNvidiaPmonQuery(execFileImpl);
+    return buildWindowsPmonTelemetry({
       parsed,
-      processOutput,
-      engineOutput,
+      pmonOutput,
       ownedPids,
     });
   } catch {
@@ -367,10 +338,9 @@ function listNvidiaGpus() {
 module.exports = {
   detectNvidiaGpu,
   listNvidiaGpus,
-  buildWindowsWddmTelemetry,
+  buildWindowsPmonTelemetry,
+  parseNvidiaPmonTelemetry,
   parseNvidiaSmiTelemetry,
-  parseNvidiaProcessIdentities,
-  parseWindowsGpuEngineTelemetry,
   sampleNvidiaGpuTelemetry,
   LIVE_QUERY_TIMEOUT_MS,
   WINDOWS_ACTIVE_GPU_PROCESS_MIN_PCT,

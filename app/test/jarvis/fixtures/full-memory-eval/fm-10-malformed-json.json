@@ -1,0 +1,61 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-10-malformed-json",
+  "coverage": ["malformed-json"],
+  "sessionId": "session-fm-10",
+  "request": {
+    "inputHash": "938bd9cc7333ebdea8b0f5f846fc38058069283396aecb5af37a758d808b7f2d",
+    "allowedSegmentIds": ["seg-fm-10-1"],
+    "allowedOwnerLabels": ["SELF"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-10-1",
+          "startedAt": 1000,
+          "endedAt": 2600,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.9,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "synthetic transcript for parser coverage."
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-10-1",
+      "expectedDisposition": "rejected",
+      "expectedErrorCode": "invalid_json",
+      "modelArguments": "{\"schemaVersion\":}"
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-10",
+      "inputHash": "938bd9cc7333ebdea8b0f5f846fc38058069283396aecb5af37a758d808b7f2d",
+      "requestBytes": 820,
+      "responseBytes": 120,
+      "durationMs": 6,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 40,
+      "outputTokens": 8,
+      "errorCode": "invalid_json",
+      "validatorIssueCode": "envelope.tool_arguments.json"
+    }
+  ],
+  "rendered": {
+    "memories": [],
+    "topics": [],
+    "todos": []
+  }
+}

@@ -1,11 +1,18 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
+const nodeFs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const JarvisService = require("../../src/jarvis/main/JarvisService");
 const JarvisRepository = require("../../src/jarvis/main/JarvisRepository");
 const PreviewAudioRing = require("../../src/jarvis/main/PreviewAudioRing");
+
+const fs = Object.create(nodeFs);
+fs.rmSync = (target, options) =>
+  nodeFs.rmSync(
+    target,
+    options?.recursive ? { ...options, maxRetries: 5, retryDelay: 50 } : options
+  );
 
 function deferred() {
   let resolve;
@@ -224,7 +231,7 @@ test("rejects capture startup while the process-wide migration gate is closed", 
   }
 });
 
-test("rebuilds and validates the emergency reserve before capture start and resume", () => {
+test("rebuilds and validates the emergency reserve before capture start and resume", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-reserve-lifecycle-"));
   const repository = createRepository();
   let ensureCalls = 0;
@@ -254,7 +261,7 @@ test("rebuilds and validates the emergency reserve before capture start and resu
 
     assert.equal(ensureCalls, 2);
   } finally {
-    service.shutdown();
+    await service.shutdown();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });
@@ -2335,7 +2342,7 @@ test("degraded dual pause and resume retain the recovering lane and gap", () => 
   }
 });
 
-test("resume rejects while all sources are automatically recovering without side effects", () => {
+test("resume rejects while all sources are automatically recovering without side effects", async () => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-all-recovering-resume-"));
   const repository = createRepository();
   let resumeCalls = 0;
@@ -2386,7 +2393,8 @@ test("resume rejects while all sources are automatically recovering without side
     assert.equal(state.sources.mic.state, "reconnecting");
     assert.equal(state.sources.system.state, "reconnecting");
   } finally {
-    service.shutdown();
+    await service.shutdown();
+    await service.whenRetentionIdle();
     fs.rmSync(userDataDir, { recursive: true, force: true });
   }
 });

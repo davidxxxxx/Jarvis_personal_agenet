@@ -1,0 +1,385 @@
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const path = require("node:path");
+const OnDemandModelRuntime = require("./OnDemandModelRuntime");
+const DiarizationSidecarClient = require("./DiarizationSidecarClient");
+const { HYBRID_DIARIZATION_POLICY } = require("./HybridDiarizationPolicy");
+const { buildSpeakerCountConsensus, findOverlapWindows } = require("./DiarizationConsensus");
+const {
+  isAiModelPackPresent,
+  resolveAiModelPackRoot,
+  verifyAiModelPack,
+} = require("./AiModelPackManifest");
+
+const SAFE_SPEAKER = /^[A-Za-z0-9_.-]{1,128}$/;
+const MAX_BOUNDARY_DRIFT_MS = 2;
+const RECOVERABLE_VERIFIER_ERRORS = new Set([
+  "DIARIZATION_BINARY_UNAVAILABLE",
+  "DIARIZATION_MODEL_UNAVAILABLE",
+  "DIARIZATION_SIDECAR_EXIT_NONZERO",
+  "DIARIZATION_SIDECAR_SPAWN_FAILED",
+  "DIARIZATION_SIDECAR_TIMEOUT",
+]);
+
+function codedError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function normalizeTurn(turn, durationMs = null) {
+  const speaker = turn?.speaker ?? turn?.label;
+  const rawStartMs = turn?.startMs ?? turn?.start * 1_000;
+  const rawEndMs = turn?.endMs ?? turn?.end * 1_000;
+  let startMs = Math.round(rawStartMs);
+  let endMs = Math.round(rawEndMs);
+  const boundedDurationMs =
+    Number.isSafeInteger(durationMs) && durationMs > 0 ? durationMs : null;
+  if (
+    typeof speaker !== "string" ||
+    !SAFE_SPEAKER.test(speaker) ||
+    !Number.isFinite(rawStartMs) ||
+    !Number.isFinite(rawEndMs) ||
+    !Number.isSafeInteger(startMs) ||
+    !Number.isSafeInteger(endMs)
+  ) {
+    throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+  }
+  if (startMs < 0) {
+    if (startMs < -MAX_BOUNDARY_DRIFT_MS) {
+      throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+    }
+    startMs = 0;
+  }
+  if (boundedDurationMs !== null) {
+    if (startMs > boundedDurationMs) {
+      const tailDriftMs = startMs - boundedDurationMs;
+      if (tailDriftMs <= MAX_BOUNDARY_DRIFT_MS) {
+        startMs = boundedDurationMs;
+      } else {
+        // A model may emit a padding-only tail that begins after the
+        // authoritative WAV duration. It contains no audio evidence, so omit
+        // only that turn rather than rejecting every valid turn from the
+        // recording.
+        if (endMs <= boundedDurationMs) return null;
+        throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+      }
+    }
+    if (endMs > boundedDurationMs) {
+      if (endMs - boundedDurationMs > MAX_BOUNDARY_DRIFT_MS) {
+        throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+      }
+      endMs = boundedDurationMs;
+    }
+  }
+  if (endMs < startMs) {
+    if (startMs - endMs > MAX_BOUNDARY_DRIFT_MS) {
+      throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+    }
+    const boundaryMs = Math.min(startMs, endMs);
+    startMs = Math.max(0, boundaryMs);
+    endMs = startMs + 1;
+  }
+  // Pyannote may emit a positive sub-millisecond segment whose independently
+  // rounded boundaries collapse onto the same millisecond. Preserve the
+  // evidence as a minimal 1 ms turn instead of discarding the entire long
+  // recording. At the audio tail, move the start back so the correction stays
+  // within the reported duration.
+  if (endMs === startMs) {
+    if (boundedDurationMs !== null && startMs >= boundedDurationMs) {
+      endMs = boundedDurationMs;
+      startMs = Math.max(0, endMs - 1);
+    } else {
+      endMs = startMs + 1;
+    }
+  }
+  if (boundedDurationMs !== null && endMs > boundedDurationMs) {
+    endMs = boundedDurationMs;
+  }
+  if (endMs <= startMs) {
+    throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar returned an invalid turn");
+  }
+  return Object.freeze({ speaker, startMs, endMs });
+}
+
+class HybridDiarizationManager {
+  constructor({
+    packRoot = resolveAiModelPackRoot(),
+    policy = HYBRID_DIARIZATION_POLICY,
+    clientFactory = (options) => new DiarizationSidecarClient(options),
+    verifyPack = verifyAiModelPack,
+    fsImpl = fs,
+    log = () => {},
+    runtime = null,
+    verifierDiarizer = null,
+    evidenceRoot = null,
+  } = {}) {
+    if (typeof packRoot !== "string" || !path.isAbsolute(packRoot)) {
+      throw new TypeError("packRoot must be absolute");
+    }
+    if (!policy || policy.executionDevice !== "cuda" || !Object.isFrozen(policy)) {
+      throw new TypeError("immutable CUDA hybrid policy is required");
+    }
+    if (typeof clientFactory !== "function" || typeof verifyPack !== "function") {
+      throw new TypeError("hybrid diarization dependencies are invalid");
+    }
+    this.packRoot = path.resolve(packRoot);
+    const inferredDataRoot =
+      typeof process.env.JARVIS_DATA_ROOT === "string" &&
+      path.isAbsolute(process.env.JARVIS_DATA_ROOT)
+        ? path.resolve(process.env.JARVIS_DATA_ROOT)
+        : path.resolve(this.packRoot, "..", "..");
+    this.evidenceRoot = path.resolve(
+      evidenceRoot ?? path.join(inferredDataRoot, "recordings-data", "overlap-stems")
+    );
+    const evidenceRelative = path.relative(inferredDataRoot, this.evidenceRoot);
+    if (
+      evidenceRelative.startsWith("..") ||
+      path.isAbsolute(evidenceRelative) ||
+      evidenceRelative === ""
+    ) {
+      throw new TypeError("overlap evidence root must be inside the Jarvis data root");
+    }
+    this.policy = policy;
+    this.verifyPack = verifyPack;
+    this.fs = fsImpl;
+    this.log = log;
+    this.loadedGpuUuid = null;
+    if (verifierDiarizer !== null && typeof verifierDiarizer.diarizeStrict !== "function") {
+      throw new TypeError("verifierDiarizer.diarizeStrict must be a function");
+    }
+    this.verifierDiarizer = verifierDiarizer;
+    this.verifierCircuitOpen = false;
+    this.verifierFailureCode = null;
+    this.verifiedPack = null;
+    this.modelRuntime =
+      runtime ??
+      new OnDemandModelRuntime({
+        unloadDelayMs: policy.unloadDelayMs,
+        load: async (loadContext) => {
+          this.verifiedPack = await this.verifyPack({ root: this.packRoot });
+          const selectedGpuUuid = loadContext?.selectedGpuUuid ?? null;
+          const client = clientFactory({
+            packRoot: this.packRoot,
+            log: this.log,
+            selectedGpuUuid,
+          });
+          await client.start();
+          const selfTest = await client.request("self_test", { loadPrimary: true });
+          if (selfTest?.cuda !== true || selfTest?.primaryLoaded !== true) {
+            await client.stop().catch(() => {});
+            throw codedError(
+              "DIARIZATION_CUDA_SELF_TEST_FAILED",
+              "offline diarization GPU self-test did not complete"
+            );
+          }
+          this.loadedGpuUuid = selectedGpuUuid;
+          return client;
+        },
+        unload: async (client) => {
+          this.loadedGpuUuid = null;
+          await client.stop();
+        },
+      });
+  }
+
+  isAvailable() {
+    return isAiModelPackPresent({ root: this.packRoot, fsImpl: this.fs });
+  }
+
+  async getModelArtifactSha256() {
+    this.verifiedPack ??= await this.verifyPack({ root: this.packRoot });
+    return this.verifiedPack.manifestSha256;
+  }
+
+  async diarizeStrict(
+    wavPath,
+    {
+      executionContext = null,
+      enableOverlapSeparation = true,
+      releaseHighMemoryResources = false,
+      artifactKey = null,
+    } = {}
+  ) {
+    if (typeof wavPath !== "string" || !path.isAbsolute(wavPath)) {
+      throw new TypeError("wavPath must be absolute");
+    }
+    if (executionContext?.device !== "cuda") {
+      throw codedError(
+        "DIARIZATION_CUDA_REQUIRED",
+        "hybrid final diarization requires CUDA admission"
+      );
+    }
+    const selectedGpuUuid = executionContext.selectedGpuUuid ?? null;
+    const rawArtifactKey =
+      artifactKey === null
+        ? `overlap_${crypto.createHash("sha256").update(path.resolve(wavPath)).digest("hex").slice(0, 32)}`
+        : artifactKey;
+    if (typeof rawArtifactKey !== "string" || !/^[A-Za-z0-9_-]{1,180}$/.test(rawArtifactKey)) {
+      throw new TypeError("overlap artifactKey must be a safe identifier");
+    }
+    // Sidecar output paths are durable database evidence. A stable chunk key is
+    // intentionally reused by retries within one policy, but it must not reuse
+    // the same UNIQUE path after a newer policy reprocesses the retained audio.
+    const safeArtifactKey = `stem_${crypto
+      .createHash("sha256")
+      .update(`${this.policy.policyId}\0${rawArtifactKey}`)
+      .digest("hex")}`;
+    if (
+      this.modelRuntime.status().loaded &&
+      this.loadedGpuUuid !== null &&
+      selectedGpuUuid !== this.loadedGpuUuid
+    ) {
+      await this.modelRuntime.dispose();
+    }
+    const result = await this.modelRuntime.run(
+      (client) =>
+        client.request("diarize", {
+          audioPath: path.resolve(wavPath),
+          minimumSpeakers: this.policy.minimumSpeakers,
+          maximumSpeakers: this.policy.maximumSpeakers,
+          verifierMaximumSpeakers: this.policy.verifierMaximumSpeakers,
+          overlapPaddingMs: this.policy.overlapPaddingMs,
+          enableOverlapSeparation: enableOverlapSeparation !== false,
+          releaseOverlapSeparatorAfterRequest: releaseHighMemoryResources === true,
+          overlapOutputRoot: this.evidenceRoot,
+          artifactKey: safeArtifactKey,
+          selectedGpuUuid,
+        }),
+      { selectedGpuUuid }
+    );
+    if (!result || typeof result !== "object" || !Array.isArray(result.turns)) {
+      throw codedError("DIARIZATION_SIDECAR_INVALID_RESULT", "sidecar result is incomplete");
+    }
+    const turns = result.turns
+      .map((turn) => normalizeTurn(turn, result.durationMs))
+      .filter((turn) => turn !== null);
+    const primaryCount = new Set(turns.map((turn) => turn.speaker)).size;
+    let verifierCount = result.verifierCount ?? null;
+    let verifierState = verifierCount === null ? "not_run" : "completed";
+    if (
+      verifierCount === null &&
+      this.verifierDiarizer !== null &&
+      !this.verifierCircuitOpen
+    ) {
+      try {
+        const verifierTurns = await this.verifierDiarizer.diarizeStrict(wavPath);
+        if (!Array.isArray(verifierTurns)) {
+          throw codedError(
+            "DIARIZATION_VERIFIER_INVALID_RESULT",
+            "speaker count verifier returned no turns"
+          );
+        }
+        verifierCount = new Set(
+          verifierTurns.map((turn) => turn?.speaker ?? turn?.label ?? turn?.rawLabel).filter(Boolean)
+        ).size;
+        verifierState = "completed";
+      } catch (error) {
+        if (!RECOVERABLE_VERIFIER_ERRORS.has(error?.code)) throw error;
+        this.verifierCircuitOpen = true;
+        this.verifierFailureCode = error.code;
+        verifierState = "unavailable";
+        this.log({
+          phase: "diarization_verifier_degraded",
+          error,
+        });
+      }
+    } else if (verifierCount === null && this.verifierCircuitOpen) {
+      verifierState = "unavailable";
+    }
+    const consensus = buildSpeakerCountConsensus({
+      primaryCount,
+      verifierCount,
+      verifierLimit: this.policy.verifierMaximumSpeakers,
+    });
+    const durationMs = Number.isSafeInteger(result.durationMs) ? result.durationMs : null;
+    const overlapWindows = findOverlapWindows(turns, {
+      paddingMs: this.policy.overlapPaddingMs,
+      durationMs,
+    });
+    const rawSeparation = result.overlapSeparation ?? {
+      state: overlapWindows.length === 0 ? "not_needed" : "pending",
+      processed: 0,
+      total: overlapWindows.length,
+      stems: [],
+    };
+    const stems = Array.isArray(rawSeparation.stems)
+      ? rawSeparation.stems.map((stem) => {
+          const resolvedPath = path.resolve(String(stem?.path ?? ""));
+          const relative = path.relative(this.evidenceRoot, resolvedPath);
+          if (
+            relative.startsWith("..") ||
+            path.isAbsolute(relative) ||
+            !/^[0-9a-f]{64}$/.test(stem?.fileSha256 ?? "") ||
+            !/^[0-9a-f]{64}$/.test(stem?.pcmSha256 ?? "") ||
+            !Number.isSafeInteger(stem?.windowIndex) ||
+            !Number.isSafeInteger(stem?.stemIndex) ||
+            !Number.isSafeInteger(stem?.startMs) ||
+            !Number.isSafeInteger(stem?.endMs) ||
+            stem.endMs <= stem.startMs ||
+            stem.sampleRate !== 16_000 ||
+            stem.channels !== 1 ||
+            typeof stem.rms !== "number" ||
+            !Number.isFinite(stem.rms) ||
+            stem.rms < 0
+          ) {
+            throw codedError(
+              "DIARIZATION_SIDECAR_INVALID_RESULT",
+              "overlap separator returned invalid stem evidence"
+            );
+          }
+          return Object.freeze({ ...stem, path: resolvedPath });
+        })
+      : [];
+    const overlapSeparation = Object.freeze({ ...rawSeparation, stems: Object.freeze(stems) });
+    const metadata = Object.freeze({
+      schemaVersion: 1,
+      stage: "final",
+      pipeline: this.policy.policyId,
+      executionDevice: "cuda",
+      speakerCount: consensus,
+      verifierState,
+      overlapWindows,
+      overlapSeparation,
+      models: Object.freeze({
+        primary: this.policy.models.primary.id,
+        verifier: verifierCount === null ? null : this.policy.models.verifier.id,
+        separator: result.overlapSeparation?.processed > 0 ? this.policy.models.separator.id : null,
+      }),
+    });
+    Object.defineProperty(turns, "metadata", {
+      value: metadata,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+    return turns;
+  }
+
+  status() {
+    return Object.freeze({
+      available: this.isAvailable(),
+      packRoot: this.packRoot,
+      policyId: this.policy.policyId,
+      verifierCircuitOpen: this.verifierCircuitOpen,
+      verifierFailureCode: this.verifierFailureCode,
+      ...this.modelRuntime.status(),
+    });
+  }
+
+  ownedPids() {
+    return this.modelRuntime.ownedPids?.() ?? [];
+  }
+
+  async dispose() {
+    try {
+      return await this.modelRuntime.dispose();
+    } finally {
+      this.verifierCircuitOpen = false;
+      this.verifierFailureCode = null;
+    }
+  }
+}
+
+module.exports = HybridDiarizationManager;
+module.exports.normalizeTurn = normalizeTurn;

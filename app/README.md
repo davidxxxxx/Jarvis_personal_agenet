@@ -1,3 +1,6 @@
+> This file preserves the upstream OpenWhispr guide. For Jarvis Memory features, source setup,
+> module boundaries and release status, start with the [Jarvis repository guide](../README.md).
+
 <p align="center">
   <img src="src/assets/logo.svg" alt="OpenWhispr" width="120" />
 </p>

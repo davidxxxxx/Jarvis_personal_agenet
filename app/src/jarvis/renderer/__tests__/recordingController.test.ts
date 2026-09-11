@@ -1018,6 +1018,23 @@ describe("Jarvis recording controller", () => {
     expect(harness.getSession()).toMatchObject({ id: "s1", status: "paused" });
   });
 
+  it("publishes finalizing while upstream stop is still pending", async () => {
+    const harness = createHarness({ status: "recording", segments: [stableSegment] });
+    const pendingStop = deferred<StopRecordingResult>();
+    harness.stopRecording.mockReturnValueOnce(pendingStop.promise);
+    const controller = createRecordingController(harness.deps);
+
+    const finishPromise = controller.finish();
+
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "finalizing" });
+    expect(harness.jarvis.finishCapture).not.toHaveBeenCalled();
+
+    pendingStop.resolve({ diarizationSessionId: null, success: true });
+    await finishPromise;
+
+    expect(harness.getSession()).toMatchObject({ id: "s1", status: "completed" });
+  });
+
   it("stops only the renderer upstream for a durable main-process power suspend", async () => {
     const harness = createHarness({ status: "recording" });
     const controller = createRecordingController(harness.deps);

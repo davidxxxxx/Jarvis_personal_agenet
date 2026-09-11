@@ -21,11 +21,34 @@ const {
   SESSION_DIARIZATION_POLICY,
   buildDiarizationJobKey,
 } = require("../../src/jarvis/main/SessionDiarizationPolicy");
+const { HYBRID_DIARIZATION_POLICY } = require("../../src/jarvis/main/HybridDiarizationPolicy");
+const {
+  SPEAKER_MODEL_KEYS,
+  getSpeakerModelManifest,
+} = require("../../src/jarvis/main/SpeakerModelManifest");
 
 const MODEL_ID = "3dspeaker-campplus-voxceleb-16k-v1";
+const PRIMARY_MODEL = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.PRIMARY);
+const REVIEW_MODEL = getSpeakerModelManifest(SPEAKER_MODEL_KEYS.REVIEW);
 
 function vector(...components) {
   const value = new Float32Array(512);
+  components.forEach((component, index) => {
+    value[index] = component;
+  });
+  return value;
+}
+
+function primaryVector(...components) {
+  const value = new Float32Array(PRIMARY_MODEL.embeddingDimension);
+  components.forEach((component, index) => {
+    value[index] = component;
+  });
+  return value;
+}
+
+function identityVector(manifest, ...components) {
+  const value = new Float32Array(manifest.embeddingDimension);
   components.forEach((component, index) => {
     value[index] = component;
   });
@@ -278,6 +301,112 @@ function seedReadyEvidence(t, { trackCount = 2, completeTracks = trackCount } = 
   return { repository, runIds, clusters };
 }
 
+test("identity snapshot exposes prior anonymous dual-model evidence as a cross-session profile", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  const anonymousRef = "anonymous-speaker-1234567890abcdef1234567890abcdef";
+  repository.db.exec(`
+    INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+    VALUES ('session-anonymous-history', 100, 900, 'completed', 100);
+    INSERT INTO audio_tracks (
+      id, session_id, source_type, application_key, application_display_name,
+      sample_rate, channels, started_at, ended_at, state
+    ) VALUES (
+      'track-anonymous-history', 'session-anonymous-history', 'system',
+      'kook', 'KOOK', 24000, 1, 100, 900, 'ended'
+    );
+    INSERT INTO speaker_clusters (
+      id, session_id, track_id, local_label, model_id, embedding,
+      speech_ms, window_count, quality_score, link_state, created_at, updated_at
+    ) VALUES (
+      'cluster-anonymous-history', 'session-anonymous-history',
+      'track-anonymous-history', 'speaker_1', '${MODEL_ID}', zeroblob(2048),
+      15000, 3, 0.9, 'unknown', 900, 900
+    );
+    INSERT INTO speaker_diarization_runs (
+      id, session_id, track_id, transcript_revision, policy_id,
+      diarizer_model_id, embedding_model_id, model_artifact_sha256,
+      embedding_dimension, sample_rate, input_version, execution_device,
+      commit_sequence, created_at, completed_at
+    ) VALUES (
+      'run-anonymous-history', 'session-anonymous-history',
+      'track-anonymous-history', '${"a".repeat(64)}',
+      '${SESSION_DIARIZATION_POLICY.policyId}',
+      'sherpa-segmentation+3dspeaker-campplus', '${MODEL_ID}',
+      '${"b".repeat(64)}', 512, 16000, 1, 'cpu', 99, 900, 900
+    );
+    INSERT INTO speaker_diarization_run_clusters (
+      run_id, cluster_id, local_label, embedding, speech_ms,
+      window_count, quality_score, first_appearance_at
+    ) VALUES (
+      'run-anonymous-history', 'cluster-anonymous-history', 'speaker_1',
+      zeroblob(2048), 15000, 3, 0.9, 100
+    );
+  `);
+  repository.replaceSpeakerClusterModelEmbeddings({
+    clusterId: "cluster-anonymous-history",
+    sourceKind: "application",
+    attributionState: "exact",
+    overlapDetected: false,
+    echoDetected: false,
+    speechMs: 15_000,
+    windowCount: 3,
+    qualityScore: 0.9,
+    createdAt: 900,
+    models: [
+      {
+        ...PRIMARY_MODEL,
+        embedding: identityVector(PRIMARY_MODEL, 1),
+        qualityScore: 0.9,
+      },
+      {
+        ...REVIEW_MODEL,
+        embedding: identityVector(REVIEW_MODEL, 1),
+        qualityScore: 0.9,
+      },
+    ],
+  });
+  repository.applySystemSpeakerResolutions({
+    id: "resolution-run-anonymous-history",
+    sessionId: "session-anonymous-history",
+    diarizationRevision: "c".repeat(64),
+    profileRevision: "d".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    evidenceRunIds: ["run-anonymous-history"],
+    results: [
+      {
+        evidenceRunId: "run-anonymous-history",
+        clusterId: "cluster-anonymous-history",
+        candidatePersonId: null,
+        candidatePersonRef: anonymousRef,
+        state: "unknown",
+        score: 0.9,
+        margin: 0.1,
+        reason: "dual_model_anonymous_group",
+      },
+    ],
+    at: 900,
+  });
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 20_000,
+  });
+  const anonymous = snapshot.samples.filter((sample) => sample.candidatePersonRef === anonymousRef);
+  assert.equal(anonymous.length, 2);
+  assert.deepEqual(
+    anonymous.map((sample) => sample.modelId).sort(),
+    [PRIMARY_MODEL.modelId, REVIEW_MODEL.modelId].sort()
+  );
+  assert.equal(
+    anonymous.every((sample) => sample.personId === null),
+    true
+  );
+  assert.equal(
+    anonymous.every((sample) => sample.sourceKind === "system_anonymous"),
+    true
+  );
+});
+
 test("v22 persists revisioned identity resolution history", (t) => {
   const repository = fixture(t);
   assert.ok(TARGET_VERSION >= 22);
@@ -321,6 +450,39 @@ test("v22 persists revisioned identity resolution history", (t) => {
   assert.deepEqual(
     { unique: systemIndex.unique, partial: systemIndex.partial },
     { unique: 1, partial: 1 }
+  );
+});
+
+test("v46 repairs confirmed speaker projections created before system resolution synced transcripts", (t) => {
+  const repository = fixture(t);
+  assert.ok(TARGET_VERSION >= 46);
+  repository.renamePerson({ personId: "person-a", displayName: "Person A" });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version
+    ) VALUES (
+      'segment-v45', 'session-resolution', 1000, 4000, 'speaker_1',
+      'legacy projection evidence', 0.9, 1, 'track-resolution', 'mic',
+      'provisional', 1
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-v45');
+    UPDATE speaker_clusters
+    SET person_id = 'person-a', link_state = 'confirmed'
+    WHERE id = 'cluster-resolution';
+    PRAGMA user_version = 45;
+  `);
+
+  assert.deepEqual(applyJarvisMigrations(repository.db), {
+    fromVersion: 45,
+    toVersion: TARGET_VERSION,
+  });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-v45"),
+    { person_id: "person-a", speaker_label: "Person A" }
   );
 });
 
@@ -484,6 +646,40 @@ test("schema rejects cross-session evidence even when individual foreign keys ex
   );
 });
 
+test("unknown dual-model matches persist a local anonymous reference without creating a person", (t) => {
+  const repository = fixture(t);
+  const batch = {
+    id: "resolution-run-anonymous",
+    sessionId: "session-resolution",
+    diarizationRevision: "1".repeat(64),
+    profileRevision: "2".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    evidenceRunIds: ["run-resolution"],
+    results: [
+      {
+        evidenceRunId: "run-resolution",
+        clusterId: "cluster-resolution",
+        candidatePersonId: null,
+        candidatePersonRef: "anonymous-speaker-local",
+        state: "unknown",
+        score: 0.91,
+        margin: 0.08,
+        reason: "dual_model_anonymous_group",
+      },
+    ],
+    at: 10_000,
+  };
+
+  const first = repository.applySystemSpeakerResolutions(batch);
+  const retry = repository.applySystemSpeakerResolutions(batch);
+
+  assert.deepEqual(retry, first);
+  assert.equal(first[0].candidatePersonId, null);
+  assert.equal(first[0].candidatePersonRef, "anonymous-speaker-local");
+  assert.equal(repository.getSpeakerCluster("cluster-resolution").linkState, "unknown");
+  assert.equal(repository.db.prepare("SELECT count(*) AS count FROM people").get().count, 0);
+});
+
 test("resolution provenance and projection survive repository restart", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-identity-resolution-"));
   const databasePath = path.join(directory, "jarvis.db");
@@ -561,6 +757,18 @@ test("resolution provenance and projection survive repository restart", (t) => {
 test("system resolution persists provenance without learning and protects user corrections", (t) => {
   const repository = fixture(t);
   addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version, model_version, completed_at
+    ) VALUES (
+      'segment-resolution', 'session-resolution', 1000, 4000, 'speaker_1',
+      'identity projection evidence', 0.9, 1, 'track-resolution', 'mic',
+      'provisional', 1, NULL, NULL
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-resolution');
+  `);
   const revisions = {
     diarizationRevision: "a".repeat(64),
     profileRevision: "b".repeat(64),
@@ -588,6 +796,12 @@ test("system resolution persists provenance without learning and protects user c
       .get(),
     { person_id: "person-a", link_state: "confirmed", match_score: 0.9, match_margin: 0.2 }
   );
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-resolution"),
+    { person_id: "person-a", speaker_label: "person-a" }
+  );
   assert.equal(
     repository.db.prepare("SELECT count(*) AS count FROM voice_profile_samples").get().count,
     beforeSamples
@@ -614,6 +828,49 @@ test("system resolution persists provenance without learning and protects user c
   assert.equal(protectedResult.projectionApplied, false);
   assert.equal(protectedResult.reason, "no_candidate");
   assert.equal(repository.getSpeakerCluster("cluster-resolution").linkState, "confirmed");
+});
+
+test("system suggestions remain candidate-only and do not project a person into transcripts", (t) => {
+  const repository = fixture(t);
+  addPersonAndSample(repository, { personId: "person-a", embedding: vector(1) });
+  repository.db.exec(`
+    INSERT INTO transcript_segments (
+      id, session_id, started_at, ended_at, speaker_label, text, confidence,
+      is_stable, track_id, source_type, result_kind, version
+    ) VALUES (
+      'segment-suggested', 'session-resolution', 1000, 4000, 'speaker_1',
+      'suggestion evidence', 0.9, 1, 'track-resolution', 'mic', 'provisional', 1
+    );
+    INSERT INTO speaker_cluster_segments (cluster_id, transcript_segment_id)
+    VALUES ('cluster-resolution', 'segment-suggested');
+  `);
+
+  repository.applySystemSpeakerResolution({
+    evidenceRunId: "run-resolution",
+    clusterId: "cluster-resolution",
+    candidatePersonId: "person-a",
+    state: "suggested",
+    score: 0.78,
+    margin: 0.1,
+    reason: "suggested",
+    diarizationRevision: "e".repeat(64),
+    profileRevision: "f".repeat(64),
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    at: 20_000,
+  });
+
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, link_state FROM speaker_clusters WHERE id = ?")
+      .get("cluster-resolution"),
+    { person_id: "person-a", link_state: "suggested" }
+  );
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT person_id, speaker_label FROM transcript_segments WHERE id = ?")
+      .get("segment-suggested"),
+    { person_id: null, speaker_label: "speaker_1" }
+  );
 });
 
 test("same-revision user rejection is durable and exact-revision scoped", (t) => {
@@ -940,7 +1197,7 @@ test("rejection, exact-job requeue, and session wake are atomic across restart",
 
 test("policy and immutable job key are exact and restart parseable", () => {
   assert.deepEqual(SPEAKER_IDENTITY_RESOLUTION_POLICY, {
-    id: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@1",
+    id: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
     modelId: MODEL_ID,
     minimumSpeechMs: 12_000,
     minimumWindows: 3,
@@ -1582,6 +1839,46 @@ test("snapshot requires every current diarization job terminal and revisions are
   );
 });
 
+test("completed primary tracks can start identity resolution while an application track waits", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 2, completeTracks: 1 });
+  repository.db.exec(`
+    UPDATE audio_tracks
+    SET application_key = 'kook', application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-ready-1';
+  `);
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0"]);
+  assert.equal(
+    repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 }).enqueued,
+    1
+  );
+});
+
+test("completed application diarization joins the next identity resolution revision", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 2, completeTracks: 2 });
+  repository.db.exec(`
+    UPDATE audio_tracks
+    SET application_key = 'kook', application_display_name = 'KOOK', capture_generation = 1
+    WHERE id = 'track-ready-1';
+  `);
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0", "run-ready-1"]);
+});
+
 test("ready snapshot uses per-run evidence and enqueue identity is strict and idempotent", (t) => {
   const { repository, clusters } = seedReadyEvidence(t, { trackCount: 1 });
   addPersonAndSample(repository, { personId: "person-a", embedding: vector(1, 0) });
@@ -1609,6 +1906,7 @@ test("ready snapshot uses per-run evidence and enqueue identity is strict and id
   const repeated = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 });
   assert.equal(queued.enqueued, 1);
   assert.equal(repeated.enqueued, 0);
+  assert.equal(queued.job.priority, 29);
   assert.equal(
     queued.job.input_hash,
     buildIdentityResolutionJobKey({
@@ -1617,6 +1915,37 @@ test("ready snapshot uses per-run evidence and enqueue identity is strict and id
       profileRevision: first.profileRevision,
       policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
     })
+  );
+});
+
+test("zero-evidence failed application tracks do not block identity resolution", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.db
+    .prepare(
+      `
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, application_key, application_display_name,
+        capture_generation, strategy, sample_rate, channels, started_at, ended_at,
+        state, failure_code
+      ) VALUES (
+        'failed-app-track', 'session-ready', 'system', 'kook', 'KOOK', 7,
+        'wasapi-application-loopback', 24000, 1, 2000, 2000, 'failed',
+        'activation_failed_0x88890004'
+      )
+    `
+    )
+    .run();
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16000,
+    policy: SPEAKER_IDENTITY_RESOLUTION_POLICY,
+  });
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, ["run-ready-0"]);
+  assert.equal(
+    repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16000 }).enqueued,
+    1
   );
 });
 
@@ -1661,6 +1990,251 @@ test("worker revalidates immutable revisions and commits a complete resolution b
     updatedAt: 18000,
   });
   await assert.rejects(() => worker.run(queued.job), { code: "IDENTITY_RESOLUTION_SUPERSEDED" });
+});
+
+test("worker distinguishes pending identity dependencies from terminal diarization failure", async (t) => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16_000 });
+  const worker = new SpeakerIdentityResolutionWorker({ repository, clock: () => 17_000 });
+  repository.db
+    .prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, job_type, state, priority,
+         input_hash, input_version, model_version, created_at
+       ) VALUES (
+         'newer-diarization', 'session-ready', 'track-ready-0', 'diarize_track',
+         'pending', 35, ?, ?, ?, 16500
+       )`
+    )
+    .run(
+      buildDiarizationJobKey({
+        sessionId: "session-ready",
+        trackId: "track-ready-0",
+        evidenceRevision: "b".repeat(64),
+        policyId: SESSION_DIARIZATION_POLICY.policyId,
+      }),
+      SESSION_DIARIZATION_POLICY.inputVersion,
+      SESSION_DIARIZATION_POLICY.policyId
+    );
+
+  let snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 17_000,
+  });
+  assert.deepEqual(
+    { eligible: snapshot.eligible, reason: snapshot.reason, dependencyState: snapshot.dependencyState },
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "pending",
+    }
+  );
+  await assert.rejects(() => worker.run(queued.job), {
+    code: "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE",
+  });
+
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'DIARIZATION_VALIDATION_FAILED', completed_at = 17500
+       WHERE id = 'newer-diarization'`
+    )
+    .run();
+  snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 18_000,
+  });
+  assert.deepEqual(
+    { eligible: snapshot.eligible, reason: snapshot.reason, dependencyState: snapshot.dependencyState },
+    {
+      eligible: false,
+      reason: "diarization_incomplete",
+      dependencyState: "terminal",
+    }
+  );
+  await assert.rejects(() => worker.run(queued.job), {
+    code: "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
+  });
+});
+
+test("v6 identity batches cover only eligible clusters from the selected current runs", async (t) => {
+  const SpeakerIdentityResolutionWorker = require("../../src/jarvis/main/SpeakerIdentityResolutionWorker");
+  const { repository, runIds, clusters } = seedReadyEvidence(t, { trackCount: 2 });
+  const runs = repository.db
+    .prepare("SELECT * FROM speaker_diarization_runs WHERE session_id = ? ORDER BY track_id")
+    .all("session-ready");
+  for (const run of runs) {
+    const inputHash = buildDiarizationJobKey({
+      sessionId: run.session_id,
+      trackId: run.track_id,
+      evidenceRevision: run.transcript_revision,
+      policyId: HYBRID_DIARIZATION_POLICY.policyId,
+    });
+    repository.db
+      .prepare("UPDATE speaker_diarization_runs SET policy_id = ?, input_version = ? WHERE id = ?")
+      .run(HYBRID_DIARIZATION_POLICY.policyId, HYBRID_DIARIZATION_POLICY.inputVersion, run.id);
+    repository.db
+      .prepare(
+        `UPDATE processing_jobs
+         SET input_hash = ?, input_version = ?, model_version = ?
+         WHERE session_id = ? AND track_id = ? AND job_type = 'diarize_track'`
+      )
+      .run(
+        inputHash,
+        HYBRID_DIARIZATION_POLICY.inputVersion,
+        HYBRID_DIARIZATION_POLICY.policyId,
+        run.session_id,
+        run.track_id
+      );
+  }
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_clusters (
+         id, session_id, track_id, local_label, model_id, embedding,
+         speech_ms, window_count, quality_score, identity_eligible,
+         quality_gate_reason, link_state, created_at, updated_at
+       ) VALUES (?, 'session-ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', 15000, 15000)`
+    )
+    .run(
+      "cluster-current-audit",
+      runs[0].track_id,
+      "speaker_audit",
+      MODEL_ID,
+      Buffer.from(vector(0.5, 0.5).buffer),
+      12_000,
+      3,
+      0.5,
+      0,
+      "low_cluster_consistency"
+    );
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_run_clusters (
+         run_id, cluster_id, local_label, embedding, speech_ms, window_count,
+         quality_score, first_appearance_at, identity_eligible, quality_gate_reason
+       ) VALUES (?, 'cluster-current-audit', 'speaker_audit', ?, 12000, 3, 0.5, 2000, 0,
+         'low_cluster_consistency')`
+    )
+    .run(runIds[0], Buffer.from(vector(0.5, 0.5).buffer));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_clusters (
+         id, session_id, track_id, local_label, model_id, embedding,
+         speech_ms, window_count, quality_score, identity_eligible,
+         quality_gate_reason, link_state, created_at, updated_at
+       ) VALUES (
+         'cluster-legacy-policy', 'session-ready', ?, 'speaker_legacy', ?, ?,
+         12000, 3, 0.9, 1, NULL, 'unknown', 15000, 15000
+       )`
+    )
+    .run(runs[0].track_id, MODEL_ID, Buffer.from(vector(0, 1).buffer));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_runs (
+         id, session_id, track_id, transcript_revision, policy_id,
+         diarizer_model_id, embedding_model_id, model_artifact_sha256,
+         embedding_dimension, sample_rate, input_version, execution_device,
+         commit_sequence, created_at, completed_at
+       ) VALUES (
+         'run-legacy-policy', 'session-ready', ?, ?, 'jarvis-hybrid-diarization-v5',
+         'legacy-hybrid', ?, ?, 512, 16000, 2, 'cuda', 99, 15000, 15000
+       )`
+    )
+    .run(runs[0].track_id, runs[0].transcript_revision, MODEL_ID, "9".repeat(64));
+  repository.db
+    .prepare(
+      `INSERT INTO speaker_diarization_run_clusters (
+         run_id, cluster_id, local_label, embedding, speech_ms, window_count,
+         quality_score, first_appearance_at, identity_eligible, quality_gate_reason
+       ) VALUES (
+         'run-legacy-policy', 'cluster-legacy-policy', 'speaker_legacy', ?,
+         12000, 3, 0.9, 1000, 1, NULL
+       )`
+    )
+    .run(Buffer.from(vector(0, 1).buffer));
+
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  assert.equal(snapshot.eligible, true);
+  assert.deepEqual(snapshot.evidenceRunIds, runIds);
+  assert.deepEqual(
+    snapshot.clusters.map((cluster) => cluster.clusterId),
+    clusters.map((cluster) => cluster.clusterId)
+  );
+  const unknownResults = snapshot.clusters.map((cluster) => ({
+    evidenceRunId: cluster.evidenceRunId,
+    clusterId: cluster.clusterId,
+    candidatePersonId: null,
+    state: "unknown",
+    score: null,
+    margin: null,
+    reason: "no_candidate",
+  }));
+  const invalidBatch = {
+    sessionId: "session-ready",
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    evidenceRunIds: snapshot.evidenceRunIds,
+    at: 16_500,
+  };
+  assert.throws(
+    () =>
+      repository.applySystemSpeakerResolutions({
+        ...invalidBatch,
+        id: "resolution-missing-eligible",
+        diarizationRevision: "a".repeat(64),
+        profileRevision: "b".repeat(64),
+        results: unknownResults.slice(0, 1),
+      }),
+    /cover every evidence cluster exactly/
+  );
+  assert.throws(
+    () =>
+      repository.applySystemSpeakerResolutions({
+        ...invalidBatch,
+        id: "resolution-duplicate-eligible",
+        diarizationRevision: "c".repeat(64),
+        profileRevision: "d".repeat(64),
+        results: [unknownResults[0], unknownResults[0]],
+      }),
+    /cover every evidence cluster exactly/
+  );
+
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", {
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  const worker = new SpeakerIdentityResolutionWorker({
+    repository,
+    clock: () => 17_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  assert.deepEqual(await worker.run(queued.job), {
+    status: "completed",
+    executionDevice: "cpu",
+    resultCount: 2,
+  });
+  assert.equal((await worker.run(queued.job)).resultCount, 2);
+  assert.deepEqual(
+    repository.db
+      .prepare(
+        `SELECT evidence_run_id, cluster_id
+         FROM speaker_identity_resolutions
+         WHERE actor = 'system'
+         ORDER BY evidence_run_id, cluster_id`
+      )
+      .all(),
+    clusters
+      .map((cluster) => ({ evidence_run_id: cluster.runId, cluster_id: cluster.clusterId }))
+      .sort(
+        (left, right) =>
+          left.evidence_run_id.localeCompare(right.evidence_run_id) ||
+          left.cluster_id.localeCompare(right.cluster_id)
+      )
+  );
 });
 
 test("identity worker renews deterministically and yields after every fixed cluster batch", async () => {
@@ -1906,6 +2480,38 @@ test("session phase always attempts resolution enqueue after diarization schedul
     isSessionReadyForPostProcessing: () => true,
     markSessionProcessing: () => calls.push("mark"),
     enqueueDiarizationJobs: () => calls.push("diarize"),
+    enqueueSpeakerIdentityResolutionJob: (_id, options) =>
+      calls.push(`resolve:${options.diarizationPolicy.policyId}`),
+    refreshSessionReadiness: (_id, _at, options) =>
+      calls.push(`refresh:${options.diarizationPolicy.policyId}`),
+  };
+  const runtime = new JarvisProcessingRuntime({
+    runner: { runOnce: async () => 0, recoverExpiredLeases: () => 0 },
+    repository,
+    reconciler: { reconcileSession: async () => calls.push("reconcile") },
+    deduper: { dedupe: async () => calls.push("dedupe") },
+    now: () => 100,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  await runtime._runSessionPhase([{ id: "session-runtime", ended_at: 100 }], 0, 1, new Set());
+  assert.deepEqual(calls, [
+    "mark",
+    "reconcile",
+    "dedupe",
+    "diarize",
+    `resolve:${HYBRID_DIARIZATION_POLICY.policyId}`,
+    `refresh:${HYBRID_DIARIZATION_POLICY.policyId}`,
+  ]);
+});
+
+test("session phase schedules completed-track diarization before every track transcript is ready", async () => {
+  const { JarvisProcessingRuntime } = require("../../src/jarvis/main/JarvisProcessingRuntime");
+  const calls = [];
+  const repository = {
+    listProcessingSessions: () => [],
+    isSessionReadyForPostProcessing: () => false,
+    markSessionProcessing: () => calls.push("mark"),
+    enqueueDiarizationJobs: () => calls.push("diarize"),
     enqueueSpeakerIdentityResolutionJob: () => calls.push("resolve"),
     refreshSessionReadiness: () => calls.push("refresh"),
   };
@@ -1915,9 +2521,122 @@ test("session phase always attempts resolution enqueue after diarization schedul
     reconciler: { reconcileSession: async () => calls.push("reconcile") },
     deduper: { dedupe: async () => calls.push("dedupe") },
     now: () => 100,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
   });
-  await runtime._runSessionPhase([{ id: "session-runtime", ended_at: 100 }], 0, 1, new Set());
-  assert.deepEqual(calls, ["mark", "reconcile", "dedupe", "diarize", "resolve", "refresh"]);
+
+  await runtime._runSessionPhase([{ id: "session-partial", ended_at: 100 }], 0, 1, new Set());
+
+  assert.deepEqual(calls, ["mark", "diarize"]);
+});
+
+test("identity resolution can enqueue from the selected hybrid diarization policy", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  const run = repository.db
+    .prepare("SELECT * FROM speaker_diarization_runs WHERE session_id = 'session-ready'")
+    .get();
+  const hybridKey = buildDiarizationJobKey({
+    sessionId: run.session_id,
+    trackId: run.track_id,
+    evidenceRevision: run.transcript_revision,
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+  });
+  repository.db
+    .prepare(
+      `UPDATE speaker_diarization_runs
+       SET policy_id = ?, input_version = ?
+       WHERE id = ?`
+    )
+    .run(HYBRID_DIARIZATION_POLICY.policyId, HYBRID_DIARIZATION_POLICY.inputVersion, run.id);
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET input_hash = ?, input_version = ?, model_version = ?
+       WHERE session_id = 'session-ready' AND job_type = 'diarize_track'`
+    )
+    .run(hybridKey, HYBRID_DIARIZATION_POLICY.inputVersion, HYBRID_DIARIZATION_POLICY.policyId);
+
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", {
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+
+  assert.equal(queued.reason, null);
+  assert.equal(queued.enqueued, 1);
+});
+
+test("startup readiness reconciliation preserves a ready hybrid-policy session", (t) => {
+  const { repository, runIds, clusters } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.renamePerson({ personId: "person-a", displayName: "person-a" });
+  const run = repository.db
+    .prepare("SELECT * FROM speaker_diarization_runs WHERE session_id = 'session-ready'")
+    .get();
+  const hybridKey = buildDiarizationJobKey({
+    sessionId: run.session_id,
+    trackId: run.track_id,
+    evidenceRevision: run.transcript_revision,
+    policyId: HYBRID_DIARIZATION_POLICY.policyId,
+  });
+  repository.db
+    .prepare(
+      `UPDATE speaker_diarization_runs
+       SET policy_id = ?, input_version = ?
+       WHERE id = ?`
+    )
+    .run(HYBRID_DIARIZATION_POLICY.policyId, HYBRID_DIARIZATION_POLICY.inputVersion, run.id);
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET input_hash = ?, input_version = ?, model_version = ?
+       WHERE session_id = 'session-ready' AND job_type = 'diarize_track'`
+    )
+    .run(hybridKey, HYBRID_DIARIZATION_POLICY.inputVersion, HYBRID_DIARIZATION_POLICY.policyId);
+  const identity = repository.enqueueSpeakerIdentityResolutionJob("session-ready", {
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  const snapshot = repository.getSpeakerIdentityResolutionSnapshot({
+    sessionId: "session-ready",
+    at: 16_000,
+    diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+  });
+  repository.applySystemSpeakerResolutions({
+    id: "hybrid-ready-resolution",
+    sessionId: "session-ready",
+    diarizationRevision: snapshot.diarizationRevision,
+    profileRevision: snapshot.profileRevision,
+    policyId: SPEAKER_IDENTITY_RESOLUTION_POLICY.id,
+    evidenceRunIds: runIds,
+    results: clusters.map(({ clusterId, runId }) => ({
+      evidenceRunId: runId,
+      clusterId,
+      candidatePersonId: null,
+      state: "unknown",
+      score: null,
+      margin: null,
+      reason: "no_candidate",
+    })),
+    at: 16_000,
+  });
+  repository.db
+    .prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 16000 WHERE id = ?")
+    .run(identity.job.id);
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+
+  assert.deepEqual(
+    repository.reconcileHistoricalSpeakerReadiness(18_000, {
+      diarizationPolicy: HYBRID_DIARIZATION_POLICY,
+    }),
+    {
+      inspected: 1,
+      woken: 0,
+      ready: 1,
+      processing: 0,
+    }
+  );
 });
 
 test("profile changes wake ready historical sessions and create one new revision job", (t) => {
@@ -1954,6 +2673,78 @@ test("profile changes wake ready historical sessions and create one new revision
   assert.equal(changed.enqueued, 1);
   assert.equal(repeated.enqueued, 0);
   assert.notEqual(changed.job.input_hash, first.job.input_hash);
+});
+
+test("a dual-model enrollment wakes historical diarization created in the legacy model space", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.renamePerson({ personId: "self", displayName: "我", isSelf: true });
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+
+  repository.addVoiceProfileSample({
+    id: "dual-primary-self",
+    personId: "self",
+    modelId: PRIMARY_MODEL.modelId,
+    embedding: primaryVector(1),
+    sourceKind: "enrollment",
+    sourceClusterId: null,
+    speechMs: 10_000,
+    windowCount: 1,
+    createdAt: 17_000,
+  });
+
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT processing_state, ready_at FROM sessions WHERE id = 'session-ready'")
+      .get(),
+    { processing_state: "processing", ready_at: null }
+  );
+});
+
+test("startup readiness reconciliation repairs a stale ready session after profile changes", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  repository.renamePerson({ personId: "person-a", displayName: "person-a" });
+  const first = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16_000 });
+  repository.db
+    .prepare("UPDATE processing_jobs SET state = 'completed', completed_at = 16000 WHERE id = ?")
+    .run(first.job.id);
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+  repository.addVoiceProfileSample({
+    id: "dual-primary-person-a",
+    personId: "person-a",
+    modelId: PRIMARY_MODEL.modelId,
+    embedding: primaryVector(1),
+    sourceKind: "enrollment",
+    sourceClusterId: null,
+    speechMs: 10_000,
+    windowCount: 1,
+    createdAt: 17_000,
+  });
+  repository.db
+    .prepare(
+      "UPDATE sessions SET processing_state = 'ready', ready_at = 16000 WHERE id = 'session-ready'"
+    )
+    .run();
+
+  assert.deepEqual(repository.reconcileHistoricalSpeakerReadiness(18_000), {
+    inspected: 1,
+    woken: 1,
+    ready: 0,
+    processing: 1,
+  });
+  assert.deepEqual(
+    repository.db
+      .prepare("SELECT processing_state, ready_at FROM sessions WHERE id = 'session-ready'")
+      .get(),
+    { processing_state: "processing", ready_at: null }
+  );
 });
 
 test("profile sample persistence and historical-session wake are one transaction", (t) => {
@@ -2163,6 +2954,47 @@ test("readiness stays processing through diarization and resolution, then become
     .run(queued.job.id);
   refreshed = repository.refreshSessionReadiness("session-ready", 17000);
   assert.equal(refreshed.processing_state, "ready");
+});
+
+test("terminal diarization failure degrades speaker evidence without trapping a complete transcript", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1, completeTracks: 0 });
+
+  let refreshed = repository.refreshSessionReadiness("session-ready", 16_000);
+  assert.equal(refreshed.processing_state, "processing");
+
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'DIARIZATION_VALIDATION_FAILED', completed_at = 16500
+       WHERE session_id = 'session-ready' AND job_type = 'diarize_track'`
+    )
+    .run();
+  refreshed = repository.refreshSessionReadiness("session-ready", 17_000);
+
+  assert.equal(refreshed.processing_state, "ready");
+  assert.equal(refreshed.ready_at, 17_000);
+  assert.deepEqual(
+    repository.listPendingJobs("session-ready").map((job) => job.error_code),
+    ["DIARIZATION_VALIDATION_FAILED"]
+  );
+});
+
+test("terminal identity failure remains visible but no longer blocks session readiness", (t) => {
+  const { repository } = seedReadyEvidence(t, { trackCount: 1 });
+  const queued = repository.enqueueSpeakerIdentityResolutionJob("session-ready", { at: 16_000 });
+  repository.db
+    .prepare(
+      `UPDATE processing_jobs
+       SET state = 'blocked', error_code = 'SQLITE_CONSTRAINT_PRIMARYKEY', completed_at = 16500
+       WHERE id = ?`
+    )
+    .run(queued.job.id);
+
+  const refreshed = repository.refreshSessionReadiness("session-ready", 17_000);
+
+  assert.equal(refreshed.processing_state, "ready");
+  assert.equal(refreshed.ready_at, 17_000);
+  assert.equal(repository.listPendingJobs("session-ready")[0].id, queued.job.id);
 });
 
 test("worker revalidates again before commit and writes no stale partial batch", async (t) => {

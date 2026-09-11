@@ -34,6 +34,7 @@ const DEFAULT_VAD_TIMEOUT_MS = 5_000;
 const AUDIBLE_SIGNAL_RMS_FLOOR = 0.006;
 const AUDIBLE_SIGNAL_PEAK_FLOOR = 0.08;
 const APPLICATION_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const APPLICATION_FAILURE_CODE_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const RECOVERY_SIDECAR_KEYS = Object.freeze([
   "durationMs",
   "endedAt",
@@ -95,6 +96,18 @@ function assertCaptureGeneration(captureGeneration) {
   return captureGeneration;
 }
 
+function applicationFailureCode(value, fallback = "application_capture_failed") {
+  const candidate =
+    typeof value === "string"
+      ? value
+      : typeof value?.failureCode === "string"
+        ? value.failureCode
+        : typeof value?.code === "string"
+          ? value.code
+          : fallback;
+  return APPLICATION_FAILURE_CODE_PATTERN.test(candidate) ? candidate : fallback;
+}
+
 class JarvisService {
   constructor({
     repository,
@@ -113,6 +126,7 @@ class JarvisService {
     onChunkCommitted = () => {},
     previewAudioRing = undefined,
     onPreviewWatermark = () => {},
+    transcriptionInputVersion = 1,
     transcriptionModelVersion = "base",
   }) {
     if (!repository || typeof repository !== "object") {
@@ -174,6 +188,8 @@ class JarvisService {
     }
 
     this.repository = repository;
+    this.transcriptionInputVersion = null;
+    this.configureTranscriptionInputVersion(transcriptionInputVersion);
     this.transcriptionModelVersion = null;
     this.configureTranscriptionModelVersion(transcriptionModelVersion);
     if (recordingsDir !== undefined && !path.isAbsolute(recordingsDir)) {
@@ -283,6 +299,14 @@ class JarvisService {
     }
     this.transcriptionModelVersion = modelVersion.trim();
     return this.transcriptionModelVersion;
+  }
+
+  configureTranscriptionInputVersion(inputVersion) {
+    if (!Number.isSafeInteger(inputVersion) || inputVersion < 1) {
+      throw new TypeError("transcriptionInputVersion must be a positive safe integer");
+    }
+    this.transcriptionInputVersion = inputVersion;
+    return this.transcriptionInputVersion;
   }
 
   startCapture(input) {
@@ -495,7 +519,12 @@ class JarvisService {
       }
       if (persisted) {
         try {
-          this.repository.setTrackState(trackId, "failed", startedAt);
+          this.repository.setTrackState(
+            trackId,
+            "failed",
+            startedAt,
+            applicationFailureCode(error, "evidence_registration_failed")
+          );
         } catch {}
       }
       throw error;
@@ -532,6 +561,7 @@ class JarvisService {
     captureGeneration,
     endedAt,
     state = "ended",
+    failureCode = null,
   }) {
     this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(endedAt, "endedAt");
@@ -546,23 +576,40 @@ class JarvisService {
     }
     this.applicationSources.delete(applicationKey);
     this.writer?.closeSource(track.trackKey, endedAt);
-    this.repository.setTrackState(track.trackId, state, endedAt);
+    this.repository.setTrackState(
+      track.trackId,
+      state,
+      endedAt,
+      state === "failed" ? applicationFailureCode(failureCode) : null
+    );
     return true;
   }
 
   recordApplicationAudioAttribution({
     sessionId,
     applicationKey,
+    applicationDisplayName = null,
     captureGeneration,
     attributionState,
     at,
     reason,
+    failureCode = null,
   }) {
     this._assertActive(sessionId, ["recording", "degraded", "paused"]);
     this._assertTime(at, "at");
     if (typeof applicationKey !== "string" || !APPLICATION_KEY_PATTERN.test(applicationKey)) {
       throw new TypeError("applicationKey must be a canonical lowercase identifier");
     }
+    const activeApplication = this.applicationSources.get(applicationKey);
+    const fallbackIdentity =
+      applicationDisplayName === null
+        ? activeApplication
+          ? {
+              applicationKey,
+              applicationDisplayName: activeApplication.applicationDisplayName,
+            }
+          : null
+        : assertApplicationIdentity(applicationKey, applicationDisplayName);
     const generation = assertCaptureGeneration(captureGeneration);
     if (attributionState !== "exact" && attributionState !== "mixed_unknown") {
       throw new TypeError("attributionState must be exact or mixed_unknown");
@@ -609,7 +656,17 @@ class JarvisService {
       captureGeneration: generation,
       startedAt: transitionAt,
       endedAt: null,
-      reason,
+      reason: attributionState === "exact" ? null : reason,
+      attemptedApplicationKey:
+        attributionState === "mixed_unknown" ? fallbackIdentity?.applicationKey ?? null : null,
+      attemptedApplicationDisplayName:
+        attributionState === "mixed_unknown"
+          ? fallbackIdentity?.applicationDisplayName ?? null
+          : null,
+      failureCode:
+        attributionState === "exact" || failureCode === null
+          ? null
+          : applicationFailureCode(failureCode),
       createdAt: transitionAt,
     });
     const active = {
@@ -1968,6 +2025,7 @@ class JarvisService {
         if (this.closed) return null;
         const committed = this.repository.commitChunk({
           ...chunk,
+          inputVersion: this.transcriptionInputVersion,
           modelVersion: this.transcriptionModelVersion,
           fileBytes: this.fs.statSync(chunk.path).size,
           expiresAt: chunk.endedAt + AUDIO_RETENTION_MS,
@@ -2182,11 +2240,13 @@ class JarvisService {
       }
       this.repository.enqueueChunkTranscription({
         ...chunk,
+        inputVersion: this.transcriptionInputVersion,
         modelVersion: this.transcriptionModelVersion,
       });
     } else {
       this.repository.commitChunk({
         ...chunk,
+        inputVersion: this.transcriptionInputVersion,
         modelVersion: this.transcriptionModelVersion,
       });
     }

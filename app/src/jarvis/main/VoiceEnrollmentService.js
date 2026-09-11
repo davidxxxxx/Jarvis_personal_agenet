@@ -22,14 +22,16 @@ const SELF_VOICE_PROFILE_ID = -1;
 
 const SELF_PROFILE_POLICY = Object.freeze({
   modelId: SPEAKER_EMBEDDING_MODEL_ID,
-  minimumSpeechMs: 30_000,
+  minimumSpeechMs: 18_000,
+  minimumSpeechMsPerWindow: 5_000,
   minimumWindows: 3,
   minimumSelfConsistency: 0.78,
 });
 
 const DUAL_SELF_PROFILE_POLICY = Object.freeze({
   policyId: `${SPEAKER_IDENTITY_MODEL_POLICY.policyId}-self-enrollment-v1`,
-  minimumSpeechMs: 30_000,
+  minimumSpeechMs: 18_000,
+  minimumSpeechMsPerWindow: 5_000,
   minimumWindows: 3,
   minimumSelfConsistency: 0.78,
   primary: SPEAKER_IDENTITY_MODEL_POLICY.primary,
@@ -39,13 +41,32 @@ const DUAL_SELF_PROFILE_POLICY = Object.freeze({
 const VIRTUAL_MICROPHONE_PATTERN =
   /\b(sonar|virtual|voicemeeter|stereo mix|loopback|vb-audio|cable|obs)\b/i;
 
-function result(status, acceptedSpeechMs = 0, windowCount = 0, selfConsistency = null) {
+function satisfiesSpeechPolicy(sampleSpeechMs, policy) {
+  return (
+    Array.isArray(sampleSpeechMs) &&
+    sampleSpeechMs.length >= policy.minimumWindows &&
+    sampleSpeechMs.every(
+      (speechMs) =>
+        Number.isSafeInteger(speechMs) && speechMs >= policy.minimumSpeechMsPerWindow
+    ) &&
+    sampleSpeechMs.reduce((sum, speechMs) => sum + speechMs, 0) >= policy.minimumSpeechMs
+  );
+}
+
+function result(
+  status,
+  acceptedSpeechMs = 0,
+  windowCount = 0,
+  selfConsistency = null,
+  sampleSpeechMs = null
+) {
   return {
     status,
     modelId: SELF_PROFILE_POLICY.modelId,
     acceptedSpeechMs,
     windowCount,
     selfConsistency,
+    ...(Array.isArray(sampleSpeechMs) ? { sampleSpeechMs: [...sampleSpeechMs] } : {}),
   };
 }
 
@@ -54,7 +75,8 @@ function dualResult(
   acceptedSpeechMs = 0,
   windowCount = 0,
   selfConsistency = null,
-  models = null
+  models = null,
+  sampleSpeechMs = null
 ) {
   return {
     status,
@@ -63,6 +85,7 @@ function dualResult(
     windowCount,
     selfConsistency,
     models,
+    ...(Array.isArray(sampleSpeechMs) ? { sampleSpeechMs: [...sampleSpeechMs] } : {}),
   };
 }
 
@@ -364,9 +387,15 @@ class VoiceEnrollmentService {
       const acceptedSpeechMs = sampleSpeechMs.reduce((sum, value) => sum + value, 0);
       if (
         embeddings.length < SELF_PROFILE_POLICY.minimumWindows ||
-        acceptedSpeechMs < SELF_PROFILE_POLICY.minimumSpeechMs
+        !satisfiesSpeechPolicy(sampleSpeechMs, SELF_PROFILE_POLICY)
       ) {
-        return result("insufficient_speech", acceptedSpeechMs, embeddings.length);
+        return result(
+          "insufficient_speech",
+          acceptedSpeechMs,
+          embeddings.length,
+          null,
+          sampleSpeechMs
+        );
       }
       const centroid = normalizedCentroid(embeddings);
       if (!centroid) return result("model_error");
@@ -375,7 +404,13 @@ class VoiceEnrollmentService {
       );
       if (!Number.isFinite(selfConsistency)) return result("model_error");
       if (selfConsistency < SELF_PROFILE_POLICY.minimumSelfConsistency) {
-        return result("inconsistent_samples", acceptedSpeechMs, embeddings.length, selfConsistency);
+        return result(
+          "inconsistent_samples",
+          acceptedSpeechMs,
+          embeddings.length,
+          selfConsistency,
+          sampleSpeechMs
+        );
       }
       this.voiceProfileStore.saveEnrollment({
         modelId: SELF_PROFILE_POLICY.modelId,
@@ -458,12 +493,15 @@ class VoiceEnrollmentService {
         modelEntries.some(
           (entry) => entry.embeddings.length < DUAL_SELF_PROFILE_POLICY.minimumWindows
         ) ||
-        acceptedSpeechMs < DUAL_SELF_PROFILE_POLICY.minimumSpeechMs
+        !satisfiesSpeechPolicy(sampleSpeechMs, DUAL_SELF_PROFILE_POLICY)
       ) {
         return dualResult(
           "insufficient_speech",
           acceptedSpeechMs,
-          Math.min(...modelEntries.map((entry) => entry.embeddings.length))
+          Math.min(...modelEntries.map((entry) => entry.embeddings.length)),
+          null,
+          null,
+          sampleSpeechMs
         );
       }
 
@@ -500,7 +538,8 @@ class VoiceEnrollmentService {
             modelId,
             embeddingSpace,
             selfConsistency: score,
-          }))
+          })),
+          sampleSpeechMs
         );
       }
       this.voiceProfileStore.saveDualEnrollment({
@@ -569,5 +608,6 @@ module.exports.CAPTURE_SAMPLE_RATE = CAPTURE_SAMPLE_RATE;
 module.exports.EXPECTED_EMBEDDING_DIMENSION = EXPECTED_EMBEDDING_DIMENSION;
 module.exports.SELF_PROFILE_POLICY = SELF_PROFILE_POLICY;
 module.exports.DUAL_SELF_PROFILE_POLICY = DUAL_SELF_PROFILE_POLICY;
+module.exports.satisfiesSpeechPolicy = satisfiesSpeechPolicy;
 module.exports.SELF_VOICE_PROFILE_ID = SELF_VOICE_PROFILE_ID;
 module.exports.VIRTUAL_MICROPHONE_PATTERN = VIRTUAL_MICROPHONE_PATTERN;

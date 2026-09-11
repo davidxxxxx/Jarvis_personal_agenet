@@ -96,6 +96,7 @@
     "voiceEnrollmentSaved": "Your local voice profile is saved.",
     "voiceEnrollmentPending": "Preparing voice calibration",
     "voiceEnrollmentWindowProgress": "Sample {{current}} of {{total}}",
+    "voiceEnrollmentSpeechDiagnostics": "Detected speech per sample: {{values}} seconds; each sample needs at least {{threshold}} seconds",
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
@@ -233,6 +234,10 @@
       "keyConfigured": "MiniMax key configured",
       "keyNotConfigured": "MiniMax key not configured",
       "model": "Model: {{model}}",
+      "modelReady": "MiniMax モデルが利用可能であることを確認しました。",
+      "modelCheckUnavailable": "MiniMax モデルの利用可否を確認できませんでした。ローカル録音には影響ありません。",
+      "modelUnavailable": "このキーでは {{model}} を利用できません。クラウド分析は一時停止されたままです。",
+      "modelFallback": "設定されたモデルを利用できなかったため、Jarvis は {{model}} を使用します。",
       "keyLabel": "MiniMax subscription key",
       "saveKey": "Save MiniMax key",
       "removeKey": "Remove MiniMax key",
@@ -276,14 +281,34 @@
       "description": "Choose how quickly Jarvis yields the GPU and resumes background processing.",
       "loading": "Loading resource settings…",
       "profiles": {
-        "game_priority": { "title": "Game priority", "description": "Yield early and resume slowly." },
-        "balanced": { "title": "Balanced", "description": "Ignore light GPU use and share safely." },
-        "processing_priority": { "title": "Processing priority", "description": "Use more idle GPU capacity." }
+        "game_priority": {
+          "title": "Game priority",
+          "description": "Yield early and resume slowly."
+        },
+        "balanced": {
+          "title": "Balanced",
+          "description": "Ignore light GPU use and share safely."
+        },
+        "processing_priority": {
+          "title": "Processing priority",
+          "description": "Use more idle GPU capacity."
+        }
       },
       "applicationAudio": {
         "title": "PC 音声をアプリ別に分離",
         "description": "実際に音を出しているアプリだけを追跡します。失敗時は出所を推測せずシステムミックスへ切り替えます。",
         "trackLimit": "同時に保持するアプリ音声トラックの上限",
+        "fallbackPolicy": "When an app track falls back to mixed system audio",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "Conservative summary",
+            "description": "Keep mixed audio and the full transcript. Allow only evidence-checkable summaries; block suggestions, todos, and identity learning."
+          },
+          "transcript_only": {
+            "title": "Transcript only",
+            "description": "Keep mixed audio and the full transcript. Block summaries, suggestions, todos, and identity learning."
+          }
+        },
         "runtime": "{{active}} 個のアプリ音声を録音中（上限 {{limit}}）・{{fallback}} 件がフォールバック中",
         "idle": "次回の録音から開始します。全画面ゲーム中は最大 2 トラックに制限されます。"
       },

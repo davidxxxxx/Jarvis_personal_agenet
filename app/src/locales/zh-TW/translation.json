@@ -96,6 +96,7 @@
     "voiceEnrollmentSaved": "Your local voice profile is saved.",
     "voiceEnrollmentPending": "Preparing voice calibration",
     "voiceEnrollmentWindowProgress": "Sample {{current}} of {{total}}",
+    "voiceEnrollmentSpeechDiagnostics": "Detected speech per sample: {{values}} seconds; each sample needs at least {{threshold}} seconds",
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
@@ -233,6 +234,10 @@
       "keyConfigured": "MiniMax Key 已設定",
       "keyNotConfigured": "MiniMax Key 未設定",
       "model": "模型：{{model}}",
+      "modelReady": "已確認 MiniMax 模型可用。",
+      "modelCheckUnavailable": "暫時無法檢查 MiniMax 模型是否可用，本機錄音不受影響。",
+      "modelUnavailable": "此 Key 無法使用 {{model}}，雲端分析將保持暫停。",
+      "modelFallback": "設定的模型無法使用，Jarvis 將改用 {{model}}。",
       "keyLabel": "MiniMax 訂閱 Key",
       "saveKey": "儲存 MiniMax Key",
       "removeKey": "移除 MiniMax Key",
@@ -293,6 +298,17 @@
         "title": "按應用程式分離電腦聲音",
         "description": "只追蹤正在發聲的應用程式；失敗時退回系統混音，確保不漏音且不猜來源。",
         "trackLimit": "最多同時保留的獨立應用程式音軌",
+        "fallbackPolicy": "應用程式音軌降級為來源未知的系統混音時",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "保守摘要",
+            "description": "保留系統混音和完整轉寫，僅允許可核查摘要；禁止建議、正式待辦及人物或聲紋學習。"
+          },
+          "transcript_only": {
+            "title": "僅轉寫",
+            "description": "保留系統混音和完整轉寫，禁止摘要、建議、正式待辦及人物或聲紋學習。"
+          }
+        },
         "runtime": "正在錄製 {{active}} 個應用程式音軌（上限 {{limit}}）· {{fallback}} 個來源已降級",
         "idle": "將在下次錄音時啟動；全螢幕遊戲期間最多保留兩個應用程式音軌。"
       },

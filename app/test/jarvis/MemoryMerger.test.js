@@ -9,8 +9,8 @@ function loadMemoryMerger() {
 }
 
 function candidateFixture(overrides = {}) {
-  return {
-    schemaVersion: "jarvis-analysis-v2",
+  const fixture = {
+    schemaVersion: "jarvis-analysis-v3",
     sessionSummary: {
       title: "Release Notes",
       summary: "API v2 is ready.",
@@ -41,6 +41,7 @@ function candidateFixture(overrides = {}) {
         title: "Publish notes",
         ownerLabel: "P1",
         dueText: "Friday",
+        semanticConfidence: 0.92,
         evidenceSegmentIds: ["seg-2", "seg-1"],
       },
     ],
@@ -52,6 +53,10 @@ function candidateFixture(overrides = {}) {
       },
     ],
     ...overrides,
+  };
+  return {
+    ...fixture,
+    todos: fixture.todos.map((todo) => ({ semanticConfidence: 0.92, ...todo })),
   };
 }
 
@@ -120,6 +125,26 @@ function assertValidationIssue(mergerModule, input, issueCode) {
       error instanceof mergerModule.MemoryMergerValidationError && error.issueCode === issueCode
   );
 }
+
+test("accepts explicit assignment and acceptance todo roles while rejecting malformed unions", () => {
+  const mergerModule = loadMemoryMerger();
+  const todo = {
+    title: "Publish notes",
+    ownerLabel: "P1",
+    dueText: "Friday",
+    semanticConfidence: 0.95,
+    evidenceSegmentIds: ["seg-1", "seg-2"],
+    actionKind: "assignment_accepted",
+    assignmentSegmentIds: ["seg-1"],
+    acceptanceSegmentIds: ["seg-2"],
+  };
+  const input = planFixture({ candidate: plannerCandidate({ todos: [todo] }) });
+  assert.doesNotThrow(() => new mergerModule.MemoryMerger().plan(input));
+
+  const malformed = structuredClone(input);
+  malformed.candidate.todos[0].acceptanceSegmentIds = ["seg-1"];
+  assertValidationIssue(mergerModule, malformed, "malformed_candidate");
+});
 
 test("canonical-v1 normalizes text exactly and preserves punctuation", () => {
   let merger;

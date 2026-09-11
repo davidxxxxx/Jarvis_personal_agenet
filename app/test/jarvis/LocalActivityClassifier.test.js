@@ -197,6 +197,14 @@ test("enforces the 80/55 confidence gates and blocks actions in the tentative ba
     confidence: 0.8,
     decision: "adopted",
     allowSummary: true,
+    allowSuggestions: false,
+    allowTodos: false,
+  });
+  assert.deepEqual(applyConfidenceGate("work_meeting", 0.8, { selfParticipated: true }), {
+    category: "work_meeting",
+    confidence: 0.8,
+    decision: "adopted",
+    allowSummary: true,
     allowSuggestions: true,
     allowTodos: true,
   });

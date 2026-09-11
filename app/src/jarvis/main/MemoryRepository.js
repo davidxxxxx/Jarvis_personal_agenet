@@ -1,5 +1,4 @@
-const crypto = require("node:crypto");
-const { AnalysisSchemaError, validateCandidateAnalysis } = require("./JarvisAnalysisSchema");
+const { AnalysisSchemaError } = require("./JarvisAnalysisSchema");
 const {
   MemoryMerger,
   canonicalizeText,
@@ -8,270 +7,77 @@ const {
   semanticCandidateHash,
 } = require("./MemoryMerger");
 const { resolveLocalDate } = require("./ZonedCalendar");
-const { compileRedactionTerms } = require("./AnalysisInputBuilder");
+const { normalizedSegmentContext } = require("./AnalysisInputBuilder");
 const { MAX_DAILY_DIGEST_INPUT_BYTES } = require("./DailyDigestContractLimits");
 const {
   DAILY_DIGEST_SCHEMA_VERSION,
   validateCandidateDailyDigest,
 } = require("./DailyDigestSchema");
 const {
+  TODO_ATTRIBUTION_POLICY_VERSION,
+  evaluateTodoAttribution,
+} = require("./TodoAttributionPolicy");
+const { ActivityOutputPolicy } = require("./ActivityOutputPolicy");
+const {
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
 } = require("../shared/contracts");
+const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
+const {
+  buildActionEvidenceAttribution,
+  buildCapturedTodoActionEvidenceAttribution,
+} = require("./ActionEvidenceAttribution");
+const { KnowledgeActionRepository } = require("./KnowledgeActionRepository");
+const PersonalizationFeedbackRepository = require("./PersonalizationFeedbackRepository");
+const { applyDailyDigestOutputPolicy } = require("./DailyDigestOutputPolicy");
 
-const HASH_PATTERN = /^[0-9a-f]{64}$/;
-const INPUT_CONTRACT_VERSION = "jarvis-analysis-input-v2";
-const REDACTION_VERSION = "jarvis-redaction-v1";
-const CANONICAL_INPUT_VERSION = "jarvis-analysis-input-canonical-v2";
-const PREPARE_TOKEN_VERSION = "jarvis-analysis-prepare-v1";
-const LEGACY_IMPORTER_VERSION = "jarvis-legacy-analysis-v1";
-const MAX_CLOUD_PAYLOAD_BYTES = 96 * 1024;
-const MAX_ANALYSIS_CANDIDATE_BYTES = 512 * 1024;
-const MAX_DAILY_DIGEST_CANDIDATE_BYTES = 512 * 1024;
-const DAILY_DIGEST_INPUT_CONTRACT_VERSION = "jarvis-daily-digest-input-v1";
-const DAILY_DIGEST_WATERMARK_VERSION = "jarvis-daily-digest-watermark-v1";
-const PUBLIC_SNAPSHOT_LIST_LIMIT = 101;
-const PUBLIC_SNAPSHOT_HISTORY_LIMIT = 20;
-const PUBLIC_SNAPSHOT_EVIDENCE_LIMIT = 8;
-const PUBLIC_ANALYSIS_ERROR_CODES = new Set([
-  "analysis_runtime_not_ready",
-  "analysis_input_empty",
-  "analysis_input_invalid",
-  "analysis_input_state_invalid",
-  "analysis_desired_head_invalid",
-  "analysis_cloud_job_invalid",
-  "analysis_failed",
-  "offline",
-  "budget_exceeded",
-  "usage_unknown",
-  "over_limit",
-  "rate_limit",
-  "invalid_response",
-]);
-const OFFLINE_ANALYSIS_ERROR_CODES = new Set(["network", "service_unavailable", "timeout"]);
-const BUDGET_ANALYSIS_ERROR_CODES = new Set(["analysis_budget_denied", "budget_unavailable"]);
-const RUNTIME_ANALYSIS_ERROR_CODES = new Set([
-  "analysis_deferred_for_local_work",
-  "analysis_configuration_required",
-  "configuration",
-]);
-const INVALID_ANALYSIS_ERROR_CODES = new Set([
-  "invalid_json",
-  "invalid_structure",
-  "analysis_invalid_response",
-  "analysis_candidate_apply_failed",
-  "ANALYSIS_RESPONSE_INVALID",
-]);
-
-function codedError(code) {
-  const error = new Error(code);
-  error.code = code;
-  return error;
-}
-
-function publicAnalysisErrorCode(errorCode, blockedReason, fallback = "analysis_failed") {
-  const raw =
-    errorCode === "ANALYSIS_MANUAL_RETRY_AUTHORIZED" ? blockedReason : (errorCode ?? blockedReason);
-  if (PUBLIC_ANALYSIS_ERROR_CODES.has(raw)) return raw;
-  if (OFFLINE_ANALYSIS_ERROR_CODES.has(raw)) return "offline";
-  if (BUDGET_ANALYSIS_ERROR_CODES.has(raw)) return "budget_exceeded";
-  if (raw === "analysis_usage_unknown") return "usage_unknown";
-  if (RUNTIME_ANALYSIS_ERROR_CODES.has(raw)) return "analysis_runtime_not_ready";
-  if (INVALID_ANALYSIS_ERROR_CODES.has(raw)) return "invalid_response";
-  return fallback;
-}
-
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function sha256(value) {
-  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
-}
-
-function compileDigestRedactor(redactionTerms) {
-  const redactAnalysisText = compileRedactionTerms(redactionTerms);
-  return (value) => redactAnalysisText(String(value)).replace(/\[SECRET\]/gu, "[REDACTED_SECRET]");
-}
-
-function digestFreeTextIsRedacted(value, redact, textContext = false) {
-  if (typeof value === "string") {
-    return !textContext || redact(value) === value;
-  }
-  if (Array.isArray(value)) {
-    return value.every((item) => digestFreeTextIsRedacted(item, redact, textContext));
-  }
-  if (!value || typeof value !== "object") return true;
-  return Object.entries(value).every(([key, item]) =>
-    digestFreeTextIsRedacted(item, redact, key === "text" || key === "alternatives")
-  );
-}
-
-function pseudonymousRef(kind, value) {
-  return `${kind}-${sha256(`${kind}:${value}`).slice(0, 16)}`;
-}
-
-function safeHashEqual(left, right) {
-  const validLeft = typeof left === "string" && HASH_PATTERN.test(left);
-  const validRight = typeof right === "string" && HASH_PATTERN.test(right);
-  const leftBytes = validLeft ? Buffer.from(left, "hex") : Buffer.alloc(32);
-  const rightBytes = validRight ? Buffer.from(right, "hex") : Buffer.alloc(32);
-  return crypto.timingSafeEqual(leftBytes, rightBytes) && validLeft && validRight;
-}
-
-function assertHash(value, name) {
-  if (typeof value !== "string" || !HASH_PATTERN.test(value)) {
-    throw new TypeError(`${name} must be a lowercase SHA-256 hash`);
-  }
-  return value;
-}
-
-function assertText(value, name, maxLength = 128) {
-  if (typeof value !== "string") throw new TypeError(`${name} must be a string`);
-  const trimmed = value.trim();
-  if (!trimmed) throw new TypeError(`${name} must not be empty`);
-  if (Array.from(trimmed).length > maxLength) throw new RangeError(`${name} is too long`);
-  return trimmed;
-}
-
-function assertId(value, name) {
-  return assertText(value, name, 512);
-}
-
-function assertTimestamp(value, name) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new TypeError(`${name} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function hasExactKeys(value, expected) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
-}
-
-function assertExactPlainObject(value, expected, name) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError(`${name} must be a plain object with exact keys`);
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError(`${name} must be a plain object with exact keys`);
-  }
-  if (!hasExactKeys(value, expected)) {
-    throw new TypeError(`${name} must be a plain object with exact keys`);
-  }
-  return value;
-}
-
-function assertJsonObject(value, name) {
-  const seen = new Set();
-  const visit = (node) => {
-    if (node === null || typeof node === "string" || typeof node === "boolean") return;
-    if (typeof node === "number") {
-      if (!Number.isFinite(node)) throw new TypeError(`${name} must contain finite JSON values`);
-      return;
-    }
-    if (typeof node !== "object") throw new TypeError(`${name} must contain JSON values`);
-    if (seen.has(node)) throw new TypeError(`${name} must not contain cycles`);
-    seen.add(node);
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-    } else {
-      const prototype = Object.getPrototypeOf(node);
-      if (prototype !== Object.prototype && prototype !== null) {
-        throw new TypeError(`${name} must contain plain objects`);
-      }
-      for (const item of Object.values(node)) visit(item);
-    }
-    seen.delete(node);
-  };
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError(`${name} must be a JSON object`);
-  }
-  visit(value);
-  return value;
-}
-
-function assertLocalDate(value) {
-  if (typeof value !== "string") throw new TypeError("localDate must be a string");
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) throw new TypeError("localDate must use YYYY-MM-DD");
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (month < 1 || month > 12 || day < 1 || day > days[month - 1]) {
-    throw new TypeError("localDate must be a real calendar date");
-  }
-  return value;
-}
-
-function assertTimezone(value) {
-  const timezone = assertText(value, "timezone", 256);
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(0);
-  } catch {
-    throw new TypeError("timezone must be a supported IANA timezone");
-  }
-  return timezone;
-}
-
-function normalizedKey(value) {
-  return value.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function parseLegacyArray(value) {
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function legacyText(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function legacyConfidence(value) {
-  return typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
-}
-
-function legacyDueText(value) {
-  if (!Number.isSafeInteger(value) || value < 0) return null;
-  try {
-    return new Date(value).toISOString().slice(0, 10);
-  } catch {
-    return null;
-  }
-}
-
-function validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels }) {
-  try {
-    return validateCandidateAnalysis(candidate, { allowedSegmentIds, allowedOwnerLabels });
-  } catch (error) {
-    if (!(error instanceof AnalysisSchemaError)) throw error;
-    if (error.issueCode === "schema.evidence_empty") throw codedError("MEMORY_EVIDENCE_REQUIRED");
-    if (error.issueCode === "schema.evidence_out_of_scope") {
-      throw codedError("MEMORY_EVIDENCE_OUT_OF_SCOPE");
-    }
-    if (error.issueCode === "schema.owner_out_of_scope") {
-      throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
-    }
-    throw codedError("MEMORY_CANDIDATE_INVALID");
-  }
-}
+const {
+  HASH_PATTERN,
+  APPLICATION_KEY_PATTERN,
+  INPUT_CONTRACT_VERSION,
+  LEGACY_INPUT_CONTRACT_VERSION,
+  REDACTION_VERSION,
+  CANONICAL_INPUT_VERSION,
+  LEGACY_CANONICAL_INPUT_VERSION,
+  PREPARE_TOKEN_VERSION,
+  LEGACY_IMPORTER_VERSION,
+  MAX_CLOUD_PAYLOAD_BYTES,
+  MAX_ANALYSIS_CANDIDATE_BYTES,
+  MAX_DAILY_DIGEST_CANDIDATE_BYTES,
+  MIN_CLOUD_ANONYMOUS_SPEECH_MS,
+  MIN_CLOUD_ANONYMOUS_WINDOWS,
+  DAILY_DIGEST_INPUT_CONTRACT_VERSION,
+  DAILY_DIGEST_WATERMARK_VERSION,
+  PUBLIC_SNAPSHOT_LIST_LIMIT,
+  PUBLIC_SNAPSHOT_HISTORY_LIMIT,
+  PUBLIC_SNAPSHOT_EVIDENCE_LIMIT,
+  codedError,
+  publicAnalysisErrorCode,
+  canonicalJson,
+  sha256,
+  latestCardEvidence,
+  latestCardSessionId,
+  cardContextFromAttribution,
+  compileDigestRedactor,
+  digestFreeTextIsRedacted,
+  pseudonymousRef,
+  safeHashEqual,
+  assertHash,
+  assertText,
+  assertId,
+  assertTimestamp,
+  hasExactKeys,
+  assertExactPlainObject,
+  assertJsonObject,
+  assertLocalDate,
+  assertTimezone,
+  normalizedKey,
+  parseLegacyArray,
+  legacyText,
+  legacyConfidence,
+  legacyDueText,
+  validateCandidate,
+} = require("./analysis/MemoryRepositorySupport");
 
 class MemoryRepository {
   constructor(db, { createId, now, validateRedactedCloudPayload, memoryMerger } = {}) {
@@ -292,6 +98,14 @@ class MemoryRepository {
     this.now = now;
     this.validateRedactedCloudPayload = validateRedactedCloudPayload;
     this.memoryMerger = memoryMerger ?? new MemoryMerger();
+    this.activityOutputPolicy = new ActivityOutputPolicy();
+    this.personalizationFeedbackRepository = new PersonalizationFeedbackRepository(db);
+    this.knowledgeActionRepository = new KnowledgeActionRepository(db, {
+      createId: (prefix) => this._nextId(prefix),
+      feedbackRepository: this.personalizationFeedbackRepository,
+    });
+    this.actionVerificationByCandidate = new WeakMap();
+    this.actionCenterWatermarkStatement = null;
   }
 
   _normalizeInputRequest(input) {
@@ -308,19 +122,224 @@ class MemoryRepository {
     if (new Set(segmentIds).size !== segmentIds.length) {
       throw codedError("MEMORY_INPUT_DUPLICATE_SEGMENT");
     }
-    return { sessionId, transcriptRevision, identityRevision, promptVersion, segmentIds };
+    let participantSnapshotRevision;
+    if (Object.prototype.hasOwnProperty.call(input, "participantSnapshotRevision")) {
+      const value = input.participantSnapshotRevision;
+      if (value === null) {
+        participantSnapshotRevision = null;
+      } else {
+        if (
+          !value ||
+          typeof value !== "object" ||
+          Array.isArray(value) ||
+          !hasExactKeys(value, ["revision", "sourceHash", "projectorVersion"])
+        ) {
+          throw new TypeError("participantSnapshotRevision must be an exact snapshot tuple");
+        }
+        const revision = assertTimestamp(value.revision, "participantSnapshotRevision.revision");
+        if (revision < 1) {
+          throw new TypeError("participantSnapshotRevision.revision must be positive");
+        }
+        participantSnapshotRevision = {
+          revision,
+          sourceHash: assertHash(value.sourceHash, "participantSnapshotRevision.sourceHash"),
+          projectorVersion: assertText(
+            value.projectorVersion,
+            "participantSnapshotRevision.projectorVersion"
+          ),
+        };
+      }
+    }
+    return {
+      sessionId,
+      transcriptRevision,
+      identityRevision,
+      promptVersion,
+      segmentIds,
+      participantSnapshotRevision,
+    };
+  }
+
+  _classificationMatchesSegmentSource(classification, segment) {
+    if (segment.source_type === "mic" || segment.track_kind === "mic") {
+      return new Set(["microphone", "application_and_microphone"]).has(
+        classification.source_attribution
+      );
+    }
+    if (segment.track_kind === "application") {
+      return new Set(["application", "application_and_microphone", "mixed_unknown"]).has(
+        classification.source_attribution
+      );
+    }
+    return classification.source_attribution === "mixed_unknown";
+  }
+
+  _classificationForAnalysisSegment(classifications, segment) {
+    const sourcePriority = { local: 1, minimax: 2, user: 3 };
+    return (
+      classifications
+        .filter(
+          (classification) =>
+            classification.started_at < segment.ended_at &&
+            segment.started_at < classification.ended_at &&
+            this._classificationMatchesSegmentSource(classification, segment)
+        )
+        .sort((left, right) => {
+          const leftOverlap =
+            Math.min(left.ended_at, segment.ended_at) -
+            Math.max(left.started_at, segment.started_at);
+          const rightOverlap =
+            Math.min(right.ended_at, segment.ended_at) -
+            Math.max(right.started_at, segment.started_at);
+          const leftSpan = left.ended_at - left.started_at;
+          const rightSpan = right.ended_at - right.started_at;
+          return (
+            rightOverlap - leftOverlap ||
+            leftSpan - rightSpan ||
+            (sourcePriority[right.source] ?? 0) - (sourcePriority[left.source] ?? 0) ||
+            right.updated_at - left.updated_at ||
+            right.id.localeCompare(left.id)
+          );
+        })[0] ?? null
+    );
+  }
+
+  _analysisSegmentContext(segment, speakerBindingLabel, classifications) {
+    const classification = this._classificationForAnalysisSegment(classifications, segment);
+    const exactApplicationKey =
+      segment.track_kind === "application" &&
+      segment.attribution_state === "exact" &&
+      typeof segment.application_key === "string" &&
+      APPLICATION_KEY_PATTERN.test(segment.application_key)
+        ? segment.application_key
+        : null;
+    const classifiedApplicationKeys = [
+      ...new Set(
+        (Array.isArray(classification?.evidence?.applicationKeys)
+          ? classification.evidence.applicationKeys
+          : []
+        ).filter(
+          (applicationKey) =>
+            typeof applicationKey === "string" && APPLICATION_KEY_PATTERN.test(applicationKey)
+        )
+      ),
+    ].sort();
+    const sourceAttribution =
+      classification?.source_attribution ??
+      (segment.source_type === "mic" || segment.track_kind === "mic"
+        ? "microphone"
+        : exactApplicationKey
+          ? "application"
+          : "mixed_unknown");
+    const applicationKey = ["application", "application_and_microphone"].includes(sourceAttribution)
+      ? (exactApplicationKey ??
+        (classifiedApplicationKeys.length === 1 ? classifiedApplicationKeys[0] : null))
+      : null;
+    try {
+      return normalizedSegmentContext({
+        applicationKey,
+        sourceAttribution,
+        activityCategory: classification?.category ?? "unknown",
+        activityConfidence: classification?.confidence ?? 0,
+        activityDecision: classification?.decision ?? "unknown",
+        selfParticipated:
+          speakerBindingLabel === "SELF" || classification?.evidence?.selfDetected === true,
+      });
+    } catch {
+      return normalizedSegmentContext({
+        applicationKey: null,
+        sourceAttribution:
+          segment.source_type === "mic" || segment.track_kind === "mic"
+            ? "microphone"
+            : "mixed_unknown",
+        activityCategory: "unknown",
+        activityConfidence: 0,
+        activityDecision: "unknown",
+        selfParticipated: speakerBindingLabel === "SELF",
+      });
+    }
   }
 
   _deriveLiveInput(normalized) {
-    const { sessionId, transcriptRevision, identityRevision, promptVersion, segmentIds } =
-      normalized;
+    const {
+      sessionId,
+      transcriptRevision,
+      identityRevision,
+      promptVersion,
+      segmentIds,
+      participantSnapshotRevision,
+    } = normalized;
     if (!this.db.prepare("SELECT 1 FROM sessions WHERE id = ?").get(sessionId)) {
       throw codedError("MEMORY_SESSION_NOT_FOUND");
+    }
+
+    const participantSnapshot = this.db
+      .prepare(
+        `SELECT id, revision, projector_version, source_hash
+         FROM session_participant_snapshots
+         WHERE session_id = ?
+         ORDER BY revision DESC LIMIT 1`
+      )
+      .get(sessionId);
+    const participantProjectionActive = Boolean(participantSnapshot);
+    if (participantSnapshotRevision !== undefined) {
+      const matchesExpectedSnapshot =
+        participantSnapshotRevision === null
+          ? !participantSnapshot
+          : participantSnapshot &&
+            participantSnapshot.revision === participantSnapshotRevision.revision &&
+            participantSnapshot.source_hash === participantSnapshotRevision.sourceHash &&
+            participantSnapshot.projector_version === participantSnapshotRevision.projectorVersion;
+      if (!matchesExpectedSnapshot) throw codedError("MEMORY_PREPARE_STALE");
+    }
+
+    // Use the latest durable participant projection as the cloud-facing identity
+    // boundary. It collapses duplicate/churned diarization clusters into one local
+    // participant and keeps media voices out of summaries without exposing the
+    // projection or any real identity to the provider.
+    const participantMemberships = this.db
+      .prepare(
+        `SELECT membership.participant_ref, membership.cluster_id,
+                membership.membership_kind, link.transcript_segment_id
+         FROM session_participant_snapshots AS snapshot
+         JOIN session_participant_snapshot_clusters AS membership
+           ON membership.snapshot_id = snapshot.id
+         LEFT JOIN speaker_cluster_segments AS link
+           ON link.cluster_id = membership.cluster_id
+         WHERE snapshot.id = ?
+         ORDER BY
+           CASE membership.membership_kind
+             WHEN 'self' THEN 0
+             WHEN 'known' THEN 1
+             WHEN 'reviewed' THEN 2
+             WHEN 'anonymous' THEN 3
+             WHEN 'temporary' THEN 4
+             ELSE 5
+           END,
+           membership.participant_ref, membership.cluster_id`
+      )
+      .all(participantSnapshot?.id ?? null);
+    const participantMembershipByCluster = new Map();
+    const participantMembershipBySegment = new Map();
+    for (const membership of participantMemberships) {
+      const projected = {
+        participantRef: membership.participant_ref,
+        clusterId: membership.cluster_id,
+        membershipKind: membership.membership_kind,
+      };
+      participantMembershipByCluster.set(membership.cluster_id, projected);
+      if (
+        membership.transcript_segment_id &&
+        !participantMembershipBySegment.has(membership.transcript_segment_id)
+      ) {
+        participantMembershipBySegment.set(membership.transcript_segment_id, projected);
+      }
     }
 
     const labelsBySubject = new Map();
     const bindings = [];
     const deviceLabels = new Set();
+    const classifications = this._effectiveActivityActionClassifications(sessionId);
     let nextOtherLabel = 1;
     const selectedSegments = segmentIds.map((segmentId) =>
       this.db
@@ -328,7 +347,10 @@ class MemoryRepository {
           `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
                   segment.version, segment.text, segment.person_id, segment.result_kind,
                   segment.is_stable, segment.superseded_by, segment.duplicate_of,
-                  track.device_label
+                  segment.projection_state,
+                  segment.source_type,
+                  track.device_label, track.track_kind, track.application_key,
+                  track.application_display_name, track.attribution_state
            FROM transcript_segments AS segment
            LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
            WHERE segment.id = ?`
@@ -352,6 +374,7 @@ class MemoryRepository {
         segment.is_stable !== 1 ||
         segment.superseded_by !== null ||
         segment.duplicate_of !== null ||
+        segment.projection_state !== "visible" ||
         typeof segment.text !== "string" ||
         segment.text.length === 0 ||
         !Number.isSafeInteger(segment.started_at) ||
@@ -362,6 +385,17 @@ class MemoryRepository {
         throw codedError("MEMORY_INPUT_STALE");
       }
       if (segment.device_label?.trim()) deviceLabels.add(segment.device_label);
+      if (
+        segment.track_kind === "application" &&
+        ApplicationAudioPolicy.isVirtualAudioInfrastructure({
+          applicationKey: segment.application_key,
+          applicationDisplayName: segment.application_display_name,
+        })
+      ) {
+        return [];
+      }
+      const projectedSegmentParticipant = participantMembershipBySegment.get(segment.id) ?? null;
+      if (projectedSegmentParticipant?.membershipKind === "media") return [];
 
       let subject;
       if (segment.person_id) {
@@ -369,39 +403,128 @@ class MemoryRepository {
           .prepare("SELECT id, display_name, is_self FROM people WHERE id = ?")
           .get(segment.person_id);
         if (!person?.display_name?.trim()) return [];
+        if (
+          participantProjectionActive &&
+          person.is_self !== 1 &&
+          projectedSegmentParticipant === null
+        ) {
+          return [];
+        }
         if (person.is_self !== 1) {
           const confirmed = this.db
             .prepare(
-              `SELECT 1 FROM speaker_clusters
-               WHERE session_id = ? AND person_id = ? AND link_state = 'confirmed' LIMIT 1`
+              `SELECT 1
+               FROM speaker_cluster_segments AS link
+               JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+               WHERE link.transcript_segment_id = ?
+                 AND cluster.session_id = ?
+                 AND cluster.person_id = ?
+                 AND cluster.link_state = 'confirmed'
+               LIMIT 1`
             )
-            .get(sessionId, person.id);
+            .get(segment.id, sessionId, person.id);
           if (!confirmed) return [];
         }
         subject = {
-          key: `person:${person.id}`,
+          key: projectedSegmentParticipant
+            ? `participant_projection:${projectedSegmentParticipant.participantRef}`
+            : `person:${person.id}`,
           subjectKind: "person",
           subjectId: person.id,
           subjectDisplayNameSnapshot: person.display_name,
-          isSelf: person.is_self === 1,
+          isSelf: person.is_self === 1 || projectedSegmentParticipant?.membershipKind === "self",
         };
       } else {
         const cluster = this.db
           .prepare(
-            `SELECT cluster.id, cluster.local_label
+            `SELECT cluster.id, cluster.local_label, cluster_track.track_kind,
+                    cluster_track.application_key, cluster_track.attribution_state,
+                    CASE
+                      WHEN resolution.resolution_state = 'unknown'
+                       AND resolution.reason IN (
+                         'dual_model_anonymous_group',
+                         'dual_model_anonymous_profile'
+                       )
+                      THEN resolution.candidate_person_ref
+                      ELSE NULL
+                    END AS anonymous_person_ref
              FROM speaker_cluster_segments AS link
              JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+             JOIN audio_tracks AS cluster_track ON cluster_track.id = cluster.track_id
+             LEFT JOIN speaker_identity_resolutions AS resolution
+               ON resolution.id = (
+                 SELECT candidate.id
+                 FROM speaker_identity_resolutions AS candidate
+                 JOIN speaker_identity_resolution_runs AS run
+                   ON run.id = candidate.resolution_run_id
+                 WHERE candidate.cluster_id = cluster.id
+                   AND candidate.actor = 'system'
+                 ORDER BY run.commit_sequence DESC, candidate.rowid DESC
+                 LIMIT 1
+             )
              WHERE link.transcript_segment_id = ? AND cluster.session_id = ?
-             ORDER BY cluster.id LIMIT 1`
+               AND (
+                 NOT EXISTS (
+                   SELECT 1
+                   FROM speaker_diarization_runs AS any_run
+                   WHERE any_run.session_id = cluster.session_id
+                     AND any_run.track_id = cluster.track_id
+                 )
+                 OR EXISTS (
+                   SELECT 1
+                   FROM speaker_diarization_run_clusters AS membership
+                   JOIN speaker_diarization_runs AS current_run
+                     ON current_run.id = membership.run_id
+                   WHERE membership.cluster_id = cluster.id
+                     AND current_run.id = (
+                       SELECT latest_run.id
+                       FROM speaker_diarization_runs AS latest_run
+                       WHERE latest_run.session_id = cluster.session_id
+                         AND latest_run.track_id = cluster.track_id
+                       ORDER BY latest_run.commit_sequence DESC, latest_run.id DESC
+                       LIMIT 1
+                     )
+                 )
+               )
+               AND (
+                 cluster.link_state = 'confirmed'
+                 OR (
+                   cluster.speech_ms >= ?
+                   AND cluster.window_count >= ?
+                 )
+               )
+             ORDER BY
+               CASE cluster.link_state WHEN 'confirmed' THEN 0 ELSE 1 END,
+               cluster.speech_ms DESC,
+               cluster.window_count DESC,
+               COALESCE(cluster.quality_score, 0) DESC,
+               cluster.id
+             LIMIT 1`
           )
-          .get(segment.id, sessionId);
+          .get(segment.id, sessionId, MIN_CLOUD_ANONYMOUS_SPEECH_MS, MIN_CLOUD_ANONYMOUS_WINDOWS);
         if (!cluster?.local_label?.trim()) return [];
+        const projectedParticipant =
+          participantMembershipByCluster.get(cluster.id) ?? projectedSegmentParticipant;
+        if (projectedParticipant?.membershipKind === "media") return [];
+        if (participantProjectionActive && !projectedParticipant) return [];
+        const applicationSpeakerKey =
+          cluster.track_kind === "application" &&
+          cluster.attribution_state === "exact" &&
+          cluster.application_key?.trim()
+            ? `application_speaker:${cluster.application_key
+                .trim()
+                .toLocaleLowerCase()}:${cluster.local_label.trim().toLocaleLowerCase()}`
+            : null;
         subject = {
-          key: `speaker_cluster:${cluster.id}`,
+          key: projectedParticipant
+            ? `participant_projection:${projectedParticipant.participantRef}`
+            : cluster.anonymous_person_ref
+              ? `anonymous_speaker:${cluster.anonymous_person_ref}`
+              : (applicationSpeakerKey ?? `speaker_cluster:${cluster.id}`),
           subjectKind: "speaker_cluster",
           subjectId: cluster.id,
           subjectDisplayNameSnapshot: cluster.local_label,
-          isSelf: false,
+          isSelf: projectedParticipant?.membershipKind === "self",
         };
       }
 
@@ -416,21 +539,25 @@ class MemoryRepository {
           subjectDisplayNameSnapshot: subject.subjectDisplayNameSnapshot,
         });
       }
-      return [{
-        ordinal: selectedOrdinal++,
-        segmentId: segment.id,
-        segmentVersion: segment.version,
-        textHash: sha256(segment.text),
-        textSnapshot: segment.text,
-        resultKind: segment.result_kind,
-        isStable: segment.is_stable === 1,
-        isCurrent: segment.superseded_by === null,
-        supersededBy: segment.superseded_by,
-        duplicateOf: segment.duplicate_of,
-        startedAt: segment.started_at,
-        endedAt: segment.ended_at,
-        speakerBindingLabel: label,
-      }];
+      const segmentContext = this._analysisSegmentContext(segment, label, classifications);
+      return [
+        {
+          ordinal: selectedOrdinal++,
+          segmentId: segment.id,
+          segmentVersion: segment.version,
+          textHash: sha256(segment.text),
+          textSnapshot: segment.text,
+          resultKind: segment.result_kind,
+          isStable: segment.is_stable === 1,
+          isCurrent: segment.superseded_by === null,
+          supersededBy: segment.superseded_by,
+          duplicateOf: segment.duplicate_of,
+          startedAt: segment.started_at,
+          endedAt: segment.ended_at,
+          speakerBindingLabel: label,
+          ...segmentContext,
+        },
+      ];
     });
     if (segments.length === 0) throw codedError("MEMORY_OWNER_OUT_OF_SCOPE");
 
@@ -444,6 +571,13 @@ class MemoryRepository {
       .all()
       .map((row) => row.display_name)
       .filter((name) => !bindings.some((binding) => binding.subjectDisplayNameSnapshot === name));
+    const learningGoals = this.db
+      .prepare(
+        `SELECT id, title FROM learning_goals
+         WHERE state = 'confirmed' ORDER BY id LIMIT 32`
+      )
+      .all()
+      .map((goal) => ({ goalId: goal.id, title: goal.title }));
     return {
       sessionId,
       transcriptRevision,
@@ -452,6 +586,7 @@ class MemoryRepository {
       segmentIds: segments.map((segment) => segment.segmentId),
       segments,
       speakerBindings: bindings,
+      learningGoals,
       redactionTerms: {
         participants: bindings.map((binding) => ({
           label: binding.label,
@@ -480,6 +615,14 @@ class MemoryRepository {
       identityRevision: prepared.identityRevision,
       promptVersion: prepared.promptVersion,
       speakerBindings: prepared.speakerBindings,
+      ...(prepared.learningGoals?.length
+        ? {
+            learningGoals: prepared.learningGoals.map((goal) => ({
+              goalId: goal.goalId,
+              titleHash: sha256(goal.title),
+            })),
+          }
+        : {}),
       segments: prepared.segments.map((segment) => ({
         ordinal: segment.ordinal,
         segmentId: segment.segmentId,
@@ -491,6 +634,15 @@ class MemoryRepository {
         supersededBy: segment.supersededBy,
         duplicateOf: segment.duplicateOf,
         speakerBindingLabel: segment.speakerBindingLabel,
+        applicationKey: segment.applicationKey,
+        sourceAttribution: segment.sourceAttribution,
+        activityCategory: segment.activityCategory,
+        activityConfidence: segment.activityConfidence,
+        activityDecision: segment.activityDecision,
+        selfParticipated: segment.selfParticipated,
+        memoryMode: segment.memoryMode,
+        allowedSuggestionBases: segment.allowedSuggestionBases,
+        todoCandidateAllowed: segment.todoCandidateAllowed,
       })),
     };
   }
@@ -500,6 +652,9 @@ class MemoryRepository {
   }
 
   _validateCloudPayload(cloudPayloadJson, inputContractVersion, prepared) {
+    if (![INPUT_CONTRACT_VERSION, LEGACY_INPUT_CONTRACT_VERSION].includes(inputContractVersion)) {
+      throw codedError("MEMORY_INPUT_CONTRACT_UNSUPPORTED");
+    }
     if (typeof cloudPayloadJson !== "string") throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
     const bytes = Buffer.byteLength(cloudPayloadJson, "utf8");
     if (bytes < 2 || bytes > MAX_CLOUD_PAYLOAD_BYTES) {
@@ -511,8 +666,16 @@ class MemoryRepository {
     } catch {
       throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
     }
+    const payloadKeys = Object.keys(payload).sort();
+    const baseKeys = ["inputVersion", "segments", "omittedRanges"].sort();
+    const goalKeys = ["inputVersion", "learningGoals", "segments", "omittedRanges"].sort();
+    const validPayloadKeys =
+      (payloadKeys.length === baseKeys.length &&
+        payloadKeys.every((key, index) => key === baseKeys[index])) ||
+      (payloadKeys.length === goalKeys.length &&
+        payloadKeys.every((key, index) => key === goalKeys[index]));
     if (
-      !hasExactKeys(payload, ["inputVersion", "segments", "omittedRanges"]) ||
+      !validPayloadKeys ||
       payload.inputVersion !== inputContractVersion ||
       !Array.isArray(payload.segments) ||
       payload.segments.length === 0 ||
@@ -520,12 +683,59 @@ class MemoryRepository {
     ) {
       throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
     }
+    const learningGoals = payload.learningGoals ?? [];
+    if (!Array.isArray(learningGoals) || learningGoals.length > 32) {
+      throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
+    }
+    const selectedLearningGoalIds = [];
+    for (const goal of learningGoals) {
+      if (
+        !hasExactKeys(goal, ["goalId", "title"]) ||
+        typeof goal.goalId !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(goal.goalId) ||
+        selectedLearningGoalIds.includes(goal.goalId) ||
+        typeof goal.title !== "string" ||
+        !goal.title.trim() ||
+        Array.from(goal.title).length > 500
+      ) {
+        throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
+      }
+      selectedLearningGoalIds.push(goal.goalId);
+    }
+    if (Array.isArray(prepared.learningGoals)) {
+      const expectedLearningGoalIds = prepared.learningGoals.map((goal) => goal.goalId).sort();
+      if (
+        JSON.stringify([...selectedLearningGoalIds].sort()) !==
+        JSON.stringify(expectedLearningGoalIds)
+      ) {
+        throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
+      }
+    }
     const manifestById = new Map(prepared.segments.map((segment) => [segment.segmentId, segment]));
+    const segmentKeys =
+      inputContractVersion === INPUT_CONTRACT_VERSION
+        ? [
+            "segmentId",
+            "startedAt",
+            "endedAt",
+            "speakerLabel",
+            "applicationKey",
+            "sourceAttribution",
+            "activityCategory",
+            "activityConfidence",
+            "activityDecision",
+            "selfParticipated",
+            "memoryMode",
+            "allowedSuggestionBases",
+            "todoCandidateAllowed",
+            "text",
+          ]
+        : ["segmentId", "startedAt", "endedAt", "speakerLabel", "text"];
     let lastOrdinal = -1;
     const selected = new Set();
     for (const segment of payload.segments) {
       if (
-        !hasExactKeys(segment, ["segmentId", "startedAt", "endedAt", "speakerLabel", "text"]) ||
+        !hasExactKeys(segment, segmentKeys) ||
         typeof segment.text !== "string" ||
         segment.text.length === 0
       ) {
@@ -538,7 +748,18 @@ class MemoryRepository {
         manifest.ordinal <= lastOrdinal ||
         segment.startedAt !== manifest.startedAt ||
         segment.endedAt !== manifest.endedAt ||
-        segment.speakerLabel !== manifest.speakerBindingLabel
+        segment.speakerLabel !== manifest.speakerBindingLabel ||
+        (inputContractVersion === INPUT_CONTRACT_VERSION &&
+          (segment.applicationKey !== manifest.applicationKey ||
+            segment.sourceAttribution !== manifest.sourceAttribution ||
+            segment.activityCategory !== manifest.activityCategory ||
+            segment.activityConfidence !== manifest.activityConfidence ||
+            segment.activityDecision !== manifest.activityDecision ||
+            segment.selfParticipated !== manifest.selfParticipated ||
+            segment.memoryMode !== manifest.memoryMode ||
+            JSON.stringify(segment.allowedSuggestionBases) !==
+              JSON.stringify(manifest.allowedSuggestionBases) ||
+            segment.todoCandidateAllowed !== manifest.todoCandidateAllowed))
       ) {
         throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
       }
@@ -582,14 +803,11 @@ class MemoryRepository {
     ) {
       throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
     }
-    for (const manifest of prepared.segments.filter((segment) => selected.has(segment.segmentId))) {
-      const overlappingOmission = canonicalOmittedRanges.some(
-        (range) => range.startedAt < manifest.endedAt && manifest.startedAt < range.endedAt
-      );
-      if (overlappingOmission) {
-        throw codedError("MEMORY_CLOUD_PAYLOAD_INVALID");
-      }
-    }
+    // Omitted ranges describe omitted segment time spans, not gaps in one
+    // continuous timeline. Independent microphone and application tracks can
+    // legitimately overlap a selected segment. Exact canonical-range matching
+    // above still proves that every omitted range came from the prepared
+    // manifest without rejecting valid multi-track captures.
     const selectedOwnerLabels = prepared.speakerBindings
       .map((binding) => binding.label)
       .filter((label) => payload.segments.some((segment) => segment.speakerLabel === label));
@@ -599,12 +817,14 @@ class MemoryRepository {
       sha256: sha256(cloudPayloadJson),
       selectedSegmentIds: payload.segments.map((segment) => segment.segmentId),
       selectedOwnerLabels,
+      selectedLearningGoalIds,
     };
   }
 
   _canonicalInputTuple(prepared, persisted) {
+    const isCurrentContract = persisted.inputContractVersion === INPUT_CONTRACT_VERSION;
     return {
-      schemaVersion: CANONICAL_INPUT_VERSION,
+      schemaVersion: isCurrentContract ? CANONICAL_INPUT_VERSION : LEGACY_CANONICAL_INPUT_VERSION,
       sessionId: prepared.sessionId,
       transcriptRevision: prepared.transcriptRevision,
       identityRevision: prepared.identityRevision,
@@ -614,12 +834,28 @@ class MemoryRepository {
       cloudPayloadBytes: persisted.cloudPayloadBytes,
       cloudPayloadSha256: persisted.cloudPayloadSha256,
       speakerBindings: prepared.speakerBindings,
+      ...(prepared.learningGoals?.length
+        ? { learningGoalIds: prepared.learningGoals.map((goal) => goal.goalId).sort() }
+        : {}),
       segments: prepared.segments.map((segment) => ({
         ordinal: segment.ordinal,
         segmentId: segment.segmentId,
         segmentVersion: segment.segmentVersion,
         textHash: segment.textHash,
         speakerBindingLabel: segment.speakerBindingLabel,
+        ...(isCurrentContract
+          ? {
+              applicationKey: segment.applicationKey,
+              sourceAttribution: segment.sourceAttribution,
+              activityCategory: segment.activityCategory,
+              activityConfidence: segment.activityConfidence,
+              activityDecision: segment.activityDecision,
+              selfParticipated: segment.selfParticipated,
+              memoryMode: segment.memoryMode,
+              allowedSuggestionBases: segment.allowedSuggestionBases,
+              todoCandidateAllowed: segment.todoCandidateAllowed,
+            }
+          : {}),
       })),
     };
   }
@@ -630,18 +866,55 @@ class MemoryRepository {
     const segments = this.db
       .prepare(
         `SELECT ordinal, segment_id, segment_version, text_hash, text_snapshot,
-                speaker_binding_label
+                speaker_binding_label, application_key, source_attribution,
+                activity_category, activity_confidence, activity_decision,
+                self_participated, memory_mode, allowed_suggestion_bases_json,
+                todo_candidate_allowed
          FROM analysis_input_segments WHERE analysis_input_id = ? ORDER BY ordinal`
       )
       .all(analysisInputId)
-      .map((segment) => ({
-        ordinal: segment.ordinal,
-        segmentId: segment.segment_id,
-        segmentVersion: segment.segment_version,
-        textHash: segment.text_hash,
-        textSnapshot: segment.text_snapshot,
-        speakerBindingLabel: segment.speaker_binding_label,
-      }));
+      .map((segment) => {
+        const base = {
+          ordinal: segment.ordinal,
+          segmentId: segment.segment_id,
+          segmentVersion: segment.segment_version,
+          textHash: segment.text_hash,
+          textSnapshot: segment.text_snapshot,
+          speakerBindingLabel: segment.speaker_binding_label,
+        };
+        if (row.input_contract_version === LEGACY_INPUT_CONTRACT_VERSION) return base;
+        if (row.input_contract_version !== INPUT_CONTRACT_VERSION) {
+          throw codedError("MEMORY_INPUT_CORRUPT");
+        }
+        let allowedSuggestionBases;
+        try {
+          allowedSuggestionBases = JSON.parse(segment.allowed_suggestion_bases_json);
+        } catch {
+          throw codedError("MEMORY_INPUT_CORRUPT");
+        }
+        let context;
+        try {
+          context = normalizedSegmentContext({
+            applicationKey: segment.application_key,
+            sourceAttribution: segment.source_attribution,
+            activityCategory: segment.activity_category,
+            activityConfidence: segment.activity_confidence,
+            activityDecision: segment.activity_decision,
+            selfParticipated: segment.self_participated === 1,
+          });
+        } catch {
+          throw codedError("MEMORY_INPUT_CORRUPT");
+        }
+        if (
+          segment.self_participated !== (context.selfParticipated ? 1 : 0) ||
+          segment.memory_mode !== context.memoryMode ||
+          segment.todo_candidate_allowed !== (context.todoCandidateAllowed ? 1 : 0) ||
+          JSON.stringify(allowedSuggestionBases) !== JSON.stringify(context.allowedSuggestionBases)
+        ) {
+          throw codedError("MEMORY_INPUT_CORRUPT");
+        }
+        return { ...base, ...context };
+      });
     const bindings = this.db
       .prepare(
         `SELECT label, subject_kind, subject_id, subject_display_name_snapshot
@@ -678,6 +951,7 @@ class MemoryRepository {
       row.input_contract_version,
       prepared
     );
+    prepared.learningGoals = (payload.payload.learningGoals ?? []).map((goal) => ({ ...goal }));
     const tuple = this._canonicalInputTuple(prepared, {
       inputContractVersion: row.input_contract_version,
       redactionVersion: row.redaction_version,
@@ -759,6 +1033,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT DISTINCT cluster.local_label AS value
          FROM active_manifest AS manifest
@@ -814,6 +1089,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.kind, item.title, item.body
@@ -845,6 +1121,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id, topic.id AS topic_id,
                 topic.name, revision.summary
@@ -872,6 +1149,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT ref.entity_id, ref.transcript_segment_id, todo.id AS todo_id,
                 todo.status, revision.title, revision.due_text
@@ -900,6 +1178,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND result_kind = 'final' AND is_stable = 1
              AND superseded_by IS NULL AND duplicate_of IS NULL
+             AND projection_state = 'visible'
          )
          SELECT conflict.id AS entity_id, ref.transcript_segment_id,
                 item.id AS item_id, item.title, item.body
@@ -975,6 +1254,7 @@ class MemoryRepository {
              AND segment.is_stable = 1
              AND segment.superseded_by IS NULL
              AND segment.duplicate_of IS NULL
+             AND segment.projection_state = 'visible'
            ORDER BY segment.started_at, segment.id`
         )
         .all(boundary.endsAt, boundary.startsAt);
@@ -1037,15 +1317,16 @@ class MemoryRepository {
       const placeholders = rawSessionIds.map(() => "?").join(",");
       const pendingUpstreamRows = this.db
         .prepare(
-          `SELECT session_id, job_type, input_hash, input_version, model_version
+          `SELECT session_id, job_type
            FROM processing_jobs
            WHERE session_id IN (${placeholders})
-             AND job_type <> 'generate_daily_digest'
-             AND completed_at IS NULL
-             AND state NOT IN (
-               'completed','failed','cancelled','superseded','audio_expired_before_processing'
-             )
-           ORDER BY session_id, job_type, input_hash, input_version, model_version`
+              AND job_type <> 'generate_daily_digest'
+              AND completed_at IS NULL
+              AND state NOT IN (
+                'completed','failed','cancelled','superseded','audio_expired_before_processing'
+              )
+           GROUP BY session_id, job_type
+           ORDER BY session_id, job_type`
         )
         .all(...rawSessionIds);
       const incompleteSegmentCount = this.db
@@ -1055,6 +1336,7 @@ class MemoryRepository {
            WHERE started_at < ? AND ended_at > ?
              AND superseded_by IS NULL
              AND duplicate_of IS NULL
+             AND projection_state = 'visible'
              AND (
                result_kind <> 'final' OR is_stable <> 1
              )`
@@ -1108,9 +1390,6 @@ class MemoryRepository {
         pendingUpstreamJobs: pendingUpstreamRows.map((job) => ({
           sessionRef: pseudonymousRef("session", job.session_id),
           jobType: job.job_type,
-          inputHash: job.input_hash,
-          inputVersion: job.input_version,
-          modelVersion: job.model_version,
         })),
       };
       const cloudPayload = {
@@ -1303,8 +1582,10 @@ class MemoryRepository {
       const insertSegment = this.db.prepare(
         `INSERT INTO analysis_input_segments (
            analysis_input_id, ordinal, segment_id, segment_version, text_hash,
-           text_snapshot, speaker_binding_label
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+           text_snapshot, speaker_binding_label, application_key, source_attribution,
+           activity_category, activity_confidence, activity_decision, self_participated,
+           memory_mode, allowed_suggestion_bases_json, todo_candidate_allowed
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const segment of prepared.segments) {
         insertSegment.run(
@@ -1314,7 +1595,16 @@ class MemoryRepository {
           segment.segmentVersion,
           segment.textHash,
           segment.textSnapshot,
-          segment.speakerBindingLabel
+          segment.speakerBindingLabel,
+          segment.applicationKey,
+          segment.sourceAttribution,
+          segment.activityCategory,
+          segment.activityConfidence,
+          segment.activityDecision,
+          segment.selfParticipated ? 1 : 0,
+          segment.memoryMode,
+          JSON.stringify(segment.allowedSuggestionBases),
+          segment.todoCandidateAllowed ? 1 : 0
         );
       }
       return {
@@ -1337,6 +1627,7 @@ class MemoryRepository {
         cloudPayloadJson: stored.row.cloud_payload_json,
         allowedSegmentIds: [...stored.payload.selectedSegmentIds],
         allowedOwnerLabels: [...stored.payload.selectedOwnerLabels],
+        allowedLearningGoalIds: [...stored.payload.selectedLearningGoalIds],
       };
     });
     return read.deferred();
@@ -1403,7 +1694,7 @@ class MemoryRepository {
     } catch {
       throw codedError("MEMORY_DESIRED_HEAD_CORRUPT");
     }
-    const expectedKeys = [
+    const legacyExpectedKeys = [
       "analysisInputId",
       "analysisInputHash",
       "transcriptRevision",
@@ -1415,6 +1706,9 @@ class MemoryRepository {
       "cloudPayloadHash",
       "segments",
     ];
+    const expectedKeys = [...legacyExpectedKeys, "activityClassificationRevision"];
+    const hasCurrentShape = hasExactKeys(vector, expectedKeys);
+    const hasLegacyShape = hasExactKeys(vector, legacyExpectedKeys);
     const validSegments =
       Array.isArray(vector?.segments) &&
       vector.segments.length > 0 &&
@@ -1428,7 +1722,8 @@ class MemoryRepository {
         ])
       );
     if (
-      !hasExactKeys(vector, expectedKeys) ||
+      (!hasCurrentShape && !hasLegacyShape) ||
+      (hasCurrentShape && !/^[0-9a-f]{64}$/u.test(vector.activityClassificationRevision)) ||
       !validSegments ||
       vector.analysisInputId !== row.analysis_input_id ||
       !safeHashEqual(vector.analysisInputHash, row.analysis_input_hash) ||
@@ -1438,6 +1733,9 @@ class MemoryRepository {
     }
     return {
       ...vector,
+      activityClassificationRevision: hasCurrentShape
+        ? vector.activityClassificationRevision
+        : null,
       desiredVectorHash: row.desired_vector_hash,
       headRevision: row.head_revision,
       createdAt: row.created_at,
@@ -1577,6 +1875,13 @@ class MemoryRepository {
       "pseudonymBindingRevision"
     );
     const modelVersion = assertText(input.modelVersion, "modelVersion");
+    const hasActivityClassificationRevision = Object.prototype.hasOwnProperty.call(
+      input,
+      "activityClassificationRevision"
+    );
+    const activityClassificationRevision = hasActivityClassificationRevision
+      ? assertHash(input.activityClassificationRevision, "activityClassificationRevision")
+      : null;
     if (!Array.isArray(input.segmentSubjectRevisions)) {
       throw new TypeError("segmentSubjectRevisions must be an array");
     }
@@ -1607,6 +1912,7 @@ class MemoryRepository {
         analysisInputHash: stored.row.input_hash,
         transcriptRevision: stored.row.transcript_revision,
         identityRevision: stored.row.identity_revision,
+        ...(hasActivityClassificationRevision ? { activityClassificationRevision } : {}),
         promptVersion: stored.row.prompt_version,
         responseSchemaVersion,
         pseudonymBindingRevision,
@@ -1685,6 +1991,7 @@ class MemoryRepository {
       validateCandidate(input.candidate, {
         allowedSegmentIds: new Set(stored.payload.selectedSegmentIds),
         allowedOwnerLabels: new Set(stored.payload.selectedOwnerLabels),
+        allowedLearningGoalIds: new Set(stored.payload.selectedLearningGoalIds),
       });
       const candidateJson = canonicalJson(input.candidate);
       const candidateBytes = Buffer.byteLength(candidateJson, "utf8");
@@ -1881,6 +2188,54 @@ class MemoryRepository {
     };
   }
 
+  _dailyDigestOutputPolicyContext(storedInput) {
+    const segmentIds = storedInput.inputWatermark.evidence.map((entry) => entry.segmentId);
+    const rows = this.db
+      .prepare(
+        `SELECT segment.id, segment.session_id, segment.started_at, segment.ended_at,
+                segment.speaker_label, segment.source_type,
+                track.track_kind, track.application_key, track.attribution_state
+         FROM transcript_segments AS segment
+         LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+         JOIN json_each(?) AS selected ON selected.value = segment.id
+         ORDER BY segment.session_id, segment.started_at, segment.ended_at, segment.id`
+      )
+      .all(JSON.stringify(segmentIds));
+    if (rows.length !== new Set(segmentIds).size) {
+      throw codedError("DAILY_DIGEST_INPUT_CORRUPT");
+    }
+    const classificationsBySession = new Map();
+    const result = new Map();
+    for (const segment of rows) {
+      let classifications = classificationsBySession.get(segment.session_id);
+      if (!classifications) {
+        classifications = this._effectiveActivityActionClassifications(segment.session_id);
+        classificationsBySession.set(segment.session_id, classifications);
+      }
+      const classification = this._classificationForAnalysisSegment(classifications, segment);
+      const context = this._analysisSegmentContext(segment, segment.speaker_label, classifications);
+      result.set(segment.id, {
+        category: context.activityCategory,
+        confidence: context.activityConfidence,
+        decision: context.activityDecision,
+        sourceAttribution: context.sourceAttribution,
+        selfParticipated: context.selfParticipated,
+        allowSuggestions:
+          classification?.evidence?.allowSuggestions === true &&
+          context.allowedSuggestionBases.length > 0,
+        applicationKey: context.applicationKey,
+      });
+    }
+    return result;
+  }
+
+  _projectDailyDigestCandidate(storedInput, candidate) {
+    return applyDailyDigestOutputPolicy(
+      candidate,
+      this._dailyDigestOutputPolicyContext(storedInput)
+    );
+  }
+
   persistValidatedDailyDigestCandidate(input) {
     assertExactPlainObject(
       input,
@@ -1895,9 +2250,13 @@ class MemoryRepository {
     const transaction = this.db.transaction(() => {
       const storedInput = this.getDailyDigestInput(digestInputId);
       if (!storedInput) throw codedError("MEMORY_DAILY_DIGEST_INPUT_NOT_FOUND");
+      const candidateContext = this._dailyDigestCandidateContext(storedInput);
       const candidate = validateCandidateDailyDigest(
-        input.candidate,
-        this._dailyDigestCandidateContext(storedInput)
+        this._projectDailyDigestCandidate(
+          storedInput,
+          validateCandidateDailyDigest(input.candidate, candidateContext)
+        ),
+        candidateContext
       );
       const candidateJson = canonicalJson(candidate);
       const candidateBytes = Buffer.byteLength(candidateJson, "utf8");
@@ -2441,11 +2800,19 @@ class MemoryRepository {
           candidateHash: candidateRow.candidate_hash,
         };
       }
+      const context = this._candidateContext({
+        id: candidateRow.analysis_input_id,
+        session_id: inputRow.session_id,
+      });
+      const projectionCandidate = this._cloudActionProjectionCandidate(
+        inputRow,
+        candidate,
+        context
+      );
       const result = this.applyCandidateAnalysis({
         analysisInputId: candidateRow.analysis_input_id,
         inputHash: inputRow.input_hash,
-        candidate,
-        claimedCandidateHash: candidateRow.candidate_hash,
+        candidate: projectionCandidate,
       });
       const applied = this.db
         .prepare(
@@ -2455,7 +2822,11 @@ class MemoryRepository {
         )
         .run(at, candidateId);
       if (applied.changes !== 1) throw codedError("MEMORY_CAS_CONFLICT");
-      return result;
+      return {
+        ...result,
+        candidateHash: candidateRow.candidate_hash,
+        rawCandidateHash: candidateRow.candidate_hash,
+      };
     });
     return transaction.immediate();
   }
@@ -2464,18 +2835,35 @@ class MemoryRepository {
     return assertId(this.createId(prefix), `${prefix}Id`);
   }
 
+  applyKnowledgeAction(input) {
+    return this.knowledgeActionRepository.apply(input);
+  }
+
   _candidateContext(inputRow) {
     const manifest = this.db
       .prepare(
         `SELECT manifest.ordinal, manifest.segment_id, manifest.segment_version,
                 manifest.text_hash, manifest.text_snapshot, manifest.speaker_binding_label,
+                manifest.application_key AS input_application_key,
+                manifest.source_attribution AS input_source_attribution,
+                manifest.activity_category AS input_activity_category,
+                manifest.activity_confidence AS input_activity_confidence,
+                manifest.activity_decision AS input_activity_decision,
+                manifest.self_participated AS input_self_participated,
+                manifest.memory_mode AS input_memory_mode,
+                manifest.allowed_suggestion_bases_json AS input_allowed_suggestion_bases_json,
+                manifest.todo_candidate_allowed AS input_todo_candidate_allowed,
                 segment.session_id, segment.started_at, segment.ended_at, segment.version,
-                segment.text, segment.result_kind, segment.is_stable, segment.superseded_by,
+                segment.text, segment.source_type, segment.result_kind, segment.is_stable,
+                segment.superseded_by,
                 segment.duplicate_of, segment.chunk_id, segment.track_id,
+                segment.confidence AS transcript_confidence,
+                track.track_kind, track.application_key, track.attribution_state,
                 chunk.deleted_at
          FROM analysis_input_segments AS manifest
          JOIN transcript_segments AS segment ON segment.id = manifest.segment_id
          LEFT JOIN audio_chunks AS chunk ON chunk.id = segment.chunk_id
+         LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
          WHERE manifest.analysis_input_id = ? ORDER BY manifest.ordinal`
       )
       .all(inputRow.id);
@@ -2843,6 +3231,504 @@ class MemoryRepository {
     };
   }
 
+  _effectiveActivityActionClassifications(sessionId) {
+    const sourcePriority = { local: 1, minimax: 2, user: 3 };
+    const history = this.db
+      .prepare(
+        `SELECT started_at, ended_at, category, confidence, decision, source, reason,
+                 source_attribution, evidence_json, updated_at, id
+         FROM activity_classifications
+         WHERE session_id = ?
+         ORDER BY started_at, ended_at, updated_at, id`
+      )
+      .all(sessionId)
+      .map((row) => {
+        let evidence = null;
+        try {
+          evidence = JSON.parse(row.evidence_json);
+        } catch {
+          // A malformed local policy record must fail closed for projected actions.
+        }
+        return { ...row, evidence };
+      });
+    const byActivityWindow = new Map();
+    for (const entry of history) {
+      const key = `${entry.started_at}\0${entry.ended_at}`;
+      const entries = byActivityWindow.get(key) ?? [];
+      entries.push(entry);
+      byActivityWindow.set(key, entries);
+    }
+    const newer = (left, right) =>
+      left.updated_at > right.updated_at ||
+      (left.updated_at === right.updated_at && left.id > right.id);
+    const evidenceBasis = (entry) => {
+      const evidence = entry.evidence ?? {};
+      return JSON.stringify({
+        applicationKeys: [...new Set(evidence.applicationKeys ?? [])].sort(),
+        microphoneParticipated: evidence.microphoneParticipated === true,
+        selfDetected: evidence.selfDetected === true,
+        speakerCount: Number.isSafeInteger(evidence.speakerCount) ? evidence.speakerCount : 0,
+        timeBucket: typeof evidence.timeBucket === "string" ? evidence.timeBucket : null,
+        personalizationRuleId:
+          typeof evidence.personalizationRuleId === "string"
+            ? evidence.personalizationRuleId
+            : null,
+        sourceAttribution: entry.source_attribution ?? null,
+      });
+    };
+    const select = (entries) => {
+      const userEntries = entries.filter((entry) => entry.source === "user");
+      if (userEntries.length > 0) {
+        return userEntries.reduce((current, entry) => (newer(entry, current) ? entry : current));
+      }
+      const localEntries = entries.filter((entry) => entry.source === "local");
+      const candidates =
+        localEntries.length === 0
+          ? entries
+          : (() => {
+              const latestLocal = localEntries.reduce((current, entry) =>
+                newer(entry, current) ? entry : current
+              );
+              const basis = evidenceBasis(latestLocal);
+              return entries.filter((entry) => evidenceBasis(entry) === basis);
+            })();
+      return candidates.reduce((current, entry) => {
+        if (sourcePriority[entry.source] > sourcePriority[current.source]) return entry;
+        if (
+          sourcePriority[entry.source] === sourcePriority[current.source] &&
+          newer(entry, current)
+        ) {
+          return entry;
+        }
+        return current;
+      });
+    };
+    return [...byActivityWindow.values()]
+      .map(select)
+      .sort(
+        (left, right) =>
+          left.started_at - right.started_at ||
+          left.ended_at - right.ended_at ||
+          left.id.localeCompare(right.id)
+      );
+  }
+
+  getActivityActionPolicyRevision(sessionId) {
+    const id = assertId(sessionId, "sessionId");
+    const classifications = this._effectiveActivityActionClassifications(id);
+    return sha256(
+      canonicalJson(
+        classifications.map((classification) => ({
+          startedAt: classification.started_at,
+          endedAt: classification.ended_at,
+          category: classification.category,
+          confidence: classification.confidence,
+          decision: classification.decision,
+          sourceAttribution: classification.source_attribution,
+          allowTodos: classification.evidence?.allowTodos === true,
+          allowSuggestions: classification.evidence?.allowSuggestions === true,
+        }))
+      )
+    );
+  }
+
+  _todoSpeakerTrust(inputRow, context, segment) {
+    const binding = context.bindingByLabel.get(segment.speaker_binding_label) ?? null;
+    const resolution = this.db
+      .prepare(
+        `SELECT identity.candidate_person_id, identity.resolution_state,
+                identity.match_score, identity.reason, identity.projection_applied,
+                person.is_self, track.track_kind, track.attribution_state,
+                (
+                  SELECT COUNT(*)
+                  FROM speaker_cluster_model_embeddings AS embedding
+                  WHERE embedding.cluster_id = cluster.id
+                ) AS embedding_model_count,
+                EXISTS(
+                  SELECT 1
+                  FROM speaker_cluster_model_embeddings AS embedding
+                  WHERE embedding.cluster_id = cluster.id
+                    AND (
+                      embedding.overlap_detected = 1
+                      OR embedding.echo_detected = 1
+                      OR embedding.attribution_state <> 'exact'
+                    )
+                ) AS untrusted_embedding,
+                EXISTS(
+                  SELECT 1
+                  FROM speaker_turns AS turn
+                  LEFT JOIN speaker_turns AS other
+                    ON other.run_id = turn.run_id
+                   AND other.cluster_id <> turn.cluster_id
+                   AND other.started_at < turn.ended_at
+                   AND turn.started_at < other.ended_at
+                  WHERE turn.transcript_segment_id = link.transcript_segment_id
+                    AND (
+                      turn.echo_state <> 'none'
+                      OR turn.duplicate_of_turn_id IS NOT NULL
+                      OR other.id IS NOT NULL
+                    )
+                ) AS overlap_or_echo
+                ,(
+                  SELECT COUNT(*)
+                  FROM speaker_identity_resolution_model_evidence AS model_evidence
+                  WHERE model_evidence.resolution_id = identity.id
+                ) AS resolution_model_count
+                ,EXISTS(
+                  SELECT 1
+                  FROM speaker_identity_resolution_model_evidence AS model_evidence
+                  WHERE model_evidence.resolution_id = identity.id
+                    AND model_evidence.passed <> 1
+                ) AS resolution_model_failed
+         FROM speaker_cluster_segments AS link
+         JOIN speaker_clusters AS cluster ON cluster.id = link.cluster_id
+         LEFT JOIN audio_tracks AS track ON track.id = cluster.track_id
+         JOIN speaker_identity_resolutions AS identity ON identity.cluster_id = cluster.id
+         JOIN speaker_identity_resolution_runs AS identity_run
+           ON identity_run.id = identity.resolution_run_id
+         LEFT JOIN people AS person ON person.id = identity.candidate_person_id
+         WHERE link.transcript_segment_id = ?
+           AND cluster.session_id = ?
+           AND identity.actor = 'system'
+         ORDER BY identity_run.commit_sequence DESC, identity.rowid DESC
+         LIMIT 1`
+      )
+      .get(segment.segment_id, inputRow.session_id);
+    const relation = segment.speaker_binding_label;
+    const isSelf = relation === "SELF";
+    const bindingMatches =
+      binding?.subject_kind === "person" &&
+      resolution?.candidate_person_id === binding.subject_id &&
+      (isSelf ? resolution?.is_self === 1 : resolution?.is_self !== 1);
+    const reasonMatches = isSelf
+      ? resolution?.reason === "dual_model_self_enrollment_confirmed"
+      : resolution?.reason === "dual_model_auto_confirmed";
+    const sourceMatches = isSelf
+      ? resolution?.track_kind === "mic" && resolution?.attribution_state === "exact"
+      : resolution?.attribution_state === "exact";
+    const overlapDetected =
+      resolution?.untrusted_embedding === 1 || resolution?.overlap_or_echo === 1;
+    const verified = Boolean(
+      resolution &&
+      resolution.resolution_state === "confirmed" &&
+      resolution.projection_applied === 1 &&
+      Number(resolution.embedding_model_count) >= 2 &&
+      Number(resolution.resolution_model_count) >= 2 &&
+      resolution.resolution_model_failed !== 1 &&
+      typeof resolution.match_score === "number" &&
+      bindingMatches &&
+      reasonMatches &&
+      sourceMatches &&
+      !overlapDetected
+    );
+    return {
+      voiceConfidence:
+        typeof resolution?.match_score === "number" && Number.isFinite(resolution.match_score)
+          ? Math.max(0, resolution.match_score)
+          : 0,
+      speakerEvidenceVerified: verified,
+      overlapDetected,
+    };
+  }
+
+  _analysisPolicySnapshotForSegment(segment, classifications) {
+    const hasStoredSnapshot = segment.input_source_attribution !== null;
+    if (!hasStoredSnapshot) {
+      return this._analysisSegmentContext(segment, segment.speaker_binding_label, classifications);
+    }
+    let allowedSuggestionBases;
+    try {
+      allowedSuggestionBases = JSON.parse(segment.input_allowed_suggestion_bases_json);
+    } catch {
+      throw codedError("MEMORY_INPUT_CORRUPT");
+    }
+    let snapshot;
+    try {
+      snapshot = normalizedSegmentContext({
+        applicationKey: segment.input_application_key,
+        sourceAttribution: segment.input_source_attribution,
+        activityCategory: segment.input_activity_category,
+        activityConfidence: segment.input_activity_confidence,
+        activityDecision: segment.input_activity_decision,
+        selfParticipated: segment.input_self_participated === 1,
+      });
+    } catch {
+      throw codedError("MEMORY_INPUT_CORRUPT");
+    }
+    if (
+      segment.input_self_participated !== (snapshot.selfParticipated ? 1 : 0) ||
+      segment.input_memory_mode !== snapshot.memoryMode ||
+      segment.input_todo_candidate_allowed !== (snapshot.todoCandidateAllowed ? 1 : 0) ||
+      JSON.stringify(allowedSuggestionBases) !== JSON.stringify(snapshot.allowedSuggestionBases)
+    ) {
+      throw codedError("MEMORY_INPUT_CORRUPT");
+    }
+    return snapshot;
+  }
+
+  _cloudActionProjectionCandidate(inputRow, candidate, context) {
+    const selfBinding = context.bindingByLabel.get("SELF");
+    const classifications = this._effectiveActivityActionClassifications(inputRow.session_id);
+    const policyBySegmentId = new Map(
+      context.manifest.map((segment) => [
+        segment.segment_id,
+        this._analysisPolicySnapshotForSegment(segment, classifications),
+      ])
+    );
+    const evidencePolicies = (segmentIds) =>
+      segmentIds.map((segmentId) => policyBySegmentId.get(segmentId) ?? null);
+    const memories = candidate.memories.filter((memory) => {
+      const policies = evidencePolicies(memory.evidenceSegmentIds);
+      if (policies.some((policy) => policy === null)) return false;
+      if (memory.kind === "preference") {
+        return (
+          policies.every((policy) => ["full", "interest_only"].includes(policy.memoryMode)) &&
+          (policies.every((policy) => policy.memoryMode === "full") ||
+            policies.every((policy) => policy.memoryMode === "interest_only"))
+        );
+      }
+      if (memory.kind === "commitment") {
+        if (memory.confidence < 0.9 || !selfBinding || selfBinding.subject_kind !== "person") {
+          return false;
+        }
+        return memory.evidenceSegmentIds.every((segmentId, index) => {
+          const segment = context.manifestById.get(segmentId);
+          const policy = policies[index];
+          if (
+            !segment ||
+            segment.speaker_binding_label !== "SELF" ||
+            policy.memoryMode !== "full" ||
+            policy.todoCandidateAllowed !== true ||
+            policy.sourceAttribution === "mixed_unknown"
+          ) {
+            return false;
+          }
+          return this._todoSpeakerTrust(inputRow, context, segment).speakerEvidenceVerified;
+        });
+      }
+      if (memory.kind === "relationship") {
+        const hasSocialParticipant = memory.evidenceSegmentIds.some((segmentId) => {
+          const label = context.manifestById.get(segmentId)?.speaker_binding_label;
+          return label !== "SELF" && context.bindingByLabel.has(label);
+        });
+        return hasSocialParticipant && policies.every((policy) => policy.memoryMode === "full");
+      }
+      return policies.every((policy) => policy.memoryMode === "full");
+    });
+    const topics = candidate.topics.filter((topic) => {
+      const policies = evidencePolicies(topic.evidenceSegmentIds);
+      return (
+        policies.length > 0 &&
+        (policies.every((policy) => policy?.memoryMode === "full") ||
+          policies.every((policy) => policy?.memoryMode === "interest_only"))
+      );
+    });
+    const actionCategories = new Set([
+      "work_meeting",
+      "learning",
+      "social_call",
+      "in_person_conversation",
+    ]);
+    const classificationMatchesSource = (classification, segment) => {
+      if (segment.source_type === "mic") {
+        return new Set(["microphone", "application_and_microphone"]).has(
+          classification.source_attribution
+        );
+      }
+      return new Set(["application", "application_and_microphone", "mixed_unknown"]).has(
+        classification.source_attribution
+      );
+    };
+    const matchingClassificationsForSegment = (segmentId) => {
+      const segment = context.manifestById.get(segmentId);
+      if (!segment) return [];
+      return classifications.filter(
+        (classification) =>
+          classification.started_at < segment.ended_at &&
+          segment.started_at < classification.ended_at &&
+          classificationMatchesSource(classification, segment)
+      );
+    };
+    const isSelfEvidence = (segmentId) =>
+      context.manifestById.get(segmentId)?.speaker_binding_label === "SELF";
+    const selfCommitmentConfidence = new Map();
+    for (const memory of candidate.memories.filter((entry) => entry.kind === "commitment")) {
+      for (const segmentId of memory.evidenceSegmentIds.filter(isSelfEvidence)) {
+        selfCommitmentConfidence.set(
+          segmentId,
+          Math.max(selfCommitmentConfidence.get(segmentId) ?? 0, memory.confidence)
+        );
+      }
+    }
+
+    const verificationByTodo = new Map();
+    const todos =
+      !selfBinding || selfBinding.subject_kind !== "person"
+        ? []
+        : candidate.todos.filter((todo) => {
+            if (this.personalizationFeedbackRepository.shouldSuppressTodo(todo.title)) {
+              return false;
+            }
+            if (todo.ownerLabel !== "SELF" || !todo.evidenceSegmentIds.some(isSelfEvidence)) {
+              return false;
+            }
+            const evidence = todo.evidenceSegmentIds.map((segmentId) => {
+              const segment = context.manifestById.get(segmentId);
+              if (!segment) return null;
+              const matching = matchingClassificationsForSegment(segmentId).sort((left, right) => {
+                const leftPass =
+                  left.decision === "adopted" &&
+                  left.source_attribution !== "mixed_unknown" &&
+                  actionCategories.has(left.category) &&
+                  left.evidence?.allowTodos === true;
+                const rightPass =
+                  right.decision === "adopted" &&
+                  right.source_attribution !== "mixed_unknown" &&
+                  actionCategories.has(right.category) &&
+                  right.evidence?.allowTodos === true;
+                if (leftPass !== rightPass) return leftPass ? 1 : -1;
+                return left.confidence - right.confidence || left.id.localeCompare(right.id);
+              });
+              const classification = matching[0] ?? null;
+              const explicitSemanticAction =
+                todo.actionKind === "self_commitment" ||
+                todo.actionKind === "assignment_accepted" ||
+                (todo.actionKind === undefined && todo.evidenceSegmentIds.every(isSelfEvidence));
+              const permissions = classification
+                ? this.activityOutputPolicy.evaluate({
+                    category: classification.category,
+                    confidence: classification.confidence,
+                    decision: classification.decision,
+                    sourceAttribution: classification.source_attribution,
+                    selfParticipated:
+                      classification.evidence?.selfDetected === true ||
+                      todo.evidenceSegmentIds.some(isSelfEvidence),
+                    explicitAgreement: explicitSemanticAction,
+                  })
+                : null;
+              const speakerTrust = this._todoSpeakerTrust(inputRow, context, segment);
+              const fallbackSource =
+                segment.source_type === "mic"
+                  ? "microphone"
+                  : segment.attribution_state === "exact"
+                    ? "application"
+                    : "mixed_unknown";
+              return {
+                segmentId,
+                speakerRelation: segment.speaker_binding_label,
+                ...speakerTrust,
+                sourceAttribution: classification?.source_attribution ?? fallbackSource,
+                applicationKey:
+                  segment.track_kind === "application" && segment.attribution_state === "exact"
+                    ? segment.application_key
+                    : null,
+                activityCategory: classification?.category ?? "unknown",
+                activityConfidence: classification?.confidence ?? 0,
+                activityDecision: classification?.decision ?? "unknown",
+                allowTodos: permissions?.allowTodos === true,
+                transcriptConfidence:
+                  typeof segment.transcript_confidence === "number" &&
+                  Number.isFinite(segment.transcript_confidence)
+                    ? segment.transcript_confidence
+                    : 0,
+                startedAt: segment.started_at,
+                endedAt: segment.ended_at,
+              };
+            });
+            if (evidence.some((entry) => entry === null)) return false;
+            const selfEvidence = evidence.filter((entry) => entry.speakerRelation === "SELF");
+            const localCommitmentConfidence = Math.min(
+              ...selfEvidence.map((entry) => selfCommitmentConfidence.get(entry.segmentId) ?? 0)
+            );
+            const evaluation = evaluateTodoAttribution({
+              ownerLabel: todo.ownerLabel,
+              semanticConfidence: todo.semanticConfidence,
+              localCommitmentConfidence,
+              actionKind: todo.actionKind,
+              assignmentSegmentIds: todo.assignmentSegmentIds,
+              acceptanceSegmentIds: todo.acceptanceSegmentIds,
+              evidence,
+            });
+            if (evaluation.disposition === "rejected") return false;
+            const key = canonicalTupleHash([
+              "todo_verification",
+              canonicalizeText(todo.title),
+              todo.dueText,
+              [...todo.evidenceSegmentIds].sort(),
+            ]);
+            verificationByTodo.set(key, {
+              state:
+                evaluation.disposition === "auto_confirmed" ? "confirmed" : "pending_confirmation",
+              reason: evaluation.reason,
+              trustSnapshot: {
+                policyId: TODO_ATTRIBUTION_POLICY_VERSION,
+                application: evidence
+                  .map((entry) => ({
+                    segmentId: entry.segmentId,
+                    applicationKey: entry.applicationKey,
+                    sourceAttribution: entry.sourceAttribution,
+                    speakerRelation: entry.speakerRelation,
+                  }))
+                  .sort((left, right) => left.segmentId.localeCompare(right.segmentId)),
+                activity: evidence
+                  .map((entry) => ({
+                    segmentId: entry.segmentId,
+                    category: entry.activityCategory,
+                    confidence: entry.activityConfidence,
+                    decision: entry.activityDecision,
+                  }))
+                  .sort((left, right) => left.segmentId.localeCompare(right.segmentId)),
+                semanticConfidence: evaluation.snapshot.semanticConfidence,
+                voiceprintConfidence: evaluation.snapshot.voiceConfidence,
+                sceneConfidence: evaluation.snapshot.sceneConfidence,
+                transcriptContextConfidence: evaluation.snapshot.transcriptConfidence,
+                speakerEvidenceVerified: evaluation.snapshot.speakerEvidenceVerified,
+                overlapDetected: evaluation.snapshot.overlapDetected,
+                automaticEligible: evaluation.disposition === "auto_confirmed",
+              },
+            });
+            return true;
+          });
+    const confirmedLearningGoalIds = this.db
+      .prepare("SELECT id FROM learning_goals WHERE state = 'confirmed' ORDER BY id")
+      .all()
+      .map((row) => row.id);
+    const suggestions =
+      !selfBinding || selfBinding.subject_kind !== "person"
+        ? []
+        : candidate.suggestions.filter((suggestion) => {
+            if (!suggestion.basedOnEvidenceSegmentIds.some(isSelfEvidence)) {
+              return false;
+            }
+            const basis =
+              suggestion.basis === undefined || suggestion.basis === "legacy_unverified"
+                ? "work_context"
+                : suggestion.basis;
+            const evidence = suggestion.basedOnEvidenceSegmentIds.flatMap((segmentId) => {
+              const segment = context.manifestById.get(segmentId);
+              return matchingClassificationsForSegment(segmentId).map((classification) => ({
+                category: classification.category,
+                confidence: classification.confidence,
+                decision: classification.decision,
+                sourceAttribution: classification.source_attribution,
+                selfParticipated:
+                  classification.evidence?.selfDetected === true ||
+                  segment?.speaker_binding_label === "SELF",
+              }));
+            });
+            if (evidence.length === 0) return false;
+            return this.activityOutputPolicy.evaluateSuggestionCandidate({
+              basis,
+              learningGoalId: basis === "learning_goal" ? suggestion.learningGoalId : null,
+              confirmedLearningGoalIds,
+              evidence,
+            }).allowed;
+          });
+    const projection = { ...candidate, memories, topics, todos, suggestions };
+    this.actionVerificationByCandidate.set(projection, verificationByTodo);
+    return projection;
+  }
+
   applyCandidateAnalysis(input) {
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       throw new TypeError("candidate application is required");
@@ -2850,6 +3736,8 @@ class MemoryRepository {
     const analysisInputId = assertId(input.analysisInputId, "analysisInputId");
     const inputHash = assertHash(input.inputHash, "inputHash");
     const candidate = input.candidate;
+    const projectedTodoVerification =
+      this.actionVerificationByCandidate.get(candidate) ?? new Map();
     const rawCandidateHash = sha256(canonicalJson(candidate));
     if (
       Object.prototype.hasOwnProperty.call(input, "claimedCandidateHash") &&
@@ -2868,7 +3756,12 @@ class MemoryRepository {
       const context = this._candidateContext(inputRow);
       const allowedSegmentIds = new Set(storedInput.payload.selectedSegmentIds);
       const allowedOwnerLabels = new Set(storedInput.payload.selectedOwnerLabels);
-      validateCandidate(candidate, { allowedSegmentIds, allowedOwnerLabels });
+      const allowedLearningGoalIds = new Set(storedInput.payload.selectedLearningGoalIds);
+      validateCandidate(candidate, {
+        allowedSegmentIds,
+        allowedOwnerLabels,
+        allowedLearningGoalIds,
+      });
       if (inputRow.candidate_hash !== null) {
         const retrySemanticHash = semanticCandidateHash(candidate);
         if (safeHashEqual(retrySemanticHash, inputRow.candidate_hash)) {
@@ -2941,6 +3834,101 @@ class MemoryRepository {
           endedAt: Math.max(...rows.map((row) => row.ended_at)),
         };
       };
+      const ensureTodoActionMetadata = this.db.prepare(`
+        INSERT OR IGNORE INTO todo_action_metadata (
+          todo_instance_id, source_kind, source_session_id, pinned, urgency,
+          user_modified, dismissed_from_verification_state, dismiss_reason_code,
+          dismiss_local_note, suppressed, updated_at, last_event_sequence
+        )
+        SELECT
+          todo.id,
+          'existing',
+          (
+            SELECT CASE
+              WHEN count(DISTINCT COALESCE(occurrence.legacy_session_id, input.session_id)) = 1
+              THEN min(COALESCE(occurrence.legacy_session_id, input.session_id))
+              ELSE NULL
+            END
+            FROM todo_occurrences AS occurrence
+            LEFT JOIN analysis_inputs AS input ON input.id = occurrence.analysis_input_id
+            WHERE occurrence.todo_instance_id = todo.id
+          ),
+          0,
+          'normal',
+          0,
+          NULL,
+          NULL,
+          NULL,
+          CASE WHEN todo.status = 'dismissed' THEN 1 ELSE 0 END,
+          todo.updated_at,
+          NULL
+        FROM todos_v2 AS todo
+        WHERE todo.id = ?
+      `);
+      const hasTodoActionMetadata = this.db.prepare(
+        "SELECT 1 FROM todo_action_metadata WHERE todo_instance_id = ?"
+      );
+      const ensureSuggestionActionMetadata = this.db.prepare(`
+        INSERT OR IGNORE INTO suggestion_action_metadata (
+          suggestion_id, effective_state, dismiss_reason_code, converted_todo_id,
+          acceptance_undone, updated_at, last_event_sequence
+        )
+        SELECT
+          suggestion.id,
+          suggestion.state,
+          NULL,
+          acceptance.todo_instance_id,
+          0,
+          suggestion.updated_at,
+          NULL
+        FROM suggestions_v2 AS suggestion
+        LEFT JOIN suggestion_acceptances AS acceptance
+          ON acceptance.suggestion_id = suggestion.id
+        WHERE suggestion.id = ?
+      `);
+      const hasSuggestionActionMetadata = this.db.prepare(
+        "SELECT 1 FROM suggestion_action_metadata WHERE suggestion_id = ?"
+      );
+      const ensureTodoActionProjection = (todoId) => {
+        ensureTodoActionMetadata.run(todoId);
+        if (!hasTodoActionMetadata.get(todoId)) {
+          throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+        }
+      };
+      const ensureSuggestionActionProjection = (suggestionId) => {
+        ensureSuggestionActionMetadata.run(suggestionId);
+        if (!hasSuggestionActionMetadata.get(suggestionId)) {
+          throw codedError("MEMORY_EXISTING_SNAPSHOT_CORRUPT");
+        }
+      };
+      const referencedTodoCanonicalKeys = new Set(
+        candidate.todos.map((todo) => {
+          const ownerSubjectId =
+            todo.ownerLabel === null
+              ? null
+              : (context.bindingByLabel.get(todo.ownerLabel)?.subject_id ?? null);
+          return canonicalTupleHash(["todo", canonicalizeText(todo.title), ownerSubjectId]);
+        })
+      );
+      for (const todo of plannerInput.existing.todos) {
+        if (referencedTodoCanonicalKeys.has(todo.canonicalBaseKey)) {
+          ensureTodoActionProjection(todo.id);
+        }
+      }
+      const referencedSuggestionCanonicalKeys = new Set(
+        candidate.suggestions.map((suggestion) =>
+          canonicalTupleHash([
+            "suggestion",
+            canonicalizeText(suggestion.title),
+            canonicalizeText(suggestion.rationale),
+          ])
+        )
+      );
+      for (const suggestion of plannerInput.existing.suggestions) {
+        if (referencedSuggestionCanonicalKeys.has(suggestion.canonicalKey)) {
+          ensureSuggestionActionProjection(suggestion.id);
+        }
+      }
 
       const cloudPayload = JSON.parse(inputRow.cloud_payload_json);
       const completeness = cloudPayload.omittedRanges.length === 0 ? "final" : "incremental";
@@ -3297,6 +4285,57 @@ class MemoryRepository {
             appliedAt
           );
         insertEvidence("todo_occurrence", occurrenceId, todo.evidenceSegmentIds);
+        ensureTodoActionProjection(todoRow.id);
+
+        const desiredVerification = projectedTodoVerification.get(
+          canonicalTupleHash([
+            "todo_verification",
+            canonicalizeText(todo.title),
+            todo.dueText,
+            [...todo.evidenceSegmentIds].sort(),
+          ])
+        );
+        const latestVerification = this._latestTodoVerification(todoRow.id);
+        if (
+          desiredVerification &&
+          latestVerification?.actor !== "user" &&
+          latestVerification?.state !== "confirmed" &&
+          latestVerification?.state !== desiredVerification.state
+        ) {
+          this.db
+            .prepare(
+              `INSERT INTO todo_verification_decisions (
+                 id, todo_instance_id, state, reason, actor,
+                 source_analysis_input_id, occurred_at,
+                 trust_policy_id, trust_snapshot_state,
+                 application_snapshot_json, activity_snapshot_json,
+                 semantic_confidence_snapshot, voiceprint_confidence_snapshot,
+                 scene_confidence_snapshot, transcript_context_confidence_snapshot,
+                 speaker_evidence_verified_snapshot, overlap_detected_snapshot,
+                 automatic_eligible
+               ) VALUES (
+                 ?, ?, ?, ?, 'system', ?, ?, ?, 'captured', ?, ?, ?, ?, ?, ?, ?, ?, ?
+               )`
+            )
+            .run(
+              this._nextId("todo_verification"),
+              todoRow.id,
+              desiredVerification.state,
+              desiredVerification.reason,
+              analysisInputId,
+              appliedAt,
+              desiredVerification.trustSnapshot.policyId,
+              canonicalJson(desiredVerification.trustSnapshot.application),
+              canonicalJson(desiredVerification.trustSnapshot.activity),
+              desiredVerification.trustSnapshot.semanticConfidence,
+              desiredVerification.trustSnapshot.voiceprintConfidence,
+              desiredVerification.trustSnapshot.sceneConfidence,
+              desiredVerification.trustSnapshot.transcriptContextConfidence,
+              desiredVerification.trustSnapshot.speakerEvidenceVerified ? 1 : 0,
+              desiredVerification.trustSnapshot.overlapDetected ? 1 : 0,
+              desiredVerification.trustSnapshot.automaticEligible ? 1 : 0
+            );
+        }
       };
 
       const applySuggestionInsert = (suggestion) => {
@@ -3345,6 +4384,7 @@ class MemoryRepository {
             appliedAt
           );
         insertEvidence("suggestion_occurrence", occurrenceId, suggestion.evidenceSegmentIds);
+        ensureSuggestionActionProjection(suggestionRow.id);
       };
 
       for (const action of plan.inserts) {
@@ -3477,6 +4517,11 @@ class MemoryRepository {
             throw codedError("MEMORY_PLAN_REFERENCE_UNRESOLVED");
           }
           insertEvidence(action.entityKind, action.occurrenceId, action.evidenceSegmentIds);
+          if (action.entityKind === "todo_occurrence") {
+            ensureTodoActionProjection(action.todoId);
+          } else if (action.entityKind === "suggestion_occurrence") {
+            ensureSuggestionActionProjection(action.suggestionId);
+          }
           continue;
         }
 
@@ -3566,6 +4611,7 @@ class MemoryRepository {
               appliedAt
             );
           insertEvidence("todo_occurrence", occurrenceId, action.evidenceSegmentIds);
+          ensureTodoActionProjection(action.todoId);
         } else if (action.entityKind === "suggestion" && action.mode === "create_occurrence") {
           const suggestion = this.db
             .prepare("SELECT id, state FROM suggestions_v2 WHERE id = ?")
@@ -3590,6 +4636,7 @@ class MemoryRepository {
               appliedAt
             );
           insertEvidence("suggestion_occurrence", occurrenceId, action.evidenceSegmentIds);
+          ensureSuggestionActionProjection(suggestion.id);
         } else {
           throw codedError("MEMORY_PLAN_ACTION_UNKNOWN");
         }
@@ -4652,14 +5699,65 @@ class MemoryRepository {
     const at = assertTimestamp(input.at, "at");
     const transaction = this.db.transaction(() => {
       const row = this.db
-        .prepare("SELECT state, decided_at FROM suggestions_v2 WHERE id = ?")
+        .prepare("SELECT id, title, state, decided_at FROM suggestions_v2 WHERE id = ?")
         .get(suggestionId);
       if (!row) throw codedError("MEMORY_SUGGESTION_NOT_FOUND");
+      const ensureAcceptedTodo = (acceptedAt) => {
+        const existing = this.db
+          .prepare(
+            `SELECT todo_instance_id
+             FROM suggestion_acceptances WHERE suggestion_id = ?`
+          )
+          .get(suggestionId);
+        if (existing) return existing.todo_instance_id;
+
+        const todoId = this._nextId("todo");
+        const canonicalBaseKey = canonicalTupleHash(["todo", canonicalizeText(row.title), null]);
+        const instanceKey = canonicalTupleHash(["suggestion_acceptance", suggestionId]);
+        this.db
+          .prepare(
+            `INSERT INTO todos_v2 (
+               id, canonical_base_key, instance_key, title, owner_subject_kind,
+               owner_subject_id, owner_display_name_snapshot, status,
+               source_analysis_input_id, provenance, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, 'open', NULL, 'suggestion', ?, ?)`
+          )
+          .run(todoId, canonicalBaseKey, instanceKey, row.title, acceptedAt, acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO todo_revisions (
+               id, todo_instance_id, revision, previous_revision_id, title, due_text,
+               source_analysis_input_id, provenance, created_at
+             ) VALUES (?, ?, 1, NULL, ?, NULL, NULL, 'suggestion', ?)`
+          )
+          .run(this._nextId("todo_revision"), todoId, row.title, acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO suggestion_acceptances (
+               suggestion_id, todo_instance_id, user_action_id, actor, accepted_at
+             ) VALUES (?, ?, ?, 'user', ?)`
+          )
+          .run(suggestionId, todoId, this._nextId("user_action"), acceptedAt);
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at,
+               trust_policy_id, trust_snapshot_state
+             ) VALUES (
+               ?, ?, 'confirmed', 'user_confirmed', 'user', NULL, ?,
+               'user-authority-v1', 'user_override'
+             )`
+          )
+          .run(this._nextId("todo_verification"), todoId, acceptedAt);
+        return todoId;
+      };
       if (row.state === terminalState) {
         return {
           status: `already_${terminalState}`,
           suggestionId,
           decidedAt: row.decided_at,
+          ...(terminalState === "accepted" ? { todoId: ensureAcceptedTodo(row.decided_at) } : {}),
         };
       }
       if (row.state !== "proposed") throw codedError("MEMORY_SUGGESTION_ALREADY_DECIDED");
@@ -4671,7 +5769,12 @@ class MemoryRepository {
         )
         .run(terminalState, at, at, suggestionId);
       if (updated.changes !== 1) throw codedError("MEMORY_SUGGESTION_STALE_TRANSITION");
-      return { status: terminalState, suggestionId, decidedAt: at };
+      return {
+        status: terminalState,
+        suggestionId,
+        decidedAt: at,
+        ...(terminalState === "accepted" ? { todoId: ensureAcceptedTodo(at) } : {}),
+      };
     });
     return transaction.immediate();
   }
@@ -4682,6 +5785,125 @@ class MemoryRepository {
 
   dismissSuggestion(input) {
     return this._transitionSuggestion(input, "dismissed");
+  }
+
+  _latestTodoVerification(todoId) {
+    const verification = this.db
+      .prepare(
+        `SELECT effective_state AS state, reason, actor, occurred_at,
+                trust_policy_id, trust_snapshot_state, application_snapshot_json,
+                activity_snapshot_json, semantic_confidence_snapshot,
+                voiceprint_confidence_snapshot, scene_confidence_snapshot,
+                transcript_context_confidence_snapshot,
+                speaker_evidence_verified_snapshot, overlap_detected_snapshot,
+                automatic_eligible
+         FROM todo_effective_verification
+         WHERE todo_instance_id = ?`
+      )
+      .get(todoId);
+    if (verification?.state !== "dismissed") return verification;
+    const restored = this.db
+      .prepare(
+        `SELECT todo.status, metadata.dismissed_from_verification_state AS prior_state
+         FROM todos_v2 AS todo
+         LEFT JOIN todo_action_metadata AS metadata
+           ON metadata.todo_instance_id = todo.id
+         WHERE todo.id = ?`
+      )
+      .get(todoId);
+    if (
+      restored?.status === "open" &&
+      ["confirmed", "pending_confirmation"].includes(restored.prior_state)
+    ) {
+      return { ...verification, state: restored.prior_state };
+    }
+    return verification;
+  }
+
+  decideTodo(input) {
+    if (!hasExactKeys(input, ["todoId", "action"])) {
+      throw new TypeError("todo decision must contain todoId and action");
+    }
+    const todoId = assertId(input.todoId, "todoId");
+    const action = input.action;
+    if (!["confirm", "dismiss", "reopen"].includes(action)) {
+      throw new TypeError("todo decision action is invalid");
+    }
+    const transaction = this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT status, completed_at, dismissed_at FROM todos_v2 WHERE id = ?")
+        .get(todoId);
+      if (!row) throw codedError("MEMORY_TODO_NOT_FOUND");
+      const latest = this._latestTodoVerification(todoId);
+      const at = assertTimestamp(this.now(), "decidedAt");
+
+      if (action === "confirm") {
+        if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+        if (latest?.state === "confirmed") {
+          return { status: "already_confirmed", todoId, decidedAt: latest.occurred_at };
+        }
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at,
+               trust_policy_id, trust_snapshot_state
+             ) VALUES (
+               ?, ?, 'confirmed', 'user_confirmed', 'user', NULL, ?,
+               'user-authority-v1', 'user_override'
+             )`
+          )
+          .run(this._nextId("todo_verification"), todoId, at);
+        return { status: "confirmed", todoId, decidedAt: at };
+      }
+
+      if (action === "dismiss") {
+        if (row.status === "dismissed" || latest?.state === "dismissed") {
+          return {
+            status: "already_dismissed",
+            todoId,
+            decidedAt: latest?.occurred_at ?? row.dismissed_at,
+          };
+        }
+        if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+        this.db
+          .prepare(
+            `INSERT INTO todo_verification_decisions (
+               id, todo_instance_id, state, reason, actor,
+               source_analysis_input_id, occurred_at,
+               trust_policy_id, trust_snapshot_state
+             ) VALUES (
+               ?, ?, 'dismissed', 'user_dismissed', 'user', NULL, ?,
+               'user-authority-v1', 'user_override'
+             )`
+          )
+          .run(this._nextId("todo_verification"), todoId, at);
+        this.db
+          .prepare(
+            `INSERT INTO todo_state_transitions (
+               id, todo_instance_id, from_status, to_status, reason,
+               source_analysis_input_id, actor, occurred_at
+             ) VALUES (?, ?, 'open', 'dismissed', 'user_action', NULL, 'user', ?)`
+          )
+          .run(this._nextId("todo_transition"), todoId, at);
+        return { status: "dismissed", todoId, decidedAt: at };
+      }
+
+      if (row.status === "open") {
+        return { status: "already_open", todoId, decidedAt: latest?.occurred_at ?? at };
+      }
+      if (row.status !== "completed") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+      this.db
+        .prepare(
+          `INSERT INTO todo_state_transitions (
+             id, todo_instance_id, from_status, to_status, reason,
+             source_analysis_input_id, actor, occurred_at
+           ) VALUES (?, ?, 'completed', 'open', 'user_action', NULL, 'user', ?)`
+        )
+        .run(this._nextId("todo_transition"), todoId, at);
+      return { status: "reopened", todoId, decidedAt: at };
+    });
+    return transaction.immediate();
   }
 
   completeTodo(input) {
@@ -4698,6 +5920,21 @@ class MemoryRepository {
         return { status: "already_completed", todoId, completedAt: row.completed_at };
       }
       if (row.status !== "open") throw codedError("MEMORY_TODO_ALREADY_TERMINAL");
+      const latest = this._latestTodoVerification(todoId);
+      if (latest?.state !== "confirmed") {
+        const systemGenerated = this.db
+          .prepare(
+            `SELECT source_analysis_input_id, provenance
+             FROM todos_v2 WHERE id = ?`
+          )
+          .get(todoId);
+        if (
+          systemGenerated?.source_analysis_input_id !== null ||
+          systemGenerated?.provenance === "legacy_unverified"
+        ) {
+          throw codedError("MEMORY_TODO_CONFIRMATION_REQUIRED");
+        }
+      }
       const completedAt = assertTimestamp(this.now(), "completedAt");
       this.db
         .prepare(
@@ -5106,6 +6343,11 @@ class MemoryRepository {
              session.ended_at AS session_ended_at,
              segment.id AS transcript_segment_id,
              COALESCE(track.source_type, segment.source_type) AS source_type,
+             track.application_key, track.attribution_state,
+             segment.person_id, segment.speaker_label,
+             segment.confidence AS transcript_confidence,
+             person.is_self AS person_is_self,
+             person.voice_confidence,
              ref.track_id, ref.started_at, ref.ended_at,
              CASE WHEN segment.id IS NULL THEN NULL ELSE ref.quote_text END AS quote_text,
              CASE
@@ -5118,7 +6360,8 @@ class MemoryRepository {
       JOIN sessions AS session ON session.id = ref.session_id
       LEFT JOIN transcript_segments AS segment ON segment.id = ref.transcript_segment_id
       LEFT JOIN audio_chunks AS chunk ON chunk.id = ref.audio_chunk_id
-      LEFT JOIN audio_tracks AS track ON track.id = ref.track_id`;
+      LEFT JOIN audio_tracks AS track ON track.id = ref.track_id
+      LEFT JOIN people AS person ON person.id = segment.person_id`;
     const ownerQueries = {
       memory_value: `${lineageColumns}
         JOIN memory_occurrences AS owner
@@ -5157,6 +6400,11 @@ class MemoryRepository {
                   session.ended_at AS session_ended_at,
                   segment.id AS transcript_segment_id,
                   COALESCE(track.source_type, segment.source_type) AS source_type,
+                  track.application_key, track.attribution_state,
+                  segment.person_id, segment.speaker_label,
+                  segment.confidence AS transcript_confidence,
+                  person.is_self AS person_is_self,
+                  person.voice_confidence,
                   segment.track_id, segment.started_at, segment.ended_at,
                   segment.text AS quote_text,
                   CASE
@@ -5173,6 +6421,7 @@ class MemoryRepository {
            JOIN sessions AS session ON session.id = segment.session_id
            LEFT JOIN audio_chunks AS chunk ON chunk.id = segment.chunk_id
            LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+           LEFT JOIN people AS person ON person.id = segment.person_id
            WHERE cluster.id = ? AND link.transcript_segment_id = ?`
         )
         .get(handle.ownerId, handle.evidenceId);
@@ -5180,8 +6429,156 @@ class MemoryRepository {
       row = this.db.prepare(ownerQueries[handle.ownerType]).get(handle.evidenceId, handle.ownerId);
     }
     if (!row) return null;
+    let transcriptContext = [];
+    if (row.transcript_segment_id !== null) {
+      const nearbySegments = this.db
+        .prepare(
+          `SELECT segment.id, segment.started_at, segment.ended_at, segment.text,
+                  segment.person_id, segment.speaker_label,
+                  segment.confidence AS transcript_confidence,
+                  person.is_self AS person_is_self,
+                  person.voice_confidence,
+                  COALESCE(track.source_type, segment.source_type) AS source_type,
+                  track.application_key, track.attribution_state
+           FROM transcript_segments AS segment
+           LEFT JOIN audio_tracks AS track ON track.id = segment.track_id
+           LEFT JOIN people AS person ON person.id = segment.person_id
+           WHERE segment.session_id = ?
+             AND segment.result_kind = 'final'
+             AND segment.is_stable = 1
+             AND segment.superseded_by IS NULL
+             AND segment.started_at < ?
+             AND segment.ended_at > ?
+           ORDER BY CASE
+             WHEN segment.id = ? THEN -1
+             WHEN segment.ended_at <= ? THEN ? - segment.ended_at
+             WHEN segment.started_at >= ? THEN segment.started_at - ?
+             ELSE 0
+           END,
+           segment.started_at, segment.ended_at, segment.id
+           LIMIT 7`
+        )
+        .all(
+          row.session_id,
+          row.ended_at + 30_000,
+          Math.max(row.session_started_at, row.started_at - 30_000),
+          row.transcript_segment_id,
+          row.started_at,
+          row.started_at,
+          row.ended_at,
+          row.ended_at
+        );
+      if (nearbySegments.some((segment) => segment.id === row.transcript_segment_id)) {
+        transcriptContext = nearbySegments
+          .map((segment) => {
+            const attribution =
+              segment.source_type === "mic" || segment.source_type === "system"
+                ? buildActionEvidenceAttribution({
+                    sourceType: segment.source_type,
+                    applicationKey: segment.application_key,
+                    attributionState:
+                      segment.attribution_state ??
+                      (segment.application_key
+                        ? "exact"
+                        : segment.source_type === "system"
+                          ? "mixed_unknown"
+                          : null),
+                    personIsSelf: segment.person_is_self,
+                    personId: segment.person_id,
+                    speakerLabel: segment.speaker_label,
+                    transcriptConfidence: segment.transcript_confidence,
+                    voiceConfidence: segment.voice_confidence,
+                    startedAt: segment.started_at,
+                    endedAt: segment.ended_at,
+                    classifications: [],
+                  })
+                : null;
+            return {
+              segmentId: segment.id,
+              startedAt: segment.started_at,
+              endedAt: segment.ended_at,
+              text: Array.from(segment.text).slice(0, 2_048).join(""),
+              speakerRelation: attribution?.speakerRelation ?? "UNKNOWN",
+              applicationName: attribution?.applicationName ?? null,
+              isEvidence: segment.id === row.transcript_segment_id,
+            };
+          })
+          .sort(
+            (left, right) =>
+              left.startedAt - right.startedAt ||
+              left.endedAt - right.endedAt ||
+              left.segmentId.localeCompare(right.segmentId)
+          );
+      }
+    }
     const quoteText =
       row.quote_text === null ? null : Array.from(row.quote_text).slice(0, 4_096).join("");
+    const semanticConfidence =
+      row.transcript_segment_id === null
+        ? null
+        : (this.db
+            .prepare(
+              `SELECT MAX(item.confidence) AS confidence
+               FROM evidence_refs AS semantic_ref
+               JOIN memory_occurrences AS occurrence
+                 ON semantic_ref.entity_type = 'memory_occurrence'
+                AND occurrence.id = semantic_ref.entity_id
+               JOIN memory_items_v2 AS item ON item.id = occurrence.memory_value_id
+               WHERE semantic_ref.transcript_segment_id = ? AND item.kind = 'commitment'`
+            )
+            .get(row.transcript_segment_id)?.confidence ?? null);
+    let actionAttribution =
+      row.source_type === "mic" || row.source_type === "system"
+        ? buildActionEvidenceAttribution({
+            sourceType: row.source_type,
+            applicationKey: row.application_key,
+            attributionState:
+              row.attribution_state ??
+              (row.application_key
+                ? "exact"
+                : row.source_type === "system"
+                  ? "mixed_unknown"
+                  : null),
+            personIsSelf: row.person_is_self,
+            personId: row.person_id,
+            speakerLabel: row.speaker_label,
+            transcriptConfidence: row.transcript_confidence,
+            voiceConfidence: row.voice_confidence,
+            semanticConfidence,
+            startedAt: row.started_at,
+            endedAt: row.ended_at,
+            classifications: this._effectiveActivityActionClassifications(row.session_id),
+          })
+        : null;
+    if (handle.ownerType === "todo_instance") {
+      const captured = this.db
+        .prepare(
+          `SELECT application_snapshot_json, activity_snapshot_json,
+                  semantic_confidence_snapshot, voiceprint_confidence_snapshot,
+                  transcript_context_confidence_snapshot
+           FROM todo_verification_decisions
+           WHERE todo_instance_id = ?
+             AND trust_snapshot_state = 'captured'
+           ORDER BY occurred_at, id
+           LIMIT 1`
+        )
+        .get(handle.ownerId);
+      actionAttribution = null;
+      if (captured && row.transcript_segment_id !== null) {
+        try {
+          actionAttribution = buildCapturedTodoActionEvidenceAttribution({
+            transcriptSegmentId: row.transcript_segment_id,
+            applicationEvidence: JSON.parse(captured.application_snapshot_json),
+            activityEvidence: JSON.parse(captured.activity_snapshot_json),
+            semanticConfidence: captured.semantic_confidence_snapshot,
+            voiceprintConfidence: captured.voiceprint_confidence_snapshot,
+            transcriptContextConfidence: captured.transcript_context_confidence_snapshot,
+          });
+        } catch {
+          throw codedError("MEMORY_PUBLIC_READ_CORRUPT");
+        }
+      }
+    }
     return normalizeEvidenceContextResponse({
       ...handle,
       sessionId: row.session_id,
@@ -5195,7 +6592,465 @@ class MemoryRepository {
       endedAt: row.ended_at,
       quoteText,
       audioState: row.current_audio_state,
+      transcriptContext,
+      actionAttribution,
     });
+  }
+
+  _readActionCenterWatermarkSeed() {
+    const todos = this.db
+      .prepare(
+        `SELECT todo.id, todo.status, todo.updated_at,
+                verification.id AS verification_id,
+                verification.effective_state AS verification_state,
+                verification.reason AS verification_reason,
+                verification.actor AS verification_actor,
+                verification.occurred_at AS verification_occurred_at,
+                reminder.reminder_at, reminder.generation AS reminder_generation,
+                reminder.state AS reminder_state,
+                reminder.deferred_reason AS reminder_deferred_reason,
+                reminder.delivered_at AS reminder_delivered_at,
+                reminder.updated_at AS reminder_updated_at,
+                revision.id AS todo_revision_id,
+                revision.revision AS todo_revision,
+                revision.title AS todo_revision_title,
+                revision.due_text AS todo_revision_due_text,
+                revision.created_at AS todo_revision_created_at,
+                occurrence.id AS todo_occurrence_id,
+                occurrence.legacy_session_id AS todo_occurrence_session_id,
+                occurrence.created_at AS todo_occurrence_created_at
+         FROM todos_v2 AS todo
+         LEFT JOIN todo_effective_verification AS verification
+           ON verification.todo_instance_id = todo.id
+         LEFT JOIN todo_reminders AS reminder ON reminder.todo_instance_id = todo.id
+         LEFT JOIN todo_revisions AS revision
+           ON revision.id = (
+             SELECT latest.id
+             FROM todo_revisions AS latest
+             WHERE latest.todo_instance_id = todo.id
+             ORDER BY latest.revision DESC, latest.id DESC
+             LIMIT 1
+           )
+         LEFT JOIN todo_occurrences AS occurrence
+           ON occurrence.id = (
+             SELECT latest.id
+             FROM todo_occurrences AS latest
+             WHERE latest.todo_instance_id = todo.id
+             ORDER BY latest.created_at DESC, latest.id DESC
+             LIMIT 1
+           )
+         ORDER BY todo.id`
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        status: row.status,
+        updatedAt: row.updated_at,
+        verificationId: row.verification_id,
+        verificationState: row.verification_state,
+        verificationReason: row.verification_reason,
+        verificationActor: row.verification_actor,
+        verificationOccurredAt: row.verification_occurred_at,
+        reminderAt: row.reminder_at,
+        reminderGeneration: row.reminder_generation,
+        reminderState: row.reminder_state,
+        reminderDeferredReason: row.reminder_deferred_reason,
+        reminderDeliveredAt: row.reminder_delivered_at,
+        reminderUpdatedAt: row.reminder_updated_at,
+        revisionId: row.todo_revision_id,
+        revision: row.todo_revision,
+        revisionTitle: row.todo_revision_title,
+        revisionDueText: row.todo_revision_due_text,
+        revisionCreatedAt: row.todo_revision_created_at,
+        occurrenceId: row.todo_occurrence_id,
+        occurrenceSessionId: row.todo_occurrence_session_id,
+        occurrenceCreatedAt: row.todo_occurrence_created_at,
+      }));
+    const suggestions = this.db
+      .prepare(
+        `SELECT suggestion.id, suggestion.state, suggestion.updated_at,
+                occurrence.id AS occurrence_id,
+                occurrence.legacy_session_id AS occurrence_session_id,
+                occurrence.created_at AS occurrence_created_at
+         FROM suggestions_v2 AS suggestion
+         LEFT JOIN suggestion_occurrences AS occurrence
+           ON occurrence.id = (
+             SELECT latest.id
+             FROM suggestion_occurrences AS latest
+             WHERE latest.suggestion_id = suggestion.id
+             ORDER BY latest.created_at DESC, latest.id DESC
+             LIMIT 1
+           )
+         ORDER BY suggestion.id`
+      )
+      .all()
+      .map((row) => ({
+        id: row.id,
+        state: row.state,
+        updatedAt: row.updated_at,
+        occurrenceId: row.occurrence_id,
+        occurrenceSessionId: row.occurrence_session_id,
+        occurrenceCreatedAt: row.occurrence_created_at,
+      }));
+    let updatedAt = null;
+    const includeTimestamp = (value) => {
+      if (Number.isSafeInteger(value) && (updatedAt === null || value > updatedAt)) {
+        updatedAt = value;
+      }
+    };
+    for (const todo of todos) {
+      includeTimestamp(todo.updatedAt);
+      includeTimestamp(todo.verificationOccurredAt);
+      includeTimestamp(todo.reminderUpdatedAt);
+      includeTimestamp(todo.revisionCreatedAt);
+      includeTimestamp(todo.occurrenceCreatedAt);
+    }
+    for (const suggestion of suggestions) {
+      includeTimestamp(suggestion.updatedAt);
+      includeTimestamp(suggestion.occurrenceCreatedAt);
+    }
+    return {
+      revision: sha256(
+        canonicalJson({
+          schemaVersion: "jarvis-action-center-watermark-v2",
+          todos,
+          suggestions,
+        })
+      ),
+      todoCount: todos.length,
+      suggestionCount: suggestions.length,
+      updatedAt,
+    };
+  }
+
+  _initializeActionCenterWatermark() {
+    if (this.actionCenterWatermarkStatement) return;
+    // JarvisRepository gives MemoryRepository, TodoReminderRepository, and the
+    // notification scheduler this same SQLite connection. Seed once from the
+    // durable tables after startup, then let TEMP triggers maintain a singleton
+    // revision without changing the persistent schema or rescanning action history.
+    const initialize = this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TEMP TABLE IF NOT EXISTS jarvis_action_center_runtime_watermark (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          base_revision TEXT NOT NULL CHECK(length(base_revision) = 64),
+          change_revision INTEGER NOT NULL CHECK(change_revision >= 0),
+          todo_count INTEGER NOT NULL CHECK(todo_count >= 0),
+          suggestion_count INTEGER NOT NULL CHECK(suggestion_count >= 0),
+          updated_at INTEGER CHECK(updated_at IS NULL OR updated_at >= 0)
+        );
+      `);
+      const existing = this.db
+        .prepare(
+          `SELECT 1
+           FROM temp.jarvis_action_center_runtime_watermark
+           WHERE singleton = 1`
+        )
+        .get();
+      if (!existing) {
+        const seed = this._readActionCenterWatermarkSeed();
+        this.db
+          .prepare(
+            `INSERT INTO temp.jarvis_action_center_runtime_watermark (
+               singleton, base_revision, change_revision, todo_count,
+               suggestion_count, updated_at
+             ) VALUES (1, ?, 0, ?, ?, ?)`
+          )
+          .run(seed.revision, seed.todoCount, seed.suggestionCount, seed.updatedAt);
+      }
+      this.db.exec(`
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_todo_insert
+        AFTER INSERT ON main.todos_v2
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              todo_count = todo_count + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_todo_update
+        AFTER UPDATE OF status, updated_at ON main.todos_v2
+        WHEN NEW.status IS NOT OLD.status OR NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_verification_insert
+        AFTER INSERT ON main.todo_verification_decisions
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.occurred_at > updated_at THEN NEW.occurred_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_todo_revision_insert
+        AFTER INSERT ON main.todo_revisions
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.created_at > updated_at THEN NEW.created_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_todo_occurrence_insert
+        AFTER INSERT ON main.todo_occurrences
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.created_at > updated_at THEN NEW.created_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_reminder_insert
+        AFTER INSERT ON main.todo_reminders
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_reminder_update
+        AFTER UPDATE OF reminder_at, generation, state, deferred_reason, delivered_at, updated_at
+        ON main.todo_reminders
+        WHEN NEW.reminder_at IS NOT OLD.reminder_at
+          OR NEW.generation IS NOT OLD.generation
+          OR NEW.state IS NOT OLD.state
+          OR NEW.deferred_reason IS NOT OLD.deferred_reason
+          OR NEW.delivered_at IS NOT OLD.delivered_at
+          OR NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_reminder_delete
+        AFTER DELETE ON main.todo_reminders
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_suggestion_insert
+        AFTER INSERT ON main.suggestions_v2
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              suggestion_count = suggestion_count + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_suggestion_update
+        AFTER UPDATE OF state, updated_at ON main.suggestions_v2
+        WHEN NEW.state IS NOT OLD.state OR NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.updated_at > updated_at THEN NEW.updated_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+
+        CREATE TEMP TRIGGER IF NOT EXISTS jarvis_action_center_suggestion_occurrence_insert
+        AFTER INSERT ON main.suggestion_occurrences
+        BEGIN
+          UPDATE jarvis_action_center_runtime_watermark
+          SET change_revision = change_revision + 1,
+              updated_at = CASE
+                WHEN updated_at IS NULL OR NEW.created_at > updated_at THEN NEW.created_at
+                ELSE updated_at
+              END
+          WHERE singleton = 1;
+        END;
+      `);
+    });
+    initialize.immediate();
+    this.actionCenterWatermarkStatement = this.db.prepare(
+      `SELECT base_revision, change_revision, todo_count, suggestion_count, updated_at
+       FROM temp.jarvis_action_center_runtime_watermark
+       WHERE singleton = 1`
+    );
+  }
+
+  getActionCenterWatermark() {
+    this._initializeActionCenterWatermark();
+    const row = this.actionCenterWatermarkStatement.get();
+    if (!row) throw codedError("MEMORY_ACTION_WATERMARK_UNAVAILABLE");
+    return {
+      revision:
+        row.change_revision === 0
+          ? row.base_revision
+          : sha256(
+              canonicalJson({
+                schemaVersion: "jarvis-action-center-runtime-watermark-v1",
+                baseRevision: row.base_revision,
+                changeRevision: row.change_revision,
+              })
+            ),
+      todoCount: row.todo_count,
+      suggestionCount: row.suggestion_count,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  getActionCenterDelta() {
+    const read = this.db.transaction(() => {
+      const state = this.db
+        .prepare(
+          `SELECT last_seen_sequence
+           FROM action_center_read_state WHERE singleton = 1`
+        )
+        .get();
+      if (!state) throw codedError("MEMORY_ACTION_READ_STATE_UNAVAILABLE");
+      const throughSequence = this.db
+        .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM action_center_events")
+        .get().sequence;
+      const rows = this.db
+        .prepare(
+          `WITH unread AS (
+             SELECT event.sequence, event.session_id, event.action_kind,
+                    CASE
+                      WHEN event.action_kind = 'todo' THEN COALESCE(
+                        (
+                          SELECT decision.effective_state
+                          FROM todo_effective_verification AS decision
+                          WHERE decision.todo_instance_id = event.action_id
+                        ),
+                        'pending_confirmation'
+                      )
+                      ELSE NULL
+                    END AS verification_state,
+                    CASE
+                      WHEN event.action_kind = 'suggestion' THEN (
+                        SELECT suggestion.state
+                        FROM suggestions_v2 AS suggestion
+                        WHERE suggestion.id = event.action_id
+                      )
+                      ELSE NULL
+                    END AS suggestion_state
+             FROM action_center_events AS event
+             WHERE event.sequence > ?
+           )
+           SELECT session_id,
+                  SUM(CASE
+                    WHEN action_kind = 'todo' AND verification_state = 'confirmed' THEN 1 ELSE 0
+                  END) AS confirmed_todo_count,
+                  SUM(CASE
+                    WHEN action_kind = 'todo' AND verification_state = 'pending_confirmation'
+                    THEN 1 ELSE 0
+                  END) AS pending_todo_count,
+                  SUM(CASE
+                    WHEN action_kind = 'suggestion' AND suggestion_state = 'proposed' THEN 1 ELSE 0
+                  END) AS suggestion_count,
+                  MIN(sequence) AS first_sequence
+           FROM unread
+           GROUP BY session_id
+           ORDER BY first_sequence, session_id`
+        )
+        .all(state.last_seen_sequence);
+      const sessions = rows
+        .map((row) => {
+          const confirmedTodoCount = row.confirmed_todo_count;
+          const pendingTodoCount = row.pending_todo_count;
+          const suggestionCount = row.suggestion_count;
+          return {
+            sessionId: row.session_id,
+            confirmedTodoCount,
+            pendingTodoCount,
+            suggestionCount,
+            total: confirmedTodoCount + pendingTodoCount + suggestionCount,
+          };
+        })
+        .filter((session) => session.total > 0);
+      const totals = sessions.reduce(
+        (result, session) => ({
+          confirmedTodoCount: result.confirmedTodoCount + session.confirmedTodoCount,
+          pendingTodoCount: result.pendingTodoCount + session.pendingTodoCount,
+          suggestionCount: result.suggestionCount + session.suggestionCount,
+        }),
+        { confirmedTodoCount: 0, pendingTodoCount: 0, suggestionCount: 0 }
+      );
+      return {
+        throughSequence,
+        lastSeenSequence: state.last_seen_sequence,
+        ...totals,
+        total: totals.confirmedTodoCount + totals.pendingTodoCount + totals.suggestionCount,
+        sessions,
+      };
+    });
+    return read.deferred();
+  }
+
+  markActionCenterRead(input) {
+    if (!hasExactKeys(input, ["throughSequence"])) {
+      throw new TypeError("action center read input must contain throughSequence");
+    }
+    const requestedSequence = assertTimestamp(input.throughSequence, "throughSequence");
+    const mark = this.db.transaction(() => {
+      const state = this.db
+        .prepare(
+          `SELECT last_seen_sequence, updated_at
+           FROM action_center_read_state WHERE singleton = 1`
+        )
+        .get();
+      if (!state) throw codedError("MEMORY_ACTION_READ_STATE_UNAVAILABLE");
+      const throughSequence = this.db
+        .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM action_center_events")
+        .get().sequence;
+      const lastSeenSequence = Math.max(
+        state.last_seen_sequence,
+        Math.min(requestedSequence, throughSequence)
+      );
+      if (lastSeenSequence === state.last_seen_sequence) {
+        return { lastSeenSequence, markedAt: state.updated_at };
+      }
+      const markedAt = assertTimestamp(this.now(), "markedAt");
+      const updated = this.db
+        .prepare(
+          `UPDATE action_center_read_state
+           SET last_seen_sequence = ?, updated_at = ?
+           WHERE singleton = 1 AND last_seen_sequence = ?`
+        )
+        .run(lastSeenSequence, markedAt, state.last_seen_sequence);
+      if (updated.changes !== 1) throw codedError("MEMORY_ACTION_READ_STATE_STALE");
+      return { lastSeenSequence, markedAt };
+    });
+    return mark.immediate();
   }
 
   readPublicSnapshot() {
@@ -5342,49 +7197,63 @@ class MemoryRepository {
          ORDER BY occurred_at DESC, id DESC
          LIMIT ?`
       );
+      const todoVerification = this.db.prepare(
+        `SELECT effective_state AS state, reason, actor, occurred_at,
+                trust_policy_id, trust_snapshot_state, application_snapshot_json,
+                activity_snapshot_json, semantic_confidence_snapshot,
+                voiceprint_confidence_snapshot, scene_confidence_snapshot,
+                transcript_context_confidence_snapshot,
+                speaker_evidence_verified_snapshot, overlap_detected_snapshot,
+                automatic_eligible
+         FROM todo_effective_verification
+         WHERE todo_instance_id = ?`
+      );
       const todos = this.db
         .prepare(
-          `SELECT todo.id, todo.title, todo.status, todo.completed_at, todo.dismissed_at,
-                  todo.provenance, todo.created_at, todo.updated_at,
-                  todo.owner_display_name_snapshot AS owner_label
-           FROM todos_v2 AS todo ORDER BY todo.updated_at DESC, todo.id
+          `SELECT todo.id,
+                  COALESCE((
+                    SELECT revision.title
+                    FROM todo_revisions AS revision
+                    WHERE revision.todo_instance_id = todo.id
+                    ORDER BY revision.revision DESC LIMIT 1
+                  ), todo.title) AS title,
+                  todo.status, todo.completed_at, todo.dismissed_at,
+                  todo.source_analysis_input_id, todo.provenance,
+                  todo.created_at,
+                  MAX(todo.updated_at, COALESCE(metadata.updated_at, todo.updated_at)) AS updated_at,
+                  todo.owner_display_name_snapshot AS owner_label,
+                  COALESCE(metadata.source_kind, 'existing') AS source_kind,
+                  metadata.source_session_id,
+                  COALESCE(metadata.pinned, 0) AS pinned,
+                  COALESCE(metadata.urgency, 'normal') AS urgency,
+                  COALESCE(metadata.user_modified, 0) AS user_modified,
+                  metadata.dismissed_from_verification_state,
+                  metadata.dismiss_reason_code,
+                  reminder.reminder_at, reminder.reminder_source,
+                  reminder.state AS reminder_state,
+                  reminder.deferred_reason AS reminder_deferred_reason,
+                  reminder.delivered_at AS reminder_delivered_at,
+                  (
+                    SELECT acceptance.suggestion_id
+                    FROM suggestion_acceptances AS acceptance
+                    WHERE acceptance.todo_instance_id = todo.id
+                  ) AS source_suggestion_id,
+                  EXISTS(
+                    SELECT 1 FROM todo_occurrences AS occurrence
+                    WHERE occurrence.todo_instance_id = todo.id
+                      AND occurrence.legacy_session_id IS NOT NULL
+                  ) AS has_legacy_occurrence
+           FROM todos_v2 AS todo
+           LEFT JOIN todo_action_metadata AS metadata
+             ON metadata.todo_instance_id = todo.id
+           LEFT JOIN todo_reminders AS reminder ON reminder.todo_instance_id = todo.id
+           WHERE COALESCE(metadata.suppressed, 0) = 0
+           ORDER BY updated_at DESC, todo.id
            LIMIT ?`
         )
         .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
-        .map((row) => ({
-          id: row.id,
-          title: row.title,
-          ownerLabel: row.owner_label,
-          status: row.status,
-          completedAt: row.completed_at,
-          dismissedAt: row.dismissed_at,
-          provenance: row.provenance,
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-          revisions: todoRevisions
-            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
-            .reverse()
-            .map((revision) => ({
-              id: revision.id,
-              revision: revision.revision,
-              title: revision.title,
-              dueText: revision.due_text,
-              provenance: revision.provenance,
-              createdAt: revision.created_at,
-            })),
-          occurrences: todoOccurrences
-            .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
-            .reverse()
-            .map((occurrence) => ({
-              id: occurrence.id,
-              sessionId: occurrence.session_id,
-              revisionId: occurrence.todo_revision_id,
-              startedAt: occurrence.started_at,
-              endedAt: occurrence.ended_at,
-              createdAt: occurrence.created_at,
-              evidence: evidenceFor("todo_occurrence", occurrence.id, "todo_instance", row.id),
-            })),
-          transitions: todoTransitions
+        .map((row) => {
+          const transitions = todoTransitions
             .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
             .reverse()
             .map((transition) => ({
@@ -5394,8 +7263,110 @@ class MemoryRepository {
               reason: transition.reason,
               actor: transition.actor,
               occurredAt: transition.occurred_at,
-            })),
-        }));
+            }));
+          const userConfirmed = transitions.some((transition) => transition.actor === "user");
+          const systemGenerated =
+            row.source_analysis_input_id !== null ||
+            row.has_legacy_occurrence === 1 ||
+            transitions.some((transition) =>
+              ["analysis_created", "recurrence"].includes(transition.reason)
+            );
+          const verification = todoVerification.get(row.id);
+          let trustSnapshot = null;
+          if (verification) {
+            try {
+              trustSnapshot = {
+                policyId: verification.trust_policy_id,
+                state: verification.trust_snapshot_state,
+                applicationEvidence: JSON.parse(verification.application_snapshot_json),
+                activityEvidence: JSON.parse(verification.activity_snapshot_json),
+                semanticConfidence: verification.semantic_confidence_snapshot,
+                voiceprintConfidence: verification.voiceprint_confidence_snapshot,
+                sceneConfidence: verification.scene_confidence_snapshot,
+                transcriptContextConfidence: verification.transcript_context_confidence_snapshot,
+                speakerEvidenceVerified:
+                  verification.speaker_evidence_verified_snapshot === null
+                    ? null
+                    : verification.speaker_evidence_verified_snapshot === 1,
+                overlapDetected:
+                  verification.overlap_detected_snapshot === null
+                    ? null
+                    : verification.overlap_detected_snapshot === 1,
+                automaticEligible: verification.automatic_eligible === 1,
+              };
+            } catch {
+              throw codedError("MEMORY_PUBLIC_READ_CORRUPT");
+            }
+          }
+          const restoredVerificationState =
+            row.status === "open" &&
+            verification?.state === "dismissed" &&
+            ["confirmed", "pending_confirmation"].includes(row.dismissed_from_verification_state)
+              ? row.dismissed_from_verification_state
+              : null;
+          const verificationState =
+            restoredVerificationState ??
+            verification?.state ??
+            (userConfirmed || (row.provenance !== "legacy_unverified" && !systemGenerated)
+              ? "confirmed"
+              : "pending_confirmation");
+          return {
+            id: row.id,
+            title: row.title,
+            ownerLabel: row.owner_label,
+            status: row.status,
+            completedAt: row.completed_at,
+            dismissedAt: row.dismissed_at,
+            provenance: row.provenance,
+            verificationState,
+            verificationReason: verification?.reason ?? null,
+            verificationActor: verification?.actor ?? null,
+            trustSnapshot,
+            sourceKind: row.source_kind,
+            sourceSessionId: row.source_session_id,
+            pinned: row.pinned === 1,
+            urgency: row.urgency,
+            userModified: row.user_modified === 1,
+            dismissReasonCode: row.dismiss_reason_code,
+            sourceSuggestionId: row.source_suggestion_id,
+            reminder:
+              row.reminder_at === null
+                ? null
+                : {
+                    reminderAt: row.reminder_at,
+                    reminderSource: row.reminder_source,
+                    state: row.reminder_state,
+                    deferredReason: row.reminder_deferred_reason,
+                    deliveredAt: row.reminder_delivered_at,
+                  },
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            revisions: todoRevisions
+              .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+              .reverse()
+              .map((revision) => ({
+                id: revision.id,
+                revision: revision.revision,
+                title: revision.title,
+                dueText: revision.due_text,
+                provenance: revision.provenance,
+                createdAt: revision.created_at,
+              })),
+            occurrences: todoOccurrences
+              .all(row.id, PUBLIC_SNAPSHOT_HISTORY_LIMIT)
+              .reverse()
+              .map((occurrence) => ({
+                id: occurrence.id,
+                sessionId: occurrence.session_id,
+                revisionId: occurrence.todo_revision_id,
+                startedAt: occurrence.started_at,
+                endedAt: occurrence.ended_at,
+                createdAt: occurrence.created_at,
+                evidence: evidenceFor("todo_occurrence", occurrence.id, "todo_instance", row.id),
+              })),
+            transitions,
+          };
+        });
 
       const suggestionOccurrences = this.db.prepare(
         `SELECT occurrence.id, occurrence.created_at,
@@ -5408,8 +7379,26 @@ class MemoryRepository {
       );
       const suggestions = this.db
         .prepare(
-          `SELECT id, title, rationale, state, provenance, decided_at, created_at, updated_at
-           FROM suggestions_v2 ORDER BY updated_at DESC, id
+          `SELECT suggestion.id, suggestion.title, suggestion.rationale,
+                  CASE
+                    WHEN metadata.last_event_sequence IS NULL THEN suggestion.state
+                    ELSE metadata.effective_state
+                  END AS state,
+                  suggestion.provenance,
+                  CASE
+                    WHEN COALESCE(metadata.effective_state, suggestion.state) = 'proposed'
+                    THEN NULL ELSE suggestion.decided_at
+                  END AS decided_at,
+                  suggestion.created_at,
+                  MAX(suggestion.updated_at, COALESCE(metadata.updated_at, suggestion.updated_at))
+                    AS updated_at,
+                  metadata.dismiss_reason_code,
+                  metadata.converted_todo_id,
+                  COALESCE(metadata.acceptance_undone, 0) AS acceptance_undone
+           FROM suggestions_v2 AS suggestion
+           LEFT JOIN suggestion_action_metadata AS metadata
+             ON metadata.suggestion_id = suggestion.id
+           ORDER BY updated_at DESC, suggestion.id
            LIMIT ?`
         )
         .all(PUBLIC_SNAPSHOT_LIST_LIMIT)
@@ -5419,6 +7408,9 @@ class MemoryRepository {
           rationale: row.rationale,
           state: row.state,
           provenance: row.provenance,
+          dismissReasonCode: row.dismiss_reason_code,
+          convertedTodoId: row.converted_todo_id,
+          acceptanceUndone: row.acceptance_undone === 1,
           decidedAt: row.decided_at,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
@@ -5432,6 +7424,156 @@ class MemoryRepository {
               evidence: evidenceFor("suggestion_occurrence", occurrence.id, "suggestion", row.id),
             })),
         }));
+
+      const todoCardSeeds = todos.map((todo) => {
+        const trustSnapshot =
+          todo.trustSnapshot?.state === "captured" &&
+          Array.isArray(todo.trustSnapshot.applicationEvidence) &&
+          Array.isArray(todo.trustSnapshot.activityEvidence)
+            ? todo.trustSnapshot
+            : null;
+        const capturedSegmentIds = trustSnapshot
+          ? new Set(
+              trustSnapshot.applicationEvidence
+                .map((entry) => entry?.segmentId)
+                .filter((segmentId) =>
+                  trustSnapshot.activityEvidence.some(
+                    (entry) => typeof segmentId === "string" && entry?.segmentId === segmentId
+                  )
+                )
+            )
+          : null;
+        const capturedEvidence =
+          capturedSegmentIds?.size > 0 ? latestCardEvidence(todo, capturedSegmentIds) : null;
+        const evidence = capturedEvidence ?? latestCardEvidence(todo);
+        return {
+          item: todo,
+          evidence,
+          sessionId: evidence?.sessionId ?? latestCardSessionId(todo),
+          trustSnapshot: capturedEvidence ? trustSnapshot : null,
+        };
+      });
+      const suggestionCardSeeds = suggestions.map((suggestion) => {
+        const evidence = latestCardEvidence(suggestion);
+        return {
+          item: suggestion,
+          evidence,
+          sessionId: evidence?.sessionId ?? latestCardSessionId(suggestion),
+          trustSnapshot: null,
+        };
+      });
+      const cardSeeds = [...todoCardSeeds, ...suggestionCardSeeds];
+      const evidenceIds = [
+        ...new Set(
+          cardSeeds
+            .map((seed) => seed.evidence?.handle?.evidenceId)
+            .filter((evidenceId) => typeof evidenceId === "string")
+        ),
+      ];
+      const cardEvidenceById = new Map(
+        (evidenceIds.length === 0
+          ? []
+          : this.db
+              .prepare(
+                `SELECT ref.id AS evidence_id, ref.session_id, ref.transcript_segment_id,
+                        ref.started_at, ref.ended_at,
+                        COALESCE(track.source_type, segment.source_type) AS source_type,
+                        track.application_key, track.attribution_state
+                 FROM evidence_refs AS ref
+                 LEFT JOIN transcript_segments AS segment
+                   ON segment.id = ref.transcript_segment_id
+                  AND segment.session_id = ref.session_id
+                 LEFT JOIN audio_tracks AS track
+                   ON track.id = ref.track_id AND track.session_id = ref.session_id
+                 WHERE ref.id IN (${evidenceIds.map(() => "?").join(", ")})`
+              )
+              .all(...evidenceIds)
+        ).map((row) => [row.evidence_id, row])
+      );
+      const sessionIds = [
+        ...new Set(
+          cardSeeds
+            .map((seed) => {
+              const evidenceId = seed.evidence?.handle?.evidenceId;
+              return cardEvidenceById.get(evidenceId)?.session_id ?? seed.sessionId;
+            })
+            .filter((sessionId) => typeof sessionId === "string")
+        ),
+      ];
+      const cardSessionStartedAt = new Map(
+        (sessionIds.length === 0
+          ? []
+          : this.db
+              .prepare(
+                `SELECT id, started_at FROM sessions
+                 WHERE id IN (${sessionIds.map(() => "?").join(", ")})`
+              )
+              .all(...sessionIds)
+        ).map((row) => [row.id, row.started_at])
+      );
+      const currentClassificationsBySession = new Map();
+      const currentClassifications = (sessionId) => {
+        if (!currentClassificationsBySession.has(sessionId)) {
+          currentClassificationsBySession.set(
+            sessionId,
+            this._effectiveActivityActionClassifications(sessionId).filter(
+              (classification) => classification.decision === "adopted"
+            )
+          );
+        }
+        return currentClassificationsBySession.get(sessionId);
+      };
+      const projectCardContext = (seed) => {
+        const evidenceId = seed.evidence?.handle?.evidenceId;
+        const row = cardEvidenceById.get(evidenceId) ?? null;
+        const sessionId = row?.session_id ?? seed.sessionId;
+        const sessionStartedAt = cardSessionStartedAt.get(sessionId) ?? null;
+        let attribution = null;
+        if (seed.trustSnapshot && typeof seed.evidence?.segmentId === "string") {
+          try {
+            attribution = buildCapturedTodoActionEvidenceAttribution({
+              transcriptSegmentId: seed.evidence.segmentId,
+              applicationEvidence: seed.trustSnapshot.applicationEvidence,
+              activityEvidence: seed.trustSnapshot.activityEvidence,
+              semanticConfidence: seed.trustSnapshot.semanticConfidence,
+              voiceprintConfidence: seed.trustSnapshot.voiceprintConfidence,
+              transcriptContextConfidence: seed.trustSnapshot.transcriptContextConfidence,
+            });
+          } catch {
+            attribution = null;
+          }
+        }
+        if (
+          attribution === null &&
+          row &&
+          (row.source_type === "mic" || row.source_type === "system") &&
+          Number.isSafeInteger(row.started_at) &&
+          Number.isSafeInteger(row.ended_at) &&
+          row.ended_at > row.started_at
+        ) {
+          try {
+            attribution = buildActionEvidenceAttribution({
+              sourceType: row.source_type,
+              applicationKey: row.application_key,
+              attributionState:
+                row.attribution_state ??
+                (row.application_key
+                  ? "exact"
+                  : row.source_type === "system"
+                    ? "mixed_unknown"
+                    : null),
+              startedAt: row.started_at,
+              endedAt: row.ended_at,
+              classifications: currentClassifications(sessionId),
+            });
+          } catch {
+            attribution = null;
+          }
+        }
+        return cardContextFromAttribution(sessionId, sessionStartedAt, attribution);
+      };
+      for (const seed of todoCardSeeds) seed.item.cardContext = projectCardContext(seed);
+      for (const seed of suggestionCardSeeds) seed.item.cardContext = projectCardContext(seed);
 
       const conflictMembers = this.db.prepare(
         `SELECT item.id, item.title, item.body, item.lifecycle

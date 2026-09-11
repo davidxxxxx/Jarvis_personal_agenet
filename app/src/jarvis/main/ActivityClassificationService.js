@@ -81,31 +81,43 @@ class ActivityClassificationService {
     this.now = now;
   }
 
-  async classifySession({
-    sessionId,
-    jobId,
-    activities,
-    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
-    cloudReview = true,
-  } = {}) {
+  _requireActivities(activities) {
     if (!Array.isArray(activities) || activities.length === 0) {
       throw new TypeError("activities must be a non-empty array");
     }
-    const local = activities.map((activity) => ({
-      activityId: activity.activityId,
-      ...this.localClassifier.classify(localInput(activity)),
-    }));
+  }
+
+  classifyLocal({ sessionId, activities } = {}) {
+    this._requireActivities(activities);
+    const local = activities.map((activity) => {
+      const classification = {
+        activityId: activity.activityId,
+        ...this.localClassifier.classify(localInput(activity)),
+      };
+      return typeof this.repository.applyPersonalizationRule === "function"
+        ? this.repository.applyPersonalizationRule(activity, classification)
+        : classification;
+    });
     this.repository.saveBatch({
       sessionId,
       activities,
       classifications: local,
       createdAt: this.now(),
     });
-    if (
-      cloudReview !== true ||
-      this.cloudClient === null ||
-      this.cloudClient.isConfigured?.() === false
-    ) {
+    return {
+      classifications: this.repository.listSessionEffective(sessionId),
+      cloudStatus: "local_only",
+    };
+  }
+
+  async reviewSessionWithCloud({
+    sessionId,
+    jobId,
+    activities,
+    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
+  } = {}) {
+    this._requireActivities(activities);
+    if (this.cloudClient === null || this.cloudClient.isConfigured?.() === false) {
       return {
         classifications: this.repository.listSessionEffective(sessionId),
         cloudStatus: this.cloudClient === null ? "local_only" : "not_configured",
@@ -125,6 +137,19 @@ class ActivityClassificationService {
       };
     }
     const requestId = this.createRequestId();
+    const cloudRequest = {
+      cloudPayloadJson: built.cloudPayloadJson,
+      inputHash: built.inputHash,
+      validationContext: built.validationContext,
+    };
+    try {
+      this.cloudClient.validateInput?.(cloudRequest);
+    } catch {
+      return {
+        classifications: this.repository.listSessionEffective(sessionId),
+        cloudStatus: "local_preflight_failed",
+      };
+    }
     const reservation = this.budgetGuard.reserveNextAttempt({
       requestId,
       jobId,
@@ -141,11 +166,7 @@ class ActivityClassificationService {
     }
     this.budgetGuard.markStarted(requestId);
     try {
-      const cloud = await this.cloudClient.classify({
-        cloudPayloadJson: built.cloudPayloadJson,
-        inputHash: built.inputHash,
-        validationContext: built.validationContext,
-      });
+      const cloud = await this.cloudClient.classify(cloudRequest);
       this.budgetGuard.reconcile({ requestId, usage: cloud.usage });
       this.repository.saveBatch({
         sessionId,
@@ -163,11 +184,13 @@ class ActivityClassificationService {
         inputHash: built.inputHash,
       };
     } catch (error) {
-      if (error?.requestSent === true) {
-        this.budgetGuard.markUsageUnknown({
-          requestId,
-          reasonCode: error?.usage ? "usage_invalid" : "transport_ambiguous",
-        });
+      if (
+        Number.isSafeInteger(error?.usage?.inputTokens) &&
+        error.usage.inputTokens >= 0 &&
+        Number.isSafeInteger(error?.usage?.outputTokens) &&
+        error.usage.outputTokens >= 0
+      ) {
+        this.budgetGuard.reconcile({ requestId, usage: error.usage });
       } else {
         this.budgetGuard.markUsageUnknown({
           requestId,
@@ -180,6 +203,23 @@ class ActivityClassificationService {
         errorCode: typeof error?.code === "string" ? error.code : "classification_failed",
       };
     }
+  }
+
+  async classifySession({
+    sessionId,
+    jobId,
+    activities,
+    redactionTerms = { participants: [], otherPeople: [], deviceLabels: [] },
+    cloudReview = true,
+  } = {}) {
+    this.classifyLocal({ sessionId, activities });
+    if (cloudReview !== true) {
+      return {
+        classifications: this.repository.listSessionEffective(sessionId),
+        cloudStatus: this.cloudClient === null ? "local_only" : "not_configured",
+      };
+    }
+    return this.reviewSessionWithCloud({ sessionId, jobId, activities, redactionTerms });
   }
 }
 

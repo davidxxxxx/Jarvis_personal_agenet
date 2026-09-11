@@ -7,9 +7,40 @@ const TERMINAL_OBSOLETE_ERRORS = new Set([
   "IDENTITY_RESOLUTION_STALE_INPUT",
   "IDENTITY_RESOLUTION_SUPERSEDED",
 ]);
+const TERMINAL_DATABASE_ERRORS = new Set([
+  "SQLITE_CONSTRAINT_CHECK",
+  "SQLITE_CONSTRAINT_FOREIGNKEY",
+  "SQLITE_CONSTRAINT_NOTNULL",
+  "SQLITE_CONSTRAINT_UNIQUE",
+  "SQLITE_CONSTRAINT_PRIMARYKEY",
+]);
+const TERMINAL_DIARIZATION_ERRORS = new Set([
+  "DIARIZATION_VALIDATION_FAILED",
+  "DIARIZATION_SPEAKER_LIMIT_EXCEEDED",
+]);
+const TERMINAL_IDENTITY_RESOLUTION_ERRORS = new Set([
+  "IDENTITY_RESOLUTION_DEPENDENCY_FAILED",
+  "IDENTITY_RESOLUTION_VALIDATION_FAILED",
+]);
+const DIARIZATION_SPEAKER_COUNT_VALIDATION =
+  /^run\.speakerCount\.maximum must be between 0 and 64 or null$/;
+const DIARIZATION_CLUSTER_COUNT_VALIDATION =
+  /^diarization cluster count exceeds the validated speaker count$/;
+const IDENTITY_RESOLUTION_BATCH_COVERAGE_VALIDATION =
+  /^identity resolution batch must cover every evidence cluster exactly$/;
 const LONG_DEPENDENCY_DEFERRALS = new Set([
   "diarization_runtime_unavailable",
   "diarization_model_unavailable",
+  "external_gpu_busy",
+  "gpu_utilization_high",
+]);
+const NON_PREEMPTIVE_ACTIVE_CUDA_DIARIZATION_REASONS = new Set([
+  "cpu_load_high",
+  "external_gpu_busy",
+  "gpu_utilization_high",
+  "insufficient_vram",
+  "recovery_hysteresis",
+  "telemetry_unavailable",
 ]);
 const LOCAL_PROCESSING_JOB_TYPES = new Set([
   "transcribe_chunk",
@@ -28,6 +59,33 @@ function normalizeErrorCode(error) {
     return "JOB_FAILED";
   }
   return typeof code === "string" && ERROR_CODE_PATTERN.test(code) ? code : "JOB_FAILED";
+}
+
+function normalizeJobErrorCode(error, job) {
+  const explicitCode = normalizeErrorCode(error);
+  if (explicitCode !== "JOB_FAILED") return explicitCode;
+  let message;
+  try {
+    message = error?.message;
+  } catch {
+    return explicitCode;
+  }
+  if (
+    job?.job_type === "diarize_track" &&
+    typeof message === "string" &&
+    (DIARIZATION_SPEAKER_COUNT_VALIDATION.test(message) ||
+      DIARIZATION_CLUSTER_COUNT_VALIDATION.test(message))
+  ) {
+    return "DIARIZATION_VALIDATION_FAILED";
+  }
+  if (
+    job?.job_type === "resolve_identities" &&
+    typeof message === "string" &&
+    IDENTITY_RESOLUTION_BATCH_COVERAGE_VALIDATION.test(message)
+  ) {
+    return "IDENTITY_RESOLUTION_VALIDATION_FAILED";
+  }
+  return explicitCode;
 }
 
 function codedError(code) {
@@ -63,6 +121,15 @@ function defaultJobCapability(job) {
     : undefined;
 }
 
+function canContinueActiveCudaDiarization(job, context, admission) {
+  return (
+    job.job_type === "diarize_track" &&
+    context.device === "cuda" &&
+    admission.action === "defer" &&
+    NON_PREEMPTIVE_ACTIVE_CUDA_DIARIZATION_REASONS.has(admission.reason)
+  );
+}
+
 class ProcessingJobRunner {
   constructor({
     store,
@@ -78,6 +145,7 @@ class ProcessingJobRunner {
     classifyCapability = defaultJobCapability,
     setIntervalImpl = setInterval,
     clearIntervalImpl = clearInterval,
+    log = () => {},
   } = {}) {
     const requiredMethods = [
       "claimJobs",
@@ -86,6 +154,7 @@ class ProcessingJobRunner {
       "recordJobExecutionDevice",
       "completeJob",
       "retryJob",
+      "deferJob",
       "blockJob",
     ];
     if (!store || requiredMethods.some((method) => typeof store[method] !== "function")) {
@@ -125,6 +194,7 @@ class ProcessingJobRunner {
     if (typeof setIntervalImpl !== "function" || typeof clearIntervalImpl !== "function") {
       throw new TypeError("interval functions are required");
     }
+    if (typeof log !== "function") throw new TypeError("log must be a function");
 
     this.store = store;
     this.owner = owner;
@@ -139,6 +209,7 @@ class ProcessingJobRunner {
     this.classifyCapability = classifyCapability;
     this.setInterval = setIntervalImpl;
     this.clearInterval = clearIntervalImpl;
+    this.log = log;
     this.handlers = new Map();
   }
 
@@ -156,6 +227,35 @@ class ProcessingJobRunner {
 
   recoverExpiredLeases(at = this.now()) {
     return this.store.recoverExpiredLeases(at);
+  }
+
+  wakeResourceDeferredJobs(at = this.now()) {
+    if (typeof this.store.wakeResourceDeferredJobs !== "function") return 0;
+    return this.store.wakeResourceDeferredJobs(at);
+  }
+
+  _wakeIdentityDependencyJobs(job, at) {
+    if (
+      job.job_type !== "diarize_track" ||
+      typeof this.store.wakeIdentityDependencyJobs !== "function"
+    ) {
+      return 0;
+    }
+    try {
+      return this.store.wakeIdentityDependencyJobs(job.session_id, at);
+    } catch (error) {
+      try {
+        this.log({
+          phase: "identity_dependency_wake_failed",
+          jobId: job.id,
+          jobType: job.job_type,
+          error,
+        });
+      } catch {
+        // Diagnostic logging must never alter the completed diarization transition.
+      }
+      return 0;
+    }
   }
 
   async _executeClaimedJob(job, { permit = null } = {}) {
@@ -226,6 +326,33 @@ class ProcessingJobRunner {
       configurable: false,
       writable: false,
     });
+    Object.defineProperty(context, "checkResources", {
+      value: async () => {
+        if (!this.governor) return true;
+        let snapshot;
+        let admission;
+        try {
+          snapshot = await this.governor.sample();
+          admission = this.governor.admit(kind, snapshot, capability);
+        } catch {
+          admission = { action: "defer", reason: "telemetry_unavailable" };
+        }
+        if (canContinueActiveCudaDiarization(job, context, admission)) return true;
+        const nextDevice = admission.action === "run_cuda" ? "cuda" : "cpu";
+        if (
+          ["defer", "pause_preview"].includes(admission.action) ||
+          nextDevice !== context.device
+        ) {
+          const error = codedError("JOB_RESOURCE_YIELD");
+          error.resourceReason = admission.reason || "resources_changed";
+          throw error;
+        }
+        return true;
+      },
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
     const heartbeat = this.setInterval(
       () => {
         try {
@@ -267,21 +394,68 @@ class ProcessingJobRunner {
         executionDevice,
       });
       if (!completed) throw codedError("JOB_LEASE_LOST");
+      this._wakeIdentityDependencyJobs(job, this.now());
     } catch (error) {
-      if (normalizeErrorCode(error) === "JOB_LEASE_LOST") throw error;
-      const errorCode = normalizeErrorCode(error);
+      const errorCode = normalizeJobErrorCode(error, job);
+      if (errorCode === "JOB_LEASE_LOST") throw error;
       const failedAt = this.now();
+      if (
+        job.job_type === "resolve_identities" &&
+        errorCode === "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE"
+      ) {
+        const deferred = this.store.deferJob(job.id, {
+          owner: this.owner,
+          at: failedAt,
+          nextRetryAt: Math.min(Number.MAX_SAFE_INTEGER, failedAt + this.dependencyRetryMs),
+          reason: "identity_dependency_incomplete",
+        });
+        if (!deferred) throw codedError("JOB_LEASE_LOST");
+        return 1;
+      }
+      if (errorCode !== "JOB_RESOURCE_YIELD") {
+        try {
+          this.log({
+            phase: "processing_job_failed",
+            jobId: job.id,
+            jobType: job.job_type,
+            error,
+          });
+        } catch {
+          // Diagnostic logging must never alter the durable job transition.
+        }
+      }
+      if (errorCode === "JOB_RESOURCE_YIELD") {
+        const deferred = this.store.deferJob(job.id, {
+          owner: this.owner,
+          at: failedAt,
+          nextRetryAt: Math.min(Number.MAX_SAFE_INTEGER, failedAt + 15_000),
+          reason:
+            typeof error.resourceReason === "string" &&
+            ERROR_CODE_PATTERN.test(error.resourceReason)
+              ? error.resourceReason
+              : "resources_changed",
+        });
+        if (!deferred) throw codedError("JOB_LEASE_LOST");
+        return 1;
+      }
       const terminalObsoleteJob =
         (job.job_type === "transcribe_chunk" && errorCode === "TRANSCRIPTION_LINEAGE_MISMATCH") ||
         (["diarize_track", "resolve_identities"].includes(job.job_type) &&
           TERMINAL_OBSOLETE_ERRORS.has(errorCode));
-      if (terminalObsoleteJob) {
+      if (
+        terminalObsoleteJob ||
+        TERMINAL_DATABASE_ERRORS.has(errorCode) ||
+        (job.job_type === "diarize_track" && TERMINAL_DIARIZATION_ERRORS.has(errorCode)) ||
+        (job.job_type === "resolve_identities" &&
+          TERMINAL_IDENTITY_RESOLUTION_ERRORS.has(errorCode))
+      ) {
         const blocked = this.store.blockJob(job.id, {
           owner: this.owner,
           at: failedAt,
           errorCode,
         });
         if (!blocked) throw codedError("JOB_LEASE_LOST");
+        this._wakeIdentityDependencyJobs(job, failedAt);
         return 1;
       }
       const exponent = Math.max(0, Math.min(30, (job.attempt_count ?? 1) - 1));

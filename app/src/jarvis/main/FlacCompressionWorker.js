@@ -304,6 +304,31 @@ class FlacCompressionWorker {
     return this._enqueueOperation(() => this._recoverStartup());
   }
 
+  async _requiresDeepStartupRecovery(chunk, job) {
+    if (chunk.retired_path) return true;
+    if (job.state === "running") return true;
+    if (
+      ["flac_authority_temporarily_unreadable", "flac_authority_invalid_recovered"].includes(
+        job.error_code
+      )
+    ) {
+      return true;
+    }
+
+    const authorityPath = this._contained(chunk.path);
+    const parsed = path.parse(authorityPath);
+    const wavPath = this._contained(path.join(parsed.dir, `${parsed.name}.wav`));
+    const flacPath = this._contained(path.join(parsed.dir, `${parsed.name}.flac`));
+    const crashArtifacts =
+      chunk.format === "wav"
+        ? [flacPath, `${flacPath}.partial`, `${flacPath}.tmp`]
+        : [wavPath, `${flacPath}.partial`, `${flacPath}.tmp`];
+    for (const candidate of crashArtifacts) {
+      if (await this._exists(candidate)) return true;
+    }
+    return false;
+  }
+
   async _recoverStartup() {
     if (typeof this.store.listCompressionRecoveryCandidates !== "function") {
       throw new TypeError("store.listCompressionRecoveryCandidates must be a function");
@@ -316,6 +341,9 @@ class FlacCompressionWorker {
         await this._cleanupRetiredArtifact(chunk.id);
         if (chunk.deleted_at !== null || chunk.expires_at <= this.now()) {
           result.removedInvalid += await this._cleanupRetiredChunk(chunk, this.now());
+          continue;
+        }
+        if (!(await this._requiresDeepStartupRecovery(chunk, job))) {
           continue;
         }
         if (chunk.format === "wav") {

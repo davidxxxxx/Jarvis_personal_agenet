@@ -131,6 +131,13 @@ function deriveValidationContext(payload) {
     sourceAttributionByActivity: Object.fromEntries(
       payload.activities.map((activity) => [activity.activityId, activity.sourceAttribution])
     ),
+    selfParticipationByActivity: Object.fromEntries(
+      payload.activities.map((activity) => [
+        activity.activityId,
+        activity.statistics.selfDetected === true ||
+          activity.statistics.microphoneParticipated === true,
+      ])
+    ),
     segmentIdsByActivity: Object.fromEntries(
       payload.activities.map((activity) => [
         activity.activityId,
@@ -162,23 +169,33 @@ function normalizeInput(input) {
   }
   exactKeys(
     input.validationContext,
-    ["activityIds", "sourceAttributionByActivity", "segmentIdsByActivity"],
+    [
+      "activityIds",
+      "sourceAttributionByActivity",
+      "selfParticipationByActivity",
+      "segmentIdsByActivity",
+    ],
     "input.validation_context"
   );
   const expectedContext = deriveValidationContext(payload);
   const suppliedActivityIds = input.validationContext.activityIds;
   const suppliedSources = input.validationContext.sourceAttributionByActivity;
+  const suppliedSelfParticipation = input.validationContext.selfParticipationByActivity;
   const suppliedSegments = input.validationContext.segmentIdsByActivity;
   if (
     !Array.isArray(suppliedActivityIds) ||
     !isPlainObject(suppliedSources) ||
+    !isPlainObject(suppliedSelfParticipation) ||
     !isPlainObject(suppliedSegments) ||
     JSON.stringify(suppliedActivityIds) !== JSON.stringify(expectedContext.activityIds) ||
     Object.keys(suppliedSources).length !== expectedContext.activityIds.length ||
+    Object.keys(suppliedSelfParticipation).length !== expectedContext.activityIds.length ||
     Object.keys(suppliedSegments).length !== expectedContext.activityIds.length ||
     expectedContext.activityIds.some(
       (activityId) =>
         suppliedSources[activityId] !== expectedContext.sourceAttributionByActivity[activityId] ||
+        suppliedSelfParticipation[activityId] !==
+          expectedContext.selfParticipationByActivity[activityId] ||
         !Array.isArray(suppliedSegments[activityId]) ||
         JSON.stringify(suppliedSegments[activityId]) !==
           JSON.stringify(expectedContext.segmentIdsByActivity[activityId])
@@ -304,6 +321,7 @@ function validateCandidate(candidate, context) {
     returned.add(item.activityId);
     const gate = applyConfidenceGate(item.category, item.confidence, {
       sourceAttribution: context.sourceAttributionByActivity[item.activityId],
+      selfParticipated: context.selfParticipationByActivity?.[item.activityId] === true,
     });
     return {
       activityId: item.activityId,
@@ -313,6 +331,80 @@ function validateCandidate(candidate, context) {
       evidenceSegmentIds: [...item.evidenceSegmentIds],
     };
   });
+  return classifications.sort(
+    (left, right) =>
+      context.activityIds.indexOf(left.activityId) - context.activityIds.indexOf(right.activityId)
+  );
+}
+
+// A malformed classification must not discard other independently valid
+// activities. Invalid or sensitive items are omitted; the service keeps the
+// previously persisted conservative local result for those activity ids.
+function salvageCandidate(candidate, context) {
+  exactKeys(candidate, ["outputVersion", "classifications"], "candidate.fields");
+  if (
+    candidate.outputVersion !== OUTPUT_CONTRACT_VERSION ||
+    !Array.isArray(candidate.classifications) ||
+    candidate.classifications.length > 32
+  ) {
+    throw clientError("invalid_structure", false, "candidate.collection");
+  }
+  const expectedIds = new Set(context.activityIds);
+  const returned = new Set();
+  const classifications = [];
+  for (const item of candidate.classifications) {
+    try {
+      exactKeys(
+        item,
+        ["activityId", "category", "confidence", "reason", "evidenceSegmentIds"],
+        "candidate.classification.fields"
+      );
+      if (
+        typeof item.activityId !== "string" ||
+        !expectedIds.has(item.activityId) ||
+        returned.has(item.activityId) ||
+        !ACTIVITY_CATEGORY_SET.has(item.category) ||
+        typeof item.confidence !== "number" ||
+        !Number.isFinite(item.confidence) ||
+        item.confidence < 0 ||
+        item.confidence > 1 ||
+        typeof item.reason !== "string" ||
+        !item.reason.trim() ||
+        sensitiveOutputText(item.reason) ||
+        !Array.isArray(item.evidenceSegmentIds)
+      ) {
+        continue;
+      }
+      const allowedEvidence = new Set(context.segmentIdsByActivity[item.activityId]);
+      const evidenceSegmentIds = [];
+      for (const segmentId of item.evidenceSegmentIds) {
+        if (
+          typeof segmentId === "string" &&
+          allowedEvidence.has(segmentId) &&
+          !evidenceSegmentIds.includes(segmentId)
+        ) {
+          evidenceSegmentIds.push(segmentId);
+        }
+        if (evidenceSegmentIds.length >= 12) break;
+      }
+      returned.add(item.activityId);
+      classifications.push({
+        activityId: item.activityId,
+        ...applyConfidenceGate(item.category, item.confidence, {
+          sourceAttribution: context.sourceAttributionByActivity[item.activityId],
+          selfParticipated: context.selfParticipationByActivity?.[item.activityId] === true,
+        }),
+        source: "minimax",
+        reason: Array.from(item.reason.trim()).slice(0, 240).join(""),
+        evidenceSegmentIds,
+      });
+    } catch (error) {
+      if (!(error instanceof ActivityClassificationClientError)) throw error;
+    }
+  }
+  if (classifications.length === 0) {
+    throw clientError("invalid_structure", false, "candidate.no_valid_classifications");
+  }
   return classifications.sort(
     (left, right) =>
       context.activityIds.indexOf(left.activityId) - context.activityIds.indexOf(right.activityId)
@@ -438,6 +530,11 @@ class MiniMaxActivityClassifier {
     }
   }
 
+  validateInput(input) {
+    normalizeInput(input);
+    return true;
+  }
+
   async classify(input) {
     const requestId = this.createRequestId();
     const startedAt = this.now();
@@ -520,7 +617,13 @@ class MiniMaxActivityClassifier {
         }
         usage = extractUsage(envelope);
         const candidate = extractCandidate(envelope);
-        const classifications = validateCandidate(candidate, normalized.validationContext);
+        let classifications;
+        try {
+          classifications = validateCandidate(candidate, normalized.validationContext);
+        } catch (error) {
+          if (!(error instanceof ActivityClassificationClientError)) throw error;
+          classifications = salvageCandidate(candidate, normalized.validationContext);
+        }
         this._log({
           requestId,
           inputHash,

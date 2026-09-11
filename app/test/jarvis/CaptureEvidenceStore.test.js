@@ -60,12 +60,12 @@ function seedProcessingJob(db, overrides = {}) {
   db.prepare(
     `
     INSERT INTO processing_jobs (
-      id, session_id, job_type, state, priority,
+      id, session_id, track_id, job_type, state, priority,
       input_hash, input_version, model_version, attempt_count,
       next_retry_at, lease_owner, lease_expires_at, error_code,
       lane, analysis_input_id, desired_head_hash, digest_input_id, created_at, completed_at
     ) VALUES (
-      @id, @sessionId, @jobType, @state, @priority,
+      @id, @sessionId, @trackId, @jobType, @state, @priority,
       @inputHash, @inputVersion, @modelVersion, @attemptCount,
       @nextRetryAt, @leaseOwner, @leaseExpiresAt, @errorCode,
       @lane, @analysisInputId, @desiredHeadHash, @digestInputId, @createdAt, @completedAt
@@ -74,6 +74,7 @@ function seedProcessingJob(db, overrides = {}) {
   ).run({
     id: "lease-job",
     sessionId: "s1",
+    trackId: null,
     jobType: "transcribe_chunk",
     state: "pending",
     priority: 0,
@@ -397,6 +398,7 @@ test("stores track state and gap lifecycle evidence", (t) => {
     started_at: 10,
     ended_at: 50,
     state: "ended",
+    failure_code: null,
   });
   assert.deepEqual(db.prepare("SELECT * FROM audio_gaps WHERE id = 'g1'").get(), {
     id: "g1",
@@ -461,11 +463,30 @@ test("stores canonical application tracks and exact/fallback attribution interva
     captureGeneration: 3,
     startedAt: 30,
     reason: "application_capture_failed",
+    attemptedApplicationKey: "quark",
+    attemptedApplicationDisplayName: "Quark",
+    failureCode: "activation_failed_0x88890004",
   });
 
   assert.equal(exact.application_key, "chrome");
   assert.equal(fallback.application_key, null);
   assert.equal(store.closeApplicationAudioInterval("interval-exact", 29).changes, 1);
+  assert.deepEqual(
+    store.db
+      .prepare(
+        `SELECT attempted_application_key, attempted_application_display_name,
+                reason, failure_code
+         FROM application_audio_fallback_evidence
+         WHERE interval_id = 'interval-fallback'`
+      )
+      .get(),
+    {
+      attempted_application_key: "quark",
+      attempted_application_display_name: "Quark",
+      reason: "application_capture_failed",
+      failure_code: "activation_failed_0x88890004",
+    }
+  );
   assert.deepEqual(
     store.listApplicationAudioIntervals("s1").map((interval) => ({
       id: interval.id,
@@ -1011,10 +1032,10 @@ test("pause and resume ignore application tracks that already ended", (t) => {
     at: 30,
   });
 
-  assert.deepEqual(
-    db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(),
-    { state: "ended", ended_at: 18 }
-  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(), {
+    state: "ended",
+    ended_at: 18,
+  });
   assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
     state: "active",
     ended_at: null,
@@ -1306,10 +1327,10 @@ test("finalization preserves an application track's earlier terminal boundary", 
     at: 40,
   });
 
-  assert.deepEqual(
-    db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(),
-    { state: "ended", ended_at: 18 }
-  );
+  assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='app-t1'").get(), {
+    state: "ended",
+    ended_at: 18,
+  });
   assert.deepEqual(db.prepare("SELECT state, ended_at FROM audio_tracks WHERE id='t1'").get(), {
     state: "ended",
     ended_at: 40,
@@ -1420,10 +1441,99 @@ test("commits a chunk and one transcription job atomically", (t) => {
       chunk_id: "c1",
       job_type: "transcribe_chunk",
       state: "pending",
-      priority: 30,
+      priority: 24,
       input_hash: "abc",
       created_at: 100,
     }
+  );
+});
+
+test("prioritizes microphone and system safety tracks ahead of application audio", (t) => {
+  const { store, db } = fixture(t);
+  createTrack(store);
+  createTrack(store, {
+    id: "t-app",
+    applicationKey: "kook",
+    applicationDisplayName: "KOOK",
+    captureGeneration: 1,
+    strategy: "include-process-tree",
+  });
+  createTrack(store, {
+    id: "t-mic",
+    sourceType: "mic",
+    deviceId: "physical-mic",
+    deviceLabel: "Desk microphone",
+    strategy: "media-recorder",
+  });
+
+  store.commitChunk(chunk({ modelVersion: "model-v1" }));
+  store.commitChunk(
+    chunk({
+      id: "c-app",
+      trackId: "t-app",
+      path: "c-app.wav",
+      sha256: "app",
+      modelVersion: "model-v1",
+    })
+  );
+  store.commitChunk(
+    chunk({
+      id: "c-mic",
+      trackId: "t-mic",
+      sourceType: "mic",
+      path: "c-mic.wav",
+      sha256: "mic",
+      modelVersion: "model-v1",
+    })
+  );
+
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT track.track_kind, job.priority
+         FROM processing_jobs AS job
+         JOIN audio_tracks AS track ON track.id = job.track_id
+         WHERE job.job_type = 'transcribe_chunk'
+         ORDER BY job.priority`
+      )
+      .all(),
+    [
+      { track_kind: "mic", priority: 20 },
+      { track_kind: "system_mix", priority: 24 },
+      { track_kind: "application", priority: 30 },
+    ]
+  );
+
+  db.prepare(
+    `UPDATE processing_jobs SET priority = 30
+     WHERE job_type = 'transcribe_chunk'`
+  ).run();
+  const current = db
+    .prepare(
+      `SELECT input_version, model_version FROM processing_jobs
+       WHERE job_type = 'transcribe_chunk' LIMIT 1`
+    )
+    .get();
+  store.enqueueCurrentModelTranscriptionJobs({
+    inputVersion: current.input_version,
+    modelVersion: current.model_version,
+    at: 101,
+  });
+  assert.deepEqual(
+    db
+      .prepare(
+        `SELECT track.track_kind, job.priority
+         FROM processing_jobs AS job
+         JOIN audio_tracks AS track ON track.id = job.track_id
+         WHERE job.job_type = 'transcribe_chunk'
+         ORDER BY job.priority`
+      )
+      .all(),
+    [
+      { track_kind: "mic", priority: 20 },
+      { track_kind: "system_mix", priority: 24 },
+      { track_kind: "application", priority: 30 },
+    ]
   );
 });
 
@@ -2234,10 +2344,10 @@ test("promotes only unfinished transcription jobs strictly inside the 24-hour ur
   assert.deepEqual(
     db.prepare("SELECT chunk_id, state, priority FROM processing_jobs ORDER BY chunk_id").all(),
     [
-      { chunk_id: "c0", state: "pending", priority: 30 },
+      { chunk_id: "c0", state: "pending", priority: 24 },
       { chunk_id: "c1", state: "retention_urgent", priority: 0 },
-      { chunk_id: "c2", state: "completed", priority: 30 },
-      { chunk_id: "c3", state: "pending", priority: 30 },
+      { chunk_id: "c2", state: "completed", priority: 24 },
+      { chunk_id: "c3", state: "pending", priority: 24 },
     ]
   );
 });
@@ -2461,7 +2571,7 @@ test("records idempotent signed storage growth and deletion telemetry in evidenc
       .all(),
     [
       { job_type: "compress_chunk", priority: 60 },
-      { job_type: "transcribe_chunk", priority: 30 },
+      { job_type: "transcribe_chunk", priority: 24 },
     ]
   );
 
@@ -2725,6 +2835,102 @@ test("claims by durable priority even when a lower-priority state was deferred",
   );
 });
 
+test("claims the newest session first among equal-priority diarization jobs", (t) => {
+  const { db, store } = fixture(t);
+  db.prepare(
+    `INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+     VALUES ('s2', 200, 300, 'completed', 200)`
+  ).run();
+  db.prepare("UPDATE sessions SET ended_at = 100, status = 'completed' WHERE id = 's1'").run();
+  createTrack(store, { id: "older-system", sessionId: "s1" });
+  createTrack(store, { id: "newer-system", sessionId: "s2" });
+  seedProcessingJob(db, {
+    id: "older-diarize",
+    sessionId: "s1",
+    trackId: "older-system",
+    jobType: "diarize_track",
+    priority: 36,
+    createdAt: 50,
+    inputHash: "older-diarize-input",
+  });
+  seedProcessingJob(db, {
+    id: "newer-diarize",
+    sessionId: "s2",
+    trackId: "newer-system",
+    jobType: "diarize_track",
+    priority: 36,
+    createdAt: 250,
+    inputHash: "newer-diarize-input",
+  });
+
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 1 })[0].id,
+    "newer-diarize"
+  );
+});
+
+test("application diarization waits for mic but does not wait for system mix", (t) => {
+  const { db, store } = fixture(t);
+  createTrack(store, {
+    id: "mic-primary",
+    sourceType: "mic",
+    deviceId: "mic-device",
+    deviceLabel: "Physical microphone",
+    strategy: "media-recorder",
+  });
+  createTrack(store, {
+    id: "app-secondary",
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    captureGeneration: 1,
+  });
+  createTrack(store, { id: "system-fallback" });
+  seedProcessingJob(db, {
+    id: "mic-diarize",
+    trackId: "mic-primary",
+    jobType: "diarize_track",
+    state: "retry",
+    priority: 18,
+    nextRetryAt: 900,
+    inputHash: "mic-diarize-input",
+  });
+  seedProcessingJob(db, {
+    id: "app-diarize",
+    trackId: "app-secondary",
+    jobType: "diarize_track",
+    priority: 26,
+    inputHash: "app-diarize-input",
+  });
+  seedProcessingJob(db, {
+    id: "system-diarize",
+    trackId: "system-fallback",
+    jobType: "diarize_track",
+    priority: 28,
+    inputHash: "system-diarize-input",
+  });
+
+  assert.deepEqual(store.claimJobs({ owner: "worker-a", at: 500, leaseMs: 100, limit: 2 }), []);
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', next_retry_at = NULL, completed_at = 550
+     WHERE id = 'mic-diarize'`
+  ).run();
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 600, leaseMs: 100, limit: 1 })[0].id,
+    "app-diarize"
+  );
+  db.prepare(
+    `UPDATE processing_jobs
+     SET state = 'completed', completed_at = 650,
+         lease_owner = NULL, lease_expires_at = NULL
+     WHERE id = 'app-diarize'`
+  ).run();
+  assert.equal(
+    store.claimJobs({ owner: "worker-a", at: 700, leaseMs: 100, limit: 1 })[0].id,
+    "system-diarize"
+  );
+});
+
 test("daily digest jobs are sessionless idempotent and wake by immutable input", (t) => {
   const { db, store } = fixture(t, { createId: (prefix) => `${prefix}-fixed` });
   const input = seedDailyDigestInput(db, { inputHash: "4".repeat(64) });
@@ -2909,24 +3115,17 @@ test("supersedeDailyDigestJob is lease fenced and terminal only for daily digest
     limit: 1,
   });
   assert.equal(claimed.id, job.id);
-  assert.equal(
-    store.supersedeDailyDigestJob(job.id, { owner: "wrong-worker", at: 510 }),
-    false
-  );
-  assert.equal(
-    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 600 }),
-    false
-  );
-  assert.equal(
-    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 510 }),
-    true
-  );
+  assert.equal(store.supersedeDailyDigestJob(job.id, { owner: "wrong-worker", at: 510 }), false);
+  assert.equal(store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 600 }), false);
+  assert.equal(store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 510 }), true);
   assert.deepEqual(
-    db.prepare(
-      `SELECT state, completed_at, next_retry_at, lease_owner, lease_expires_at,
+    db
+      .prepare(
+        `SELECT state, completed_at, next_retry_at, lease_owner, lease_expires_at,
               error_code, blocked_reason, execution_device
        FROM processing_jobs WHERE id = ?`
-    ).get(job.id),
+      )
+      .get(job.id),
     {
       state: "superseded",
       completed_at: 510,
@@ -2938,10 +3137,7 @@ test("supersedeDailyDigestJob is lease fenced and terminal only for daily digest
       execution_device: null,
     }
   );
-  assert.equal(
-    store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 511 }),
-    false
-  );
+  assert.equal(store.supersedeDailyDigestJob(job.id, { owner: "digest-worker", at: 511 }), false);
   const analysisJob = setPrestartRecoveryState(db, store, "none");
   db.prepare(
     `UPDATE processing_jobs
@@ -2982,22 +3178,24 @@ test("daily digest candidates require a reconciled daily-digest budget attempt",
   });
   const candidateJson = JSON.stringify({ schemaVersion: "jarvis-daily-digest-v1" });
   const insertCandidate = () =>
-    db.prepare(
-      `INSERT INTO daily_digest_response_candidates (
+    db
+      .prepare(
+        `INSERT INTO daily_digest_response_candidates (
          id, job_id, digest_input_id, budget_attempt_id, response_schema_version,
          candidate_json, candidate_bytes, candidate_hash, state, created_at
        ) VALUES (
          'digest-candidate', ?, ?, 'digest-attempt', 'jarvis-daily-digest-v1',
          ?, ?, ?, 'validated', ?
        )`
-    ).run(
-      job.id,
-      input.inputId,
-      candidateJson,
-      Buffer.byteLength(candidateJson, "utf8"),
-      "3".repeat(64),
-      at + 4
-    );
+      )
+      .run(
+        job.id,
+        input.inputId,
+        candidateJson,
+        Buffer.byteLength(candidateJson, "utf8"),
+        "3".repeat(64),
+        at + 4
+      );
   assert.throws(insertCandidate, /identity|linkage|mismatch/i);
   budget.markStarted({ requestId: "digest-attempt", at: at + 2 });
   budget.reconcile({
@@ -3238,14 +3436,16 @@ test("digest candidate recovery renews validated applied and superseded unfinish
         leaseMs: 300,
         limit: 1,
       }),
-      [{
-        jobId: seeded.job.id,
-        jobType: "generate_daily_digest",
-        candidateId: seeded.candidateId,
-        candidateState,
-        leaseOwner: "restart-digest-worker",
-        leaseExpiresAt: 500,
-      }],
+      [
+        {
+          jobId: seeded.job.id,
+          jobType: "generate_daily_digest",
+          candidateId: seeded.candidateId,
+          candidateState,
+          leaseOwner: "restart-digest-worker",
+          leaseExpiresAt: 500,
+        },
+      ],
       candidateState
     );
   }
@@ -3323,8 +3523,10 @@ test("digest candidate recovery rejects every mismatched input job budget and st
       name: "job input hash",
       corrupt(db, seeded) {
         db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
-        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
-          .run("6".repeat(64), seeded.job.id);
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?").run(
+          "6".repeat(64),
+          seeded.job.id
+        );
       },
     },
     {
@@ -3340,8 +3542,9 @@ test("digest candidate recovery rejects every mismatched input job budget and st
     {
       name: "job budget model",
       corrupt(db, seeded) {
-        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?")
-          .run(seeded.job.id);
+        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?").run(
+          seeded.job.id
+        );
       },
     },
     {
@@ -3352,8 +3555,9 @@ test("digest candidate recovery rejects every mismatched input job budget and st
           DROP TRIGGER analysis_budget_attempts_terminal;
         `);
         db.pragma("foreign_keys = OFF");
-        db.prepare("UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?")
-          .run(seeded.requestId);
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?"
+        ).run(seeded.requestId);
         db.pragma("foreign_keys = ON");
       },
     },
@@ -3380,8 +3584,9 @@ test("digest candidate recovery rejects every mismatched input job budget and st
           DROP TRIGGER analysis_budget_attempts_transition;
         `);
         db.pragma("ignore_check_constraints = ON");
-        db.prepare("UPDATE analysis_budget_attempts SET state = 'started' WHERE request_id = ?")
-          .run(seeded.requestId);
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET state = 'started' WHERE request_id = ?"
+        ).run(seeded.requestId);
         db.pragma("ignore_check_constraints = OFF");
       },
     },
@@ -3680,9 +3885,9 @@ test("recovered paid digest crash windows converge without another network reque
         now: () => budgetAt + 20,
         defaultTimezone: "Asia/Shanghai",
       });
-      const inputRow = db.prepare("SELECT * FROM daily_digest_inputs WHERE id = ?").get(
-        seeded.input.inputId
-      );
+      const inputRow = db
+        .prepare("SELECT * FROM daily_digest_inputs WHERE id = ?")
+        .get(seeded.input.inputId);
       const memoryRepository = {
         createDailyDigestInput() {
           throw new Error("source rebuild must remain unreachable");
@@ -3752,10 +3957,12 @@ test("recovered paid digest crash windows converge without another network reque
       });
       assert.equal(networkRequests, 0);
       assert.deepEqual(
-        db.prepare(
-          `SELECT state, error_code, lease_owner, lease_expires_at, completed_at
+        db
+          .prepare(
+            `SELECT state, error_code, lease_owner, lease_expires_at, completed_at
            FROM processing_jobs WHERE id = ?`
-        ).get(seeded.job.id),
+          )
+          .get(seeded.job.id),
         {
           state: "blocked",
           error_code: scenario.errorCode,
@@ -3785,8 +3992,10 @@ test("expired digest pre-start recovery refuses ambiguous or inexact work", asyn
           suffix: "prestart-hash",
         });
         db.exec("DROP TRIGGER processing_jobs_cloud_contract_update");
-        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?")
-          .run("4".repeat(64), seeded.job.id);
+        db.prepare("UPDATE processing_jobs SET input_hash = ? WHERE id = ?").run(
+          "4".repeat(64),
+          seeded.job.id
+        );
         return seeded;
       },
     },
@@ -3798,8 +4007,9 @@ test("expired digest pre-start recovery refuses ambiguous or inexact work", asyn
           persistCandidate: false,
           suffix: "prestart-model",
         });
-        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?")
-          .run(seeded.job.id);
+        db.prepare("UPDATE processing_jobs SET model_version = 'forged-model' WHERE id = ?").run(
+          seeded.job.id
+        );
         return seeded;
       },
     },
@@ -3816,8 +4026,9 @@ test("expired digest pre-start recovery refuses ambiguous or inexact work", asyn
           DROP TRIGGER analysis_budget_attempts_terminal;
         `);
         db.pragma("foreign_keys = OFF");
-        db.prepare("UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?")
-          .run(seeded.requestId);
+        db.prepare(
+          "UPDATE analysis_budget_attempts SET provider = 'forged' WHERE request_id = ?"
+        ).run(seeded.requestId);
         db.pragma("foreign_keys = ON");
         return seeded;
       },
@@ -4037,20 +4248,28 @@ test("digest admission sees actionable analysis while analysis excludes its own 
   });
 
   assert.deepEqual(store.listAgentAdmissionBacklog({ priorityBefore: 70 }), []);
-  assert.deepEqual(store.listAgentAdmissionBacklog({
-    priorityBefore: 80,
-    excludeJobId: "other-job",
-  }), [{
-    jobType: "analyze_session",
-    lane: "cloud",
-    state: "running",
-    priority: 70,
-    nextRetryAt: null,
-  }]);
-  assert.deepEqual(store.listAgentAdmissionBacklog({
-    priorityBefore: 80,
-    excludeJobId: job.id,
-  }), []);
+  assert.deepEqual(
+    store.listAgentAdmissionBacklog({
+      priorityBefore: 80,
+      excludeJobId: "other-job",
+    }),
+    [
+      {
+        jobType: "analyze_session",
+        lane: "cloud",
+        state: "running",
+        priority: 70,
+        nextRetryAt: null,
+      },
+    ]
+  );
+  assert.deepEqual(
+    store.listAgentAdmissionBacklog({
+      priorityBefore: 80,
+      excludeJobId: job.id,
+    }),
+    []
+  );
 });
 
 test("atomically claims only durable jobs above the preview priority ceiling", (t) => {

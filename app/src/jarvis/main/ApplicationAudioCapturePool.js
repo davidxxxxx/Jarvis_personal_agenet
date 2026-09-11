@@ -3,16 +3,33 @@ const WindowsLoopbackAudioManager = require("../../helpers/windowsLoopbackAudioM
 const ApplicationAudioPolicy = require("./ApplicationAudioPolicy");
 const { createApplicationAudioStatus } = require("./ApplicationAudioStatus");
 
-const DEFAULT_SILENCE_RELEASE_MS = 15_000;
+const DEFAULT_SILENCE_RELEASE_MS = 60_000;
 const DEFAULT_RETRY_DELAY_MS = 5_000;
 const DEFAULT_PREBUFFER_MS = 2_000;
+const DEFAULT_SELECTION_DEBOUNCE_MS = 2_000;
+const DEFAULT_SESSION_INACTIVE_GRACE_MS = 15_000;
 const SWEEP_INTERVAL_MS = 1_000;
 const PCM_ACTIVITY_THRESHOLD = 256;
+const WATCHER_AUDIBLE_PEAK_THRESHOLD = 0.0005;
 const MAX_CANDIDATE_COUNT = 256;
+const MAX_STARTUP_PCM_BYTES = 24_000 * 2 * 5;
 
 function safeReason(error, fallback = "application_capture_unavailable") {
   const candidate = typeof error?.code === "string" ? error.code : fallback;
   return /^[a-z0-9_-]{1,64}$/i.test(candidate) ? candidate : fallback;
+}
+
+function safeFailureCode(error, fallback = "application_capture_unavailable") {
+  const candidate =
+    typeof error?.failureCode === "string" ? error.failureCode : safeReason(error, fallback);
+  return /^[A-Za-z0-9_-]{1,128}$/.test(candidate) ? candidate : fallback;
+}
+
+function scopedFailureCode(scope, error) {
+  const detail = safeFailureCode(error, scope);
+  if (detail === scope || detail.startsWith(`${scope}_`)) return detail;
+  const prefix = `${scope}_`;
+  return `${prefix}${detail.slice(0, 128 - prefix.length)}`;
 }
 
 function isAudiblePcm(pcm) {
@@ -34,6 +51,8 @@ class ApplicationAudioCapturePool {
     silenceReleaseMs = DEFAULT_SILENCE_RELEASE_MS,
     retryDelayMs = DEFAULT_RETRY_DELAY_MS,
     prebufferMs = DEFAULT_PREBUFFER_MS,
+    selectionDebounceMs = DEFAULT_SELECTION_DEBOUNCE_MS,
+    sessionInactiveGraceMs = DEFAULT_SESSION_INACTIVE_GRACE_MS,
     onTrackStarted = () => {},
     onTrackEnded = () => {},
     onAttributionChange = () => {},
@@ -50,6 +69,14 @@ class ApplicationAudioCapturePool {
     this.silenceReleaseMs = Math.max(1_000, silenceReleaseMs ?? DEFAULT_SILENCE_RELEASE_MS);
     this.retryDelayMs = Math.max(250, retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
     this.prebufferMs = Math.max(0, Math.min(10_000, prebufferMs ?? DEFAULT_PREBUFFER_MS));
+    this.selectionDebounceMs = Math.max(
+      0,
+      Math.min(10_000, selectionDebounceMs ?? DEFAULT_SELECTION_DEBOUNCE_MS)
+    );
+    this.sessionInactiveGraceMs = Math.max(
+      1_000,
+      Math.min(60_000, sessionInactiveGraceMs ?? DEFAULT_SESSION_INACTIVE_GRACE_MS)
+    );
     this.onTrackStarted = onTrackStarted;
     this.onTrackEnded = onTrackEnded;
     this.onAttributionChange = onAttributionChange;
@@ -129,7 +156,9 @@ class ApplicationAudioCapturePool {
     const tracks = [...this.activeTracks.values()];
     this.activeTracks.clear();
     for (const track of tracks) {
-      this._notifyTrackStopped(track, "pool_stopped", stoppedAt, sessionId);
+      if (track.registered) {
+        this._notifyTrackStopped(track, "pool_stopped", stoppedAt, sessionId);
+      }
     }
 
     const watcher = this.watcher;
@@ -142,7 +171,7 @@ class ApplicationAudioCapturePool {
       await pendingWork;
       const cleanupWork = [];
       if (watcher) cleanupWork.push(watcher.stop());
-      for (const track of tracks) cleanupWork.push(track.manager.stop());
+      for (const track of tracks) cleanupWork.push(this._stopManagerOnce(track));
       const settled = await Promise.allSettled(cleanupWork);
       for (const result of settled) {
         if (result.status === "rejected") {
@@ -174,22 +203,34 @@ class ApplicationAudioCapturePool {
           applicationDisplayName: event.applicationDisplayName,
           pids: new Map(),
           blockedUntil: 0,
+          firstSeenAt: at,
+          inactiveSinceAt: null,
+          requiresAudibleRearm: false,
         };
         this.candidates.set(event.applicationKey, candidate);
       }
       candidate.applicationDisplayName = event.applicationDisplayName;
       if (event.state === "active") {
+        const audible = this._isAudibleSessionEvent(event);
+        if (audible) {
+          candidate.requiresAudibleRearm = false;
+        }
+        candidate.inactiveSinceAt = null;
         candidate.pids.set(event.pid, {
           pid: event.pid,
           peak: event.peak,
+          audible,
           isForeground: event.isForeground === true,
           lastSeenAt: at,
         });
       } else {
         candidate.pids.delete(event.pid);
         if (candidate.pids.size === 0) {
-          this.candidates.delete(event.applicationKey);
-          this.fallbacks.delete(event.applicationKey);
+          candidate.inactiveSinceAt = at;
+          if (!this.activeTracks.has(event.applicationKey)) {
+            this.candidates.delete(event.applicationKey);
+            this.fallbacks.delete(event.applicationKey);
+          }
         }
       }
       await this._reconcile(at);
@@ -219,9 +260,23 @@ class ApplicationAudioCapturePool {
       for (const [applicationKey, track] of [...this.activeTracks]) {
         if (at - track.lastSoundAt < this.silenceReleaseMs) continue;
         const candidate = this.candidates.get(applicationKey);
-        if (candidate) candidate.blockedUntil = at + this.retryDelayMs;
+        if (candidate) {
+          candidate.blockedUntil = at + this.retryDelayMs;
+          candidate.requiresAudibleRearm = true;
+        }
         this._setFallback(track, "confirmed_silence", at + this.retryDelayMs);
         await this._stopTrack(applicationKey, "confirmed_silence", at);
+      }
+      for (const [applicationKey, candidate] of [...this.candidates]) {
+        if (
+          candidate.pids.size === 0 &&
+          !this.activeTracks.has(applicationKey) &&
+          candidate.inactiveSinceAt !== null &&
+          at - candidate.inactiveSinceAt >= this.sessionInactiveGraceMs
+        ) {
+          this.candidates.delete(applicationKey);
+          this.fallbacks.delete(applicationKey);
+        }
       }
       await this._reconcile(at);
     });
@@ -256,8 +311,35 @@ class ApplicationAudioCapturePool {
   _candidateList(at) {
     const result = [];
     for (const candidate of this.candidates.values()) {
-      if (candidate.blockedUntil > at || candidate.pids.size === 0) continue;
-      const process = [...candidate.pids.values()].sort((left, right) => {
+      if (candidate.blockedUntil > at) continue;
+      if (candidate.requiresAudibleRearm === true) continue;
+      const activePid = this.activeTracks.get(candidate.applicationKey)?.pid;
+      let processes = [...candidate.pids.values()];
+      if (activePid) {
+        processes = processes.filter((process) => process.audible || process.pid === activePid);
+      } else {
+        processes = processes.filter((process) => process.audible);
+      }
+      if (
+        processes.length === 0 &&
+        activePid &&
+        candidate.inactiveSinceAt !== null &&
+        at - candidate.inactiveSinceAt < this.sessionInactiveGraceMs
+      ) {
+        processes = [
+          {
+            pid: activePid,
+            peak: 0,
+            audible: false,
+            isForeground: false,
+            lastSeenAt: candidate.inactiveSinceAt,
+          },
+        ];
+      }
+      if (processes.length === 0) continue;
+      const process = processes.sort((left, right) => {
+        if (left.pid === activePid && right.pid !== activePid) return -1;
+        if (right.pid === activePid && left.pid !== activePid) return 1;
         if (right.isForeground !== left.isForeground) return right.isForeground ? 1 : -1;
         if (right.peak !== left.peak) return right.peak - left.peak;
         return right.lastSeenAt - left.lastSeenAt;
@@ -270,6 +352,7 @@ class ApplicationAudioCapturePool {
         peak: process.peak,
         isForeground: process.isForeground,
         lastSeenAt: process.lastSeenAt,
+        firstSeenAt: candidate.firstSeenAt,
       });
     }
     return result;
@@ -277,9 +360,22 @@ class ApplicationAudioCapturePool {
 
   async _reconcile(at) {
     if (!this.running) return;
-    const selected = this.policy.select(this._candidateList(at), {
+    const effectiveLimit = this.policy.resolveLimit({
       configuredLimit: this.configuredLimit,
       fullscreen: this.fullscreen,
+    });
+    const activeApplicationKeys = new Set(this.activeTracks.keys());
+    const poolIsFull = this.activeTracks.size >= effectiveLimit;
+    const candidates = this._candidateList(at).filter(
+      (candidate) =>
+        activeApplicationKeys.has(candidate.applicationKey) ||
+        !poolIsFull ||
+        at - candidate.firstSeenAt >= this.selectionDebounceMs
+    );
+    const selected = this.policy.select(candidates, {
+      configuredLimit: this.configuredLimit,
+      fullscreen: this.fullscreen,
+      activeApplicationKeys,
     });
     const desired = new Map(selected.map((candidate) => [candidate.applicationKey, candidate]));
 
@@ -291,11 +387,7 @@ class ApplicationAudioCapturePool {
           : this.candidates.has(applicationKey)
             ? "application_not_selected"
             : "application_inactive";
-        await this._stopTrack(
-          applicationKey,
-          reason,
-          at
-        );
+        await this._stopTrack(applicationKey, reason, at);
       }
     }
     for (const candidate of selected) {
@@ -323,8 +415,14 @@ class ApplicationAudioCapturePool {
       pid: candidate.pid,
       captureGeneration,
       manager,
-      startedAt: at,
+      startedAt: null,
       lastSoundAt: at,
+      registered: false,
+      startNotified: false,
+      startupChunks: [],
+      startupBytes: 0,
+      startupFailure: null,
+      managerStopWork: null,
     };
     this.activeTracks.set(candidate.applicationKey, track);
     try {
@@ -339,20 +437,38 @@ class ApplicationAudioCapturePool {
             code: safeReason(warning, "application_capture_warning"),
           }),
         onError: (error) => {
+          if (!track.registered) {
+            if (this._latchStartupFailure(track, error, this.now())) {
+              void this._enqueue(() => this._handleStartupFailure(track));
+            }
+            return;
+          }
           void this._enqueue(() => this._handleCaptureError(track, error));
         },
       });
     } catch (error) {
+      if (track.startupFailure) {
+        await this._handleStartupFailure(track);
+        return;
+      }
+      if (this.activeTracks.get(candidate.applicationKey) !== track) {
+        try {
+          await this._stopManagerOnce(track);
+        } catch {}
+        return;
+      }
       if (this.activeTracks.get(candidate.applicationKey) === track) {
         this.activeTracks.delete(candidate.applicationKey);
       }
       try {
-        await manager.stop();
+        await this._stopManagerOnce(track);
       } catch {}
       const retryAt = at + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
-      this._setFallback(track, safeReason(error, "capture_start_failed"), retryAt);
+      const reason = safeReason(error, "capture_start_failed");
+      const failureCode = safeFailureCode(error, reason);
+      this._setFallback(track, reason, retryAt, failureCode);
       try {
         this.onAttributionChange({
           sessionId: this.sessionId,
@@ -361,7 +477,8 @@ class ApplicationAudioCapturePool {
           captureGeneration,
           attributionState: "mixed_unknown",
           at,
-          reason: safeReason(error, "capture_start_failed"),
+          reason,
+          failureCode,
         });
       } catch (callbackError) {
         this.onError(callbackError);
@@ -369,15 +486,29 @@ class ApplicationAudioCapturePool {
       return;
     }
 
+    if (track.startupFailure) {
+      await this._handleStartupFailure(track);
+      return;
+    }
+    if (this.activeTracks.get(candidate.applicationKey) !== track) {
+      try {
+        await this._stopManagerOnce(track);
+      } catch {}
+      return;
+    }
+    const captureStartedAt = track.startupChunks[0]?.at ?? this.now();
+    track.startedAt = captureStartedAt;
+    track.lastSoundAt = captureStartedAt;
     this.fallbacks.delete(candidate.applicationKey);
     try {
+      track.startNotified = true;
       this.onTrackStarted({
         sessionId: this.sessionId,
         applicationKey: track.applicationKey,
         applicationDisplayName: track.applicationDisplayName,
         pid: track.pid,
         captureGeneration,
-        startedAt: at,
+        startedAt: captureStartedAt,
       });
       if (this.prebufferMs > 0) {
         this.onAttributionChange({
@@ -396,39 +527,53 @@ class ApplicationAudioCapturePool {
         applicationDisplayName: track.applicationDisplayName,
         captureGeneration,
         attributionState: "exact",
-        at,
+        at: captureStartedAt,
         reason: "application_capture_started",
       });
+      track.registered = true;
+      const startupChunks = track.startupChunks;
+      track.startupChunks = [];
+      track.startupBytes = 0;
+      for (const startupChunk of startupChunks) {
+        this._deliverChunk(track, startupChunk.pcm, startupChunk.at);
+      }
     } catch (error) {
-      this.activeTracks.delete(candidate.applicationKey);
+      if (this.activeTracks.get(candidate.applicationKey) === track) {
+        this.activeTracks.delete(candidate.applicationKey);
+      }
       try {
-        await manager.stop();
+        await this._stopManagerOnce(track);
       } catch {}
-      const retryAt = at + this.retryDelayMs;
+      const failureAt = Math.max(captureStartedAt, this.now());
+      const retryAt = failureAt + this.retryDelayMs;
       const stored = this.candidates.get(candidate.applicationKey);
       if (stored) stored.blockedUntil = retryAt;
-      this._setFallback(track, "evidence_registration_failed", retryAt);
-      try {
-        this.onTrackEnded({
-          sessionId: this.sessionId,
-          applicationKey: track.applicationKey,
-          applicationDisplayName: track.applicationDisplayName,
-          pid: track.pid,
-          captureGeneration: track.captureGeneration,
-          endedAt: at,
-          reason: "evidence_registration_failed",
-        });
-      } catch {}
+      const failureCode = scopedFailureCode("evidence_registration_failed", error);
+      this._setFallback(track, "evidence_registration_failed", retryAt, failureCode);
+      if (track.startNotified) {
+        try {
+          this.onTrackEnded({
+            sessionId: this.sessionId,
+            applicationKey: track.applicationKey,
+            applicationDisplayName: track.applicationDisplayName,
+            pid: track.pid,
+            captureGeneration: track.captureGeneration,
+            endedAt: failureAt,
+            reason: "evidence_registration_failed",
+            failureCode,
+          });
+        } catch {}
+      }
       this.onError(error);
     }
   }
 
-  async _stopTrack(applicationKey, reason, at) {
+  async _stopTrack(applicationKey, reason, at, failureCode = null) {
     const track = this.activeTracks.get(applicationKey);
     if (!track) return;
     this.activeTracks.delete(applicationKey);
     try {
-      await track.manager.stop();
+      await this._stopManagerOnce(track);
     } catch (error) {
       this.onWarning({
         applicationKey,
@@ -436,10 +581,19 @@ class ApplicationAudioCapturePool {
         code: safeReason(error, "capture_stop_failed"),
       });
     }
-    this._notifyTrackStopped(track, reason, at, this.sessionId);
+    if (track.registered) {
+      this._notifyTrackStopped(track, reason, at, this.sessionId, failureCode);
+    }
   }
 
-  _notifyTrackStopped(track, reason, at, sessionId) {
+  _stopManagerOnce(track) {
+    if (!track.managerStopWork) {
+      track.managerStopWork = Promise.resolve().then(() => track.manager.stop());
+    }
+    return track.managerStopWork;
+  }
+
+  _notifyTrackStopped(track, reason, at, sessionId, failureCode = null) {
     try {
       this.onAttributionChange({
         sessionId,
@@ -449,6 +603,7 @@ class ApplicationAudioCapturePool {
         attributionState: "mixed_unknown",
         at,
         reason,
+        failureCode,
       });
       this.onTrackEnded({
         sessionId,
@@ -458,6 +613,7 @@ class ApplicationAudioCapturePool {
         captureGeneration: track.captureGeneration,
         endedAt: at,
         reason,
+        failureCode,
       });
     } catch (error) {
       this.onError(error);
@@ -467,6 +623,25 @@ class ApplicationAudioCapturePool {
   _handleChunk(track, pcm) {
     if (this.activeTracks.get(track.applicationKey) !== track || !Buffer.isBuffer(pcm)) return;
     const at = this.now();
+    if (!track.registered) {
+      if (track.startupFailure) return;
+      if (track.startupBytes + pcm.length > MAX_STARTUP_PCM_BYTES) {
+        const error = new Error("Application audio startup PCM exceeded its bounded buffer");
+        error.code = "startup_pcm_overflow";
+        if (this._latchStartupFailure(track, error, at)) {
+          void this._enqueue(() => this._handleStartupFailure(track));
+        }
+        return;
+      }
+      track.startupChunks.push({ pcm: Buffer.from(pcm), at });
+      track.startupBytes += pcm.length;
+      return;
+    }
+    this._deliverChunk(track, pcm, at);
+  }
+
+  _deliverChunk(track, pcm, at) {
+    if (this.activeTracks.get(track.applicationKey) !== track || !track.registered) return;
     if (isAudiblePcm(pcm)) track.lastSoundAt = at;
     try {
       this.onChunk({
@@ -483,35 +658,102 @@ class ApplicationAudioCapturePool {
     }
   }
 
+  _latchStartupFailure(track, error, at) {
+    if (
+      track.registered ||
+      track.startupFailure ||
+      this.activeTracks.get(track.applicationKey) !== track
+    ) {
+      return false;
+    }
+    const reason = safeReason(error);
+    const failureCode = safeFailureCode(error, reason);
+    const retryAt = at + this.retryDelayMs;
+    track.startupFailure = {
+      error,
+      at,
+      reason,
+      failureCode,
+      retryAt,
+      notified: false,
+    };
+    track.startupChunks = [];
+    track.startupBytes = 0;
+    const candidate = this.candidates.get(track.applicationKey);
+    if (candidate) candidate.blockedUntil = retryAt;
+    this._setFallback(track, reason, retryAt, failureCode);
+    return true;
+  }
+
+  async _handleStartupFailure(track) {
+    const failure = track.startupFailure;
+    if (!failure) return;
+    const isCurrent = this.activeTracks.get(track.applicationKey) === track;
+    if (isCurrent) {
+      this.activeTracks.delete(track.applicationKey);
+      if (!failure.notified) {
+        failure.notified = true;
+        try {
+          this.onAttributionChange({
+            sessionId: this.sessionId,
+            applicationKey: track.applicationKey,
+            applicationDisplayName: track.applicationDisplayName,
+            captureGeneration: track.captureGeneration,
+            attributionState: "mixed_unknown",
+            at: failure.at,
+            reason: failure.reason,
+            failureCode: failure.failureCode,
+          });
+        } catch (error) {
+          this.onError(error);
+        }
+      }
+    }
+    try {
+      await this._stopManagerOnce(track);
+    } catch (error) {
+      if (isCurrent) {
+        this.onWarning({
+          applicationKey: track.applicationKey,
+          captureGeneration: track.captureGeneration,
+          code: safeReason(error, "capture_stop_failed"),
+        });
+      }
+    }
+  }
+
   async _handleCaptureError(track, error) {
     if (this.activeTracks.get(track.applicationKey) !== track) return;
     const at = this.now();
     const reason = safeReason(error);
+    const failureCode = safeFailureCode(error, reason);
     const retryAt = at + this.retryDelayMs;
     const candidate = this.candidates.get(track.applicationKey);
     if (candidate) candidate.blockedUntil = retryAt;
-    this._setFallback(track, reason, retryAt);
-    await this._stopTrack(track.applicationKey, reason, at);
+    this._setFallback(track, reason, retryAt, failureCode);
+    await this._stopTrack(track.applicationKey, reason, at, failureCode);
     await this._reconcile(at);
   }
 
   async _handleWatcherError(error) {
     const at = this.now();
     const reason = safeReason(error, "session_watch_unavailable");
+    const failureCode = safeFailureCode(error, reason);
     for (const track of this.activeTracks.values()) {
-      this._setFallback(track, reason, at + this.retryDelayMs);
+      this._setFallback(track, reason, at + this.retryDelayMs, failureCode);
     }
     for (const applicationKey of [...this.activeTracks.keys()]) {
-      await this._stopTrack(applicationKey, reason, at);
+      await this._stopTrack(applicationKey, reason, at, failureCode);
     }
     this.onError(error);
   }
 
-  _setFallback(track, reason, retryAt) {
+  _setFallback(track, reason, retryAt, failureCode = null) {
     this.fallbacks.set(track.applicationKey, {
       applicationKey: track.applicationKey,
       applicationDisplayName: track.applicationDisplayName,
       reason,
+      failureCode,
       retryAt,
     });
   }
@@ -533,7 +775,14 @@ class ApplicationAudioCapturePool {
       typeof event.peak === "number" &&
       Number.isFinite(event.peak) &&
       event.peak >= 0 &&
-      event.peak <= 1
+      event.peak <= 1 &&
+      (event.audible === undefined || typeof event.audible === "boolean")
+    );
+  }
+
+  _isAudibleSessionEvent(event) {
+    return (
+      event.state === "active" && (event.audible ?? event.peak >= WATCHER_AUDIBLE_PEAK_THRESHOLD)
     );
   }
 }

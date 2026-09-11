@@ -7,12 +7,23 @@ const {
   normalizeSuggestionDecisionInput,
   normalizeMemoryConflictResolutionInput,
   normalizeKnowledgeTodoCompletionInput,
+  normalizeKnowledgeTodoDecisionInput,
+  normalizeKnowledgeActionInput,
+  normalizeActionCenterReadInput,
+  normalizeActivityCorrectionInput,
+  normalizePersonalizationRuleDecisionInput,
+  normalizeLearningGoalCreateInput,
+  normalizeLearningGoalEditInput,
+  normalizeLearningGoalIdInput,
+  normalizeNotificationPreferencesInput,
+  normalizeTodoReminderInput,
   normalizeEvidenceContextRequest,
   normalizeEvidenceContextResponse,
   normalizeMiniMaxKeyInput,
   normalizeMiniMaxConfig,
   normalizeResourceGovernanceSettings,
   normalizeApplicationAudioSettings,
+  normalizeJarvisRolloutFlags,
   normalizeAnalysisBudgetInput,
   normalizeAnalysisBudgetStatus,
   normalizeAnalysisStatus,
@@ -185,6 +196,7 @@ function normalizeApplicationAudioStatus(input) {
   const settings = normalizeApplicationAudioSettings({
     enabled: input?.enabled,
     trackLimit: input?.trackLimit,
+    fallbackPolicy: input?.fallbackPolicy,
   });
   const runtime = input?.runtime;
   if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
@@ -272,6 +284,49 @@ contextBridge.exposeInMainWorld("electronAPI", {
     listSegments: (sessionId) => ipcRenderer.invoke("jarvis:segments:list", sessionId),
     listActivityClassifications: (sessionId) =>
       ipcRenderer.invoke("jarvis:activity:list-session", assertJarvisId(sessionId, "sessionId")),
+    correctActivityClassification: (classificationId, category) =>
+      ipcRenderer.invoke(
+        "jarvis:activity:correct",
+        normalizeActivityCorrectionInput({ classificationId, category })
+      ),
+    getPersonalizationSettings: () => ipcRenderer.invoke("jarvis:personalization:get"),
+    decidePersonalizationRule: (ruleId, action, edit) =>
+      ipcRenderer.invoke(
+        "jarvis:personalization:rule-decision",
+        normalizePersonalizationRuleDecisionInput(
+          action === "edit" ? { ruleId, action, ...edit } : { ruleId, action }
+        )
+      ),
+    resetPersonalizationRules: () => ipcRenderer.invoke("jarvis:personalization:reset"),
+    listLearningGoals: () => ipcRenderer.invoke("jarvis:learning-goals:list"),
+    createLearningGoal: (title) =>
+      ipcRenderer.invoke(
+        "jarvis:learning-goals:create",
+        normalizeLearningGoalCreateInput({ title })
+      ),
+    editLearningGoal: (goalId, title) =>
+      ipcRenderer.invoke(
+        "jarvis:learning-goals:edit",
+        normalizeLearningGoalEditInput({ goalId, title })
+      ),
+    archiveLearningGoal: (goalId) =>
+      ipcRenderer.invoke("jarvis:learning-goals:archive", normalizeLearningGoalIdInput({ goalId })),
+    restoreLearningGoal: (goalId) =>
+      ipcRenderer.invoke("jarvis:learning-goals:restore", normalizeLearningGoalIdInput({ goalId })),
+    deleteLearningGoal: (goalId) =>
+      ipcRenderer.invoke("jarvis:learning-goals:delete", normalizeLearningGoalIdInput({ goalId })),
+    setNotificationPreferences: (focusMode, mutedUntil) =>
+      ipcRenderer.invoke(
+        "jarvis:notification-preferences:set",
+        normalizeNotificationPreferencesInput({ focusMode, mutedUntil })
+      ),
+    getTodoReminder: (todoId) =>
+      ipcRenderer.invoke("jarvis:todo-reminder:get", assertJarvisId(todoId, "todoId")),
+    setTodoReminder: (todoId, reminderAt) =>
+      ipcRenderer.invoke(
+        "jarvis:todo-reminder:set",
+        normalizeTodoReminderInput({ todoId, reminderAt })
+      ),
     renamePerson: (input) => ipcRenderer.invoke("jarvis:person:rename", input),
     listPeople: () => ipcRenderer.invoke("jarvis:person:list"),
     listSessionSpeakerClusters: (sessionId) =>
@@ -297,12 +352,26 @@ contextBridge.exposeInMainWorld("electronAPI", {
     },
     listAudioChunks: (sessionId) => ipcRenderer.invoke("jarvis:audio:list", sessionId),
     readAudioChunk: (audioChunkId) => ipcRenderer.invoke("jarvis:audio:read", audioChunkId),
+    readSpeakerUtteranceAudio: (utteranceId) =>
+      ipcRenderer.invoke("jarvis:speaker-utterance:audio:read", utteranceId),
     getSessionDetail: (sessionId) => ipcRenderer.invoke("jarvis:memory:session-detail", sessionId),
-    getSessionTimeline: (sessionId) =>
-      ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId),
+    getSessionTimeline: (sessionId, page) =>
+      page === undefined
+        ? ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId)
+        : ipcRenderer.invoke("jarvis:memory:session-timeline", sessionId, page),
+    getSessionTimelineStatus: (sessionId) =>
+      ipcRenderer.invoke("jarvis:memory:session-timeline-status", sessionId),
     getRuntimeStatus: () => ipcRenderer.invoke("jarvis:runtime:status"),
     searchMemory: (query, limit) => ipcRenderer.invoke("jarvis:memory:search", query, limit),
     listPeopleOverview: () => ipcRenderer.invoke("jarvis:memory:people"),
+    listPeopleReviewOverview: () => ipcRenderer.invoke("jarvis:memory:people-review"),
+    previewParticipantReview: (input) =>
+      ipcRenderer.invoke("jarvis:participant-review:preview", input),
+    applyParticipantReview: (input) => ipcRenderer.invoke("jarvis:participant-review:apply", input),
+    undoParticipantReview: (eventId) =>
+      ipcRenderer.invoke("jarvis:participant-review:undo", eventId),
+    listParticipantReviewHistory: (sessionId) =>
+      ipcRenderer.invoke("jarvis:participant-review:history", sessionId),
     getPersonDetail: (personId) => ipcRenderer.invoke("jarvis:memory:person-detail", personId),
     listTopics: () => ipcRenderer.invoke("jarvis:memory:topics"),
     getTopicDetail: (topicId) => ipcRenderer.invoke("jarvis:memory:topic-detail", topicId),
@@ -317,6 +386,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.invoke(
         "jarvis:memory:daily-digest",
         normalizeDailyDigestDateRequest({ localDate })
+      ),
+    getActionCenterWatermark: () => ipcRenderer.invoke("jarvis:memory:v2-action-watermark"),
+    getActionCenterDelta: () => ipcRenderer.invoke("jarvis:memory:v2-action-delta"),
+    markActionCenterRead: (throughSequence) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-action-read",
+        normalizeActionCenterReadInput({ throughSequence })
       ),
     getKnowledgeOverview: () => ipcRenderer.invoke("jarvis:memory:v2-overview"),
     decideKnowledgeSuggestion: (suggestionId, action) =>
@@ -334,6 +410,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
         "jarvis:memory:v2-todo-complete",
         normalizeKnowledgeTodoCompletionInput({ todoId })
       ),
+    decideKnowledgeTodo: (todoId, action) =>
+      ipcRenderer.invoke(
+        "jarvis:memory:v2-todo-decision",
+        normalizeKnowledgeTodoDecisionInput({ todoId, action })
+      ),
+    applyKnowledgeAction: (input) =>
+      ipcRenderer.invoke("jarvis:memory:v2-knowledge-action", normalizeKnowledgeActionInput(input)),
     getEvidenceContext: (input) => invokeEvidenceContext(input),
     analyzeSession: (sessionId, kind) =>
       invokeAnalysisStatus("jarvis:analysis:run", sessionId, kind),
@@ -361,6 +444,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       invokeApplicationAudioSettings("jarvis:application-audio:set", [
         normalizeApplicationAudioSettings(input),
       ]),
+    getRolloutFlags: () =>
+      ipcRenderer.invoke("jarvis:rollout-flags:get").then(normalizeJarvisRolloutFlags),
     startCapture: (input) => ipcRenderer.invoke("jarvis:capture:start", input),
     setRetentionMode: (id, retentionMode, at) =>
       ipcRenderer.invoke("jarvis:capture:set-retention-mode", id, retentionMode, at),

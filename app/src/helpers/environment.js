@@ -9,6 +9,7 @@ const {
   RESOURCE_GOVERNANCE_PRESETS,
   normalizeResourceGovernanceSettings,
 } = require("../jarvis/shared/contracts");
+const { resolveJarvisRolloutFlags } = require("../jarvis/main/JarvisRolloutFlags");
 
 const SECRET_KEYS = [
   "MINIMAX_API_KEY",
@@ -65,6 +66,11 @@ const PERSISTED_KEYS = [
   "JARVIS_RESOURCE_RECOVERY_WAIT_MS",
   "JARVIS_APPLICATION_AUDIO_ENABLED",
   "JARVIS_APPLICATION_AUDIO_TRACK_LIMIT",
+  "JARVIS_APPLICATION_AUDIO_FALLBACK_POLICY",
+  "JARVIS_ROLLOUT_APPLICATION_AUDIO_V1",
+  "JARVIS_ROLLOUT_DUAL_SPEAKER_VERIFICATION_V1",
+  "JARVIS_ROLLOUT_ACTIVITY_CLASSIFICATION_V1",
+  "JARVIS_ROLLOUT_ACTION_CENTER_V1",
   "BEDROCK_REGION",
   "BEDROCK_PROFILE",
   "AZURE_OPENAI_ENDPOINT",
@@ -619,8 +625,7 @@ class EnvironmentManager {
 
   getJarvisResourceSettings() {
     const profile = this._getKey("JARVIS_RESOURCE_PROFILE");
-    const preset =
-      RESOURCE_GOVERNANCE_PRESETS[profile] ?? RESOURCE_GOVERNANCE_PRESETS.balanced;
+    const preset = RESOURCE_GOVERNANCE_PRESETS[profile] ?? RESOURCE_GOVERNANCE_PRESETS.balanced;
     const threshold = Number.parseInt(this._getKey("JARVIS_EXTERNAL_GPU_THRESHOLD_PCT"), 10);
     const recoveryWaitMs = Number.parseInt(this._getKey("JARVIS_RESOURCE_RECOVERY_WAIT_MS"), 10);
     try {
@@ -641,10 +646,7 @@ class EnvironmentManager {
   async saveJarvisResourceSettings(input) {
     const normalized = normalizeResourceGovernanceSettings(input);
     this._saveKey("JARVIS_RESOURCE_PROFILE", normalized.profile);
-    this._saveKey(
-      "JARVIS_EXTERNAL_GPU_THRESHOLD_PCT",
-      String(normalized.externalGpuThresholdPct)
-    );
+    this._saveKey("JARVIS_EXTERNAL_GPU_THRESHOLD_PCT", String(normalized.externalGpuThresholdPct));
     this._saveKey("JARVIS_RESOURCE_RECOVERY_WAIT_MS", String(normalized.recoveryWaitMs));
     await this.saveAllKeysToEnvFile();
     return normalized;
@@ -652,23 +654,37 @@ class EnvironmentManager {
 
   getApplicationAudioSettings() {
     const rawLimit = Number.parseInt(this._getKey("JARVIS_APPLICATION_AUDIO_TRACK_LIMIT"), 10);
+    const rawFallbackPolicy = this._getKey("JARVIS_APPLICATION_AUDIO_FALLBACK_POLICY");
     return {
-      enabled: this._getKey("JARVIS_APPLICATION_AUDIO_ENABLED") !== "false",
+      enabled:
+        this.getJarvisRolloutFlags().applicationAudioV1 &&
+        this._getKey("JARVIS_APPLICATION_AUDIO_ENABLED") !== "false",
       trackLimit: Number.isSafeInteger(rawLimit) ? Math.max(1, Math.min(8, rawLimit)) : 4,
+      fallbackPolicy: rawFallbackPolicy === "transcript_only" ? "transcript_only" : "conservative",
     };
   }
 
-  async saveApplicationAudioSettings({ enabled = true, trackLimit = 4 } = {}) {
+  async saveApplicationAudioSettings({
+    enabled = true,
+    trackLimit = 4,
+    fallbackPolicy = "conservative",
+  } = {}) {
     const normalized = {
       enabled: enabled !== false,
       trackLimit: Number.isFinite(trackLimit)
         ? Math.max(1, Math.min(8, Math.round(trackLimit)))
         : 4,
+      fallbackPolicy: fallbackPolicy === "transcript_only" ? "transcript_only" : "conservative",
     };
     this._saveKey("JARVIS_APPLICATION_AUDIO_ENABLED", String(normalized.enabled));
     this._saveKey("JARVIS_APPLICATION_AUDIO_TRACK_LIMIT", String(normalized.trackLimit));
+    this._saveKey("JARVIS_APPLICATION_AUDIO_FALLBACK_POLICY", normalized.fallbackPolicy);
     await this.saveAllKeysToEnvFile();
-    return normalized;
+    return this.getApplicationAudioSettings();
+  }
+
+  getJarvisRolloutFlags() {
+    return resolveJarvisRolloutFlags((key) => this._getKey(key));
   }
 
   getUiLanguage() {

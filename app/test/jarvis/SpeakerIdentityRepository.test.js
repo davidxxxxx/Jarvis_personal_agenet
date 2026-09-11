@@ -880,6 +880,7 @@ test("public cluster projection allowlists current monotonic provenance and evid
 
   assert.deepEqual(Object.keys(view).sort(), [
     "canUndo",
+    "candidatePersonRef",
     "diarizationRevision",
     "evidenceSegmentIds",
     "id",
@@ -890,12 +891,15 @@ test("public cluster projection allowlists current monotonic provenance and evid
     "person",
     "policyId",
     "profileRevision",
+    "qualityScore",
     "reason",
     "score",
     "sessionId",
+    "speechMs",
     "suggestedPerson",
     "trackId",
     "updatedAt",
+    "windowCount",
   ]);
   assert.equal(view.linkState, "suggested");
   assert.deepEqual(view.suggestedPerson, {

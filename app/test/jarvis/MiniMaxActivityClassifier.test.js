@@ -173,7 +173,8 @@ test("classifies every batched activity exactly once and preserves input order",
     result.classifications.map((classification) => classification.activityId),
     ["activity-1", "activity-2"]
   );
-  assert.equal(result.classifications[1].allowTodos, true);
+  assert.equal(result.classifications[1].allowTodos, false);
+  assert.equal(result.classifications[1].allowSuggestions, false);
 });
 
 test("caps MiniMax confidence for mixed unknown system audio", async () => {
@@ -203,38 +204,45 @@ test("caps MiniMax confidence for mixed unknown system audio", async () => {
   assert.equal(result.classifications[0].allowTodos, false);
 });
 
-test("rejects invented evidence, duplicate activities, and unsupported categories", async () => {
-  const candidates = [
-    [
-      {
-        activityId: "activity-1",
-        category: "work_meeting",
-        confidence: 0.9,
-        reason: "Invented evidence.",
-        evidenceSegmentIds: ["not-supplied"],
-      },
-    ],
-    [
-      {
-        activityId: "activity-1",
-        category: "podcast",
-        confidence: 0.9,
-        reason: "Unsupported category.",
-        evidenceSegmentIds: ["activity-1-segment-1"],
-      },
-    ],
-  ];
-  for (const classifications of candidates) {
-    const client = new MiniMaxActivityClassifier({
-      getApiKey: () => "sk-cp-test-only",
-      fetchImpl: async () => jsonResponse(responseBody(classifications)),
-    });
-    await assert.rejects(
-      () => client.classify(classifierInput([sourceActivity()])),
-      (error) =>
-        error instanceof ActivityClassificationClientError && error.code === "invalid_structure"
-    );
-  }
+test("strips invented evidence but rejects a response with no valid classifications", async () => {
+  const recoverable = new MiniMaxActivityClassifier({
+    getApiKey: () => "sk-cp-test-only",
+    fetchImpl: async () =>
+      jsonResponse(
+        responseBody([
+          {
+            activityId: "activity-1",
+            category: "work_meeting",
+            confidence: 0.9,
+            reason: "The transcript resembles a meeting.",
+            evidenceSegmentIds: ["not-supplied"],
+          },
+        ])
+      ),
+  });
+  const recovered = await recoverable.classify(classifierInput([sourceActivity()]));
+  assert.deepEqual(recovered.classifications[0].evidenceSegmentIds, []);
+
+  const invalid = new MiniMaxActivityClassifier({
+    getApiKey: () => "sk-cp-test-only",
+    fetchImpl: async () =>
+      jsonResponse(
+        responseBody([
+          {
+            activityId: "activity-1",
+            category: "podcast",
+            confidence: 0.9,
+            reason: "Unsupported category.",
+            evidenceSegmentIds: ["activity-1-segment-1"],
+          },
+        ])
+      ),
+  });
+  await assert.rejects(
+    () => invalid.classify(classifierInput([sourceActivity()])),
+    (error) =>
+      error instanceof ActivityClassificationClientError && error.code === "invalid_structure"
+  );
 });
 
 test("marks transient MiniMax failures retryable so the caller can fall back locally", async () => {

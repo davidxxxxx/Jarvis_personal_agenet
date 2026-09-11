@@ -1,13 +1,32 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, BrainCircuit, Lightbulb } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { JarvisKnowledgeOverview } from "../types";
+import type { JarvisKnowledgeDismissReason, JarvisKnowledgeOverview } from "../types";
 import EvidenceLink from "./EvidenceLink";
+import {
+  createKnowledgeActionId,
+  IgnoreReasonDialog,
+  TodoComposerDialog,
+} from "./KnowledgeActionDialogs";
+
+type Suggestion = JarvisKnowledgeOverview["suggestions"][number];
 
 export default function KnowledgeMemoryPanel() {
   const { t } = useTranslation();
   const [overview, setOverview] = useState<JarvisKnowledgeOverview | null>(null);
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState(false);
+  const [suggestionComposer, setSuggestionComposer] = useState<{
+    suggestion: Suggestion;
+    commandId: string;
+    todoId: string;
+  } | null>(null);
+  const [ignoreTarget, setIgnoreTarget] = useState<{
+    suggestion: Suggestion;
+    commandId: string;
+  } | null>(null);
   const generation = useRef(0);
 
   const load = useCallback(async () => {
@@ -31,33 +50,60 @@ export default function KnowledgeMemoryPanel() {
     };
   }, [load]);
 
-  const decide = async (suggestionId: string, action: "accept" | "dismiss") => {
+  const startSuggestionDecision = (suggestion: Suggestion, action: "accept" | "dismiss") => {
     if (busyId) return;
-    setBusyId(suggestionId);
+    if (action === "accept") {
+      setSuggestionComposer({
+        suggestion,
+        commandId: createKnowledgeActionId("command"),
+        todoId: createKnowledgeActionId("todo"),
+      });
+      return;
+    }
+    setIgnoreTarget({
+      suggestion,
+      commandId: createKnowledgeActionId("command"),
+    });
+  };
+
+  const acceptSuggestion = async (value: { title: string; dueText: string | null }) => {
+    if (!suggestionComposer || busyId) return;
+    setBusyId(suggestionComposer.suggestion.id);
     try {
-      const result = await window.electronAPI.jarvis.decideKnowledgeSuggestion(
-        suggestionId,
-        action
-      );
-      setOverview((current) =>
-        current
-          ? {
-              ...current,
-              suggestions: current.suggestions.map((item) =>
-                item.id === suggestionId
-                  ? {
-                      ...item,
-                      state: action === "accept" ? "accepted" : "dismissed",
-                      decidedAt: result.decidedAt,
-                    }
-                  : item
-              ),
-            }
-          : current
-      );
+      await window.electronAPI.jarvis.applyKnowledgeAction({
+        commandId: suggestionComposer.commandId,
+        type: "suggestion_accept",
+        suggestionId: suggestionComposer.suggestion.id,
+        todoId: suggestionComposer.todoId,
+        ...value,
+      });
+      setSuggestionComposer(null);
+      await load();
       setError(false);
-    } catch {
+    } catch (caught) {
       setError(true);
+      throw caught;
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const dismissSuggestion = async (reasonCode: JarvisKnowledgeDismissReason) => {
+    if (!ignoreTarget || busyId) return;
+    setBusyId(ignoreTarget.suggestion.id);
+    try {
+      await window.electronAPI.jarvis.applyKnowledgeAction({
+        commandId: ignoreTarget.commandId,
+        type: "suggestion_dismiss",
+        suggestionId: ignoreTarget.suggestion.id,
+        reasonCode,
+      });
+      setIgnoreTarget(null);
+      await load();
+      setError(false);
+    } catch (caught) {
+      setError(true);
+      throw caught;
     } finally {
       setBusyId(null);
     }
@@ -99,93 +145,194 @@ export default function KnowledgeMemoryPanel() {
     }
   };
 
-  if (!overview && !error) return null;
+  const proposedSuggestions =
+    overview?.suggestions.filter((item) => item.state === "proposed") ?? [];
+  const openConflicts = overview?.conflicts.filter((item) => item.state === "open") ?? [];
+  const selectedMemory =
+    overview?.memories.find((memory) => memory.id === selectedMemoryId) ?? null;
+  const selectedEvidence = useMemo(
+    () => selectedMemory?.occurrences.flatMap((occurrence) => occurrence.evidence) ?? [],
+    [selectedMemory]
+  );
+  const visibleMemories = showAll
+    ? (overview?.memories ?? [])
+    : (overview?.memories.slice(0, 6) ?? []);
+
+  if (!overview && !error) {
+    return <p className="text-sm text-muted-foreground">正在读取长期记忆…</p>;
+  }
+
   return (
-    <section className="mb-6 rounded-xl border border-border/50 bg-card/70 p-4">
-      <h2 className="text-lg font-semibold">
-        {t("jarvis.knowledge.longTerm", { defaultValue: "Long-term memory / 长期记忆" })}
-      </h2>
+    <section aria-labelledby="long-term-memory-title">
+      <header className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="long-term-memory-title" className="text-lg font-semibold">
+            长期记忆
+          </h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            系统从多次对话中保留下来的事实、决定和偏好。点击一条后再查看原始依据。
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2 text-xs">
+          <span className="rounded-full bg-muted px-2.5 py-1">
+            {overview?.memories.length ?? 0} 条记忆
+          </span>
+          <span className="rounded-full bg-amber-100 px-2.5 py-1 text-amber-800">
+            {proposedSuggestions.length} 条建议
+          </span>
+        </div>
+      </header>
+
       {error && (
-        <p role="alert" className="mt-3 text-sm text-destructive">
+        <p role="alert" className="mt-3 rounded-lg bg-destructive/10 p-3 text-sm text-destructive">
           {t("jarvis.knowledge.loadFailed", {
             defaultValue: "Could not load saved knowledge / 读取失败",
           })}
         </p>
       )}
-      <div className="mt-4 grid gap-3 md:grid-cols-2">
-        {overview?.memories.map((memory) => (
-          <article key={memory.id} className="rounded-lg bg-muted/30 p-3">
-            <div className="flex justify-between gap-2">
-              <h3 className="text-sm font-medium">{memory.title}</h3>
-              <span className="text-[10px] text-muted-foreground">{memory.lifecycle}</span>
-            </div>
-            <p className="mt-1 text-sm text-muted-foreground">{memory.body}</p>
-            {memory.occurrences
-              .flatMap((occurrence) => occurrence.evidence)
-              .map((evidence) => (
-                <div
-                  key={evidence.handle?.evidenceId ?? evidence.segmentId}
-                  className="mt-2 text-xs"
-                >
-                  <EvidenceLink
-                    handle={evidence.handle}
-                    quote={evidence.quote}
-                    startedAt={evidence.startedAt}
-                    audioState={evidence.audioState}
-                  />
+
+      {!overview?.memories.length && !error ? (
+        <div className="mt-5 rounded-xl border border-dashed border-border p-8 text-center">
+          <BrainCircuit className="mx-auto size-8 text-muted-foreground" aria-hidden="true" />
+          <p className="mt-3 font-medium">还没有长期记忆</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            当同一事实、决定或偏好在可靠场景中出现后，系统会逐步保存到这里。
+          </p>
+        </div>
+      ) : (
+        <div className="mt-5 grid items-start gap-4 lg:grid-cols-[minmax(300px,0.9fr)_minmax(0,1.1fr)]">
+          <div className="space-y-2">
+            {visibleMemories.map((memory) => (
+              <button
+                type="button"
+                key={memory.id}
+                aria-label={`查看长期记忆 ${memory.title}`}
+                onClick={() => setSelectedMemoryId(memory.id)}
+                className={`w-full rounded-xl border bg-card p-4 text-left ${
+                  selectedMemoryId === memory.id
+                    ? "border-primary/40"
+                    : "border-border/50 hover:border-border"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="text-sm font-medium">{memory.title}</h3>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    {memory.lifecycle}
+                  </span>
                 </div>
-              ))}
-          </article>
-        ))}
-      </div>
-      {overview?.suggestions.some((item) => item.state === "proposed") && (
-        <div className="mt-5">
-          <h3 className="text-sm font-semibold">Suggestions / 建议</h3>
-          {overview.suggestions
-            .filter((item) => item.state === "proposed")
-            .map((suggestion) => (
-              <article key={suggestion.id} className="mt-2 rounded-lg border border-border/50 p-3">
+                <p className="mt-1 line-clamp-2 text-sm leading-5 text-muted-foreground">
+                  {memory.body}
+                </p>
+                <p className="mt-2 text-[11px] text-muted-foreground">
+                  {memory.occurrences.length} 次相关记录
+                </p>
+              </button>
+            ))}
+            {(overview?.memories.length ?? 0) > 6 && (
+              <button
+                type="button"
+                onClick={() => setShowAll((current) => !current)}
+                className="w-full rounded-lg border border-border px-3 py-2 text-sm text-muted-foreground hover:text-foreground"
+              >
+                {showAll ? "收起" : `显示全部 ${overview?.memories.length ?? 0} 条`}
+              </button>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-border/50 bg-card p-5 lg:sticky lg:top-0">
+            {selectedMemory ? (
+              <>
+                <p className="text-xs font-medium text-primary">记忆详情</p>
+                <h3 className="mt-1 text-lg font-semibold">{selectedMemory.title}</h3>
+                <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
+                  {selectedMemory.body}
+                </p>
+                <details className="mt-5 rounded-lg border border-border/50 p-3">
+                  <summary className="cursor-pointer text-sm font-medium">
+                    查看来源证据（{selectedEvidence.length}）
+                  </summary>
+                  <div className="mt-3 space-y-2">
+                    {selectedEvidence.map((evidence) => (
+                      <EvidenceLink
+                        key={evidence.handle?.evidenceId ?? evidence.segmentId}
+                        handle={evidence.handle}
+                        quote={evidence.quote}
+                        startedAt={evidence.startedAt}
+                        audioState={evidence.audioState}
+                      />
+                    ))}
+                  </div>
+                </details>
+              </>
+            ) : (
+              <div className="py-12 text-center">
+                <BrainCircuit className="mx-auto size-8 text-muted-foreground" aria-hidden="true" />
+                <p className="mt-3 font-medium">选择一条长期记忆</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  原始转写和音频证据默认收起，不会再全部铺开。
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {proposedSuggestions.length > 0 && (
+        <details className="mt-5 rounded-xl border border-border/50 bg-card p-4">
+          <summary className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
+            <Lightbulb className="size-4 text-amber-600" aria-hidden="true" />
+            候选建议（{proposedSuggestions.length}）
+          </summary>
+          <p className="mt-2 text-xs text-muted-foreground">
+            建议不会自动成为待办，也不会通过系统弹窗打扰你。
+          </p>
+          <div className="mt-3 space-y-2">
+            {proposedSuggestions.map((suggestion) => (
+              <article key={suggestion.id} className="rounded-lg border border-border/50 p-3">
                 <p className="text-sm font-medium">{suggestion.title}</p>
                 <p className="mt-1 text-xs text-muted-foreground">{suggestion.rationale}</p>
-                <div className="mt-2 flex gap-2">
+                <div className="mt-3 flex gap-2 text-xs">
                   <button
                     type="button"
                     disabled={busyId !== null}
-                    onClick={() => void decide(suggestion.id, "accept")}
+                    onClick={() => startSuggestionDecision(suggestion, "accept")}
+                    className="rounded-lg bg-primary px-3 py-1.5 text-primary-foreground disabled:opacity-50"
                   >
                     Accept / 接受
                   </button>
                   <button
                     type="button"
                     disabled={busyId !== null}
-                    onClick={() => void decide(suggestion.id, "dismiss")}
+                    onClick={() => startSuggestionDecision(suggestion, "dismiss")}
+                    className="rounded-lg border border-border px-3 py-1.5 disabled:opacity-50"
                   >
                     Dismiss / 忽略
                   </button>
                 </div>
               </article>
             ))}
-        </div>
+          </div>
+        </details>
       )}
-      {overview?.conflicts.some((item) => item.state === "open") && (
-        <div className="mt-5">
-          <h3 className="text-sm font-semibold">Conflicts / 待确认冲突</h3>
-          {overview.conflicts
-            .filter((item) => item.state === "open")
-            .map((conflict) => (
-              <div key={conflict.id} className="mt-2 space-y-2">
+
+      {openConflicts.length > 0 && (
+        <details className="mt-3 rounded-xl border border-amber-300/60 bg-amber-50/50 p-4">
+          <summary className="flex cursor-pointer items-center gap-2 text-sm font-semibold">
+            <AlertTriangle className="size-4 text-amber-700" aria-hidden="true" />
+            待确认冲突（{openConflicts.length}）
+          </summary>
+          <div className="mt-3 space-y-4">
+            {openConflicts.map((conflict) => (
+              <div key={conflict.id} className="space-y-2">
                 {conflict.members.map((member) => (
-                  <article
-                    key={member.memoryItemId}
-                    className="rounded-lg border border-border/50 p-3"
-                  >
+                  <article key={member.memoryItemId} className="rounded-lg bg-background p-3">
                     <p className="text-sm font-medium">{member.title}</p>
                     <p className="mt-1 text-xs text-muted-foreground">{member.body}</p>
                     <button
                       type="button"
                       disabled={busyId !== null}
                       onClick={() => void resolve(conflict.id, member.memoryItemId)}
-                      className="mt-2 text-xs"
+                      className="mt-2 rounded-lg border border-border px-3 py-1.5 text-xs disabled:opacity-50"
                     >
                       Choose / 选择这一项
                     </button>
@@ -193,7 +340,26 @@ export default function KnowledgeMemoryPanel() {
                 ))}
               </div>
             ))}
-        </div>
+          </div>
+        </details>
+      )}
+      {suggestionComposer && (
+        <TodoComposerDialog
+          heading="接受候选建议"
+          description="确认标题和日期后，建议才会通过统一行动生命周期转为正式待办。"
+          confirmLabel="创建待办"
+          initialTitle={suggestionComposer.suggestion.title}
+          onCancel={() => setSuggestionComposer(null)}
+          onConfirm={acceptSuggestion}
+        />
+      )}
+      {ignoreTarget && (
+        <IgnoreReasonDialog
+          entityTitle={ignoreTarget.suggestion.title}
+          allowLocalNote={false}
+          onCancel={() => setIgnoreTarget(null)}
+          onConfirm={(reasonCode) => dismissSuggestion(reasonCode)}
+        />
       )}
     </section>
   );

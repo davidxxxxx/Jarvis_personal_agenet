@@ -24,6 +24,7 @@ const {
   dialog,
   ipcMain,
   net,
+  Notification,
   session,
   systemPreferences,
 } = require("electron");
@@ -306,6 +307,8 @@ const VoiceEnrollmentService = require("./src/jarvis/main/VoiceEnrollmentService
 const VoiceProfileStore = require("./src/jarvis/main/VoiceProfileStore");
 const VoiceSpeechDurationMeasurer = require("./src/jarvis/main/VoiceSpeechDurationMeasurer");
 const VoiceEmbeddingCipher = require("./src/jarvis/main/VoiceEmbeddingCipher");
+const HistoricalSelfVoiceRecoveryService = require("./src/jarvis/main/HistoricalSelfVoiceRecoveryService");
+const ParticipantReviewBackfillService = require("./src/jarvis/main/ParticipantReviewBackfillService");
 const secretCrypto = require("./src/helpers/secretCrypto");
 const {
   DataRootConfig,
@@ -333,19 +336,22 @@ const {
   RendererShutdownHandshake,
 } = require("./src/jarvis/main/GracefulShutdownCoordinator");
 const { createJarvisProcessingRuntime } = require("./src/jarvis/main/JarvisProcessingRuntime");
+const { installBundledAiModelPackIfPresent } = require("./src/jarvis/main/AiModelPackInstaller");
 const { resolveJarvisWhisperModel } = require("./src/jarvis/main/JarvisWhisperModel");
 const { createJarvisOwnedPidsProvider } = require("./src/jarvis/main/JarvisProcessOwnership");
 const { createWindowsForegroundActivityProvider } = require("./src/jarvis/main/ResourceGovernor");
 const { resolveFullscreenYieldActive } = require("./src/jarvis/main/FullscreenYieldPolicy");
 const ApplicationAudioCapturePool = require("./src/jarvis/main/ApplicationAudioCapturePool");
-const ApplicationAudioLifecycleCoordinator = require(
-  "./src/jarvis/main/ApplicationAudioLifecycleCoordinator"
-);
+const ApplicationAudioLifecycleCoordinator = require("./src/jarvis/main/ApplicationAudioLifecycleCoordinator");
 const {
   JarvisProcessingLifecycle,
   createJarvisRuntimeMigrationParticipant,
 } = require("./src/jarvis/main/JarvisProcessingLifecycle");
 const JarvisPowerLifecycle = require("./src/jarvis/main/JarvisPowerLifecycle");
+const JarvisNotificationScheduler = require("./src/jarvis/main/JarvisNotificationScheduler");
+const MiniMaxModelDiscovery = require("./src/jarvis/main/MiniMaxModelDiscovery");
+const { DEFAULT_JARVIS_ROLLOUT_FLAGS } = require("./src/jarvis/main/JarvisRolloutFlags");
+const { createElectronNotificationDelivery } = JarvisNotificationScheduler;
 const { RendererPowerResumeHandshake } = JarvisPowerLifecycle;
 
 // Manager instances - initialized after app.whenReady()
@@ -392,7 +398,10 @@ let rendererShutdownHandshake = null;
 let jarvisPowerLifecycle = null;
 let rendererPowerResumeHandshake = null;
 let jarvisLocalDateTimer = null;
+let participantReviewBackfillService = null;
+let participantReviewBackfillTimer = null;
 let applicationAudioLifecycleCoordinator = null;
+let jarvisNotificationScheduler = null;
 const foregroundActivityProvider = createWindowsForegroundActivityProvider();
 const jarvisOwnedPidsProvider = createJarvisOwnedPidsProvider({
   mainPid: process.pid,
@@ -408,14 +417,86 @@ function resolveConfiguredJarvisWhisperModel() {
   });
 }
 
+const PARTICIPANT_REVIEW_BACKFILL_LIMIT = 4;
+const PARTICIPANT_REVIEW_BACKFILL_RETRY_MS = 60_000;
+const SAFE_JARVIS_REPOSITORY_LOG_PHASES = new Set(["activity_correction_participant_refresh"]);
+const SAFE_JARVIS_REPOSITORY_ERROR_CODES = new Set([
+  "PARTICIPANT_SNAPSHOT_REFRESH_FAILED",
+  "SQLITE_BUSY",
+  "SQLITE_CONSTRAINT",
+  "SQLITE_CONSTRAINT_TRIGGER",
+  "SQLITE_CORRUPT",
+  "SQLITE_FULL",
+  "SQLITE_IOERR",
+  "SQLITE_LOCKED",
+  "SQLITE_NOTADB",
+  "SQLITE_READONLY",
+]);
+
+function safeJarvisRepositoryLogToken(value, allowlist, fallback) {
+  return typeof value === "string" && allowlist.has(value) ? value : fallback;
+}
+
+function createSafeJarvisRepositoryLogRecord({ phase, errorCode } = {}) {
+  return {
+    phase: safeJarvisRepositoryLogToken(
+      phase,
+      SAFE_JARVIS_REPOSITORY_LOG_PHASES,
+      "repository_deferred"
+    ),
+    errorCode: safeJarvisRepositoryLogToken(
+      errorCode,
+      SAFE_JARVIS_REPOSITORY_ERROR_CODES,
+      "PARTICIPANT_SNAPSHOT_REFRESH_FAILED"
+    ),
+  };
+}
+
+function scheduleParticipantReviewBackfill(scope = "recent_audio", delayMs = 15_000) {
+  if (participantReviewBackfillTimer || !participantReviewBackfillService) return;
+  participantReviewBackfillTimer = setTimeout(() => {
+    participantReviewBackfillTimer = null;
+    const state = jarvisService?.getState?.();
+    if (state?.status && state.status !== "idle") {
+      scheduleParticipantReviewBackfill(scope, PARTICIPANT_REVIEW_BACKFILL_RETRY_MS);
+      return;
+    }
+    void participantReviewBackfillService
+      .runOnce({ scope })
+      .then((result) => {
+        debugLogger?.info("Jarvis participant review backfill", result, "jarvis");
+        if (result.state !== "completed") return;
+        if (result.inspected >= PARTICIPANT_REVIEW_BACKFILL_LIMIT) {
+          scheduleParticipantReviewBackfill(scope, PARTICIPANT_REVIEW_BACKFILL_RETRY_MS);
+        } else if (scope === "recent_audio") {
+          scheduleParticipantReviewBackfill(
+            "metadata_cleanup",
+            PARTICIPANT_REVIEW_BACKFILL_RETRY_MS
+          );
+        }
+      })
+      .catch((error) => {
+        debugLogger?.warn(
+          "Jarvis participant review backfill failed",
+          { error: error?.message ?? String(error) },
+          "jarvis"
+        );
+      });
+  }, delayMs);
+  participantReviewBackfillTimer.unref?.();
+}
+
 function buildJarvisProcessingRuntime() {
   const model = resolveConfiguredJarvisWhisperModel();
+  const rolloutFlags =
+    environmentManager?.getJarvisRolloutFlags?.() ?? DEFAULT_JARVIS_ROLLOUT_FLAGS;
   return createJarvisProcessingRuntime({
     repository: jarvisRepository,
     service: jarvisService,
     ipcHandlers,
     model,
     resourceSettings: environmentManager?.getJarvisResourceSettings?.(),
+    dualSpeakerVerificationEnabled: rolloutFlags.dualSpeakerVerificationV1,
     foregroundActivityProvider,
     ownedPidsProvider: jarvisOwnedPidsProvider,
     onResourceSnapshot: async (snapshot) => {
@@ -425,6 +506,7 @@ function buildJarvisProcessingRuntime() {
       );
       windowManager?.setFullscreenYieldActive(jarvisFullscreenYieldActive);
       await ipcHandlers?.setJarvisFullscreenYield(jarvisFullscreenYieldActive);
+      jarvisNotificationScheduler?.wake();
     },
     cloudCompositionFactory: ({ repository, governor, previewScheduler, owner, now }) =>
       createProductionAgentCloudComposition({
@@ -434,15 +516,24 @@ function buildJarvisProcessingRuntime() {
         fetchImpl: (url, options) => net.fetch(url, options),
         governor,
         previewScheduler,
+        calendarEventsProvider: ({ startedAt, endedAt }) =>
+          databaseManager?.getCalendarEventsOverlapping?.(startedAt, endedAt) ?? [],
         timezoneProvider: () => Intl.DateTimeFormat().resolvedOptions().timeZone,
+        activityClassificationEnabled: rolloutFlags.activityClassificationV1,
         owner,
         now,
         log: (entry) => debugLogger?.info("Jarvis agent cloud", entry, "jarvis"),
       }),
-    log: ({ phase, sessionId, error }) =>
+    log: ({ phase, sessionId, jobId, jobType, error }) =>
       debugLogger?.warn(
         "Jarvis background processing failed",
-        { phase, sessionId: sessionId ?? null, error: error?.message ?? String(error) },
+        {
+          phase,
+          sessionId: sessionId ?? null,
+          jobId: jobId ?? null,
+          jobType: jobType ?? null,
+          error: error?.message ?? String(error),
+        },
         "jarvis"
       ),
   });
@@ -590,6 +681,27 @@ async function initializeCoreManagers() {
     validateRedactedCloudPayload: (input) =>
       jarvisAnalysisInputBuilder.verifyRedactedCloudPayload(input),
     embeddingCipher: voiceEmbeddingCipher,
+    log: (entry) =>
+      debugLogger?.warn(
+        "Jarvis repository deferred maintenance",
+        createSafeJarvisRepositoryLogRecord(entry),
+        "jarvis"
+      ),
+  });
+  participantReviewBackfillService = new ParticipantReviewBackfillService({
+    repository: jarvisRepository,
+    limit: PARTICIPANT_REVIEW_BACKFILL_LIMIT,
+    log: ({ phase, batchId, sessionId, error }) =>
+      debugLogger?.warn(
+        "Jarvis participant review backfill session failed",
+        {
+          phase,
+          batchId,
+          sessionId,
+          error: error?.message ?? String(error),
+        },
+        "jarvis"
+      ),
   });
   const speakerCorrectionService = new SpeakerCorrectionService({
     repository: jarvisRepository,
@@ -606,6 +718,9 @@ async function initializeCoreManagers() {
     recordingsRoot,
     log: (message, details) => debugLogger.info(message, details, "jarvis"),
   });
+  // The one-time historical SELF recovery runs before the window/runtime managers
+  // are created, so VAD model resolution must already be available here.
+  diarizationManager = new DiarizationManager();
   speechVadClassifier = new SpeechVadClassifier({
     getModelPath: () => diarizationManager?.getVadModelPath?.() ?? null,
   });
@@ -673,6 +788,47 @@ async function initializeCoreManagers() {
     temporaryEvidenceCleaner: jarvisService.audioEvidenceReader,
     log: (counts) => debugLogger.info("Jarvis audio retention cleanup", counts, "jarvis"),
   });
+  jarvisNotificationScheduler = new JarvisNotificationScheduler({
+    repository: jarvisRepository,
+    notify: createElectronNotificationDelivery({
+      Notification,
+      onClick: () => {
+        const existing = windowManager?.controlPanelWindow;
+        if (isLiveWindow(existing)) {
+          if (existing.isMinimized()) existing.restore();
+          existing.show();
+          existing.focus();
+          return;
+        }
+        return windowManager?.createControlPanelWindow?.();
+      },
+    }),
+    contextProvider: async () => {
+      const governor = jarvisProcessingLifecycle.runtime?.governor ?? null;
+      let snapshot = governor?.latestSnapshot ?? null;
+      const sampledAt = snapshot?.sampledAt;
+      if (!snapshot || !Number.isSafeInteger(sampledAt) || Date.now() - sampledAt > 60_000) {
+        snapshot = (await governor?.sample?.()) ?? null;
+      }
+      if (!snapshot) {
+        const error = new Error("Notification focus context is unavailable");
+        error.code = "JARVIS_NOTIFICATION_CONTEXT_UNAVAILABLE";
+        throw error;
+      }
+      const foregroundProcess = String(snapshot?.foregroundActivityProcessName ?? "").toLowerCase();
+      const presentationActive =
+        snapshot?.fullscreenActivityActive === true &&
+        /^(powerpnt|keynote|soffice|libreoffice|wps|wpp)$/u.test(foregroundProcess);
+      return {
+        fullscreenGame: jarvisFullscreenYieldActive && !presentationActive,
+        presentationActive,
+        meetingActive:
+          meetingDetectionEngine?.isMeetingModeActive?.() === true ||
+          Boolean(googleCalendarManager?.getActiveMeetingState?.()?.activeMeeting),
+      };
+    },
+    log: (entry) => debugLogger?.warn("Jarvis restrained notification", entry, "jarvis"),
+  });
   const reconfigureStorageHolders = async (root) => {
     const currentLeaseRoot = jarvisDataRootLease ? path.dirname(jarvisDataRootLease.path) : null;
     const nextLease =
@@ -708,12 +864,16 @@ async function initializeCoreManagers() {
       prepareStorageMigration: () => jarvisService.prepareStorageMigration(),
       stopRetention: () => retentionCleaner.stop(),
       quiesceAnalysis: () => jarvisAnalysisScheduler.quiesce(),
-      checkpointAndCloseRepository: () => {
+      checkpointAndCloseRepository: async () => {
+        await jarvisNotificationScheduler?.stop();
         jarvisRepository.checkpointForMigration();
         jarvisRepository.close();
       },
       reconfigureStorageHolders,
-      resumeAnalysis: () => jarvisAnalysisScheduler.resume(),
+      resumeAnalysis: () => {
+        jarvisAnalysisScheduler.resume();
+        jarvisNotificationScheduler?.start();
+      },
       startRetention: () => retentionCleaner.start(),
     })
   );
@@ -733,22 +893,55 @@ async function initializeCoreManagers() {
   voiceProfileStore.importLegacySelfProfileSafely((details) =>
     debugLogger.warn("Jarvis skipped an invalid legacy voice profile", details, "jarvis")
   );
-  const {
-    SpeakerEmbeddings,
-    SPEAKER_MODEL_KEYS,
-  } = require("./src/helpers/speakerEmbeddings");
+  const { SpeakerEmbeddings, SPEAKER_MODEL_KEYS } = require("./src/helpers/speakerEmbeddings");
+  const primarySpeakerEmbeddings = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
+  });
+  const reviewSpeakerEmbeddings = new SpeakerEmbeddings({
+    modelKey: SPEAKER_MODEL_KEYS.REVIEW,
+  });
+  const voiceSpeechDurationMeasurer = new VoiceSpeechDurationMeasurer({
+    classifier: speechVadClassifier,
+  });
   voiceEnrollmentService = new VoiceEnrollmentService({
-    primarySpeakerEmbeddings: new SpeakerEmbeddings({
-      modelKey: SPEAKER_MODEL_KEYS.PRIMARY,
-    }),
-    reviewSpeakerEmbeddings: new SpeakerEmbeddings({
-      modelKey: SPEAKER_MODEL_KEYS.REVIEW,
-    }),
-    speechDurationMeasurer: new VoiceSpeechDurationMeasurer({
-      classifier: speechVadClassifier,
-    }),
+    primarySpeakerEmbeddings,
+    reviewSpeakerEmbeddings,
+    speechDurationMeasurer: voiceSpeechDurationMeasurer,
     voiceProfileStore,
   });
+  const historicalRecoveryArgument = process.argv.find((argument) =>
+    argument.startsWith("--recover-self-turn-groups=")
+  );
+  if (historicalRecoveryArgument) {
+    const serializedGroups = historicalRecoveryArgument.slice("--recover-self-turn-groups=".length);
+    const turnGroups = serializedGroups.split("|").map((group) => group.split("+").filter(Boolean));
+    const recoveryService = new HistoricalSelfVoiceRecoveryService({
+      repository: jarvisRepository,
+      audioEvidenceReader: jarvisService.audioEvidenceReader,
+      primarySpeakerEmbeddings,
+      reviewSpeakerEmbeddings,
+      speechDurationMeasurer: voiceSpeechDurationMeasurer,
+      voiceProfileStore,
+    });
+    try {
+      const recovery = await recoveryService.recover({ turnGroups });
+      debugLogger.info(
+        "Jarvis historical SELF voice recovery completed",
+        {
+          status: recovery.status,
+          acceptedSpeechMs: recovery.acceptedSpeechMs ?? 0,
+          selfConsistency: recovery.selfConsistency ?? null,
+        },
+        "jarvis"
+      );
+    } catch (error) {
+      debugLogger.error(
+        "Jarvis historical SELF voice recovery failed",
+        { error: error?.message ?? String(error) },
+        "jarvis"
+      );
+    }
+  }
   environmentManager = new EnvironmentManager();
   jarvisAnalysisScheduler = {
     analyzeSession(sessionId, kind, options) {
@@ -853,15 +1046,12 @@ async function initializeCoreManagers() {
     service: jarvisService,
     processingLifecycle: jarvisProcessingLifecycle,
     releaseWhisper: async () => whisperManager?.stopServer(),
-    suspendUpstream: (captureState) =>
-      applicationAudioLifecycleCoordinator.suspend(captureState),
+    suspendUpstream: (captureState) => applicationAudioLifecycleCoordinator.suspend(captureState),
     resumeDevices: (token) => rendererPowerResumeHandshake.request("enumerate", token),
-    resumeUpstream: (resumeToken) =>
-      applicationAudioLifecycleCoordinator.resume(resumeToken),
+    resumeUpstream: (resumeToken) => applicationAudioLifecycleCoordinator.resume(resumeToken),
     rebindPcmSession: (previousSessionId, nextSessionId, phase) =>
       ipcHandlers.rebindJarvisSession(previousSessionId, nextSessionId, phase),
-    rotateUpstream: (rotation) =>
-      applicationAudioLifecycleCoordinator.rotate(rotation),
+    rotateUpstream: (rotation) => applicationAudioLifecycleCoordinator.rotate(rotation),
     ensureGpuReady: async () => {
       await new Promise((resolve) => setTimeout(resolve, WHISPER_WAKE_REWARM_DELAY_MS));
       await whisperManager?.onWakeFromSleep();
@@ -913,25 +1103,27 @@ async function initializeCoreManagers() {
         const settings = environmentManager.getApplicationAudioSettings();
         return {
           ...settings,
-          runtime:
-            applicationAudioCapturePool?.getStatus?.() ?? {
-              running: false,
-              configuredLimit: settings.trackLimit,
-              effectiveLimit: jarvisFullscreenYieldActive
-                ? Math.min(settings.trackLimit, 2)
-                : settings.trackLimit,
-              fullscreen: jarvisFullscreenYieldActive,
-              activeTracks: [],
-              fallbacks: [],
-            },
+          runtime: applicationAudioCapturePool?.getStatus?.() ?? {
+            running: false,
+            configuredLimit: settings.trackLimit,
+            effectiveLimit: jarvisFullscreenYieldActive
+              ? Math.min(settings.trackLimit, 2)
+              : settings.trackLimit,
+            fullscreen: jarvisFullscreenYieldActive,
+            activeTracks: [],
+            fallbacks: [],
+          },
         };
       },
       setPolicy: async (input) => {
+        const previous = environmentManager.getApplicationAudioSettings();
         const saved = await environmentManager.saveApplicationAudioSettings(input);
         const pool = applicationAudioCapturePool;
-        if (pool) {
+        const captureSettingsChanged =
+          previous.enabled !== saved.enabled || previous.trackLimit !== saved.trackLimit;
+        if (pool && captureSettingsChanged) {
           if (!saved.enabled) {
-            await pool.stop();
+            if (previous.enabled) await pool.stop();
           } else {
             await pool.setConfiguredLimit(saved.trackLimit);
             const capture = jarvisService.getState();
@@ -950,21 +1142,26 @@ async function initializeCoreManagers() {
         }
         return {
           ...saved,
-          runtime:
-            pool?.getStatus?.() ?? {
-              running: false,
-              configuredLimit: saved.trackLimit,
-              effectiveLimit: jarvisFullscreenYieldActive
-                ? Math.min(saved.trackLimit, 2)
-                : saved.trackLimit,
-              fullscreen: jarvisFullscreenYieldActive,
-              activeTracks: [],
-              fallbacks: [],
-            },
+          runtime: pool?.getStatus?.() ?? {
+            running: false,
+            configuredLimit: saved.trackLimit,
+            effectiveLimit: jarvisFullscreenYieldActive
+              ? Math.min(saved.trackLimit, 2)
+              : saved.trackLimit,
+            fullscreen: jarvisFullscreenYieldActive,
+            activeTracks: [],
+            fallbacks: [],
+          },
         };
       },
     },
+    rolloutFlags: environmentManager.getJarvisRolloutFlags(),
+    miniMaxModelDiscovery: new MiniMaxModelDiscovery({
+      fetchImpl: (url, options) => net.fetch(url, options),
+      getApiKey: () => environmentManager.getMiniMaxKey(),
+    }),
     dailyDigestScheduler: jarvisDailyDigestScheduler,
+    notificationScheduler: jarvisNotificationScheduler,
     audioEvidenceReader: jarvisService.audioEvidenceReader,
     storageManager: jarvisStorageManager,
     pickStorageDirectory: async () => {
@@ -975,6 +1172,7 @@ async function initializeCoreManagers() {
       return result.canceled ? null : (result.filePaths[0] ?? null);
     },
     processingLifecycle: jarvisProcessingLifecycle,
+    log: (entry) => debugLogger?.warn("Jarvis IPC deferred work", entry, "jarvis"),
   });
 
   const uiLanguage = environmentManager.getUiLanguage();
@@ -1037,7 +1235,6 @@ async function initializeCoreManagers() {
     );
   }
   parakeetManager = new ParakeetManager();
-  diarizationManager = new DiarizationManager();
   speechVadClassifier.startRecovery({
     onRecovered: () => jarvisService?.reportVadRecovered(Date.now()),
   });
@@ -1086,6 +1283,7 @@ async function initializeCoreManagers() {
       jarvisService.stopApplicationAudioTrack({
         ...event,
         state:
+          event.failureCode ||
           event.reason === "evidence_delivery_failed" ||
           event.reason === "evidence_registration_failed"
             ? "failed"
@@ -1109,7 +1307,10 @@ async function initializeCoreManagers() {
     onError: (error) => {
       debugLogger?.warn(
         "Application audio capture degraded to mixed system evidence",
-        { code: error?.code ?? "application_capture_unavailable" },
+        {
+          code: error?.code ?? "application_capture_unavailable",
+          failureCode: error?.failureCode ?? null,
+        },
         "meeting"
       );
     },
@@ -1482,7 +1683,36 @@ async function startApp() {
   // Phase 1: Core managers + IPC handlers before windows
   await initializeCoreManagers();
   await environmentManager.init();
-  startJarvisProcessingRuntime();
+  try {
+    const modelPack = await installBundledAiModelPackIfPresent();
+    if (modelPack.state !== "not_bundled") {
+      debugLogger?.info(
+        "Jarvis offline AI model component ready",
+        {
+          state: modelPack.state,
+          packVersion: modelPack.packVersion,
+          manifestSha256: modelPack.manifestSha256,
+        },
+        "jarvis"
+      );
+    }
+  } catch (error) {
+    debugLogger?.warn(
+      "Jarvis offline AI model component installation failed; legacy local processing remains available",
+      { code: error?.code ?? null, error: error?.message ?? String(error) },
+      "jarvis"
+    );
+  }
+  const processingRuntime = startJarvisProcessingRuntime();
+  const historicalSpeakerReadiness = jarvisRepository.reconcileHistoricalSpeakerReadiness(
+    Date.now(),
+    { diarizationPolicy: processingRuntime.diarizationPolicy }
+  );
+  debugLogger.info(
+    "Jarvis historical speaker readiness reconciliation",
+    historicalSpeakerReadiness,
+    "jarvis"
+  );
   registerSidecars();
   startAuthBridgeServer();
 
@@ -1560,6 +1790,10 @@ async function startApp() {
   if (!startMinimized) {
     await windowManager.createControlPanelWindow();
   }
+
+  // Historical participant snapshots are local-only and deliberately trickled
+  // after the first visible window. Active recording always takes priority.
+  scheduleParticipantReviewBackfill();
 
   // Retention can touch hundreds of files; begin only after the first user-visible windows exist.
   retentionCleaner.start();
@@ -1651,6 +1885,7 @@ async function startApp() {
 
   // Phase 2: Initialize remaining managers after windows are visible
   initializeDeferredManagers();
+  jarvisNotificationScheduler.start();
 
   if (whisperCudaManager && whisperCudaVerifier) {
     const { detectNvidiaGpu, listNvidiaGpus } = require("./src/utils/gpuDetection");
@@ -2399,14 +2634,26 @@ function performGracefulTeardown() {
       () => sidecarRegistry.shutdownAll(),
     ],
     stopRuntime: [
+      async () => {
+        const scheduler = jarvisNotificationScheduler;
+        jarvisNotificationScheduler = null;
+        await scheduler?.stop();
+      },
       stopJarvisProcessingRuntime,
       () => {
         if (jarvisLocalDateTimer) clearInterval(jarvisLocalDateTimer);
         jarvisLocalDateTimer = null;
+        if (participantReviewBackfillTimer) clearTimeout(participantReviewBackfillTimer);
+        participantReviewBackfillTimer = null;
         jarvisPowerLifecycle = null;
         applicationAudioLifecycleCoordinator = null;
         rendererPowerResumeHandshake?.markUnavailable("application shutting down");
         rendererPowerResumeHandshake = null;
+      },
+      async () => {
+        const service = participantReviewBackfillService;
+        participantReviewBackfillService = null;
+        await service?.stop();
       },
       closeAuthBridge,
       () => {

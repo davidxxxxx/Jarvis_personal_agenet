@@ -151,7 +151,9 @@ test("async telemetry sinks cannot delay an authoritative release", async (t) =>
         return neverSettles;
       },
     }),
-    delay(250, "timed-out"),
+    // Leave enough room for a saturated Windows CI filesystem while still proving
+    // that an accidentally awaited never-settling telemetry sink fails the test.
+    delay(2_000, "timed-out"),
   ]);
 
   assert.equal(outcome, true);

@@ -26,7 +26,7 @@ test("migration stops the old runtime and rebuilds production handlers from reco
   const compressionCalls = [];
   const transcriptionModel = "large-v3-turbo";
   const speakerProcessingPolicy = new SpeakerProcessingPolicy({
-    transcriptionInputVersion: 1,
+    transcriptionInputVersion: 2,
     transcriptionModelVersion: transcriptionModel,
   });
   const makeReader = (name) => ({
@@ -44,6 +44,10 @@ test("migration stops the old runtime and rebuilds production handlers from reco
     audioEvidenceReader: makeReader("old-reader"),
     flacCompressionWorker: makeCompressionWorker("old-flac"),
     previewAudioRing: new PreviewAudioRing({ rootDir: path.join(oldRoot, ".preview") }),
+    configureTranscriptionInputVersion(inputVersion) {
+      this.transcriptionInputVersion = inputVersion;
+      return this.transcriptionInputVersion;
+    },
     configureTranscriptionModelVersion(modelVersion) {
       this.transcriptionModelVersion = modelVersion.trim();
       return this.transcriptionModelVersion;

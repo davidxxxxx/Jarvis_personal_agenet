@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Button } from "../../components/ui/button";
 import type {
   JarvisApplicationAudioStatus,
+  JarvisApplicationAudioSettings,
   JarvisResourceGovernanceProfile,
   JarvisResourceGovernanceSettings,
 } from "../types";
@@ -39,8 +40,9 @@ export default function ResourceGovernanceSettingsCard() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(false);
   const [saved, setSaved] = useState(false);
-  const [applicationAudio, setApplicationAudio] =
-    useState<JarvisApplicationAudioStatus | null>(null);
+  const [applicationAudio, setApplicationAudio] = useState<JarvisApplicationAudioStatus | null>(
+    null
+  );
   const [applicationSaving, setApplicationSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -61,26 +63,20 @@ export default function ResourceGovernanceSettingsCard() {
     }
   }, []);
 
-  const persistApplicationAudio = useCallback(
-    async (enabled: boolean, trackLimit: number) => {
-      setApplicationSaving(true);
-      setSaved(false);
-      setError(false);
-      try {
-        const current = await window.electronAPI.jarvis.setApplicationAudioSettings({
-          enabled,
-          trackLimit,
-        });
-        setApplicationAudio(current);
-        setSaved(true);
-      } catch {
-        setError(true);
-      } finally {
-        setApplicationSaving(false);
-      }
-    },
-    []
-  );
+  const persistApplicationAudio = useCallback(async (next: JarvisApplicationAudioSettings) => {
+    setApplicationSaving(true);
+    setSaved(false);
+    setError(false);
+    try {
+      const current = await window.electronAPI.jarvis.setApplicationAudioSettings(next);
+      setApplicationAudio(current);
+      setSaved(true);
+    } catch {
+      setError(true);
+    } finally {
+      setApplicationSaving(false);
+    }
+  }, []);
 
   useEffect(() => {
     void load();
@@ -186,10 +182,11 @@ export default function ResourceGovernanceSettingsCard() {
                   aria-checked={applicationAudio.enabled}
                   disabled={applicationSaving}
                   onClick={() =>
-                    void persistApplicationAudio(
-                      !applicationAudio.enabled,
-                      applicationAudio.trackLimit
-                    )
+                    void persistApplicationAudio({
+                      enabled: !applicationAudio.enabled,
+                      trackLimit: applicationAudio.trackLimit,
+                      fallbackPolicy: applicationAudio.fallbackPolicy,
+                    })
                   }
                   className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
                     applicationAudio.enabled ? "bg-primary" : "bg-muted"
@@ -214,10 +211,11 @@ export default function ResourceGovernanceSettingsCard() {
                   disabled={applicationSaving || !applicationAudio.enabled}
                   value={applicationAudio.trackLimit}
                   onChange={(event) =>
-                    void persistApplicationAudio(
-                      applicationAudio.enabled,
-                      Number(event.target.value)
-                    )
+                    void persistApplicationAudio({
+                      enabled: applicationAudio.enabled,
+                      trackLimit: Number(event.target.value),
+                      fallbackPolicy: applicationAudio.fallbackPolicy,
+                    })
                   }
                   className="rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
                 >
@@ -228,6 +226,48 @@ export default function ResourceGovernanceSettingsCard() {
                   ))}
                 </select>
               </div>
+              <fieldset className="mt-3 space-y-2">
+                <legend className="text-[11px] text-muted-foreground">
+                  {t("jarvis.resourceGovernance.applicationAudio.fallbackPolicy")}
+                </legend>
+                <div className="grid gap-2 sm:grid-cols-2" role="radiogroup">
+                  {(["conservative", "transcript_only"] as const).map((fallbackPolicy) => {
+                    const selected = applicationAudio.fallbackPolicy === fallbackPolicy;
+                    return (
+                      <button
+                        key={fallbackPolicy}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        disabled={applicationSaving}
+                        onClick={() =>
+                          void persistApplicationAudio({
+                            enabled: applicationAudio.enabled,
+                            trackLimit: applicationAudio.trackLimit,
+                            fallbackPolicy,
+                          })
+                        }
+                        className={`rounded-md border px-2.5 py-2 text-left transition-colors ${
+                          selected
+                            ? "border-primary bg-primary/10 text-foreground"
+                            : "border-border/60 bg-background text-muted-foreground hover:border-primary/50"
+                        }`}
+                      >
+                        <span className="block text-[11px] font-semibold">
+                          {t(
+                            `jarvis.resourceGovernance.applicationAudio.fallbackPolicies.${fallbackPolicy}.title`
+                          )}
+                        </span>
+                        <span className="mt-1 block text-[10px] leading-relaxed">
+                          {t(
+                            `jarvis.resourceGovernance.applicationAudio.fallbackPolicies.${fallbackPolicy}.description`
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </fieldset>
               <p className="mt-2 text-[11px] text-muted-foreground">
                 {applicationAudio.runtime.running
                   ? t("jarvis.resourceGovernance.applicationAudio.runtime", {

@@ -7,6 +7,34 @@ try {
   autoUpdaterLoadError = error;
 }
 
+const JARVIS_UPDATE_FEED = Object.freeze({
+  provider: "github",
+  owner: "davidxxxxx",
+  repo: "Jarvis_personal_agenet",
+  private: false,
+});
+
+function isNoPublishedVersionsError(error) {
+  const message =
+    typeof error === "string" ? error : String(error?.message ?? error?.stack ?? error ?? "");
+  return (
+    error?.code === "ERR_UPDATER_NO_PUBLISHED_VERSIONS" ||
+    /no published versions/i.test(message)
+  );
+}
+
+function createUpdaterLogger() {
+  return {
+    debug: (...args) => console.debug(...args),
+    info: (...args) => console.log(...args),
+    warn: (...args) => console.warn(...args),
+    error: (...args) => {
+      if (args.some(isNoPublishedVersionsError)) return;
+      console.error(...args);
+    },
+  };
+}
+
 class UpdateManager {
   constructor() {
     this.mainWindow = null;
@@ -49,12 +77,7 @@ class UpdateManager {
       return;
     }
 
-    autoUpdater.setFeedURL({
-      provider: "github",
-      owner: "OpenWhispr",
-      repo: "openwhispr",
-      private: false,
-    });
+    autoUpdater.setFeedURL(JARVIS_UPDATE_FEED);
 
     // Use arch-specific update channel on macOS to prevent arm64/x64
     // from downloading mismatched artifacts. Both builds publish to the
@@ -88,7 +111,7 @@ class UpdateManager {
 
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.logger = console;
+    autoUpdater.logger = createUpdaterLogger();
 
     this.setupEventHandlers();
   }
@@ -129,6 +152,14 @@ class UpdateManager {
         this.notifyRenderers("update-not-available", info);
       },
       error: (err) => {
+        if (isNoPublishedVersionsError(err)) {
+          console.log("Jarvis update channel has no published versions yet");
+          this.updateAvailable = false;
+          this._suppressNotification = false;
+          this.isDownloading = false;
+          this.notifyRenderers("update-not-available", { reason: "no_published_versions" });
+          return;
+        }
         console.error("❌ Auto-updater error:", err);
         this._suppressNotification = false;
         this.isDownloading = false;
@@ -223,6 +254,14 @@ class UpdateManager {
         };
       }
     } catch (error) {
+      if (isNoPublishedVersionsError(error)) {
+        this._suppressNotification = false;
+        console.log("Jarvis update channel has no published versions yet");
+        return {
+          updateAvailable: false,
+          message: "No Jarvis updates have been published yet",
+        };
+      }
       console.error("❌ Update check error:", error);
       throw error;
     }
@@ -352,6 +391,10 @@ class UpdateManager {
       setTimeout(() => {
         console.log("🔄 Checking for updates on startup...");
         autoUpdater.checkForUpdates().catch((err) => {
+          if (isNoPublishedVersionsError(err)) {
+            console.log("Jarvis update channel has no published versions yet");
+            return;
+          }
           console.error("Startup update check failed:", err);
         });
       }, 3000);
@@ -360,6 +403,10 @@ class UpdateManager {
       this.updateCheckInterval = setInterval(() => {
         console.log("🔄 Periodic update check...");
         autoUpdater.checkForUpdates().catch((err) => {
+          if (isNoPublishedVersionsError(err)) {
+            console.log("Jarvis update channel has no published versions yet");
+            return;
+          }
           console.error("Periodic update check failed:", err);
         });
       }, FOUR_HOURS_MS);

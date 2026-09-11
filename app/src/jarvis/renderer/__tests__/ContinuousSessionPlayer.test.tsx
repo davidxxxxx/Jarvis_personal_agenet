@@ -1,11 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { JarvisSessionTimeline } from "../../types";
+import type { JarvisKnowledgeActionInput, JarvisSessionTimeline } from "../../types";
 import ContinuousSessionPlayer from "../ContinuousSessionPlayer";
 
 class FakeAudio {
   currentTime = 0;
   onended: (() => void) | null = null;
+  ontimeupdate: (() => void) | null = null;
   play = vi.fn(async () => undefined);
   pause = vi.fn();
 
@@ -228,7 +229,7 @@ describe("ContinuousSessionPlayer", () => {
     const readChunk = vi.fn(async () => new Uint8Array([1]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "电脑声音" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统音频·安全兜底" }));
     fireEvent.click(screen.getByRole("button", { name: "连续播放" }));
 
     await waitFor(() => expect(readChunk).toHaveBeenCalledWith("system-1"));
@@ -267,7 +268,7 @@ describe("ContinuousSessionPlayer", () => {
     );
     const view = render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
     fireEvent.click(screen.getByRole("button", { name: "连续播放" }));
-    fireEvent.click(screen.getByRole("button", { name: "电脑声音" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统音频·安全兜底" }));
     resolveRead?.(new Uint8Array([1]));
     await Promise.resolve();
     await Promise.resolve();
@@ -286,12 +287,91 @@ describe("ContinuousSessionPlayer", () => {
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={vi.fn()} />);
 
     expect(screen.getByTestId("source-lane-mic")).toHaveTextContent("麦克风");
-    expect(screen.getByTestId("source-lane-system")).toHaveTextContent("电脑声音");
+    expect(screen.getByTestId("source-lane-system")).toHaveTextContent("系统音频·安全兜底");
     expect(screen.getByText(/缺失 0.5 秒/)).toBeInTheDocument();
     expect(screen.getByText(/device_interrupted/)).toBeInTheDocument();
   });
 
-  it("starts the matching chunk at the transcript timestamp offset", async () => {
+  it("shows the normalized application name on its source lane and transcript", () => {
+    const sourceTimeline = timeline();
+    const applicationTrack = {
+      ...sourceTimeline.tracks[1],
+      id: "track-kook",
+      track_kind: "application" as const,
+      application_key: "kook",
+      application_display_name: "KOOK",
+      attribution_state: "exact" as const,
+    };
+    const applicationSegment = {
+      ...sourceTimeline.segments[0],
+      track_id: "track-kook",
+      application_key: "kook",
+      application_display_name: "KOOK",
+      track_kind: "application" as const,
+    };
+
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          tracks: [sourceTimeline.tracks[0], applicationTrack],
+          segments: [applicationSegment],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+
+    expect(screen.getAllByText("KOOK")).toHaveLength(2);
+  });
+
+  it("shows a raw interval failure code when application capture falls back before a track starts", () => {
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          application_audio_intervals: [
+            {
+              id: "fallback-1",
+              session_id: "session-1",
+              track_id: "track-system",
+              interval_kind: "mixed_fallback",
+              application_key: null,
+              attribution_state: "mixed_unknown",
+              capture_generation: 1,
+              started_at: 1_500,
+              ended_at: 2_500,
+              reason: "capture_start_failed",
+              failure_code: "application_native_start_E_ACCESSDENIED",
+            },
+          ],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+
+    const failures = screen.getByTestId("application-capture-failures");
+    expect(failures).toHaveTextContent("系统音频·应用未知");
+    expect(failures).toHaveTextContent("application_native_start_E_ACCESSDENIED");
+  });
+
+  it("requests the next bounded source page", () => {
+    const onTrackPageChange = vi.fn();
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          evidence_page: {
+            tracks: { total: 250, offset: 0, limit: 100 },
+            intervals: { total: 0, offset: 0, limit: 200 },
+          },
+        })}
+        readChunk={vi.fn()}
+        onTrackPageChange={onTrackPageChange}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(onTrackPageChange).toHaveBeenCalledWith(100);
+  });
+
+  it("plays only the selected transcript time range and then stops", async () => {
     const readChunk = vi.fn(async () => new Uint8Array([1]));
     render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
 
@@ -300,5 +380,95 @@ describe("ContinuousSessionPlayer", () => {
     await waitFor(() => expect(readChunk).toHaveBeenCalledWith("system-1"));
     await waitFor(() => expect(createdAudio).toHaveLength(1));
     expect(createdAudio[0].currentTime).toBe(0.25);
+    expect(
+      screen.getByRole("button", { name: /停止这条转写：点击定位到这句话/ })
+    ).toBeInTheDocument();
+
+    createdAudio[0].currentTime = 0.4;
+    createdAudio[0].ontimeupdate?.();
+
+    await waitFor(() => expect(createdAudio[0].pause).toHaveBeenCalled());
+    expect(
+      screen.getByRole("button", { name: /播放这条转写：点击定位到这句话/ })
+    ).toBeInTheDocument();
+  });
+
+  it("lets the transcript row stop its own playback immediately", async () => {
+    const readChunk = vi.fn(async () => new Uint8Array([1]));
+    render(<ContinuousSessionPlayer timeline={timeline()} readChunk={readChunk} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /播放这条转写/ }));
+    await waitFor(() => expect(createdAudio).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: /停止这条转写/ }));
+
+    expect(createdAudio[0].pause).toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /播放这条转写/ })).toBeInTheDocument();
+  });
+
+  it("creates a Todo from final transcript references without copying raw evidence", async () => {
+    const applyKnowledgeAction = vi
+      .fn<(input: JarvisKnowledgeActionInput) => Promise<unknown>>()
+      .mockRejectedValueOnce(new Error("temporary failure"))
+      .mockImplementation(async (input) => ({
+        status: "applied" as const,
+        commandId: input.commandId,
+        type: input.type,
+        entityKind: "todo" as const,
+        entityId: "todo-created",
+        occurredAt: Date.now(),
+        todoId: "todo-created",
+      }));
+    window.electronAPI = {
+      jarvis: { applyKnowledgeAction },
+    } as unknown as typeof window.electronAPI;
+
+    const view = render(<ContinuousSessionPlayer timeline={timeline()} readChunk={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "从该转写创建 Todo" }));
+    expect(screen.getByLabelText("待办标题")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "创建待办" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("待办标题"), {
+      target: { value: "整理这段讨论" },
+    });
+    fireEvent.change(screen.getByLabelText("日期或时间（可选）"), {
+      target: { value: "周五" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建待办" }));
+
+    await waitFor(() => expect(applyKnowledgeAction).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("操作没有保存，请稍后重试。")).toBeVisible();
+    const firstInput = applyKnowledgeAction.mock.calls[0][0];
+    fireEvent.click(screen.getByRole("button", { name: "创建待办" }));
+    await waitFor(() => expect(applyKnowledgeAction).toHaveBeenCalledTimes(2));
+    const input = applyKnowledgeAction.mock.calls[1][0];
+    expect(firstInput.type).toBe("transcript_create");
+    expect(input.type).toBe("transcript_create");
+    expect(input.commandId).toBe(firstInput.commandId);
+    if (firstInput.type !== "transcript_create" || input.type !== "transcript_create") {
+      throw new Error("expected transcript_create actions");
+    }
+    expect(input.todoId).toBe(firstInput.todoId);
+    expect(input).toEqual(
+      expect.objectContaining({
+        type: "transcript_create",
+        sessionId: "session-1",
+        segmentIds: ["segment-system"],
+        title: "整理这段讨论",
+        dueText: "周五",
+      })
+    );
+    expect(input).not.toHaveProperty("quote");
+    expect(input).not.toHaveProperty("evidence");
+    expect(input).not.toHaveProperty("text");
+
+    view.unmount();
+    render(
+      <ContinuousSessionPlayer
+        timeline={timeline({
+          segments: [{ ...timeline().segments[0], result_kind: "provisional" }],
+        })}
+        readChunk={vi.fn()}
+      />
+    );
+    expect(screen.queryByRole("button", { name: "从该转写创建 Todo" })).not.toBeInTheDocument();
   });
 });

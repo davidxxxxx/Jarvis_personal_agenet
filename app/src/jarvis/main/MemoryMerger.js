@@ -15,6 +15,12 @@ const CANDIDATE_MEMORY_KINDS = new Set([
 const EXISTING_MEMORY_KINDS = new Set([...CANDIDATE_MEMORY_KINDS, "opinion"]);
 const SUBJECT_KINDS = new Set(["person", "speaker_cluster"]);
 const HASH_PATTERN = /^[0-9a-f]{64}$/u;
+const SUGGESTION_BASES = new Set([
+  "work_context",
+  "learning_goal",
+  "explicit_agreement",
+  "legacy_unverified",
+]);
 
 class MemoryMergerValidationError extends Error {
   constructor(issueCode) {
@@ -284,7 +290,12 @@ function canonicalizeCandidate(candidate) {
     .map((suggestion) => {
       const normalizedTitle = canonicalizeText(suggestion.title);
       const normalizedRationale = canonicalizeText(suggestion.rationale);
-      const canonicalTuple = ["suggestion", normalizedTitle, normalizedRationale];
+      const basis = suggestion.basis ?? "legacy_unverified";
+      const learningGoalId = suggestion.learningGoalId ?? null;
+      const canonicalTuple =
+        basis === "legacy_unverified"
+          ? ["suggestion", normalizedTitle, normalizedRationale]
+          : ["suggestion", normalizedTitle, normalizedRationale, basis, learningGoalId];
       const basedOnEvidenceSegmentIds = normalizeStringSet(
         suggestion.basedOnEvidenceSegmentIds,
         "suggestion.basedOnEvidenceSegmentIds"
@@ -293,11 +304,13 @@ function canonicalizeCandidate(candidate) {
         ...suggestion,
         normalizedTitle,
         normalizedRationale,
+        basis,
+        learningGoalId,
         basedOnEvidenceSegmentIds,
         canonicalTuple,
         canonicalHash: canonicalTupleHash(canonicalTuple),
         semanticTuple: [canonicalTuple, basedOnEvidenceSegmentIds],
-        displayTuple: ["suggestion", suggestion.title, suggestion.rationale],
+        displayTuple: ["suggestion", suggestion.title, suggestion.rationale, basis, learningGoalId],
       };
     })
     .sort(compareCanonicalItems);
@@ -448,7 +461,7 @@ function validateCandidate(candidate) {
     ["schemaVersion", "sessionSummary", "memories", "topics", "todos", "suggestions"],
     "malformed_candidate"
   );
-  if (input.schemaVersion !== "jarvis-analysis-v2") validationFail("malformed_candidate");
+  if (input.schemaVersion !== "jarvis-analysis-v3") validationFail("malformed_candidate");
   const summary = exactObject(
     input.sessionSummary,
     ["title", "summary", "evidenceSegmentIds"],
@@ -497,27 +510,89 @@ function validateCandidate(candidate) {
     });
   }
   for (const todo of requireArray(input.todos, "malformed_candidate")) {
-    const item = exactObject(
-      todo,
-      ["title", "ownerLabel", "dueText", "evidenceSegmentIds"],
-      "malformed_candidate"
-    );
+    const todoInput = plainObject(todo, "malformed_candidate");
+    const legacyKeys = [
+      "title",
+      "ownerLabel",
+      "dueText",
+      "semanticConfidence",
+      "evidenceSegmentIds",
+    ];
+    const currentKeys = [
+      ...legacyKeys,
+      "actionKind",
+      "assignmentSegmentIds",
+      "acceptanceSegmentIds",
+    ];
+    const legacy =
+      Object.keys(todoInput).length === legacyKeys.length &&
+      legacyKeys.every((key) => Object.prototype.hasOwnProperty.call(todoInput, key));
+    const item = exactObject(todoInput, legacy ? legacyKeys : currentKeys, "malformed_candidate");
     requireText(item.title, "malformed_candidate");
     if (item.ownerLabel !== null) requireId(item.ownerLabel, "malformed_candidate");
     requireNullableText(item.dueText, "malformed_candidate");
+    if (
+      typeof item.semanticConfidence !== "number" ||
+      !Number.isFinite(item.semanticConfidence) ||
+      item.semanticConfidence < 0 ||
+      item.semanticConfidence > 1
+    ) {
+      validationFail("malformed_candidate");
+    }
     validateIdSet(item.evidenceSegmentIds, {
       issueCode: "malformed_candidate",
       allowEmpty: false,
     });
+    if (!legacy) {
+      if (!new Set(["self_commitment", "assignment_accepted"]).has(item.actionKind)) {
+        validationFail("malformed_candidate");
+      }
+      validateIdSet(item.assignmentSegmentIds, {
+        issueCode: "malformed_candidate",
+        allowEmpty: true,
+      });
+      validateIdSet(item.acceptanceSegmentIds, {
+        issueCode: "malformed_candidate",
+        allowEmpty: true,
+      });
+      if (item.actionKind === "self_commitment") {
+        if (item.assignmentSegmentIds.length > 0 || item.acceptanceSegmentIds.length > 0) {
+          validationFail("malformed_candidate");
+        }
+      } else {
+        const assignment = new Set(item.assignmentSegmentIds);
+        const acceptance = new Set(item.acceptanceSegmentIds);
+        if (
+          assignment.size === 0 ||
+          acceptance.size === 0 ||
+          [...assignment].some((id) => acceptance.has(id)) ||
+          item.evidenceSegmentIds.length !== assignment.size + acceptance.size ||
+          item.evidenceSegmentIds.some((id) => !assignment.has(id) && !acceptance.has(id))
+        ) {
+          validationFail("malformed_candidate");
+        }
+      }
+    }
   }
   for (const suggestion of requireArray(input.suggestions, "malformed_candidate")) {
+    const legacy = Object.keys(plainObject(suggestion, "malformed_candidate")).length === 3;
     const item = exactObject(
       suggestion,
-      ["title", "rationale", "basedOnEvidenceSegmentIds"],
+      legacy
+        ? ["title", "rationale", "basedOnEvidenceSegmentIds"]
+        : ["title", "rationale", "basis", "learningGoalId", "basedOnEvidenceSegmentIds"],
       "malformed_candidate"
     );
     requireText(item.title, "malformed_candidate");
     requireText(item.rationale, "malformed_candidate");
+    const basis = legacy ? "legacy_unverified" : item.basis;
+    const learningGoalId = legacy ? null : item.learningGoalId;
+    if (!SUGGESTION_BASES.has(basis)) validationFail("malformed_candidate");
+    if (basis === "learning_goal") {
+      requireId(learningGoalId, "malformed_candidate");
+    } else if (learningGoalId !== null) {
+      validationFail("malformed_candidate");
+    }
     validateIdSet(item.basedOnEvidenceSegmentIds, {
       issueCode: "malformed_candidate",
       allowEmpty: true,
@@ -1444,8 +1519,7 @@ function planMemories({
         const reusableEvent = exactMemory.occurrences
           .filter(
             (occurrence) =>
-              Number.isSafeInteger(occurrence.startedAt) &&
-              Number.isSafeInteger(occurrence.endedAt)
+              Number.isSafeInteger(occurrence.startedAt) && Number.isSafeInteger(occurrence.endedAt)
           )
           .map((occurrence) => {
             const gap = Math.max(
@@ -1704,6 +1778,8 @@ function planSuggestions({ suggestions, suggestionsByKey }) {
       canonicalTuple: suggestion.canonicalTuple,
       title: suggestion.title,
       rationale: suggestion.rationale,
+      basis: suggestion.basis,
+      learningGoalId: suggestion.learningGoalId,
       evidenceSegmentIds: suggestion.basedOnEvidenceSegmentIds,
     }));
   const occurrenceLinks = [];

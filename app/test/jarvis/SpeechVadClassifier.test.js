@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const SpeechVadClassifier = require("../../src/jarvis/main/SpeechVadClassifier");
 const SileroVadRuntime = require("../../src/workers/SileroVadRuntime");
@@ -8,6 +10,17 @@ function pcm100ms(amplitude = 0) {
   const output = Buffer.alloc(2_400 * 2);
   for (let offset = 0; offset < output.length; offset += 2) {
     output.writeInt16LE(amplitude, offset);
+  }
+  return output;
+}
+
+function voicedPcm100ms() {
+  const sampleRate = 24_000;
+  const output = Buffer.alloc(2_400 * 2);
+  for (let index = 0; index < 2_400; index += 1) {
+    const carrier = Math.sin((2 * Math.PI * 180 * index) / sampleRate);
+    const modulation = 0.55 + 0.45 * Math.sin((2 * Math.PI * 4 * index) / sampleRate);
+    output.writeInt16LE(Math.round(carrier * modulation * 12_000), index * 2);
   }
   return output;
 }
@@ -171,6 +184,87 @@ test("Silero runtime keeps recurrent state and remainder independent per source 
   assert.ok(stateInputs.slice(1, 6).some((value) => value > 0));
   assert.equal(stateInputs[6], 0);
   assert.equal(runtime.streamCount, 2);
+});
+
+test("Silero runtime carries recurrent h/c state through new_h and new_c outputs", async () => {
+  const stateInputs = [];
+  class Tensor {
+    constructor(type, data, dimensions) {
+      this.type = type;
+      this.data = data;
+      this.dimensions = dimensions;
+    }
+  }
+  const session = {
+    inputNames: ["x", "h", "c"],
+    outputNames: ["prob", "new_h", "new_c"],
+    inputMetadata: {
+      h: { dimensions: [2, 1, 64] },
+      c: { dimensions: [2, 1, 64] },
+    },
+    async run(feeds) {
+      const h = Number(feeds.h.data[0]);
+      const c = Number(feeds.c.data[0]);
+      stateInputs.push({ h, c });
+      return {
+        prob: { data: Float32Array.from([0.8]) },
+        new_h: { data: Float32Array.from({ length: 128 }, () => h + 1) },
+        new_c: { data: Float32Array.from({ length: 128 }, () => c + 2) },
+      };
+    },
+  };
+  const runtime = new SileroVadRuntime({
+    ort: { Tensor, InferenceSession: { create: async () => session } },
+  });
+  await runtime.load("silero_vad.onnx");
+
+  await runtime.classify({
+    sessionId: "s1",
+    streamId: "s1:mic:1",
+    sampleRate: 24_000,
+    samplesBuffer: pcm100ms().buffer,
+  });
+
+  assert.deepEqual(stateInputs.slice(0, 3), [
+    { h: 0, c: 0 },
+    { h: 1, c: 2 },
+    { h: 2, c: 4 },
+  ]);
+});
+
+test("bundled Silero model advances real new_h/new_c recurrent state", async (t) => {
+  const modelPath = path.resolve(
+    __dirname,
+    "../../dist/win-unpacked/resources/bin/diarization-models/silero_vad.onnx"
+  );
+  if (!fs.existsSync(modelPath)) {
+    t.skip("bundled Silero model is not present in this checkout");
+    return;
+  }
+  const ort = require("onnxruntime-node");
+  const runtime = new SileroVadRuntime({ ort });
+  await runtime.load(modelPath);
+
+  await runtime.classify({
+    sessionId: "real-model",
+    streamId: "real-model:mic:1",
+    sampleRate: 24_000,
+    samplesBuffer: voicedPcm100ms().buffer,
+  });
+  const stream = runtime.streams.get("real-model:mic:1");
+  const firstH = Float32Array.from(stream.states.get("h"));
+  const firstC = Float32Array.from(stream.states.get("c"));
+  assert.ok(firstH.some((value) => value !== 0));
+  assert.ok(firstC.some((value) => value !== 0));
+
+  await runtime.classify({
+    sessionId: "real-model",
+    streamId: "real-model:mic:1",
+    sampleRate: 24_000,
+    samplesBuffer: voicedPcm100ms().buffer,
+  });
+  assert.notDeepEqual([...stream.states.get("h")], [...firstH]);
+  assert.notDeepEqual([...stream.states.get("c")], [...firstC]);
 });
 
 test("Silero runtime reports probability from the current classify call", async () => {

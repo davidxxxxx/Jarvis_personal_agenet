@@ -1,0 +1,22 @@
+# Jarvis offline AI model component
+
+The Windows release treats the application core and the offline diarization models as two
+versioned components while keeping one installer entry. The verified tree is staged in
+`resources/ai-model-pack/prebuilt`; `scripts/build-windows-model-bundle.js` archives only the
+files named by its manifest and emits a SHA-512-pinned sibling component next to Setup. NSIS
+verifies and extracts that component, then Jarvis performs the per-file manifest verification and
+adopts it atomically into `JARVIS_DATA_ROOT/models/ai-model-pack` on first launch. Build models,
+caches, and temporary files stay on a non-system drive.
+
+Release inputs are intentionally predownloaded. In particular, the build machine must already
+have access to the gated `pyannote/speaker-diarization-community-1` repository; access tokens are
+never passed to the pack builder or included in the output.
+
+Use `scripts/prepare-ai-model-pack.ps1` with a self-contained Python 3.11 x64 runtime, the pinned
+Community-1 snapshot, the complete `alibabasglab/MossFormer2_SS_16K` snapshot directory, and the
+downloaded sherpa/CAM++/ERes2NetV2/Silero directory. It also requires the official
+ClearerVoice-Studio v0.1.2 inference source at revision
+`a170d81ae1372201d8ad14f1cb80bb95e5e7e65b`. Jarvis vendors that source rather than installing
+the PyPI wrapper, whose NumPy constraint conflicts with pyannote 4. The script stages and caches
+only on G:, pins the CUDA runtime dependencies, builds a per-file SHA-256 manifest, and performs
+a real CUDA, pyannote, and MossFormer load test before the application is packaged.

@@ -46,6 +46,41 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* MinGW's endpointvolume.h currently forward-declares this interface without
+ * its C vtable. Keep the ABI-compatible definition local so the same source
+ * builds with both the Windows SDK and Zig's MinGW headers. */
+#ifndef __IAudioMeterInformation_INTERFACE_DEFINED__
+#define __IAudioMeterInformation_INTERFACE_DEFINED__
+typedef struct IAudioMeterInformationVtbl {
+    BEGIN_INTERFACE
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(
+        IAudioMeterInformation *This, REFIID riid, void **ppvObject);
+    ULONG (STDMETHODCALLTYPE *AddRef)(IAudioMeterInformation *This);
+    ULONG (STDMETHODCALLTYPE *Release)(IAudioMeterInformation *This);
+    HRESULT (STDMETHODCALLTYPE *GetPeakValue)(
+        IAudioMeterInformation *This, float *peak);
+    HRESULT (STDMETHODCALLTYPE *GetMeteringChannelCount)(
+        IAudioMeterInformation *This, UINT *channelCount);
+    HRESULT (STDMETHODCALLTYPE *GetChannelsPeakValues)(
+        IAudioMeterInformation *This, UINT32 channelCount, float *peakValues);
+    HRESULT (STDMETHODCALLTYPE *QueryHardwareSupport)(
+        IAudioMeterInformation *This, DWORD *hardwareSupportMask);
+    END_INTERFACE
+} IAudioMeterInformationVtbl;
+
+interface IAudioMeterInformation {
+    CONST_VTBL IAudioMeterInformationVtbl *lpVtbl;
+};
+
+#ifndef IAudioMeterInformation_GetPeakValue
+#define IAudioMeterInformation_GetPeakValue(This,peak) \
+    (This)->lpVtbl->GetPeakValue((This),(peak))
+#endif
+#ifndef IAudioMeterInformation_Release
+#define IAudioMeterInformation_Release(This) (This)->lpVtbl->Release((This))
+#endif
+#endif
+
 DEFINE_GUID(HELPER_CLSID_MMDeviceEnumerator,
     0xbcde0395, 0xe52f, 0x467c, 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e);
 DEFINE_GUID(HELPER_IID_IMMDeviceEnumerator,
@@ -54,6 +89,8 @@ DEFINE_GUID(HELPER_IID_IAudioSessionManager2,
     0x77aa99a0, 0x1bd6, 0x484f, 0x8b, 0xc7, 0x2c, 0x65, 0x4c, 0x9a, 0x9b, 0x6f);
 DEFINE_GUID(HELPER_IID_IAudioSessionControl2,
     0xbfb7ff88, 0x7239, 0x4fc9, 0x8f, 0xa2, 0x07, 0xc9, 0x50, 0xbe, 0x9c, 0x6d);
+DEFINE_GUID(HELPER_IID_IAudioMeterInformation,
+    0xc02216f6, 0x8c67, 0x4b5b, 0x9d, 0x00, 0xd0, 0x08, 0xe7, 0x3e, 0x00, 0x64);
 
 #if defined(__has_include)
 #if __has_include(<audioclientactivationparams.h>)
@@ -193,6 +230,15 @@ static void emit_capture_start(PROCESS_LOOPBACK_MODE loopbackMode, DWORD targetP
                 ? "include-process-tree"
                 : "exclude-process-tree",
             (unsigned long)targetPid);
+    fflush(stderr);
+}
+
+static void emit_hresult_error(const char *code, const char *message, HRESULT hr)
+{
+    fprintf(stderr,
+            "{\"type\":\"error\",\"code\":\"%s\",\"nativeCode\":\"0x%08lx\","
+            "\"message\":\"%s (hr=0x%08lx)\"}\n",
+            code, (unsigned long)hr, message, (unsigned long)hr);
     fflush(stderr);
 }
 
@@ -426,16 +472,18 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = activate_process_loopback(targetPid, loopbackMode, sampleRate, &audioClient, &errorCode);
     if (FAILED(hr)) {
-        emit_event("error", errorCode, "Process loopback activation failed (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error(errorCode, "Process loopback activation failed", hr);
         return 2;
     }
 
     samplesReadyEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!samplesReadyEvent ||
-        FAILED(hr = IAudioClient_SetEventHandle(audioClient, samplesReadyEvent))) {
-        emit_event("error", "initialize_failed", "Failed to attach capture event (hr=0x%08lx)",
-                   (unsigned long)hr);
+    if (!samplesReadyEvent) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    } else {
+        hr = IAudioClient_SetEventHandle(audioClient, samplesReadyEvent);
+    }
+    if (FAILED(hr)) {
+        emit_hresult_error("initialize_failed", "Failed to attach capture event", hr);
         IAudioClient_Release(audioClient);
         if (samplesReadyEvent) CloseHandle(samplesReadyEvent);
         return 2;
@@ -443,8 +491,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = IAudioClient_GetService(audioClient, &IID_IAudioCaptureClient, (void **)&captureClient);
     if (FAILED(hr)) {
-        emit_event("error", "initialize_failed", "Failed to get capture client (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error("initialize_failed", "Failed to get capture client", hr);
         IAudioClient_Release(audioClient);
         CloseHandle(samplesReadyEvent);
         return 2;
@@ -452,8 +499,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
 
     hr = IAudioClient_Start(audioClient);
     if (FAILED(hr)) {
-        emit_event("error", "start_failed", "Failed to start capture (hr=0x%08lx)",
-                   (unsigned long)hr);
+        emit_hresult_error("start_failed", "Failed to start capture", hr);
         IAudioCaptureClient_Release(captureClient);
         IAudioClient_Release(audioClient);
         CloseHandle(samplesReadyEvent);
@@ -529,8 +575,7 @@ static int run_capture(DWORD targetPid, PROCESS_LOOPBACK_MODE loopbackMode, UINT
         }
 
         if (FAILED(hr) && hr != AUDCLNT_S_BUFFER_EMPTY) {
-            emit_event("error", "wasapi_capture_failed", "Capture read failed (hr=0x%08lx)",
-                       (unsigned long)hr);
+            emit_hresult_error("wasapi_capture_failed", "Capture read failed", hr);
             exitCode = 2;
             goto done;
         }
@@ -606,8 +651,10 @@ static int find_session_process(
 
 static void emit_session_event(const char *state, DWORD pid, float peak)
 {
-    printf("{\"type\":\"session\",\"state\":\"%s\",\"pid\":%lu,\"peak\":%.6f}\n",
-           state, (unsigned long)pid, (double)peak);
+    BOOL audible = strcmp(state, "active") == 0 && peak >= SESSION_PEAK_THRESHOLD;
+    printf("{\"type\":\"session\",\"state\":\"%s\",\"pid\":%lu,\"peak\":%.6f,"
+           "\"audible\":%s}\n",
+           state, (unsigned long)pid, (double)peak, audible ? "true" : "false");
     fflush(stdout);
 }
 
@@ -672,9 +719,10 @@ static HRESULT collect_active_session_processes(
         for (sessionIndex = 0; sessionIndex < sessionCount; sessionIndex++) {
             IAudioSessionControl *sessionControl = NULL;
             IAudioSessionControl2 *sessionControl2 = NULL;
+            IAudioMeterInformation *audioMeter = NULL;
             AudioSessionState sessionState;
             DWORD pid = 0;
-            float peak = 1.0f;
+            float peak = 0.0f;
             int existing;
 
             if (FAILED(IAudioSessionEnumerator_GetSession(
@@ -691,6 +739,24 @@ static HRESULT collect_active_session_processes(
                 if (sessionControl2) IAudioSessionControl2_Release(sessionControl2);
                 IAudioSessionControl_Release(sessionControl);
                 continue;
+            }
+
+            /* AudioSessionStateActive only means that the application has an
+             * active render stream. It does not mean that the stream is
+             * currently audible. Query the per-session meter so the dynamic
+             * application pool does not open one capture helper for every
+             * silent browser, game launcher, or call session. A meter failure
+             * is treated conservatively as silence; the mixed safety track
+             * still preserves the audio while a later enumeration retries. */
+            if (SUCCEEDED(IAudioSessionControl_QueryInterface(
+                    sessionControl, &HELPER_IID_IAudioMeterInformation,
+                    (void **)&audioMeter))) {
+                if (FAILED(IAudioMeterInformation_GetPeakValue(audioMeter, &peak)) ||
+                    peak < 0.0f || peak > 1.0f) {
+                    peak = 0.0f;
+                }
+                IAudioMeterInformation_Release(audioMeter);
+                audioMeter = NULL;
             }
 
             existing = find_session_process(processes, count, pid);

@@ -79,6 +79,62 @@ test("clean migration creates the continuation table with foreign keys", () => {
   }
 });
 
+test("v60 hides final transcript rows contradicted by the latest no-speech state", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 100 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at)
+      VALUES ('no-speech-session', 10, 20, 'completed', 10);
+      INSERT INTO audio_tracks (
+        id, session_id, source_type, strategy, sample_rate, channels,
+        started_at, ended_at, state
+      ) VALUES (
+        'no-speech-track', 'no-speech-session', 'mic', 'web-audio', 24000, 1,
+        10, 20, 'ended'
+      );
+      INSERT INTO audio_chunks (
+        id, session_id, path, started_at, ended_at, duration_ms, sha256, expires_at,
+        transcription_status, track_id, source_type, sequence_number, write_state,
+        format, file_sha256, sample_rate, channels
+      ) VALUES (
+        'no-speech-chunk', 'no-speech-session', 'G:\\no-speech.wav', 10, 20, 10,
+        'pcm-no-speech', 999, 'no_speech', 'no-speech-track', 'mic', 0, 'committed',
+        'wav', 'file-no-speech', 24000, 1
+      );
+      INSERT INTO transcript_segments (
+        id, session_id, started_at, ended_at, speaker_label, text, confidence,
+        is_stable, track_id, chunk_id, source_type, result_kind, model_version,
+        completed_at
+      ) VALUES (
+        'stale-final', 'no-speech-session', 10, 20, 'mic', 'stale text', 0.5,
+        1, 'no-speech-track', 'no-speech-chunk', 'mic', 'final', 'turbo', 20
+      );
+      PRAGMA user_version = 59;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 200 }), {
+      fromVersion: 59,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT projection_state, projection_reason
+           FROM transcript_segments WHERE id = 'stale-final'`
+        )
+        .get(),
+      {
+        projection_state: "audit_hidden",
+        projection_reason: "latest_transcription_no_speech",
+      }
+    );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
 test("creates dual-track evidence schema idempotently in an empty database", () => {
   const db = new Database(":memory:");
 
@@ -1127,6 +1183,8 @@ test("v13 preserves every valid v12 final field, dependent evidence, and semanti
         superseded_by: null,
         echo_score: null,
         duplicate_of: null,
+        projection_state: "visible",
+        projection_reason: null,
       }
     );
     assert.deepEqual(db.prepare("SELECT * FROM segment_links").all(), [
@@ -1781,7 +1839,7 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   const db = new Database(":memory:");
   try {
     applyJarvisMigrations(db, { now: () => 1_000 });
-    assert.equal(TARGET_VERSION, 34);
+    assert.ok(TARGET_VERSION >= 30);
 
     const explain = (sql, ...params) =>
       db
@@ -1831,6 +1889,41 @@ test("v30 indexes bounded public knowledge reads without full scans or top-level
   }
 });
 
+test("v38 indexes per-chunk runtime status lookups instead of scanning every processing job", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      DROP INDEX idx_processing_jobs_chunk_type_order;
+      PRAGMA user_version = 37;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 37,
+      toVersion: TARGET_VERSION,
+    });
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT id
+         FROM processing_jobs
+         WHERE chunk_id = ?
+           AND job_type = 'transcribe_chunk'
+           AND state NOT IN ('completed','superseded','audio_expired_before_processing')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`
+      )
+      .all("chunk-1")
+      .map((row) => row.detail)
+      .join(" ");
+
+    assert.match(plan, /idx_processing_jobs_chunk_type_order/);
+    assert.doesNotMatch(plan, /SCAN processing_jobs/);
+  } finally {
+    db.close();
+  }
+});
+
 test("v29 fails closed without dropping an extra constrained processing_jobs column or its data", () => {
   const db = new Database(":memory:");
   try {
@@ -1861,6 +1954,81 @@ test("v29 fails closed without dropping an extra constrained processing_jobs col
       schemaBefore
     );
     assert.deepEqual(db.prepare("SELECT * FROM processing_jobs").all(), dataBefore);
+  } finally {
+    db.close();
+  }
+});
+
+test("v45 prunes only unreferenced superseded daily-digest snapshots", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    const insertInput = db.prepare(
+      `INSERT INTO daily_digest_inputs (
+         id, local_date, timezone, source_hash, contract_version, completeness,
+         input_watermark_json, cloud_payload_json, input_bytes, model_version, created_at
+       ) VALUES (?, '2026-07-28', 'Asia/Shanghai', ?,
+         'jarvis-daily-digest-input-v1', 'partial', '{}', '{}', 2, 'MiniMax-M2.7', ?)`
+    );
+    const insertJob = db.prepare(
+      `INSERT INTO processing_jobs (
+         id, session_id, track_id, chunk_id, job_type, state, priority,
+         input_hash, input_version, model_version, attempt_count, next_retry_at,
+         lease_owner, lease_expires_at, error_code, blocked_reason, execution_device,
+         created_at, completed_at, lane, analysis_input_id, desired_head_hash, digest_input_id
+       ) VALUES (?, NULL, NULL, NULL, 'generate_daily_digest', ?, 80,
+         ?, 1, 'MiniMax-M2.7', 0, NULL, NULL, NULL, ?, NULL, NULL,
+         ?, ?, 'cloud', NULL, NULL, ?)`
+    );
+    const obsoleteHash = "a".repeat(64);
+    const activeHash = "b".repeat(64);
+    insertInput.run("digest-input-obsolete", obsoleteHash, 2_000);
+    insertInput.run("digest-input-active", activeHash, 2_001);
+    insertJob.run(
+      "digest-job-obsolete",
+      "superseded",
+      obsoleteHash,
+      "DAILY_DIGEST_SUPERSEDED",
+      2_000,
+      2_100,
+      "digest-input-obsolete"
+    );
+    insertJob.run(
+      "digest-job-active",
+      "pending",
+      activeHash,
+      null,
+      2_001,
+      null,
+      "digest-input-active"
+    );
+    db.pragma("user_version = 44");
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 3_000 }), {
+      fromVersion: 44,
+      toVersion: TARGET_VERSION,
+    });
+    assert.deepEqual(db.prepare("SELECT id FROM daily_digest_inputs ORDER BY id").all(), [
+      { id: "digest-input-active" },
+    ]);
+    assert.deepEqual(
+      db
+        .prepare(
+          "SELECT id, state, digest_input_id FROM processing_jobs WHERE job_type = 'generate_daily_digest'"
+        )
+        .all(),
+      [
+        {
+          id: "digest-job-active",
+          state: "pending",
+          digest_input_id: "digest-input-active",
+        },
+      ]
+    );
+    assert.throws(
+      () => db.prepare("DELETE FROM daily_digest_inputs WHERE id = ?").run("digest-input-active"),
+      /daily digest input is immutable/
+    );
   } finally {
     db.close();
   }
@@ -2099,6 +2267,96 @@ test("v29 preserves legacy session-anchored digest jobs as inert terminal histor
         completed_at: 123,
       }
     );
+    assert.deepEqual(db.pragma("foreign_key_check"), []);
+  } finally {
+    db.close();
+  }
+});
+
+test("v50 upgrades active v49 local reprocessing with semantic SHA-256 baselines", () => {
+  const db = new Database(":memory:");
+  try {
+    applyJarvisMigrations(db, { now: () => 1_000 });
+    db.exec(`
+      INSERT INTO sessions (id, started_at, ended_at, status, created_at, processing_state)
+      VALUES ('v49-reprocessing', 10, 20, 'completed', 10, 'ready');
+      DROP TRIGGER personalization_feedback_events_immutable_update;
+      DROP TRIGGER personalization_feedback_events_immutable_delete;
+      DROP INDEX idx_personalization_feedback_events_effective;
+      DROP INDEX idx_personalization_feedback_events_source;
+      DROP TABLE personalization_feedback_events;
+      DROP TABLE session_reprocessing_state;
+      DROP TABLE session_summary_refresh_state;
+      CREATE TABLE session_summary_refresh_state (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        basis_policy_id TEXT,
+        latest_policy_id TEXT NOT NULL,
+        recommended INTEGER NOT NULL DEFAULT 0 CHECK(recommended IN (0,1)),
+        reason TEXT CHECK(reason IS NULL OR reason IN (
+          'speaker_count_changed','speaker_identity_changed','application_source_changed',
+          'transcript_changed','manual_request'
+        )),
+        updated_at INTEGER NOT NULL,
+        CHECK(recommended = 1 OR reason IS NULL)
+      );
+      CREATE TABLE session_reprocessing_state (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        policy_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode = 'historical_local_only'),
+        state TEXT NOT NULL CHECK(state IN ('queued','processing','completed')),
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        CHECK((state = 'completed') = (completed_at IS NOT NULL))
+      );
+      INSERT INTO session_reprocessing_state (
+        session_id, policy_id, mode, state, started_at, completed_at
+      ) VALUES (
+        'v49-reprocessing', 'jarvis-hybrid-diarization-v2',
+        'historical_local_only', 'processing', 900, NULL
+      );
+      PRAGMA user_version = 49;
+    `);
+
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 2_000 }), {
+      fromVersion: 49,
+      toVersion: TARGET_VERSION,
+    });
+    const row = db
+      .prepare("SELECT * FROM session_reprocessing_state WHERE session_id = ?")
+      .get("v49-reprocessing");
+    assert.equal(row.state, "processing");
+    assert.equal(row.started_at, 900);
+    assert.equal(row.completed_at, null);
+    for (const column of [
+      "baseline_content_sha256",
+      "baseline_identity_sha256",
+      "baseline_classification_sha256",
+    ]) {
+      assert.match(row[column], /^[0-9a-f]{64}$/u);
+    }
+    assert.doesNotThrow(() =>
+      db
+        .prepare(
+          `INSERT INTO session_summary_refresh_state (
+             session_id, latest_policy_id, recommended, reason, updated_at
+           ) VALUES (?, ?, 1, 'activity_classification_changed', ?)`
+        )
+        .run("v49-reprocessing", "jarvis-hybrid-diarization-v2", 2_000)
+    );
+    assert.equal(
+      db
+        .prepare(
+          `SELECT count(*) AS count FROM sqlite_master
+           WHERE type = 'table' AND name = 'personalization_feedback_events'`
+        )
+        .get().count,
+      1
+    );
+    assert.deepEqual(applyJarvisMigrations(db, { now: () => 3_000 }), {
+      fromVersion: TARGET_VERSION,
+      toVersion: TARGET_VERSION,
+    });
+    assert.equal(db.pragma("integrity_check", { simple: true }), "ok");
     assert.deepEqual(db.pragma("foreign_key_check"), []);
   } finally {
     db.close();

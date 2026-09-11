@@ -1,0 +1,137 @@
+{
+  "fixtureVersion": 1,
+  "id": "fm-01-chinese",
+  "coverage": ["chinese"],
+  "sessionId": "session-fm-01",
+  "request": {
+    "inputHash": "d63912dfcb8a5c670c9edb64d751c998257a34a1d65f71d88396e042fbfa5bca",
+    "allowedSegmentIds": ["seg-fm-01-1", "seg-fm-01-2"],
+    "allowedOwnerLabels": ["SELF", "P1"],
+    "allowedLearningGoalIds": [],
+    "cloudPayload": {
+      "inputVersion": "jarvis-analysis-input-v3",
+      "segments": [
+        {
+          "segmentId": "seg-fm-01-1",
+          "startedAt": 1000,
+          "endedAt": 2400,
+          "speakerLabel": "SELF",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.96,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "我们决定周五前完成发布说明。"
+        },
+        {
+          "segmentId": "seg-fm-01-2",
+          "startedAt": 2500,
+          "endedAt": 3900,
+          "speakerLabel": "P1",
+          "applicationKey": "teams",
+          "sourceAttribution": "application_and_microphone",
+          "activityCategory": "work_meeting",
+          "activityConfidence": 0.96,
+          "activityDecision": "adopted",
+          "selfParticipated": true,
+          "memoryMode": "full",
+          "allowedSuggestionBases": ["work_context"],
+          "todoCandidateAllowed": true,
+          "text": "我会复核测试结果。"
+        }
+      ],
+      "omittedRanges": []
+    }
+  },
+  "attempts": [
+    {
+      "attemptId": "attempt-fm-01-1",
+      "expectedDisposition": "accepted",
+      "expectedErrorCode": null,
+      "modelArguments": {
+        "schemaVersion": "jarvis-analysis-v3",
+        "sessionSummary": {
+          "title": "发布准备",
+          "summary": "讨论确定了发布说明和测试复核安排。",
+          "evidenceSegmentIds": ["seg-fm-01-1", "seg-fm-01-2"]
+        },
+        "memories": [
+          {
+            "kind": "decision",
+            "title": "发布说明截止时间",
+            "body": "发布说明计划在周五前完成。",
+            "confidence": 0.98,
+            "evidenceSegmentIds": ["seg-fm-01-1"]
+          }
+        ],
+        "topics": [
+          {
+            "name": "发布准备",
+            "summary": "发布说明编写和测试结果复核。",
+            "evidenceSegmentIds": ["seg-fm-01-1", "seg-fm-01-2"]
+          }
+        ],
+        "todos": [
+          {
+            "title": "周五前完成发布说明",
+            "ownerLabel": "SELF",
+            "dueText": "周五",
+            "semanticConfidence": 0.97,
+            "evidenceSegmentIds": ["seg-fm-01-1"],
+            "actionKind": "self_commitment",
+            "assignmentSegmentIds": [],
+            "acceptanceSegmentIds": []
+          }
+        ],
+        "suggestions": [
+          {
+            "title": "先核对发布清单",
+            "rationale": "发布说明已有明确截止时间，先核对清单可减少遗漏。",
+            "basis": "work_context",
+            "learningGoalId": null,
+            "basedOnEvidenceSegmentIds": ["seg-fm-01-1"]
+          }
+        ]
+      }
+    }
+  ],
+  "logs": [
+    {
+      "requestId": "request-fm-01",
+      "inputHash": "d63912dfcb8a5c670c9edb64d751c998257a34a1d65f71d88396e042fbfa5bca",
+      "requestBytes": 1024,
+      "responseBytes": 768,
+      "durationMs": 12,
+      "model": "MiniMax-M2.7",
+      "inputTokens": 90,
+      "outputTokens": 110
+    }
+  ],
+  "rendered": {
+    "memories": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-01",
+        "sourceSegmentId": "seg-fm-01-1"
+      }
+    ],
+    "topics": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-01",
+        "sourceSegmentId": "seg-fm-01-1"
+      }
+    ],
+    "todos": [
+      {
+        "outputIndex": 0,
+        "sourceSessionId": "session-fm-01",
+        "sourceSegmentId": "seg-fm-01-1"
+      }
+    ]
+  }
+}

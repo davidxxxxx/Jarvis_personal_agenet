@@ -3,11 +3,14 @@ import {
   BrainCircuit,
   CalendarDays,
   CheckSquare2,
+  AlertTriangle,
   LockKeyhole,
   MessageSquareText,
   HardDrive,
   UsersRound,
+  X,
 } from "lucide-react";
+import MeetingRecordingMount from "../../components/MeetingRecordingMount";
 import { useJarvisStore, type JarvisView } from "./jarvisStore";
 import { useJarvisRecording } from "./useJarvisRecording";
 import JarvisTitleBar from "./JarvisTitleBar";
@@ -35,6 +38,9 @@ export default function JarvisShell() {
   const recording = useJarvisRecording();
   const selectedView = useJarvisStore((state) => state.selectedView);
   const setSelectedView = useJarvisStore((state) => state.setSelectedView);
+  const openSession = useJarvisStore((state) => state.openSession);
+  const evidenceNavigation = useJarvisStore((state) => state.evidenceNavigation);
+  const clearEvidenceNavigation = useJarvisStore((state) => state.clearEvidenceNavigation);
 
   const captureActive = ["recording", "degraded", "paused", "finalizing"].includes(
     recording.session.status
@@ -43,7 +49,7 @@ export default function JarvisShell() {
     selectedView === "people" ? (
       <PeopleView />
     ) : selectedView === "topics" ? (
-      <TopicsView />
+      <TopicsView onOpenSession={openSession} />
     ) : selectedView === "todos" ? (
       <TodosView />
     ) : selectedView === "memory" ? (
@@ -51,15 +57,46 @@ export default function JarvisShell() {
     ) : selectedView === "storage" ? (
       <JarvisStorageSettings captureActive={captureActive} />
     ) : (
-      <TodayView recording={recording} />
+      <TodayView
+        recording={recording}
+        onOpenSession={openSession}
+        onViewAllTodos={() => setSelectedView("todos")}
+      />
     );
 
   return (
     <div className="grid h-screen grid-rows-[40px_minmax(0,1fr)] overflow-hidden bg-background text-foreground">
+      <MeetingRecordingMount />
       <JarvisTitleBar />
+      {evidenceNavigation.phase === "failed" && (
+        <div
+          role="alert"
+          className="fixed right-4 top-12 z-[70] flex max-w-sm items-start gap-2 rounded-xl border border-amber-300 bg-background p-3 shadow-lg"
+        >
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">无法打开这条来源</p>
+            <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+              {evidenceNavigation.code === "evidence_not_found"
+                ? "这条来源已不存在或已被安全清理，其他录音和文字不受影响。"
+                : evidenceNavigation.code === "session_unavailable"
+                  ? "对应会话暂时无法读取，请稍后从记忆库重试。"
+                  : "来源导航暂时失败，请稍后重试；已保存的数据不会丢失。"}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={clearEvidenceNavigation}
+            aria-label="关闭来源导航错误"
+            className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <X className="size-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      )}
       <div
         data-testid="jarvis-shell"
-        className="grid min-h-0 grid-cols-1 auto-rows-max overflow-y-auto bg-background text-foreground lg:grid-cols-[176px_minmax(420px,1fr)_320px] lg:grid-rows-1 lg:overflow-hidden"
+        className="grid min-h-0 grid-cols-1 auto-rows-max overflow-y-auto bg-background text-foreground lg:grid-cols-[176px_minmax(420px,1fr)_380px] lg:grid-rows-1 lg:overflow-hidden"
       >
         <nav
           className="flex min-h-0 flex-row border-b border-border/40 bg-card/40 px-3 py-3 lg:flex-col lg:border-b-0 lg:border-r lg:py-4"

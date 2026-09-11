@@ -75,6 +75,7 @@ test("unsigned Windows wrapper disables all certificate auto-discovery without a
     "--win",
     "--config",
     path.join(appRoot, "electron-builder.unsigned-win.json"),
+    `--config.directories.output=${path.join(appRoot, "dist")}`,
   ]);
 });
 
@@ -89,10 +90,7 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
   const artifactRoot = path.join(appRoot, "dist");
   const signedResult = {
     status: 0,
-    stdout: JSON.stringify([
-      { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "Valid" },
-      { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
-    ]),
+    stdout: JSON.stringify([{ name: `Jarvis Memory Setup ${appVersion}.exe`, status: "Valid" }]),
   };
 
   assert.throws(
@@ -117,7 +115,6 @@ test("unsigned wrapper rejects a signed or unverifiable final executable", () =>
         status: 0,
         stdout: JSON.stringify([
           { name: `Jarvis Memory Setup ${appVersion}.exe`, status: "NotSigned" },
-          { name: `Jarvis Memory ${appVersion}.exe`, status: "NotSigned" },
         ]),
       }),
     })
@@ -147,6 +144,29 @@ test("package safety redacts credentials embedded in ordinary loose JavaScript",
       () => assertSafeArtifactTree(root),
       (error) => {
         assert.match(error.message, /credential content.*openai/i);
+        assert.doesNotMatch(error.message, new RegExp(secret));
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("package safety rejects Hugging Face tokens without exposing their contents", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "jarvis-package-hugging-face-"));
+  const secret = `hf_${"H".repeat(34)}`;
+  const relativePath = "ordinary.js";
+  fs.writeFileSync(path.join(root, relativePath), `export const token = "${secret}";`);
+
+  try {
+    assert.throws(
+      () => assertSafeArtifactTree(root),
+      (error) => {
+        assert.equal(
+          error.message,
+          `credential content (hugging-face) found [redacted]: ${relativePath}`
+        );
         assert.doesNotMatch(error.message, new RegExp(secret));
         return true;
       }

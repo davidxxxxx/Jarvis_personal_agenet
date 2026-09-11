@@ -52,8 +52,9 @@ function runtime(vectors) {
   };
 }
 
-function serviceHarness({ primaryVectors, reviewVectors } = {}) {
+function serviceHarness({ primaryVectors, reviewVectors, speechDurations } = {}) {
   let now = 1_000;
+  let speechWindow = 0;
   const primary = runtime(
     primaryVectors ?? [vector(0, 1), vector(0, 2), vector(0, 3)]
   );
@@ -66,7 +67,7 @@ function serviceHarness({ primaryVectors, reviewVectors } = {}) {
     reviewSpeakerEmbeddings: review,
     speechDurationMeasurer: {
       async measureSpeechMs() {
-        return 10_000;
+        return speechDurations?.[speechWindow++] ?? 10_000;
       },
     },
     voiceProfileStore: {
@@ -160,6 +161,29 @@ test("production enrollment accepts one physical microphone sample set in both m
   );
 });
 
+test("dual enrollment accepts natural pauses but rejects a mostly silent sample window", async () => {
+  const accepted = serviceHarness({ speechDurations: [7_000, 6_500, 7_000] });
+  const acceptedResult = await accepted.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: accepted.session.sessionId,
+    payload: payload(),
+  });
+  assert.equal(acceptedResult.status, "accepted");
+  assert.equal(acceptedResult.acceptedSpeechMs, 20_500);
+  assert.equal(accepted.saved.length, 1);
+
+  const rejected = serviceHarness({ speechDurations: [10_000, 4_999, 10_000] });
+  const rejectedResult = await rejected.service.complete({
+    ownerId: OWNER_ID,
+    sessionId: rejected.session.sessionId,
+    payload: payload(),
+  });
+  assert.equal(rejectedResult.status, "insufficient_speech");
+  assert.equal(rejectedResult.acceptedSpeechMs, 24_999);
+  assert.deepEqual(rejectedResult.sampleSpeechMs, [10_000, 4_999, 10_000]);
+  assert.equal(rejected.saved.length, 0);
+});
+
 test("production enrollment rejects virtual microphones before running either model", async () => {
   const harness = serviceHarness();
   const input = payload("SteelSeries Sonar - Microphone");
@@ -209,4 +233,14 @@ test("dual enrollment persistence is atomic and encrypted at rest", (t) => {
     .all()
     .map((row) => ({ id: row.id, embedding: Buffer.from(row.embedding) }));
   assert.deepEqual(after, before);
+
+  assert.throws(
+    () =>
+      store.saveDualEnrollment({
+        ...dualEnrollment(),
+        sampleSpeechMs: [10_000, 4_999, 10_000],
+        acceptedSpeechMs: 24_999,
+      }),
+    /evidence policy/
+  );
 });

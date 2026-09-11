@@ -6,10 +6,15 @@ const {
   evaluateSpeakerIdentityRelease,
 } = require("./SpeakerIdentityReleaseGate");
 
+const SELF_ENROLLMENT_MINIMUM_SAMPLES = 3;
+const SELF_ENROLLMENT_MINIMUM_SPEECH_MS = 15_000;
+const SELF_ENROLLMENT_MINIMUM_CONSISTENCY = 0.88;
+
 function unknown(reason, evidence = {}) {
   return {
     state: "unknown",
     candidatePersonId: evidence.candidatePersonId ?? null,
+    candidatePersonRef: evidence.candidatePersonRef ?? null,
     score: evidence.score ?? null,
     margin: evidence.margin ?? null,
     reason,
@@ -38,20 +43,21 @@ function cosine(left, right) {
 function profileCentroids(samples, manifest, rejected) {
   const grouped = new Map();
   for (const sample of samples) {
+    const candidatePersonRef = sample?.candidatePersonRef ?? sample?.personId;
     if (
       !sample ||
       sample.modelId !== manifest.modelId ||
-      typeof sample.personId !== "string" ||
-      !sample.personId ||
-      rejected.has(sample.personId)
+      typeof candidatePersonRef !== "string" ||
+      !candidatePersonRef ||
+      rejected.has(candidatePersonRef)
     ) {
       continue;
     }
     const embedding = normalize(sample.embedding, manifest.embeddingDimension);
     if (!embedding) continue;
-    const list = grouped.get(sample.personId) ?? [];
+    const list = grouped.get(candidatePersonRef) ?? [];
     list.push(embedding);
-    grouped.set(sample.personId, list);
+    grouped.set(candidatePersonRef, list);
   }
   const result = new Map();
   for (const [personId, embeddings] of grouped) {
@@ -67,14 +73,14 @@ function profileCentroids(samples, manifest, rejected) {
 }
 
 function rankStage(observed, centroids, manifest) {
-  const ranked = [...centroids].map(([personId, embedding]) => ({
-    personId,
+  const ranked = [...centroids].map(([candidatePersonRef, embedding]) => ({
+    candidatePersonRef,
     score: cosine(observed, embedding),
   }));
   ranked.sort(
     (left, right) =>
       right.score - left.score ||
-      left.personId.localeCompare(right.personId, "en")
+      left.candidatePersonRef.localeCompare(right.candidatePersonRef, "en")
   );
   if (ranked.length === 0) return null;
   const top = ranked[0];
@@ -83,13 +89,90 @@ function rankStage(observed, centroids, manifest) {
     modelId: manifest.modelId,
     artifactVersion: manifest.artifactVersion,
     embeddingSpace: manifest.embeddingSpace,
-    candidatePersonId: top.personId,
+    candidatePersonRef: top.candidatePersonRef,
     similarity: top.score,
     margin: Math.max(0, margin),
     passed:
       top.score >= manifest.thresholds.similarity &&
       margin >= manifest.thresholds.margin,
   });
+}
+
+function candidateMetadata(samples, candidatePersonRef) {
+  const matching = samples.filter(
+    (sample) => (sample?.candidatePersonRef ?? sample?.personId) === candidatePersonRef
+  );
+  const personIds = [
+    ...new Set(
+      matching
+        .map((sample) => sample?.personId)
+        .filter((personId) => typeof personId === "string" && personId)
+    ),
+  ];
+  return {
+    candidatePersonId: personIds.length === 1 ? personIds[0] : null,
+    isSelf:
+      personIds.length === 1 &&
+      matching.some(
+        (sample) => sample?.personId === personIds[0] && sample?.isSelf === true
+      ),
+  };
+}
+
+function enrollmentConsistency(samples, candidatePersonRef, manifest) {
+  const enrolled = samples.filter(
+    (sample) =>
+      (sample?.candidatePersonRef ?? sample?.personId) === candidatePersonRef &&
+      sample?.isSelf === true &&
+      sample?.sourceKind === "enrollment" &&
+      sample?.modelId === manifest.modelId
+  );
+  if (
+    enrolled.length < SELF_ENROLLMENT_MINIMUM_SAMPLES ||
+    enrolled.reduce(
+      (total, sample) =>
+        total + (Number.isSafeInteger(sample.speechMs) ? sample.speechMs : 0),
+      0
+    ) < SELF_ENROLLMENT_MINIMUM_SPEECH_MS ||
+    enrolled.reduce(
+      (total, sample) =>
+        total + (Number.isSafeInteger(sample.windowCount) ? sample.windowCount : 0),
+      0
+    ) < SELF_ENROLLMENT_MINIMUM_SAMPLES
+  ) {
+    return null;
+  }
+  const vectors = enrolled
+    .map((sample) => normalize(sample.embedding, manifest.embeddingDimension))
+    .filter(Boolean);
+  if (vectors.length !== enrolled.length) return null;
+  const sum = new Float32Array(manifest.embeddingDimension);
+  for (const vector of vectors) {
+    for (let index = 0; index < sum.length; index += 1) sum[index] += vector[index];
+  }
+  const centroid = normalize(sum, manifest.embeddingDimension);
+  sum.fill(0);
+  if (!centroid) return null;
+  return Math.min(...vectors.map((vector) => cosine(vector, centroid)));
+}
+
+function hasTrustedSelfEnrollment(samples, candidatePersonRef, primaryManifest, reviewManifest) {
+  const primaryConsistency = enrollmentConsistency(
+    samples,
+    candidatePersonRef,
+    primaryManifest
+  );
+  const reviewConsistency = enrollmentConsistency(
+    samples,
+    candidatePersonRef,
+    reviewManifest
+  );
+  return (
+    primaryConsistency !== null &&
+    reviewConsistency !== null &&
+    primaryConsistency >= SELF_ENROLLMENT_MINIMUM_CONSISTENCY &&
+    reviewConsistency >= SELF_ENROLLMENT_MINIMUM_CONSISTENCY
+  );
 }
 
 function observedStage(cluster, role, manifest) {
@@ -165,17 +248,39 @@ class DualSpeakerIdentityResolver {
     );
     if (!primary || !review) return unknown("no_dual_candidate");
     const models = { primary, review };
-    if (primary.candidatePersonId !== review.candidatePersonId) {
+    if (primary.candidatePersonRef !== review.candidatePersonRef) {
       return unknown("models_disagree", { models });
     }
+    const candidate = candidateMetadata(samples, primary.candidatePersonRef);
+    const candidatePersonRef = primary.candidatePersonRef;
     const evidence = {
-      candidatePersonId: primary.candidatePersonId,
+      candidatePersonId: candidate.candidatePersonId,
+      candidatePersonRef,
       score: Math.min(primary.similarity, review.similarity),
       margin: Math.min(primary.margin, review.margin),
       models,
     };
     if (!primary.passed) return unknown("primary_gate_failed", evidence);
     if (!review.passed) return unknown("review_gate_failed", evidence);
+    if (candidate.candidatePersonId === null) {
+      return unknown("dual_model_anonymous_profile", evidence);
+    }
+    if (
+      candidate.isSelf &&
+      cluster.sourceKind === "mic" &&
+      hasTrustedSelfEnrollment(
+        samples,
+        candidatePersonRef,
+        this.primaryManifest,
+        this.reviewManifest
+      )
+    ) {
+      return {
+        state: "confirmed",
+        ...evidence,
+        reason: "dual_model_self_enrollment_confirmed",
+      };
+    }
     if (!this.release.automaticAssociationEnabled) {
       return {
         state: "suggested",
@@ -193,3 +298,4 @@ class DualSpeakerIdentityResolver {
 
 module.exports = DualSpeakerIdentityResolver;
 module.exports.profileCentroids = profileCentroids;
+module.exports.hasTrustedSelfEnrollment = hasTrustedSelfEnrollment;

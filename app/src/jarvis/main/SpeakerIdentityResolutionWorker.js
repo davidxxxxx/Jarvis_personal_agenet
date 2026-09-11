@@ -5,6 +5,8 @@ const {
   assertExactIdentityResolutionPolicy,
   parseIdentityResolutionJobKey,
 } = require("./SpeakerIdentityResolutionPolicy");
+const { SESSION_DIARIZATION_POLICY } = require("./SessionDiarizationPolicy");
+const { clusterAnonymousSpeakers } = require("./AnonymousSpeakerClusterer");
 
 function codedError(code) {
   const error = new Error(code);
@@ -39,6 +41,24 @@ function compareClusters(left, right) {
   );
 }
 
+function anonymousSourceGroup(cluster) {
+  if (typeof cluster?.applicationKey === "string" && cluster.applicationKey.trim()) {
+    return `application:${cluster.applicationKey.trim().toLocaleLowerCase()}`;
+  }
+  if (cluster?.trackKind === "mic") return "microphone";
+  if (cluster?.trackKind === "system_mix") return "system_mix";
+  return null;
+}
+
+function canReplaceWeakCandidate(result) {
+  return new Set([
+    "primary_gate_failed",
+    "review_gate_failed",
+    "models_disagree",
+    "no_dual_candidate",
+  ]).has(result?.reason);
+}
+
 class SpeakerIdentityResolutionWorker {
   constructor({
     repository,
@@ -46,6 +66,7 @@ class SpeakerIdentityResolutionWorker {
     dualEvidenceProvider = null,
     dualResolver = null,
     policy = SPEAKER_IDENTITY_RESOLUTION_POLICY,
+    diarizationPolicy = SESSION_DIARIZATION_POLICY,
     clock = Date.now,
     yieldToEventLoop = defaultYieldToEventLoop,
   } = {}) {
@@ -74,6 +95,13 @@ class SpeakerIdentityResolutionWorker {
     }
     assertExactIdentityResolutionPolicy(policy);
     assertExactIdentityResolutionPolicy(resolver.policy);
+    if (
+      !diarizationPolicy ||
+      typeof diarizationPolicy.policyId !== "string" ||
+      !new Set([1, 2]).has(diarizationPolicy.inputVersion)
+    ) {
+      throw new TypeError("a versioned diarizationPolicy is required");
+    }
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     if (typeof yieldToEventLoop !== "function") {
       throw new TypeError("yieldToEventLoop must be a function");
@@ -83,6 +111,7 @@ class SpeakerIdentityResolutionWorker {
     this.dualEvidenceProvider = dualEvidenceProvider;
     this.dualResolver = dualResolver;
     this.policy = policy;
+    this.diarizationPolicy = diarizationPolicy;
     this.clock = clock;
     this.yieldToEventLoop = yieldToEventLoop;
   }
@@ -122,8 +151,17 @@ class SpeakerIdentityResolutionWorker {
       sessionId: identity.sessionId,
       at: this.clock(),
       policy: this.policy,
+      diarizationPolicy: this.diarizationPolicy,
     });
-    if (!snapshot.eligible) throw codedError("IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE");
+    if (!snapshot.eligible) {
+      const error = codedError(
+        snapshot.dependencyState === "terminal"
+          ? "IDENTITY_RESOLUTION_DEPENDENCY_FAILED"
+          : "IDENTITY_RESOLUTION_DEPENDENCY_INCOMPLETE"
+      );
+      error.dependencyReason = snapshot.reason;
+      throw error;
+    }
     if (
       snapshot.diarizationRevision !== identity.diarizationRevision ||
       snapshot.profileRevision !== identity.profileRevision
@@ -138,71 +176,117 @@ class SpeakerIdentityResolutionWorker {
     const rejectedByCluster = new Map();
     const clusters = [...snapshot.clusters].sort(compareClusters);
     const results = [];
-    for (let index = 0; index < clusters.length; index += 1) {
-      const cluster = clusters[index];
-      const rejectedPersonIds = this.repository.listRejectedSpeakerPersonIds(
-        cluster.clusterId,
-        revision
-      );
-      rejectedByCluster.set(cluster.clusterId, rejectedPersonIds);
-      let result;
-      if (this.dualEvidenceProvider === null) {
-        result = this.resolver.resolveCluster({
-          cluster,
-          samples: snapshot.samples,
-          rejectedPersonIds,
-        });
-      } else {
-        const evidence = await this.dualEvidenceProvider.buildClusterEvidence({
-          sessionId: identity.sessionId,
-          evidenceRunId: cluster.evidenceRunId,
-          clusterId: cluster.clusterId,
-          createdAt: this.clock(),
-        });
-        if (!evidence.eligible) {
-          result = {
-            candidatePersonId: null,
-            state: "unknown",
-            score: null,
-            margin: null,
-            reason: evidence.reason,
-          };
+    const anonymousEvidence = [];
+    try {
+      for (let index = 0; index < clusters.length; index += 1) {
+        const cluster = clusters[index];
+        const rejectedPersonIds = this.repository.listRejectedSpeakerPersonIds(
+          cluster.clusterId,
+          revision
+        );
+        rejectedByCluster.set(cluster.clusterId, rejectedPersonIds);
+        let result;
+        if (this.dualEvidenceProvider === null) {
+          result = this.resolver.resolveCluster({
+            cluster,
+            samples: snapshot.samples,
+            rejectedPersonIds,
+          });
         } else {
-          try {
-            result = this.dualResolver.resolveCluster({
-              cluster: {
-                ...cluster,
-                attributionState: evidence.attributionState,
-                overlapDetected: evidence.overlapDetected,
-                echoDetected: evidence.echoDetected,
-                speechMs: evidence.speechMs,
-                windowCount: evidence.windowCount,
-                qualityScore: evidence.qualityScore,
-                models: evidence.models,
-              },
-              samples: snapshot.samples,
-              rejectedPersonIds,
-            });
-          } finally {
-            for (const model of Object.values(evidence.models ?? {})) {
-              model?.embedding?.fill?.(0);
+          const evidence = await this.dualEvidenceProvider.buildClusterEvidence({
+            sessionId: identity.sessionId,
+            evidenceRunId: cluster.evidenceRunId,
+            clusterId: cluster.clusterId,
+            createdAt: this.clock(),
+          });
+          if (!evidence.eligible) {
+            result = {
+              candidatePersonId: null,
+              state: "unknown",
+              score: null,
+              margin: null,
+              reason: evidence.reason,
+            };
+          } else {
+            try {
+              result = this.dualResolver.resolveCluster({
+                cluster: {
+                  ...cluster,
+                  sourceKind: evidence.sourceKind,
+                  attributionState: evidence.attributionState,
+                  overlapDetected: evidence.overlapDetected,
+                  echoDetected: evidence.echoDetected,
+                  speechMs: evidence.speechMs,
+                  windowCount: evidence.windowCount,
+                  qualityScore: evidence.qualityScore,
+                  models: evidence.models,
+                },
+                samples: snapshot.samples,
+                rejectedPersonIds,
+              });
+              if (
+                result.state === "unknown" &&
+                (!result.candidatePersonRef || canReplaceWeakCandidate(result))
+              ) {
+                anonymousEvidence.push({
+                  clusterId: cluster.clusterId,
+                  trackId: cluster.trackId,
+                  sourceGroup: anonymousSourceGroup(cluster),
+                  speechMs: evidence.speechMs,
+                  windowCount: evidence.windowCount,
+                  qualityScore: evidence.qualityScore,
+                  models: {
+                    primary: Float32Array.from(evidence.models.primary.embedding),
+                    review: Float32Array.from(evidence.models.review.embedding),
+                  },
+                });
+              }
+            } finally {
+              for (const model of Object.values(evidence.models ?? {})) {
+                model?.embedding?.fill?.(0);
+              }
             }
           }
         }
+        results.push({
+          evidenceRunId: cluster.evidenceRunId,
+          clusterId: cluster.clusterId,
+          candidatePersonId: result.candidatePersonId,
+          ...(result.candidatePersonRef
+            ? { candidatePersonRef: result.candidatePersonRef }
+            : {}),
+          state: result.state,
+          score: result.score,
+          margin: result.margin,
+          reason: result.reason,
+          ...(result.models ? { models: result.models } : {}),
+        });
+        await renewLease();
+        if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
+          await this.yieldToEventLoop();
+        }
       }
-      results.push({
-        evidenceRunId: cluster.evidenceRunId,
-        clusterId: cluster.clusterId,
-        candidatePersonId: result.candidatePersonId,
-        state: result.state,
-        score: result.score,
-        margin: result.margin,
-        reason: result.reason,
-        ...(result.models ? { models: result.models } : {}),
-      });
-      await renewLease();
-      if ((index + 1) % CLUSTER_BATCH_SIZE === 0 || index === clusters.length - 1) {
-        await this.yieldToEventLoop();
+
+      const anonymousAssignments = clusterAnonymousSpeakers(anonymousEvidence);
+      for (const result of results) {
+        const assignment = anonymousAssignments.get(result.clusterId);
+        if (
+          !assignment ||
+          result.state !== "unknown" ||
+          (result.candidatePersonRef && !canReplaceWeakCandidate(result))
+        ) {
+          continue;
+        }
+        result.candidatePersonId = null;
+        result.candidatePersonRef = assignment.candidatePersonRef;
+        result.score = assignment.score;
+        result.margin = assignment.margin;
+        result.reason = "dual_model_anonymous_group";
+      }
+    } finally {
+      for (const evidence of anonymousEvidence) {
+        evidence.models.primary.fill(0);
+        evidence.models.review.fill(0);
       }
     }
     await renewLease();
@@ -210,6 +294,7 @@ class SpeakerIdentityResolutionWorker {
       sessionId: identity.sessionId,
       at: this.clock(),
       policy: this.policy,
+      diarizationPolicy: this.diarizationPolicy,
     });
     if (
       !precommit.eligible ||

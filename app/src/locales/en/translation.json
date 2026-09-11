@@ -96,6 +96,7 @@
     "voiceEnrollmentSaved": "Your local voice profile is saved.",
     "voiceEnrollmentPending": "Preparing voice calibration",
     "voiceEnrollmentWindowProgress": "Sample {{current}} of {{total}}",
+    "voiceEnrollmentSpeechDiagnostics": "Detected speech per sample: {{values}} seconds; each sample needs at least {{threshold}} seconds",
     "voiceEnrollmentOutcome": {
       "insufficient_speech": "Not enough voice was detected. Speak clearly for all three ten-second samples and retry.",
       "inconsistent_samples": "The three voice samples were inconsistent. Retry alone in a quieter room.",
@@ -236,6 +237,10 @@
       "keyConfigured": "MiniMax key configured",
       "keyNotConfigured": "MiniMax key not configured",
       "model": "Model: {{model}}",
+      "modelReady": "MiniMax model availability confirmed.",
+      "modelCheckUnavailable": "MiniMax model availability could not be checked. Local recording is unaffected.",
+      "modelUnavailable": "{{model}} is not available for this key. Cloud analysis remains paused.",
+      "modelFallback": "The configured model was unavailable. Jarvis will use {{model}}.",
       "keyLabel": "MiniMax subscription key",
       "saveKey": "Save MiniMax key",
       "removeKey": "Remove MiniMax key",
@@ -305,6 +310,17 @@
         "title": "Separate computer audio by app",
         "description": "Track only apps that are producing sound. Fall back to the system mix without guessing the source.",
         "trackLimit": "Maximum simultaneous app tracks",
+        "fallbackPolicy": "When an app track falls back to mixed system audio",
+        "fallbackPolicies": {
+          "conservative": {
+            "title": "Conservative summary",
+            "description": "Keep mixed audio and the full transcript. Allow only evidence-checkable summaries; block suggestions, todos, and identity learning."
+          },
+          "transcript_only": {
+            "title": "Transcript only",
+            "description": "Keep mixed audio and the full transcript. Block summaries, suggestions, todos, and identity learning."
+          }
+        },
         "runtime": "Recording {{active}} app tracks (limit {{limit}}) · {{fallback}} sources degraded",
         "idle": "Starts with the next recording; full-screen games keep at most two app tracks."
       },

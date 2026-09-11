@@ -92,6 +92,38 @@ test("every drain remains gated until incomplete-budget recovery succeeds", asyn
   ]);
 });
 
+test("explicit startup recovery gates direct cloud producers without claiming queued work", async () => {
+  const AgentCloudDispatcher = loadDispatcher();
+  const calls = [];
+  const dispatcher = new AgentCloudDispatcher({
+    store: {
+      recoverExpiredCloudCandidateLeases: () => {
+        calls.push("recover_candidates");
+        return [];
+      },
+      recoverExpiredCloudPrestartLeases: () => [],
+      claimCloudJobs: () => {
+        calls.push("claim");
+        return [];
+      },
+    },
+    worker: {
+      recoverCandidate: () => {},
+      execute: () => {},
+    },
+    recoverIncompleteBudgetAttempts: () => {
+      calls.push("recover_budget");
+      return { releasedCount: 0, usageUnknownCount: 0 };
+    },
+    owner: "cloud-worker",
+  });
+
+  await dispatcher.recoverStartup();
+  assert.deepEqual(calls, ["recover_budget"]);
+  await dispatcher.start();
+  assert.deepEqual(calls, ["recover_budget", "recover_candidates", "claim"]);
+});
+
 test("concurrent drains perform exactly one active cloud request", async () => {
   const AgentCloudDispatcher = loadDispatcher();
   const release = deferred();

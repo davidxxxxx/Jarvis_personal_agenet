@@ -71,6 +71,7 @@ export default function VoiceEnrollment() {
     JarvisVoiceEnrollmentOutcome,
     "accepted"
   > | null>(null);
+  const [speechDiagnostics, setSpeechDiagnostics] = useState<number[] | null>(null);
   const mountedRef = useRef(true);
   const operationRef = useRef(false);
   const chunksRef = useRef<Float32Array[]>([]);
@@ -202,6 +203,7 @@ export default function VoiceEnrollment() {
     operationRef.current = true;
     setState("setup");
     setErrorOutcome(null);
+    setSpeechDiagnostics(null);
     setLevel(0);
     setSecondsLeft(RECORDING_SECONDS);
     dropChunks();
@@ -301,6 +303,7 @@ export default function VoiceEnrollment() {
     if (mountedRef.current) {
       setSecondsLeft(RECORDING_SECONDS);
       setErrorOutcome(null);
+      setSpeechDiagnostics(null);
       setState("idle");
     }
     operationRef.current = false;
@@ -348,11 +351,21 @@ export default function VoiceEnrollment() {
         await refreshProfileStatus();
       } else if (mountedRef.current) {
         setErrorOutcome(enrollment.status === "accepted" ? null : enrollment.status);
+        setSpeechDiagnostics(
+          enrollment.status !== "accepted" &&
+            Array.isArray(enrollment.sampleSpeechMs) &&
+            enrollment.sampleSpeechMs.length === 3
+            ? enrollment.sampleSpeechMs
+            : null
+        );
         setState("error");
       }
     } catch {
       await cleanupCapture({ cancelSession: true, flush: false });
-      if (mountedRef.current) setState("error");
+      if (mountedRef.current) {
+        setSpeechDiagnostics(null);
+        setState("error");
+      }
     } finally {
       for (const entry of payload.windows) entry.samples.fill(0);
       samples.fill(0);
@@ -426,6 +439,15 @@ export default function VoiceEnrollment() {
           {errorOutcome
             ? t(`jarvis.voiceEnrollmentOutcome.${errorOutcome}`)
             : t("jarvis.voiceEnrollmentError")}
+          {errorOutcome === "insufficient_speech" && speechDiagnostics ? (
+            <>
+              <br />
+              {t("jarvis.voiceEnrollmentSpeechDiagnostics", {
+                values: speechDiagnostics.map((value) => (value / 1_000).toFixed(1)).join(" / "),
+                threshold: "5.0",
+              })}
+            </>
+          ) : null}
         </p>
       )}
       {state === "saved" && (

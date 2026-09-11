@@ -38,7 +38,8 @@ function createServiceHarness() {
       calls.push(["close-interval", id, at]);
       return { changes: 1 };
     },
-    setTrackState: (id, state, at) => calls.push(["track-state", id, state, at]),
+    setTrackState: (id, state, at, failureCode) =>
+      calls.push(["track-state", id, state, at, failureCode]),
   };
   return { service, calls };
 }
@@ -117,9 +118,13 @@ test("attribution transitions use the system mix for fallback and app track for 
     null,
     "fallback evidence must never persist a guessed application source"
   );
+  assert.equal(intervals[0][1].attemptedApplicationKey, "kook");
+  assert.equal(intervals[0][1].attemptedApplicationDisplayName, "KOOK");
   assert.equal(intervals[1][1].trackId, track.trackId);
   assert.equal(intervals[1][1].intervalKind, "application_active");
   assert.equal(intervals[1][1].applicationKey, "kook");
+  assert.equal(intervals[1][1].reason, null);
+  assert.equal(intervals[1][1].failureCode, null);
   assert.deepEqual(
     calls.find((entry) => entry[0] === "close-interval").slice(1),
     ["interval-1", 3_000]
@@ -174,4 +179,40 @@ test("ending an app track preserves mixed fallback until the application becomes
     ),
     true
   );
+});
+
+test("capture failures persist a safe concrete code on fallback evidence and failed tracks", () => {
+  const { service, calls } = createServiceHarness();
+  service.startApplicationAudioTrack({
+    sessionId: "session-1",
+    applicationKey: "chrome",
+    applicationDisplayName: "Chrome",
+    captureGeneration: 7,
+    startedAt: 2_000,
+  });
+  service.recordApplicationAudioAttribution({
+    sessionId: "session-1",
+    applicationKey: "chrome",
+    captureGeneration: 7,
+    attributionState: "mixed_unknown",
+    at: 2_500,
+    reason: "activation_failed",
+    failureCode: "activation_failed_0x88890004",
+  });
+  service.stopApplicationAudioTrack({
+    sessionId: "session-1",
+    applicationKey: "chrome",
+    captureGeneration: 7,
+    endedAt: 3_000,
+    state: "failed",
+    failureCode: "activation_failed_0x88890004",
+  });
+
+  const interval = calls.find((entry) => entry[0] === "create-interval")[1];
+  assert.equal(interval.failureCode, "activation_failed_0x88890004");
+  assert.deepEqual(calls.find((entry) => entry[0] === "track-state").slice(2), [
+    "failed",
+    3_000,
+    "activation_failed_0x88890004",
+  ]);
 });

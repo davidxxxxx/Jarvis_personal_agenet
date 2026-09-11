@@ -2,10 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 
-const {
-  applyJarvisMigrations,
-  TARGET_VERSION,
-} = require("../../src/jarvis/main/JarvisMigrations");
+const { applyJarvisMigrations, TARGET_VERSION } = require("../../src/jarvis/main/JarvisMigrations");
 
 const V34_TABLES = [
   "speaker_cluster_model_embeddings",
@@ -16,13 +13,11 @@ const V34_TABLES = [
 test("v34 adds encrypted dual-speaker evidence and activity classification history", () => {
   const db = new Database(":memory:");
   try {
-    assert.equal(TARGET_VERSION, 34);
+    assert.ok(TARGET_VERSION >= 34);
     applyJarvisMigrations(db);
     for (const table of V34_TABLES) {
       assert.ok(
-        db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-          .get(table),
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table),
         `${table} should exist`
       );
     }
@@ -45,13 +40,14 @@ test("v33 upgrades in place to v34 without changing existing sessions", () => {
       PRAGMA user_version = 33;
     `);
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 33, toVersion: 34 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: 33,
+      toVersion: TARGET_VERSION,
+    });
     assert.ok(db.prepare("SELECT 1 FROM sessions WHERE id = 'preserved-v33'").get());
     for (const table of V34_TABLES) {
       assert.ok(
-        db
-          .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-          .get(table)
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
       );
     }
     assert.deepEqual(db.pragma("foreign_key_check"), []);
@@ -161,7 +157,10 @@ test("v34 upgrades the existing shared budget price parent without breaking its 
     `);
     db.pragma("foreign_keys = ON");
 
-    assert.deepEqual(applyJarvisMigrations(db), { fromVersion: 33, toVersion: 34 });
+    assert.deepEqual(applyJarvisMigrations(db), {
+      fromVersion: 33,
+      toVersion: TARGET_VERSION,
+    });
     assert.deepEqual(
       db
         .prepare(

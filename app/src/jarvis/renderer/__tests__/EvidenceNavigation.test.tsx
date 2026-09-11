@@ -35,6 +35,7 @@ function context(id: string): JarvisEvidenceContext {
     endedAt: 2_500,
     quoteText: `quote-${id}`,
     audioState: "available",
+    actionAttribution: null,
   };
 }
 
@@ -85,6 +86,24 @@ describe("evidence navigation store", () => {
       code: "evidence_not_found",
     });
     expect(useJarvisStore.getState().selectedSessionId).toBeNull();
+  });
+
+  it("opens an already-known session without forging an evidence handle", () => {
+    useJarvisStore.setState({
+      evidenceNavigation: {
+        phase: "failed",
+        requestId: 4,
+        code: "evidence_navigation_failed",
+      },
+    });
+
+    useJarvisStore.getState().openSession("session-recent");
+
+    expect(useJarvisStore.getState()).toMatchObject({
+      selectedView: "memory",
+      selectedSessionId: "session-recent",
+      evidenceNavigation: { phase: "idle", requestId: 5 },
+    });
   });
 });
 

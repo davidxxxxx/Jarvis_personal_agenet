@@ -3,7 +3,7 @@ const REVISION = /^[0-9a-f]{64}$/;
 const SAFE_POLICY_ID = /^[A-Za-z0-9_./@+-]{1,200}$/;
 
 const SPEAKER_IDENTITY_RESOLUTION_POLICY = Object.freeze({
-  id: "speaker-identity/3dspeaker-campplus-voxceleb-16k-v1@1",
+  id: "speaker-identity/campplus-eres2netv2-dual-zh-cn@2",
   modelId: "3dspeaker-campplus-voxceleb-16k-v1",
   minimumSpeechMs: 12_000,
   minimumWindows: 3,

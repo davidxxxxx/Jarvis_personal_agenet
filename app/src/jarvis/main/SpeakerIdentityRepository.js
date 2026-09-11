@@ -255,6 +255,11 @@ class SpeakerIdentityRepository {
         WHERE session_id = ?
         ORDER BY track_id, local_label, id
       `),
+      listConfirmedSessionClusterIds: db.prepare(`
+        SELECT id FROM speaker_clusters
+        WHERE session_id = ? AND link_state = 'confirmed'
+        ORDER BY id
+      `),
       listClusterSegments: db.prepare(`
         SELECT transcript_segment_id FROM speaker_cluster_segments
         WHERE cluster_id = ? ORDER BY transcript_segment_id
@@ -294,8 +299,11 @@ class SpeakerIdentityRepository {
         ORDER BY correction.created_at DESC, correction.rowid DESC
       `),
       listProfiles: db.prepare(`
-        SELECT * FROM voice_profile_samples
-        WHERE model_id = ? ORDER BY person_id, created_at, id
+        SELECT sample.* FROM voice_profile_samples AS sample
+        LEFT JOIN speaker_identity_review_overrides AS forgotten
+          ON forgotten.person_id = sample.person_id AND forgotten.state = 'forgotten'
+        WHERE sample.model_id = ? AND forgotten.person_id IS NULL
+        ORDER BY sample.person_id, sample.created_at, sample.id
       `),
       deleteClusterModelEmbeddings: db.prepare(`
         DELETE FROM speaker_cluster_model_embeddings WHERE cluster_id = ?
@@ -419,14 +427,26 @@ class SpeakerIdentityRepository {
           AND source_kind = 'user_confirmed'
         LIMIT 1
       `),
-      syncClusterTranscriptProjection: db.prepare(`
+      syncClusterTranscriptPersonProjection: db.prepare(`
         UPDATE transcript_segments
-        SET person_id = @personId,
-            speaker_label = COALESCE(@displayName, speaker_label)
+        SET person_id = @personId
         WHERE id IN (
           SELECT transcript_segment_id FROM speaker_cluster_segments
           WHERE cluster_id = @clusterId
         )
+      `),
+      syncClusterTranscriptLabelProjection: db.prepare(`
+        UPDATE transcript_segments
+        SET speaker_label = @displayName
+        WHERE @displayName IS NOT NULL
+          AND id IN (
+            SELECT transcript_segment_id FROM speaker_cluster_segments
+            WHERE cluster_id = @clusterId
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_input_segments
+            WHERE segment_id = transcript_segments.id
+          )
       `),
       listModelEmbeddings: db.prepare(`
         SELECT embedding FROM speaker_clusters
@@ -446,6 +466,7 @@ class SpeakerIdentityRepository {
         FROM speaker_diarization_runs AS run
         JOIN speaker_diarization_run_clusters AS run_cluster ON run_cluster.run_id = run.id
         WHERE run.session_id = ?
+          AND run_cluster.identity_eligible = 1
         ORDER BY run.id, run_cluster.cluster_id
       `),
       getResolutionRun: db.prepare(`
@@ -595,6 +616,8 @@ class SpeakerIdentityRepository {
         WHERE status IN ('completed','recovered')
           AND id IN (
             SELECT DISTINCT session_id FROM speaker_clusters WHERE model_id = ?
+            UNION
+            SELECT DISTINCT session_id FROM speaker_diarization_runs
           )
           AND (processing_state <> 'processing' OR ready_at IS NOT NULL)
       `),
@@ -762,7 +785,7 @@ class SpeakerIdentityRepository {
           this.statements.updateSystemResolution.run({
             id: row.id,
             candidatePersonId: result.candidatePersonId,
-            candidatePersonRef: result.candidatePersonId,
+            candidatePersonRef: result.candidatePersonRef,
             state: result.state,
             score: result.score,
             margin: result.margin,
@@ -779,6 +802,7 @@ class SpeakerIdentityRepository {
               matchMargin: result.margin,
               updatedAt: input.at,
             });
+            this._syncSystemTranscriptProjection(result);
           }
         }
         return this.statements.listResolutionRunResults.all(existing.id);
@@ -841,7 +865,7 @@ class SpeakerIdentityRepository {
           profileRevision: input.profileRevision,
           policyId: input.policyId,
           candidatePersonId: result.candidatePersonId,
-          candidatePersonRef: result.candidatePersonId,
+          candidatePersonRef: result.candidatePersonRef,
           state: result.state,
           score: result.score,
           margin: result.margin,
@@ -861,6 +885,7 @@ class SpeakerIdentityRepository {
             matchMargin: result.margin,
             updatedAt: input.at,
           });
+          this._syncSystemTranscriptProjection(result);
         }
         rows.push(this.statements.getResolution.get(id));
       }
@@ -1320,6 +1345,10 @@ class SpeakerIdentityRepository {
       lastRejectedPerson: this._mapPersonSummary(rejectedPerson),
       score: row.match_score,
       margin: row.match_margin,
+      candidatePersonRef: resolution?.candidate_person_ref ?? null,
+      speechMs: row.speech_ms,
+      windowCount: row.window_count,
+      qualityScore: row.quality_score,
       reason: this._correctionReason(correction, resolution),
       policyId: resolution?.policy_id ?? "unresolved",
       diarizationRevision: resolution?.diarization_revision ?? "",
@@ -1387,11 +1416,19 @@ class SpeakerIdentityRepository {
   }
 
   _syncTranscriptProjection(clusterId, personId, displayName) {
-    this.statements.syncClusterTranscriptProjection.run({
+    this.statements.syncClusterTranscriptPersonProjection.run({
       clusterId,
       personId,
-      displayName,
     });
+    this.statements.syncClusterTranscriptLabelProjection.run({ clusterId, displayName });
+  }
+
+  _syncSystemTranscriptProjection(result) {
+    const person =
+      result.state === "confirmed" && result.candidatePersonId !== null
+        ? this._requirePerson(result.candidatePersonId)
+        : null;
+    this._syncTranscriptProjection(result.clusterId, person?.id ?? null, person?.display_name ?? null);
   }
 
   _wakeResolvedSessionsForClusterModels(cluster) {
@@ -1564,6 +1601,12 @@ class SpeakerIdentityRepository {
     return this.statements.listSessionClusters
       .all(assertId(sessionId, "sessionId"))
       .map((row) => this._mapCluster(row));
+  }
+
+  listConfirmedSessionClusterIds(sessionId) {
+    return this.statements.listConfirmedSessionClusterIds
+      .all(assertId(sessionId, "sessionId"))
+      .map((row) => row.id);
   }
 
   getClusterView(clusterId) {
@@ -1913,13 +1956,25 @@ class SpeakerIdentityRepository {
           result.candidatePersonId === null || result.candidatePersonId === undefined
             ? null
             : assertId(result.candidatePersonId, "candidatePersonId");
+        const candidatePersonRef =
+          result.candidatePersonRef === null || result.candidatePersonRef === undefined
+            ? candidatePersonId
+            : assertId(result.candidatePersonRef, "candidatePersonRef");
         if (state !== "unknown" && candidatePersonId === null) {
           throw new TypeError("suggested and confirmed resolutions require a candidate person");
+        }
+        if (
+          candidatePersonId !== null &&
+          candidatePersonRef !== null &&
+          candidatePersonRef !== candidatePersonId
+        ) {
+          throw new TypeError("named speaker candidate reference must match its person");
         }
         return {
           evidenceRunId: assertId(result.evidenceRunId, "evidenceRunId"),
           clusterId: assertId(result.clusterId, "clusterId"),
           candidatePersonId,
+          candidatePersonRef,
           state,
           score: assertResolutionScore(result.score, "score"),
           margin: assertResolutionScore(result.margin, "margin", {

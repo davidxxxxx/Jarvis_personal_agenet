@@ -15,6 +15,15 @@ import type {
   JarvisSessionQuery,
   JarvisSessionStatus,
   JarvisActivityClassification,
+  JarvisActivityCategory,
+  JarvisActivityCorrectionResult,
+  JarvisPersonalizationRule,
+  JarvisPersonalizationRuleEdit,
+  JarvisPersonalizationSettings,
+  JarvisLearningGoal,
+  JarvisLearningGoalResult,
+  JarvisNotificationPreferences,
+  JarvisTodoReminder,
   JarvisSourceInterruptionInput,
   JarvisSourceRestorationInput,
   JarvisTranscriptSegment,
@@ -31,24 +40,37 @@ import type {
   JarvisResourceGovernanceSettings,
   JarvisApplicationAudioSettings,
   JarvisApplicationAudioStatus,
+  JarvisRolloutFlags,
   JarvisMemoryItem,
   JarvisMiniMaxConfig,
   JarvisPersonDetail,
   JarvisPersonOverview,
+  JarvisPeopleReviewOverview,
+  JarvisParticipantReviewInput,
+  JarvisParticipantReviewHistoryEvent,
+  JarvisParticipantReviewPreview,
+  JarvisParticipantReviewResult,
   JarvisConfirmSpeakerInput,
   JarvisSpeakerClusterView,
   JarvisSpeakerConfirmationResult,
   JarvisSpeakerCorrectionView,
   JarvisSessionDetail,
   JarvisSessionTimeline,
+  JarvisSessionTimelineStatus,
   JarvisRuntimeStatus,
   JarvisTodayInsights,
   JarvisDailyDigestReadResult,
   JarvisDailyDigestStatus,
+  JarvisActionCenterWatermark,
+  JarvisActionCenterDelta,
+  JarvisActionCenterReadResult,
   JarvisKnowledgeOverview,
   JarvisSuggestionDecisionResult,
   JarvisMemoryConflictResolutionResult,
   JarvisKnowledgeTodoCompletionResult,
+  JarvisKnowledgeTodoDecisionResult,
+  JarvisKnowledgeActionInput,
+  JarvisKnowledgeActionResult,
   JarvisEvidenceHandle,
   JarvisEvidenceContext,
   JarvisTodo,
@@ -598,6 +620,32 @@ declare global {
         ) => Promise<JarvisTranscriptSegment[]>;
         listSegments: (sessionId: string) => Promise<JarvisTranscriptSegment[]>;
         listActivityClassifications: (sessionId: string) => Promise<JarvisActivityClassification[]>;
+        correctActivityClassification: (
+          classificationId: string,
+          category: JarvisActivityCategory
+        ) => Promise<JarvisActivityCorrectionResult>;
+        getPersonalizationSettings: () => Promise<JarvisPersonalizationSettings>;
+        decidePersonalizationRule: (
+          ruleId: string,
+          action: "enable" | "disable" | "delete" | "edit",
+          edit?: JarvisPersonalizationRuleEdit
+        ) => Promise<JarvisPersonalizationRule>;
+        resetPersonalizationRules: () => Promise<{ resetCount: number; resetAt: number }>;
+        listLearningGoals: () => Promise<JarvisLearningGoal[]>;
+        createLearningGoal: (title: string) => Promise<JarvisLearningGoalResult>;
+        editLearningGoal: (goalId: string, title: string) => Promise<JarvisLearningGoalResult>;
+        archiveLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
+        restoreLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
+        deleteLearningGoal: (goalId: string) => Promise<JarvisLearningGoalResult>;
+        setNotificationPreferences: (
+          focusMode: boolean,
+          mutedUntil: number | null
+        ) => Promise<JarvisNotificationPreferences>;
+        getTodoReminder: (todoId: string) => Promise<JarvisTodoReminder | null>;
+        setTodoReminder: (
+          todoId: string,
+          reminderAt: number | null
+        ) => Promise<JarvisTodoReminder | null>;
         renamePerson: (input: JarvisRenamePersonInput) => Promise<JarvisPerson>;
         listPeople: () => Promise<JarvisPerson[]>;
         listSessionSpeakerClusters: (sessionId: string) => Promise<JarvisSpeakerClusterView[]>;
@@ -613,11 +661,34 @@ declare global {
         ) => Promise<JarvisPersonDetail>;
         listAudioChunks: (sessionId: string) => Promise<JarvisAudioChunk[]>;
         readAudioChunk: (audioChunkId: string) => Promise<Uint8Array | null>;
+        readSpeakerUtteranceAudio: (utteranceId: string) => Promise<Uint8Array | null>;
         getSessionDetail: (sessionId: string) => Promise<JarvisSessionDetail | null>;
-        getSessionTimeline: (sessionId: string) => Promise<JarvisSessionTimeline | null>;
+        getSessionTimeline: (
+          sessionId: string,
+          page?: {
+            trackOffset?: number;
+            trackLimit?: number;
+            intervalOffset?: number;
+            intervalLimit?: number;
+          }
+        ) => Promise<JarvisSessionTimeline | null>;
+        getSessionTimelineStatus: (
+          sessionId: string
+        ) => Promise<JarvisSessionTimelineStatus | null>;
         getRuntimeStatus: () => Promise<JarvisRuntimeStatus>;
         searchMemory: (query: string, limit?: number) => Promise<JarvisSession[]>;
         listPeopleOverview: () => Promise<JarvisPersonOverview[]>;
+        listPeopleReviewOverview: () => Promise<JarvisPeopleReviewOverview>;
+        previewParticipantReview: (
+          input: JarvisParticipantReviewInput
+        ) => Promise<JarvisParticipantReviewPreview>;
+        applyParticipantReview: (
+          input: JarvisParticipantReviewInput
+        ) => Promise<JarvisParticipantReviewResult>;
+        undoParticipantReview: (eventId: string) => Promise<JarvisParticipantReviewResult>;
+        listParticipantReviewHistory: (
+          sessionId: string
+        ) => Promise<JarvisParticipantReviewHistoryEvent[]>;
         getPersonDetail: (personId: string) => Promise<JarvisPersonDetail | null>;
         listTopics: () => Promise<JarvisTopic[]>;
         getTopicDetail: (topicId: string) => Promise<JarvisTopicDetail | null>;
@@ -627,6 +698,9 @@ declare global {
         listMemories: (limit?: number) => Promise<JarvisMemoryItem[]>;
         getTodayInsights: (sessionId: string) => Promise<JarvisTodayInsights | null>;
         getDailyDigest: (localDate: string) => Promise<JarvisDailyDigestReadResult>;
+        getActionCenterWatermark: () => Promise<JarvisActionCenterWatermark>;
+        getActionCenterDelta: () => Promise<JarvisActionCenterDelta>;
+        markActionCenterRead: (throughSequence: number) => Promise<JarvisActionCenterReadResult>;
         getKnowledgeOverview: () => Promise<JarvisKnowledgeOverview>;
         decideKnowledgeSuggestion: (
           suggestionId: string,
@@ -637,6 +711,13 @@ declare global {
           selectedMemoryItemId: string
         ) => Promise<JarvisMemoryConflictResolutionResult>;
         completeKnowledgeTodo: (todoId: string) => Promise<JarvisKnowledgeTodoCompletionResult>;
+        decideKnowledgeTodo: (
+          todoId: string,
+          action: "confirm" | "dismiss" | "reopen"
+        ) => Promise<JarvisKnowledgeTodoDecisionResult>;
+        applyKnowledgeAction: (
+          input: JarvisKnowledgeActionInput
+        ) => Promise<JarvisKnowledgeActionResult>;
         getEvidenceContext: (handle: JarvisEvidenceHandle) => Promise<JarvisEvidenceContext | null>;
         analyzeSession: (
           sessionId: string,
@@ -662,6 +743,7 @@ declare global {
         setApplicationAudioSettings: (
           input: JarvisApplicationAudioSettings
         ) => Promise<JarvisApplicationAudioStatus>;
+        getRolloutFlags: () => Promise<JarvisRolloutFlags>;
         startCapture: (input: JarvisCaptureInput) => Promise<JarvisRuntimeState>;
         setRetentionMode: (
           id: string,

@@ -1,5 +1,6 @@
 const NO_SPEECH_MARKER = /^\[\s*(?:blank_audio|silence|inaudible)\s*\]$/iu;
 const NO_SPEECH_MESSAGE = /(?:no\s+audio|no\s+speech|blank_audio|silence)/iu;
+const MAX_TRANSCRIPT_WORDS = 5_000;
 
 function codedError(code) {
   const error = new Error(code);
@@ -36,7 +37,36 @@ function normalizeResult(result) {
   ) {
     throw codedError("TRANSCRIPTION_INVALID_RESULT");
   }
-  return { text, confidence, noSpeech: false };
+  const rawWords = result.words ?? [];
+  if (!Array.isArray(rawWords) || rawWords.length > MAX_TRANSCRIPT_WORDS) {
+    throw codedError("TRANSCRIPTION_INVALID_RESULT");
+  }
+  const words = rawWords.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw codedError("TRANSCRIPTION_INVALID_RESULT");
+    }
+    const word = typeof entry.word === "string" ? entry.word : "";
+    const startedAtMs = entry.startedAtMs;
+    const endedAtMs = entry.endedAtMs;
+    const probability = entry.probability ?? null;
+    if (
+      !word.trim() ||
+      Array.from(word).length > 256 ||
+      !Number.isSafeInteger(startedAtMs) ||
+      !Number.isSafeInteger(endedAtMs) ||
+      startedAtMs < 0 ||
+      endedAtMs <= startedAtMs ||
+      (probability !== null &&
+        (typeof probability !== "number" ||
+          !Number.isFinite(probability) ||
+          probability < 0 ||
+          probability > 1))
+    ) {
+      throw codedError("TRANSCRIPTION_INVALID_RESULT");
+    }
+    return { word, startedAtMs, endedAtMs, probability };
+  });
+  return { text, confidence, words, noSpeech: false };
 }
 
 class JarvisTranscriptionWorker {
@@ -106,7 +136,7 @@ class JarvisTranscriptionWorker {
       throw codedError("AUDIO_UNAVAILABLE");
     }
 
-    const initialPrompt = this.repository.getTranscriptPrompt(chunk.session_id);
+    const initialPrompt = this.repository.getTranscriptPrompt(chunk.session_id, chunk.track_id);
     let transcriptionStarted = false;
     let rawResult;
     try {

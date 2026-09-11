@@ -794,6 +794,39 @@ a:hover {
   background: transparent;
 }
 
+/* Jarvis library views contain long, durable records. Keep their scroll position
+   discoverable instead of hiding the thumb until hover. */
+.jarvis-scroll-region {
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+  scrollbar-color: color-mix(in srgb, var(--color-primary) 60%, var(--color-border))
+    color-mix(in srgb, var(--color-muted) 65%, transparent);
+}
+
+.jarvis-scroll-region::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+.jarvis-scroll-region::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--color-muted) 65%, transparent);
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 65%, transparent);
+}
+
+.jarvis-scroll-region::-webkit-scrollbar-thumb,
+.jarvis-scroll-region:hover::-webkit-scrollbar-thumb {
+  min-height: 56px;
+  background: color-mix(in srgb, var(--color-primary) 58%, var(--color-border));
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+.jarvis-scroll-region::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-primary) 82%, var(--color-border-hover));
+  background-clip: padding-box;
+}
+
 /* ---- Agent Overlay ---- */
 
 body:has(.agent-overlay-window) {

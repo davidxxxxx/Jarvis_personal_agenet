@@ -671,6 +671,12 @@ function executionFixture(options = {}) {
   const memoryRepository = {
     createDailyDigestInput(input) {
       calls.push(["rebuild_input", input]);
+      if (options.currentInputErrorAt === state.currentInputIndex) {
+        state.currentInputIndex += 1;
+        throw options.currentInputError ?? Object.assign(new Error("evidence out of scope"), {
+          code: "DAILY_DIGEST_EVIDENCE_OUT_OF_SCOPE",
+        });
+      }
       const current = state.currentInputs[
         Math.min(state.currentInputIndex, state.currentInputs.length - 1)
       ];
@@ -964,6 +970,34 @@ test("execute rebuilds the live source on both sides of reserve and supersedes s
     true
   );
   assert.equal(postReserve.calls.some(([name]) => name === "mark_started"), false);
+  assert.equal(postReserve.calls.some(([name]) => name === "request"), false);
+});
+
+test("deterministic digest evidence boundary failures block once instead of retaining the cloud lease", async () => {
+  const preReserve = executionFixture({ currentInputErrorAt: 0 });
+  assert.deepEqual(await preReserve.service.execute(claimedDigestJob()), {
+    status: "blocked",
+    jobId: "digest-job-1",
+  });
+  assert.deepEqual(preReserve.calls.find(([name]) => name === "block").slice(1), [
+    "digest-job-1",
+    {
+      owner: "digest-worker",
+      at: 200,
+      errorCode: "daily_digest_evidence_out_of_scope",
+    },
+  ]);
+  assert.equal(preReserve.calls.some(([name]) => name === "reserve"), false);
+
+  const postReserve = executionFixture({ currentInputErrorAt: 1 });
+  assert.deepEqual(await postReserve.service.execute(claimedDigestJob()), {
+    status: "blocked",
+    jobId: "digest-job-1",
+  });
+  assert.deepEqual(postReserve.calls.find(([name]) => name === "release")[1], {
+    requestId: "digest-request-1",
+    reasonCode: "superseded_before_transport",
+  });
   assert.equal(postReserve.calls.some(([name]) => name === "request"), false);
 });
 

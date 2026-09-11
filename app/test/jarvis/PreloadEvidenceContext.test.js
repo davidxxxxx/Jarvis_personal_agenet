@@ -55,6 +55,8 @@ function context(overrides = {}) {
     endedAt: 2_500,
     quoteText: "Stored quote",
     audioState: "available",
+    transcriptContext: [],
+    actionAttribution: null,
     ...overrides,
   };
 }

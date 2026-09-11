@@ -154,6 +154,87 @@ export interface JarvisActivityClassification {
   updatedAt: number;
 }
 
+export interface JarvisPersonalizationRule {
+  id: string;
+  domain: "activity_classification" | "suggestion" | "todo" | "person";
+  targetValue: string;
+  label: string;
+  supportCount: number;
+  state: "proposed" | "enabled" | "disabled" | "deleted";
+  conditions: {
+    applicationKeys: string[];
+    selfParticipated: boolean;
+    speakerCountBucket: "none" | "one" | "multiple";
+    timeBucket: "night" | "morning" | "afternoon" | "evening" | "unknown";
+  };
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface JarvisPersonalizationRuleEdit {
+  label: string;
+  targetValue: JarvisActivityCategory;
+  conditions: Omit<JarvisPersonalizationRule["conditions"], "timeBucket"> & {
+    timeBucket: Exclude<JarvisPersonalizationRule["conditions"]["timeBucket"], "unknown">;
+  };
+}
+
+export interface JarvisNotificationPreferences {
+  focusMode: boolean;
+  mutedUntil: number | null;
+  updatedAt: number;
+  effectiveMuted: boolean;
+}
+
+export interface JarvisTodoReminder {
+  todoId: string;
+  reminderAt: number;
+  reminderSource: "user";
+  state: "scheduled" | "deferred" | "delivered" | "cancelled";
+  deferredReason: string | null;
+  deliveredAt: number | null;
+  updatedAt: number;
+}
+
+export interface JarvisPersonalizationSettings {
+  rules: JarvisPersonalizationRule[];
+  notifications: JarvisNotificationPreferences;
+}
+
+export type JarvisLearningGoalState = "confirmed" | "archived" | "deleted";
+
+export interface JarvisLearningGoal {
+  id: string;
+  title: string;
+  state: JarvisLearningGoalState;
+  createdAt: number;
+  updatedAt: number;
+  confirmedAt: number;
+  archivedAt: number | null;
+}
+
+export type JarvisLearningGoalResultStatus =
+  | "created"
+  | "existing"
+  | "edited"
+  | "unchanged"
+  | "archived"
+  | "already_archived"
+  | "restored"
+  | "already_confirmed"
+  | "deleted";
+
+export interface JarvisLearningGoalResult {
+  status: JarvisLearningGoalResultStatus;
+  goal: JarvisLearningGoal;
+}
+
+export interface JarvisActivityCorrectionResult {
+  classification: JarvisActivityClassification;
+  proposedRule: JarvisPersonalizationRule | null;
+  supportCount: number;
+}
+
 export type JarvisEvidenceOwnerType =
   | "memory_value"
   | "topic_revision"
@@ -181,6 +262,33 @@ export interface JarvisEvidenceContext extends JarvisEvidenceHandle {
   endedAt: number;
   quoteText: string | null;
   audioState: "available" | "expired" | "missing";
+  transcriptContext?: Array<{
+    segmentId: string;
+    startedAt: number;
+    endedAt: number;
+    text: string;
+    speakerRelation: "SELF" | `P${number}` | "UNKNOWN";
+    applicationName: string | null;
+    isEvidence: boolean;
+  }>;
+  actionAttribution: {
+    basis: "captured_todo_snapshot" | "current_local_state";
+    applicationKey: string | null;
+    applicationName: string;
+    sourceAttribution: JarvisActivityClassification["sourceAttribution"];
+    speakerRelation: "SELF" | `P${number}` | "UNKNOWN";
+    semanticConfidence: number | null;
+    voiceConfidence: number | null;
+    transcriptConfidence: number | null;
+    activityClassification: {
+      id: string | null;
+      category: JarvisActivityCategory;
+      confidence: number | null;
+      decision: JarvisActivityDecision;
+      source: JarvisActivityClassification["source"] | "captured_snapshot";
+      reason: string | null;
+    } | null;
+  } | null;
 }
 
 export type JarvisEvidenceNavigationState =
@@ -244,6 +352,9 @@ export interface JarvisTranscriptSegment {
   superseded_by?: string | null;
   echo_score?: number | null;
   duplicate_of?: string | null;
+  application_key?: string | null;
+  application_display_name?: string | null;
+  track_kind?: "mic" | "system_mix" | "application" | null;
 }
 
 export interface JarvisRenamePersonInput {
@@ -283,6 +394,10 @@ export interface JarvisSpeakerClusterView {
   lastRejectedPerson: JarvisSpeakerPersonSummary | null;
   score: number | null;
   margin: number | null;
+  candidatePersonRef: string | null;
+  speechMs: number;
+  windowCount: number;
+  qualityScore: number | null;
   reason: string;
   policyId: string;
   diarizationRevision: string;
@@ -359,6 +474,7 @@ export interface JarvisAudioChunk {
   started_at: number;
   ended_at: number;
   duration_ms: number;
+  transcription_status?: string;
   track_id?: string | null;
   source_type?: "mic" | "system";
   sequence_number?: number;
@@ -392,6 +508,7 @@ export interface JarvisAudioTrack {
   started_at: number;
   ended_at: number | null;
   state: string;
+  failure_code?: string | null;
   gaps: JarvisAudioGap[];
 }
 
@@ -406,6 +523,7 @@ export interface JarvisApplicationAudioInterval {
   started_at: number;
   ended_at: number | null;
   reason: string | null;
+  failure_code?: string | null;
 }
 
 export interface JarvisProcessingJobCounts {
@@ -507,12 +625,28 @@ export interface JarvisSessionTimeline {
     exact_coverage_pct: number | null;
     degraded_intervals: JarvisApplicationAudioInterval[];
     recovery_points: number[];
+    degraded_interval_count?: number;
+    recovery_count?: number;
   };
+  evidence_page?: {
+    tracks: { offset: number; limit: number; total: number };
+    intervals: { offset: number; limit: number; total: number };
+  } | null;
   gaps: JarvisAudioGap[];
   chunks: JarvisAudioChunk[];
   segments: JarvisTranscriptSegment[];
   processing_counts: JarvisProcessingJobCounts;
   preview_status?: JarvisPreviewStatus | null;
+}
+
+export interface JarvisSessionTimelineStatus {
+  session_id: string;
+  status: JarvisSessionStatus;
+  processing_state: "pending" | "processing" | "ready";
+  timeline_version: number;
+  finalized_at: number | null;
+  ready_at: number | null;
+  processing_counts: JarvisProcessingJobCounts;
 }
 
 export interface JarvisSessionSummary {
@@ -569,16 +703,236 @@ export interface JarvisSessionDetail {
   session: JarvisSession;
   summary: JarvisSessionSummary | null;
   segments: JarvisTranscriptSegment[];
+  speakerUtterances?: JarvisSpeakerUtterance[];
   audioChunks: JarvisAudioChunk[];
   topics: JarvisTopic[];
   todos: JarvisTodo[];
   memories: JarvisMemoryItem[];
+  speakerProcessing: JarvisSessionSpeakerProcessing | null;
+}
+
+export interface JarvisSpeakerUtterance {
+  id: string;
+  session_id: string;
+  chunk_id: string;
+  cluster_id: string;
+  source_segment_id: string | null;
+  stem_id: string | null;
+  started_at: number;
+  ended_at: number;
+  text: string;
+  confidence: number | null;
+  overlap_state: "single" | "overlap";
+  evidence_kind: "word_alignment" | "separated_stem";
+  local_label: string;
+  person_id: string | null;
+  link_state: "unknown" | "suggested" | "confirmed" | "rejected";
+  person_display_name: string | null;
+  application_key: string | null;
+  application_display_name: string | null;
+  track_kind: "mic" | "system_mix" | "application";
+  has_isolated_audio: boolean;
+}
+
+export interface JarvisDiarizationRunView {
+  id: string;
+  trackId: string;
+  policyId: string;
+  inputVersion: 1 | 2;
+  executionDevice: "cpu" | "cuda";
+  speakerCount: {
+    minimum: number;
+    maximum: number;
+    preferred: number | null;
+    confidence: number | null;
+    state: string;
+  } | null;
+  overlapMs: number;
+  overlapSeparationState: "not_needed" | "completed" | "partial" | "failed";
+  modelPackVersion: string | null;
+  models: string[];
+  commitSequence: number;
+  completedAt: number;
+}
+
+export type JarvisSessionParticipantKind =
+  "self" | "known" | "anonymous" | "reviewed" | "temporary" | "media";
+
+export interface JarvisParticipantEvidenceSegment {
+  clusterId: string;
+  id: string;
+  started_at: number;
+  ended_at: number;
+  text: string;
+  confidence: number | null;
+  track_id: string | null;
+  source_type: "mic" | "system";
+  result_kind: string;
+  duplicate_of: string | null;
+  sourceName: string;
+  pinned?: boolean;
+}
+
+export interface JarvisSessionParticipant {
+  id: string;
+  kind: JarvisSessionParticipantKind;
+  displayName: string;
+  person: JarvisSpeakerPersonSummary | null;
+  candidatePersonRef: string | null;
+  reviewState: "confirmed" | "needs_review" | "media";
+  durable: boolean;
+  speechMs: number;
+  segmentCount: number;
+  clusterCount: number;
+  clusterIds: string[];
+  segmentIds: string[];
+  sourceNames: string[];
+  minimumCount: number;
+  maximumCount: number;
+  score: number | null;
+  representativeSegments: JarvisParticipantEvidenceSegment[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisSessionParticipantProjection {
+  projectorVersion?: string;
+  count: {
+    minimum: number;
+    maximum: number;
+    confirmed: number;
+    needsReview: number;
+    selfIncluded: boolean;
+  };
+  participants: JarvisSessionParticipant[];
+  mediaVoices: JarvisSessionParticipant[];
+  excluded: {
+    fragmented: number;
+    shadowedSystemMix: number;
+    anomaly: boolean;
+  };
+}
+
+export interface JarvisSessionSpeakerProcessing {
+  preferredInputVersion: 1 | 2;
+  latestRuns: JarvisDiarizationRunView[];
+  history: JarvisDiarizationRunView[];
+  speakers: JarvisSpeakerClusterView[];
+  participants: JarvisSessionParticipantProjection;
+  participantSnapshot: {
+    id: string;
+    revision: number;
+    sourceHash: string;
+    createdAt: number;
+  } | null;
+  fragmentedEvidenceCount: number;
+  summaryRefresh: {
+    basis_policy_id: string | null;
+    latest_policy_id: string;
+    recommended: 0 | 1;
+    reason: string | null;
+    updated_at: number;
+  } | null;
+  reprocessing: {
+    policy_id: string;
+    mode: "historical_local_only";
+    state: "queued" | "processing" | "completed";
+    started_at: number;
+    completed_at: number | null;
+    baseline_content_sha256: string;
+    baseline_identity_sha256: string;
+    baseline_classification_sha256: string;
+  } | null;
 }
 
 export interface JarvisPersonOverview extends JarvisPerson {
   session_count: number;
   open_todo_count: number;
   last_interaction_at: number | null;
+}
+
+export interface JarvisAnonymousPersonOverview {
+  id: string;
+  displayName: string;
+  sessionCount: number;
+  clusterCount: number;
+  speechMs: number;
+  lastSeenAt: number;
+  sourceNames: string[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisPendingParticipantOverview {
+  id: string;
+  sessionId: string;
+  sessionStartedAt: number;
+  minimumCount: number;
+  maximumCount: number;
+  clusterCount: number;
+  speechMs: number;
+  sourceNames: string[];
+  representativeCluster: JarvisSpeakerClusterView;
+}
+
+export interface JarvisPeopleReviewOverview {
+  anonymous: JarvisAnonymousPersonOverview[];
+  needsReview: JarvisPendingParticipantOverview[];
+}
+
+export type JarvisParticipantReviewAction =
+  | "split"
+  | "merge"
+  | "mark_media"
+  | "restore_social"
+  | "forget_identity"
+  | "pin_evidence"
+  | "unpin_evidence";
+
+export interface JarvisParticipantReviewInput {
+  sessionId: string;
+  action: JarvisParticipantReviewAction;
+  clusterIds?: string[];
+  segmentIds?: string[];
+  personId?: string;
+  label?: string;
+}
+
+export interface JarvisParticipantReviewPreview {
+  sessionId: string;
+  action: JarvisParticipantReviewAction;
+  clusterIds: string[];
+  segmentIds: string[];
+  affectedClusterCount: number;
+  affectedSegmentCount: number;
+  affectedPersonIds: string[];
+  affectedSessionIds: string[];
+  historyImpact?: {
+    sessionCount: number;
+    clusterCount: number;
+    segmentCount: number;
+    sessionIds: string[];
+  };
+  canUndo: boolean;
+}
+
+export interface JarvisParticipantReviewEvent {
+  id: string;
+  sessionId: string;
+  action: JarvisParticipantReviewAction | "undo";
+  createdAt: number;
+  canUndo: boolean;
+}
+
+export interface JarvisParticipantReviewHistoryEvent extends JarvisParticipantReviewEvent {
+  subjectRef: string;
+  payload: Record<string, unknown>;
+  revertsEventId: string | null;
+  actor: "user" | "system";
+}
+
+export interface JarvisParticipantReviewResult {
+  event: JarvisParticipantReviewEvent;
+  preview?: JarvisParticipantReviewPreview;
+  speakerProcessing: JarvisSessionSpeakerProcessing;
 }
 
 export interface JarvisPersonDetail {
@@ -592,7 +946,9 @@ export interface JarvisPersonDetail {
 
 export interface JarvisTopicDetail {
   topic: JarvisTopic;
+  people: JarvisPerson[];
   sessions: JarvisSession[];
+  decisions: Array<{ sessionId: string; content: string }>;
   todos: JarvisTodo[];
   memories: JarvisMemoryItem[];
 }
@@ -687,6 +1043,69 @@ export interface JarvisKnowledgeEvidence {
   handle?: JarvisEvidenceHandle;
 }
 
+export interface JarvisActionCenterWatermark {
+  revision: string;
+  todoCount: number;
+  suggestionCount: number;
+  updatedAt: number | null;
+}
+
+export interface JarvisActionCenterSessionDelta {
+  sessionId: string;
+  confirmedTodoCount: number;
+  pendingTodoCount: number;
+  suggestionCount: number;
+  total: number;
+}
+
+export interface JarvisActionCenterDelta {
+  throughSequence: number;
+  lastSeenSequence: number;
+  confirmedTodoCount: number;
+  pendingTodoCount: number;
+  suggestionCount: number;
+  total: number;
+  sessions: JarvisActionCenterSessionDelta[];
+}
+
+export interface JarvisActionCenterReadResult {
+  lastSeenSequence: number;
+  markedAt: number;
+}
+
+export interface JarvisTodoTrustSnapshot {
+  policyId: string;
+  state: "captured" | "legacy_unverified" | "user_override";
+  applicationEvidence: Array<{
+    segmentId: string;
+    applicationKey: string | null;
+    sourceAttribution: JarvisActivityClassification["sourceAttribution"];
+    speakerRelation: "SELF" | `P${number}` | "UNKNOWN";
+  }>;
+  activityEvidence: Array<{
+    segmentId: string;
+    category: JarvisActivityCategory;
+    confidence: number;
+    decision: JarvisActivityDecision;
+  }>;
+  semanticConfidence: number | null;
+  voiceprintConfidence: number | null;
+  sceneConfidence: number | null;
+  transcriptContextConfidence: number | null;
+  speakerEvidenceVerified: boolean | null;
+  overlapDetected: boolean | null;
+  automaticEligible: boolean;
+}
+
+export interface JarvisKnowledgeCardContext {
+  sessionId: string | null;
+  startedAt: number | null;
+  applicationName: string | null;
+  activityCategory: JarvisActivityCategory | null;
+  activityConfidence: number | null;
+  sourceAttribution: JarvisActivityClassification["sourceAttribution"];
+}
+
 export interface JarvisKnowledgeOverview {
   memories: Array<{
     id: string;
@@ -734,6 +1153,25 @@ export interface JarvisKnowledgeOverview {
     status: "open" | "completed" | "dismissed";
     completedAt: number | null;
     dismissedAt: number | null;
+    verificationState: "confirmed" | "pending_confirmation" | "dismissed";
+    verificationReason?:
+      | "strict_self_commitment"
+      | "assigned_and_accepted"
+      | "user_confirmed"
+      | "user_dismissed"
+      | null;
+    verificationActor?: "system" | "user" | null;
+    trustSnapshot: JarvisTodoTrustSnapshot | null;
+    cardContext: JarvisKnowledgeCardContext;
+    sourceKind?: "existing" | "manual" | "transcript" | "suggestion";
+    sourceSessionId?: string | null;
+    pinned?: boolean;
+    urgency?: "normal" | "urgent";
+    userModified?: boolean;
+    dismissReasonCode?: JarvisKnowledgeDismissReason | null;
+    provenance?: "evidence_linked" | "legacy_unverified" | "suggestion" | "source_deleted";
+    sourceSuggestionId?: string | null;
+    reminder?: Omit<JarvisTodoReminder, "todoId" | "updatedAt"> | null;
     createdAt: number;
     updatedAt: number;
     revisions: Array<{
@@ -756,6 +1194,8 @@ export interface JarvisKnowledgeOverview {
       id: string;
       fromStatus: string | null;
       toStatus: "open" | "completed" | "dismissed";
+      reason?: string;
+      actor?: "system" | "user";
       occurredAt: number;
     }>;
   }>;
@@ -764,9 +1204,13 @@ export interface JarvisKnowledgeOverview {
     title: string;
     rationale: string;
     state: "proposed" | "accepted" | "dismissed";
+    dismissReasonCode?: JarvisKnowledgeDismissReason | null;
+    convertedTodoId?: string | null;
+    acceptanceUndone?: boolean;
     decidedAt: number | null;
     createdAt: number;
     updatedAt: number;
+    cardContext: JarvisKnowledgeCardContext;
     occurrences: Array<{
       id: string;
       sessionId: string | null;
@@ -797,6 +1241,7 @@ export interface JarvisSuggestionDecisionResult {
   status: "accepted" | "already_accepted" | "dismissed" | "already_dismissed";
   suggestionId: string;
   decidedAt: number;
+  todoId?: string | null;
 }
 
 export interface JarvisMemoryConflictResolutionResult {
@@ -809,6 +1254,88 @@ export interface JarvisKnowledgeTodoCompletionResult {
   status: "completed" | "already_completed";
   todoId: string;
   completedAt: number;
+}
+
+export interface JarvisKnowledgeTodoDecisionResult {
+  status:
+    | "confirmed"
+    | "already_confirmed"
+    | "dismissed"
+    | "already_dismissed"
+    | "reopened"
+    | "already_open";
+  todoId: string;
+  decidedAt: number;
+}
+
+export type JarvisKnowledgeDismissReason =
+  "not_relevant" | "already_done" | "not_mine" | "wrong_context" | "low_value" | "other";
+
+interface JarvisKnowledgeActionBase {
+  commandId: string;
+}
+
+export type JarvisKnowledgeActionInput =
+  | (JarvisKnowledgeActionBase & {
+      type: "manual_create";
+      todoId: string;
+      title: string;
+      dueText: string | null;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "transcript_create";
+      todoId: string;
+      title: string;
+      dueText: string | null;
+      sessionId: string;
+      segmentIds: string[];
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "todo_dismiss";
+      todoId: string;
+      reasonCode: JarvisKnowledgeDismissReason;
+      localNote?: string | null;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "todo_restore" | "todo_pin" | "todo_unpin";
+      todoId: string;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "suggestion_dismiss";
+      suggestionId: string;
+      reasonCode: JarvisKnowledgeDismissReason;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "suggestion_restore" | "suggestion_accept_undo";
+      suggestionId: string;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "suggestion_accept";
+      suggestionId: string;
+      todoId: string;
+      title: string;
+      dueText: string | null;
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "urgency_set";
+      todoId: string;
+      urgency: "normal" | "urgent";
+    })
+  | (JarvisKnowledgeActionBase & {
+      type: "title_due_edit";
+      todoId: string;
+      title?: string;
+      dueText?: string | null;
+    });
+
+export interface JarvisKnowledgeActionResult {
+  status: "applied" | "already_applied";
+  commandId: string;
+  type: JarvisKnowledgeActionInput["type"];
+  entityKind: "todo" | "suggestion";
+  entityId: string;
+  occurredAt: number;
+  todoId: string | null;
 }
 
 export interface JarvisAnalysisStatus {
@@ -843,6 +1370,16 @@ export interface JarvisAnalysisStatus {
 export interface JarvisMiniMaxConfig {
   keyConfigured: boolean;
   model: "MiniMax-M2.7";
+  modelStatus: "not_configured" | "ready" | "unavailable" | "model_unavailable";
+  fallbackUsed: boolean;
+  checkedAt: number | null;
+}
+
+export interface JarvisRolloutFlags {
+  applicationAudioV1: boolean;
+  dualSpeakerVerificationV1: boolean;
+  activityClassificationV1: boolean;
+  actionCenterV1: boolean;
 }
 
 export type JarvisAnalysisBudgetBlockedReason =
@@ -879,7 +1416,10 @@ export interface JarvisResourceGovernanceSettings {
 export interface JarvisApplicationAudioSettings {
   enabled: boolean;
   trackLimit: number;
+  fallbackPolicy: JarvisApplicationAudioFallbackPolicy;
 }
+
+export type JarvisApplicationAudioFallbackPolicy = "conservative" | "transcript_only";
 
 export interface JarvisApplicationAudioRuntimeStatus {
   running: boolean;
@@ -896,6 +1436,7 @@ export interface JarvisApplicationAudioRuntimeStatus {
     applicationKey: string;
     applicationDisplayName: string;
     reason: string;
+    failureCode: string | null;
     retryAt: number | null;
     state: "mixed_unknown";
   }>;
@@ -946,6 +1487,7 @@ export interface JarvisVoiceEnrollmentResult {
   status: JarvisVoiceEnrollmentOutcome;
   modelId: string;
   acceptedSpeechMs: number;
+  sampleSpeechMs?: number[];
   windowCount: number;
   selfConsistency: number | null;
   models?: JarvisVoiceEnrollmentModelStatus[] | null;

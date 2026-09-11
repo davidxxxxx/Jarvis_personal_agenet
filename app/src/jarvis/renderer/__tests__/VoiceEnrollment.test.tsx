@@ -374,6 +374,8 @@ describe("VoiceEnrollment", () => {
         status,
         modelId: "3dspeaker-campplus-voxceleb-16k-v1",
         acceptedSpeechMs: status === "insufficient_speech" ? 20_000 : 30_000,
+        sampleSpeechMs:
+          status === "insufficient_speech" ? [6_200, 5_400, 3_800] : undefined,
         windowCount: status === "insufficient_speech" ? 2 : 3,
         selfConsistency: status === "inconsistent_samples" ? 0.5 : null,
       }),
@@ -392,6 +394,11 @@ describe("VoiceEnrollment", () => {
       await Promise.resolve();
     });
     expect(screen.getByRole("alert")).toHaveTextContent(message);
+    if (status === "insufficient_speech") {
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "每段有效语音：6.2 / 5.4 / 3.8 秒；每段至少需要 5.0 秒"
+      );
+    }
     expect(screen.queryByText("你的本地声纹已保存。")).not.toBeInTheDocument();
   });
 });

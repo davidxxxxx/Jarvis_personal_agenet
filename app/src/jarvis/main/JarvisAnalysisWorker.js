@@ -42,6 +42,12 @@ function codedError(code) {
   return error;
 }
 
+function safeValidationReason(issueCode) {
+  if (typeof issueCode !== "string" || issueCode.length === 0) return null;
+  const normalized = issueCode.replace(/[^A-Za-z0-9_-]/gu, "_").slice(0, 96);
+  return normalized ? `analysis_validation_${normalized}`.slice(0, 128) : null;
+}
+
 function usage(value) {
   if (
     !value ||
@@ -201,8 +207,8 @@ class JarvisAnalysisWorker {
       head.analysisInputHash === job.input_hash &&
       head.desiredVectorHash === job.desired_head_hash &&
       head.modelVersion === this.model &&
-      head.promptVersion === "jarvis-analysis-v2" &&
-      head.responseSchemaVersion === "jarvis-analysis-v2"
+      head.promptVersion === "jarvis-analysis-hierarchical-v3" &&
+      head.responseSchemaVersion === "jarvis-analysis-v3"
     );
   }
 
@@ -264,12 +270,13 @@ class JarvisAnalysisWorker {
     }
   }
 
-  _block(jobId, errorCode) {
+  _block(jobId, errorCode, { blockedReason = null } = {}) {
     if (
       this.store.blockJob(jobId, {
         owner: this.owner,
         at: this._at(),
         errorCode,
+        blockedReason,
       }) !== true
     ) {
       throw codedError("JOB_LEASE_LOST");
@@ -311,6 +318,7 @@ class JarvisAnalysisWorker {
       const result = this.validateCandidate(response.result, {
         allowedSegmentIds: new Set(analysisInput.allowedSegmentIds),
         allowedOwnerLabels: new Set(analysisInput.allowedOwnerLabels),
+        allowedLearningGoalIds: new Set(analysisInput.allowedLearningGoalIds ?? []),
       });
       return { result, usage: authoritativeUsage };
     } catch (cause) {
@@ -512,7 +520,9 @@ class JarvisAnalysisWorker {
           this._defer(job.id, "analysis_authoritative_zero_usage");
           return { status: "deferred", reason: "authoritative_zero_usage", jobId: job.id };
         }
-        this._block(job.id, "analysis_invalid_response");
+        this._block(job.id, "analysis_invalid_response", {
+          blockedReason: safeValidationReason(error?.issueCode),
+        });
         return { status: "blocked", reason: "invalid_response", jobId: job.id };
       }
       this.budgetGuard.markUsageUnknown({
@@ -528,7 +538,9 @@ class JarvisAnalysisWorker {
     } catch (error) {
       if (error.authoritativeUsage) {
         this.budgetGuard.reconcile({ requestId, usage: error.authoritativeUsage });
-        this._block(job.id, "analysis_invalid_response");
+        this._block(job.id, "analysis_invalid_response", {
+          blockedReason: safeValidationReason(error?.cause?.issueCode ?? error?.issueCode),
+        });
         return { status: "blocked", reason: "invalid_response", jobId: job.id };
       }
       this.budgetGuard.markUsageUnknown({ requestId, reasonCode: "usage_invalid" });

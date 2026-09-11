@@ -9,6 +9,10 @@ const { execFileSync, spawn } = require("node:child_process");
 const WebSocket = require("ws");
 
 const DIAGNOSTIC_FILE = "packaged-smoke.jsonl";
+const BUILD_MANIFEST_FILE = "jarvis-build.json";
+const BUILD_MANIFEST_VERSION = 1;
+const MAX_BUILD_MANIFEST_BYTES = 16 * 1024;
+const GIT_SHA1_PATTERN = /^[a-f0-9]{40}$/u;
 const OFFLINE_PROXY = "http://127.0.0.1:9";
 const MAX_CAPTURE_BYTES = 256 * 1024;
 const CREDENTIAL_ENV_NAMES = new Set([
@@ -121,6 +125,7 @@ function appendDiagnostic(fsImpl, diagnosticPath, entry) {
       stage: entry.stage,
       code: entry.code,
       exitCode: Number.isSafeInteger(entry.exitCode) ? entry.exitCode : null,
+      artifactCommit: GIT_SHA1_PATTERN.test(entry.artifactCommit) ? entry.artifactCommit : null,
     })}\n`,
     "utf8"
   );
@@ -589,20 +594,83 @@ function sha256File(fsImpl, filePath) {
   return hash.digest("hex");
 }
 
-function resolveGitCommit(execFileSyncImpl = execFileSync) {
+function resolveCleanGitHead(
+  execFileSyncImpl = execFileSync,
+  sourceRoot = path.resolve(__dirname, "..")
+) {
   try {
+    const options = {
+      cwd: sourceRoot,
+      encoding: "utf8",
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    };
     const commit = String(
-      execFileSyncImpl("git", ["rev-parse", "HEAD"], {
-        cwd: path.resolve(__dirname, ".."),
-        encoding: "utf8",
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
+      execFileSyncImpl("git", ["rev-parse", "--verify", "HEAD^{commit}"], options)
     ).trim();
-    return /^[a-f0-9]{40,64}$/u.test(commit) ? commit : null;
+    const status = String(
+      execFileSyncImpl("git", ["status", "--porcelain=v1", "--untracked-files=all"], options)
+    ).trim();
+    return GIT_SHA1_PATTERN.test(commit) && status.length === 0 ? commit : null;
   } catch {
     return null;
   }
+}
+
+function hasExactKeys(value, expected) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => keys.includes(key));
+}
+
+function readArtifactBuildManifest(fsImpl, executablePath) {
+  const manifestPath = path.join(path.dirname(executablePath), "resources", BUILD_MANIFEST_FILE);
+  let stat;
+  let manifest;
+  try {
+    stat = fsImpl.statSync(manifestPath);
+    if (!stat.isFile() || stat.size < 2 || stat.size > MAX_BUILD_MANIFEST_BYTES) throw new Error();
+    manifest = JSON.parse(fsImpl.readFileSync(manifestPath, "utf8"));
+  } catch {
+    throw codedError(
+      "PACKAGED_ARTIFACT_IDENTITY_UNAVAILABLE",
+      "Packaged artifact identity is unavailable"
+    );
+  }
+  const verification = manifest?.verification;
+  const builtAt = typeof manifest?.builtAtUtc === "string" ? new Date(manifest.builtAtUtc) : null;
+  if (
+    !hasExactKeys(manifest, [
+      "manifestVersion",
+      "verification",
+      "appVersion",
+      "gitCommit",
+      "schemaVersion",
+      "builtAtUtc",
+    ]) ||
+    manifest.manifestVersion !== BUILD_MANIFEST_VERSION ||
+    !hasExactKeys(verification, ["state", "provenance", "commitFormat", "sourceTree"]) ||
+    verification.state !== "built-unverified" ||
+    verification.provenance !== "git-head" ||
+    verification.commitFormat !== "sha1-40" ||
+    verification.sourceTree !== "clean" ||
+    typeof manifest.appVersion !== "string" ||
+    manifest.appVersion.length < 1 ||
+    manifest.appVersion.length > 64 ||
+    /[\0\r\n]/u.test(manifest.appVersion) ||
+    !GIT_SHA1_PATTERN.test(manifest.gitCommit) ||
+    !Number.isSafeInteger(manifest.schemaVersion) ||
+    manifest.schemaVersion < 1 ||
+    builtAt === null ||
+    Number.isNaN(builtAt.getTime()) ||
+    builtAt.toISOString() !== manifest.builtAtUtc
+  ) {
+    throw codedError(
+      "PACKAGED_ARTIFACT_IDENTITY_UNAVAILABLE",
+      "Packaged artifact identity is unavailable"
+    );
+  }
+  return manifest;
 }
 
 function prepareRunLayout({ fsImpl, runtimeRoot }) {
@@ -635,13 +703,14 @@ async function runPackagedWindowsSmoke({
   env = process.env,
   startupTimeoutMs = 45_000,
   exitTimeoutMs = 20_000,
-  gitCommit,
+  expectedCommit,
   fsImpl = fs,
   spawnImpl = spawn,
   allocatePort = allocateLoopbackPort,
   probeImpl = probeElectron,
   exerciseSessionImpl = exerciseSessionThroughCdp,
   closeBrowserImpl = closeBrowserViaCdp,
+  resolveCleanGitHeadImpl = resolveCleanGitHead,
 } = {}) {
   const safeRuntimeRoot = assertRuntimeRoot(runtimeRoot, platform);
   assertPositiveTimeout(startupTimeoutMs, "startupTimeoutMs");
@@ -655,24 +724,60 @@ async function runPackagedWindowsSmoke({
   ) {
     throw codedError("PACKAGED_EXECUTABLE_NOT_FOUND", "Packaged Windows executable is unavailable");
   }
+  const artifactBuild = readArtifactBuildManifest(fsImpl, executablePath);
   const artifactSha256 = sha256File(fsImpl, executablePath);
-  const sourceCommit =
-    gitCommit === undefined
-      ? resolveGitCommit()
-      : typeof gitCommit === "string" && /^[a-f0-9]{40,64}$/u.test(gitCommit)
-        ? gitCommit
-        : null;
-  if (sourceCommit === null) {
-    throw codedError(
-      "PACKAGED_ARTIFACT_IDENTITY_UNAVAILABLE",
-      "Packaged artifact identity is unavailable"
-    );
-  }
-
   const layout = prepareRunLayout({
     fsImpl,
     runtimeRoot: safeRuntimeRoot,
   });
+  const recordDiagnostic = (entry) =>
+    appendDiagnostic(fsImpl, layout.diagnosticPath, {
+      ...entry,
+      artifactCommit: artifactBuild.gitCommit,
+    });
+  recordDiagnostic({
+    launch: 0,
+    stage: "artifact_identity",
+    code: "OK",
+    exitCode: null,
+  });
+  const comparisonCommit =
+    expectedCommit === undefined
+      ? resolveCleanGitHeadImpl()
+      : typeof expectedCommit === "string" && GIT_SHA1_PATTERN.test(expectedCommit)
+        ? expectedCommit
+        : null;
+  if (comparisonCommit === null) {
+    recordDiagnostic({
+      launch: 0,
+      stage: "artifact_expectation",
+      code: "PACKAGED_EXPECTED_COMMIT_UNAVAILABLE",
+      exitCode: null,
+    });
+    const error = codedError(
+      "PACKAGED_EXPECTED_COMMIT_UNAVAILABLE",
+      "Expected clean Git commit is unavailable"
+    );
+    error.artifactCommit = artifactBuild.gitCommit;
+    error.diagnosticFile = DIAGNOSTIC_FILE;
+    throw error;
+  }
+  if (artifactBuild.gitCommit !== comparisonCommit) {
+    recordDiagnostic({
+      launch: 0,
+      stage: "artifact_expectation",
+      code: "PACKAGED_ARTIFACT_COMMIT_MISMATCH",
+      exitCode: null,
+    });
+    const error = codedError(
+      "PACKAGED_ARTIFACT_COMMIT_MISMATCH",
+      "Packaged artifact does not match the expected Git commit"
+    );
+    error.artifactCommit = artifactBuild.gitCommit;
+    error.diagnosticFile = DIAGNOSTIC_FILE;
+    throw error;
+  }
+
   const childEnvironment = createOfflineSmokeEnvironment({
     runtimeRoot: layout.runRoot,
     env,
@@ -705,7 +810,7 @@ async function runPackagedWindowsSmoke({
       });
     } catch {
       const error = codedError("PACKAGED_STARTUP_FAILED", "Packaged application failed to start");
-      appendDiagnostic(fsImpl, layout.diagnosticPath, {
+      recordDiagnostic({
         launch: launchIndex,
         stage: "spawn",
         code: error.code,
@@ -727,7 +832,7 @@ async function runPackagedWindowsSmoke({
       if (!ready) {
         const exit = childExit.result();
         const error = failureForOutput(output());
-        appendDiagnostic(fsImpl, layout.diagnosticPath, {
+        recordDiagnostic({
           launch: launchIndex,
           stage: exit ? "early_exit" : "startup_timeout",
           code: error.code,
@@ -735,7 +840,7 @@ async function runPackagedWindowsSmoke({
         });
         throw error;
       }
-      appendDiagnostic(fsImpl, layout.diagnosticPath, {
+      recordDiagnostic({
         launch: launchIndex,
         stage: "window_ready",
         code: "OK",
@@ -757,7 +862,7 @@ async function runPackagedWindowsSmoke({
           throw new Error("invalid session evidence");
         }
         sessionEvidence.push(evidence);
-        appendDiagnostic(fsImpl, layout.diagnosticPath, {
+        recordDiagnostic({
           launch: launchIndex,
           stage: launchIndex === 1 ? "session_completed" : "session_restarted",
           code: "OK",
@@ -767,7 +872,7 @@ async function runPackagedWindowsSmoke({
           "PACKAGED_SESSION_PERSISTENCE_FAILED",
           "Packaged session persistence check failed"
         );
-        appendDiagnostic(fsImpl, layout.diagnosticPath, {
+        recordDiagnostic({
           launch: launchIndex,
           stage: launchIndex === 1 ? "session_create" : "session_restart",
           code: error.code,
@@ -785,7 +890,7 @@ async function runPackagedWindowsSmoke({
           "PACKAGED_GRACEFUL_EXIT_FAILED",
           "Packaged application did not accept graceful exit"
         );
-        appendDiagnostic(fsImpl, layout.diagnosticPath, {
+        recordDiagnostic({
           launch: launchIndex,
           stage: "close_request",
           code: error.code,
@@ -802,7 +907,7 @@ async function runPackagedWindowsSmoke({
                 "PACKAGED_GRACEFUL_EXIT_FAILED",
                 "Packaged application did not exit gracefully"
               );
-        appendDiagnostic(fsImpl, layout.diagnosticPath, {
+        recordDiagnostic({
           launch: launchIndex,
           stage: "exit",
           code: error.code,
@@ -811,7 +916,7 @@ async function runPackagedWindowsSmoke({
         throw error;
       }
       completed = true;
-      appendDiagnostic(fsImpl, layout.diagnosticPath, {
+      recordDiagnostic({
         launch: launchIndex,
         stage: "graceful_exit",
         code: "OK",
@@ -849,7 +954,9 @@ async function runPackagedWindowsSmoke({
       diagnosticPath: layout.diagnosticPath,
       artifactName: path.basename(executablePath),
       artifactSha256,
-      gitCommit: sourceCommit,
+      artifactCommit: artifactBuild.gitCommit,
+      expectedCommit: comparisonCommit,
+      artifactBuild,
       assertions: {
         storageRootUnderRunProfile: sessionEvidence.every(
           (evidence) => evidence.storageRootVerified === true
@@ -868,6 +975,7 @@ async function runPackagedWindowsSmoke({
         ? error
         : codedError("PACKAGED_SMOKE_FAILED", "Packaged Windows smoke failed");
     publicError.diagnosticFile = DIAGNOSTIC_FILE;
+    publicError.artifactCommit = artifactBuild.gitCommit;
     throw publicError;
   }
 }
@@ -876,12 +984,12 @@ function parseCliArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    const match = /^--(runtime-root|executable)=(.+)$/u.exec(argument);
+    const match = /^--(runtime-root|executable|expected-commit)=(.+)$/u.exec(argument);
     if (match) {
       values[match[1]] = match[2];
       continue;
     }
-    if (new Set(["--runtime-root", "--executable"]).has(argument)) {
+    if (new Set(["--runtime-root", "--executable", "--expected-commit"]).has(argument)) {
       const value = argv[index + 1];
       if (typeof value !== "string" || value.startsWith("--")) {
         throw codedError("PACKAGED_SMOKE_INPUT_INVALID", "Packaged smoke arguments are invalid");
@@ -895,6 +1003,7 @@ function parseCliArgs(argv) {
   return {
     runtimeRoot: values["runtime-root"] ?? process.env.JARVIS_PACKAGED_SMOKE_ROOT,
     executablePath: values.executable,
+    expectedCommit: values["expected-commit"],
   };
 }
 
@@ -902,6 +1011,7 @@ async function main() {
   try {
     const options = parseCliArgs(process.argv.slice(2));
     if (options.executablePath === undefined) delete options.executablePath;
+    if (options.expectedCommit === undefined) delete options.expectedCommit;
     const result = await runPackagedWindowsSmoke(options);
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
@@ -914,6 +1024,9 @@ async function main() {
             : "PACKAGED_SMOKE_FAILED",
         diagnosticFile:
           typeof error?.diagnosticFile === "string" ? error.diagnosticFile : undefined,
+        artifactCommit: GIT_SHA1_PATTERN.test(error?.artifactCommit)
+          ? error.artifactCommit
+          : undefined,
       })}\n`
     );
     process.exitCode = 1;
@@ -930,6 +1043,8 @@ module.exports = {
   exerciseSessionThroughCdp,
   parseCliArgs,
   probeElectron,
+  readArtifactBuildManifest,
+  resolveCleanGitHead,
   runPackagedWindowsSmoke,
   waitForExitWithin,
 };
