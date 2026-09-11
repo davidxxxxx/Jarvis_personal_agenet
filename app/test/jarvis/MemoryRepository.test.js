@@ -7812,7 +7812,7 @@ test("a newer final daily input appends one evidence-backed revision", () => {
 
 test("two repositories applying one durable candidate converge on one revision", () => {
   const filename = path.join(
-    "G:\\Jarvis\\.runtime-cache\\temp",
+    os.tmpdir(),
     `jarvis-digest-apply-${process.pid}-${Date.now()}.sqlite`
   );
   const firstDb = createFixture(filename);

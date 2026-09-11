@@ -10,6 +10,15 @@ Jarvis-prefixed Git tags so they cannot be confused with upstream OpenWhispr rel
   migration, cold-reopen, and Full Memory gates. External legacy-data, physical microphone, real
   CUDA, private CAM++, and live MiniMax acceptance remain explicitly blocked rather than inferred.
 
+## 0.2.0-rc.13 - 2026-09-12
+
+- Add a Jarvis-first repository guide, evidence-backed feature inventory, module map and development/configuration/testing documentation; preserve upstream and historical design records.
+- Separate background lifecycle, worker composition and committed-audio preview while preserving the original runtime exports.
+- Extract IPC public projections, analysis validation/support and speaker logical-track selection from oversized orchestration/repository files; retain database schema v60 and existing transaction ownership.
+- Extract Memory presentation helpers and summary card without changing the UI or authorizing automatic paid refreshes.
+- Add module-boundary and summary-interaction regression tests. Make database fixture paths portable and inject native port discovery so mocked lifecycle tests do not depend on host port availability.
+- Source-only maintenance candidate: no new Windows installer, production data reprocessing, paid cloud request or physical-device/endurance acceptance is included.
+
 ## 0.2.0-rc.12 - 2026-08-08
 
 - Exclude audit-only transcript projections from every Daily Review evidence section, keeping the

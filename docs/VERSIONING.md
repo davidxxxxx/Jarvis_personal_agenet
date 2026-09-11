@@ -2,11 +2,11 @@
 
 Jarvis uses Semantic Versioning independently from the upstream OpenWhispr version.
 
-Current hardened source candidate: `0.2.0-rc.12` with database schema target `v60`.
-Its main-process regression and the retained rc.8 DOTA 2/KOOK identity reprocessing check passed on
-2026-08-08. The rc.12 Windows package, renderer/static gates, offline restart smoke, and controlled
-replacement are rerun before its tag is pushed. Three-hour endurance and a fresh physical-microphone
-recording remain separate manual acceptance gates and are never inferred from automated checks.
+Current source candidate: `0.2.0-rc.13` with unchanged database schema target `v60`.
+This is a behavior-preserving modularization checkpoint, not a new Windows package or a claim of
+production recording acceptance. See [the rc.13 verification record](testing/rc13-modularization.md).
+Historical rc.12 package/runtime evidence remains associated with rc.12 and is not inherited as proof
+for a new binary. Three-hour endurance and fresh physical-microphone recording remain separate gates.
 
 ## Version line
 
@@ -17,6 +17,7 @@ recording remain separate manual acceptance gates and are never inferred from au
 | Phase 2 complete       | `0.2.0-alpha.2` | `jarvis-v0.2.0-alpha.2` | Identity and activity classification      |
 | Phase 3 complete       | `0.2.0-beta.1`  | `jarvis-v0.2.0-beta.1`  | Actions and personalization               |
 | Phase 4 acceptance     | `0.2.0-rc.12`   | `jarvis-v0.2.0-rc.12`   | Packaged release candidate                |
+| Module organization    | `0.2.0-rc.13`   | `jarvis-v0.2.0-rc.13`   | Source-only maintenance checkpoint        |
 | Final verified release | `0.2.0`         | `jarvis-v0.2.0`         | User-facing stable release                |
 
 Database versions and app versions are deliberately separate. For example, schema `v33` is an
@@ -24,8 +25,8 @@ internal migration target and does not imply app version `33`.
 
 ## Source-control rules
 
-- Development stays on `codex/jarvis-start-budget-ui` until the dirty baseline has been safely
-  checkpointed.
+- Integration stays on `codex/jarvis-start-budget-ui`; isolated `codex/` worktrees may fast-forward
+  that branch after verification. Do not overwrite or stage an unrelated dirty root checkout.
 - Each phase receives a focused checkpoint commit after its scoped tests pass.
 - A phase version is changed only after all tasks and gates for that phase pass.
 - Every packaged artifact records the app version, full Git commit, schema target, build time, and
@@ -75,11 +76,11 @@ comparison; Jarvis branches and tags go only to `origin`.
 ## Phase release sequence
 
 ```powershell
-cd G:\Jarvis\.worktrees\jarvis-all-day-runtime\app
+# From the verified worktree's app/ directory:
 npm run release:check -- --tag jarvis-vX.Y.Z
 cd ..
 git tag -a jarvis-vX.Y.Z -m "Jarvis Memory X.Y.Z"
-git push origin codex/jarvis-start-budget-ui
+git push origin HEAD:codex/jarvis-start-budget-ui
 git push origin jarvis-vX.Y.Z
 ```
 

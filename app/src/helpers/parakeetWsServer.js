@@ -20,9 +20,13 @@ const HEALTH_CHECK_INTERVAL_MS = 5000;
 const TRANSCRIPTION_TIMEOUT_MS = 300000;
 
 class ParakeetWsServer {
-  constructor({ spawnImpl = spawn } = {}) {
+  constructor({ spawnImpl = spawn, findAvailablePortImpl = findAvailablePort } = {}) {
     if (typeof spawnImpl !== "function") throw new TypeError("spawnImpl must be a function");
+    if (typeof findAvailablePortImpl !== "function") {
+      throw new TypeError("findAvailablePortImpl must be a function");
+    }
     this.spawnImpl = spawnImpl;
+    this.findAvailablePort = findAvailablePortImpl;
     this.process = null;
     this.port = null;
     this.ready = false;
@@ -70,7 +74,7 @@ class ParakeetWsServer {
     if (!wsBinary) throw new Error("sherpa-onnx WS server binary not found");
     if (!fs.existsSync(modelDir)) throw new Error(`Model directory not found: ${modelDir}`);
 
-    this.port = await findAvailablePort(PORT_RANGE_START, PORT_RANGE_END);
+    this.port = await this.findAvailablePort(PORT_RANGE_START, PORT_RANGE_END);
     this.modelName = modelName;
     this.modelDir = modelDir;
 

@@ -13,3 +13,18 @@ userdata/
 recordings/
 /.private/speaker-eval/
 .planning/debug/
+
+# Local Jarvis evidence, dependencies and private runtime state
+/.planning/tmp/
+/.models/
+/.npm-cache/
+/.release-evidence/
+/.runtime-data/
+/.toolchains/
+/releases/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
